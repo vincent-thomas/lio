@@ -31,7 +31,6 @@ impl Operation for Tee {
       .build()
   }
 
-  #[cfg(not(linux))]
   fn fd(&self) -> Option<RawFd> {
     None
   }
@@ -39,7 +38,6 @@ impl Operation for Tee {
   #[cfg(not(linux))]
   const EVENT_TYPE: Option<EventType> = None;
 
-  #[cfg(not(linux))]
   fn run_blocking(&self) -> std::io::Result<i32> {
     syscall!(tee(self.fd_in, self.fd_out, self.size as usize, 0))
       .map(|s| s as i32)

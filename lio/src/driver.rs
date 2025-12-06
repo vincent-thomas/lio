@@ -57,9 +57,6 @@ impl OpStore {
 }
 
 #[cfg(linux)]
-use crate::op_registration::OpRegistrationStatus;
-
-#[cfg(linux)]
 pub type Default = backends::IoUring;
 #[cfg(not(linux))]
 pub type Default = backends::Polling;

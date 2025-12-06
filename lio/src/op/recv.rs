@@ -47,12 +47,10 @@ impl Operation for Recv {
   #[cfg(not(linux))]
   const EVENT_TYPE: Option<EventType> = Some(EventType::Read);
 
-  #[cfg(not(linux))]
   fn fd(&self) -> Option<RawFd> {
     Some(self.fd)
   }
 
-  #[cfg(not(linux))]
   fn run_blocking(&self) -> io::Result<i32> {
     let buf = self.buf.as_ref().unwrap();
     syscall!(recv(self.fd, buf.as_ptr() as *mut _, buf.len(), self.flags))

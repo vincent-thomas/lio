@@ -55,12 +55,10 @@ impl Operation for Accept {
   #[cfg(not(linux))]
   const EVENT_TYPE: Option<EventType> = Some(EventType::Read);
 
-  #[cfg(not(linux))]
   fn fd(&self) -> Option<RawFd> {
     Some(self.fd)
   }
 
-  #[cfg(not(linux))]
   fn run_blocking(&self) -> std::io::Result<i32> {
     #[cfg(any(
       target_os = "android",

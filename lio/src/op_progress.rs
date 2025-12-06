@@ -1,19 +1,69 @@
 use crate::op::Operation;
 
-#[cfg(linux)]
-use std::marker::PhantomData;
+#[cfg(not(linux))]
+use std::io;
+#[cfg(not(linux))]
+use std::thread;
 #[cfg(feature = "high")]
 use std::{
   future::Future,
   pin::Pin,
   task::{Context, Poll},
 };
-use std::{io, thread};
+use std::{marker::PhantomData, sync::mpsc::Receiver};
+use std::{
+  mem,
+  sync::mpsc::{self, TryRecvError},
+};
 
 use crate::{
   Driver,
   op::{self, DetachSafe},
 };
+
+pub struct BlockingReceiver<T> {
+  recv: Option<Receiver<T>>,
+}
+
+impl<T> BlockingReceiver<T> {
+  fn get_inner(&mut self) -> Option<Receiver<T>> {
+    mem::replace(&mut self.recv, None)
+  }
+
+  fn set_inner(&mut self, value: Receiver<T>) {
+    if let Some(_) = mem::replace(&mut self.recv, Some(value)) {
+      panic!("internal lio error");
+    };
+  }
+  pub fn recv(mut self) -> T {
+    match self.get_inner() {
+      Some(value) => value
+        .recv()
+        .expect("internal lio error: Sender dropped without sending"),
+      None => unreachable!(),
+    }
+  }
+
+  pub fn try_recv(&mut self) -> Option<T> {
+    match self.get_inner() {
+      Some(receiver) => match receiver.try_recv() {
+        Ok(value) => Some(value),
+        Err(err) => match err {
+          TryRecvError::Empty => {
+            self.set_inner(receiver);
+            None
+          }
+          TryRecvError::Disconnected => panic!(
+            "internal lio error: sender didn't send before getting dropped."
+          ),
+        },
+      },
+      None => panic!(
+        "lio consumer error: Tried running BlockingReceiver::try_recv after first one returned value."
+      ),
+    }
+  }
+}
 
 /// Represents the progress of an I/O operation across different platforms.
 ///
@@ -46,19 +96,28 @@ use crate::{
 pub enum OperationProgress<T> {
   #[cfg(not(linux))]
   #[cfg_attr(docsrs, doc(cfg(not(linux))))]
-  Poll { id: u64 },
+  Poll {
+    id: u64,
+  },
 
   #[cfg(linux)]
   #[cfg_attr(docsrs, doc(cfg(linux)))]
-  IoUring { id: u64, _m: PhantomData<T> },
+  IoUring {
+    id: u64,
+    _m: PhantomData<T>,
+  },
+
+  Threaded {
+    id: u64,
+    _m: PhantomData<T>,
+  },
 
   #[cfg(not(linux))]
   #[cfg_attr(docsrs, doc(cfg(not(linux))))]
-  Blocking { operation: Option<T> },
-
-  #[cfg(not(linux))]
-  #[cfg_attr(docsrs, doc(cfg(not(linux))))]
-  FromResult { res: Option<io::Result<i32>>, operation: T },
+  FromResult {
+    res: Option<io::Result<i32>>,
+    operation: T,
+  },
 }
 
 unsafe impl<T> Send for OperationProgress<T> where T: Send {}
@@ -191,15 +250,9 @@ impl<T: op::Operation> OperationProgress<T> {
         Driver::get().set_callback::<T, F>(id, callback);
         std::mem::forget(self); // Prevent Drop from cancelling the operation
       }
-      #[cfg(not(linux))]
-      OperationProgress::Blocking { ref mut operation } => {
-        let mut op = operation.take().expect("no operation found");
-        // For now.
-        thread::spawn(move || {
-          let result = op.run_blocking();
-          let output = op.result(result);
-          callback(output);
-        });
+      OperationProgress::Threaded { id, .. } => {
+        Driver::get().set_callback::<T, F>(id, callback);
+        std::mem::forget(self); // Prevent Drop from cancelling the operation
       }
       #[cfg(not(linux))]
       OperationProgress::FromResult { ref mut res, ref mut operation } => {
@@ -228,19 +281,19 @@ impl<T: op::Operation> OperationProgress<T> {
   /// let (result, buffer) = receiver.recv().unwrap();
   /// # }
   /// ```
-  #[cfg(feature = "high")]
-  pub fn get_receiver(self) -> oneshot::Receiver<T::Result>
+  pub fn send(self) -> BlockingReceiver<T::Result>
   where
     T::Result: Send,
     T: Send + 'static,
   {
-    let (sender, receiver) = oneshot::channel();
+    let (sender, receiver) = mpsc::channel();
+    let blocking_receiver = BlockingReceiver { recv: Some(receiver) };
 
     self.when_done(move |res| {
       let _ = sender.send(res);
     });
 
-    receiver
+    blocking_receiver
   }
 
   /// Block the current thread until the operation completes and return the result.
@@ -259,15 +312,12 @@ impl<T: op::Operation> OperationProgress<T> {
   /// }
   /// # }
   /// ```
-  #[cfg(feature = "high")]
   pub fn blocking(self) -> T::Result
   where
     T::Result: Send,
     T: Send + 'static,
   {
-    self.get_receiver().recv().expect(
-      "lio internal error: Receiver was dropped before value was received.",
-    )
+    self.send().recv()
   }
 }
 
@@ -299,12 +349,18 @@ where
     Self::Poll { id }
   }
 
-  pub(crate) fn new_blocking(operation: T) -> Self {
-    Self::Blocking { operation: Some(operation) }
-  }
-
   pub(crate) fn new_from_result(operation: T, result: io::Result<i32>) -> Self {
     Self::FromResult { operation, res: Some(result) }
+  }
+}
+
+// Threading backend works on all platforms
+impl<T> OperationProgress<T>
+where
+  T: op::Operation,
+{
+  pub(crate) fn new_threaded(id: u64) -> Self {
+    Self::Threaded { id, _m: PhantomData }
   }
 }
 
@@ -342,12 +398,7 @@ where
       OperationProgress::IoUring { id, _m: _ } => check_done::<T>(id, cx),
       #[cfg(not(linux))]
       OperationProgress::Poll { id } => check_done::<T>(id, cx),
-      #[cfg(not(linux))]
-      OperationProgress::Blocking { ref mut operation } => {
-        let mut op = operation.take().expect("no operation found");
-        let result = op.run_blocking();
-        Poll::Ready(op.result(result))
-      }
+      OperationProgress::Threaded { id, _m } => check_done::<T>(id, cx),
       #[cfg(not(linux))]
       OperationProgress::FromResult { ref mut res, ref mut operation } => {
         let result = operation.result(res.take().expect("Already awaited."));
@@ -364,13 +415,10 @@ impl<T> Drop for OperationProgress<T> {
       OperationProgress::Poll { id: _, .. } => {
         // Driver::get().detach(*id);
       }
+      OperationProgress::Threaded { id: _, _m: _ } => {}
       #[cfg(linux)]
       OperationProgress::IoUring { id: _, _m, .. } => {
         // Driver::get().detach(*id);
-      }
-      #[cfg(not(linux))]
-      OperationProgress::Blocking { .. } => {
-        // Blocking operations don't need cleanup
       }
       #[cfg(not(linux))]
       OperationProgress::FromResult { res: _, operation: _ } => {}

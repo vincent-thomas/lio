@@ -10,7 +10,6 @@ macro_rules! impl_result {
   };
 
   (fd) => {
-    #[cfg(unix)]
     type Result = std::io::Result<std::os::fd::RawFd>;
 
     /// File descriptor returned from the operation.
@@ -22,10 +21,8 @@ macro_rules! impl_result {
 
 macro_rules! impl_no_readyness {
   () => {
-    #[cfg(not(linux))]
     const EVENT_TYPE: Option<crate::op::EventType> = None;
 
-    #[cfg(not(linux))]
     fn fd(&self) -> Option<std::os::fd::RawFd> {
       None
     }

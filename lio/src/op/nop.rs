@@ -1,4 +1,5 @@
 use crate::op::Operation;
+use std::io;
 
 pub struct Nop;
 
@@ -16,5 +17,13 @@ impl Operation for Nop {
   #[cfg(linux)]
   fn create_entry(&mut self) -> io_uring::squeue::Entry {
     io_uring::opcode::Nop::new().build()
+  }
+
+  fn fd(&self) -> Option<std::os::fd::RawFd> {
+    None
+  }
+
+  fn run_blocking(&self) -> io::Result<i32> {
+    panic!();
   }
 }

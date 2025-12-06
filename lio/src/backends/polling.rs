@@ -1,12 +1,11 @@
-#[cfg(not(linux))]
+use std::io::ErrorKind;
+use std::os::fd::BorrowedFd;
 use std::{collections::HashMap, io, os::fd::RawFd};
 
-#[cfg(not(linux))]
 use parking_lot::Mutex;
 
 use crate::op_registration::ExtractedOpNotification;
 
-#[cfg(not(linux))]
 use crate::{
   OperationProgress,
   backends::IoBackend,
@@ -14,33 +13,38 @@ use crate::{
   op::{EventType, Operation},
 };
 
-#[cfg(not(linux))]
 pub struct Polling {
   inner: polling::Poller,
+  // inner_io: Threading,
   fd_map: Mutex<HashMap<u64, RawFd>>,
 }
 
-#[cfg(not(linux))]
 impl IoBackend for Polling {
   fn submit<O>(&self, op: O, store: &OpStore) -> OperationProgress<O>
   where
     O: Operation + Sized,
   {
-    #[cfg(not(linux))]
     if O::EVENT_TYPE.is_none() {
-      return OperationProgress::<O>::new_blocking(op);
+      return OperationProgress::FromResult {
+        res: Some(op.run_blocking()),
+        operation: op,
+      };
+
+      // return self.inner_io.submit(op, store);
     };
 
     if !O::IS_CONNECT {
       return self.new_polling(op, store);
     };
 
+    println!("is connect");
+
     let result = op.run_blocking();
 
-    if result
-      .as_ref()
+    if dbg!(result.as_ref())
       .is_err_and(|err| err.raw_os_error() == Some(libc::EINPROGRESS))
     {
+      dbg!("nice");
       self.new_polling(op, store)
     } else {
       OperationProgress::<O>::new_from_result(op, result)
@@ -50,6 +54,8 @@ impl IoBackend for Polling {
     self.inner.notify().unwrap();
   }
   fn tick(&self, store: &OpStore, can_wait: bool) {
+    // self.inner_io.tick(store, can_wait);
+
     let events =
       self.interest_wait(can_wait).expect("background thread failed");
 
@@ -72,7 +78,7 @@ impl IoBackend for Polling {
       match result {
         // Special-case.
         Err(err)
-          if err.kind() == io::ErrorKind::WouldBlock
+          if err.kind() == ErrorKind::WouldBlock
             || err.raw_os_error() == Some(libc::EINPROGRESS) =>
         {
           self.modify_interest(entry_fd, event).expect("fd sure exists");
@@ -108,11 +114,11 @@ impl IoBackend for Polling {
   }
 }
 
-#[cfg(not(linux))]
 impl Polling {
   pub fn new() -> Self {
     Self {
       inner: polling::Poller::new().unwrap(),
+      // inner_io: Threading::new(),
       fd_map: Mutex::new(HashMap::new()),
     }
   }
@@ -151,11 +157,18 @@ impl Polling {
       EventType::Write => polling::Event::writable(key as usize),
     };
 
-    unsafe {
-      use std::os::fd::BorrowedFd;
+    let result = unsafe { self.inner.add(&BorrowedFd::borrow_raw(fd), event) };
 
-      self.inner.add(&BorrowedFd::borrow_raw(fd), event)
-    }
+    if let Err(err) = result {
+      match err.kind() {
+        // If a interest already exists. Expected if multiple accept calls
+        // to the same fd is called.
+        ErrorKind::AlreadyExists => return Ok(()),
+        _ => return Err(err),
+      };
+    };
+
+    Ok(())
   }
   pub(crate) fn modify_interest(
     &self,
