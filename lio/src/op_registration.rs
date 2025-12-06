@@ -36,7 +36,9 @@ impl OpCallback {
     let callback = unsafe { Box::from_raw(callback_ptr as *mut F) };
 
     match reg.try_extract::<T>() {
-      TryExtractOutcome::StillWaiting => panic!("wtf??"),
+      TryExtractOutcome::StillWaiting => panic!(
+        "internal lio error: it is illegal for TryExtractOutcome to be StillWaiting when callback is called"
+      ),
       TryExtractOutcome::Done(res) => callback(res),
     };
   }
@@ -50,8 +52,7 @@ pub struct OpRegistration {
   // Fields common to both platforms
   op: Option<*const ()>,
   op_fn_drop: fn(*const ()), // Function to properly drop the operation
-  #[cfg(not(linux))]
-  op_fn_run_blocking: fn(*const ()) -> std::io::Result<i32>, // Function to properly drop the operation
+  op_fn_run_blocking: fn(*const ()) -> std::io::Result<i32>,
 }
 
 impl Drop for OpRegistration {
@@ -134,7 +135,6 @@ impl OpRegistration {
       drop(unsafe { Box::from_raw(ptr as *mut T) })
     }
 
-    #[cfg(not(linux))]
     fn op_fn_run_blocking<T>(ptr: *const ()) -> std::io::Result<i32>
     where
       T: Operation,
@@ -146,13 +146,11 @@ impl OpRegistration {
     OpRegistration {
       op: Some(Box::into_raw(op) as *const ()),
       op_fn_drop: drop_op::<T>,
-      #[cfg(not(linux))]
       op_fn_run_blocking: op_fn_run_blocking::<T>,
       status: OpRegistrationStatus::Waiting { notifier: None },
     }
   }
 
-  #[cfg(not(linux))]
   pub fn run_blocking(&mut self) -> io::Result<i32> {
     (self.op_fn_run_blocking)(self.op_ptr())
   }

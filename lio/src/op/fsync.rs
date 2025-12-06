@@ -32,7 +32,6 @@ impl Operation for Fsync {
 
   impl_no_readyness!();
 
-  #[cfg(not(linux))]
   fn run_blocking(&self) -> std::io::Result<i32> {
     syscall!(fsync(self.fd))
   }

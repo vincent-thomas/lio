@@ -1,11 +1,9 @@
-#![cfg(feature = "high")]
 mod common;
 
 use lio::*;
 use std::ffi::CString;
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{self, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 // ============================================================================
 // DETACH SAFE OPERATIONS - Can use .detach()
@@ -14,224 +12,298 @@ use std::time::Duration;
 /// Test Close (DetachSafe) with .detach()
 #[test]
 fn test_close_detach_safe() {
-  liten::block_on(async {
-    let mut fds = [0i32; 2];
-    unsafe {
-      assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
-    }
-    let fd = fds[0];
+  lio::init();
 
-    // DetachSafe: can use .detach()
-    close(fd).detach();
+  let mut fds = [0i32; 2];
+  unsafe {
+    assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+  }
+  let fd = fds[0];
 
-    std::thread::sleep(Duration::from_millis(50));
+  // DetachSafe: can use .detach()
+  close(fd).detach();
 
-    // Verify fd is closed
-    let result = unsafe { libc::close(fd) };
-    assert_eq!(result, -1, "fd should already be closed");
+  lio::tick();
 
-    unsafe {
-      libc::close(fds[1]);
-    }
-  });
+  // Verify fd is closed
+  let result = unsafe { libc::close(fd) };
+  assert_eq!(result, -1, "fd should already be closed");
+
+  unsafe {
+    libc::close(fds[1]);
+  }
 }
 
 /// Test Close (DetachSafe) with .when_done()
 #[test]
 fn test_close_when_done() {
-  liten::block_on(async {
-    let mut fds = [0i32; 2];
-    unsafe {
-      libc::pipe(fds.as_mut_ptr());
-    }
-    let fd = fds[0];
+  lio::init();
 
-    let (tx, rx) = sync_channel(1);
-    close(fd).when_done(move |result| {
-      assert!(result.is_ok());
-      tx.send(()).unwrap();
-    });
+  let mut fds = [0i32; 2];
+  unsafe {
+    libc::pipe(fds.as_mut_ptr());
+  }
+  let fd = fds[0];
 
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
 
-    unsafe {
-      libc::close(fds[1]);
-    }
+  close(fd).when_done(move |result| {
+    assert!(result.is_ok());
+    sender1.send(()).unwrap();
   });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  unsafe {
+    libc::close(fds[1]);
+  }
 }
 
 /// Test Bind (DetachSafe) with .detach()
 #[test]
 fn test_bind_detach_safe() {
-  liten::block_on(async {
-    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    assert!(sock >= 0);
+  lio::init();
 
-    let addr = "127.0.0.1:0".parse().unwrap();
-    bind(sock, addr).detach();
+  let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+  assert!(sock >= 0);
 
-    std::thread::sleep(Duration::from_millis(50));
+  let addr = "127.0.0.1:0".parse().unwrap();
+  bind(sock, addr).detach();
 
-    unsafe {
-      libc::close(sock);
-    }
-  });
+  lio::tick();
+
+  unsafe {
+    libc::close(sock);
+  }
 }
 
 /// Test Bind (DetachSafe) with .when_done()
 #[test]
 fn test_bind_when_done() {
-  liten::block_on(async {
-    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    let addr = "127.0.0.1:0".parse().unwrap();
+  lio::init();
 
-    let (tx, rx) = sync_channel(1);
-    bind(sock, addr).when_done(move |result| {
-      assert!(result.is_ok());
-      tx.send(()).unwrap();
-    });
+  let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+  let addr = "127.0.0.1:0".parse().unwrap();
 
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
 
-    unsafe {
-      libc::close(sock);
-    }
+  bind(sock, addr).when_done(move |result| {
+    assert!(result.is_ok());
+    sender1.send(()).unwrap();
   });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  unsafe {
+    libc::close(sock);
+  }
 }
 
 /// Test Connect (DetachSafe) with .detach()
 #[test]
 fn test_connect_detach_safe() {
-  liten::block_on(async {
-    let listen_sock =
-      unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    let addr = "127.0.0.1:0".parse().unwrap();
-    bind(listen_sock, addr).await.unwrap();
-    listen(listen_sock, 5).await.unwrap();
+  lio::init();
 
-    let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let mut addrlen =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    unsafe {
-      libc::getsockname(
-        listen_sock,
-        &mut sockaddr as *mut _ as *mut libc::sockaddr,
-        &mut addrlen,
-      );
-    }
-    let port = u16::from_be(sockaddr.sin_port);
-    let connect_addr = format!("127.0.0.1:{}", port).parse().unwrap();
+  let listen_sock =
+    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+  let addr = "127.0.0.1:0".parse().unwrap();
 
-    let client_sock =
-      unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
+  let sender2 = sender.clone();
 
-    connect(client_sock, connect_addr).detach();
-
-    std::thread::sleep(Duration::from_millis(100));
-
-    unsafe {
-      libc::close(client_sock);
-      libc::close(listen_sock);
-    }
+  bind(listen_sock, addr).when_done(move |result| {
+    result.unwrap();
+    sender1.send(()).unwrap();
   });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  listen(listen_sock, 5).when_done(move |result| {
+    result.unwrap();
+    sender2.send(()).unwrap();
+  });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+  let mut addrlen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+  unsafe {
+    libc::getsockname(
+      listen_sock,
+      &mut sockaddr as *mut _ as *mut libc::sockaddr,
+      &mut addrlen,
+    );
+  }
+  let port = u16::from_be(sockaddr.sin_port);
+  let connect_addr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+  let client_sock =
+    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+
+  connect(client_sock, connect_addr).detach();
+
+  lio::tick();
+
+  unsafe {
+    libc::close(client_sock);
+    libc::close(listen_sock);
+  }
 }
 
 /// Test Connect (DetachSafe) with .when_done()
 #[test]
 fn test_connect_when_done() {
-  liten::block_on(async {
-    let listen_sock =
-      unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    let addr = "127.0.0.1:0".parse().unwrap();
-    bind(listen_sock, addr).await.unwrap();
-    listen(listen_sock, 5).await.unwrap();
+  lio::init();
 
-    let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let mut addrlen =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    unsafe {
-      libc::getsockname(
-        listen_sock,
-        &mut sockaddr as *mut _ as *mut libc::sockaddr,
-        &mut addrlen,
-      );
-    }
-    let port = u16::from_be(sockaddr.sin_port);
-    let connect_addr = format!("127.0.0.1:{}", port).parse().unwrap();
+  let listen_sock =
+    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+  let addr = "127.0.0.1:0".parse().unwrap();
 
-    let client_sock =
-      unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
+  let sender2 = sender.clone();
+  let sender3 = sender.clone();
 
-    // Connect with .await for simplicity - DetachSafe means it CAN use .detach()
-    connect(client_sock, connect_addr).await.unwrap();
-
-    unsafe {
-      libc::close(client_sock);
-      libc::close(listen_sock);
-    }
+  bind(listen_sock, addr).when_done(move |result| {
+    result.unwrap();
+    sender1.send(()).unwrap();
   });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  listen(listen_sock, 5).when_done(move |result| {
+    result.unwrap();
+    sender2.send(()).unwrap();
+  });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+  let mut addrlen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+  unsafe {
+    libc::getsockname(
+      listen_sock,
+      &mut sockaddr as *mut _ as *mut libc::sockaddr,
+      &mut addrlen,
+    );
+  }
+  let port = u16::from_be(sockaddr.sin_port);
+  let connect_addr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+  let client_sock =
+    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+
+  // Connect with .when_done() - DetachSafe means it CAN use .detach()
+  connect(client_sock, connect_addr).when_done(move |result| {
+    result.unwrap();
+    sender3.send(()).unwrap();
+  });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  unsafe {
+    libc::close(client_sock);
+    libc::close(listen_sock);
+  }
 }
 
 /// Test Fsync (DetachSafe) with .detach()
 #[test]
 fn test_fsync_detach_safe() {
-  liten::block_on(async {
-    let path = CString::new("/tmp/lio_test_fsync_detach.txt").unwrap();
-    let fd = unsafe {
-      libc::open(
-        path.as_ptr(),
-        libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-        0o644,
-      )
-    };
+  lio::init();
 
-    let data = b"test data";
-    unsafe {
-      libc::write(fd, data.as_ptr() as *const libc::c_void, data.len());
-    }
+  let path = CString::new("/tmp/lio_test_fsync_detach.txt").unwrap();
+  let fd = unsafe {
+    libc::open(
+      path.as_ptr(),
+      libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+      0o644,
+    )
+  };
 
-    fsync(fd).detach();
+  let data = b"test data";
+  unsafe {
+    libc::write(fd, data.as_ptr() as *const libc::c_void, data.len());
+  }
 
-    std::thread::sleep(Duration::from_millis(50));
+  fsync(fd).detach();
 
-    unsafe {
-      libc::close(fd);
-      libc::unlink(path.as_ptr());
-    }
-  });
+  lio::tick();
+
+  unsafe {
+    libc::close(fd);
+    libc::unlink(path.as_ptr());
+  }
 }
 
 /// Test Fsync (DetachSafe) with .when_done()
 #[test]
 fn test_fsync_when_done() {
-  liten::block_on(async {
-    let path = CString::new("/tmp/lio_test_fsync_when_done.txt").unwrap();
-    let fd = unsafe {
-      libc::open(
-        path.as_ptr(),
-        libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-        0o644,
-      )
-    };
+  lio::init();
 
-    let data = b"test data";
-    unsafe {
-      libc::write(fd, data.as_ptr() as *const libc::c_void, data.len());
-    }
+  let path = CString::new("/tmp/lio_test_fsync_when_done.txt").unwrap();
+  let fd = unsafe {
+    libc::open(
+      path.as_ptr(),
+      libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+      0o644,
+    )
+  };
 
-    let (tx, rx) = sync_channel(1);
-    fsync(fd).when_done(move |result| {
-      assert!(result.is_ok());
-      tx.send(()).unwrap();
-    });
+  let data = b"test data";
+  unsafe {
+    libc::write(fd, data.as_ptr() as *const libc::c_void, data.len());
+  }
 
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
 
-    unsafe {
-      libc::close(fd);
-      libc::unlink(path.as_ptr());
-    }
+  fsync(fd).when_done(move |result| {
+    assert!(result.is_ok());
+    sender1.send(()).unwrap();
   });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  unsafe {
+    libc::close(fd);
+    libc::unlink(path.as_ptr());
+  }
 }
 
 // ============================================================================
@@ -241,337 +313,571 @@ fn test_fsync_when_done() {
 /// Test Read (NOT DetachSafe) with .when_done()
 #[test]
 fn test_read_when_done_not_detach_safe() {
-  liten::block_on(async {
-    let path = CString::new("/tmp/lio_test_read_when_done.txt").unwrap();
-    let fd = unsafe {
-      let fd = libc::open(
-        path.as_ptr(),
-        libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-        0o644,
-      );
-      let data = b"hello";
-      libc::write(fd, data.as_ptr() as *const libc::c_void, data.len());
-      fd
-    };
+  lio::init();
 
-    let (tx, rx) = sync_channel(1);
-    read(fd, vec![0u8; 100], 0).when_done(move |(result, buf)| {
-      let bytes_read = result.expect("Read should succeed");
-      assert_eq!(bytes_read, 5);
-      assert_eq!(&buf[..5], b"hello");
-      tx.send(()).unwrap();
-    });
+  let path = CString::new("/tmp/lio_test_read_when_done.txt").unwrap();
+  let fd = unsafe {
+    let fd = libc::open(
+      path.as_ptr(),
+      libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+      0o644,
+    );
+    let data = b"hello";
+    libc::write(fd, data.as_ptr() as *const libc::c_void, data.len());
+    fd
+  };
 
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
 
-    unsafe {
-      libc::close(fd);
-      libc::unlink(path.as_ptr());
-    }
+  read(fd, vec![0u8; 100], 0).when_done(move |(result, buf)| {
+    let bytes_read = result.expect("Read should succeed");
+    assert_eq!(bytes_read, 5);
+    assert_eq!(&buf[..5], b"hello");
+    sender1.send(()).unwrap();
   });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  unsafe {
+    libc::close(fd);
+    libc::unlink(path.as_ptr());
+  }
 }
 
 /// Test Write (NOT DetachSafe) with .when_done()
 #[test]
 fn test_write_when_done_not_detach_safe() {
-  liten::block_on(async {
-    let path = CString::new("/tmp/lio_test_write_when_done.txt").unwrap();
-    let fd = unsafe {
-      libc::open(
-        path.as_ptr(),
-        libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-        0o644,
-      )
-    };
+  lio::init();
 
-    let (tx, rx) = sync_channel(1);
-    write(fd, b"test data".to_vec(), 0).when_done(move |(result, _buf)| {
-      let bytes_written = result.expect("Write should succeed");
-      assert_eq!(bytes_written, 9);
-      tx.send(()).unwrap();
-    });
+  let path = CString::new("/tmp/lio_test_write_when_done.txt").unwrap();
+  let fd = unsafe {
+    libc::open(
+      path.as_ptr(),
+      libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+      0o644,
+    )
+  };
 
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
 
-    unsafe {
-      libc::close(fd);
-      libc::unlink(path.as_ptr());
-    }
+  write(fd, b"test data".to_vec(), 0).when_done(move |(result, _buf)| {
+    let bytes_written = result.expect("Write should succeed");
+    assert_eq!(bytes_written, 9);
+    sender1.send(()).unwrap();
   });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  unsafe {
+    libc::close(fd);
+    libc::unlink(path.as_ptr());
+  }
 }
 
-/// Test Accept (NOT DetachSafe) with .await instead of callback
-/// Note: Accept with callbacks requires complex async coordination
+/// Test Accept (NOT DetachSafe) with .when_done()
 #[test]
-fn test_accept_with_await_not_detach_safe() {
-  liten::block_on(async {
-    let server_sock =
-      unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    let addr = "127.0.0.1:0".parse().unwrap();
-    bind(server_sock, addr).await.unwrap();
-    listen(server_sock, 5).await.unwrap();
+fn test_accept_with_when_done_not_detach_safe() {
+  lio::init();
 
-    let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let mut addrlen =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    unsafe {
-      libc::getsockname(
-        server_sock,
-        &mut sockaddr as *mut _ as *mut libc::sockaddr,
-        &mut addrlen,
-      );
-    }
-    let port = u16::from_be(sockaddr.sin_port);
-    let connect_addr = format!("127.0.0.1:{}", port).parse().unwrap();
+  let server_sock =
+    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+  let addr = "127.0.0.1:0".parse().unwrap();
 
-    // Connect from client in background
-    let client_sock =
-      unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    connect(client_sock, connect_addr).await.unwrap();
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
+  let sender2 = sender.clone();
+  let sender3 = sender.clone();
 
-    // Accept with .await works fine
-    let (accepted_fd, _) = accept(server_sock).await.unwrap();
-
-    unsafe {
-      libc::close(accepted_fd);
-      libc::close(client_sock);
-      libc::close(server_sock);
-    }
+  bind(server_sock, addr).when_done(move |result| {
+    result.unwrap();
+    sender1.send(()).unwrap();
   });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  listen(server_sock, 5).when_done(move |result| {
+    result.unwrap();
+    sender2.send(()).unwrap();
+  });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+  let mut addrlen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+  unsafe {
+    libc::getsockname(
+      server_sock,
+      &mut sockaddr as *mut _ as *mut libc::sockaddr,
+      &mut addrlen,
+    );
+  }
+  let port = u16::from_be(sockaddr.sin_port);
+  let connect_addr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+  // Connect from client
+  let client_sock =
+    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+
+  connect(client_sock, connect_addr).when_done(move |result| {
+    result.unwrap();
+    sender3.send(()).unwrap();
+  });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  let (sender4, receiver4) = mpsc::channel();
+  let sender5 = sender4.clone();
+
+  // Accept with .when_done()
+  accept(server_sock).when_done(move |result| {
+    let (accepted_fd, _) = result.unwrap();
+    sender5.send(accepted_fd).unwrap();
+  });
+
+  assert_eq!(receiver4.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  let accepted_fd = receiver4.recv().unwrap();
+
+  unsafe {
+    libc::close(accepted_fd);
+    libc::close(client_sock);
+    libc::close(server_sock);
+  }
 }
 
 /// Test Listen (NOT DetachSafe) with .when_done()
 #[test]
 fn test_listen_when_done_not_detach_safe() {
-  liten::block_on(async {
-    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    let addr = "127.0.0.1:0".parse().unwrap();
-    bind(sock, addr).await.unwrap();
+  lio::init();
 
-    let (tx, rx) = sync_channel(1);
-    listen(sock, 5).when_done(move |result| {
-      assert!(result.is_ok());
-      tx.send(()).unwrap();
-    });
+  let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+  let addr = "127.0.0.1:0".parse().unwrap();
 
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
+  let sender2 = sender.clone();
 
-    unsafe {
-      libc::close(sock);
-    }
+  bind(sock, addr).when_done(move |result| {
+    result.unwrap();
+    sender1.send(()).unwrap();
   });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  listen(sock, 5).when_done(move |result| {
+    assert!(result.is_ok());
+    sender2.send(()).unwrap();
+  });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  unsafe {
+    libc::close(sock);
+  }
 }
 
-/// Test Recv (NOT DetachSafe) with .await
-/// Note: Recv with callbacks requires coordinating sender and receiver
+/// Test Recv (NOT DetachSafe) with .when_done()
 #[test]
-fn test_recv_with_await_not_detach_safe() {
-  liten::block_on(async {
-    let server_sock =
-      unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    let addr = "127.0.0.1:0".parse().unwrap();
-    bind(server_sock, addr).await.unwrap();
-    listen(server_sock, 5).await.unwrap();
+fn test_recv_with_when_done_not_detach_safe() {
+  lio::init();
 
-    let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let mut addrlen =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    unsafe {
-      libc::getsockname(
-        server_sock,
-        &mut sockaddr as *mut _ as *mut libc::sockaddr,
-        &mut addrlen,
-      );
-    }
-    let port = u16::from_be(sockaddr.sin_port);
-    let connect_addr = format!("127.0.0.1:{}", port).parse().unwrap();
+  let server_sock =
+    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+  let addr = "127.0.0.1:0".parse().unwrap();
 
-    let client_sock =
-      unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    connect(client_sock, connect_addr).await.unwrap();
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
+  let sender2 = sender.clone();
+  let sender3 = sender.clone();
+  let (accept_sender, accept_receiver) = mpsc::channel();
+  // let sender4 = sender.clone();
 
-    let (accepted_fd, _) = accept(server_sock).await.unwrap();
+  bind(server_sock, addr).when_done(move |result| {
+    result.unwrap();
+    sender1.send(()).unwrap();
+  });
 
-    // Send data from client
-    let data = b"hello";
-    unsafe {
-      libc::send(
-        client_sock,
-        data.as_ptr() as *const libc::c_void,
-        data.len(),
-        0,
-      );
-    }
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
-    // Recv with .await
-    let (bytes_received, buf) = recv(accepted_fd, vec![0u8; 100], None).await;
-    assert_eq!(bytes_received.unwrap(), 5);
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  listen(server_sock, 5).when_done(move |result| {
+    result.unwrap();
+    sender2.send(()).unwrap();
+  });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+  let mut addrlen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+  unsafe {
+    libc::getsockname(
+      server_sock,
+      &mut sockaddr as *mut _ as *mut libc::sockaddr,
+      &mut addrlen,
+    );
+  }
+  let port = u16::from_be(sockaddr.sin_port);
+  let connect_addr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+  let client_sock =
+    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+
+  connect(client_sock, connect_addr).when_done(move |result| {
+    result.unwrap();
+    sender3.send(()).unwrap();
+  });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  accept(server_sock).when_done(move |result| {
+    let (accepted_fd, _) = result.unwrap();
+    accept_sender.send(accepted_fd).unwrap();
+  });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  let accepted_fd = accept_receiver.recv().unwrap();
+
+  // Send data from client
+  let data = b"hello";
+  unsafe {
+    libc::send(
+      client_sock,
+      data.as_ptr() as *const libc::c_void,
+      data.len(),
+      0,
+    );
+  }
+
+  let (sender5, receiver5) = mpsc::channel();
+  let sender6 = sender5.clone();
+
+  // Recv with .when_done()
+  recv(accepted_fd, vec![0u8; 100], None).when_done(move |(result, buf)| {
+    let bytes_received = result.unwrap();
+    assert_eq!(bytes_received, 5);
     assert_eq!(&buf[..5], b"hello");
-
-    unsafe {
-      libc::close(accepted_fd);
-      libc::close(client_sock);
-      libc::close(server_sock);
-    }
+    sender6.send(()).unwrap();
   });
+
+  assert_eq!(receiver5.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver5.recv().unwrap();
+
+  unsafe {
+    libc::close(accepted_fd);
+    libc::close(client_sock);
+    libc::close(server_sock);
+  }
 }
 
-/// Test Send (NOT DetachSafe) with .await
-/// Note: Send with callbacks requires coordinating sender and receiver
+/// Test Send (NOT DetachSafe) with .when_done()
 #[test]
-fn test_send_with_await_not_detach_safe() {
-  liten::block_on(async {
-    let server_sock =
-      unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    let addr = "127.0.0.1:0".parse().unwrap();
-    bind(server_sock, addr).await.unwrap();
-    listen(server_sock, 5).await.unwrap();
+fn test_send_with_when_done_not_detach_safe() {
+  lio::init();
 
-    let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let mut addrlen =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    unsafe {
-      libc::getsockname(
-        server_sock,
-        &mut sockaddr as *mut _ as *mut libc::sockaddr,
-        &mut addrlen,
-      );
-    }
-    let port = u16::from_be(sockaddr.sin_port);
-    let connect_addr = format!("127.0.0.1:{}", port).parse().unwrap();
+  let server_sock =
+    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+  let addr = "127.0.0.1:0".parse().unwrap();
 
-    let client_sock =
-      unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    connect(client_sock, connect_addr).await.unwrap();
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
+  let sender2 = sender.clone();
+  let sender3 = sender.clone();
 
-    // Send with .await
-    let (bytes_sent, _buf) = send(client_sock, b"test".to_vec(), None).await;
-    assert_eq!(bytes_sent.unwrap(), 4);
-
-    unsafe {
-      libc::close(client_sock);
-      libc::close(server_sock);
-    }
+  bind(server_sock, addr).when_done(move |result| {
+    result.unwrap();
+    sender1.send(()).unwrap();
   });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  listen(server_sock, 5).when_done(move |result| {
+    result.unwrap();
+    sender2.send(()).unwrap();
+  });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+  let mut addrlen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+  unsafe {
+    libc::getsockname(
+      server_sock,
+      &mut sockaddr as *mut _ as *mut libc::sockaddr,
+      &mut addrlen,
+    );
+  }
+  let port = u16::from_be(sockaddr.sin_port);
+  let connect_addr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+  let client_sock =
+    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+
+  connect(client_sock, connect_addr).when_done(move |result| {
+    result.unwrap();
+    sender3.send(()).unwrap();
+  });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  let (sender4, receiver4) = mpsc::channel();
+  let sender5 = sender4.clone();
+
+  // Send with .when_done()
+  send(client_sock, b"test".to_vec(), None).when_done(move |(result, _buf)| {
+    let bytes_sent = result.unwrap();
+    assert_eq!(bytes_sent, 4);
+    sender5.send(()).unwrap();
+  });
+
+  assert_eq!(receiver4.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver4.recv().unwrap();
+
+  unsafe {
+    libc::close(client_sock);
+    libc::close(server_sock);
+  }
 }
 
 /// Test Socket (NOT DetachSafe) with .when_done()
 #[test]
 fn test_socket_when_done_not_detach_safe() {
-  liten::block_on(async {
-    let (tx, rx) = sync_channel(1);
-    socket(socket2::Domain::IPV4, socket2::Type::STREAM, None).when_done(
-      move |result| {
-        let fd = result.expect("Socket creation should succeed");
-        unsafe {
-          libc::close(fd);
-        }
-        tx.send(()).unwrap();
-      },
-    );
+  lio::init();
 
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
-  });
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
+
+  socket(socket2::Domain::IPV4, socket2::Type::STREAM, None).when_done(
+    move |result| {
+      let fd = result.expect("Socket creation should succeed");
+      unsafe {
+        libc::close(fd);
+      }
+      sender1.send(()).unwrap();
+    },
+  );
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
 }
 
 /// Test OpenAt (NOT DetachSafe) with .when_done()
 #[test]
 fn test_openat_when_done_not_detach_safe() {
-  liten::block_on(async {
-    let path = CString::new("/tmp/lio_test_openat_when_done.txt").unwrap();
+  lio::init();
 
-    let (tx, rx) = sync_channel(1);
-    openat(
-      libc::AT_FDCWD,
-      path.clone(),
-      libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-    )
-    .when_done(move |result| {
-      let fd = result.expect("OpenAt should succeed");
-      unsafe {
-        libc::close(fd);
-        libc::unlink(path.as_ptr());
-      }
-      tx.send(()).unwrap();
-    });
+  let path = CString::new("/tmp/lio_test_openat_when_done.txt").unwrap();
 
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
+
+  let path_clone = path.clone();
+  openat(
+    libc::AT_FDCWD,
+    path.clone(),
+    libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+  )
+  .when_done(move |result| {
+    let fd = result.expect("OpenAt should succeed");
+    unsafe {
+      libc::close(fd);
+      libc::unlink(path_clone.as_ptr());
+    }
+    sender1.send(()).unwrap();
   });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
 }
 
 /// Test Shutdown (NOT DetachSafe) with .when_done()
 #[test]
 fn test_shutdown_when_done_not_detach_safe() {
-  liten::block_on(async {
-    let server_sock =
-      unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    let addr = "127.0.0.1:0".parse().unwrap();
-    bind(server_sock, addr).await.unwrap();
-    listen(server_sock, 5).await.unwrap();
+  lio::init();
 
-    let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let mut addrlen =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    unsafe {
-      libc::getsockname(
-        server_sock,
-        &mut sockaddr as *mut _ as *mut libc::sockaddr,
-        &mut addrlen,
-      );
-    }
-    let port = u16::from_be(sockaddr.sin_port);
-    let connect_addr = format!("127.0.0.1:{}", port).parse().unwrap();
+  let server_sock =
+    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+  let addr = "127.0.0.1:0".parse().unwrap();
 
-    let client_sock =
-      unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    connect(client_sock, connect_addr).await.unwrap();
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
+  let sender2 = sender.clone();
+  let sender3 = sender.clone();
 
-    let (tx, rx) = sync_channel(1);
-    shutdown(client_sock, libc::SHUT_WR).when_done(move |result| {
-      assert!(result.is_ok());
-      tx.send(()).unwrap();
-    });
-
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
-
-    unsafe {
-      libc::close(client_sock);
-      libc::close(server_sock);
-    }
+  bind(server_sock, addr).when_done(move |result| {
+    result.unwrap();
+    sender1.send(()).unwrap();
   });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  listen(server_sock, 5).when_done(move |result| {
+    result.unwrap();
+    sender2.send(()).unwrap();
+  });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+  let mut addrlen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+  unsafe {
+    libc::getsockname(
+      server_sock,
+      &mut sockaddr as *mut _ as *mut libc::sockaddr,
+      &mut addrlen,
+    );
+  }
+  let port = u16::from_be(sockaddr.sin_port);
+  let connect_addr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+  let client_sock =
+    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+
+  connect(client_sock, connect_addr).when_done(move |result| {
+    result.unwrap();
+    sender3.send(()).unwrap();
+  });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  let (sender4, receiver4) = mpsc::channel();
+  let sender5 = sender4.clone();
+
+  shutdown(client_sock, libc::SHUT_WR).when_done(move |result| {
+    assert!(result.is_ok());
+    sender5.send(()).unwrap();
+  });
+
+  assert_eq!(receiver4.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver4.recv().unwrap();
+
+  unsafe {
+    libc::close(client_sock);
+    libc::close(server_sock);
+  }
 }
 
 /// Test Truncate (NOT DetachSafe) with .when_done()
 #[test]
 fn test_truncate_when_done_not_detach_safe() {
-  liten::block_on(async {
-    let path = CString::new("/tmp/lio_test_truncate_when_done.txt").unwrap();
-    let fd = unsafe {
-      libc::open(
-        path.as_ptr(),
-        libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-        0o644,
-      )
-    };
+  lio::init();
 
-    let data = b"test data for truncate";
-    unsafe {
-      libc::write(fd, data.as_ptr() as *const libc::c_void, data.len());
-    }
+  let path = CString::new("/tmp/lio_test_truncate_when_done.txt").unwrap();
+  let fd = unsafe {
+    libc::open(
+      path.as_ptr(),
+      libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+      0o644,
+    )
+  };
 
-    let (tx, rx) = sync_channel(1);
-    truncate(fd, 10).when_done(move |result| {
-      assert!(result.is_ok());
-      tx.send(()).unwrap();
-    });
+  let data = b"test data for truncate";
+  unsafe {
+    libc::write(fd, data.as_ptr() as *const libc::c_void, data.len());
+  }
 
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  let (sender, receiver) = mpsc::channel();
+  let sender1 = sender.clone();
 
-    unsafe {
-      libc::close(fd);
-      libc::unlink(path.as_ptr());
-    }
+  truncate(fd, 10).when_done(move |result| {
+    assert!(result.is_ok());
+    sender1.send(()).unwrap();
   });
+
+  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+
+  lio::tick();
+
+  receiver.recv().unwrap();
+
+  unsafe {
+    libc::close(fd);
+    libc::unlink(path.as_ptr());
+  }
 }
 
 // ============================================================================
@@ -581,41 +887,41 @@ fn test_truncate_when_done_not_detach_safe() {
 /// Test concurrent operations with mixed DetachSafe and non-DetachSafe
 #[test]
 fn test_concurrent_mixed_operations() {
-  liten::block_on(async {
-    let completed = Arc::new(Mutex::new(0));
+  lio::init();
 
-    // DetachSafe operations
-    let mut fds = [0i32; 2];
-    unsafe {
-      libc::pipe(fds.as_mut_ptr());
-    }
-    let c = completed.clone();
-    close(fds[0]).when_done(move |_| {
-      *c.lock().unwrap() += 1;
-    });
+  let completed = Arc::new(Mutex::new(0));
 
-    // Non-DetachSafe operation
-    let path = CString::new("/tmp/lio_test_mixed_ops.txt").unwrap();
-    let fd = unsafe {
-      libc::open(
-        path.as_ptr(),
-        libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-        0o644,
-      )
-    };
-    let c = completed.clone();
-    write(fd, b"data".to_vec(), 0).when_done(move |(_, _)| {
-      *c.lock().unwrap() += 1;
-    });
-
-    std::thread::sleep(Duration::from_millis(100));
-
-    assert_eq!(*completed.lock().unwrap(), 2);
-
-    unsafe {
-      libc::close(fds[1]);
-      libc::close(fd);
-      libc::unlink(path.as_ptr());
-    }
+  // DetachSafe operations
+  let mut fds = [0i32; 2];
+  unsafe {
+    libc::pipe(fds.as_mut_ptr());
+  }
+  let c = completed.clone();
+  close(fds[0]).when_done(move |_| {
+    *c.lock().unwrap() += 1;
   });
+
+  // Non-DetachSafe operation
+  let path = CString::new("/tmp/lio_test_mixed_ops.txt").unwrap();
+  let fd = unsafe {
+    libc::open(
+      path.as_ptr(),
+      libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+      0o644,
+    )
+  };
+  let c = completed.clone();
+  write(fd, b"data".to_vec(), 0).when_done(move |(_, _)| {
+    *c.lock().unwrap() += 1;
+  });
+
+  lio::tick();
+
+  assert_eq!(*completed.lock().unwrap(), 2);
+
+  unsafe {
+    libc::close(fds[1]);
+    libc::close(fd);
+    libc::unlink(path.as_ptr());
+  }
 }

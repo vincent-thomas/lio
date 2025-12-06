@@ -1,218 +1,453 @@
-#![cfg(feature = "high")]
 use lio::{accept, bind, connect, listen, recv, send, socket};
 use proptest::prelude::*;
 use socket2::{Domain, Protocol, Type};
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
+use std::sync::mpsc::{self, TryRecvError};
 
 #[test]
 fn test_recv_multiple() {
-  liten::block_on(async {
-    let server_sock = socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-      .await
-      .expect("Failed to create server socket");
+  lio::init();
 
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    bind(server_sock, addr).await.expect("Failed to bind");
+  let (sender_sock, receiver_sock) = mpsc::channel();
+  let (sender_unit, receiver_unit) = mpsc::channel();
 
-    let bound_addr = unsafe {
-      let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-      let mut addr_len =
-        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-      libc::getsockname(
-        server_sock,
-        addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-        &mut addr_len,
-      );
-      let sockaddr_in = addr_storage.assume_init();
-      let port = u16::from_be(sockaddr_in.sin_port);
-      format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-    };
+  // Create server socket
+  let sender_s1 = sender_sock.clone();
+  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+    move |res| {
+      sender_s1.send(res).unwrap();
+    },
+  );
 
-    listen(server_sock, 128).await.expect("Failed to listen");
+  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
 
-    let server_fut = async move {
-      let (client_fd, _client_addr) =
-        accept(server_sock).await.expect("Failed to accept");
+  let server_sock =
+    receiver_sock.recv().unwrap().expect("Failed to create server socket");
 
-      // Receive until EOF
-      let mut all_data = Vec::new();
-      loop {
-        let buf = vec![0u8; 1024];
-        let (bytes_received, received_buf) = recv(client_fd, buf, None).await;
-        let bytes_received =
-          bytes_received.expect("Failed to receive") as usize;
+  let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-        if bytes_received == 0 {
-          break; // EOF
-        }
-
-        all_data.extend_from_slice(&received_buf[..bytes_received]);
-      }
-
-      (all_data, client_fd, server_sock)
-    };
-
-    let client_fut = async {
-      let client_sock = socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-        .await
-        .expect("Failed to create client socket");
-      connect(client_sock, bound_addr).await.expect("Failed to connect");
-
-      // Send multiple messages
-      for i in 0..3 {
-        let data = format!("Message {}", i).into_bytes();
-        let (bytes_sent, _) = send(client_sock, data, None).await;
-        bytes_sent.expect("Failed to send");
-      }
-
-      // Shutdown write side to signal EOF to server
-      unsafe {
-        libc::shutdown(client_sock, libc::SHUT_WR);
-      }
-
-      client_sock
-    };
-
-    let ((all_data, server_client_fd, server_sock), client_sock) =
-      liten::join!(server_fut, client_fut);
-
-    // Verify we received all 3 messages concatenated
-    let expected = b"Message 0Message 1Message 2";
-    assert_eq!(all_data, expected);
-
-    lio::close(client_sock).await.expect("Failed to close client");
-    lio::close(server_client_fd).await.expect("Failed to close server client");
-    lio::close(server_sock).await.expect("Failed to close server");
+  let sender_b = sender_unit.clone();
+  bind(server_sock, addr).when_done(move |res| {
+    sender_b.send(res).unwrap();
   });
+
+  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  receiver_unit.recv().unwrap().expect("Failed to bind");
+
+  let bound_addr = unsafe {
+    let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
+    let mut addr_len =
+      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    libc::getsockname(
+      server_sock,
+      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
+      &mut addr_len,
+    );
+    let sockaddr_in = addr_storage.assume_init();
+    let port = u16::from_be(sockaddr_in.sin_port);
+    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
+  };
+
+  let sender_l = sender_unit.clone();
+  listen(server_sock, 128).when_done(move |res| {
+    sender_l.send(res).unwrap();
+  });
+
+  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  receiver_unit.recv().unwrap().expect("Failed to listen");
+
+  // Create client socket
+  let sender_cs = sender_sock.clone();
+  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+    move |res| {
+      sender_cs.send(res).unwrap();
+    },
+  );
+
+  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  let client_sock =
+    receiver_sock.recv().unwrap().expect("Failed to create client socket");
+
+  // Accept and connect
+  let (sender_a, receiver_a) = mpsc::channel();
+  let (sender_c, receiver_c) = mpsc::channel();
+
+  accept(server_sock).when_done(move |res| {
+    sender_a.send(res).unwrap();
+  });
+
+  connect(client_sock, bound_addr).when_done(move |res| {
+    sender_c.send(res).unwrap();
+  });
+
+  assert_eq!(receiver_a.try_recv().unwrap_err(), TryRecvError::Empty);
+  assert_eq!(receiver_c.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  let (client_fd, _client_addr) =
+    receiver_a.recv().unwrap().expect("Failed to accept");
+  receiver_c.recv().unwrap().expect("Failed to connect");
+
+  // Send multiple messages from client
+  let (sender_send, receiver_send) = mpsc::channel();
+  for i in 0..3 {
+    let data = format!("Message {}", i).into_bytes();
+    let sender_s = sender_send.clone();
+    send(client_sock, data, None).when_done(move |res| {
+      sender_s.send(res).unwrap();
+    });
+  }
+
+  assert_eq!(receiver_send.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  for _ in 0..3 {
+    let (res, buf) = receiver_send.recv().unwrap();
+    res.expect("Failed to send");
+  }
+
+  // Shutdown write side to signal EOF to server
+  unsafe {
+    libc::shutdown(client_sock, libc::SHUT_WR);
+  }
+
+  // Receive until EOF
+  let mut all_data = Vec::new();
+  loop {
+    let buf = vec![0u8; 1024];
+    let (sender_recv, receiver_recv) = mpsc::channel();
+    recv(client_fd, buf, None).when_done(move |res| {
+      sender_recv.send(res).unwrap();
+    });
+
+    assert_eq!(receiver_recv.try_recv().unwrap_err(), TryRecvError::Empty);
+    lio::tick();
+
+    let (bytes_received, received_buf) = receiver_recv.recv().unwrap();
+    let bytes_received = bytes_received.expect("Failed to receive") as usize;
+
+    if bytes_received == 0 {
+      break; // EOF
+    }
+
+    all_data.extend_from_slice(&received_buf[..bytes_received]);
+  }
+
+  // Verify we received all 3 messages concatenated
+  let expected = b"Message 0Message 1Message 2";
+  assert_eq!(all_data, expected);
+
+  // Cleanup
+  let (sender_close, receiver_close) = mpsc::channel();
+
+  let sender_close1 = sender_close.clone();
+  lio::close(client_sock).when_done(move |res| {
+    sender_close1.send(res).unwrap();
+  });
+
+  let sender_close2 = sender_close.clone();
+  lio::close(client_fd).when_done(move |res| {
+    sender_close2.send(res).unwrap();
+  });
+
+  let sender_close3 = sender_close.clone();
+  lio::close(server_sock).when_done(move |res| {
+    sender_close3.send(res).unwrap();
+  });
+
+  assert_eq!(receiver_close.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  receiver_close.recv().unwrap().expect("Failed to close client");
+  receiver_close.recv().unwrap().expect("Failed to close server client");
+  receiver_close.recv().unwrap().expect("Failed to close server");
 }
 
 #[test]
 fn test_recv_with_flags() {
-  liten::block_on(async {
-    let server_sock = socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-      .await
-      .expect("Failed to create server socket");
+  lio::init();
 
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    bind(server_sock, addr).await.expect("Failed to bind");
+  let (sender_sock, receiver_sock) = mpsc::channel();
+  let (sender_unit, receiver_unit) = mpsc::channel();
 
-    let bound_addr = unsafe {
-      let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-      let mut addr_len =
-        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-      libc::getsockname(
-        server_sock,
-        addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-        &mut addr_len,
-      );
-      let sockaddr_in = addr_storage.assume_init();
-      let port = u16::from_be(sockaddr_in.sin_port);
-      format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-    };
+  // Create server socket
+  let sender_s1 = sender_sock.clone();
+  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+    move |res| {
+      sender_s1.send(res).unwrap();
+    },
+  );
 
-    listen(server_sock, 128).await.expect("Failed to listen");
+  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
 
-    let send_data = b"Data with flags".to_vec();
+  let server_sock =
+    receiver_sock.recv().unwrap().expect("Failed to create server socket");
 
-    let server_fut = async move {
-      let (client_fd, _client_addr) =
-        accept(server_sock).await.expect("Failed to accept");
+  let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-      let buf = vec![0u8; 1024];
-      let (bytes_received, received_buf) = recv(client_fd, buf, Some(0)).await;
-      let bytes_received =
-        bytes_received.expect("Failed to receive with flags");
-
-      (bytes_received, received_buf, client_fd, server_sock)
-    };
-
-    let client_fut = async {
-      let client_sock = socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-        .await
-        .expect("Failed to create client socket");
-      connect(client_sock, bound_addr).await.expect("Failed to connect");
-
-      let (bytes_sent, _) = send(client_sock, send_data.clone(), None).await;
-      bytes_sent.expect("Failed to send");
-      client_sock
-    };
-
-    let (
-      (bytes_received, received_buf, server_client_fd, server_sock),
-      client_sock,
-    ) = liten::join!(server_fut, client_fut);
-
-    assert_eq!(bytes_received as usize, send_data.len());
-    assert_eq!(&received_buf[..bytes_received as usize], send_data.as_slice());
-
-    lio::close(client_sock).await.expect("Failed to close client");
-    lio::close(server_client_fd).await.expect("Failed to close server client");
-    lio::close(server_sock).await.expect("Failed to close server");
+  let sender_b = sender_unit.clone();
+  bind(server_sock, addr).when_done(move |res| {
+    sender_b.send(res).unwrap();
   });
+
+  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  receiver_unit.recv().unwrap().expect("Failed to bind");
+
+  let bound_addr = unsafe {
+    let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
+    let mut addr_len =
+      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    libc::getsockname(
+      server_sock,
+      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
+      &mut addr_len,
+    );
+    let sockaddr_in = addr_storage.assume_init();
+    let port = u16::from_be(sockaddr_in.sin_port);
+    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
+  };
+
+  let sender_l = sender_unit.clone();
+  listen(server_sock, 128).when_done(move |res| {
+    sender_l.send(res).unwrap();
+  });
+
+  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  receiver_unit.recv().unwrap().expect("Failed to listen");
+
+  // Create client socket
+  let sender_cs = sender_sock.clone();
+  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+    move |res| {
+      sender_cs.send(res).unwrap();
+    },
+  );
+
+  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  let client_sock =
+    receiver_sock.recv().unwrap().expect("Failed to create client socket");
+
+  // Accept and connect
+  let (sender_a, receiver_a) = mpsc::channel();
+  let (sender_c, receiver_c) = mpsc::channel();
+
+  accept(server_sock).when_done(move |res| {
+    sender_a.send(res).unwrap();
+  });
+
+  connect(client_sock, bound_addr).when_done(move |res| {
+    sender_c.send(res).unwrap();
+  });
+
+  assert_eq!(receiver_a.try_recv().unwrap_err(), TryRecvError::Empty);
+  assert_eq!(receiver_c.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  let (client_fd, _client_addr) =
+    receiver_a.recv().unwrap().expect("Failed to accept");
+  receiver_c.recv().unwrap().expect("Failed to connect");
+
+  // Send data
+  let send_data = b"Data with flags".to_vec();
+  let (sender_send, receiver_send) = mpsc::channel();
+  send(client_sock, send_data, None).when_done(move |res| {
+    sender_send.send(res).unwrap();
+  });
+
+  assert_eq!(receiver_send.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  let (res, send_data) = receiver_send.recv().unwrap();
+  res.expect("Failed to send");
+
+  // Receive with flags
+  let buf = vec![0u8; 1024];
+  let (sender_recv, receiver_recv) = mpsc::channel();
+  recv(client_fd, buf, Some(0)).when_done(move |res| {
+    sender_recv.send(res).unwrap();
+  });
+
+  assert_eq!(receiver_recv.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  let (bytes_received, received_buf) = receiver_recv.recv().unwrap();
+  let bytes_received = bytes_received.expect("Failed to receive with flags");
+
+  assert_eq!(bytes_received as usize, send_data.len());
+  assert_eq!(&received_buf[..bytes_received as usize], send_data.as_slice());
+
+  // Cleanup
+  let (sender_close, receiver_close) = mpsc::channel();
+
+  let sender_close1 = sender_close.clone();
+  lio::close(client_sock).when_done(move |res| {
+    sender_close1.send(res).unwrap();
+  });
+
+  let sender_close2 = sender_close.clone();
+  lio::close(client_fd).when_done(move |res| {
+    sender_close2.send(res).unwrap();
+  });
+
+  let sender_close3 = sender_close.clone();
+  lio::close(server_sock).when_done(move |res| {
+    sender_close3.send(res).unwrap();
+  });
+
+  assert_eq!(receiver_close.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  receiver_close.recv().unwrap().expect("Failed to close client");
+  receiver_close.recv().unwrap().expect("Failed to close server client");
+  receiver_close.recv().unwrap().expect("Failed to close server");
 }
 
 #[test]
 fn test_recv_on_closed() {
-  liten::block_on(async {
-    let server_sock = socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-      .await
-      .expect("Failed to create server socket");
+  lio::init();
 
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    bind(server_sock, addr).await.expect("Failed to bind");
+  let (sender_sock, receiver_sock) = mpsc::channel();
+  let (sender_unit, receiver_unit) = mpsc::channel();
 
-    let bound_addr = unsafe {
-      let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-      let mut addr_len =
-        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-      libc::getsockname(
-        server_sock,
-        addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-        &mut addr_len,
-      );
-      let sockaddr_in = addr_storage.assume_init();
-      let port = u16::from_be(sockaddr_in.sin_port);
-      format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-    };
+  // Create server socket
+  let sender_s1 = sender_sock.clone();
+  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+    move |res| {
+      sender_s1.send(res).unwrap();
+    },
+  );
 
-    listen(server_sock, 128).await.expect("Failed to listen");
+  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
 
-    let server_fut = async move {
-      let (client_fd, _client_addr) =
-        accept(server_sock).await.expect("Failed to accept");
+  let server_sock =
+    receiver_sock.recv().unwrap().expect("Failed to create server socket");
 
-      (client_fd, server_sock)
-    };
+  let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let client_fut = async {
-      let client_sock = socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-        .await
-        .expect("Failed to create client socket");
-      connect(client_sock, bound_addr).await.expect("Failed to connect");
-      client_sock
-    };
-
-    let ((server_client_fd, server_sock), client_sock) =
-      liten::join!(server_fut, client_fut);
-
-    // Close client
-    unsafe {
-      libc::close(client_sock);
-    }
-
-    // Try to receive on closed connection
-    let buf = vec![0u8; 1024];
-    let (bytes_received, _) = recv(server_client_fd, buf, None).await;
-    let bytes_received =
-      bytes_received.expect("recv should succeed but return 0");
-
-    // Should return 0 when connection is closed
-    assert_eq!(bytes_received, 0);
-
-    lio::close(server_client_fd).await.expect("Failed to close server client");
-    lio::close(server_sock).await.expect("Failed to close server");
+  let sender_b = sender_unit.clone();
+  bind(server_sock, addr).when_done(move |res| {
+    sender_b.send(res).unwrap();
   });
+
+  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  receiver_unit.recv().unwrap().expect("Failed to bind");
+
+  let bound_addr = unsafe {
+    let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
+    let mut addr_len =
+      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    libc::getsockname(
+      server_sock,
+      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
+      &mut addr_len,
+    );
+    let sockaddr_in = addr_storage.assume_init();
+    let port = u16::from_be(sockaddr_in.sin_port);
+    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
+  };
+
+  let sender_l = sender_unit.clone();
+  listen(server_sock, 128).when_done(move |res| {
+    sender_l.send(res).unwrap();
+  });
+
+  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  receiver_unit.recv().unwrap().expect("Failed to listen");
+
+  // Create client socket
+  let sender_cs = sender_sock.clone();
+  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+    move |res| {
+      sender_cs.send(res).unwrap();
+    },
+  );
+
+  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  let client_sock =
+    receiver_sock.recv().unwrap().expect("Failed to create client socket");
+
+  // Accept and connect
+  let (sender_a, receiver_a) = mpsc::channel();
+  let (sender_c, receiver_c) = mpsc::channel();
+
+  accept(server_sock).when_done(move |res| {
+    sender_a.send(res).unwrap();
+  });
+
+  connect(client_sock, bound_addr).when_done(move |res| {
+    sender_c.send(res).unwrap();
+  });
+
+  assert_eq!(receiver_a.try_recv().unwrap_err(), TryRecvError::Empty);
+  assert_eq!(receiver_c.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  let (server_client_fd, _client_addr) =
+    receiver_a.recv().unwrap().expect("Failed to accept");
+  receiver_c.recv().unwrap().expect("Failed to connect");
+
+  // Close client
+  unsafe {
+    libc::close(client_sock);
+  }
+
+  // Try to receive on closed connection
+  let buf = vec![0u8; 1024];
+  let (sender_recv, receiver_recv) = mpsc::channel();
+  recv(server_client_fd, buf, None).when_done(move |res| {
+    sender_recv.send(res).unwrap();
+  });
+
+  assert_eq!(receiver_recv.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  let (bytes_received, _) = receiver_recv.recv().unwrap();
+  let bytes_received =
+    bytes_received.expect("recv should succeed but return 0");
+
+  // Should return 0 when connection is closed
+  assert_eq!(bytes_received, 0);
+
+  // Cleanup
+  let (sender_close, receiver_close) = mpsc::channel();
+
+  let sender_close1 = sender_close.clone();
+  lio::close(server_client_fd).when_done(move |res| {
+    sender_close1.send(res).unwrap();
+  });
+
+  let sender_close2 = sender_close.clone();
+  lio::close(server_sock).when_done(move |res| {
+    sender_close2.send(res).unwrap();
+  });
+
+  assert_eq!(receiver_close.try_recv().unwrap_err(), TryRecvError::Empty);
+  lio::tick();
+
+  receiver_close.recv().unwrap().expect("Failed to close server client");
+  receiver_close.recv().unwrap().expect("Failed to close server");
 }
 
 proptest! {
@@ -221,79 +456,145 @@ proptest! {
     data_size in 1usize..=8192,
     seed in any::<u64>(),
   ) {
-    liten::block_on(async move {
-      // Generate deterministic random data
-      let test_data: Vec<u8> = (0..data_size)
-        .map(|i| ((seed.wrapping_add(i as u64)) % 256) as u8)
-        .collect();
+    lio::init();
 
-      // Create server socket using lio (required for lio::accept to work)
-      let server_sock = socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-        .await
-        .expect("Failed to create server socket");
+    // Generate deterministic random data
+    let test_data: Vec<u8> = (0..data_size)
+      .map(|i| ((seed.wrapping_add(i as u64)) % 256) as u8)
+      .collect();
 
-      // Bind using lio
-      let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-      bind(server_sock, addr).await.expect("Failed to bind");
+    let (sender_sock, receiver_sock) = mpsc::channel();
+    let (sender_unit, receiver_unit) = mpsc::channel();
 
-      // Get bound address
-      let bound_addr = unsafe {
-        let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-        let mut addr_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        libc::getsockname(server_sock, addr_storage.as_mut_ptr() as *mut libc::sockaddr, &mut addr_len);
-        let sockaddr_in = addr_storage.assume_init();
-        let port = u16::from_be(sockaddr_in.sin_port);
-        format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-      };
-
-      // Listen using lio
-      listen(server_sock, 128).await.expect("Failed to listen");
-
-      // Accept connection and connect client (using lio for proper async handling)
-      let (server_client_fd, client_sock) = liten::join!(
-        async {
-          let (fd, _addr) = accept(server_sock).await.expect("Accept failed");
-          fd
-        },
-        async {
-          let sock = socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-            .await
-            .expect("Failed to create client socket");
-          connect(sock, bound_addr).await.expect("Connect failed");
-          sock
-        }
-      );
-
-      // Send data from client using libc
-      let sent = unsafe {
-        libc::send(
-          client_sock,
-          test_data.as_ptr() as *const libc::c_void,
-          test_data.len(),
-          0,
-        )
-      };
-      assert_eq!(sent as usize, test_data.len(), "Send failed");
-
-      // Test recv on server side using lio (the only lio syscall in this test)
-      let recv_buf = vec![0u8; data_size];
-      let (recv_result, received_buf) = recv(server_client_fd, recv_buf, None).await;
-      let bytes_received = recv_result.expect("Recv failed") as usize;
-
-      // Verify
-      assert!(bytes_received > 0, "Should receive at least some bytes");
-      assert_eq!(
-        &received_buf[..bytes_received],
-        &test_data[..bytes_received],
-        "Received data should match sent data"
-      );
-
-      // Cleanup
-      lio::close(client_sock).await.expect("Failed to close client");
-      lio::close(server_client_fd)
-        .await
-        .expect("Failed to close server client");
-      lio::close(server_sock).await.expect("Failed to close server");
+    // Create server socket
+    let sender_s1 = sender_sock.clone();
+    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(move |res| {
+      sender_s1.send(res).unwrap();
     });
+
+    assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
+    lio::tick();
+
+    let server_sock = receiver_sock.recv().unwrap().expect("Failed to create server socket");
+
+    // Bind
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let sender_b = sender_unit.clone();
+    bind(server_sock, addr).when_done(move |res| {
+      sender_b.send(res).unwrap();
+    });
+
+    assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+    lio::tick();
+
+    receiver_unit.recv().unwrap().expect("Failed to bind");
+
+    // Get bound address
+    let bound_addr = unsafe {
+      let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
+      let mut addr_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+      libc::getsockname(server_sock, addr_storage.as_mut_ptr() as *mut libc::sockaddr, &mut addr_len);
+      let sockaddr_in = addr_storage.assume_init();
+      let port = u16::from_be(sockaddr_in.sin_port);
+      format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
+    };
+
+    // Listen
+    let sender_l = sender_unit.clone();
+    listen(server_sock, 128).when_done(move |res| {
+      sender_l.send(res).unwrap();
+    });
+
+    assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+    lio::tick();
+
+    receiver_unit.recv().unwrap().expect("Failed to listen");
+
+    // Create client socket
+    let sender_cs = sender_sock.clone();
+    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(move |res| {
+      sender_cs.send(res).unwrap();
+    });
+
+    assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
+    lio::tick();
+
+    let client_sock = receiver_sock.recv().unwrap().expect("Failed to create client socket");
+
+    // Accept and connect
+    let (sender_a, receiver_a) = mpsc::channel();
+    let (sender_c, receiver_c) = mpsc::channel();
+
+    accept(server_sock).when_done(move |res| {
+      sender_a.send(res).unwrap();
+    });
+
+    connect(client_sock, bound_addr).when_done(move |res| {
+      sender_c.send(res).unwrap();
+    });
+
+    assert_eq!(receiver_a.try_recv().unwrap_err(), TryRecvError::Empty);
+    assert_eq!(receiver_c.try_recv().unwrap_err(), TryRecvError::Empty);
+    lio::tick();
+
+    let server_client_fd = receiver_a.recv().unwrap().expect("Accept failed").0;
+    receiver_c.recv().unwrap().expect("Connect failed");
+
+    // Send data from client using libc
+    let sent = unsafe {
+      libc::send(
+        client_sock,
+        test_data.as_ptr() as *const libc::c_void,
+        test_data.len(),
+        0,
+      )
+    };
+    assert_eq!(sent as usize, test_data.len(), "Send failed");
+
+    // Test recv on server side
+    let recv_buf = vec![0u8; data_size];
+    let (sender_recv, receiver_recv) = mpsc::channel();
+    recv(server_client_fd, recv_buf, None).when_done(move |res| {
+      sender_recv.send(res).unwrap();
+    });
+
+    assert_eq!(receiver_recv.try_recv().unwrap_err(), TryRecvError::Empty);
+    lio::tick();
+
+    let (recv_result, received_buf) = receiver_recv.recv().unwrap();
+    let bytes_received = recv_result.expect("Recv failed") as usize;
+
+    // Verify
+    assert!(bytes_received > 0, "Should receive at least some bytes");
+    assert_eq!(
+      &received_buf[..bytes_received],
+      &test_data[..bytes_received],
+      "Received data should match sent data"
+    );
+
+    // Cleanup
+    let (sender_close, receiver_close) = mpsc::channel();
+
+    let sender_close1 = sender_close.clone();
+    lio::close(client_sock).when_done(move |res| {
+      sender_close1.send(res).unwrap();
+    });
+
+    let sender_close2 = sender_close.clone();
+    lio::close(server_client_fd).when_done(move |res| {
+      sender_close2.send(res).unwrap();
+    });
+
+    let sender_close3 = sender_close.clone();
+    lio::close(server_sock).when_done(move |res| {
+      sender_close3.send(res).unwrap();
+    });
+
+    assert_eq!(receiver_close.try_recv().unwrap_err(), TryRecvError::Empty);
+    lio::tick();
+
+    receiver_close.recv().unwrap().expect("Failed to close client");
+    receiver_close.recv().unwrap().expect("Failed to close server client");
+    receiver_close.recv().unwrap().expect("Failed to close server");
   }
 }

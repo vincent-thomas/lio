@@ -60,12 +60,10 @@ impl Operation for Timeout {
   #[cfg(not(linux))]
   const EVENT_TYPE: Option<EventType> = None;
 
-  #[cfg(not(linux))]
-  fn fd(&self) -> Option<RawFd> {
+  fn fd(&self) -> Option<std::os::fd::RawFd> {
     None
   }
 
-  #[cfg(not(linux))]
   fn run_blocking(&self) -> std::io::Result<i32> {
     todo!();
     // syscall!(timeout(self.fd, self.size as i64))

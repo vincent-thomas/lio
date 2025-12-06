@@ -1,3 +1,8 @@
+use super::{IoBackend, OpStore};
+use crate::op_registration::ExtractedOpNotification;
+use crate::{OperationProgress, op};
+use std::{io, sync::Mutex};
+
 pub struct IoUring {
   inner: io_uring::IoUring,
   probe: io_uring::Probe,
@@ -15,8 +20,8 @@ impl IoUring {
 
     Self { inner: io_uring, probe, submission_guard: Mutex::new(()) }
   }
-  pub fn from_i32_to_io_result(res: i32) -> std::io::Result<i32> {
-    if res < 0 { Err(std::io::Error::from_raw_os_error(res)) } else { Ok(res) }
+  pub fn from_i32_to_io_result(res: i32) -> io::Result<i32> {
+    if res < 0 { Err(io::Error::from_raw_os_error(res)) } else { Ok(res) }
   }
 }
 
@@ -63,8 +68,6 @@ impl IoBackend for IoUring {
 
     // SAFETY: lio guarrantees that only one tick impl is running at any time.
     for io_entry in unsafe { self.inner.completion_shared() } {
-      use std::mem;
-
       let operation_id = io_entry.user_data();
 
       // If the operation id is not registered (e.g., wake-up NOP), skip.

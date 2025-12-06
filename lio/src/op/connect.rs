@@ -67,30 +67,35 @@ impl Operation for Connect {
   #[cfg(not(linux))]
   const EVENT_TYPE: Option<EventType> = Some(EventType::Write);
 
-  #[cfg(not(linux))]
   fn fd(&self) -> Option<RawFd> {
     Some(self.fd)
   }
 
-  #[cfg(not(linux))]
   fn run_blocking(&self) -> std::io::Result<i32> {
-    let result =
-      syscall!(connect(self.fd, self.addr.get().cast(), self.get_addrlen(),));
+    let result = dbg!(syscall!(connect(
+      self.fd,
+      self.addr.get().cast(),
+      self.get_addrlen()
+    )));
 
     // Track if this is the first connect() call for this operation
     let is_first_call = !self.connect_called.swap(true, Ordering::SeqCst);
 
     // - If this is a subsequent call: connection just completed (success)
     // - If this is the first connect() call: socket was already connected (error)
-    if let Err(Some(errno)) = result.as_ref().map_err(|e| e.raw_os_error()) {
+    if let Err(Some(errno)) =
+      dbg!(result.as_ref().map_err(|e| e.raw_os_error()))
+    {
       if errno == libc::EISCONN {
-        if is_first_call {
-          // First connect() returned EISCONN = socket was already connected
-          return Err(std::io::Error::from_raw_os_error(libc::EISCONN));
-        } else {
-          // Subsequent connect() returned EISCONN = connection completed
-          return Ok(0);
-        }
+        // if is_first_call {
+        //   // First connect() returned EISCONN = socket was already connected
+        //   return Err(std::io::Error::from_raw_os_error(libc::EISCONN));
+        // } else {
+        //   // Subsequent connect() returned EISCONN = connection completed
+        return Ok(0);
+        // }
+      } else {
+        return result;
       }
     };
     result

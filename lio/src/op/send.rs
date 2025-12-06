@@ -41,18 +41,16 @@ impl Operation for Send {
   #[cfg(not(linux))]
   const EVENT_TYPE: Option<EventType> = Some(EventType::Write);
 
-  #[cfg(not(linux))]
   fn fd(&self) -> Option<RawFd> {
     Some(self.fd)
   }
 
-  #[cfg(not(linux))]
   fn run_blocking(&self) -> io::Result<i32> {
     let buf = self.buf.as_ref().unwrap();
     syscall!(send(self.fd, buf.as_ptr() as *mut _, buf.len(), self.flags))
       .map(|t| t as i32)
   }
-  fn result(&mut self, _ret: std::io::Result<i32>) -> Self::Result {
+  fn result(&mut self, _ret: io::Result<i32>) -> Self::Result {
     let buf = self.buf.take().expect("ran Recv::result more than once.");
 
     (_ret, buf)

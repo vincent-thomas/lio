@@ -11,8 +11,6 @@ macro_rules! syscall {
 }
 
 use std::io;
-
-#[cfg(not(linux))]
 use std::os::fd::RawFd;
 
 mod accept;
@@ -48,6 +46,7 @@ pub use fsync::*;
 pub use linkat::*;
 pub use listen::*;
 #[cfg(linux)]
+#[allow(unused_imports)]
 pub(crate) use nop::*;
 pub use openat::*;
 pub use read::*;
@@ -92,20 +91,15 @@ pub trait Operation: Sealed {
   #[cfg(linux)]
   fn create_entry(&mut self) -> io_uring::squeue::Entry;
 
-  #[cfg(not(linux))]
   const IS_CONNECT: bool = false;
 
-  #[cfg(not(linux))]
   const EVENT_TYPE: Option<EventType> = None;
 
-  #[cfg(not(linux))]
   fn fd(&self) -> Option<RawFd>;
 
-  #[cfg(not(linux))]
   fn run_blocking(&self) -> io::Result<i32>;
 }
 
-#[cfg(not(linux))]
 #[derive(Debug)]
 pub enum EventType {
   Read,

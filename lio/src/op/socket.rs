@@ -197,12 +197,10 @@ impl Operation for Socket {
   #[cfg(not(linux))]
   const EVENT_TYPE: Option<EventType> = None;
 
-  #[cfg(not(linux))]
   fn fd(&self) -> Option<RawFd> {
     None
   }
 
-  #[cfg(not(linux))]
   fn run_blocking(&self) -> io::Result<i32> {
     // Path 1: Platforms with SOCK_CLOEXEC support (atomic CLOEXEC flag)
     #[cfg(any(

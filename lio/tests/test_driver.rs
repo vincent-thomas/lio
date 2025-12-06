@@ -1,4 +1,3 @@
-#![cfg(feature = "high")]
 #[test]
 fn test_driver() {
   lio::init();

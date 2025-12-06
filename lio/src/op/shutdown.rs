@@ -1,4 +1,5 @@
-use std::{io, os::fd::RawFd};
+use std::io;
+use std::os::fd::RawFd;
 
 #[cfg(linux)]
 use io_uring::types::Fd;
@@ -34,7 +35,6 @@ impl Operation for Shutdown {
   // NOTE: Not sure here, kqueue can prob be used with flags.
   impl_no_readyness!();
 
-  #[cfg(not(linux))]
   fn run_blocking(&self) -> io::Result<i32> {
     syscall!(shutdown(self.fd, self.how))
   }

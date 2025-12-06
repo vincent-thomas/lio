@@ -41,12 +41,10 @@ impl Operation for Write {
   #[cfg(not(linux))]
   const EVENT_TYPE: Option<EventType> = None;
 
-  #[cfg(not(linux))]
   fn fd(&self) -> Option<RawFd> {
     None
   }
 
-  #[cfg(not(linux))]
   fn run_blocking(&self) -> std::io::Result<i32> {
     syscall!(pwrite(
       self.fd,

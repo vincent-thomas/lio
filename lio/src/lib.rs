@@ -518,8 +518,6 @@ pub fn exit() {
   Driver::exit()
 }
 
-// #[cfg(any(loom, test))]
-#[doc(hidden)]
 pub fn init() {
   Driver::init();
 }
