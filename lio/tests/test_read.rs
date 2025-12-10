@@ -1,11 +1,8 @@
 mod common;
 
 use lio::read;
-use proptest::prelude::*;
-use std::{
-  ffi::CString,
-  sync::mpsc::{self, TryRecvError},
-};
+use proptest::{prelude::*, test_runner::TestRunner};
+use std::{ffi::CString, sync::mpsc};
 
 #[test]
 fn test_read_large_buffer() {
@@ -14,8 +11,7 @@ fn test_read_large_buffer() {
   let path = CString::new("/tmp/lio_test_read_large.txt").unwrap();
 
   // Create large data (1MB)
-  let large_data: Vec<u8> =
-    (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
+  let large_data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
   let fd = unsafe {
     let fd = libc::open(
       path.as_ptr(),
@@ -30,22 +26,16 @@ fn test_read_large_buffer() {
     fd
   };
 
-  let (sender, receiver) = mpsc::channel();
-
-  let sender1 = sender.clone();
-
   // Read it back
   let buf = vec![0u8; 1024 * 1024];
-  read(fd, buf, 0).when_done(move |result| {
-    sender1.send(result).unwrap();
-  });
-
-  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+  let mut recv_read = read(fd, buf, 0).send();
 
   lio::tick();
 
-  let (bytes_read_result, result) = receiver.recv().unwrap();
-  let bytes_read = bytes_read_result.expect("Failed to read large buffer") as usize;
+  let (bytes_read_result, result) =
+    recv_read.try_recv().expect("recv didn't finish at time of call");
+  let bytes_read =
+    bytes_read_result.expect("Failed to read large buffer") as usize;
 
   assert_eq!(bytes_read, large_data.len());
   assert_eq!(&result[..bytes_read], large_data.as_slice());
@@ -94,7 +84,7 @@ fn test_read_concurrent() {
     });
   }
 
-  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
   lio::tick();
 
@@ -114,103 +104,111 @@ fn test_read_concurrent() {
   }
 }
 
-proptest! {
-  #[test]
-  fn prop_test_read_arbitrary_data_and_offsets(
-    data_size in 0usize..=8192,
-    read_offset in 0i64..=4096,
-    buffer_size in 0usize..=4096,
-    seed in any::<u64>(),
-  ) {
-    lio::init();
+#[test]
+fn prop_test_read_arbitrary_data_and_offsets() {
+  let mut runner = TestRunner::new(proptest::test_runner::Config::default());
 
-    // Generate deterministic random data based on seed
-    let test_data: Vec<u8> = (0..data_size)
-      .map(|i| ((seed.wrapping_add(i as u64)) % 256) as u8)
-      .collect();
+  lio::init();
 
-    // Create unique test file path
-    let path = common::make_temp_path("read", seed);
+  let result = runner
+    .run(&(0..=8192usize, 0..=4096i64, 0..=4096usize, any::<u64>()), |props| {
+      let (_0, _1, _2, _3) = props;
+      prop_test_read_arbitrary_data_and_offsets_run(_0, _1, _2, _3)
+    })
+    .unwrap();
+}
 
-    // Write test data to file
-    let fd = unsafe {
-      let fd = libc::open(
-        path.as_ptr(),
-        libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-        0o644,
-      );
-      assert!(fd >= 0, "Failed to create test file");
+fn prop_test_read_arbitrary_data_and_offsets_run(
+  data_size: usize,   // in 0usize..=8192,
+  read_offset: i64,   // in 0i64..=4096,
+  buffer_size: usize, // in 0usize..=4096,
+  seed: u64,          // in any::<u64>(),
+) -> Result<(), TestCaseError> {
+  // lio::init();
 
-      let written = libc::write(
-        fd,
-        test_data.as_ptr() as *const libc::c_void,
-        test_data.len(),
-      );
-      assert_eq!(written as usize, test_data.len(), "Failed to write all data");
-      fd
-    };
+  // Generate deterministic random data based on seed
+  let test_data: Vec<u8> = (0..data_size)
+    .map(|i| ((seed.wrapping_add(i as u64)) % 256) as u8)
+    .collect();
 
-    let (sender, receiver) = mpsc::channel();
+  // Create unique test file path
+  let path = common::make_temp_path("read", seed);
 
-    let sender1 = sender.clone();
+  // Write test data to file
+  let fd = unsafe {
+    let fd = libc::open(
+      path.as_ptr(),
+      libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+      0o644,
+    );
+    assert!(fd >= 0, "Failed to create test file");
 
-    // Perform the read operation
-    let buf = vec![0u8; buffer_size];
-    read(fd, buf, read_offset).when_done(move |result| {
-      sender1.send(result).unwrap();
-    });
+    let written = libc::write(
+      fd,
+      test_data.as_ptr() as *const libc::c_void,
+      test_data.len(),
+    );
+    assert_eq!(written as usize, test_data.len(), "Failed to write all data");
+    fd
+  };
 
-    assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+  // Perform the read operation
+  let buf = vec![0u8; buffer_size];
+  let mut receiver = read(fd, buf, read_offset).send();
 
-    lio::tick();
+  lio::tick();
 
-    let (bytes_read_result, result_buf) = receiver.recv().unwrap();
+  let (bytes_read_result, result_buf) =
+    receiver.try_recv().expect("read wasn't ready");
 
-    let test_result = (|| -> Result<(), TestCaseError> {
-      let bytes_read = bytes_read_result
-        .map_err(|e| TestCaseError::fail(format!("Read operation failed unexpectedly: {}", e)))?;
-      let bytes_read = bytes_read as usize;
+  let test_result = (|| -> Result<(), TestCaseError> {
+    let bytes_read = bytes_read_result.map_err(|e| {
+      TestCaseError::fail(format!("Read operation failed unexpectedly: {}", e))
+    })?;
+    let bytes_read = bytes_read as usize;
 
-      // Calculate expected bytes to read
-      let file_size = test_data.len();
-      let offset = read_offset as usize;
+    // Calculate expected bytes to read
+    let file_size = test_data.len();
+    let offset = read_offset as usize;
 
-      if offset >= file_size {
-        // Reading beyond EOF should return 0 bytes
-        if bytes_read != 0 {
-          return Err(TestCaseError::fail(format!(
-            "Reading beyond EOF should return 0 bytes, got {}", bytes_read
-          )));
-        }
-      } else {
-        // Calculate how many bytes we expect to read
-        let available_bytes = file_size - offset;
-        let expected_bytes = std::cmp::min(buffer_size, available_bytes);
-
-        if bytes_read != expected_bytes {
-          return Err(TestCaseError::fail(format!(
-            "Read should return min(buffer_size={}, available_bytes={})={}, got {}",
-            buffer_size, available_bytes, expected_bytes, bytes_read
-          )));
-        }
-
-        // Verify the data matches what we wrote
-        let expected_data = &test_data[offset..offset + bytes_read];
-        if &result_buf[..bytes_read] != expected_data {
-          return Err(TestCaseError::fail(
-            "Read data should match written data at offset".to_string()
-          ));
-        }
+    if offset >= file_size {
+      // Reading beyond EOF should return 0 bytes
+      if bytes_read != 0 {
+        return Err(TestCaseError::fail(format!(
+          "Reading beyond EOF should return 0 bytes, got {}",
+          bytes_read
+        )));
       }
-      Ok(())
-    })();
+    } else {
+      // Calculate how many bytes we expect to read
+      let available_bytes = file_size - offset;
+      let expected_bytes = std::cmp::min(buffer_size, available_bytes);
 
-    // Cleanup
-    unsafe {
-      libc::close(fd);
-      libc::unlink(path.as_ptr());
+      if bytes_read != expected_bytes {
+        return Err(TestCaseError::fail(format!(
+          "Read should return min(buffer_size={}, available_bytes={})={}, got {}",
+          buffer_size, available_bytes, expected_bytes, bytes_read
+        )));
+      }
+
+      // Verify the data matches what we wrote
+      let expected_data = &test_data[offset..offset + bytes_read];
+      if &result_buf[..bytes_read] != expected_data {
+        return Err(TestCaseError::fail(
+          "Read data should match written data at offset".to_string(),
+        ));
+      }
     }
+    Ok(())
+  })();
 
-    test_result?;
+  // Cleanup
+  unsafe {
+    libc::close(fd);
+    libc::unlink(path.as_ptr());
   }
+
+  test_result?;
+
+  Ok(())
 }

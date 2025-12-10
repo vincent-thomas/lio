@@ -263,6 +263,16 @@ impl<T: op::Operation> OperationProgress<T> {
     }
   }
 
+  pub fn send_with(self, sender: mpsc::Sender<T::Result>)
+  where
+    T::Result: Send,
+    T: Send + 'static,
+  {
+    self.when_done(move |res| {
+      let _ = sender.send(res);
+    });
+  }
+
   /// Convert the operation into a channel receiver.
   ///
   /// Returns a oneshot receiver that will receive the operation result when complete.
@@ -287,13 +297,10 @@ impl<T: op::Operation> OperationProgress<T> {
     T: Send + 'static,
   {
     let (sender, receiver) = mpsc::channel();
-    let blocking_receiver = BlockingReceiver { recv: Some(receiver) };
 
-    self.when_done(move |res| {
-      let _ = sender.send(res);
-    });
+    self.send_with(sender);
 
-    blocking_receiver
+    BlockingReceiver { recv: Some(receiver) }
   }
 
   /// Block the current thread until the operation completes and return the result.

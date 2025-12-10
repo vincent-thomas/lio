@@ -1,6 +1,9 @@
-# Liten
+# `lio`
 
-An async runtime for Rust, designed to be performant, minimal and simple.
+A fast low-level, non-blocking using ready-ness/completion os APIs depending on platform.
+
+
+<!-- An async runtime for Rust, designed to be performant, minimal and simple. -->
 
 # Motivation
 
@@ -19,4 +22,4 @@ I wanted to see how an async runtime worked in rust, so i created my own. I want
 
 # LICENSE
 
-The project is licensed under the [MIT License](https://opensource.org/license/mit).
+The project is licensed under the [MIT License](https://opensource.org/license/mit).mittest

@@ -70,6 +70,7 @@
 
 #[cfg(feature = "unstable_ffi")]
 pub mod ffi;
+mod sync;
 use std::{
   ffi::{CString, NulError},
   net::SocketAddr,
@@ -100,7 +101,7 @@ pub use backends::IoBackend;
 
 pub use op_progress::OperationProgress;
 
-use crate::driver::Driver;
+use crate::driver::{AlreadyExists, Driver};
 use std::path::Path;
 
 macro_rules! impl_op {
@@ -518,6 +519,10 @@ pub fn exit() {
   Driver::exit()
 }
 
+pub fn try_init() -> Result<(), AlreadyExists> {
+  Driver::try_init()
+}
+
 pub fn init() {
-  Driver::init();
+  Driver::try_init().expect("lio is already initialised.");
 }

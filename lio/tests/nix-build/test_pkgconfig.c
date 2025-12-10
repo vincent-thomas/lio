@@ -10,6 +10,8 @@ void call(int32_t verynice) {
 int main() {
     printf("Testing lio library via pkg-config\n");
 
+    lio_init();
+
     // Initialize lio runtime
     // struct lio_runtime *runtime = lio_runtime_new();
     lio_close(2, call);

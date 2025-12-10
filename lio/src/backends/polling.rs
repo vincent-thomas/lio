@@ -1,8 +1,7 @@
+use crate::sync::Mutex;
 use std::io::ErrorKind;
 use std::os::fd::BorrowedFd;
 use std::{collections::HashMap, io, os::fd::RawFd};
-
-use parking_lot::Mutex;
 
 use crate::op_registration::ExtractedOpNotification;
 
@@ -29,22 +28,18 @@ impl IoBackend for Polling {
         res: Some(op.run_blocking()),
         operation: op,
       };
-
-      // return self.inner_io.submit(op, store);
     };
 
     if !O::IS_CONNECT {
       return self.new_polling(op, store);
     };
 
-    println!("is connect");
-
     let result = op.run_blocking();
 
-    if dbg!(result.as_ref())
+    if result
+      .as_ref()
       .is_err_and(|err| err.raw_os_error() == Some(libc::EINPROGRESS))
     {
-      dbg!("nice");
       self.new_polling(op, store)
     } else {
       OperationProgress::<O>::new_from_result(op, result)
@@ -54,14 +49,10 @@ impl IoBackend for Polling {
     self.inner.notify().unwrap();
   }
   fn tick(&self, store: &OpStore, can_wait: bool) {
-    // self.inner_io.tick(store, can_wait);
-
     let events =
       self.interest_wait(can_wait).expect("background thread failed");
 
     for event in events.iter() {
-      use std::io;
-
       let operation_id = event.key as u64;
 
       // Look up fd from our internal map
@@ -163,7 +154,10 @@ impl Polling {
       match err.kind() {
         // If a interest already exists. Expected if multiple accept calls
         // to the same fd is called.
-        ErrorKind::AlreadyExists => return Ok(()),
+        ErrorKind::AlreadyExists => {
+          println!("fd: {fd} already has interest");
+          return Ok(());
+        }
         _ => return Err(err),
       };
     };

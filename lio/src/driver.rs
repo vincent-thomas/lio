@@ -3,8 +3,10 @@ use crate::backends::{self, IoBackend};
 use crate::op::Operation;
 #[cfg(feature = "high")]
 use crate::op_registration::TryExtractOutcome;
+use crate::sync::Mutex;
 
-use parking_lot::Mutex;
+use thiserror::Error;
+
 #[cfg(feature = "high")]
 use std::task::Waker;
 use std::{
@@ -71,8 +73,12 @@ pub(crate) struct Driver<Io = Default> {
 
 static DRIVER: AtomicPtr<Driver> = AtomicPtr::new(std::ptr::null_mut());
 
+#[derive(Error, Debug)]
+#[error("lio is already initalised")]
+pub struct AlreadyExists;
+
 impl Driver {
-  pub(crate) fn init() {
+  pub(crate) fn try_init() -> Result<(), AlreadyExists> {
     // Check if already initialized
     let current = DRIVER.load(Ordering::Acquire);
     if !current.is_null() {
@@ -95,13 +101,13 @@ impl Driver {
       Ordering::AcqRel,
       Ordering::Acquire,
     ) {
-      Ok(_) => {}
+      Ok(_) => Ok(()),
       Err(_) => {
         // Another thread initialized first, clean up our allocation
         unsafe {
           let _ = Box::from_raw(driver_ptr);
         }
-        panic!("Driver already initialized (race condition).");
+        Err(AlreadyExists)
       }
     }
   }

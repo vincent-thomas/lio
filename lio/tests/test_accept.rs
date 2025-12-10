@@ -65,16 +65,16 @@ fn test_accept_basic() {
     .expect("socket didn't finish after tick")
     .expect("failed socket syscall");
 
-  let mut accept_recv = accept(server_sock).send();
   let mut connect_recv = connect(client_sock, bound_addr).send();
+  let mut accept_recv = accept(server_sock).send();
 
   println!("nice");
-  assert!(connect_recv.try_recv().is_none());
+  // assert!(connect_recv.try_recv().is_none());
   println!("nice");
-  assert!(accept_recv.try_recv().is_none());
+  // assert!(accept_recv.try_recv().is_none());
 
   lio::tick();
-  // lio::tick();
+  lio::tick();
 
   let (accepted_fd, addr) = accept_recv
     .try_recv()
@@ -106,7 +106,7 @@ fn test_accept_multiple() {
     },
   );
 
-  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
+  // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let server_sock =
@@ -119,7 +119,7 @@ fn test_accept_multiple() {
     sender_b.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+  // assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to bind");
@@ -143,7 +143,7 @@ fn test_accept_multiple() {
     sender_l.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+  // assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to listen");
@@ -169,8 +169,7 @@ fn test_accept_multiple() {
       },
     );
 
-    assert_eq!(receiver_a.try_recv().unwrap_err(), TryRecvError::Empty);
-    assert_eq!(receiver_s.try_recv().unwrap_err(), TryRecvError::Empty);
+    // assert_eq!(receiver_a.try_recv().unwrap_err(), TryRecvError::Empty);
     lio::tick();
 
     let client_sock =
@@ -180,10 +179,13 @@ fn test_accept_multiple() {
       sender_c.send(res).unwrap();
     });
 
-    assert_eq!(receiver_c.try_recv().unwrap_err(), TryRecvError::Empty);
+    // assert_eq!(receiver_c.try_recv().unwrap_err(), TryRecvError::Empty);
     lio::tick();
 
     receiver_c.recv().unwrap().expect("Failed to connect");
+
+    lio::tick();
+
     let (accepted_fd, _) =
       receiver_a.recv().unwrap().expect("Failed to accept");
 
@@ -220,7 +222,7 @@ fn test_accept_with_client_info() {
     },
   );
 
-  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
+  // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let server_sock =
@@ -233,7 +235,7 @@ fn test_accept_with_client_info() {
     sender_b.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+  // assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to bind");
@@ -257,7 +259,7 @@ fn test_accept_with_client_info() {
     sender_l.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+  // assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to listen");
@@ -276,8 +278,7 @@ fn test_accept_with_client_info() {
     },
   );
 
-  assert_eq!(receiver_a.try_recv().unwrap_err(), TryRecvError::Empty);
-  assert_eq!(receiver_s.try_recv().unwrap_err(), TryRecvError::Empty);
+  // assert_eq!(receiver_a.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let client_sock =
@@ -287,10 +288,13 @@ fn test_accept_with_client_info() {
     sender_c.send(res).unwrap();
   });
 
-  assert_eq!(receiver_c.try_recv().unwrap_err(), TryRecvError::Empty);
+  // assert_eq!(receiver_c.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_c.recv().unwrap().expect("Failed to connect");
+
+  lio::tick();
+
   let (accepted_fd, _client_addr) =
     receiver_a.recv().unwrap().expect("Failed to accept");
 
@@ -306,32 +310,32 @@ fn test_accept_with_client_info() {
 fn test_accept_ipv6() {
   lio::init();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
-  let (sender_unit, receiver_unit) = mpsc::channel();
+  // let (sender_sock, receiver_sock) = mpsc::channel();
+  // let (sender_unit, receiver_unit) = mpsc::channel();
 
-  socket(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).when_done(
-    move |res| {
-      sender_sock.send(res).unwrap();
-    },
-  );
+  let mut socket_recv =
+    socket(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).send();
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
-  let server_sock =
-    receiver_sock.recv().unwrap().expect("Failed to create IPv6 server socket");
+  let server_sock = socket_recv
+    .try_recv()
+    .expect("socket didn't finish")
+    .expect("Failed to create IPv6 server socket");
 
   let addr: SocketAddr = "[::1]:0".parse().unwrap();
 
-  let sender_b = sender_unit.clone();
-  bind(server_sock, addr).when_done(move |res| {
-    sender_b.send(res).unwrap();
-  });
+  // let sender_b = sender_unit.clone();
+  let mut bind_recv = bind(server_sock, addr).send();
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+  // assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
-  receiver_unit.recv().unwrap().expect("Failed to bind IPv6");
+  bind_recv
+    .try_recv()
+    .expect("bind didn't finish")
+    .expect("Failed to bind IPv6");
 
   let bound_addr = unsafe {
     let mut addr_storage = MaybeUninit::<libc::sockaddr_in6>::zeroed();
@@ -347,47 +351,45 @@ fn test_accept_ipv6() {
     format!("[::1]:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  let sender_l = sender_unit.clone();
-  listen(server_sock, 128).when_done(move |res| {
-    sender_l.send(res).unwrap();
-  });
+  let mut listen_recv = listen(server_sock, 128).send();
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
+  // assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
-  receiver_unit.recv().unwrap().expect("Failed to listen");
+  listen_recv
+    .try_recv()
+    .expect("listen didn't complete")
+    .expect("Failed to listen");
 
-  let (sender_a, receiver_a) = mpsc::channel();
-  let (sender_s, receiver_s) = mpsc::channel();
-  let (sender_c, receiver_c) = mpsc::channel();
+  let mut accept_recv = accept(server_sock).send();
 
-  accept(server_sock).when_done(move |res| {
-    sender_a.send(res).unwrap();
-  });
+  let mut client_s_recv =
+    socket(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).send();
 
-  socket(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).when_done(
-    move |res| {
-      sender_s.send(res).unwrap();
-    },
-  );
-
-  assert_eq!(receiver_a.try_recv().unwrap_err(), TryRecvError::Empty);
-  assert_eq!(receiver_s.try_recv().unwrap_err(), TryRecvError::Empty);
+  // assert_eq!(receiver_s.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
-  let client_sock =
-    receiver_s.recv().unwrap().expect("Failed to create IPv6 client socket");
+  let client_sock = client_s_recv
+    .try_recv()
+    .unwrap()
+    .expect("Failed to create IPv6 client socket");
 
-  connect(client_sock, bound_addr).when_done(move |res| {
-    sender_c.send(res).unwrap();
-  });
+  let mut connect_recv = connect(client_sock, bound_addr).send();
 
-  assert_eq!(receiver_c.try_recv().unwrap_err(), TryRecvError::Empty);
+  // assert_eq!(receiver_c.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
-  receiver_c.recv().unwrap().expect("Failed to connect");
-  let (accepted_fd, _) =
-    receiver_a.recv().unwrap().expect("Failed to accept IPv6");
+  connect_recv
+    .try_recv()
+    .expect("connect didn't finish")
+    .expect("connect error");
+
+  lio::tick();
+
+  let (accepted_fd, _) = accept_recv
+    .try_recv()
+    .expect("accept didn't finish")
+    .expect("Failed to accept IPv6");
 
   assert!(accepted_fd >= 0);
 

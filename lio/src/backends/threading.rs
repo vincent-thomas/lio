@@ -6,7 +6,7 @@ use std::{
   thread::{self, JoinHandle},
 };
 
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 
 use crate::{
   OperationProgress, backends::IoBackend, driver::OpStore, op::Operation,
