@@ -26,7 +26,7 @@ pkgs.rustPlatform.buildRustPackage {
 
   buildPhase = ''
     runHook preBuild
-    make lio-cbuild
+    make cbuild
     runHook postBuild
   '';
 

@@ -28,6 +28,7 @@
 //! ```rust
 //! # #![cfg(feature = "high")]
 //! use std::os::fd::RawFd;
+//! use std::io;
 //!
 //! fn handle_result(result: std::io::Result<i32>, buf: Vec<u8>) {
 //!   println!("result: {result:?}, buf: {buf:?}");
@@ -42,8 +43,8 @@
 //!     handle_result(result, buf);
 //!
 //!     // Channel API (on "high" feature flag).
-//!     let receiver: oneshot::Receiver<(std::io::Result<i32>, Vec<u8>)> = lio::write(fd, data.clone(), 0).get_receiver();
-//!     let (result, buf) = receiver.recv().unwrap();
+//!     let receiver: lio::BlockingReceiver<(io::Result<i32>, Vec<u8>)> = lio::write(fd, data.clone(), 0).send();
+//!     let (result, buf) = receiver.recv();
 //!     handle_result(result, buf);
 //!
 //!     // Callback API.
@@ -99,7 +100,7 @@ mod op_registration;
 mod backends;
 pub use backends::IoBackend;
 
-pub use op_progress::OperationProgress;
+pub use op_progress::{BlockingReceiver, OperationProgress};
 
 use crate::driver::{AlreadyExists, Driver};
 use std::path::Path;
