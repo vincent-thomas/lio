@@ -7,6 +7,7 @@
 #include <lio.h>
 
 void write_callback(int result, uint8_t *buf, size_t buf_len) {
+    lio_init();
     if (result < 0) {
         fprintf(stderr, "Write failed with error: %d\n", result);
     } else {

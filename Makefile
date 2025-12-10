@@ -4,17 +4,15 @@ doc:
 	cargo test --doc
 	RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --no-deps --all-features
 
-lio-cbuild:
+cbuild:
 	cargo rustc -p lio --crate-type dylib --features unstable_ffi --release
 	cbindgen --crate lio --output lio/include/lio.h --cpp-compat &> /dev/null
 	echo "lio: built c api at: $(pwd)/target/release/liblio.(dylib|so|dll)"
 
-lio-test:
+test:
 	cargo nextest r --release -p lio --all-features
 	./lio/tests/ffi/test.sh
 	./lio/tests/nix-build/test.sh
-
-test: lio-test
 
 check-flags:
 	cargo hack check --feature-powerset --lib --tests
