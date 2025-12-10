@@ -76,6 +76,7 @@ use std::{
   ffi::{CString, NulError},
   net::SocketAddr,
   os::fd::RawFd,
+  sync::mpsc,
 };
 
 /// Result type for operations that return both a result and a buffer.
