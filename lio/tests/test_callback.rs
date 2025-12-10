@@ -23,12 +23,14 @@ fn test_callback_basic_read() {
   };
 
   // Use callback instead of awaiting
-  let (tx, rx) = sync_channel(1);
+  let (tx, rx) = channel();
 
   let buf = vec![0u8; 100];
   read(fd, buf, 0).when_done(move |(bytes_read, buffer)| {
     tx.send((bytes_read, buffer)).unwrap();
   });
+
+  lio::tick();
 
   // Wait for callback to execute
   let (bytes_read, buffer) = rx
@@ -60,13 +62,14 @@ fn test_callback_basic_write() {
     )
   };
 
-  let (tx, rx) = sync_channel(1);
+  let (tx, rx) = channel();
 
   write(fd, test_data.to_vec(), 0).when_done(
     move |(bytes_written, _buffer)| {
       tx.send(bytes_written).unwrap();
     },
   );
+  lio::tick();
 
   // Wait for callback to execute
   let bytes_written = rx
@@ -95,13 +98,14 @@ fn test_callback_error_handling() {
   lio::init();
   // Try to read from an invalid fd
   let invalid_fd = -1;
-  let (tx, rx) = sync_channel(1);
+  let (tx, rx) = channel();
 
   let buf = vec![0u8; 100];
   read(invalid_fd, buf, 0).when_done(move |(bytes_read, _buffer)| {
     tx.send(bytes_read).unwrap();
   });
 
+  lio::tick();
   // Wait for callback to execute
   let bytes_read = rx
     .recv_timeout(Duration::from_secs(5))
@@ -154,6 +158,7 @@ fn test_callback_concurrent() {
 
       tx_clone.send(i).unwrap();
     });
+    lio::tick();
   }
 
   // Drop the original sender so we can check when all are done
@@ -194,6 +199,7 @@ fn test_callback_vs_future_mutually_exclusive() {
   progress.when_done(move |(bytes_read, buffer)| {
     tx.send((bytes_read, buffer)).unwrap();
   });
+  lio::tick();
 
   // At this point, we can't poll the future because when_done took ownership
 
@@ -236,6 +242,7 @@ fn test_callback_with_detach() {
     // Just mark as invoked, don't care about result
     tx.send(()).unwrap();
   });
+  lio::tick();
 
   // Wait for callback
   rx.recv_timeout(Duration::from_secs(5))
@@ -276,6 +283,7 @@ fn test_callback_preserves_buffer_ownership() {
     tx.send(buffer).unwrap();
   });
 
+  lio::tick();
   // Wait for callback
   let buffer =
     rx.recv_timeout(Duration::from_secs(5)).expect("Buffer should be received");

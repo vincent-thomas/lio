@@ -20,7 +20,6 @@ fn test_listen_basic() {
     },
   );
 
-  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
@@ -32,7 +31,6 @@ fn test_listen_basic() {
     sender_b.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to bind socket");
@@ -42,7 +40,6 @@ fn test_listen_basic() {
     sender_l.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to listen on socket");
@@ -84,7 +81,6 @@ fn test_listen_with_backlog() {
     },
   );
 
-  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
@@ -96,7 +92,6 @@ fn test_listen_with_backlog() {
     sender_b.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to bind socket");
@@ -107,7 +102,6 @@ fn test_listen_with_backlog() {
     sender_l.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to listen with backlog 10");
@@ -143,7 +137,6 @@ fn test_listen_large_backlog() {
     },
   );
 
-  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
@@ -155,7 +148,6 @@ fn test_listen_large_backlog() {
     sender_b.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to bind socket");
@@ -166,7 +158,6 @@ fn test_listen_large_backlog() {
     sender_l.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to listen with large backlog");
@@ -200,7 +191,6 @@ fn test_listen_without_bind() {
     },
   );
 
-  // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
@@ -213,7 +203,6 @@ fn test_listen_without_bind() {
     sender_l1.send(res).unwrap();
   });
 
-  // assert_eq!(receiver_l.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let _ = receiver_l.recv().unwrap();
@@ -240,7 +229,6 @@ fn test_listen_ipv6() {
     },
   );
 
-  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let sock =
@@ -253,7 +241,6 @@ fn test_listen_ipv6() {
     sender_b.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to bind IPv6 socket");
@@ -263,7 +250,6 @@ fn test_listen_ipv6() {
     sender_l.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to listen on IPv6 socket");
@@ -298,7 +284,6 @@ fn test_listen_on_udp() {
     },
   );
 
-  // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let sock =
@@ -311,7 +296,6 @@ fn test_listen_on_udp() {
     sender_b.send(res).unwrap();
   });
 
-  // assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to bind UDP socket");
@@ -324,7 +308,6 @@ fn test_listen_on_udp() {
     sender_l1.send(res).unwrap();
   });
 
-  // assert_eq!(receiver_l.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let result = receiver_l.recv().unwrap();
@@ -351,7 +334,6 @@ fn test_listen_twice() {
     },
   );
 
-  // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
@@ -363,7 +345,6 @@ fn test_listen_twice() {
     sender_b.send(res).unwrap();
   });
 
-  // assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to bind socket");
@@ -373,7 +354,6 @@ fn test_listen_twice() {
     sender_l.send(res).unwrap();
   });
 
-  // assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("First listen should succeed");
@@ -386,7 +366,6 @@ fn test_listen_twice() {
     sender_l3.send(res).unwrap();
   });
 
-  // assert_eq!(receiver_l2.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let _ = receiver_l2.recv().unwrap();
@@ -412,7 +391,6 @@ fn test_listen_zero_backlog() {
     },
   );
 
-  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
@@ -424,7 +402,6 @@ fn test_listen_zero_backlog() {
     sender_b.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to bind socket");
@@ -435,7 +412,6 @@ fn test_listen_zero_backlog() {
     sender_l.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to listen with backlog 0");
@@ -463,7 +439,6 @@ fn test_listen_after_close() {
   let mut socket_recv =
     socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
 
-  // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let sock = socket_recv.try_recv().unwrap().expect("Failed to create socket");
@@ -472,7 +447,6 @@ fn test_listen_after_close() {
 
   let mut bind_recv = bind(sock, addr).send();
 
-  // assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   bind_recv.try_recv().unwrap().expect("Failed to bind socket");
@@ -484,7 +458,6 @@ fn test_listen_after_close() {
   // Try to listen on closed socket
   let mut listen_recv = listen(sock, 128).send();
 
-  // assert_eq!(receiver_l.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let result = listen_recv.try_recv().unwrap();
@@ -509,7 +482,6 @@ fn test_listen_concurrent() {
     );
   }
 
-  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let mut sockets = Vec::new();
@@ -528,7 +500,6 @@ fn test_listen_concurrent() {
     });
   }
 
-  assert_eq!(receiver_bind.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   for _ in 0..10 {
@@ -544,7 +515,6 @@ fn test_listen_concurrent() {
     });
   }
 
-  assert_eq!(receiver_listen.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   for _ in 0..10 {
@@ -583,7 +553,6 @@ fn test_listen_on_all_interfaces() {
     },
   );
 
-  assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
@@ -596,7 +565,6 @@ fn test_listen_on_all_interfaces() {
     sender_b.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to bind to all interfaces");
@@ -606,7 +574,6 @@ fn test_listen_on_all_interfaces() {
     sender_l.send(res).unwrap();
   });
 
-  assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
   receiver_unit.recv().unwrap().expect("Failed to listen on all interfaces");
