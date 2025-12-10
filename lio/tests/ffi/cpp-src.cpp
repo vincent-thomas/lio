@@ -10,6 +10,7 @@ void test_callback(int32_t result) {
 }
 
 int main() {
+    lio_init();
     lio_close(999, test_callback);
     sleep(1);
     return 0;

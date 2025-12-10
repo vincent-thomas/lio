@@ -37,6 +37,19 @@ use std::ptr;
 
 use crate::op::net_utils::{self, sockaddr_to_socketaddr};
 
+#[unsafe(no_mangle)]
+pub extern "C" fn lio_init() {
+  crate::init()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lio_try_init() -> libc::c_int {
+  match crate::try_init() {
+    Ok(_) => 0,
+    Err(_) => -1,
+  }
+}
+
 /// Shut down part of a full-duplex connection.
 ///
 /// # Parameters

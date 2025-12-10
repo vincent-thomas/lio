@@ -1,7 +1,8 @@
 use super::{IoBackend, OpStore};
 use crate::op_registration::ExtractedOpNotification;
+use crate::sync::Mutex;
 use crate::{OperationProgress, op};
-use std::{io, sync::Mutex};
+use std::io;
 
 pub struct IoUring {
   inner: io_uring::IoUring,
