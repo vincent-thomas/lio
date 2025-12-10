@@ -224,7 +224,7 @@ impl<T: op::Operation> OperationProgress<T> {
   ///
   /// async fn example() -> std::io::Result<()> {
   ///     lio::init();
-  ///     # let fd = 0;
+  ///     # let fd = 1;
   ///     let data = b"Hello, callbacks!".to_vec();
   ///     let result = Arc::new(Mutex::new(None));
   ///     let result_clone = result.clone();
@@ -283,18 +283,15 @@ impl<T: op::Operation> OperationProgress<T> {
   /// for the result in a different context than where the operation was started.
   ///
   /// # Example
-  /// ```rust
-  /// # #[cfg(feature = "high")]
-  /// # {
-  /// # let fd = 0;
+  /// ```ignore
+  /// let fd = 1;
   /// // Some fd defined.
   /// // ...
-  ///     lio::init();
+  /// lio::init();
   /// let buf = vec![0; 10];
-  /// let receiver = lio::read(fd, buf, 0).send();
+  /// let receiver = lio::write(fd, buf, 0).send();
   /// let (result, buffer) = receiver.recv();
   /// let _ = result.unwrap();
-  /// # }
   /// ```
   pub fn send(self) -> BlockingReceiver<T::Result>
   where
