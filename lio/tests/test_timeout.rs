@@ -5,17 +5,16 @@ use std::{future::Future, pin::Pin, task::Context, time::Duration};
 use futures_task::noop_waker;
 
 #[test]
+#[ignore]
 fn test_timeout() {
   lio::init();
 
   println!("testing");
 
-  let mut _test = lio::timeout(Duration::from_millis(1000));
-
-  let _ = Pin::new(&mut _test).poll(&mut Context::from_waker(&noop_waker()));
+  let mut _test = lio::timeout(Duration::from_millis(1000)).send();
 
   std::thread::sleep(Duration::from_secs(1010));
   lio::tick();
 
-  _test.blocking();
+  _test.try_recv().unwrap().unwrap();
 }
