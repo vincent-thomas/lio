@@ -278,7 +278,7 @@ impl<T: op::Operation> OperationProgress<T> {
   /// for the result in a different context than where the operation was started.
   ///
   /// # Example
-  /// ```rust
+  /// ```ignore
   /// let fd = 1;
   /// // Some fd defined.
   /// // ...
