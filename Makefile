@@ -1,7 +1,7 @@
 lint: doc
 	cargo clippy --all-features
 doc:
-	cargo test --doc
+	RUST_BACKTRACE=1 cargo test --doc
 	RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --no-deps --all-features
 
 cbuild:
