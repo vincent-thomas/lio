@@ -278,13 +278,14 @@ impl<T: op::Operation> OperationProgress<T> {
   /// for the result in a different context than where the operation was started.
   ///
   /// # Example
-  /// ```ignore
+  /// ```rust
   /// let fd = 1;
   /// // Some fd defined.
   /// // ...
   /// lio::init();
   /// let buf = vec![0; 10];
   /// let receiver = lio::write(fd, buf, 0).send();
+  /// lio::tick();
   /// let (result, buffer) = receiver.recv();
   /// let _ = result.unwrap();
   /// ```
@@ -306,16 +307,16 @@ impl<T: op::Operation> OperationProgress<T> {
   ///
   /// # Example
   /// ```rust
-  /// # #[cfg(feature = "high")]
-  /// # {
   /// # let fd = 0;
   /// lio::init();
-  /// let result = lio::listen(fd, 128).blocking();
+  /// let receiver = lio::write(fd, vec![0u8; 10], 0).send();
+  /// lio::tick();
+  ///
+  /// let (result, buf) = receiver.recv();
   /// match result {
-  ///     Ok(()) => println!("success"),
-  ///     Err(e) => eprintln!("Error: {}", e),
+  ///     Ok(_) => println!("success"),
+  ///     Err(err) => eprintln!("Error: {}", err),
   /// }
-  /// # }
   /// ```
   pub fn blocking(self) -> T::Result
   where
