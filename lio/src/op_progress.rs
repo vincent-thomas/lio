@@ -83,6 +83,7 @@ impl<T> BlockingReceiver<T> {
 /// use std::os::fd::RawFd;
 ///
 /// async fn example() -> std::io::Result<()> {
+///     lio::init();
 ///     let fd: RawFd = 0; // stdin
 ///     let buffer = vec![0u8; 1024];
 ///     
@@ -190,6 +191,7 @@ impl<T: op::Operation> OperationProgress<T> {
   /// use std::sync::mpsc::channel;
   ///
   /// async fn example() -> std::io::Result<()> {
+  ///     lio::init();
   ///     # let fd = 0;
   ///     let buffer = vec![0u8; 1024];
   ///     let (tx, rx) = channel();
@@ -221,6 +223,7 @@ impl<T: op::Operation> OperationProgress<T> {
   /// use std::sync::{Arc, Mutex};
   ///
   /// async fn example() -> std::io::Result<()> {
+  ///     lio::init();
   ///     # let fd = 0;
   ///     let data = b"Hello, callbacks!".to_vec();
   ///     let result = Arc::new(Mutex::new(None));
@@ -286,9 +289,11 @@ impl<T: op::Operation> OperationProgress<T> {
   /// # let fd = 0;
   /// // Some fd defined.
   /// // ...
+  ///     lio::init();
   /// let buf = vec![0; 10];
-  /// let receiver = lio::read(fd, buf, 0).get_receiver();
-  /// let (result, buffer) = receiver.recv().unwrap();
+  /// let receiver = lio::read(fd, buf, 0).send();
+  /// let (result, buffer) = receiver.recv();
+  /// let _ = result.unwrap();
   /// # }
   /// ```
   pub fn send(self) -> BlockingReceiver<T::Result>
@@ -312,6 +317,7 @@ impl<T: op::Operation> OperationProgress<T> {
   /// # #[cfg(feature = "high")]
   /// # {
   /// # let fd = 0;
+  /// lio::init();
   /// let result = lio::listen(fd, 128).blocking();
   /// match result {
   ///     Ok(()) => println!("success"),

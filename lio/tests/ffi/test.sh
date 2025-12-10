@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 TARGET_DIR="$PROJECT_ROOT/target/release"
 
 # Build library
-make lio-cbuild
+make cbuild
 
 echo "lio C compilation successful"
 

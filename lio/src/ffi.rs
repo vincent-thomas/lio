@@ -3,7 +3,7 @@
 //! ## Compiling
 //! `lio` can be compiled using cargo with command:
 //! ```sh
-//! make lio-cbuild
+//! make cbuild
 //! ```
 //! `lio` dynamic library can be found at `target/release/liblio.{dylib,dll,so}`
 //!
