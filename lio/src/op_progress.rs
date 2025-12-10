@@ -1,6 +1,5 @@
 use crate::op::Operation;
 
-#[cfg(not(linux))]
 use std::io;
 #[cfg(not(linux))]
 use std::thread;
@@ -95,8 +94,6 @@ impl<T> BlockingReceiver<T> {
 /// }
 /// ```
 pub enum OperationProgress<T> {
-  #[cfg(not(linux))]
-  #[cfg_attr(docsrs, doc(cfg(not(linux))))]
   Poll {
     id: u64,
   },
@@ -113,8 +110,8 @@ pub enum OperationProgress<T> {
     _m: PhantomData<T>,
   },
 
-  #[cfg(not(linux))]
-  #[cfg_attr(docsrs, doc(cfg(not(linux))))]
+  // #[cfg(not(linux))]
+  // #[cfg_attr(docsrs, doc(cfg(not(linux))))]
   FromResult {
     res: Option<io::Result<i32>>,
     operation: T,
@@ -248,7 +245,6 @@ impl<T: op::Operation> OperationProgress<T> {
         Driver::get().set_callback::<T, F>(id, callback);
         std::mem::forget(self); // Prevent Drop from cancelling the operation
       }
-      #[cfg(not(linux))]
       OperationProgress::Poll { id, .. } => {
         Driver::get().set_callback::<T, F>(id, callback);
         std::mem::forget(self); // Prevent Drop from cancelling the operation
@@ -257,7 +253,6 @@ impl<T: op::Operation> OperationProgress<T> {
         Driver::get().set_callback::<T, F>(id, callback);
         std::mem::forget(self); // Prevent Drop from cancelling the operation
       }
-      #[cfg(not(linux))]
       OperationProgress::FromResult { ref mut res, ref mut operation } => {
         let res = res.take().expect("Blocking operation already consumed");
         let output = operation.result(res);
@@ -341,7 +336,6 @@ where
   }
 }
 
-#[cfg(not(linux))]
 impl<T> OperationProgress<T>
 where
   T: op::Operation,
@@ -406,10 +400,8 @@ where
     match *self {
       #[cfg(linux)]
       OperationProgress::IoUring { id, _m: _ } => check_done::<T>(id, cx),
-      #[cfg(not(linux))]
       OperationProgress::Poll { id } => check_done::<T>(id, cx),
       OperationProgress::Threaded { id, _m } => check_done::<T>(id, cx),
-      #[cfg(not(linux))]
       OperationProgress::FromResult { ref mut res, ref mut operation } => {
         let result = operation.result(res.take().expect("Already awaited."));
         Poll::Ready(result)
@@ -421,7 +413,6 @@ where
 impl<T> Drop for OperationProgress<T> {
   fn drop(&mut self) {
     match self {
-      #[cfg(not(linux))]
       OperationProgress::Poll { id: _, .. } => {
         // Driver::get().detach(*id);
       }
@@ -430,7 +421,6 @@ impl<T> Drop for OperationProgress<T> {
       OperationProgress::IoUring { id: _, _m, .. } => {
         // Driver::get().detach(*id);
       }
-      #[cfg(not(linux))]
       OperationProgress::FromResult { res: _, operation: _ } => {}
     }
   }

@@ -8,6 +8,7 @@ pub struct IoUring {
   inner: io_uring::IoUring,
   probe: io_uring::Probe,
   submission_guard: Mutex<()>,
+  polling: super::Polling,
 }
 
 impl IoUring {
@@ -19,7 +20,12 @@ impl IoUring {
       (io_uring, probe)
     };
 
-    Self { inner: io_uring, probe, submission_guard: Mutex::new(()) }
+    Self {
+      inner: io_uring,
+      probe,
+      submission_guard: Mutex::new(()),
+      polling: super::Polling::new(),
+    }
   }
   pub fn from_i32_to_io_result(res: i32) -> io::Result<i32> {
     if res < 0 { Err(io::Error::from_raw_os_error(res)) } else { Ok(res) }
@@ -55,7 +61,8 @@ impl IoBackend for IoUring {
       self.inner.submit().unwrap();
       OperationProgress::<T>::new_uring(operation_id)
     } else {
-      todo!();
+      self.polling.submit(op, store)
+      // todo!();
       // OperationProgress::<T>::new_blocking(op)
     }
   }
@@ -65,6 +72,8 @@ impl IoBackend for IoUring {
   }
 
   fn tick(&self, store: &OpStore, can_wait: bool) {
+    self.polling.tick(store, can_wait);
+
     self.inner.submit_and_wait(if can_wait { 1 } else { 0 }).unwrap();
 
     // SAFETY: lio guarrantees that only one tick impl is running at any time.
