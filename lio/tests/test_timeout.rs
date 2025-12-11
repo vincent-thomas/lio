@@ -2,8 +2,6 @@
 /// write in append mode is not tested since `pwrite` doesn't support it.
 use std::{future::Future, pin::Pin, task::Context, time::Duration};
 
-use futures_task::noop_waker;
-
 #[test]
 #[ignore]
 fn test_timeout() {
