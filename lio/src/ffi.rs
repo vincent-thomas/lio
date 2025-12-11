@@ -441,7 +441,7 @@ pub extern "C" fn lio_recv(
 /// # Parameters
 /// - `fd`: File descriptor to close
 /// - `callback(result)`: Called when complete
-///   - `result`: 0 on success, or negative errno on error
+/// - `result`: 0 on success, or negative errno on error
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_close(fd: libc::c_int, callback: extern "C" fn(i32)) {
   crate::close(fd).when_done(move |res| {
@@ -452,8 +452,6 @@ pub extern "C" fn lio_close(fd: libc::c_int, callback: extern "C" fn(i32)) {
     callback(result_code);
   });
 }
-
-// openat: TODO
 
 /// Shutdown the lio runtime and wait for all pending operations to complete.
 ///
