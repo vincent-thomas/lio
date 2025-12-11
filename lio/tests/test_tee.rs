@@ -143,7 +143,8 @@ fn test_tee_large_data() {
 
   lio::tick();
 
-  let bytes_copied = receiver.recv().unwrap().expect("Failed to tee large data");
+  let bytes_copied =
+    receiver.recv().unwrap().expect("Failed to tee large data");
 
   assert!(bytes_copied > 0);
   assert!(bytes_copied as usize <= test_data.len());
@@ -230,7 +231,8 @@ fn test_tee_partial() {
 
   lio::tick();
 
-  let bytes_copied = receiver.recv().unwrap().expect("Failed to tee partial data");
+  let bytes_copied =
+    receiver.recv().unwrap().expect("Failed to tee partial data");
   assert_eq!(bytes_copied, bytes_to_tee as i32);
 
   // Read from pipe2
@@ -389,7 +391,8 @@ fn test_tee_zero_size() {
 
   lio::tick();
 
-  let bytes_copied = receiver.recv().unwrap().expect("Tee with size 0 should succeed");
+  let bytes_copied =
+    receiver.recv().unwrap().expect("Tee with size 0 should succeed");
   assert_eq!(bytes_copied, 0);
 
   // Cleanup
@@ -487,22 +490,14 @@ fn test_tee_multiple() {
   // Verify data in pipe2
   let mut buf2 = vec![0u8; test_data.len()];
   unsafe {
-    libc::read(
-      pipe2_read,
-      buf2.as_mut_ptr() as *mut libc::c_void,
-      buf2.len(),
-    );
+    libc::read(pipe2_read, buf2.as_mut_ptr() as *mut libc::c_void, buf2.len());
   }
   assert_eq!(&buf2, test_data);
 
   // Verify data in pipe3
   let mut buf3 = vec![0u8; test_data.len()];
   unsafe {
-    libc::read(
-      pipe3_read,
-      buf3.as_mut_ptr() as *mut libc::c_void,
-      buf3.len(),
-    );
+    libc::read(pipe3_read, buf3.as_mut_ptr() as *mut libc::c_void, buf3.len());
   }
   assert_eq!(&buf3, test_data);
 

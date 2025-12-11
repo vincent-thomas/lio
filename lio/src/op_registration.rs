@@ -1,5 +1,5 @@
 // NOTE: OpRegistration should **NEVER** impl Sync.gg
-use std::io;
+use std::{io, ptr::NonNull};
 
 #[cfg(feature = "high")]
 use std::task::Waker;
@@ -50,15 +50,15 @@ pub struct OpRegistration {
   status: OpRegistrationStatus,
 
   // Fields common to both platforms
-  op: Option<*const ()>,
+  op: Option<NonNull<()>>,
   op_fn_drop: fn(*const ()), // Function to properly drop the operation
   op_fn_run_blocking: fn(*const ()) -> std::io::Result<i32>,
 }
 
 impl Drop for OpRegistration {
   fn drop(&mut self) {
-    if let Some(operation) = self.op {
-      (self.op_fn_drop)(operation);
+    if let Some(operation) = self.op.take() {
+      (self.op_fn_drop)(operation.as_ptr());
     }
   }
 }
@@ -124,7 +124,7 @@ pub enum TryExtractOutcome<T = io::Result<i32>> {
 
 impl OpRegistration {
   fn op_ptr(&self) -> *const () {
-    self.op.expect("trying to run run_blocking after result")
+    self.op.expect("trying to run run_blocking after result").as_ptr()
   }
 
   pub fn new<T>(op: Box<T>) -> Self
@@ -144,7 +144,7 @@ impl OpRegistration {
     }
 
     OpRegistration {
-      op: Some(Box::into_raw(op) as *const ()),
+      op: Some(NonNull::new(Box::into_raw(op) as *mut ()).unwrap()),
       op_fn_drop: drop_op::<T>,
       op_fn_run_blocking: op_fn_run_blocking::<T>,
       status: OpRegistrationStatus::Waiting { notifier: None },
@@ -166,7 +166,7 @@ impl OpRegistration {
       OpRegistrationStatus::Done { ref mut ret, before_notifier: _ } => {
         let res = ret.take().expect("Already taken ret value after done");
 
-        let ptr = self.op.take().expect("guarranteed not to panic, because we have owned and drop can't be called.");
+        let ptr = self.op.take().expect("guarranteed not to panic, because we have owned and drop can't be called.").as_ptr();
         let mut op = unsafe { Box::from_raw(ptr as *mut T) };
 
         TryExtractOutcome::Done(op.result(res))

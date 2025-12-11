@@ -76,7 +76,6 @@ use std::{
   ffi::{CString, NulError},
   net::SocketAddr,
   os::fd::RawFd,
-  sync::mpsc,
 };
 
 /// Result type for operations that return both a result and a buffer.
@@ -92,6 +91,8 @@ mod macros;
 
 mod driver;
 
+pub use driver::OpStore;
+
 pub mod op;
 use op::*;
 
@@ -103,7 +104,7 @@ pub use backends::IoBackend;
 
 pub use op_progress::{BlockingReceiver, OperationProgress};
 
-use crate::driver::{AlreadyExists, Driver};
+use crate::driver::{Driver, LioAlreadyInitialized};
 use std::path::Path;
 
 macro_rules! impl_op {
@@ -521,7 +522,7 @@ pub fn exit() {
   Driver::exit()
 }
 
-pub fn try_init() -> Result<(), AlreadyExists> {
+pub fn try_init() -> Result<(), LioAlreadyInitialized> {
   Driver::try_init()
 }
 

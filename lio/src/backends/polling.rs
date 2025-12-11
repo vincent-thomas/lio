@@ -134,7 +134,7 @@ impl Polling {
         T::EVENT_TYPE.expect("op is event but no event_type??"),
       )
       .expect("fd sure exists");
-    OperationProgress::<T>::new_polling(id)
+    OperationProgress::<T>::new_store_tracked(id)
   }
 
   pub(crate) fn add_interest(

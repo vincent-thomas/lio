@@ -1,18 +1,19 @@
-lint: doc
+lint:
+	cargo fmt
 	cargo clippy --all-features
+
+lint-full: lint
+	cargo hack check --feature-powerset --lib --tests
+
 doc:
-	RUST_BACKTRACE=1 cargo test --doc
 	RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --no-deps --all-features
 
 cbuild:
 	cargo rustc -p lio --crate-type dylib --features unstable_ffi --release
-	cbindgen --crate lio --output lio/include/lio.h --cpp-compat &> /dev/null
 	echo "lio: built c api at: $(pwd)/target/release/liblio.(dylib|so|dll)"
 
 test:
-	cargo nextest r --release -p lio --all-features
+	cargo nextest r --release -p lio --all-features --stress-count 4
+	RUST_BACKTRACE=1 cargo test --doc
 	./lio/tests/ffi/test.sh
 	./lio/tests/nix-build/test.sh
-
-check-flags:
-	cargo hack check --feature-powerset --lib --tests

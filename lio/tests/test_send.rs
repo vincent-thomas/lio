@@ -613,6 +613,7 @@ fn prop_test_send_arbitrary_data_run(
   );
 
   // Receive the data on server side to verify it was sent
+  // FIXME: This sometimes deadlocks.
   let (bytes_received, received_buf) = recv_recv.try_recv().unwrap();
   let bytes_received = bytes_received.expect("Recv failed") as usize;
 

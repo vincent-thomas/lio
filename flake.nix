@@ -32,7 +32,6 @@
         baseBuildInputs = with pkgs; [
           (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
           gnumake
-          rust-cbindgen
         ];
 
       in

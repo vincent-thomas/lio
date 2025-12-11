@@ -1,5 +1,3 @@
-use std::fs::OpenOptions;
-
 fn main() {
   cfg_aliases::cfg_aliases! {
       linux: { target_os = "linux" },
@@ -13,7 +11,7 @@ fn main() {
 
     std::fs::create_dir_all("./include").unwrap();
 
-    let file = OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
       .create(true)
       .write(true)
       // .truncate(true)
