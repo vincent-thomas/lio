@@ -2,7 +2,7 @@ lint:
 	cargo fmt
 	cargo clippy --all-features
 
-lint-flags: lint
+lint-flags:
 	cargo hack check --feature-powerset --lib --tests
 
 doc:
