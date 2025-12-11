@@ -1,8 +1,8 @@
 use crate::op::Operation;
 
 use std::io;
-#[cfg(not(linux))]
-use std::thread;
+// #[cfg(not(linux))]
+// use std::thread;
 #[cfg(feature = "high")]
 use std::{
   future::Future,
@@ -94,28 +94,19 @@ impl<T> BlockingReceiver<T> {
 /// }
 /// ```
 pub enum OperationProgress<T> {
-  Poll {
-    id: u64,
-  },
+  StoreTracked { id: u64 },
 
-  #[cfg(linux)]
-  #[cfg_attr(docsrs, doc(cfg(linux)))]
-  IoUring {
-    id: u64,
-    _m: PhantomData<T>,
-  },
-
-  Threaded {
-    id: u64,
-    _m: PhantomData<T>,
-  },
+  // #[cfg(linux)]
+  // #[cfg_attr(docsrs, doc(cfg(linux)))]
+  // IoUring {
+  //   id: u64,
+  //   _m: PhantomData<T>,
+  // },
+  Threaded { id: u64, _m: PhantomData<T> },
 
   // #[cfg(not(linux))]
   // #[cfg_attr(docsrs, doc(cfg(not(linux))))]
-  FromResult {
-    res: Option<io::Result<i32>>,
-    operation: T,
-  },
+  FromResult { res: Option<io::Result<i32>>, operation: T },
 }
 
 unsafe impl<T> Send for OperationProgress<T> where T: Send {}
@@ -240,12 +231,7 @@ impl<T: op::Operation> OperationProgress<T> {
     T: Send + 'static,
   {
     match self {
-      #[cfg(linux)]
-      OperationProgress::IoUring { id, .. } => {
-        Driver::get().set_callback::<T, F>(id, callback);
-        std::mem::forget(self); // Prevent Drop from cancelling the operation
-      }
-      OperationProgress::Poll { id, .. } => {
+      OperationProgress::StoreTracked { id, .. } => {
         Driver::get().set_callback::<T, F>(id, callback);
         std::mem::forget(self); // Prevent Drop from cancelling the operation
       }
@@ -327,47 +313,33 @@ impl<T: op::Operation> OperationProgress<T> {
   }
 }
 
-#[cfg(linux)]
 impl<T> OperationProgress<T>
 where
   T: op::Operation,
 {
-  pub(crate) fn new_uring(id: u64) -> Self {
-    Self::IoUring { id, _m: PhantomData }
-  }
-}
-
-impl<T> OperationProgress<T>
-where
-  T: op::Operation,
-{
-  pub(crate) fn new_polling(id: u64) -> Self
+  pub(crate) fn new_store_tracked(id: u64) -> Self
   where
     T: Operation,
   {
-    if T::EVENT_TYPE.is_none() {
-      panic!(
-        "tried running OperationProgress::new without associated op event type"
-      );
-    };
+    // if T::EVENT_TYPE.is_none() {
+    //   panic!(
+    //     "tried running OperationProgress::new_store_tracked without associated op event type"
+    //   );
+    // };
 
-    Self::Poll { id }
+    Self::StoreTracked { id }
   }
 
   pub(crate) fn new_from_result(operation: T, result: io::Result<i32>) -> Self {
     Self::FromResult { operation, res: Some(result) }
   }
-}
-
-// Threading backend works on all platforms
-impl<T> OperationProgress<T>
-where
-  T: op::Operation,
-{
   pub(crate) fn new_threaded(id: u64) -> Self {
     Self::Threaded { id, _m: PhantomData }
   }
 }
+
+// Threading backend works on all platforms
+impl<T> OperationProgress<T> where T: op::Operation {}
 
 /// Implements `Future` for polling-based operations on non-Linux platforms.
 ///
@@ -399,9 +371,7 @@ where
     }
 
     match *self {
-      #[cfg(linux)]
-      OperationProgress::IoUring { id, _m: _ } => check_done::<T>(id, cx),
-      OperationProgress::Poll { id } => check_done::<T>(id, cx),
+      OperationProgress::StoreTracked { id } => check_done::<T>(id, cx),
       OperationProgress::Threaded { id, _m } => check_done::<T>(id, cx),
       OperationProgress::FromResult { ref mut res, ref mut operation } => {
         let result = operation.result(res.take().expect("Already awaited."));
@@ -414,14 +384,10 @@ where
 impl<T> Drop for OperationProgress<T> {
   fn drop(&mut self) {
     match self {
-      OperationProgress::Poll { id: _, .. } => {
+      OperationProgress::StoreTracked { id: _, .. } => {
         // Driver::get().detach(*id);
       }
       OperationProgress::Threaded { id: _, _m: _ } => {}
-      #[cfg(linux)]
-      OperationProgress::IoUring { id: _, _m, .. } => {
-        // Driver::get().detach(*id);
-      }
       OperationProgress::FromResult { res: _, operation: _ } => {}
     }
   }

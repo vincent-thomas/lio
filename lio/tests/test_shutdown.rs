@@ -730,10 +730,7 @@ fn test_shutdown_ipv6() {
 
   lio::tick();
 
-  connect_recv
-    .try_recv()
-    .unwrap()
-    .expect("Failed to connect IPv6");
+  connect_recv.try_recv().unwrap().expect("Failed to connect IPv6");
 
   // Accept connection on server
   let mut accept_recv = accept(server_sock).send();
@@ -749,10 +746,7 @@ fn test_shutdown_ipv6() {
 
   lio::tick();
 
-  shutdown_recv
-    .try_recv()
-    .unwrap()
-    .expect("Failed to shutdown IPv6 socket");
+  shutdown_recv.try_recv().unwrap().expect("Failed to shutdown IPv6 socket");
 
   // Verify EOF
   let buf = vec![0u8; 100];
@@ -839,10 +833,7 @@ fn test_shutdown_concurrent() {
 
     lio::tick();
 
-    shutdown_recv
-      .try_recv()
-      .unwrap()
-      .expect("Concurrent shutdown failed");
+    shutdown_recv.try_recv().unwrap().expect("Concurrent shutdown failed");
 
     unsafe {
       libc::close(client_sock);

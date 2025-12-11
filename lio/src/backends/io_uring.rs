@@ -59,11 +59,9 @@ impl IoBackend for IoUring {
       drop(_g);
 
       self.inner.submit().unwrap();
-      OperationProgress::<T>::new_uring(operation_id)
+      OperationProgress::<T>::new_store_tracked(operation_id)
     } else {
       self.polling.submit(op, store)
-      // todo!();
-      // OperationProgress::<T>::new_blocking(op)
     }
   }
 

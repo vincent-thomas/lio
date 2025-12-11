@@ -5,8 +5,7 @@ use crate::op::Operation;
 use crate::op_registration::TryExtractOutcome;
 use crate::sync::Mutex;
 
-use thiserror::Error;
-
+use std::fmt;
 #[cfg(feature = "high")]
 use std::task::Waker;
 use std::{
@@ -17,7 +16,6 @@ use std::{
     atomic::{AtomicPtr, AtomicU64, Ordering},
     mpsc,
   },
-  thread,
 };
 
 use crate::op;
@@ -29,7 +27,7 @@ pub struct OpStore {
 
 impl OpStore {
   fn new() -> OpStore {
-    Self { store: Mutex::new(HashMap::with_capacity(512)) }
+    Self { store: Mutex::new(HashMap::new()) }
   }
   pub fn next_id(&self) -> u64 {
     static NEXT: OnceLock<AtomicU64> = OnceLock::new();
@@ -67,18 +65,25 @@ pub(crate) struct Driver<Io = Default> {
   driver: Io,
   store: OpStore,
   // Shared shutdown state and background thread handle
-  shutting_down: Mutex<Option<mpsc::Sender<()>>>,
-  background_handle: Mutex<Option<thread::JoinHandle<()>>>,
+  // shutting_down: Mutex<Option<mpsc::Sender<()>>>,
+  // background_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 static DRIVER: AtomicPtr<Driver> = AtomicPtr::new(std::ptr::null_mut());
 
-#[derive(Error, Debug)]
-#[error("lio is already initalised")]
-pub struct AlreadyExists;
+#[derive(Debug)]
+pub struct LioAlreadyInitialized;
+
+impl std::error::Error for LioAlreadyInitialized {}
+
+impl fmt::Display for LioAlreadyInitialized {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    <Self as fmt::Debug>::fmt(self, f)
+  }
+}
 
 impl Driver {
-  pub(crate) fn try_init() -> Result<(), AlreadyExists> {
+  pub(crate) fn try_init() -> Result<(), LioAlreadyInitialized> {
     // Check if already initialized
     let current = DRIVER.load(Ordering::Acquire);
     if !current.is_null() {
@@ -88,8 +93,8 @@ impl Driver {
     let driver = Driver {
       driver: Default::new(),
       store: OpStore::new(),
-      shutting_down: Mutex::new(None),
-      background_handle: Mutex::new(None),
+      // shutting_down: Mutex::new(None),
+      // background_handle: Mutex::new(None),
     };
 
     let driver_ptr = Box::into_raw(Box::new(driver));
@@ -107,7 +112,7 @@ impl Driver {
         unsafe {
           let _ = Box::from_raw(driver_ptr);
         }
-        Err(AlreadyExists)
+        Err(LioAlreadyInitialized)
       }
     }
   }
@@ -129,11 +134,12 @@ impl Driver {
   }
 
   pub(crate) fn worker_shutdown(&'static self) {
-    let mut handle_lock = self.background_handle.lock();
+    todo!();
+    // let mut handle_lock = self.background_handle.lock();
 
-    if let Some(handle) = handle_lock.take() {
-      // driver.poller.
-    };
+    // if let Some(handle) = handle_lock.take() {
+    //   // driver.poller.
+    // };
   }
 
   /// Deallocates the Driver, freeing all resources.
@@ -146,6 +152,7 @@ impl Driver {
   }
 
   pub(crate) fn detach(&self, id: u64) -> Option<()> {
+    let _ = id;
     todo!();
   }
 
@@ -162,23 +169,24 @@ impl Driver {
   }
 
   pub fn spawn_ev(&'static self, sender: mpsc::Receiver<()>) {
-    let handle = utils::create_worker(move || {
-      loop {
-        match sender.try_recv() {
-          Ok(()) => break,
-          Err(err) => match err {
-            mpsc::TryRecvError::Empty => {}
-            mpsc::TryRecvError::Disconnected => {
-              break;
-            }
-          },
-        }
-
-        self.driver.tick(&self.store, true);
-      }
-    });
-    let old = self.background_handle.lock().replace(handle);
-    assert!(old.is_none());
+    let _ = sender;
+    // let handle = utils::create_worker(move || {
+    //   loop {
+    //     match sender.try_recv() {
+    //       Ok(()) => break,
+    //       Err(err) => match err {
+    //         mpsc::TryRecvError::Empty => {}
+    //         mpsc::TryRecvError::Disconnected => {
+    //           break;
+    //         }
+    //       },
+    //     }
+    //
+    //     self.driver.tick(&self.store, true);
+    //   }
+    // });
+    // let old = self.background_handle.lock().replace(handle);
+    // assert!(old.is_none());
   }
 
   // FIXME: On first run per key, run run_blocking and that will fix it.
