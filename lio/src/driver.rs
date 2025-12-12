@@ -1,8 +1,6 @@
 use crate::OperationProgress;
 use crate::backends::{self, IoBackend};
 use crate::op::Operation;
-#[cfg(feature = "high")]
-use crate::op_registration::TryExtractOutcome;
 use crate::sync::Mutex;
 
 use std::fmt;
@@ -191,16 +189,16 @@ impl Driver {
 
   // FIXME: On first run per key, run run_blocking and that will fix it.
   #[cfg(feature = "high")]
-  pub fn check_done<T>(&self, key: u64) -> TryExtractOutcome<T::Result>
+  pub fn check_done<T>(&self, key: u64) -> Option<T::Result>
   where
     T: Operation,
   {
     match self.store.get_mut(key, |entry| entry.try_extract::<T>()).unwrap() {
-      TryExtractOutcome::Done(res) => {
+      Some(res) => {
         self.store.remove(key);
-        TryExtractOutcome::Done(res)
+        Some(res)
       }
-      TryExtractOutcome::StillWaiting => TryExtractOutcome::StillWaiting,
+      None => None,
     }
   }
   pub fn set_callback<T, F>(&self, id: u64, callback: F)

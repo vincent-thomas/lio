@@ -6,11 +6,10 @@ use std::{
   thread::{self, JoinHandle},
 };
 
-use crate::sync::Mutex;
+use crate::{op_registration::OpNotification, sync::Mutex};
 
 use crate::{
   OperationProgress, backends::IoBackend, driver::OpStore, op::Operation,
-  op_registration::ExtractedOpNotification,
 };
 
 /// Work item sent to worker threads
@@ -123,8 +122,8 @@ impl IoBackend for Threading {
       if let Some(Some(notification)) = set_done_result {
         match notification {
           #[cfg(feature = "high")]
-          ExtractedOpNotification::Waker(waker) => waker.wake(),
-          ExtractedOpNotification::Callback(callback) => {
+          OpNotification::Waker(waker) => waker.wake(),
+          OpNotification::Callback(callback) => {
             store.get_mut(completion.id, |entry| callback.call(entry));
             assert!(store.remove(completion.id));
           }
