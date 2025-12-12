@@ -1,5 +1,5 @@
 use super::{IoBackend, OpStore};
-use crate::op_registration::ExtractedOpNotification;
+use crate::op_registration::OpNotification;
 use crate::sync::Mutex;
 use crate::{OperationProgress, op};
 use std::io;
@@ -90,8 +90,8 @@ impl IoBackend for IoUring {
         None => {}
         Some(value) => match value {
           #[cfg(feature = "high")]
-          ExtractedOpNotification::Waker(waker) => waker.wake(),
-          ExtractedOpNotification::Callback(callback) => {
+          OpNotification::Waker(waker) => waker.wake(),
+          OpNotification::Callback(callback) => {
             store.get_mut(operation_id, |entry| callback.call(entry));
             assert!(store.remove(operation_id));
           }
