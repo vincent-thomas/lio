@@ -29,6 +29,26 @@ jobs:
       - name: Check format
         run: nix develop .#ci -c cargo fmt --check
 
+  deny:
+    runs-on: ubuntu-latest
+    name: cargo deny
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        continue-on-error: false
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-build-cache
+
+      - name: Check format
+        run: nix develop .#ci -c cargo deny check
+
   clippy:
     runs-on: ubuntu-latest
     name: Clippy

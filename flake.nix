@@ -28,36 +28,29 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
-
-        baseBuildInputs = with pkgs; [
-          (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-          gnumake
-        ];
-
       in
       {
         packages.default = import ./default.nix { inherit pkgs; };
 
         devShells =
           let
-            ciNativeBuildInputs =
-              baseBuildInputs
-              ++ (with pkgs; [
-                cargo-nextest
-                cargo-hack
-                gcc
-              ]);
+            nativeBuildInputs = with pkgs; [
+              (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+              gcc
+              gnumake
+
+              cargo-nextest
+              cargo-hack
+              cargo-audit
+              cargo-deny
+            ];
           in
           {
             ci = pkgs.mkShell {
-              nativeBuildInputs = ciNativeBuildInputs;
+              inherit nativeBuildInputs;
             };
             default = pkgs.mkShell {
-              buildInputs =
-                ciNativeBuildInputs
-                ++ (with pkgs; [
-                  cargo-expand
-                ]);
+              buildInputs = nativeBuildInputs;
             };
           };
       }
