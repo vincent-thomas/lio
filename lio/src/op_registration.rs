@@ -63,6 +63,7 @@ impl Drop for OpRegistration {
 
 unsafe impl Send for OpRegistration {}
 
+#[repr(u8)]
 pub enum OpRegistrationStatus {
   Waiting,
   WaitingWithNotifier(OpNotification),
@@ -183,6 +184,7 @@ impl OpRegistration {
       OpRegistrationStatus::DoneWithResultAfterNotifier { .. } => {
         unreachable!("internal lio: not allowed.")
       }
+      #[cfg(feature = "high")]
       OpRegistrationStatus::WaitingWithNotifier(OpNotification::Waker(_)) => {
         unreachable!("lio not allowed: Cannot set waker for callback backed IO")
       }
