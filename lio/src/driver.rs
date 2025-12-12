@@ -62,9 +62,6 @@ pub type Default = backends::Polling;
 pub(crate) struct Driver<Io = Default> {
   driver: Io,
   store: OpStore,
-  // Shared shutdown state and background thread handle
-  // shutting_down: Mutex<Option<mpsc::Sender<()>>>,
-  // background_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 static DRIVER: AtomicPtr<Driver> = AtomicPtr::new(std::ptr::null_mut());
@@ -85,17 +82,13 @@ impl Driver {
     // Check if already initialized
     let current = DRIVER.load(Ordering::Acquire);
     if !current.is_null() {
-      panic!("Driver already initialized.");
+      return Err(LioAlreadyInitialized);
     }
 
-    let driver = Driver {
+    let driver_ptr = Box::into_raw(Box::new(Driver {
       driver: Default::new(),
       store: OpStore::new(),
-      // shutting_down: Mutex::new(None),
-      // background_handle: Mutex::new(None),
-    };
-
-    let driver_ptr = Box::into_raw(Box::new(driver));
+    }));
 
     // Try to set the driver pointer atomically
     match DRIVER.compare_exchange(
@@ -107,9 +100,7 @@ impl Driver {
       Ok(_) => Ok(()),
       Err(_) => {
         // Another thread initialized first, clean up our allocation
-        unsafe {
-          let _ = Box::from_raw(driver_ptr);
-        }
+        let _ = unsafe { Box::from_raw(driver_ptr) };
         Err(LioAlreadyInitialized)
       }
     }
@@ -144,9 +135,7 @@ impl Driver {
   /// This will panic if the driver is not initialized or if shutdown has not been called first.
   pub(crate) fn deallocate(ptr: NonNull<Driver>) {
     // SAFETY: This pointer was created via Box::into_raw in init()
-    unsafe {
-      let _ = Box::from_raw(ptr.as_ptr());
-    }
+    let _ = unsafe { Box::from_raw(ptr.as_ptr()) };
   }
 
   pub(crate) fn detach(&self, id: u64) -> Option<()> {
