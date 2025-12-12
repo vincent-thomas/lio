@@ -1,4 +1,3 @@
-#[cfg(feature = "high")]
 use crate::op_registration::OpNotification;
 use crate::sync::Mutex;
 use std::io::ErrorKind;
