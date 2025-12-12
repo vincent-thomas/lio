@@ -1,9 +1,9 @@
+#[cfg(feature = "high")]
+use crate::op_registration::OpNotification;
 use crate::sync::Mutex;
 use std::io::ErrorKind;
 use std::os::fd::BorrowedFd;
 use std::{collections::HashMap, io, os::fd::RawFd};
-
-use crate::op_registration::ExtractedOpNotification;
 
 use crate::{
   OperationProgress,
@@ -92,8 +92,8 @@ impl IoBackend for Polling {
             None => {}
             Some(value) => match value {
               #[cfg(feature = "high")]
-              ExtractedOpNotification::Waker(waker) => waker.wake(),
-              ExtractedOpNotification::Callback(callback) => {
+              OpNotification::Waker(waker) => waker.wake(),
+              OpNotification::Callback(callback) => {
                 store.get_mut(operation_id, |entry| callback.call(entry));
                 assert!(store.remove(operation_id));
               }

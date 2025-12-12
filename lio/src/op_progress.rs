@@ -1,15 +1,13 @@
 use crate::op::Operation;
 
 use std::io;
-// #[cfg(not(linux))]
-// use std::thread;
+use std::sync::mpsc::Receiver;
 #[cfg(feature = "high")]
 use std::{
   future::Future,
   pin::Pin,
   task::{Context, Poll},
 };
-use std::{marker::PhantomData, sync::mpsc::Receiver};
 use std::{
   mem,
   sync::mpsc::{self, TryRecvError},
@@ -95,17 +93,7 @@ impl<T> BlockingReceiver<T> {
 /// ```
 pub enum OperationProgress<T> {
   StoreTracked { id: u64 },
-
-  // #[cfg(linux)]
-  // #[cfg_attr(docsrs, doc(cfg(linux)))]
-  // IoUring {
-  //   id: u64,
-  //   _m: PhantomData<T>,
-  // },
-  Threaded { id: u64, _m: PhantomData<T> },
-
-  // #[cfg(not(linux))]
-  // #[cfg_attr(docsrs, doc(cfg(not(linux))))]
+  Threaded { id: u64 },
   FromResult { res: Option<io::Result<i32>>, operation: T },
 }
 
@@ -140,6 +128,103 @@ impl<T: op::Operation> OperationProgress<T> {
     T: DetachSafe + Send + 'static,
   {
     self.when_done(drop);
+  }
+
+  /// Block the current thread until the operation completes and return the result.
+  /// A easy way of calling non-async syscalls This method still makes use of
+  /// lio's non-blocking core.
+  ///
+  /// # Example
+  /// ```rust
+  /// # let fd = 0;
+  /// lio::init();
+  /// let receiver = lio::write(fd, vec![0u8; 10], 0).send();
+  /// lio::tick();
+  ///
+  /// let (result, buf) = receiver.recv();
+  /// match result {
+  ///     Ok(_) => println!("success"),
+  ///     Err(err) => eprintln!("Error: {}", err),
+  /// }
+  /// ```
+  pub fn blocking(self) -> T::Result
+  where
+    T::Result: Send,
+    T: Send + 'static,
+  {
+    self.send().recv()
+  }
+
+  /// Convert the operation into a channel receiver.
+  ///
+  /// Returns a oneshot receiver that will receive the operation result when complete.
+  /// Useful for integrating with channel-based async code or when you need to wait
+  /// for the result in a different context than where the operation was started.
+  ///
+  /// # Example
+  /// ```ignore
+  /// let fd = 1;
+  /// // Some fd defined.
+  /// // ...
+  /// lio::init();
+  /// let buf = vec![0; 10];
+  /// let receiver = lio::write(fd, buf, 0).send();
+  /// lio::tick();
+  /// let (result, buffer) = receiver.recv();
+  /// let _ = result.unwrap();
+  /// ```
+  pub fn send(self) -> BlockingReceiver<T::Result>
+  where
+    T::Result: Send,
+    T: Send + 'static,
+  {
+    let (sender, receiver) = mpsc::channel();
+
+    self.send_with(sender);
+
+    BlockingReceiver { recv: Some(receiver) }
+  }
+
+  /// Sends the operation result through a provided channel sender when complete.
+  ///
+  /// This is a variant of [`send()`](Self::send) that allows you to provide your own
+  /// `Sender` instead of creating a new channel. Useful when integrating with existing
+  /// channel-based architectures or when you want to multiplex multiple operation results
+  /// into a single receiver.
+  ///
+  /// # Arguments
+  ///
+  /// * `sender` - The channel sender that will receive the operation result
+  ///
+  /// # Examples
+  ///
+  /// ```rust
+  /// use lio::read;
+  /// use std::sync::mpsc;
+  ///
+  /// async fn example() -> std::io::Result<()> {
+  ///     lio::init();
+  ///     let (tx, rx) = mpsc::channel();
+  ///
+  ///     // Send multiple operations to the same receiver
+  ///     read(0, vec![0u8; 1024], 0).send_with(tx.clone());
+  ///     read(1, vec![0u8; 1024], 0).send_with(tx.clone());
+  ///
+  ///     // Receive results from either operation
+  ///     let (result1, buf1) = rx.recv().unwrap();
+  ///     let (result2, buf2) = rx.recv().unwrap();
+  ///
+  ///     Ok(())
+  /// }
+  /// ```
+  pub fn send_with(self, sender: mpsc::Sender<T::Result>)
+  where
+    T::Result: Send,
+    T: Send + 'static,
+  {
+    self.when_done(move |res| {
+      let _ = sender.send(res);
+    });
   }
 
   /// Registers a callback to be invoked when the operation completes.
@@ -231,11 +316,11 @@ impl<T: op::Operation> OperationProgress<T> {
     T: Send + 'static,
   {
     match self {
-      OperationProgress::StoreTracked { id, .. } => {
+      OperationProgress::StoreTracked { id } => {
         Driver::get().set_callback::<T, F>(id, callback);
         std::mem::forget(self); // Prevent Drop from cancelling the operation
       }
-      OperationProgress::Threaded { id, .. } => {
+      OperationProgress::Threaded { id } => {
         Driver::get().set_callback::<T, F>(id, callback);
         std::mem::forget(self); // Prevent Drop from cancelling the operation
       }
@@ -245,71 +330,6 @@ impl<T: op::Operation> OperationProgress<T> {
         callback(output);
       }
     }
-  }
-
-  pub fn send_with(self, sender: mpsc::Sender<T::Result>)
-  where
-    T::Result: Send,
-    T: Send + 'static,
-  {
-    self.when_done(move |res| {
-      let _ = sender.send(res);
-    });
-  }
-
-  /// Convert the operation into a channel receiver.
-  ///
-  /// Returns a oneshot receiver that will receive the operation result when complete.
-  /// Useful for integrating with channel-based async code or when you need to wait
-  /// for the result in a different context than where the operation was started.
-  ///
-  /// # Example
-  /// ```ignore
-  /// let fd = 1;
-  /// // Some fd defined.
-  /// // ...
-  /// lio::init();
-  /// let buf = vec![0; 10];
-  /// let receiver = lio::write(fd, buf, 0).send();
-  /// lio::tick();
-  /// let (result, buffer) = receiver.recv();
-  /// let _ = result.unwrap();
-  /// ```
-  pub fn send(self) -> BlockingReceiver<T::Result>
-  where
-    T::Result: Send,
-    T: Send + 'static,
-  {
-    let (sender, receiver) = mpsc::channel();
-
-    self.send_with(sender);
-
-    BlockingReceiver { recv: Some(receiver) }
-  }
-
-  /// Block the current thread until the operation completes and return the result.
-  /// A easy way of calling non-async syscalls This method still makes use of
-  /// lio's non-blocking core.
-  ///
-  /// # Example
-  /// ```rust
-  /// # let fd = 0;
-  /// lio::init();
-  /// let receiver = lio::write(fd, vec![0u8; 10], 0).send();
-  /// lio::tick();
-  ///
-  /// let (result, buf) = receiver.recv();
-  /// match result {
-  ///     Ok(_) => println!("success"),
-  ///     Err(err) => eprintln!("Error: {}", err),
-  /// }
-  /// ```
-  pub fn blocking(self) -> T::Result
-  where
-    T::Result: Send,
-    T: Send + 'static,
-  {
-    self.send().recv()
   }
 }
 
@@ -321,12 +341,6 @@ where
   where
     T: Operation,
   {
-    // if T::EVENT_TYPE.is_none() {
-    //   panic!(
-    //     "tried running OperationProgress::new_store_tracked without associated op event type"
-    //   );
-    // };
-
     Self::StoreTracked { id }
   }
 
@@ -334,7 +348,7 @@ where
     Self::FromResult { operation, res: Some(result) }
   }
   pub(crate) fn new_threaded(id: u64) -> Self {
-    Self::Threaded { id, _m: PhantomData }
+    Self::Threaded { id }
   }
 }
 
@@ -356,14 +370,13 @@ where
     mut self: Pin<&mut Self>,
     cx: &mut Context<'_>,
   ) -> Poll<Self::Output> {
-    use crate::op_registration::TryExtractOutcome;
     fn check_done<T>(id: u64, cx: &mut Context<'_>) -> Poll<T::Result>
     where
       T: op::Operation,
     {
       match Driver::get().check_done::<T>(id) {
-        TryExtractOutcome::Done(result) => Poll::Ready(result),
-        TryExtractOutcome::StillWaiting => {
+        Some(result) => Poll::Ready(result),
+        None => {
           Driver::get().set_waker(id, cx.waker().clone());
           Poll::Pending
         }
@@ -371,8 +384,8 @@ where
     }
 
     match *self {
-      OperationProgress::StoreTracked { id } => check_done::<T>(id, cx),
-      OperationProgress::Threaded { id, _m } => check_done::<T>(id, cx),
+      OperationProgress::StoreTracked { id }
+      | OperationProgress::Threaded { id } => check_done::<T>(id, cx),
       OperationProgress::FromResult { ref mut res, ref mut operation } => {
         let result = operation.result(res.take().expect("Already awaited."));
         Poll::Ready(result)
@@ -384,10 +397,10 @@ where
 impl<T> Drop for OperationProgress<T> {
   fn drop(&mut self) {
     match self {
-      OperationProgress::StoreTracked { id: _, .. } => {
+      OperationProgress::StoreTracked { id: _ } => {
         // Driver::get().detach(*id);
       }
-      OperationProgress::Threaded { id: _, _m: _ } => {}
+      OperationProgress::Threaded { id: _ } => {}
       OperationProgress::FromResult { res: _, operation: _ } => {}
     }
   }
