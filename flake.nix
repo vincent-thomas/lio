@@ -47,7 +47,7 @@
           {
             ci = pkgs.mkShell {
               inherit nativeBuildInputs;
-              packages = [
+              packages = with pkgs; [
                 cargo-deny
                 cargo-audit
                 cargo-hack
