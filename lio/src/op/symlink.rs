@@ -7,9 +7,6 @@ use std::{
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-#[cfg(not(linux))]
-use crate::op::EventType;
-
 use super::Operation;
 
 pub struct SymlinkAt {
@@ -43,12 +40,7 @@ impl Operation for SymlinkAt {
   #[cfg(linux)]
   const OPCODE: u8 = 38;
 
-  #[cfg(not(linux))]
-  const EVENT_TYPE: Option<EventType> = None;
-
-  fn fd(&self) -> Option<RawFd> {
-    None
-  }
+  impl_no_readyness!();
 
   #[cfg(linux)]
   fn create_entry(&mut self) -> io_uring::squeue::Entry {

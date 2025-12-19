@@ -4,8 +4,6 @@ use std::os::fd::RawFd;
 use io_uring::{opcode, squeue, types::Fd};
 
 use crate::op::DetachSafe;
-#[cfg(not(linux))]
-use crate::op::EventType;
 
 use super::Operation;
 
@@ -33,12 +31,7 @@ impl Operation for Truncate {
     opcode::Ftruncate::new(Fd(self.fd), self.size).build()
   }
 
-  #[cfg(not(linux))]
-  const EVENT_TYPE: Option<EventType> = None;
-
-  fn fd(&self) -> Option<RawFd> {
-    None
-  }
+  impl_no_readyness!();
 
   fn run_blocking(&self) -> std::io::Result<i32> {
     syscall!(ftruncate(self.fd, self.size as i64))

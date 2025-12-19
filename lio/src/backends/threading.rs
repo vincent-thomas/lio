@@ -136,8 +136,8 @@ impl IoBackend for Threading {
   where
     O: Operation + Sized,
   {
-    if O::EVENT_TYPE.is_some() {
-      panic!("Threading io driver is not compatible with O::EVENT_TYPE");
+    if O::INTEREST.is_some() {
+      panic!("Threading io driver is not compatible with O::INTEREST");
     }
 
     let id = store.next_id();

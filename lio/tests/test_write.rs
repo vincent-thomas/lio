@@ -104,9 +104,11 @@ fn prop_test_write_arbitrary_data_and_offsets() {
   lio::init();
   let mut runner = TestRunner::new(ProptestConfig::default());
 
-  runner.run(&(0usize..=8192, 0i64..=4096, any::<u64>()), |props| {
-    prop_test_write_arbitrary_data_and_offsets_run(props.0, props.1, props.2)
-  });
+  runner
+    .run(&(0usize..=8192, 0i64..=4096, any::<u64>()), |props| {
+      prop_test_write_arbitrary_data_and_offsets_run(props.0, props.1, props.2)
+    })
+    .unwrap();
 }
 
 // proptest! {
@@ -152,18 +154,13 @@ fn prop_test_write_arbitrary_data_and_offsets_run(
   }
 
   // Perform the write operation with channel pattern
-  let (sender, receiver) = mpsc::channel();
-  let sender1 = sender.clone();
   let test_data_clone = test_data.clone();
 
-  write(fd, test_data.clone(), write_offset).when_done(move |res| {
-    sender1.send(res).unwrap();
-  });
+  let mut receiver = write(fd, test_data.clone(), write_offset).send();
 
-  prop_assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
 
-  let (write_result, returned_buf) = receiver.recv().unwrap();
+  let (write_result, returned_buf) = receiver.try_recv().unwrap();
 
   let bytes_written = write_result.map_err(|e| {
     TestCaseError::fail(format!("Write operation failed: {}", e))

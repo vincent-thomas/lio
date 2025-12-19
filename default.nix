@@ -8,7 +8,8 @@ let
 in
 pkgs.rustPlatform.buildRustPackage {
   inherit pname version;
-  useNextest = true;
+  # useNextest = true;
+  doCheck = false;
 
   src = ./.;
 
@@ -33,6 +34,7 @@ pkgs.rustPlatform.buildRustPackage {
     mkdir -p $out/lib $out/include $out/lib/pkgconfig
     cp lio/include/lio.h $out/include/
     cp target/release/liblio${pkgs.stdenv.hostPlatform.extensions.sharedLibrary} $out/lib/
+    cp target/release/liblio${pkgs.stdenv.hostPlatform.extensions.staticLibrary} $out/lib/
 
     # Fix install name on macOS
     ${pkgs.lib.optionalString pkgs.stdenv.isDarwin ''

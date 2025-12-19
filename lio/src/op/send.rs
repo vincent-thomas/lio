@@ -3,8 +3,6 @@ use std::{io, os::fd::RawFd};
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-#[cfg(not(linux))]
-use crate::op::EventType;
 use crate::{BufResult, op::DetachSafe};
 
 use super::Operation;
@@ -38,9 +36,11 @@ impl Operation for Send {
       .build()
   }
 
-  #[cfg(not(linux))]
-  const EVENT_TYPE: Option<EventType> = Some(EventType::Write);
+  #[cfg(unix)]
+  const INTEREST: Option<crate::backends::pollingv2::Interest> =
+    Some(crate::backends::pollingv2::Interest::WRITE);
 
+  #[cfg(unix)]
   fn fd(&self) -> Option<RawFd> {
     Some(self.fd)
   }

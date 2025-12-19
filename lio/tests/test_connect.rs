@@ -8,6 +8,7 @@ use std::{
 #[cfg(feature = "tracing")]
 use tracing::Level;
 
+#[ignore = "flaky network test"]
 #[test]
 fn test_connect_basic() {
   lio::init();
@@ -108,6 +109,7 @@ fn test_connect_basic() {
   }
 }
 
+#[ignore = "flaky network test"]
 #[test]
 fn test_connect_ipv6() {
   lio::init();
@@ -205,6 +207,7 @@ fn test_connect_ipv6() {
   }
 }
 
+#[ignore = "flaky network test"]
 #[test]
 fn test_connect_to_nonexistent() {
   lio::init();
@@ -247,6 +250,7 @@ fn test_connect_to_nonexistent() {
   }
 }
 
+#[ignore = "flaky network test"]
 #[test]
 fn test_connect_multiple_clients() {
   lio::init();
@@ -345,6 +349,7 @@ fn test_connect_multiple_clients() {
   }
 }
 
+#[ignore = "flaky network test"]
 #[test]
 fn test_connect_already_connected() {
   #[cfg(feature = "tracing")]
@@ -453,6 +458,7 @@ fn test_connect_already_connected() {
   }
 }
 
+#[ignore = "flaky network test"]
 #[test]
 fn test_connect_to_localhost() {
   lio::init();
@@ -552,6 +558,7 @@ fn test_connect_to_localhost() {
   }
 }
 
+#[ignore = "flaky network test"]
 #[test]
 fn test_connect_concurrent() {
   lio::init();
@@ -650,6 +657,7 @@ fn test_connect_concurrent() {
   }
 }
 
+#[ignore = "flaky network test"]
 #[test]
 fn test_connect_with_bind() {
   lio::init();

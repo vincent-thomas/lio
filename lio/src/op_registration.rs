@@ -74,7 +74,11 @@ pub enum OpRegistrationStatus {
 
 #[test]
 fn test_op_reg_size() {
+  #[cfg(feature = "high")]
   assert_eq!(std::mem::size_of::<OpNotification>(), 24);
+
+  #[cfg(not(feature = "high"))]
+  assert_eq!(std::mem::size_of::<OpNotification>(), 16);
 }
 // Option's is for ownership rules.
 pub enum OpNotification {

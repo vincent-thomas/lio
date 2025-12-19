@@ -13,6 +13,17 @@ void lio_init(void);
 
 int lio_try_init(void);
 
+void lio_stop(void);
+void lio_start(void);
+
+/**
+ * Shutdown the lio runtime and wait for all pending operations to complete.
+ *
+ * This function blocks until all pending I/O operations finish and their callbacks are called.
+ * After calling this, no new operations should be submitted.
+ */
+void lio_exit(void);
+
 /**
  * Shut down part of a full-duplex connection.
  *
@@ -221,12 +232,16 @@ void lio_close(int fd,
                void (*callback)(int32_t));
 
 /**
- * Shutdown the lio runtime and wait for all pending operations to complete.
+ * Close a file descriptor.
  *
- * This function blocks until all pending I/O operations finish and their callbacks are called.
- * After calling this, no new operations should be submitted.
+ * # Parameters
+ * - `fd`: File descriptor to close
+ * - `callback(result)`: Called when complete
+ * - `result`: 0 on success, or negative errno on error
  */
-void lio_exit(void);
+void lio_timeout(int duration,
+               void (*callback)(int32_t));
+
 
 #ifdef __cplusplus
 }  // extern "C"

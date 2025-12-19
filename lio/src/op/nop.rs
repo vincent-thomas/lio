@@ -19,10 +19,12 @@ impl Operation for Nop {
     io_uring::opcode::Nop::new().build()
   }
 
+  #[cfg(unix)]
   fn fd(&self) -> Option<std::os::fd::RawFd> {
     None
   }
 
+  #[cfg(unix)]
   fn run_blocking(&self) -> io::Result<i32> {
     panic!();
   }

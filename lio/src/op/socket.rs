@@ -1,9 +1,6 @@
 use std::io;
 use std::os::fd::RawFd;
 
-#[cfg(not(linux))]
-use crate::op::EventType;
-
 use super::Operation;
 
 // Not detach safe.
@@ -194,12 +191,7 @@ impl Operation for Socket {
     .build()
   }
 
-  #[cfg(not(linux))]
-  const EVENT_TYPE: Option<EventType> = None;
-
-  fn fd(&self) -> Option<RawFd> {
-    None
-  }
+  impl_no_readyness!();
 
   fn run_blocking(&self) -> io::Result<i32> {
     // Path 1: Platforms with SOCK_CLOEXEC support (atomic CLOEXEC flag)

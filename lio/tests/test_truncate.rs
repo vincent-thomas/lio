@@ -1,8 +1,5 @@
 use lio::truncate;
-use std::{
-  ffi::CString,
-  sync::mpsc::{self, TryRecvError},
-};
+use std::{ffi::CString, sync::mpsc};
 
 #[test]
 fn test_truncate_shrink_file() {

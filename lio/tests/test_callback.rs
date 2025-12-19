@@ -62,17 +62,11 @@ fn test_callback_basic_write() {
     )
   };
 
-  let (tx, rx) = channel();
-
-  write(fd, test_data.to_vec(), 0).when_done(
-    move |(bytes_written, _buffer)| {
-      tx.send(bytes_written).unwrap();
-    },
-  );
+  let recv = write(fd, test_data.to_vec(), 0).send();
   lio::tick();
 
   // Wait for callback to execute
-  let bytes_written = rx
+  let (bytes_written, buf) = recv
     .recv_timeout(Duration::from_secs(5))
     .expect("Callback was not invoked within timeout");
   assert_eq!(bytes_written.expect("Write failed") as usize, test_data.len());

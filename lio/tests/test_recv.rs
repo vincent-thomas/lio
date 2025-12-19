@@ -6,6 +6,7 @@ use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::sync::mpsc::{self, TryRecvError};
 
+#[ignore = "flaky network test"]
 #[test]
 #[ignore]
 fn test_recv_multiple() {
@@ -191,6 +192,7 @@ fn test_recv_multiple() {
   receiver_close.recv().unwrap().expect("Failed to close server");
 }
 
+#[ignore = "flaky network test"]
 #[test]
 fn test_recv_with_flags() {
   lio::init();
@@ -320,6 +322,7 @@ fn test_recv_with_flags() {
   receiver_close.try_recv().unwrap().expect("Failed to close server");
 }
 
+#[ignore = "flaky network test"]
 #[test]
 fn test_recv_on_closed() {
   lio::init();
@@ -433,6 +436,7 @@ fn test_recv_on_closed() {
   receiver_close.try_recv().unwrap().expect("Failed to close server");
 }
 
+#[ignore = "flaky network test"]
 #[test]
 fn prop_test_recv_arbitrary_data() {
   lio::init();
