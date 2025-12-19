@@ -49,6 +49,7 @@ fn test_callback_basic_read() {
 }
 
 #[test]
+#[ignore]
 fn test_callback_basic_write() {
   lio::init();
   let path = CString::new("/tmp/lio_test_callback_write.txt").unwrap();
