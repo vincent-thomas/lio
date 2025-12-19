@@ -3,10 +3,7 @@ mod common;
 
 use lio::write;
 use proptest::{prelude::*, test_runner::TestRunner};
-use std::{
-  ffi::CString,
-  sync::mpsc::{self, TryRecvError},
-};
+use std::{ffi::CString, sync::mpsc, thread, time::Duration};
 
 #[test]
 fn test_write_large_buffer() {
@@ -37,9 +34,24 @@ fn test_write_large_buffer() {
   //   receiver.try_recv().map(|nice| nice.0).unwrap_err(),
   //   TryRecvError::Empty
   // );
-  lio::tick();
 
-  let (bytes_written, returned_buf) = receiver.try_recv().unwrap();
+  // Poll until the write completes (may take multiple ticks on some backends)
+  let (bytes_written, returned_buf) = {
+    let mut attempts = 0;
+    loop {
+      lio::tick();
+      match receiver.try_recv() {
+        Ok(result) => break result,
+        Err(_) => {
+          attempts += 1;
+          if attempts > 100 {
+            panic!("Write operation did not complete after 100 ticks");
+          }
+          thread::sleep(Duration::from_micros(100));
+        }
+      }
+    }
+  };
   let bytes_written =
     bytes_written.expect("Failed to write large buffer") as usize;
 
@@ -84,9 +96,24 @@ fn test_write_concurrent() {
     });
 
     // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-    lio::tick();
 
-    let (bytes_written, returned_buf) = receiver.recv().unwrap();
+    // Poll until the write completes (may take multiple ticks on some backends)
+    let (bytes_written, returned_buf) = {
+      let mut attempts = 0;
+      loop {
+        lio::tick();
+        match receiver.try_recv() {
+          Ok(result) => break result,
+          Err(_) => {
+            attempts += 1;
+            if attempts > 100 {
+              panic!("Write operation did not complete after 100 ticks");
+            }
+            thread::sleep(Duration::from_micros(100));
+          }
+        }
+      }
+    };
     let bytes_written = bytes_written.expect("Failed to write") as usize;
 
     assert_eq!(bytes_written, data_clone.len());
@@ -158,9 +185,25 @@ fn prop_test_write_arbitrary_data_and_offsets_run(
 
   let mut receiver = write(fd, test_data.clone(), write_offset).send();
 
-  lio::tick();
-
-  let (write_result, returned_buf) = receiver.try_recv().unwrap();
+  // Poll until the write completes (may take multiple ticks on some backends)
+  let (write_result, returned_buf) = {
+    let mut attempts = 0;
+    loop {
+      lio::tick();
+      match receiver.try_recv() {
+        Some(result) => break result,
+        None => {
+          attempts += 1;
+          if attempts > 100 {
+            return Err(TestCaseError::fail(
+              "Write operation did not complete after 100 ticks".to_string(),
+            ));
+          }
+          thread::sleep(Duration::from_micros(100));
+        }
+      }
+    }
+  };
 
   let bytes_written = write_result.map_err(|e| {
     TestCaseError::fail(format!("Write operation failed: {}", e))

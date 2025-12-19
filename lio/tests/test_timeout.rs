@@ -5,13 +5,13 @@ use std::time::Duration;
 fn test_timeout() {
   lio::init();
 
-  let mut recv = lio::timeout(Duration::from_millis(1000)).send();
+  let mut recv = lio::timeout(Duration::from_millis(300)).send();
 
   assert!(recv.try_recv().is_none());
 
   lio::tick();
   assert!(recv.try_recv().is_none());
-  std::thread::sleep(Duration::from_millis(1100));
+  std::thread::sleep(Duration::from_millis(400));
   assert!(recv.try_recv().is_none());
   lio::tick();
 

@@ -17,26 +17,10 @@ PKGCONFIG_DIR="$(readlink -f $PROJECT_ROOT/result)/lib/pkgconfig"
 
 which pkg-config
 
-# Nix's pkg-config wrapper uses architecture-specific variables
-# Detect if we're in a nix environment and set the appropriate variable
-if [ -n "${NIX_PKG_CONFIG_WRAPPER_TARGET_TARGET_aarch64_unknown_linux_gnu:-}" ]; then
-    export PKG_CONFIG_PATH_aarch64_unknown_linux_gnu="$PKGCONFIG_DIR"
-    echo "PKG_CONFIG_PATH_aarch64_unknown_linux_gnu=$PKG_CONFIG_PATH_aarch64_unknown_linux_gnu"
-elif [ -n "${NIX_PKG_CONFIG_WRAPPER_TARGET_TARGET_x86_64_unknown_linux_gnu:-}" ]; then
-    export PKG_CONFIG_PATH_x86_64_unknown_linux_gnu="$PKGCONFIG_DIR"
-    echo "PKG_CONFIG_PATH_x86_64_unknown_linux_gnu=$PKG_CONFIG_PATH_x86_64_unknown_linux_gnu"
-elif [ -n "${NIX_PKG_CONFIG_WRAPPER_TARGET_TARGET_x86_64_apple_darwin:-}" ]; then
-    export PKG_CONFIG_PATH_x86_64_apple_darwin="$PKGCONFIG_DIR"
-    echo "PKG_CONFIG_PATH_x86_64_apple_darwin=$PKG_CONFIG_PATH_x86_64_apple_darwin"
-elif [ -n "${NIX_PKG_CONFIG_WRAPPER_TARGET_TARGET_aarch64_apple_darwin:-}" ]; then
-    export PKG_CONFIG_PATH_aarch64_apple_darwin="$PKGCONFIG_DIR"
-    echo "PKG_CONFIG_PATH_aarch64_apple_darwin=$PKG_CONFIG_PATH_aarch64_apple_darwin"
-else
-    # Fallback to standard PKG_CONFIG_PATH for non-nix environments
-    echo "Falling back, no nix env"
-    export PKG_CONFIG_PATH="$PKGCONFIG_DIR"
-    echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
-fi
+echo "Falling back, no nix env"
+export PKG_CONFIG_PATH="$PKGCONFIG_DIR"
+echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
+
 echo ""
 echo "Testing pkg-config queries..."
 echo "1. Check if lio.pc is found:"

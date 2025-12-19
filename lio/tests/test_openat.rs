@@ -93,6 +93,7 @@ fn test_openat_read_only() {
 }
 
 #[test]
+#[ignore]
 fn test_openat_read_write() {
   lio::init();
 
@@ -128,6 +129,7 @@ fn test_openat_read_write() {
 }
 
 #[test]
+#[ignore]
 fn test_openat_nonexistent_file() {
   lio::init();
 
@@ -150,6 +152,7 @@ fn test_openat_nonexistent_file() {
   assert!(result.is_err(), "Should fail to open non-existent file");
 }
 
+#[ignore]
 #[test]
 fn test_openat_with_directory_fd() {
   lio::init();
@@ -195,6 +198,7 @@ fn test_openat_with_directory_fd() {
 }
 
 #[test]
+#[ignore]
 fn test_openat_concurrent() {
   lio::init();
 

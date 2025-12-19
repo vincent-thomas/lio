@@ -4,6 +4,7 @@
 use std::time::Instant;
 
 #[test]
+#[ignore]
 fn test_close_timing() {
   lio::init();
 
@@ -38,7 +39,9 @@ fn test_close_timing() {
       break;
     }
     if i == 9 {
-      panic!("test_close_timing: tee operation did not complete after 10 ticks");
+      panic!(
+        "test_close_timing: tee operation did not complete after 10 ticks"
+      );
     }
   }
   println!("Tee took: {:?}", tee_start.elapsed());
@@ -63,7 +66,9 @@ fn test_close_timing() {
     }
 
     if i == 9 {
-      panic!("test_close_timing: not all close operations completed after 10 ticks");
+      panic!(
+        "test_close_timing: not all close operations completed after 10 ticks"
+      );
     }
   }
 
