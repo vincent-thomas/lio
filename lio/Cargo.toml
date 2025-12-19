@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2024"
 description = "A platform-independent async I/O library with native support for io_uring (Linux), IOCP (Windows), and kqueue (macOS)"
 license = "MIT"
-repository = "https://github.com/liten-rs/liten"
+repository = "https://github.com/vincent-thomas/lio"
 documentation = "https://docs.rs/lio"
 keywords = ["async", "io", "networking", "filesystem"]
 categories = ["asynchronous", "network-programming", "filesystem"]
@@ -25,12 +25,15 @@ parking_lot = ["dep:parking_lot"]
 parking_lot = { version = "0.12", optional = true }
 socket2 = { version = "0.6.0" }
 libc = { version = "0.2.174" }
+dashmap = { version = "6.1" }
 
 tracing = { version = "0.1.41", optional = true }
-polling = "3.10.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.9"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_IO"] }
 
 [build-dependencies]
 cfg_aliases = "0.2.1"

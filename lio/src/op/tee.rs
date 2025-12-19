@@ -31,12 +31,7 @@ impl Operation for Tee {
       .build()
   }
 
-  fn fd(&self) -> Option<RawFd> {
-    None
-  }
-
-  #[cfg(not(linux))]
-  const EVENT_TYPE: Option<EventType> = None;
+  impl_no_readyness!();
 
   fn run_blocking(&self) -> std::io::Result<i32> {
     syscall!(tee(self.fd_in, self.fd_out, self.size as usize, 0))

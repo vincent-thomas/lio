@@ -8,8 +8,6 @@ use std::{
 #[cfg(linux)]
 use io_uring::{opcode, squeue, types::Fd};
 
-#[cfg(not(linux))]
-use crate::op::EventType;
 use crate::op::net_utils::libc_socketaddr_into_std;
 
 use super::Operation;
@@ -52,9 +50,11 @@ impl Operation for Accept {
     .build()
   }
 
-  #[cfg(not(linux))]
-  const EVENT_TYPE: Option<EventType> = Some(EventType::Read);
+  #[cfg(unix)]
+  const INTEREST: Option<crate::backends::pollingv2::Interest> =
+    Some(crate::backends::pollingv2::Interest::READ);
 
+  #[cfg(unix)]
   fn fd(&self) -> Option<RawFd> {
     Some(self.fd)
   }

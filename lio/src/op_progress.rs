@@ -2,7 +2,7 @@ use crate::op::Operation;
 
 use std::io;
 use std::sync::mpsc::Receiver;
-#[cfg(feature = "high")]
+use std::time::Duration;
 use std::{
   future::Future,
   pin::Pin,
@@ -22,6 +22,9 @@ pub struct BlockingReceiver<T> {
   recv: Option<Receiver<T>>,
 }
 
+#[derive(Debug)]
+pub struct RecvTimeoutError;
+
 impl<T> BlockingReceiver<T> {
   fn get_inner(&mut self) -> Option<Receiver<T>> {
     mem::replace(&mut self.recv, None)
@@ -37,6 +40,16 @@ impl<T> BlockingReceiver<T> {
       Some(value) => value
         .recv()
         .expect("internal lio error: Sender dropped without sending"),
+      None => unreachable!(),
+    }
+  }
+
+  pub fn recv_timeout(
+    mut self,
+    duration: Duration,
+  ) -> Result<T, RecvTimeoutError> {
+    match self.get_inner() {
+      Some(value) => value.recv_timeout(duration).map_err(|_| RecvTimeoutError),
       None => unreachable!(),
     }
   }
@@ -352,15 +365,34 @@ where
   }
 }
 
-// Threading backend works on all platforms
-impl<T> OperationProgress<T> where T: op::Operation {}
-
-/// Implements `Future` for polling-based operations on non-Linux platforms.
-///
-/// This implementation handles operations that use polling-based async I/O,
-/// automatically re-registering for events when operations would block.
 #[cfg(feature = "high")]
-impl<T> Future for OperationProgress<T>
+impl<T> IntoFuture for OperationProgress<T>
+where
+  T: Operation + Unpin,
+{
+  type Output = T::Result;
+  type IntoFuture = FutRecv<T>;
+
+  fn into_future(self) -> Self::IntoFuture {
+    match self {
+      OperationProgress::StoreTracked { id } => FutRecv::StoreTracked { id },
+      OperationProgress::Threaded { id } => FutRecv::Threaded { id },
+      OperationProgress::FromResult { res, operation } => {
+        FutRecv::FromResult { res, operation }
+      }
+    }
+  }
+}
+
+#[cfg(feature = "high")]
+pub enum FutRecv<T> {
+  StoreTracked { id: u64 },
+  Threaded { id: u64 },
+  FromResult { res: Option<io::Result<i32>>, operation: T },
+}
+
+#[cfg(feature = "high")]
+impl<T> Future for FutRecv<T>
 where
   T: Operation + Unpin,
 {
@@ -384,24 +416,12 @@ where
     }
 
     match *self {
-      OperationProgress::StoreTracked { id }
-      | OperationProgress::Threaded { id } => check_done::<T>(id, cx),
-      OperationProgress::FromResult { ref mut res, ref mut operation } => {
+      FutRecv::StoreTracked { id } => check_done::<T>(id, cx),
+      FutRecv::Threaded { id } => check_done::<T>(id, cx),
+      FutRecv::FromResult { ref mut res, ref mut operation } => {
         let result = operation.result(res.take().expect("Already awaited."));
         Poll::Ready(result)
       }
-    }
-  }
-}
-
-impl<T> Drop for OperationProgress<T> {
-  fn drop(&mut self) {
-    match self {
-      OperationProgress::StoreTracked { id: _ } => {
-        // Driver::get().detach(*id);
-      }
-      OperationProgress::Threaded { id: _ } => {}
-      OperationProgress::FromResult { res: _, operation: _ } => {}
     }
   }
 }

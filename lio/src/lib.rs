@@ -76,6 +76,7 @@ use std::{
   ffi::{CString, NulError},
   net::SocketAddr,
   os::fd::RawFd,
+  time::Duration,
 };
 
 /// Result type for operations that return both a result and a buffer.
@@ -89,12 +90,15 @@ pub type BufResult<T, B> = (std::io::Result<T>, B);
 #[macro_use]
 mod macros;
 
-mod driver;
+pub mod driver;
 
 pub use driver::OpStore;
 
 pub mod op;
 use op::*;
+
+#[cfg(target_os = "linux")]
+mod liburing;
 
 mod op_progress;
 mod op_registration;
@@ -104,13 +108,13 @@ pub use backends::IoBackend;
 
 pub use op_progress::{BlockingReceiver, OperationProgress};
 
-use crate::driver::{Driver, LioAlreadyInitialized};
+use crate::driver::{Driver, TryInitError};
 use std::path::Path;
 
 macro_rules! impl_op {
   // Internal helper: Generate function with common documentation
   (@impl_fn
-    { $desc:expr, $operation:ident, $name:ident, [$($arg:ident : $arg_ty:ty),*], $ret:ty }
+    { $desc:expr, $operation:ident, $name:ident, [$($arg:ident : $arg_ty:ty),*], $ret:ty, $detach_safe:expr }
     $( #[$($doc:tt)*] )*
     { $($body:tt)* }
   ) => {
@@ -121,6 +125,7 @@ macro_rules! impl_op {
     #[doc = concat!("```ignore\nasync fn ",stringify!($name), "(", stringify!($($arg_ty),*), ") -> ", stringify!($ret), "\n```")]
     #[doc = "# Behavior"]
     #[doc = "As soon as this function is called, the operation is submitted into the io-driver used by the current platform (for example io-uring). If the user then chooses to drop [`OperationProgress`] before the [`Future`] is ready, the operation will **NOT** tried be cancelled, but instead \"detached\"."]
+    #[doc = $detach_safe]
     #[doc = "\n\nSee more [what methods are available to the return type](crate::OperationProgress#impl-OperationProgress<T>)."]
     $( #[$($doc)*] )*
     $($body)*
@@ -132,11 +137,16 @@ macro_rules! impl_op {
     $(#[$($doc:tt)*])*
     $operation:ident, fn $name:ident ( $($arg:ident: $arg_ty:ty),* ) -> $ret:ty ; $err:ty
   ) => {
-    impl_op!(
-      concat!($desc, "\n\n### Detach safe\n This method is not [`detach safe`](crate::DetachSafe), which means that resources _**will**_ leak if not handled carefully."),
-      $(#[$($doc)*])*
-      $operation,
-      fn $name($($arg: $arg_ty),*) -> $ret:ty ; $err:ty
+    use op::$operation;
+
+    impl_op!(@impl_fn
+      { $desc, $operation, $name, [$($arg : $arg_ty),*], $ret, "\n\n## Detach safe\nThis method is not [`detach safe`](crate::DetachSafe), which means that resources _**will**_ leak if not handled carefully." }
+      $( #[$($doc)*] )*
+      {
+        pub fn $name($($arg: $arg_ty),*) -> Result<OperationProgress<$operation>, $err> {
+          Ok(Driver::submit($operation::new($($arg),*)?))
+        }
+      }
     );
   };
 
@@ -146,11 +156,14 @@ macro_rules! impl_op {
     $(#[$($doc:tt)*])*
     $operation:ident, fn $name:ident ( $($arg:ident: $arg_ty:ty),* ) -> $ret:ty
   ) => {
-    impl_op!(
-      concat!($desc, "\n\n### Detach safe\n This method is not [`detach safe`](crate::DetachSafe), which means that resources _**will**_ leak if not handled carefully."),
-      $(#[$($doc)*])*
-      $operation,
-      fn $name($($arg: $arg_ty),*) -> $ret
+    impl_op!(@impl_fn
+      { $desc, $operation, $name, [$($arg : $arg_ty),*], $ret, "\n\n## Detach safe\nThis method is not [`detach safe`](crate::DetachSafe), which means that resources _**will**_ leak if not handled carefully." }
+      $( #[$($doc)*] )*
+      {
+        pub fn $name($($arg: $arg_ty),*) -> OperationProgress<$operation> {
+          Driver::submit($operation::new($($arg),*))
+        }
+      }
     );
   };
 
@@ -163,7 +176,7 @@ macro_rules! impl_op {
     use op::$operation;
 
     impl_op!(@impl_fn
-      { $desc, $operation, $name, [$($arg : $arg_ty),*], $ret }
+      { $desc, $operation, $name, [$($arg : $arg_ty),*], $ret, "" }
       $( #[$($doc)*] )*
       {
         pub fn $name($($arg: $arg_ty),*) -> Result<OperationProgress<$operation>, $err> {
@@ -180,7 +193,7 @@ macro_rules! impl_op {
     $operation:ident, fn $name:ident ( $($arg:ident: $arg_ty:ty),* ) -> $ret:ty
   ) => {
     impl_op!(@impl_fn
-      { $desc, $operation, $name, [$($arg : $arg_ty),*], $ret }
+      { $desc, $operation, $name, [$($arg : $arg_ty),*], $ret, "" }
       $( #[$($doc)*] )*
       {
         pub fn $name($($arg: $arg_ty),*) -> OperationProgress<$operation> {
@@ -199,9 +212,6 @@ macro_rules! impl_op {
   };
 }
 
-#[cfg(linux)]
-use std::time::Duration;
-
 impl_op!(
  "Shuts socket down.",
  /// # Examples
@@ -217,8 +227,6 @@ impl_op!(
  Shutdown, fn shutdown(fd: RawFd, how: i32) -> io::Result<()>
 );
 
-#[cfg(linux)]
-#[cfg_attr(docsrs, doc(cfg(linux)))]
 impl_op!(
   "Times out something",
   /// # Examples
@@ -280,7 +288,17 @@ impl_op!(
 );
 
 impl_op!(
-  "Performs a write operation on a file descriptor. Equivalent to the `pwrite` syscall.",
+  "Performs a write operation on a file descriptor. Equivalent to the `pwrite` syscall.
+
+# Offset Behavior
+
+- **Seekable fd, offset ≥ 0**: Write at specified offset (does not advance file cursor).
+- **Seekable fd, offset -1**: Write at current file position and advance the cursor.
+- **Non-seekable fd** (e.g., pipes, sockets, stdout): Offset is ignored; behaves like `write(2)`.
+
+# Errors
+
+- `EINVAL`: Invalid offset on non-seekable fd.",
   /// # Examples
   ///
   /// ```rust
@@ -514,6 +532,41 @@ pub fn tick() {
   Driver::get().tick(false)
 }
 
+/// Spawns a background worker thread that continuously processes I/O operations.
+///
+/// The worker thread will automatically process pending I/O operations, so you don't
+/// need to manually call `tick()`. This is useful for applications that want async
+/// operations to complete in the background.
+///
+/// # Example
+///
+/// ```no_run
+/// lio::init();
+/// lio::start().expect("Failed to spawn worker");
+///
+/// // Operations now complete automatically in the background
+/// // No need to call tick() manually
+///
+/// lio::stop(); // Clean shutdown
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if a worker thread is already running.
+pub fn start() -> Result<(), &'static str> {
+  Driver::get().spawn_worker()
+}
+
+/// Stops the background worker thread gracefully.
+///
+/// Sends a shutdown signal to the worker and waits for it to finish.
+/// Does nothing if no worker is running.
+///
+/// This should be called before `exit()` if you've spawned a worker thread.
+pub fn stop() {
+  Driver::get().stop_worker()
+}
+
 /// Deallocates the lio I/O driver, freeing all resources.
 ///
 /// This must be called after `exit()` to properly clean up the driver.
@@ -522,7 +575,7 @@ pub fn exit() {
   Driver::exit()
 }
 
-pub fn try_init() -> Result<(), LioAlreadyInitialized> {
+pub fn try_init() -> Result<(), TryInitError> {
   Driver::try_init()
 }
 

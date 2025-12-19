@@ -8,24 +8,24 @@ pub struct IoUring {
   inner: io_uring::IoUring,
   probe: io_uring::Probe,
   submission_guard: Mutex<()>,
-  polling: super::Polling,
+  polling: super::pollingv2::Poller,
 }
 
 impl IoUring {
-  pub fn new() -> Self {
+  pub fn new() -> io::Result<Self> {
     let (io_uring, probe) = {
-      let io_uring = io_uring::IoUring::new(256).unwrap();
+      let io_uring = io_uring::IoUring::new(256)?;
       let mut probe = io_uring::Probe::new();
-      io_uring.submitter().register_probe(&mut probe).unwrap();
+      io_uring.submitter().register_probe(&mut probe)?;
       (io_uring, probe)
     };
 
-    Self {
+    Ok(Self {
       inner: io_uring,
       probe,
       submission_guard: Mutex::new(()),
-      polling: super::Polling::new(),
-    }
+      polling: super::pollingv2::Poller::new()?,
+    })
   }
   pub fn from_i32_to_io_result(res: i32) -> io::Result<i32> {
     if res < 0 { Err(io::Error::from_raw_os_error(res)) } else { Ok(res) }
@@ -66,11 +66,27 @@ impl IoBackend for IoUring {
   }
 
   fn notify(&self) {
-    todo!();
+    // Submit a NOP operation to wake up submit_and_wait
+    // Use a special user_data value (u64::MAX) that won't match any real operation
+    // Submit a NOP operation to wake up submit_and_wait
+    // Use a special user_data value that won't match any real operation
+    let nop_entry = io_uring::opcode::Nop::new().build().user_data(u64::MAX);
+
+    let _g = self.submission_guard.lock();
+    unsafe {
+      let mut sub = self.inner.submission_shared();
+      // If queue is full, just skip - the tick will happen soon anyway
+      let _ = sub.push(&nop_entry);
+      sub.sync();
+    }
+    drop(_g);
+
+    // Submit to wake up any blocked submit_and_wait
+    let _ = self.inner.submit();
   }
 
   fn tick(&self, store: &OpStore, can_wait: bool) {
-    self.polling.tick(store, can_wait);
+    self.polling.tick(store, false);
 
     self.inner.submit_and_wait(if can_wait { 1 } else { 0 }).unwrap();
 

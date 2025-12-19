@@ -3,8 +3,6 @@ use std::{io, os::fd::RawFd};
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-#[cfg(not(linux))]
-use crate::op::EventType;
 use crate::{BufResult, op::DetachSafe};
 
 use super::Operation;
@@ -44,9 +42,11 @@ impl Operation for Recv {
     }
   }
 
-  #[cfg(not(linux))]
-  const EVENT_TYPE: Option<EventType> = Some(EventType::Read);
+  #[cfg(unix)]
+  const INTEREST: Option<crate::backends::pollingv2::Interest> =
+    Some(crate::backends::pollingv2::Interest::READ);
 
+  #[cfg(unix)]
   fn fd(&self) -> Option<RawFd> {
     Some(self.fd)
   }

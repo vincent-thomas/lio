@@ -1,15 +1,3 @@
-macro_rules! syscall {
-  ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
-      #[allow(unused_unsafe)]
-      let res = unsafe { libc::$fn($($arg, )*) };
-      if res == -1 {
-          Err(std::io::Error::last_os_error())
-      } else {
-          Ok(res)
-      }
-  }};
-}
-
 use std::io;
 use std::os::fd::RawFd;
 
@@ -33,7 +21,6 @@ mod shutdown;
 mod symlink;
 #[cfg(linux)]
 mod tee;
-#[cfg(linux)]
 mod timeout;
 mod truncate;
 mod write;
@@ -55,7 +42,6 @@ pub use send::*;
 pub use shutdown::*;
 pub use socket::*;
 pub use symlink::*;
-#[cfg(linux)]
 pub use timeout::*;
 
 #[cfg(linux)]
@@ -93,15 +79,11 @@ pub trait Operation: Sealed {
 
   const IS_CONNECT: bool = false;
 
-  const EVENT_TYPE: Option<EventType> = None;
+  #[cfg(unix)]
+  const INTEREST: Option<crate::backends::pollingv2::Interest> = None;
 
+  #[cfg(unix)]
   fn fd(&self) -> Option<RawFd>;
 
   fn run_blocking(&self) -> io::Result<i32>;
-}
-
-#[derive(Debug)]
-pub enum EventType {
-  Read,
-  Write,
 }

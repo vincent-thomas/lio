@@ -28,6 +28,7 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
+        inherit (nixpkgs) lib;
       in
       {
         packages.default = import ./default.nix { inherit pkgs; };
@@ -38,19 +39,23 @@
               (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
               gcc
               gnumake
+              pkg-config-unwrapped
 
               cargo-nextest
-              cargo-hack
-              cargo-audit
-              cargo-deny
             ];
           in
           {
             ci = pkgs.mkShell {
               inherit nativeBuildInputs;
+              packages = [
+                cargo-deny
+                cargo-audit
+                cargo-hack
+              ];
             };
             default = pkgs.mkShell {
               buildInputs = nativeBuildInputs;
+              RUST_BACKTRACE = "1";
             };
           };
       }

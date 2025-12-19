@@ -33,9 +33,12 @@
 //! ```
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ptr;
+use std::{ptr, time::Duration};
 
-use crate::op::net_utils::{self, sockaddr_to_socketaddr};
+use crate::{
+  driver::TryInitError,
+  op::net_utils::{self, sockaddr_to_socketaddr},
+};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_init() {
@@ -46,8 +49,30 @@ pub extern "C" fn lio_init() {
 pub extern "C" fn lio_try_init() -> libc::c_int {
   match crate::try_init() {
     Ok(_) => 0,
-    Err(_) => -1,
+    Err(err) => match err {
+      TryInitError::AlreadyInit => -1,
+      TryInitError::Io(io) => io.raw_os_error().unwrap_or(-1),
+    },
   }
+}
+
+/// Shutdown the lio runtime and wait for all pending operations to complete.
+///
+/// This function blocks until all pending I/O operations finish and their callbacks are called.
+/// After calling this, no new operations should be submitted.
+#[unsafe(no_mangle)]
+pub extern "C" fn lio_exit() {
+  crate::exit()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lio_start() {
+  crate::start().unwrap()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lio_stop() {
+  crate::stop()
 }
 
 /// Shut down part of a full-duplex connection.
@@ -453,11 +478,25 @@ pub extern "C" fn lio_close(fd: libc::c_int, callback: extern "C" fn(i32)) {
   });
 }
 
-/// Shutdown the lio runtime and wait for all pending operations to complete.
+/// Waits for a specified duration.
 ///
-/// This function blocks until all pending I/O operations finish and their callbacks are called.
-/// After calling this, no new operations should be submitted.
+/// # Parameters
+/// - `millis`: Duration to sleep in milliseconds.
+/// - `callback(result)`: Called when complete
 #[unsafe(no_mangle)]
-pub extern "C" fn lio_exit() {
-  crate::exit()
+pub extern "C" fn lio_timeout(
+  millis: libc::c_int,
+  callback: extern "C" fn(i32),
+) {
+  if millis < 0 {
+    callback(libc::EINVAL);
+    return;
+  }
+  crate::timeout(Duration::from_millis(millis as u64)).when_done(move |res| {
+    let result_code = match res {
+      Ok(_) => 0,
+      Err(err) => err.raw_os_error().unwrap_or(-1),
+    };
+    callback(result_code);
+  });
 }

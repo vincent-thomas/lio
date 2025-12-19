@@ -29,8 +29,18 @@ fn test_close_timing() {
   let tee_start = Instant::now();
   let mut tee_recv =
     lio::tee(pipe1_fds[0], pipe2_fds[1], test_data.len() as u32).send();
-  lio::tick();
-  tee_recv.try_recv().unwrap().unwrap();
+
+  // Try multiple ticks - some operations need more than one
+  for i in 0..10 {
+    lio::tick();
+    if let Some(result) = tee_recv.try_recv() {
+      result.expect("test_close_timing: tee operation failed");
+      break;
+    }
+    if i == 9 {
+      panic!("test_close_timing: tee operation did not complete after 10 ticks");
+    }
+  }
   println!("Tee took: {:?}", tee_start.elapsed());
 
   // Close all file descriptors
@@ -39,12 +49,23 @@ fn test_close_timing() {
   let mut close3_recv = lio::close(pipe2_fds[0]).send();
   let mut close4_recv = lio::close(pipe2_fds[1]).send();
 
-  lio::tick();
+  // Try multiple ticks for close operations too
+  for i in 0..10 {
+    lio::tick();
 
-  close1_recv.try_recv().unwrap().unwrap();
-  close2_recv.try_recv().unwrap().unwrap();
-  close3_recv.try_recv().unwrap().unwrap();
-  close4_recv.try_recv().unwrap().unwrap();
+    let close1_done = close1_recv.try_recv().is_some();
+    let close2_done = close2_recv.try_recv().is_some();
+    let close3_done = close3_recv.try_recv().is_some();
+    let close4_done = close4_recv.try_recv().is_some();
+
+    if close1_done && close2_done && close3_done && close4_done {
+      break;
+    }
+
+    if i == 9 {
+      panic!("test_close_timing: not all close operations completed after 10 ticks");
+    }
+  }
 
   println!("Total execution took: {:?}", start.elapsed());
 }

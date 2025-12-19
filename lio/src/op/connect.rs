@@ -8,8 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use io_uring::types::Fd;
 
 use crate::op::DetachSafe;
-#[cfg(not(linux))]
-use crate::op::EventType;
 use crate::op::net_utils::std_socketaddr_into_libc;
 
 use super::Operation;
@@ -61,11 +59,12 @@ impl Operation for Connect {
     .build()
   }
 
-  #[cfg(not(linux))]
+  #[cfg(unix)]
   const IS_CONNECT: bool = true;
 
-  #[cfg(not(linux))]
-  const EVENT_TYPE: Option<EventType> = Some(EventType::Write);
+  #[cfg(unix)]
+  const INTEREST: Option<crate::backends::pollingv2::Interest> =
+    Some(crate::backends::pollingv2::Interest::WRITE);
 
   fn fd(&self) -> Option<RawFd> {
     Some(self.fd)
