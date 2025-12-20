@@ -165,7 +165,7 @@ pub use extra_buf::*;
 #[cfg(feature = "buf")]
 mod extra_buf {
   use crate::sync::Mutex;
-  use std::{array, ops::Index};
+  use std::array;
 
   /// A borrowed buffer from a `BufStore` pool.
   ///
@@ -179,6 +179,10 @@ mod extra_buf {
   impl super::BufLike for LentBuf<'_> {
     fn init(&mut self) {
       self.0.len = 0;
+      #[cfg(feature = "buf")]
+      {
+        self.0.pos = 0;
+      }
     }
 
     unsafe fn buf_ptr(&self) -> *const u8 {
@@ -202,14 +206,7 @@ mod extra_buf {
 
   impl<'a> AsRef<[u8]> for LentBuf<'a> {
     fn as_ref(&self) -> &[u8] {
-      &self.0.buf[..self.0.len]
-    }
-  }
-
-  impl<'a> Index<usize> for LentBuf<'a> {
-    type Output = u8;
-    fn index(&self, index: usize) -> &Self::Output {
-      &self.0.buf[index]
+      &self.0.buf[self.pos()..self.0.len]
     }
   }
 
@@ -221,10 +218,11 @@ mod extra_buf {
   impl<'a> Iterator for LentBufIter<'a> {
     type Item = u8;
     fn next(&mut self) -> Option<Self::Item> {
-      if self.index >= self.buf.0.len {
+      let remaining = self.buf.0.len - self.buf.pos();
+      if self.index >= remaining {
         None
       } else {
-        let val = self.buf[self.index];
+        let val = self.buf.as_ref()[self.index];
         self.index += 1;
         Some(val)
       }
@@ -240,7 +238,63 @@ mod extra_buf {
     }
   }
 
+  /// Implementation of `bytes::Buf` for `LentBuf`.
+  ///
+  /// Allows `LentBuf` to be used with the `bytes` crate ecosystem.
+  /// The buffer's valid data is from `pos..len`, where `len` is set by `deinit()`
+  /// and `pos` tracks how much has been consumed via `advance()`.
+  ///
+  /// This implementation uses a position offset instead of copying data,
+  /// making `advance()` a zero-copy operation.
+  ///
+  /// # Example
+  ///
+  /// ```ignore
+  /// use bytes::Buf;
+  ///
+  /// let store = BufStore::default();
+  /// let mut buf = store.try_get().unwrap();
+  /// // ... fill buffer with data and call deinit(n) ...
+  ///
+  /// // Use as bytes::Buf - all operations are zero-copy
+  /// let byte = buf.get_u8();
+  /// let bytes = buf.copy_to_bytes(4);
+  /// ```
+  impl bytes::Buf for LentBuf<'_> {
+    fn remaining(&self) -> usize {
+      self.0.len - self.0.pos
+    }
+
+    fn chunk(&self) -> &[u8] {
+      &self.0.buf[self.0.pos..self.0.len]
+    }
+
+    fn advance(&mut self, cnt: usize) {
+      let remaining = self.0.len - self.0.pos;
+      assert!(
+        cnt <= remaining,
+        "LentBuf::advance: cannot advance by {} bytes, only {} remaining",
+        cnt,
+        remaining
+      );
+
+      self.0.pos += cnt;
+    }
+  }
+
   impl<'a> LentBuf<'a> {
+    #[inline]
+    fn pos(&self) -> usize {
+      #[cfg(feature = "buf")]
+      {
+        self.0.pos
+      }
+      #[cfg(not(feature = "buf"))]
+      {
+        0
+      }
+    }
+
     /// Returns an iterator over `chunk_size` chunks of the buffer.
     ///
     /// The last chunk may be shorter if the buffer length is not evenly divisible.
@@ -270,11 +324,18 @@ mod extra_buf {
   pub(crate) struct BufStoreBuffer {
     buf: [u8; 4096],
     len: usize,
+    #[cfg(feature = "buf")]
+    pos: usize,
   }
 
   impl BufStoreBuffer {
     pub fn new() -> Self {
-      Self { buf: array::from_fn::<_, 4096, _>(|_| 0), len: 0 }
+      Self {
+        buf: array::from_fn::<_, 4096, _>(|_| 0),
+        len: 0,
+        #[cfg(feature = "buf")]
+        pos: 0,
+      }
     }
   }
 
@@ -420,6 +481,47 @@ mod extra_buf {
       assert_eq!(windows[0], b"ABC");
       assert_eq!(windows[1], b"BCD");
       assert_eq!(windows[2], b"CDE");
+    }
+
+    #[test]
+    fn test_lent_buf_bytes_buf() {
+      use bytes::Buf;
+
+      let store = BufStore::with_capacity(1);
+      let mut buf = store.try_get().expect("should get buffer from pool");
+
+      buf.init();
+      buf.0.len = 8;
+      buf.0.buf[0] = b'H';
+      buf.0.buf[1] = b'e';
+      buf.0.buf[2] = b'l';
+      buf.0.buf[3] = b'l';
+      buf.0.buf[4] = b'o';
+      buf.0.buf[5] = b'!';
+      buf.0.buf[6] = b'!';
+      buf.0.buf[7] = b'!';
+
+      // Test remaining
+      assert_eq!(buf.remaining(), 8);
+
+      // Test chunk
+      assert_eq!(buf.chunk(), b"Hello!!!");
+
+      // Test get_u8
+      assert_eq!(buf.get_u8(), b'H');
+      assert_eq!(buf.remaining(), 7);
+      assert_eq!(buf.chunk(), b"ello!!!");
+
+      // Test advance
+      buf.advance(4);
+      assert_eq!(buf.remaining(), 3);
+      assert_eq!(buf.chunk(), b"!!!");
+
+      // Test copy_to_bytes
+      let bytes = buf.copy_to_bytes(2);
+      assert_eq!(&bytes[..], b"!!");
+      assert_eq!(buf.remaining(), 1);
+      assert_eq!(buf.chunk(), b"!");
     }
   }
 }

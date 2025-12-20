@@ -6,7 +6,7 @@ lint-flags:
 	cargo hack check --feature-powerset --lib --tests
 
 doc:
-	RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --no-deps --all-features
+	RUSTDOCFLAGS="--cfg docsrs" cargo doc --no-deps --all-features
 
 cbuild:
 	cargo rustc -p lio --crate-type dylib,staticlib --features unstable_ffi --release
