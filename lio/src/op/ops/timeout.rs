@@ -7,7 +7,7 @@ use std::time::Duration;
 #[cfg(linux)]
 use io_uring::{opcode, squeue, types::Timespec};
 
-use super::Operation;
+use crate::op::Operation;
 
 pub struct Timeout {
   duration: Duration,
@@ -27,7 +27,10 @@ impl Timeout {
     Self::new_with_id(duration, 0)
   }
 
-  pub(crate) fn new_with_id(duration: Duration, id: u64) -> Self {
+  pub(crate) fn new_with_id(
+    duration: Duration,
+    #[allow(unused)] id: u64,
+  ) -> Self {
     #[cfg(target_os = "linux")]
     let timer_fd =
       Self::create_timer_fd(duration).expect("Failed to create timerfd");

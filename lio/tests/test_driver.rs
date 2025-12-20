@@ -18,7 +18,7 @@ fn test_worker_start_stop() {
 
   let thing = "hello".as_bytes().to_vec();
 
-  let send = lio::write(2, thing, -1).send();
+  let send = lio::write_with_buf(2, thing, -1).send();
 
   let (res, _buf) = send.recv();
 

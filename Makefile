@@ -12,10 +12,13 @@ cbuild:
 	cargo rustc -p lio --crate-type dylib,staticlib --features unstable_ffi --release
 	echo "lio: built c api at: $(pwd)/target/release/liblio.(dylib|so|dll)"
 
-test:
-	cargo nextest r --release -p lio --all-features --stress-count 10
+test: test-lib test-ffi test-doc
+
+test-doc:
 	RUST_BACKTRACE=1 cargo test --doc
-	$(MAKE) test-ffi
+
+test-lib:
+	cargo nextest r --release -p lio --all-features --stress-count 10
 
 test-ffi:
 	./lio/tests/ffi/test.sh

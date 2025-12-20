@@ -29,11 +29,13 @@ pub(crate) mod tests;
 use std::collections::HashMap;
 use std::io::{self, ErrorKind};
 use std::os::fd::RawFd;
+use std::slice;
 use std::time::Duration;
 
 use crate::op::Operation;
 use crate::op_registration::OpNotification;
-use crate::{IoBackend, OpStore, OperationProgress};
+use crate::sync::Mutex;
+use crate::{OperationProgress, backends::IoBackend, driver::OpStore};
 
 /// Interest flags for event registration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,18 +130,30 @@ pub struct Event {
 /// A collection of events returned from polling
 pub struct Events {
   events: Vec<<sys::OsPoller as ReadinessPoll>::NativeEvent>,
-  len: usize,
 }
+
+// impl AsMut<[<sys::OsPoller as ReadinessPoll>::NativeEvent]> for Events {
+//   /// Makes Events ready for input.
+//   fn as_mut(&mut self) -> &mut [<sys::OsPoller as ReadinessPoll>::NativeEvent] {
+//
+//     // &mut self.events
+//   }
+// }
+
+// SAFETY: Events buffer is protected by Mutex and only used within the same thread
+// The raw pointers in NativeEvent (e.g., kevent) are never dereferenced across threads
+unsafe impl Send for Events {}
+unsafe impl Sync for Events {}
 
 impl Events {
   /// Create a new empty events collection with default capacity
   pub fn new() -> Self {
-    Self::with_capacity(128)
+    Self::with_capacity(512)
   }
 
   /// Create a new empty events collection with specified capacity
   pub fn with_capacity(capacity: usize) -> Self {
-    Self { events: vec![unsafe { std::mem::zeroed() }; capacity], len: 0 }
+    Self { events: vec![unsafe { std::mem::zeroed() }; capacity] }
   }
 
   /// Get an iterator over the events
@@ -149,25 +163,32 @@ impl Events {
 
   /// Get the number of events
   pub fn len(&self) -> usize {
-    self.len
+    self.events.len()
   }
 
-  /// Check if there are no events
-  pub fn is_empty(&self) -> bool {
-    self.len == 0
+  unsafe fn set_len(&mut self, len: usize) {
+    assert!(len <= self.events.capacity(), "set_len: len must be <= capacity");
+    unsafe { self.events.set_len(len) }
   }
 
-  fn as_mut_slice(
+  /// Returns the whole allocated buf
+  fn as_buf_mut(
     &mut self,
   ) -> &mut [<sys::OsPoller as ReadinessPoll>::NativeEvent] {
-    &mut self.events
+    unsafe {
+      slice::from_raw_parts_mut(
+        self.events.as_mut_ptr(),
+        self.events.capacity(),
+      )
+    }
   }
 
-  fn set_len(&mut self, len: usize) {
-    self.len = len;
+  fn clear(&mut self) {
+    self.events.clear();
   }
 
   fn get_event(&self, index: usize) -> Event {
+    assert!(index < self.events.len(), "get_event: index out of bounds");
     let native_event = &self.events[index];
     let key = sys::OsPoller::event_key(native_event);
     let interest = sys::OsPoller::event_interest(native_event);
@@ -209,8 +230,9 @@ impl<'a> Iterator for EventsIter<'a> {
 
 /// Main polling structure
 pub struct Poller {
-  fd_map: crate::sync::Mutex<HashMap<u64, RawFd>>,
+  fd_map: Mutex<HashMap<u64, RawFd>>,
   inner: sys::OsPoller,
+  events: Mutex<Events>,
 }
 
 impl Poller {
@@ -218,7 +240,8 @@ impl Poller {
   pub fn new() -> io::Result<Self> {
     Ok(Self {
       inner: sys::OsPoller::new()?,
-      fd_map: crate::sync::Mutex::new(HashMap::default()),
+      fd_map: Mutex::new(HashMap::default()),
+      events: Mutex::new(Events::new()),
     })
   }
 
@@ -229,9 +252,12 @@ impl Poller {
     key: u64,
     interest: Interest,
   ) -> io::Result<()> {
-    if fd < 0 {
-      return Err(io::Error::from_raw_os_error(libc::EBADF));
-    }
+    assert!(fd >= 0, "Poller::add: fd must be >= 0, got {}", fd);
+    assert_ne!(
+      interest,
+      Interest::None,
+      "Poller::add: interest cannot be None"
+    );
 
     self.inner.add(fd, key, interest)
   }
@@ -242,11 +268,16 @@ impl Poller {
       return Err(io::Error::from_raw_os_error(libc::EBADF));
     }
 
+    assert!(
+      event.readable || event.writable || event.timer,
+      "Poller::modify: at least one of readable/writable/timer must be true"
+    );
+
     let interest = match (event.readable, event.writable) {
       (true, true) => Interest::ReadAndWrite,
       (true, false) => Interest::Read,
       (false, true) => Interest::Write,
-      (false, false) => Interest::Read, // Fallback
+      (false, false) => unreachable!("already checked above"),
     };
 
     self.inner.modify(fd, event.key, interest)
@@ -267,11 +298,18 @@ impl Poller {
   }
 
   /// Wait for events with optional timeout
-  pub fn wait(&self, timeout: Option<Duration>) -> io::Result<Events> {
-    let mut events = Events::new();
-    let n = self.inner.wait(events.as_mut_slice(), timeout)?;
-    events.set_len(n);
-    Ok(events)
+  /// Reuses the internal events buffer to avoid allocations
+  fn wait(&self, timeout: Option<Duration>) -> io::Result<()> {
+    let mut events = self.events.lock();
+    events.clear();
+
+    let n = self.inner.wait(events.as_buf_mut(), timeout)?;
+    assert!(
+      n <= events.events.capacity(),
+      "wait returned more events than buffer capacity"
+    );
+    unsafe { events.set_len(n) };
+    Ok(())
   }
 
   fn new_polling<T>(&self, op: T, store: &OpStore) -> OperationProgress<T>
@@ -281,6 +319,7 @@ impl Poller {
     let interest = T::INTEREST.expect("op is event but no interest??");
     let id = store.next_id();
     let fd = op.fd().expect("not provided fd");
+    assert!(fd >= 0, "new_polling: fd must be valid (>= 0)");
 
     self.fd_map.lock().insert(id, fd);
     store.insert(id, Box::new(op));
@@ -301,7 +340,7 @@ impl IoBackend for Poller {
       };
     };
 
-    if !O::IS_CONNECT {
+    if !O::FLAGS.is_connect() {
       return self.new_polling(op, store);
     };
 
@@ -320,12 +359,19 @@ impl IoBackend for Poller {
     self.inner.notify().unwrap();
   }
   fn tick(&self, store: &OpStore, can_wait: bool) {
-    let events = self
+    self
       .wait(if can_wait { None } else { Some(Duration::from_millis(0)) })
       .expect("background thread failed");
 
+    let events = self.events.lock();
+
     for event in events.iter() {
       let operation_id = event.key as u64;
+      assert_ne!(
+        operation_id,
+        u64::MAX,
+        "Poller::tick: internal notification event should be filtered"
+      );
 
       // Look up fd from our internal map
       let entry_fd = *self
@@ -366,7 +412,6 @@ impl IoBackend for Poller {
           match set_done_result {
             None => {}
             Some(value) => match value {
-              #[cfg(feature = "high")]
               OpNotification::Waker(waker) => waker.wake(),
               OpNotification::Callback(callback) => {
                 store.get_mut(operation_id, |entry| callback.call(entry));

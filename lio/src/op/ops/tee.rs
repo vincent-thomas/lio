@@ -4,7 +4,7 @@ use std::{io, os::fd::RawFd};
 
 use io_uring::types::Fd;
 
-use super::Operation;
+use crate::op::Operation;
 
 // TODO: not sure detach safe.
 pub struct Tee {
@@ -20,6 +20,8 @@ impl Tee {
 }
 
 impl Operation for Tee {
+  impl_no_readyness!();
+
   #[cfg(linux)]
   const OPCODE: u8 = 33;
 
@@ -30,8 +32,6 @@ impl Operation for Tee {
     io_uring::opcode::Tee::new(Fd(self.fd_in), Fd(self.fd_out), self.size)
       .build()
   }
-
-  impl_no_readyness!();
 
   fn run_blocking(&self) -> std::io::Result<i32> {
     syscall!(tee(self.fd_in, self.fd_out, self.size as usize, 0))

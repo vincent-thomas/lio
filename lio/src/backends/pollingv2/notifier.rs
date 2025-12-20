@@ -5,7 +5,19 @@
 //! - On epoll: Uses a pipe (POSIX-compliant, works on Linux and Redox OS)
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::RawFd;
+
+#[cfg(not(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "tvos",
+  target_os = "watchos",
+  target_os = "freebsd",
+  target_os = "dragonfly",
+  target_os = "openbsd",
+  target_os = "netbsd"
+)))]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 /// Special key used to identify notification events
 pub const NOTIFY_KEY: u64 = u64::MAX;

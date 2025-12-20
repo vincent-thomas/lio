@@ -2,8 +2,7 @@ mod common;
 
 use lio::*;
 use std::ffi::CString;
-use std::sync::mpsc::{self, TryRecvError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 
 // ============================================================================
 // DETACH SAFE OPERATIONS - Can use .detach()

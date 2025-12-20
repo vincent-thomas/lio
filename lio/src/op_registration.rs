@@ -1,7 +1,6 @@
 // NOTE: OpRegistration should **NEVER** impl Sync.
 use std::{io, mem, ptr::NonNull};
 
-#[cfg(feature = "high")]
 use std::task::Waker;
 
 use crate::op::Operation;
@@ -49,14 +48,14 @@ unsafe impl Send for OpCallback {}
 pub struct OpRegistration {
   status: OpRegistrationStatus,
   op: Option<NonNull<()>>,
-  op_fn_drop: fn(*const ()), // Function to properly drop the operation
-  op_fn_run_blocking: fn(*const ()) -> std::io::Result<i32>,
+  op_fn_drop: fn(NonNull<()>), // Function to properly drop the operation
+  op_fn_run_blocking: fn(NonNull<()>) -> std::io::Result<i32>,
 }
 
 impl Drop for OpRegistration {
   fn drop(&mut self) {
     if let Some(operation) = self.op.take() {
-      (self.op_fn_drop)(operation.as_ptr());
+      (self.op_fn_drop)(operation);
     }
   }
 }
@@ -74,37 +73,32 @@ pub enum OpRegistrationStatus {
 
 #[test]
 fn test_op_reg_size() {
-  #[cfg(feature = "high")]
   assert_eq!(std::mem::size_of::<OpNotification>(), 24);
-
-  #[cfg(not(feature = "high"))]
-  assert_eq!(std::mem::size_of::<OpNotification>(), 16);
 }
 // Option's is for ownership rules.
 pub enum OpNotification {
-  #[cfg(feature = "high")]
   Waker(Waker),
   Callback(OpCallback),
 }
 
 impl OpRegistration {
-  fn op_ptr(&self) -> *const () {
-    self.op.expect("trying to run run_blocking after result").as_ptr()
+  fn op_ptr(&self) -> NonNull<()> {
+    self.op.expect("trying to run run_blocking after result")
   }
 
   pub fn new<T>(op: Box<T>) -> Self
   where
     T: Operation,
   {
-    fn drop_op<T>(ptr: *const ()) {
-      drop(unsafe { Box::from_raw(ptr as *mut T) })
+    fn drop_op<T>(ptr: NonNull<()>) {
+      drop(unsafe { Box::from_raw(ptr.as_ptr() as *mut T) })
     }
 
-    fn op_fn_run_blocking<T>(ptr: *const ()) -> std::io::Result<i32>
+    fn op_fn_run_blocking<T>(ptr: NonNull<()>) -> std::io::Result<i32>
     where
       T: Operation,
     {
-      let op: &T = unsafe { &*(ptr as *const T) };
+      let op: &T = unsafe { &*(ptr.as_ptr() as *const T) };
       op.run_blocking()
     }
 
@@ -142,7 +136,6 @@ impl OpRegistration {
   }
 
   /// Sets the waker, replacing any existing waker
-  #[cfg(feature = "high")]
   pub fn set_waker(&mut self, waker: Waker) {
     use std::mem;
 
@@ -188,7 +181,6 @@ impl OpRegistration {
       OpRegistrationStatus::DoneWithResultAfterNotifier { .. } => {
         unreachable!("internal lio: not allowed.")
       }
-      #[cfg(feature = "high")]
       OpRegistrationStatus::WaitingWithNotifier(OpNotification::Waker(_)) => {
         unreachable!("lio not allowed: Cannot set waker for callback backed IO")
       }
@@ -215,12 +207,14 @@ impl OpRegistration {
     let after_notifier = match self.status {
       OpRegistrationStatus::DoneWithResultBeforeNotifier { .. }
       | OpRegistrationStatus::DoneWithResultAfterNotifier { .. } => {
-        unreachable!("lio not allowed: Cannot set done on thing already done.")
+        panic!(
+          "OpRegistration::set_done: Cannot set done on operation already done"
+        )
       }
       OpRegistrationStatus::Waiting => false,
       OpRegistrationStatus::WaitingWithNotifier(_) => true,
       OpRegistrationStatus::DoneResultTaken => {
-        panic!("lio: tried to set done after result taken")
+        panic!("OpRegistration::set_done: tried to set done after result taken")
       }
     };
 

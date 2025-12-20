@@ -5,7 +5,7 @@ use io_uring::{opcode, types::Fd};
 
 use crate::op::DetachSafe;
 
-use super::Operation;
+use crate::op::Operation;
 
 pub struct Close {
   fd: RawFd,
@@ -21,6 +21,7 @@ impl Close {
 
 impl Operation for Close {
   impl_result!(());
+  impl_no_readyness!();
 
   #[cfg(linux)]
   const OPCODE: u8 = 19;
@@ -29,8 +30,6 @@ impl Operation for Close {
   fn create_entry(&mut self) -> io_uring::squeue::Entry {
     opcode::Close::new(Fd(self.fd)).build()
   }
-
-  impl_no_readyness!();
 
   fn run_blocking(&self) -> std::io::Result<i32> {
     syscall!(close(self.fd))

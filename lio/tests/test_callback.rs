@@ -1,12 +1,13 @@
+#![cfg(feature = "buf")]
+
 mod common;
 
-use lio::{read, write};
 use std::ffi::CString;
 use std::sync::mpsc::{channel, sync_channel};
 use std::time::Duration;
 
 #[test]
-fn test_callback_basic_read() {
+fn test_callback_basic_lio() {
   lio::init();
   let path = CString::new("/tmp/lio_test_callback_basic.txt").unwrap();
   let test_data = b"Hello, callback!";
@@ -26,7 +27,7 @@ fn test_callback_basic_read() {
   let (tx, rx) = channel();
 
   let buf = vec![0u8; 100];
-  read(fd, buf, 0).when_done(move |(bytes_read, buffer)| {
+  lio::read_with_buf(fd, buf, 0).when_done(move |(bytes_read, buffer)| {
     tx.send((bytes_read, buffer)).unwrap();
   });
 
@@ -46,6 +47,7 @@ fn test_callback_basic_read() {
     libc::close(fd);
     libc::unlink(path.as_ptr());
   }
+  lio::exit();
 }
 
 #[test]
@@ -63,7 +65,7 @@ fn test_callback_basic_write() {
     )
   };
 
-  let recv = write(fd, test_data.to_vec(), 0).send();
+  let recv = lio::write_with_buf(fd, test_data.to_vec(), 0).send();
   lio::tick();
 
   // Wait for callback to execute
@@ -86,6 +88,7 @@ fn test_callback_basic_write() {
     libc::close(fd);
     libc::unlink(path.as_ptr());
   }
+  lio::exit();
 }
 
 #[test]
@@ -96,9 +99,11 @@ fn test_callback_error_handling() {
   let (tx, rx) = channel();
 
   let buf = vec![0u8; 100];
-  read(invalid_fd, buf, 0).when_done(move |(bytes_read, _buffer)| {
-    tx.send(bytes_read).unwrap();
-  });
+  lio::read_with_buf(invalid_fd, buf, 0).when_done(
+    move |(bytes_read, _buffer)| {
+      tx.send(bytes_read).unwrap();
+    },
+  );
 
   lio::tick();
   // Wait for callback to execute
@@ -110,6 +115,7 @@ fn test_callback_error_handling() {
     "Expected error for invalid fd, got: {:?}",
     bytes_read
   );
+  lio::exit();
 }
 
 #[test]
@@ -140,7 +146,7 @@ fn test_callback_concurrent() {
     let expected_data = data.clone();
     let path_clone = path.clone();
 
-    read(fd, buf, 0).when_done(move |(bytes_read, buffer)| {
+    lio::read_with_buf(fd, buf, 0).when_done(move |(bytes_read, buffer)| {
       let bytes_read = bytes_read.expect("Read failed") as usize;
       assert_eq!(bytes_read, expected_data.len());
       assert_eq!(&buffer[..bytes_read], expected_data.as_bytes());
@@ -166,6 +172,7 @@ fn test_callback_concurrent() {
   // Verify all callbacks were invoked
   assert_eq!(results.len(), 10, "Not all callbacks were invoked");
   assert_eq!(results, (0..10).collect::<Vec<_>>());
+  lio::exit();
 }
 
 #[test]
@@ -186,7 +193,7 @@ fn test_callback_vs_future_mutually_exclusive() {
 
   // Create an operation progress
   let buf = vec![0u8; 100];
-  let progress = read(fd, buf, 0);
+  let progress = lio::read_with_buf(fd, buf, 0);
 
   // Use callback - this takes ownership, so future can't be polled
   let (tx, rx) = sync_channel(1);
@@ -212,6 +219,7 @@ fn test_callback_vs_future_mutually_exclusive() {
     libc::close(fd);
     libc::unlink(path.as_ptr());
   }
+  lio::exit();
 }
 
 #[test]
@@ -233,7 +241,7 @@ fn test_callback_with_detach() {
   let (tx, rx) = sync_channel(1);
 
   let buf = vec![0u8; 100];
-  read(fd, buf, 0).when_done(move |_result| {
+  lio::read_with_buf(fd, buf, 0).when_done(move |_result| {
     // Just mark as invoked, don't care about result
     tx.send(()).unwrap();
   });
@@ -248,6 +256,8 @@ fn test_callback_with_detach() {
     libc::close(fd);
     libc::unlink(path.as_ptr());
   }
+
+  lio::exit();
 }
 
 #[test]
@@ -269,7 +279,7 @@ fn test_callback_preserves_buffer_ownership() {
   let (tx, rx) = sync_channel(1);
 
   let buf = vec![0u8; 100];
-  read(fd, buf, 0).when_done(move |(bytes_read, buffer)| {
+  lio::read_with_buf(fd, buf, 0).when_done(move |(bytes_read, buffer)| {
     // Verify we got ownership of the buffer
     let bytes_read = bytes_read.expect("Read failed") as usize;
     assert_eq!(&buffer[..bytes_read], test_data);
@@ -289,4 +299,6 @@ fn test_callback_preserves_buffer_ownership() {
     libc::close(fd);
     libc::unlink(path.as_ptr());
   }
+
+  lio::exit();
 }

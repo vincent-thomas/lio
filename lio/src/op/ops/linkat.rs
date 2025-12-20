@@ -9,7 +9,7 @@ use io_uring::types::Fd;
 
 use crate::op::DetachSafe;
 
-use super::Operation;
+use crate::op::Operation;
 
 pub struct LinkAt {
   old_dir_fd: RawFd,
@@ -41,11 +41,10 @@ impl LinkAt {
 
 impl Operation for LinkAt {
   impl_result!(());
+  impl_no_readyness!();
 
   #[cfg(linux)]
   const OPCODE: u8 = 39;
-
-  impl_no_readyness!();
 
   #[cfg(linux)]
   fn create_entry(&mut self) -> io_uring::squeue::Entry {

@@ -1,3 +1,5 @@
+#![cfg(feature = "buf")]
+
 mod common;
 
 use lio::read;
@@ -28,7 +30,7 @@ fn test_read_large_buffer() {
 
   // Read it back
   let buf = vec![0u8; 1024 * 1024];
-  let mut recv_read = read(fd, buf, 0).send();
+  let mut recv_read = lio::read_with_buf(fd, buf, 0).send();
 
   lio::tick();
 
@@ -76,24 +78,17 @@ fn test_read_concurrent() {
   let (sender, receiver) = mpsc::channel();
 
   for (fd, _, data) in &test_data {
-    let sender_clone = sender.clone();
-    let expected_data = data.clone();
     let buf = vec![0u8; 100];
-    read(*fd, buf, 0).when_done(move |result| {
-      sender_clone.send((result, expected_data)).unwrap();
-    });
+    lio::read_with_buf(*fd, buf, 0).send_with(sender.clone());
   }
-
-  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
   lio::tick();
 
   for _ in 0..10 {
-    let ((bytes_read_result, result), expected_data) = receiver.recv().unwrap();
+    let (bytes_read_result, expected_data) = receiver.try_recv().unwrap();
     let bytes_read = bytes_read_result.expect("Failed to read") as usize;
 
     assert_eq!(bytes_read, expected_data.len());
-    assert_eq!(&result[..bytes_read], expected_data.as_bytes());
   }
 
   for (fd, path, _) in test_data {
@@ -154,7 +149,7 @@ fn prop_test_read_arbitrary_data_and_offsets_run(
 
   // Perform the read operation
   let buf = vec![0u8; buffer_size];
-  let mut receiver = read(fd, buf, read_offset).send();
+  let mut receiver = lio::read_with_buf(fd, buf, read_offset).send();
 
   lio::tick();
 

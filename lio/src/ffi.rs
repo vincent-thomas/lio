@@ -71,6 +71,11 @@ pub extern "C" fn lio_start() {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn lio_tick() {
+  crate::tick()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn lio_stop() {
   crate::stop()
 }
@@ -181,22 +186,24 @@ pub extern "C" fn lio_write(
   // 3. We'll return it via the callback where C can free it
   let buf_vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
 
-  crate::write(fd, buf_vec, offset).when_done(move |(res, mut buf)| {
-    let result_code = match res {
-      Ok(n) => n,
-      Err(err) => err.raw_os_error().unwrap_or(-1),
-    };
+  crate::write_with_buf(fd, buf_vec, offset).when_done(
+    move |(res, mut buf)| {
+      let result_code = match res {
+        Ok(n) => n,
+        Err(err) => err.raw_os_error().unwrap_or(-1),
+      };
 
-    // Return buffer ownership to C caller
-    let buf_ptr = buf.as_mut_ptr();
-    let buf_len = buf.len();
+      // Return buffer ownership to C caller
+      let buf_ptr = buf.as_mut_ptr();
+      let buf_len = buf.len();
 
-    // SAFETY: Prevent Rust from freeing the buffer since we're giving ownership back to C.
-    // C must now free this buffer to avoid memory leak.
-    std::mem::forget(buf);
+      // SAFETY: Prevent Rust from freeing the buffer since we're giving ownership back to C.
+      // C must now free this buffer to avoid memory leak.
+      std::mem::forget(buf);
 
-    callback(result_code, buf_ptr, buf_len);
-  });
+      callback(result_code, buf_ptr, buf_len);
+    },
+  );
 }
 
 /// Read data from a file descriptor.
@@ -227,7 +234,7 @@ pub extern "C" fn lio_read(
   // 3. We'll return it via the callback where C can free it
   let buf_vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
 
-  crate::read(fd, buf_vec, offset).when_done(move |(res, mut buf)| {
+  crate::read_with_buf(fd, buf_vec, offset).when_done(move |(res, mut buf)| {
     let result_code = match res {
       Ok(n) => n,
       Err(err) => err.raw_os_error().unwrap_or(-1),
@@ -397,22 +404,24 @@ pub extern "C" fn lio_send(
   // 3. We'll return it via the callback where C can free it
   let buf_vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
 
-  crate::send(fd, buf_vec, Some(flags)).when_done(move |(res, mut buf)| {
-    let result_code = match res {
-      Ok(n) => n,
-      Err(err) => err.raw_os_error().unwrap_or(-1),
-    };
+  crate::send_with_buf(fd, buf_vec, Some(flags)).when_done(
+    move |(res, mut buf)| {
+      let result_code = match res {
+        Ok(n) => n,
+        Err(err) => err.raw_os_error().unwrap_or(-1),
+      };
 
-    // Return buffer ownership to C caller
-    let buf_ptr = buf.as_mut_ptr();
-    let buf_len = buf.len();
+      // Return buffer ownership to C caller
+      let buf_ptr = buf.as_mut_ptr();
+      let buf_len = buf.len();
 
-    // SAFETY: Prevent Rust from freeing the buffer since we're giving ownership back to C.
-    // C must now free this buffer to avoid memory leak.
-    std::mem::forget(buf);
+      // SAFETY: Prevent Rust from freeing the buffer since we're giving ownership back to C.
+      // C must now free this buffer to avoid memory leak.
+      std::mem::forget(buf);
 
-    callback(result_code, buf_ptr, buf_len);
-  });
+      callback(result_code, buf_ptr, buf_len);
+    },
+  );
 }
 
 /// Receive data from a socket.
@@ -443,22 +452,24 @@ pub extern "C" fn lio_recv(
   // 3. We'll return it via the callback where C can free it
   let buf_vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
 
-  crate::recv(fd, buf_vec, Some(flags)).when_done(move |(res, mut buf)| {
-    let result_code = match res {
-      Ok(n) => n,
-      Err(err) => err.raw_os_error().unwrap_or(-1),
-    };
+  crate::recv_with_buf(fd, buf_vec, Some(flags)).when_done(
+    move |(res, mut buf)| {
+      let result_code = match res {
+        Ok(n) => n,
+        Err(err) => err.raw_os_error().unwrap_or(-1),
+      };
 
-    // Return buffer ownership to C caller
-    let buf_ptr = buf.as_mut_ptr();
-    let buf_len = buf.len();
+      // Return buffer ownership to C caller
+      let buf_ptr = buf.as_mut_ptr();
+      let buf_len = buf.len();
 
-    // SAFETY: Prevent Rust from freeing the buffer since we're giving ownership back to C.
-    // C must now free this buffer to avoid memory leak.
-    std::mem::forget(buf);
+      // SAFETY: Prevent Rust from freeing the buffer since we're giving ownership back to C.
+      // C must now free this buffer to avoid memory leak.
+      std::mem::forget(buf);
 
-    callback(result_code, buf_ptr, buf_len);
-  });
+      callback(result_code, buf_ptr, buf_len);
+    },
+  );
 }
 
 /// Close a file descriptor.

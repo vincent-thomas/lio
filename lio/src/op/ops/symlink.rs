@@ -7,7 +7,7 @@ use std::{
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-use super::Operation;
+use crate::op::Operation;
 
 pub struct SymlinkAt {
   fd: RawFd,
@@ -36,11 +36,10 @@ impl SymlinkAt {
 
 impl Operation for SymlinkAt {
   impl_result!(());
+  impl_no_readyness!();
 
   #[cfg(linux)]
   const OPCODE: u8 = 38;
-
-  impl_no_readyness!();
 
   #[cfg(linux)]
   fn create_entry(&mut self) -> io_uring::squeue::Entry {

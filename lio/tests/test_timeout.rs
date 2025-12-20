@@ -11,7 +11,7 @@ fn test_timeout() {
 
   lio::tick();
   assert!(recv.try_recv().is_none());
-  std::thread::sleep(Duration::from_millis(400));
+  std::thread::sleep(Duration::from_millis(500));
   assert!(recv.try_recv().is_none());
   lio::tick();
 

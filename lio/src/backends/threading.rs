@@ -121,7 +121,6 @@ impl IoBackend for Threading {
       // Handle wakers/callbacks
       if let Some(Some(notification)) = set_done_result {
         match notification {
-          #[cfg(feature = "high")]
           OpNotification::Waker(waker) => waker.wake(),
           OpNotification::Callback(callback) => {
             store.get_mut(completion.id, |entry| callback.call(entry));
