@@ -1,57 +1,60 @@
-use super::Operation;
-use crate::{BufResult, op::DetachSafe};
+use crate::{
+  BufResult,
+  buf::{Buf, BufLike},
+  op::{DetachSafe, Operation},
+};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
 
 use std::{
-  io::{self, stdout},
+  io::{self},
   os::fd::RawFd,
 };
 
-#[derive(Debug)]
-pub struct Write {
+pub struct Write<B> {
   fd: RawFd,
-  buf: Option<Vec<u8>>,
+  buf: Option<Buf<B>>,
   offset: i64,
 }
 
-unsafe impl DetachSafe for Write {}
+unsafe impl<B> DetachSafe for Write<B> where B: BufLike {}
 
-impl Write {
-  pub(crate) fn new(fd: RawFd, buf: Vec<u8>, offset: i64) -> Write {
+impl<B> Write<B> {
+  pub(crate) fn new(fd: RawFd, buf: Buf<B>, offset: i64) -> Write<B> {
     Self { fd, buf: Some(buf), offset }
   }
 }
 
-impl Operation for Write {
-  type Result = BufResult<i32, Vec<u8>>;
+impl<B> Operation for Write<B>
+where
+  B: BufLike,
+{
+  impl_no_readyness!();
+
+  type Result = BufResult<i32, B>;
 
   #[cfg(linux)]
   const OPCODE: u8 = 23;
 
   #[cfg(linux)]
   fn create_entry(&mut self) -> io_uring::squeue::Entry {
-    let buf = self.buf.as_ref().unwrap();
-    assert!((buf.len()) <= u32::MAX as usize);
-    io_uring::opcode::Write::new(Fd(self.fd), buf.as_ptr(), buf.len() as u32)
+    let (ptr, len) = self.buf.as_ref().unwrap().get();
+    assert!(len <= u32::MAX as usize);
+    io_uring::opcode::Write::new(Fd(self.fd), ptr.cast_mut(), len as u32)
       .offset(self.offset as u64)
       .build()
   }
 
-  impl_no_readyness!();
-
   fn run_blocking(&self) -> std::io::Result<i32> {
+    let (ptr, len) = self.buf.as_ref().unwrap().get();
+
     // For non-seekable fds (pipes, sockets, char devices) with offset -1,
     // use write() instead of pwrite()
     // Try pwrite first
-    let result = syscall!(pwrite(
-      self.fd,
-      self.buf.as_ref().unwrap().as_ptr() as *const _,
-      self.buf.as_ref().unwrap().len(),
-      self.offset
-    ))
-    .map(|i| i as i32);
+    let result =
+      syscall!(pwrite(self.fd, ptr.cast::<libc::c_void>(), len, self.offset))
+        .map(|i| i as i32);
 
     if self.offset == -1 {
       // If pwrite fails with EINVAL (InvalidInput) or ESPIPE (NotSeekable),
@@ -64,8 +67,8 @@ impl Operation for Write {
         {
           return syscall!(write(
             self.fd,
-            self.buf.as_ref().unwrap().as_ptr() as *const _,
-            self.buf.as_ref().unwrap().len(),
+            ptr.cast::<libc::c_void>() as *const _,
+            len,
           ))
           .map(|out| out as i32);
         }
@@ -77,9 +80,9 @@ impl Operation for Write {
     }
   }
 
-  fn result(&mut self, _ret: std::io::Result<i32>) -> Self::Result {
+  fn result(&mut self, res: std::io::Result<i32>) -> Self::Result {
     let buf = self.buf.take().expect("ran Recv::result more than once.");
-
-    (_ret, buf)
+    let out = buf.after(*res.as_ref().unwrap_or(&0) as usize);
+    (res, out)
   }
 }

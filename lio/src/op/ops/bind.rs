@@ -5,7 +5,7 @@ use io_uring::types::Fd;
 
 use crate::op::{DetachSafe, net_utils::std_socketaddr_into_libc};
 
-use super::Operation;
+use crate::op::Operation;
 
 pub struct Bind {
   fd: RawFd,
@@ -22,6 +22,7 @@ impl Bind {
 
 impl Operation for Bind {
   impl_result!(());
+  impl_no_readyness!();
 
   #[cfg(linux)]
   const OPCODE: u8 = 56;
@@ -35,8 +36,6 @@ impl Operation for Bind {
     )
     .build()
   }
-
-  impl_no_readyness!();
 
   fn run_blocking(&self) -> io::Result<i32> {
     let storage = unsafe { &*self.addr.get() };

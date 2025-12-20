@@ -3,9 +3,7 @@ use std::os::fd::RawFd;
 #[cfg(linux)]
 use io_uring::{opcode, squeue, types::Fd};
 
-use crate::op::DetachSafe;
-
-use super::Operation;
+use crate::op::{DetachSafe, Operation};
 
 pub struct Truncate {
   fd: RawFd,
@@ -22,6 +20,7 @@ impl Truncate {
 
 impl Operation for Truncate {
   impl_result!(());
+  impl_no_readyness!();
 
   #[cfg(linux)]
   const OPCODE: u8 = 55;
@@ -30,8 +29,6 @@ impl Operation for Truncate {
   fn create_entry(&mut self) -> squeue::Entry {
     opcode::Ftruncate::new(Fd(self.fd), self.size).build()
   }
-
-  impl_no_readyness!();
 
   fn run_blocking(&self) -> std::io::Result<i32> {
     syscall!(ftruncate(self.fd, self.size as i64))

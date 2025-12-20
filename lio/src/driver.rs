@@ -1,9 +1,10 @@
 use crate::OperationProgress;
 use crate::backends::{self, IoBackend};
+#[cfg(feature = "buf")]
+use crate::buf::{BufStore, LentBuf};
 use crate::op::Operation;
 use crate::sync::Mutex;
 
-#[cfg(feature = "high")]
 use std::task::Waker;
 use std::{
   collections::HashMap,
@@ -13,7 +14,7 @@ use std::{
     atomic::{AtomicPtr, AtomicU64, Ordering},
     mpsc,
   },
-  thread::{self, JoinHandle},
+  thread::JoinHandle,
 };
 use std::{fmt, io};
 
@@ -50,7 +51,11 @@ impl OpStore {
   {
     let mut _lock = self.store.lock();
     let result = _lock.insert(id, OpRegistration::new(op));
-    assert!(result.is_none());
+    assert!(
+      result.is_none(),
+      "OpStore::insert: operation ID {} already exists",
+      id
+    );
     drop(_lock);
   }
 }
@@ -65,6 +70,8 @@ pub struct Driver<Io = Default> {
   store: OpStore,
   worker_shutdown: Mutex<Option<mpsc::Sender<()>>>,
   worker_thread: Mutex<Option<JoinHandle<()>>>,
+  #[cfg(feature = "buf")]
+  buf_store: BufStore,
 }
 
 #[derive(Debug)]
@@ -95,6 +102,8 @@ impl Driver {
     }
 
     let driver_ptr = Box::into_raw(Box::new(Driver {
+      #[cfg(feature = "buf")]
+      buf_store: BufStore::default(),
       driver: Default::new().map_err(TryInitError::Io)?,
       store: OpStore::new(),
       worker_shutdown: Mutex::new(None),
@@ -135,26 +144,9 @@ impl Driver {
     Self::deallocate(ptr);
   }
 
-  pub(crate) fn worker_shutdown(&'static self) {
-    let sender = self
-      .worker_shutdown
-      .lock()
-      .take()
-      .expect("tried to shutdown worker when worker doesn't exist");
-    let is_dropped = sender.send(()).is_err();
-
-    if is_dropped {
-      return;
-    }
-
-    self.driver.notify();
-    let handle_lock = self
-      .worker_thread
-      .lock()
-      .take()
-      .expect("tried to shutdown worker when join handle doesn't exist");
-
-    let _ = handle_lock.join().unwrap();
+  #[cfg(feature = "buf")]
+  pub(crate) fn try_lend_buf(&'static self) -> Option<LentBuf<'static>> {
+    self.buf_store.try_get()
   }
 
   /// Deallocates the Driver, freeing all resources.
@@ -197,23 +189,19 @@ impl Driver {
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
 
-    let handle = thread::Builder::new()
-      .name("lio-worker".into())
-      .spawn(move || {
-        loop {
-          // Check for shutdown signal (non-blocking)
-          match shutdown_rx.try_recv() {
-            Ok(()) => break,
-            Err(mpsc::TryRecvError::Disconnected) => break,
-            Err(mpsc::TryRecvError::Empty) => {}
-          }
-
-          // Process I/O operations (blocking wait)
-          self.tick(true);
+    let handle = utils::create_worker(move || {
+      loop {
+        // Check for shutdown signal (non-blocking)
+        match shutdown_rx.try_recv() {
+          Ok(()) => break,
+          Err(mpsc::TryRecvError::Disconnected) => break,
+          Err(mpsc::TryRecvError::Empty) => {}
         }
-      })
-      .expect("Failed to spawn worker thread");
 
+        // Process I/O operations (blocking wait)
+        self.tick(true);
+      }
+    });
     *self.worker_shutdown.lock() = Some(shutdown_tx);
     *worker_guard = Some(handle);
 
@@ -259,7 +247,6 @@ impl Driver {
   }
 
   // FIXME: On first run per key, run run_blocking and that will fix it.
-  #[cfg(feature = "high")]
   pub fn check_done<T>(&self, key: u64) -> Option<T::Result>
   where
     T: Operation,
@@ -286,7 +273,6 @@ impl Driver {
       .unwrap()
   }
 
-  #[cfg(feature = "high")]
   pub(crate) fn set_waker(&self, id: u64, waker: Waker) {
     self.store.get_mut(id, |entry| entry.set_waker(waker)).unwrap()
   }

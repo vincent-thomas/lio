@@ -17,9 +17,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 tracing = ["dep:tracing"]
-high = []
 unstable_ffi = []
 parking_lot = ["dep:parking_lot"]
+buf = []
 
 [dependencies]
 parking_lot = { version = "0.12", optional = true }

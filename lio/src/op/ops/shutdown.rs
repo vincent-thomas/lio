@@ -6,7 +6,7 @@ use io_uring::types::Fd;
 
 use crate::op::DetachSafe;
 
-use super::Operation;
+use crate::op::Operation;
 
 pub struct Shutdown {
   fd: RawFd,
@@ -23,6 +23,8 @@ unsafe impl DetachSafe for Shutdown {}
 
 impl Operation for Shutdown {
   impl_result!(());
+  // NOTE: Not sure here, kqueue can prob be used with flags.
+  impl_no_readyness!();
 
   #[cfg(linux)]
   const OPCODE: u8 = 34;
@@ -31,9 +33,6 @@ impl Operation for Shutdown {
   fn create_entry(&mut self) -> io_uring::squeue::Entry {
     io_uring::opcode::Shutdown::new(Fd(self.fd), self.how).build()
   }
-
-  // NOTE: Not sure here, kqueue can prob be used with flags.
-  impl_no_readyness!();
 
   fn run_blocking(&self) -> io::Result<i32> {
     syscall!(shutdown(self.fd, self.how))

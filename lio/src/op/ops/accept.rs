@@ -10,7 +10,7 @@ use io_uring::{opcode, squeue, types::Fd};
 
 use crate::op::net_utils::libc_socketaddr_into_std;
 
-use super::Operation;
+use crate::op::Operation;
 
 // Not detach safe.
 pub struct Accept {

@@ -1,9 +1,8 @@
 #![cfg(feature = "high")]
-use lio::{accept, bind, connect, listen, recv, send, shutdown, socket};
+use lio::{accept, bind, connect, listen, shutdown, socket};
 use socket2::{Domain, Protocol, Type};
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
-use std::sync::mpsc;
 
 #[test]
 #[ignore = "flaky shutdown test"]
@@ -78,7 +77,7 @@ fn test_shutdown_write() {
 
   // Try to send data (should fail or return 0)
   let data = b"Test data".to_vec();
-  let mut send_recv = send(client_sock, data, None).send();
+  let mut send_recv = lio::send_with_buf(client_sock, data, None).send();
 
   lio::tick();
 
@@ -92,7 +91,7 @@ fn test_shutdown_write() {
 
   // Server should be able to read EOF
   let buf = vec![0u8; 100];
-  let mut recv_recv = recv(server_client_fd, buf, None).send();
+  let mut recv_recv = lio::recv_with_buf(server_client_fd, buf, None).send();
 
   lio::tick();
 
@@ -183,7 +182,8 @@ fn test_shutdown_read() {
 
   // Client can still send
   let data = b"Hello".to_vec();
-  let mut send_recv = send(client_sock, data.clone(), None).send();
+  let mut send_recv =
+    lio::send_with_buf(client_sock, data.clone(), None).send();
 
   lio::tick();
 
@@ -192,7 +192,7 @@ fn test_shutdown_read() {
 
   // Server can receive
   let buf = vec![0u8; 100];
-  let mut recv_recv = recv(server_client_fd, buf, None).send();
+  let mut recv_recv = lio::recv_with_buf(server_client_fd, buf, None).send();
 
   lio::tick();
 
@@ -281,7 +281,7 @@ fn test_shutdown_both() {
 
   // Send should fail
   let data = b"Test".to_vec();
-  let mut send_recv = send(client_sock, data, None).send();
+  let mut send_recv = lio::send_with_buf(client_sock, data, None).send();
 
   lio::tick();
 
@@ -293,7 +293,7 @@ fn test_shutdown_both() {
 
   // Server should receive EOF
   let buf = vec![0u8; 100];
-  let mut recv_recv = recv(server_client_fd, buf, None).send();
+  let mut recv_recv = lio::recv_with_buf(server_client_fd, buf, None).send();
 
   lio::tick();
 
@@ -557,7 +557,7 @@ fn test_shutdown_sequential_directions() {
 
   // Client can still receive - send from server
   let data = b"From server".to_vec();
-  let mut send_recv = send(server_client_fd, data, None).send();
+  let mut send_recv = lio::send_with_buf(server_client_fd, data, None).send();
 
   lio::tick();
 
@@ -566,7 +566,7 @@ fn test_shutdown_sequential_directions() {
 
   // Receive on client
   let buf = vec![0u8; 100];
-  let mut recv_recv = recv(client_sock, buf, None).send();
+  let mut recv_recv = lio::recv_with_buf(client_sock, buf, None).send();
 
   lio::tick();
 
@@ -666,7 +666,7 @@ fn test_shutdown_before_data_sent() {
 
   // Verify server sees EOF
   let buf = vec![0u8; 100];
-  let mut recv_recv = recv(server_client_fd, buf, None).send();
+  let mut recv_recv = lio::recv_with_buf(server_client_fd, buf, None).send();
 
   lio::tick();
 
@@ -759,7 +759,7 @@ fn test_shutdown_ipv6() {
 
   // Verify EOF
   let buf = vec![0u8; 100];
-  let mut recv_recv = recv(server_client_fd, buf, None).send();
+  let mut recv_recv = lio::recv_with_buf(server_client_fd, buf, None).send();
 
   lio::tick();
 
@@ -918,7 +918,8 @@ fn test_shutdown_with_pending_data() {
 
   // Send some data from client
   let data = b"Data before shutdown".to_vec();
-  let mut send_recv = send(client_sock, data.clone(), None).send();
+  let mut send_recv =
+    lio::send_with_buf(client_sock, data.clone(), None).send();
 
   lio::tick();
 
@@ -934,7 +935,7 @@ fn test_shutdown_with_pending_data() {
 
   // Server should still be able to receive the data
   let buf = vec![0u8; 100];
-  let mut recv_recv = recv(server_client_fd, buf, None).send();
+  let mut recv_recv = lio::recv_with_buf(server_client_fd, buf, None).send();
 
   lio::tick();
 
@@ -947,7 +948,8 @@ fn test_shutdown_with_pending_data() {
 
     // Next read should be EOF
     let buf2 = vec![0u8; 100];
-    let mut recv_recv2 = recv(server_client_fd, buf2, None).send();
+    let mut recv_recv2 =
+      lio::recv_with_buf(server_client_fd, buf2, None).send();
 
     lio::tick();
 
@@ -961,4 +963,5 @@ fn test_shutdown_with_pending_data() {
     libc::close(server_client_fd);
     libc::close(server_sock);
   }
+  lio::exit();
 }

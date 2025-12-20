@@ -1,4 +1,5 @@
-use lio::{accept, bind, connect, listen, recv, send, socket};
+#![cfg(feature = "buf")]
+use lio::{accept, bind, connect, listen, recv, recv_with_buf, send, socket};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 use socket2::{Domain, Protocol, Type};
@@ -107,7 +108,7 @@ fn test_recv_multiple() {
   println!("Queueing 3 send operations");
   for i in 0..3 {
     let data = format!("Message {}", i).into_bytes();
-    send(client_sock, data, None).send_with(sender_send.clone());
+    lio::send_with_buf(client_sock, data, None).send_with(sender_send.clone());
   }
 
   // assert_eq!(receiver_send.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -139,7 +140,7 @@ fn test_recv_multiple() {
     println!("Loop iteration, all_data.len() = {}", all_data.len());
     let buf = vec![0u8; 1024];
     let (sender_recv, receiver_recv) = mpsc::channel();
-    recv(client_fd, buf, None).when_done(move |res| {
+    lio::recv_with_buf(client_fd, buf, None).when_done(move |res| {
       sender_recv.send(res).unwrap();
     });
 
@@ -281,7 +282,7 @@ fn test_recv_with_flags() {
   // Send data
   let send_data = b"Data with flags".to_vec();
   let (sender_send, receiver_send) = mpsc::channel();
-  send(client_sock, send_data, None).when_done(move |res| {
+  lio::send_with_buf(client_sock, send_data, None).when_done(move |res| {
     sender_send.send(res).unwrap();
   });
 
@@ -294,7 +295,7 @@ fn test_recv_with_flags() {
   // Receive with flags
   let buf = vec![0u8; 1024];
   let (sender_recv, receiver_recv) = mpsc::channel();
-  recv(client_fd, buf, Some(0)).when_done(move |res| {
+  lio::recv_with_buf(client_fd, buf, Some(0)).when_done(move |res| {
     sender_recv.send(res).unwrap();
   });
 
@@ -404,7 +405,8 @@ fn test_recv_on_closed() {
   // Try to receive on closed connection
   let buf = vec![0u8; 1024];
   let (sender_recv, receiver_recv) = mpsc::channel();
-  recv(server_client_fd, buf, None).send_with(sender_recv.clone());
+  lio::recv_with_buf(server_client_fd, buf, None)
+    .send_with(sender_recv.clone());
 
   // assert_eq!(receiver_recv.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -535,9 +537,10 @@ fn prop_test_recv_arbitrary_data_run(
   assert_eq!(sent as usize, test_data.len(), "Send failed");
 
   // Test recv on server side
-  let recv_buf = vec![0u8; data_size];
+  let recv_buf = Vec::with_capacity(data_size);
+  // let recv_buf = vec![0u8; data_size];
   let (sender_recv, receiver_recv) = mpsc::channel();
-  recv(server_client_fd, recv_buf, None).when_done(move |res| {
+  lio::recv_with_buf(server_client_fd, recv_buf, None).when_done(move |res| {
     sender_recv.send(res).unwrap();
   });
 

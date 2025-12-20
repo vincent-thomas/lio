@@ -365,7 +365,6 @@ where
   }
 }
 
-#[cfg(feature = "high")]
 impl<T> IntoFuture for OperationProgress<T>
 where
   T: Operation + Unpin,
@@ -384,14 +383,12 @@ where
   }
 }
 
-#[cfg(feature = "high")]
 pub enum FutRecv<T> {
   StoreTracked { id: u64 },
   Threaded { id: u64 },
   FromResult { res: Option<io::Result<i32>>, operation: T },
 }
 
-#[cfg(feature = "high")]
 impl<T> Future for FutRecv<T>
 where
   T: Operation + Unpin,

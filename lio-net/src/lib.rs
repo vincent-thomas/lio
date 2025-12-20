@@ -111,12 +111,12 @@ impl Socket {
     Ok(Socket(fd))
   }
 
-  pub async fn bind(&self, addr: SocketAddr) -> io::Result<()> {
-    lio::bind(self.0.0, addr).await
+  pub fn bind(&self, addr: SocketAddr) -> impl Future<Output = io::Result<()>> {
+    lio::bind(self.0.0, addr).into_future()
   }
 
-  pub async fn listen(&self) -> io::Result<()> {
-    lio::listen(self.0.0, 128).await
+  pub fn listen(&self) -> impl Future<Output = io::Result<()>> {
+    lio::listen(self.0.0, 128).into_future()
   }
 
   pub async fn accept(&self) -> io::Result<(Socket, SocketAddr)> {
@@ -126,19 +126,28 @@ impl Socket {
     Ok((Socket::from(fd), addr))
   }
 
-  pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-    lio::connect(self.0.0, addr).await
+  pub fn connect(
+    &self,
+    addr: SocketAddr,
+  ) -> impl Future<Output = io::Result<()>> {
+    lio::connect(self.0.0, addr).into_future()
   }
 
-  pub async fn recv(&self, vec: Vec<u8>) -> lio::BufResult<i32, Vec<u8>> {
-    lio::recv(self.0.0, vec, None).await
+  pub fn recv(
+    &self,
+    vec: Vec<u8>,
+  ) -> impl Future<Output = lio::BufResult<i32, Vec<u8>>> {
+    lio::recv_with_buf(self.0.0, vec, None).into_future()
   }
 
-  pub async fn send(&self, vec: Vec<u8>) -> lio::BufResult<i32, Vec<u8>> {
-    lio::send(self.0.0, vec, None).await
+  pub fn send(
+    &self,
+    vec: Vec<u8>,
+  ) -> impl Future<Output = lio::BufResult<i32, Vec<u8>>> {
+    lio::send_with_buf(self.0.0, vec, None).into_future()
   }
-  pub async fn shutdown(&self, how: i32) -> io::Result<()> {
-    lio::shutdown(self.0.0, how).await
+  pub fn shutdown(&self, how: i32) -> impl Future<Output = io::Result<()>> {
+    lio::shutdown(self.0.0, how).into_future()
   }
 }
 

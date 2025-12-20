@@ -1,7 +1,7 @@
 use std::io;
 use std::os::fd::RawFd;
 
-use super::Operation;
+use crate::op::Operation;
 
 // Not detach safe.
 pub struct Socket {
@@ -177,6 +177,7 @@ impl Socket {
 
 impl Operation for Socket {
   impl_result!(fd);
+  impl_no_readyness!();
 
   #[cfg(linux)]
   const OPCODE: u8 = 45;
@@ -190,8 +191,6 @@ impl Operation for Socket {
     )
     .build()
   }
-
-  impl_no_readyness!();
 
   fn run_blocking(&self) -> io::Result<i32> {
     // Path 1: Platforms with SOCK_CLOEXEC support (atomic CLOEXEC flag)

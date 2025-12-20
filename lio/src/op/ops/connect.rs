@@ -10,7 +10,7 @@ use io_uring::types::Fd;
 use crate::op::DetachSafe;
 use crate::op::net_utils::std_socketaddr_into_libc;
 
-use super::Operation;
+use crate::op::Operation;
 
 pub struct Connect {
   fd: RawFd,
@@ -60,7 +60,7 @@ impl Operation for Connect {
   }
 
   #[cfg(unix)]
-  const IS_CONNECT: bool = true;
+  const FLAGS: crate::op::OpFlags = crate::op::OpFlags::IS_CONNECT;
 
   #[cfg(unix)]
   const INTEREST: Option<crate::backends::pollingv2::Interest> =

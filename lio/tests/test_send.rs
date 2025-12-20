@@ -1,4 +1,4 @@
-#![cfg(feature = "high")]
+#![cfg(feature = "buf")]
 use lio::{accept, bind, connect, listen, recv, send, socket};
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -77,7 +77,8 @@ fn test_send_basic() {
 
   // Send data
   let data = b"Hello, Server!".to_vec();
-  let mut send_recv = send(client_sock, data.clone(), None).send();
+  let mut send_recv =
+    lio::send_with_buf(client_sock, data.clone(), None).send();
 
   lio::tick();
 
@@ -159,7 +160,8 @@ fn test_send_large_data() {
 
   // Send large data (1MB)
   let large_data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
-  let mut send_recv = send(client_sock, large_data.clone(), None).send();
+  let mut send_recv =
+    lio::send_with_buf(client_sock, large_data.clone(), None).send();
 
   lio::tick();
 
@@ -243,7 +245,8 @@ fn test_send_multiple() {
   // Send multiple messages
   for i in 0..5 {
     let data = format!("Message {}", i).into_bytes();
-    let mut send_recv = send(client_sock, data.clone(), None).send();
+    let mut send_recv =
+      lio::send_with_buf(client_sock, data.clone(), None).send();
 
     lio::tick();
 
@@ -326,7 +329,8 @@ fn test_send_with_flags() {
 
   // Send with flags (0 is a valid flag value)
   let data = b"Data with flags".to_vec();
-  let mut send_recv = send(client_sock, data.clone(), Some(0)).send();
+  let mut send_recv =
+    lio::send_with_buf(client_sock, data.clone(), Some(0)).send();
 
   lio::tick();
 
@@ -413,7 +417,7 @@ fn test_send_on_closed_socket() {
 
   // Try to send after server closed
   let data = b"This should fail".to_vec();
-  let mut send_recv = send(client_sock, data, None).send();
+  let mut send_recv = lio::send_with_buf(client_sock, data, None).send();
 
   lio::tick();
 
@@ -493,7 +497,8 @@ fn test_send_concurrent() {
 
     // Send data
     let data = format!("Client {}", i).into_bytes();
-    let mut send_recv = send(client_sock, data.clone(), None).send();
+    let mut send_recv =
+      lio::send_with_buf(client_sock, data.clone(), None).send();
 
     lio::tick();
 
@@ -598,9 +603,11 @@ fn prop_test_send_arbitrary_data_run(
   connect_recv.try_recv().unwrap().unwrap();
   let (server_client_fd, _) = accept_recv.try_recv().unwrap().unwrap();
 
-  let mut send_recv = send(client_sock, test_data.clone(), None).send();
+  let mut send_recv =
+    lio::send_with_buf(client_sock, test_data.clone(), None).send();
   let recv_buf = vec![0u8; data_size];
-  let mut recv_recv = recv(server_client_fd, recv_buf, None).send();
+  let mut recv_recv =
+    lio::recv_with_buf(server_client_fd, recv_buf, None).send();
 
   lio::tick();
   lio::tick();
@@ -614,6 +621,7 @@ fn prop_test_send_arbitrary_data_run(
     test_data.len(),
     "Send should return correct byte count"
   );
+
   assert_eq!(
     returned_buf, test_data,
     "Send returned buffer should match original data"

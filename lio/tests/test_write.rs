@@ -1,3 +1,5 @@
+#![cfg(feature = "buf")]
+
 /// write in append mode is not tested since `pwrite` doesn't support it.
 mod common;
 
@@ -26,7 +28,7 @@ fn test_write_large_buffer() {
   let sender1 = sender.clone();
   let large_data_clone = large_data.clone();
 
-  write(fd, large_data.clone(), 0).when_done(move |res| {
+  lio::write_with_buf(fd, large_data.clone(), 0).when_done(move |res| {
     sender1.send(res).unwrap();
   });
 
@@ -91,7 +93,7 @@ fn test_write_concurrent() {
     let sender1 = sender.clone();
     let data_clone = data.clone();
 
-    write(fd, data.clone(), 0).when_done(move |res| {
+    lio::write_with_buf(fd, data.clone(), 0).when_done(move |res| {
       sender1.send(res).unwrap();
     });
 
@@ -183,7 +185,8 @@ fn prop_test_write_arbitrary_data_and_offsets_run(
   // Perform the write operation with channel pattern
   let test_data_clone = test_data.clone();
 
-  let mut receiver = write(fd, test_data.clone(), write_offset).send();
+  let mut receiver =
+    lio::write_with_buf(fd, test_data.clone(), write_offset).send();
 
   // Poll until the write completes (may take multiple ticks on some backends)
   let (write_result, returned_buf) = {

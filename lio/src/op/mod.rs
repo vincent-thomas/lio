@@ -1,57 +1,37 @@
+pub(crate) mod net_utils;
+
+mod ops;
+mod progress;
+pub use ops::*;
+pub use progress::*;
 use std::io;
+use std::ops::BitOr;
 use std::os::fd::RawFd;
 
-mod accept;
-mod bind;
-mod close;
-mod connect;
-mod listen;
-pub(crate) mod net_utils;
-mod openat;
-mod read;
-mod recv;
-mod send;
-mod socket;
+/// Operation flags using bitflags pattern
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpFlags(u8);
 
-mod fsync;
-mod linkat;
-#[cfg(linux)]
-pub mod nop;
-mod shutdown;
-mod symlink;
-#[cfg(linux)]
-mod tee;
-mod timeout;
-mod truncate;
-mod write;
+impl OpFlags {
+  pub const NONE: Self = Self(0);
+  pub const IS_CONNECT: Self = Self(1 << 0);
 
-pub use accept::*;
-pub use bind::*;
-pub use close::*;
-pub use connect::*;
-pub use fsync::*;
-pub use linkat::*;
-pub use listen::*;
-#[cfg(linux)]
-#[allow(unused_imports)]
-pub(crate) use nop::*;
-pub use openat::*;
-pub use read::*;
-pub use recv::*;
-pub use send::*;
-pub use shutdown::*;
-pub use socket::*;
-pub use symlink::*;
-pub use timeout::*;
+  /// Check if the IS_CONNECT flag is set
+  pub const fn is_connect(self) -> bool {
+    self.0 & Self::IS_CONNECT.0 != 0
+  }
+}
 
-#[cfg(linux)]
-pub use tee::*;
+impl BitOr for OpFlags {
+  type Output = Self;
 
-pub use truncate::*;
-pub use write::*;
+  fn bitor(self, rhs: Self) -> Self::Output {
+    Self(self.0 | rhs.0)
+  }
+}
 
-/// Done to disallow someone creating a operation outside of lio, which will cause issues.
 trait Sealed {}
+/// Done to disallow someone creating a operation outside of lio, which will cause issues.
 impl<O: Operation> Sealed for O {}
 
 // Safety: Decides if resources can be leaked when using OperationProgress::detach
@@ -59,7 +39,6 @@ impl<O: Operation> Sealed for O {}
 pub unsafe trait DetachSafe: Sealed {}
 
 // Things that implement this trait represent a command that can be executed using io-uring.
-#[allow(private_bounds)]
 pub trait Operation: Sealed {
   type Result;
   /// This is guarranteed to fire after this has completed and only fire ONCE.
@@ -77,7 +56,7 @@ pub trait Operation: Sealed {
   #[cfg(linux)]
   fn create_entry(&mut self) -> io_uring::squeue::Entry;
 
-  const IS_CONNECT: bool = false;
+  const FLAGS: OpFlags = OpFlags::NONE;
 
   #[cfg(unix)]
   const INTEREST: Option<crate::backends::pollingv2::Interest> = None;

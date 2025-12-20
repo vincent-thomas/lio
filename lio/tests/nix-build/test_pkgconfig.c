@@ -17,9 +17,10 @@ int main() {
     lio_init();
     lio_start();
 
-    lio_timeout(2000, call);
+    lio_timeout(1000, call);
+  lio_tick();
 
-    sleep(3);
+    sleep(5);
 
     lio_stop();
     lio_exit();

@@ -23,6 +23,7 @@ void lio_start(void);
  * After calling this, no new operations should be submitted.
  */
 void lio_exit(void);
+void lio_tick(void);
 
 /**
  * Shut down part of a full-duplex connection.

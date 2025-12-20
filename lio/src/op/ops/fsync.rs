@@ -5,7 +5,7 @@ use io_uring::types::Fd;
 
 use crate::op::DetachSafe;
 
-use super::Operation;
+use crate::op::Operation;
 
 pub struct Fsync {
   fd: RawFd,
@@ -21,6 +21,7 @@ unsafe impl DetachSafe for Fsync {}
 
 impl Operation for Fsync {
   impl_result!(());
+  impl_no_readyness!();
 
   #[cfg(linux)]
   const OPCODE: u8 = 3;
@@ -29,8 +30,6 @@ impl Operation for Fsync {
   fn create_entry(&mut self) -> io_uring::squeue::Entry {
     io_uring::opcode::Fsync::new(Fd(self.fd)).build()
   }
-
-  impl_no_readyness!();
 
   fn run_blocking(&self) -> std::io::Result<i32> {
     syscall!(fsync(self.fd))

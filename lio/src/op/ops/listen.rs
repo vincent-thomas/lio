@@ -5,7 +5,7 @@ use io_uring::types::Fd;
 
 use crate::op::DetachSafe;
 
-use super::Operation;
+use crate::op::Operation;
 
 pub struct Listen {
   fd: RawFd,
@@ -22,11 +22,10 @@ impl Listen {
 
 impl Operation for Listen {
   impl_result!(());
+  impl_no_readyness!();
 
   #[cfg(linux)]
   const OPCODE: u8 = 57;
-
-  impl_no_readyness!();
 
   #[cfg(linux)]
   fn create_entry(&mut self) -> io_uring::squeue::Entry {

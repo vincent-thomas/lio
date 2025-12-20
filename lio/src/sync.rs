@@ -38,6 +38,22 @@ mod std_sync {
     pub fn lock(&self) -> MutexGuard<'_, T> {
       MutexGuard { inner: self.inner.lock().unwrap_or_else(|e| e.into_inner()) }
     }
+
+    /// Acquires a mutex, blocking the current thread until it is able to do so.
+    ///
+    /// This function does not propagate poisoning, so it will always succeed.
+    #[inline]
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+      match self.inner.try_lock() {
+        Ok(value) => Some(MutexGuard { inner: value }),
+        Err(err) => match err {
+          std_sync::TryLockError::WouldBlock => None,
+          std_sync::TryLockError::Poisoned(e) => {
+            Some(MutexGuard { inner: e.into_inner() })
+          }
+        },
+      }
+    }
   }
 
   /// An RAII implementation of a "scoped lock" of a mutex.

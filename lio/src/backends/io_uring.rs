@@ -105,7 +105,6 @@ impl IoBackend for IoUring {
       match set_done_result {
         None => {}
         Some(value) => match value {
-          #[cfg(feature = "high")]
           OpNotification::Waker(waker) => waker.wake(),
           OpNotification::Callback(callback) => {
             store.get_mut(operation_id, |entry| callback.call(entry));

@@ -3,7 +3,7 @@ use std::{ffi::CString, os::fd::RawFd};
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-use super::Operation;
+use crate::op::Operation;
 
 pub struct OpenAt {
   fd: RawFd,
@@ -19,11 +19,10 @@ impl OpenAt {
 
 impl Operation for OpenAt {
   impl_result!(fd);
+  impl_no_readyness!();
 
   #[cfg(linux)]
   const OPCODE: u8 = 18;
-
-  impl_no_readyness!();
 
   #[cfg(linux)]
   fn create_entry(&mut self) -> io_uring::squeue::Entry {

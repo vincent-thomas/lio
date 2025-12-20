@@ -1,3 +1,4 @@
+#![allow(private_bounds)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! # Lio - Platform-Independent Async I/O Library
@@ -69,6 +70,7 @@
 //! that return buffers. Errors are automatically converted from platform-specific
 //! error codes to Rust's standard I/O error types.
 
+pub mod buf;
 #[cfg(feature = "unstable_ffi")]
 pub mod ffi;
 mod sync;
@@ -79,20 +81,12 @@ use std::{
   time::Duration,
 };
 
-/// Result type for operations that return both a result and a buffer.
-///
-/// This is commonly used for read/write operations where the buffer
-/// is returned along with the operation result.
-///
-/// Example: See [`lio::read`](crate::read).
-pub type BufResult<T, B> = (std::io::Result<T>, B);
+pub use buf::BufResult;
 
 #[macro_use]
 mod macros;
 
 pub mod driver;
-
-pub use driver::OpStore;
 
 pub mod op;
 use op::*;
@@ -100,15 +94,17 @@ use op::*;
 #[cfg(target_os = "linux")]
 mod liburing;
 
-mod op_progress;
 mod op_registration;
 
 mod backends;
-pub use backends::IoBackend;
 
-pub use op_progress::{BlockingReceiver, OperationProgress};
+use crate::{
+  buf::{Buf, BufLike},
+  driver::{Driver, TryInitError},
+};
 
-use crate::driver::{Driver, TryInitError};
+#[cfg(feature = "buf")]
+use crate::buf::LentBuf;
 use std::path::Path;
 
 macro_rules! impl_op {
@@ -287,8 +283,9 @@ impl_op!(
   Fsync, fn fsync(fd: RawFd) -> io::Result<()>
 );
 
-impl_op!(
-  "Performs a write operation on a file descriptor. Equivalent to the `pwrite` syscall.
+#[cfg(feature = "buf")]
+impl_op!(@impl_fn {
+    "Performs a write operation on a file descriptor. Equivalent to the `pwrite` syscall.
 
 # Offset Behavior
 
@@ -298,37 +295,47 @@ impl_op!(
 
 # Errors
 
-- `EINVAL`: Invalid offset on non-seekable fd.",
-  /// # Examples
-  ///
-  /// ```rust
-  /// async fn write_example() -> std::io::Result<()> {
-  ///     # let fd = 0;
-  ///     let data = b"Hello, World!".to_vec();
-  ///     let (result_bytes_written, _buf) = lio::write(fd, data, 0).await;
-  ///     println!("Wrote {} bytes", result_bytes_written?);
-  ///     Ok(())
-  /// }
-  /// ```
-  Write, fn write(fd: RawFd, buf: Vec<u8>, offset: i64) -> BufResult<i32, Vec<u8>>
-);
+- `EINVAL`: Invalid offset on non-seekable fd.",Write,write,[fd:RawFd,buf:Vec<u8> ,offset:i64],BufResult<i32,Vec<u8>> ,""
+}#[doc = r" # Examples"]#[doc = r""]#[doc = r" ```rust"]#[doc = r" async fn write_example() -> std::io::Result<()> {"]#[doc = r"     # let fd = 0;"]#[doc = r#"     let data = b"Hello, World!".to_vec();"#]#[doc = r"     let (result_bytes_written, _buf) = lio::write(fd, data, 0).await;"]#[doc = r#"     println!("Wrote {} bytes", result_bytes_written?);"#]#[doc = r"     Ok(())"]#[doc = r" }"]#[doc = r" ```"]{
+    pub fn write(fd: RawFd, offset: i64)-> OperationProgress<Write<LentBuf<'static>>> {
+        crate::write_with_buf(fd, Driver::get().try_lend_buf().expect("Couldn't lend buffer"), offset)
+    }
+});
 
-impl_op!(
-  "Performs a read operation on a file descriptor. Equivalent of the `pread` syscall.",
-  /// # Examples
-  ///
-  /// ```rust
-  /// async fn read_example() -> std::io::Result<()> {
-  ///     # let fd = 0;
-  ///     let mut buffer = vec![0u8; 1024];
-  ///     let (res_bytes_read, buf) = lio::read(fd, buffer, 0).await;
-  ///     let bytes_read = res_bytes_read?;
-  ///     println!("Read {} bytes: {:?}", bytes_read, &buf[..bytes_read as usize]);
-  ///     Ok(())
-  /// }
-  /// ```
-  Read, fn read(fd: RawFd, mem: Vec<u8>, offset: i64) -> BufResult<i32, Vec<u8>>
-);
+impl_op!(@impl_fn {
+    "Performs a write operation on a file descriptor. Equivalent to the `pwrite` syscall.
+
+# Offset Behavior
+
+- **Seekable fd, offset ≥ 0**: Write at specified offset (does not advance file cursor).
+- **Seekable fd, offset -1**: Write at current file position and advance the cursor.
+- **Non-seekable fd** (e.g., pipes, sockets, stdout): Offset is ignored; behaves like `write(2)`.
+
+# Errors
+
+- `EINVAL`: Invalid offset on non-seekable fd.",Write,write,[fd:RawFd,buf:Vec<u8> ,offset:i64],BufResult<i32,Vec<u8>> ,""
+}#[doc = r" # Examples"]#[doc = r""]#[doc = r" ```rust"]#[doc = r" async fn write_example() -> std::io::Result<()> {"]#[doc = r"     # let fd = 0;"]#[doc = r#"     let data = b"Hello, World!".to_vec();"#]#[doc = r"     let (result_bytes_written, _buf) = lio::write_with_buf(fd, data, 0).await;"]#[doc = r#"     println!("Wrote {} bytes", result_bytes_written?);"#]#[doc = r"     Ok(())"]#[doc = r" }"]#[doc = r" ```"]{
+    pub fn write_with_buf<B>(fd: RawFd, buf: B, offset: i64)-> OperationProgress<Write<B>> where B: BufLike {
+        Driver::submit(Write::new(fd, Buf::new(buf),offset))
+    }
+});
+
+#[cfg(feature = "buf")]
+impl_op!(@impl_fn {
+    "Performs a read operation on a file descriptor. Equivalent of the `pread` syscall.",Read,read,[fd:RawFd,mem:Vec<u8> ,offset:i64],BufResult<i32,Vec<u8>> ,""
+}#[doc = r" # Examples"]#[doc = r""]#[doc = r" ```rust"]#[doc = r" async fn read_example() -> std::io::Result<()> {"]#[doc = r"     # let fd = 0;"]#[doc = r"     let mut buffer = vec![0u8; 1024];"]#[doc = r"     let (res_bytes_read, buf) = lio::read_with_buf(fd, buffer, 0).await;"]#[doc = r"     let bytes_read = res_bytes_read?;"]#[doc = r#"     println!("Read {} bytes: {:?}", bytes_read, &buf[..bytes_read as usize]);"#]#[doc = r"     Ok(())"]#[doc = r" }"]#[doc = r" ```"]{
+    pub fn read(fd: RawFd, offset: i64)-> OperationProgress<Read<LentBuf<'static>>> {
+        crate::read_with_buf(fd, Driver::get().try_lend_buf().expect("Couldn't lend buffer"), offset)
+    }
+});
+
+impl_op!(@impl_fn {
+    "Performs a read operation on a file descriptor. Equivalent of the `pread` syscall.",Read,read,[fd:RawFd,mem:Vec<u8> ,offset:i64],BufResult<i32,Vec<u8>> ,""
+}#[doc = r" # Examples"]#[doc = r""]#[doc = r" ```rust"]#[doc = r" async fn read_example() -> std::io::Result<()> {"]#[doc = r"     # let fd = 0;"]#[doc = r"     let mut buffer = vec![0u8; 1024];"]#[doc = r"     let (res_bytes_read, buf) = lio::read_with_buf(fd, buffer, 0).await;"]#[doc = r"     let bytes_read = res_bytes_read?;"]#[doc = r#"     println!("Read {} bytes: {:?}", bytes_read, &buf[..bytes_read as usize]);"#]#[doc = r"     Ok(())"]#[doc = r" }"]#[doc = r" ```"]{
+    pub fn read_with_buf<B>(fd: RawFd, mem: B, offset: i64)-> OperationProgress<Read<B>> where B: BufLike {
+        Driver::submit(Read::new(fd, Buf::new(mem), offset))
+    }
+});
 
 impl_op!(
   "Truncates a file to a specified length.",
@@ -433,38 +440,39 @@ impl_op!(
   Connect, fn connect(fd: RawFd, addr: SocketAddr) -> std::io::Result<()>
 );
 
-impl_op!(
-  "Sends data on a connected socket.",
-  /// # Examples
-  ///
-  /// ```rust
-  /// async fn send_example() -> std::io::Result<()> {
-  ///     # let fd = 0;
-  ///     let data = b"Hello, server!".to_vec();
-  ///     let (bytes_sent, _buf) = lio::send(fd, data, None).await;
-  ///     println!("Sent {} bytes", bytes_sent?);
-  ///     Ok(())
-  /// }
-  /// ```
-  Send, fn send(fd: RawFd, buf: Vec<u8>, flags: Option<i32>) -> BufResult<i32, Vec<u8>>
-);
+#[cfg(feature = "buf")]
+impl_op!(@impl_fn {
+    "Sends data on a connected socket.",Send,send,[fd:RawFd,buf:Vec<u8> ,flags:Option<i32>],BufResult<i32,Vec<u8>> ,""
+}#[doc = r" # Examples"]#[doc = r""]#[doc = r" ```rust"]#[doc = r" async fn send_example() -> std::io::Result<()> {"]#[doc = r"     # let fd = 0;"]#[doc = r#"     let data = b"Hello, server!".to_vec();"#]#[doc = r"     let (bytes_sent, _buf) = lio::send_with_buf(fd, data, None).await;"]#[doc = r#"     println!("Sent {} bytes", bytes_sent?);"#]#[doc = r"     Ok(())"]#[doc = r" }"]#[doc = r" ```"]{
+    pub fn send(fd: RawFd, flags:Option<i32>)-> OperationProgress<Send<LentBuf<'static>>> {
+        crate::send_with_buf(fd, Driver::get().try_lend_buf().expect("Couldn't lend driver buffer"), flags)
+    }
+});
 
-impl_op!(
-  "Receives data from a connected socket.",
-  /// # Examples
-  ///
-  /// ```rust
-  /// async fn recv_example() -> std::io::Result<()> {
-  ///     # let fd = 0;
-  ///     let mut buffer = vec![0u8; 1024];
-  ///     let (res_bytes_received, buf) = lio::recv(fd, buffer, None).await;
-  ///     let bytes_received = res_bytes_received?;
-  ///     println!("Received {} bytes: {:?}", bytes_received, &buf[..bytes_received as usize]);
-  ///     Ok(())
-  /// }
-  /// ```
-  Recv, fn recv(fd: RawFd, buf: Vec<u8>, flags: Option<i32>) -> BufResult<i32, Vec<u8>>
-);
+impl_op!(@impl_fn {
+    "Sends data on a connected socket.",Send,send,[fd:RawFd,buf:Vec<u8> ,flags:Option<i32>],BufResult<i32,Vec<u8>> ,""
+}#[doc = r" # Examples"]#[doc = r""]#[doc = r" ```rust"]#[doc = r" async fn send_example() -> std::io::Result<()> {"]#[doc = r"     # let fd = 0;"]#[doc = r#"     let data = b"Hello, server!".to_vec();"#]#[doc = r"     let (bytes_sent, _buf) = lio::send_with_buf(fd, data, None).await;"]#[doc = r#"     println!("Sent {} bytes", bytes_sent?);"#]#[doc = r"     Ok(())"]#[doc = r" }"]#[doc = r" ```"]{
+    pub fn send_with_buf<B>(fd: RawFd, buf: B, flags: Option<i32>)->OperationProgress<Send<B>> where B: BufLike {
+        Driver::submit(Send::new(fd, Buf::new(buf),flags))
+    }
+});
+
+impl_op!(@impl_fn {
+    "Receives data from a connected socket.",Recv,recv,[fd:RawFd,buf:Vec<u8> ,flags:Option<i32>],BufResult<i32,Vec<u8>> ,""
+}#[doc = r" # Examples"]#[doc = r""]#[doc = r" ```rust"]#[doc = r" async fn recv_example() -> std::io::Result<()> {"]#[doc = r"     # let fd = 0;"]#[doc = r"     let mut buffer = vec![0u8; 1024];"]#[doc = r"     let (res_bytes_received, buf) = lio::recv_with_buf(fd, buffer, None).await;"]#[doc = r"     let bytes_received = res_bytes_received?;"]#[doc = r#"     println!("Received {} bytes: {:?}", bytes_received, &buf[..bytes_received as usize]);"#]#[doc = r"     Ok(())"]#[doc = r" }"]#[doc = r" ```"]{
+    pub fn recv_with_buf<B>(fd:RawFd,buf: B,flags:Option<i32>)->OperationProgress<Recv<B>> where B: BufLike {
+        Driver::submit(Recv::new(fd,Buf::new(buf),flags))
+    }
+});
+
+#[cfg(feature = "buf")]
+impl_op!(@impl_fn {
+    "Receives data from a connected socket.",Recv,recv,[fd:RawFd,buf:Vec<u8> ,flags:Option<i32>],BufResult<i32,Vec<u8>> ,""
+}#[doc = r" # Examples"]#[doc = r""]#[doc = r" ```rust"]#[doc = r" async fn recv_example() -> std::io::Result<()> {"]#[doc = r"     # let fd = 0;"]#[doc = r"     let mut buffer = vec![0u8; 1024];"]#[doc = r"     let (res_bytes_received, buf) = lio::recv_with_buf(fd, buffer, None).await;"]#[doc = r"     let bytes_received = res_bytes_received?;"]#[doc = r#"     println!("Received {} bytes: {:?}", bytes_received, &buf[..bytes_received as usize]);"#]#[doc = r"     Ok(())"]#[doc = r" }"]#[doc = r" ```"]{
+    pub fn recv(fd:RawFd,flags:Option<i32>)->OperationProgress<Recv<LentBuf<'static>>> {
+        crate::recv_with_buf(fd, Driver::get().try_lend_buf().expect("Couldn't lend buffer"), flags)
+    }
+});
 
 impl_op!(
   "Closes a file descriptor.",
