@@ -1,3 +1,5 @@
+use std::io;
+
 use crate::{OperationProgress, driver::OpStore, op::Operation};
 
 #[cfg(linux)]
@@ -16,6 +18,12 @@ pub mod pollingv2;
 mod threading;
 #[allow(unused_imports)]
 pub use threading::*;
+
+#[derive(Debug)]
+pub enum SubmitErr {
+  Io(io::Error),
+  Full,
+}
 
 /// Trait defining the interface for I/O operation execution backends.
 ///
@@ -59,9 +67,7 @@ pub trait IoBackend: Send + Sync {
   /// - Either complete the operation immediately or arrange for it to complete asynchronously
   /// - If completing asynchronously, insert the operation into the `OpStore` with a unique ID
   /// - Return an appropriate `OperationProgress` matching the chosen completion path
-  fn submit<O>(&self, op: O, store: &OpStore) -> OperationProgress<O>
-  where
-    O: Operation + Sized;
+  fn submit(&self, op: &dyn Operation, id: u64) -> Result<(), SubmitErr>;
 
   /// Wakes up a potentially blocking `tick()` call.
   ///

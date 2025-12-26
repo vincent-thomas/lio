@@ -8,7 +8,7 @@ use std::{
 #[cfg(linux)]
 use io_uring::{opcode, squeue, types::Fd};
 
-use crate::op::net_utils::libc_socketaddr_into_std;
+use crate::op::{OpMeta, net_utils::libc_socketaddr_into_std};
 
 use crate::op::Operation;
 
@@ -31,14 +31,20 @@ impl Accept {
 }
 
 impl Operation for Accept {
-  type Result = std::io::Result<(RawFd, SocketAddr)>;
-
-  fn result(&mut self, res: std::io::Result<i32>) -> Self::Result {
-    Ok((res?, libc_socketaddr_into_std(self.addr.get())?))
+  // type Result = std::io::Result<(RawFd, SocketAddr)>;
+  //
+  fn result(&mut self, res: std::io::Result<i32>) -> *const () {
+    fn nice(
+      this: &mut Accept,
+      res: std::io::Result<i32>,
+    ) -> std::io::Result<(RawFd, SocketAddr)> {
+      Ok((res?, libc_socketaddr_into_std(this.addr.get())?))
+    }
+    Box::into_raw(Box::new(nice(self, res))) as *const _
   }
 
-  #[cfg(linux)]
-  const OPCODE: u8 = 13;
+  // #[cfg(linux)]
+  // const OPCODE: u8 = 13;
 
   #[cfg(linux)]
   fn create_entry(&mut self) -> squeue::Entry {
@@ -50,13 +56,17 @@ impl Operation for Accept {
     .build()
   }
 
-  #[cfg(unix)]
-  const INTEREST: Option<crate::backends::pollingv2::Interest> =
-    Some(crate::backends::pollingv2::Interest::READ);
+  // #[cfg(unix)]
+  // const INTEREST: Option<crate::backends::pollingv2::Interest> =
+  //   Some(crate::backends::pollingv2::Interest::READ);
+
+  fn meta(&self) -> OpMeta {
+    OpMeta::CAP_FD | OpMeta::FD_READ
+  }
 
   #[cfg(unix)]
-  fn fd(&self) -> Option<RawFd> {
-    Some(self.fd)
+  fn cap(&self) -> i32 {
+    self.fd
   }
 
   fn run_blocking(&self) -> std::io::Result<i32> {

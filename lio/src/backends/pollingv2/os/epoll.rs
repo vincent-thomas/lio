@@ -1,5 +1,5 @@
+use super::super::notifier::{NOTIFY_KEY, Notifier};
 use super::super::{Interest, ReadinessPoll};
-use super::super::notifier::{Notifier, NOTIFY_KEY};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 use std::{io, ptr};
@@ -27,10 +27,8 @@ impl OsPoller {
 
     // Register notifier's read fd for read events with special key
     if let Some(notify_fd) = epoll.notifier.read_fd() {
-      let mut event = libc::epoll_event {
-        events: libc::EPOLLIN as u32,
-        u64: NOTIFY_KEY,
-      };
+      let mut event =
+        libc::epoll_event { events: libc::EPOLLIN as u32, u64: NOTIFY_KEY };
 
       syscall!(epoll_ctl(
         epoll.epoll_fd.as_raw_fd(),

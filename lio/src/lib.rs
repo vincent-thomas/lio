@@ -91,9 +91,6 @@ pub mod driver;
 pub mod op;
 use op::*;
 
-#[cfg(target_os = "linux")]
-mod liburing;
-
 mod op_registration;
 
 mod backends;

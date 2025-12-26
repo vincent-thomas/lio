@@ -2,7 +2,7 @@ use crate::OperationProgress;
 use crate::backends::{self, IoBackend};
 #[cfg(feature = "buf")]
 use crate::buf::{BufStore, LentBuf};
-use crate::op::Operation;
+use crate::op::{Operation, OperationExt};
 use crate::sync::Mutex;
 
 use std::task::Waker;
@@ -19,7 +19,7 @@ use std::{
 use std::{fmt, io};
 
 use crate::op;
-use crate::op_registration::OpRegistration;
+use crate::op_registration::{OpRegistration, StoredOp};
 
 pub struct OpStore {
   store: Mutex<HashMap<u64, OpRegistration>>,
@@ -45,12 +45,9 @@ impl OpStore {
     let reg = _lock.get_mut(&id)?;
     Some(_f(reg))
   }
-  pub fn insert<O>(&self, id: u64, op: Box<O>)
-  where
-    O: Operation,
-  {
+  pub fn insert(&self, id: u64, stored: StoredOp) {
     let mut _lock = self.store.lock();
-    let result = _lock.insert(id, OpRegistration::new(op));
+    let result = _lock.insert(id, OpRegistration::new(stored));
     assert!(
       result.is_none(),
       "OpStore::insert: operation ID {} already exists",
@@ -162,12 +159,15 @@ impl Driver {
     todo!();
   }
 
-  pub(crate) fn submit<T>(op: T) -> OperationProgress<T>
-  where
-    T: op::Operation,
-  {
+  pub(crate) fn submit(stored: StoredOp) -> u64 {
     let driver = Driver::get();
-    driver.driver.submit(op, &driver.store)
+    let id = driver.store.next_id();
+    driver.driver.submit(stored.op_ref(), id).unwrap();
+    driver.store.insert(id, stored);
+
+    id
+    // OperationProgress::StoreTracked { id }
+    // driver.driver.submit(op, &driver.store)
   }
 
   pub(crate) fn tick(&self, can_wait: bool) {
@@ -249,7 +249,7 @@ impl Driver {
   // FIXME: On first run per key, run run_blocking and that will fix it.
   pub fn check_done<T>(&self, key: u64) -> Option<T::Result>
   where
-    T: Operation,
+    T: OperationExt,
   {
     match self.store.get_mut(key, |entry| entry.try_extract::<T>()).unwrap() {
       Some(res) => {
@@ -259,19 +259,19 @@ impl Driver {
       None => None,
     }
   }
-  pub fn set_callback<T, F>(&self, id: u64, callback: F)
-  where
-    T: op::Operation,
-    F: FnOnce(T::Result) + Send,
-  {
-    use crate::op_registration::OpCallback;
-    self
-      .store
-      .get_mut(id, |entry| {
-        entry.set_callback(OpCallback::new::<T, F>(callback))
-      })
-      .unwrap()
-  }
+  // pub fn set_callback<T, F>(&self, id: u64, callback: F)
+  // where
+  //   T: op::Operation,
+  //   F: FnOnce(T::Result) + Send,
+  // {
+  //   use crate::op_registration::OpCallback;
+  //   self
+  //     .store
+  //     .get_mut(id, |entry| {
+  //       entry.set_callback(OpCallback::new::<T, F>(callback))
+  //     })
+  //     .unwrap()
+  // }
 
   pub(crate) fn set_waker(&self, id: u64, waker: Waker) {
     self.store.get_mut(id, |entry| entry.set_waker(waker)).unwrap()
