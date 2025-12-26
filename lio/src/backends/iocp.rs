@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::thread;
 
 #[cfg(windows)]
-use windows_sys::Win32::System::IO::{
-  CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus,
-  INVALID_HANDLE_VALUE,
-};
-#[cfg(windows)]
 use windows_sys::Win32::Foundation::{
   CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE as INVALID_HANDLE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::{
+  CreateIoCompletionPort, GetQueuedCompletionStatus, INVALID_HANDLE_VALUE,
+  PostQueuedCompletionStatus,
 };
 
 /// Completion packet data posted to IOCP
@@ -63,21 +63,16 @@ impl Iocp {
   /// Associates a file handle with the completion port.
   ///
   /// This must be called for each file handle before performing I/O operations on it.
-  pub fn associate_handle(&self, handle: HANDLE, completion_key: usize) -> io::Result<()> {
+  pub fn associate_handle(
+    &self,
+    handle: HANDLE,
+    completion_key: usize,
+  ) -> io::Result<()> {
     let result = unsafe {
-      CreateIoCompletionPort(
-        handle,
-        self.completion_port,
-        completion_key,
-        0,
-      )
+      CreateIoCompletionPort(handle, self.completion_port, completion_key, 0)
     };
 
-    if result == 0 {
-      Err(io::Error::last_os_error())
-    } else {
-      Ok(())
-    }
+    if result == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
   }
 }
 
@@ -134,8 +129,8 @@ impl IoBackend for Iocp {
     unsafe {
       PostQueuedCompletionStatus(
         self.completion_port,
-        0,        // Number of bytes transferred
-        0,        // Completion key
+        0,               // Number of bytes transferred
+        0,               // Completion key
         ptr::null_mut(), // OVERLAPPED pointer
       );
     }
@@ -179,7 +174,8 @@ impl IoBackend for Iocp {
         Ok(bytes_transferred as i32)
       } else {
         // Operation failed, get the error code
-        let error_code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        let error_code =
+          unsafe { windows_sys::Win32::Foundation::GetLastError() };
         Err(io::Error::from_raw_os_error(error_code as i32))
       };
 

@@ -32,8 +32,9 @@ use std::os::fd::RawFd;
 use std::slice;
 use std::time::Duration;
 
+use crate::backends::SubmitErr;
 use crate::op::Operation;
-use crate::op_registration::OpNotification;
+use crate::op_registration::Notifier;
 use crate::sync::Mutex;
 use crate::{OperationProgress, backends::IoBackend, driver::OpStore};
 
@@ -312,37 +313,55 @@ impl Poller {
     Ok(())
   }
 
-  fn new_polling<T>(&self, op: T, store: &OpStore) -> OperationProgress<T>
+  fn new_polling(&self, op: &dyn Operation, id: u64) -> Result<(), SubmitErr>
   where
     T: Operation,
   {
-    let interest = T::INTEREST.expect("op is event but no interest??");
-    let id = store.next_id();
-    let fd = op.fd().expect("not provided fd");
-    assert!(fd >= 0, "new_polling: fd must be valid (>= 0)");
+    let meta = op.meta();
+    let interest = if meta.is_cap_fd() {
+      if meta.is_fd_readable() && meta.is_fd_writable() {
+        Interest::ReadAndWrite
+      } else if meta.is_fd_readable() {
+        Interest::Read
+      } else if meta.is_fd_writable() {
+        Interest::Write
+      } else {
+        panic!()
+      }
+    } else if meta.is_cap_timer() {
+      Interest::Timer
+    } else {
+      panic!()
+    };
+    // let interest = T::INTEREST.expect("op is event but no interest??");
+    // let id = store.next_id();
+    // let fd = op.cap();
+    // assert!(fd >= 0, "new_polling: fd must be valid (>= 0)");
 
-    self.fd_map.lock().insert(id, fd);
-    store.insert(id, Box::new(op));
-    unsafe { self.add(fd, id, interest) }.expect("registration failed");
-    OperationProgress::<T>::new_store_tracked(id)
+    // self.fd_map.lock().insert(id, fd);
+    // store.insert(id, Box::new(op));
+    unsafe { self.add(meta.cap(), id, interest) }.map_err(SubmitErr::Io)?;
+    Ok(())
+    // OperationProgress::<T>::new_store_tracked(id)
   }
 }
 
 impl IoBackend for Poller {
-  fn submit<O>(&self, op: O, store: &OpStore) -> OperationProgress<O>
-  where
-    O: Operation + Sized,
-  {
-    if O::INTEREST.is_none() {
-      return OperationProgress::FromResult {
-        res: Some(op.run_blocking()),
-        operation: op,
-      };
+  fn submit(&self, op: &dyn Operation, id: u64) -> Result<(), SubmitErr> {
+    let meta = op.meta();
+    if meta.is_cap_none() {
+      panic!();
+      // return OperationProgress::FromResult {
+      //   res: Some(op.run_blocking()),
+      //   operation: op,
+      // };
     };
 
-    if !O::FLAGS.is_connect() {
-      return self.new_polling(op, store);
-    };
+    if !meta.is_beh_run_before_noti() {
+      return self.new_polling(op, id);
+    }
+
+    // CONNECT
 
     let result = op.run_blocking();
 
@@ -350,9 +369,10 @@ impl IoBackend for Poller {
       .as_ref()
       .is_err_and(|err| err.raw_os_error() == Some(libc::EINPROGRESS))
     {
-      self.new_polling(op, store)
+      self.new_polling(op, id)
     } else {
-      OperationProgress::<O>::new_from_result(op, result)
+      panic!();
+      // OperationProgress::<O>::new_from_result(op, result);
     }
   }
   fn notify(&self) {
@@ -412,8 +432,8 @@ impl IoBackend for Poller {
           match set_done_result {
             None => {}
             Some(value) => match value {
-              OpNotification::Waker(waker) => waker.wake(),
-              OpNotification::Callback(callback) => {
+              Notifier::Waker(waker) => waker.wake(),
+              Notifier::Callback(callback) => {
                 store.get_mut(operation_id, |entry| callback.call(entry));
                 assert!(store.remove(operation_id));
               }
