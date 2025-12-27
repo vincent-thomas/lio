@@ -32,36 +32,65 @@ use std::os::fd::RawFd;
 use std::slice;
 use std::time::Duration;
 
-use crate::backends::SubmitErr;
-use crate::op::Operation;
-use crate::op_registration::Notifier;
-use crate::sync::Mutex;
-use crate::{OperationProgress, backends::IoBackend, driver::OpStore};
+use crate::backends::{IoDriver, IoHandler, IoSubmitter, OpCompleted};
+use crate::{backends::SubmitErr, op::Operation, store::OpStore, sync::Mutex};
 
-/// Interest flags for event registration
+/// Interest/Event flags for I/O readiness
+///
+/// This type is used for both:
+/// - Registering interest (what you want to be notified about)
+/// - Receiving events (what actually happened)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Interest {
-  None,
-  Read,
-  Write,
-  ReadAndWrite,
-  Timer,
+pub struct Interest {
+  bits: u8,
 }
 
 impl Interest {
-  pub const READ: Self = Self::Read;
-  pub const WRITE: Self = Self::Write;
+  pub const NONE: Self = Self { bits: 0 };
+  pub const READ: Self = Self { bits: 1 << 0 };
+  pub const WRITE: Self = Self { bits: 1 << 1 };
+  pub const TIMER: Self = Self { bits: 1 << 2 };
+  pub const READ_AND_WRITE: Self =
+    Self { bits: Self::READ.bits | Self::WRITE.bits };
 
-  pub fn is_readable(&self) -> bool {
-    matches!(self, Self::Read | Self::ReadAndWrite)
+  pub const fn is_readable(self) -> bool {
+    self.bits & Self::READ.bits != 0
   }
 
-  pub fn is_writable(&self) -> bool {
-    matches!(self, Self::Write | Self::ReadAndWrite)
+  pub const fn is_writable(self) -> bool {
+    self.bits & Self::WRITE.bits != 0
   }
 
-  pub fn is_timer(&self) -> bool {
-    matches!(self, Self::Timer)
+  pub const fn is_timer(self) -> bool {
+    self.bits & Self::TIMER.bits != 0
+  }
+
+  pub const fn is_none(self) -> bool {
+    self.bits == 0
+  }
+
+  /// Combine interests using bitwise OR
+  pub const fn or(self, other: Self) -> Self {
+    Self { bits: self.bits | other.bits }
+  }
+
+  /// Check if this interest contains all bits from another
+  pub const fn contains(self, other: Self) -> bool {
+    (self.bits & other.bits) == other.bits
+  }
+}
+
+impl std::ops::BitOr for Interest {
+  type Output = Self;
+
+  fn bitor(self, rhs: Self) -> Self::Output {
+    self.or(rhs)
+  }
+}
+
+impl std::ops::BitOrAssign for Interest {
+  fn bitor_assign(&mut self, rhs: Self) {
+    *self = self.or(rhs);
   }
 }
 
@@ -115,17 +144,13 @@ pub trait ReadinessPoll {
   fn event_interest(event: &Self::NativeEvent) -> Interest;
 }
 
-/// Represents an event interest registration
+/// Represents a readiness event from the poller
 #[derive(Debug, Clone, Copy)]
 pub struct Event {
   /// User-provided key to identify this event
   pub key: u64,
-  /// Whether this is a read event
-  pub readable: bool,
-  /// Whether this is a write event
-  pub writable: bool,
-  /// Whether this is a timer event
-  pub timer: bool,
+  /// The interest flags that triggered (what actually happened)
+  pub interest: Interest,
 }
 
 /// A collection of events returned from polling
@@ -133,13 +158,11 @@ pub struct Events {
   events: Vec<<sys::OsPoller as ReadinessPoll>::NativeEvent>,
 }
 
-// impl AsMut<[<sys::OsPoller as ReadinessPoll>::NativeEvent]> for Events {
-//   /// Makes Events ready for input.
-//   fn as_mut(&mut self) -> &mut [<sys::OsPoller as ReadinessPoll>::NativeEvent] {
-//
-//     // &mut self.events
-//   }
-// }
+impl AsMut<[<sys::OsPoller as ReadinessPoll>::NativeEvent]> for Events {
+  fn as_mut(&mut self) -> &mut [<sys::OsPoller as ReadinessPoll>::NativeEvent] {
+    &mut self.events
+  }
+}
 
 // SAFETY: Events buffer is protected by Mutex and only used within the same thread
 // The raw pointers in NativeEvent (e.g., kevent) are never dereferenced across threads
@@ -194,12 +217,7 @@ impl Events {
     let key = sys::OsPoller::event_key(native_event);
     let interest = sys::OsPoller::event_interest(native_event);
 
-    Event {
-      key,
-      readable: interest.is_readable(),
-      writable: interest.is_writable(),
-      timer: interest.is_timer(),
-    }
+    Event { key, interest }
   }
 }
 
@@ -231,7 +249,6 @@ impl<'a> Iterator for EventsIter<'a> {
 
 /// Main polling structure
 pub struct Poller {
-  fd_map: Mutex<HashMap<u64, RawFd>>,
   inner: sys::OsPoller,
   events: Mutex<Events>,
 }
@@ -241,7 +258,7 @@ impl Poller {
   pub fn new() -> io::Result<Self> {
     Ok(Self {
       inner: sys::OsPoller::new()?,
-      fd_map: Mutex::new(HashMap::default()),
+      // fd_map: Mutex::new(HashMap::default()),
       events: Mutex::new(Events::new()),
     })
   }
@@ -254,34 +271,25 @@ impl Poller {
     interest: Interest,
   ) -> io::Result<()> {
     assert!(fd >= 0, "Poller::add: fd must be >= 0, got {}", fd);
-    assert_ne!(
-      interest,
-      Interest::None,
-      "Poller::add: interest cannot be None"
-    );
+    assert!(!interest.is_none(), "Poller::add: interest cannot be None");
 
     self.inner.add(fd, key, interest)
   }
 
   /// Modify interest for a file descriptor
-  pub unsafe fn modify(&self, fd: RawFd, event: Event) -> io::Result<()> {
+  pub unsafe fn modify(
+    &self,
+    fd: RawFd,
+    key: u64,
+    interest: Interest,
+  ) -> io::Result<()> {
     if fd < 0 {
       return Err(io::Error::from_raw_os_error(libc::EBADF));
     }
 
-    assert!(
-      event.readable || event.writable || event.timer,
-      "Poller::modify: at least one of readable/writable/timer must be true"
-    );
+    assert!(!interest.is_none(), "Poller::modify: interest cannot be None");
 
-    let interest = match (event.readable, event.writable) {
-      (true, true) => Interest::ReadAndWrite,
-      (true, false) => Interest::Read,
-      (false, true) => Interest::Write,
-      (false, false) => unreachable!("already checked above"),
-    };
-
-    self.inner.modify(fd, event.key, interest)
+    self.inner.modify(fd, key, interest)
   }
 
   /// Remove interest for a file descriptor
@@ -312,80 +320,32 @@ impl Poller {
     unsafe { events.set_len(n) };
     Ok(())
   }
-
-  fn new_polling(&self, op: &dyn Operation, id: u64) -> Result<(), SubmitErr>
-  where
-    T: Operation,
-  {
-    let meta = op.meta();
-    let interest = if meta.is_cap_fd() {
-      if meta.is_fd_readable() && meta.is_fd_writable() {
-        Interest::ReadAndWrite
-      } else if meta.is_fd_readable() {
-        Interest::Read
-      } else if meta.is_fd_writable() {
-        Interest::Write
-      } else {
-        panic!()
-      }
-    } else if meta.is_cap_timer() {
-      Interest::Timer
-    } else {
-      panic!()
-    };
-    // let interest = T::INTEREST.expect("op is event but no interest??");
-    // let id = store.next_id();
-    // let fd = op.cap();
-    // assert!(fd >= 0, "new_polling: fd must be valid (>= 0)");
-
-    // self.fd_map.lock().insert(id, fd);
-    // store.insert(id, Box::new(op));
-    unsafe { self.add(meta.cap(), id, interest) }.map_err(SubmitErr::Io)?;
-    Ok(())
-    // OperationProgress::<T>::new_store_tracked(id)
-  }
 }
 
-impl IoBackend for Poller {
-  fn submit(&self, op: &dyn Operation, id: u64) -> Result<(), SubmitErr> {
-    let meta = op.meta();
-    if meta.is_cap_none() {
-      panic!();
-      // return OperationProgress::FromResult {
-      //   res: Some(op.run_blocking()),
-      //   operation: op,
-      // };
-    };
+pub struct PollerState {
+  sys: sys::OsPoller,
+}
+pub struct PollerHandle {
+  events: Events,
+  fd_map: HashMap<u64, RawFd>,
+}
 
-    if !meta.is_beh_run_before_noti() {
-      return self.new_polling(op, id);
-    }
+impl PollerHandle {
+  fn tick_inner(
+    &mut self,
+    state: &PollerState,
+    store: &OpStore,
+    can_wait: bool,
+  ) -> io::Result<Vec<super::OpCompleted>> {
+    self.events.clear();
+    state.sys.wait(
+      self.events.as_mut(),
+      if can_wait { None } else { Some(Duration::from_millis(0)) },
+    )?;
 
-    // CONNECT
+    let mut completed = Vec::new();
 
-    let result = op.run_blocking();
-
-    if result
-      .as_ref()
-      .is_err_and(|err| err.raw_os_error() == Some(libc::EINPROGRESS))
-    {
-      self.new_polling(op, id)
-    } else {
-      panic!();
-      // OperationProgress::<O>::new_from_result(op, result);
-    }
-  }
-  fn notify(&self) {
-    self.inner.notify().unwrap();
-  }
-  fn tick(&self, store: &OpStore, can_wait: bool) {
-    self
-      .wait(if can_wait { None } else { Some(Duration::from_millis(0)) })
-      .expect("background thread failed");
-
-    let events = self.events.lock();
-
-    for event in events.iter() {
+    for event in self.events.iter() {
       let operation_id = event.key as u64;
       assert_ne!(
         operation_id,
@@ -396,7 +356,6 @@ impl IoBackend for Poller {
       // Look up fd from our internal map
       let entry_fd = *self
         .fd_map
-        .lock()
         .get(&operation_id)
         .expect("couldn't find fd for operation");
 
@@ -410,37 +369,134 @@ impl IoBackend for Poller {
           if err.kind() == ErrorKind::WouldBlock
             || err.raw_os_error() == Some(libc::EINPROGRESS) =>
         {
-          unsafe { self.modify(entry_fd, event) }.expect("fd sure exists");
+          state.sys.modify(entry_fd, operation_id, event.interest)?;
 
           continue;
         }
         _ => {
           // Clean up - use delete_timer for timer events, delete for fd-based events
-          if event.timer {
-            unsafe { self.delete_timer(operation_id) }.unwrap();
+          if event.interest.is_timer() {
+            state.sys.delete_timer(operation_id)?;
           } else {
-            unsafe { self.delete(entry_fd) }.unwrap();
+            state.sys.delete(entry_fd)?;
           }
-          self.fd_map.lock().remove(&operation_id);
+          self.fd_map.remove(&operation_id);
 
-          let set_done_result = store
-            .get_mut(operation_id, |reg| {
-              // if should keep.
-              reg.set_done(result)
-            })
-            .expect("Cannot find matching operation");
-          match set_done_result {
-            None => {}
-            Some(value) => match value {
-              Notifier::Waker(waker) => waker.wake(),
-              Notifier::Callback(callback) => {
-                store.get_mut(operation_id, |entry| callback.call(entry));
-                assert!(store.remove(operation_id));
-              }
-            },
-          }
+          completed.push(OpCompleted::new(operation_id, result));
+
+          // let exists = store.get_mut(operation_id, |reg| reg.set_done(result));
+          // assert!(exists.is_some(), "Cannot find matching operation");
+          // assert!(store.remove(operation_id));
         }
       };
     }
+
+    Ok(completed)
+  }
+}
+
+impl IoHandler for PollerHandle {
+  fn tick(
+    &mut self,
+    state: *const (),
+    store: &OpStore,
+  ) -> io::Result<Vec<super::OpCompleted>> {
+    self.tick_inner(into_shared(state), store, true)
+  }
+
+  fn try_tick(
+    &mut self,
+    state: *const (),
+    store: &OpStore,
+  ) -> io::Result<Vec<super::OpCompleted>> {
+    self.tick_inner(into_shared(state), store, false)
+  }
+}
+pub struct PollerSubmitter;
+
+impl PollerSubmitter {
+  fn new_polling(
+    &self,
+    state: &PollerState,
+    id: u64,
+    op: &dyn Operation,
+  ) -> Result<(), SubmitErr> {
+    let meta = op.meta();
+    let interest = if meta.is_cap_fd() {
+      if meta.is_fd_readable() && meta.is_fd_writable() {
+        Interest::READ_AND_WRITE
+      } else if meta.is_fd_readable() {
+        Interest::READ
+      } else if meta.is_fd_writable() {
+        Interest::WRITE
+      } else {
+        panic!()
+      }
+    } else if meta.is_cap_timer() {
+      Interest::TIMER
+    } else {
+      panic!()
+    };
+
+    state.sys.add(op.cap(), id, interest).map_err(SubmitErr::Io)?;
+    Ok(())
+  }
+}
+
+fn into_shared<'a>(ptr: *const ()) -> &'a PollerState {
+  unsafe { &*(ptr as *const _) }
+}
+
+impl IoSubmitter for PollerSubmitter {
+  fn submit(
+    &mut self,
+    state: *const (),
+    id: u64,
+    op: &dyn Operation,
+  ) -> Result<(), SubmitErr> {
+    let meta = op.meta();
+    if meta.is_cap_none() {
+      return Err(SubmitErr::NotCompatible);
+    };
+
+    if !meta.is_beh_run_before_noti() {
+      return self.new_polling(into_shared(state), id, op);
+    }
+
+    // CONNECT
+
+    let result = op.run_blocking();
+
+    if result
+      .as_ref()
+      .is_err_and(|err| err.raw_os_error() == Some(libc::EINPROGRESS))
+    {
+      self.new_polling(into_shared(state), id, op)
+    } else {
+      panic!("Not sure what todo here");
+    }
+  }
+  fn notify(&mut self, state: *const ()) -> Result<(), SubmitErr> {
+    Ok(into_shared(state).sys.notify()?)
+  }
+}
+
+impl IoDriver for Poller {
+  type Handler = PollerHandle;
+  type Submitter = PollerSubmitter;
+
+  fn new_state() -> io::Result<*const ()> {
+    let state = PollerState { sys: sys::OsPoller::new()? };
+
+    Ok(Box::into_raw(Box::new(state)) as *const _)
+  }
+  fn drop_state(state: *const ()) {
+    let _ = unsafe { Box::from_raw(state as *mut PollerState) };
+  }
+  fn new(_ptr: *const ()) -> io::Result<(Self::Submitter, Self::Handler)> {
+    Ok((
+      PollerSubmitter,
+      PollerHandle { events: Events::new(), fd_map: HashMap::new() },
+    ))
   }
 }

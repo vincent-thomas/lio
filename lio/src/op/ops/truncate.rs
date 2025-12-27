@@ -3,7 +3,7 @@ use std::os::fd::RawFd;
 #[cfg(linux)]
 use io_uring::{opcode, squeue, types::Fd};
 
-use crate::op::{DetachSafe, Operation};
+use crate::op::{DetachSafe, Operation, OperationExt};
 
 pub struct Truncate {
   fd: RawFd,
@@ -16,6 +16,10 @@ impl Truncate {
   pub(crate) fn new(fd: RawFd, size: u64) -> Self {
     Self { fd, size }
   }
+}
+
+impl OperationExt for Truncate {
+  type Result = std::io::Result<()>;
 }
 
 impl Operation for Truncate {

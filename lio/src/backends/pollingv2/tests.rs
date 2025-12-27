@@ -139,7 +139,7 @@ where
 
   let mut events = vec![unsafe { std::mem::zeroed() }; 16];
 
-  let both = Interest::ReadAndWrite;
+  let both = Interest::READ_AND_WRITE;
   poller.add(fd1, 3, both)?;
 
   let n = poller.wait(&mut events, Some(Duration::from_millis(100)))?;
@@ -651,7 +651,7 @@ where
     syscall!(write(fd2, data.as_ptr() as *const libc::c_void, data.len()));
 
   // Register for both read and write (write should be immediately ready, read should be ready too)
-  let both = Interest::ReadAndWrite;
+  let both = Interest::READ_AND_WRITE;
   poller.add(fd1, 42, both)?;
 
   let n = poller.wait(&mut events, Some(Duration::from_millis(100)))?;
@@ -718,7 +718,7 @@ where
   poller.add(fd1, 1, Interest::WRITE)?;
 
   // Modify to no interest (edge case - shouldn't get events)
-  let none = Interest::None;
+  let none = Interest::NONE;
   poller.modify(fd1, 1, none)?;
 
   let _n = poller.wait(&mut events, Some(Duration::from_millis(10)))?;

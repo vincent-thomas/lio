@@ -9,7 +9,7 @@ use crate::{
   op::DetachSafe,
 };
 
-use crate::op::Operation;
+use crate::op::{Operation, OperationExt};
 
 pub struct Read<T> {
   fd: RawFd,
@@ -29,14 +29,24 @@ impl<T> Read<T> {
   }
 }
 
+impl<T> OperationExt for Read<T>
+where
+  T: BufLike,
+{
+  type Result = BufResult<i32, T>;
+}
+
 impl<T> Operation for Read<T>
 where
   T: BufLike,
 {
-  impl_no_readyness!();
+  impl_result!(|this, ret: io::Result<i32>| -> BufResult<i32, T> {
+    let buf = this.buf.take().expect("ran Recv::result more than once.");
+    let out = buf.after(*ret.as_ref().unwrap_or(&0) as usize);
+    (ret, out)
+  });
 
-  #[cfg(linux)]
-  const OPCODE: u8 = 22;
+  impl_no_readyness!();
 
   #[cfg(linux)]
   fn create_entry(&mut self) -> io_uring::squeue::Entry {
@@ -45,15 +55,9 @@ where
       .offset(self.offset as u64)
       .build()
   }
-  type Result = BufResult<i32, T>;
 
   fn run_blocking(&self) -> io::Result<i32> {
     let (ptr, len) = self.buf.as_ref().unwrap().get();
     syscall!(pread(self.fd, ptr as *mut _, len, self.offset)).map(|t| t as i32)
-  }
-  fn result(&mut self, ret: io::Result<i32>) -> Self::Result {
-    let buf = self.buf.take().expect("ran Recv::result more than once.");
-    let out = buf.after(*ret.as_ref().unwrap_or(&0) as usize);
-    (ret, out)
   }
 }

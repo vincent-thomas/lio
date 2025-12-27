@@ -6,11 +6,9 @@ use std::{
   thread::{self, JoinHandle},
 };
 
-use crate::{op_registration::OpNotification, sync::Mutex};
+use crate::sync::Mutex;
 
-use crate::{
-  OperationProgress, backends::IoBackend, driver::OpStore, op::Operation,
-};
+use crate::{Progress, backends::IoBackend, driver::OpStore, op::Operation};
 
 /// Work item sent to worker threads
 /// The runner executes the operation and sends the completion
@@ -121,8 +119,8 @@ impl IoBackend for Threading {
       // Handle wakers/callbacks
       if let Some(Some(notification)) = set_done_result {
         match notification {
-          OpNotification::Waker(waker) => waker.wake(),
-          OpNotification::Callback(callback) => {
+          Notifier::Waker(waker) => waker.wake(),
+          Notifier::Callback(callback) => {
             store.get_mut(completion.id, |entry| callback.call(entry));
             assert!(store.remove(completion.id));
           }

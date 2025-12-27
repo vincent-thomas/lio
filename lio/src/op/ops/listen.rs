@@ -5,7 +5,7 @@ use io_uring::types::Fd;
 
 use crate::op::DetachSafe;
 
-use crate::op::Operation;
+use crate::op::{Operation, OperationExt};
 
 pub struct Listen {
   fd: RawFd,
@@ -18,6 +18,10 @@ impl Listen {
   pub(crate) fn new(fd: RawFd, backlog: i32) -> Self {
     Self { fd, backlog }
   }
+}
+
+impl OperationExt for Listen {
+  type Result = std::io::Result<()>;
 }
 
 impl Operation for Listen {

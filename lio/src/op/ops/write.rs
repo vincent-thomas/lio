@@ -1,7 +1,7 @@
 use crate::{
   BufResult,
   buf::{Buf, BufLike},
-  op::{DetachSafe, Operation},
+  op::{DetachSafe, Operation, OperationExt},
 };
 
 #[cfg(linux)]
@@ -26,13 +26,24 @@ impl<B> Write<B> {
   }
 }
 
+impl<B> OperationExt for Write<B>
+where
+  B: BufLike,
+{
+  type Result = BufResult<i32, B>;
+}
+
 impl<B> Operation for Write<B>
 where
   B: BufLike,
 {
-  impl_no_readyness!();
+  impl_result!(|this, res: io::Result<i32>| -> BufResult<i32, B> {
+    let buf = this.buf.take().expect("ran Recv::result more than once.");
+    let out = buf.after(*res.as_ref().unwrap_or(&0) as usize);
+    (res, out)
+  });
 
-  type Result = BufResult<i32, B>;
+  impl_no_readyness!();
 
   #[cfg(linux)]
   const OPCODE: u8 = 23;
@@ -78,11 +89,5 @@ where
     } else {
       result
     }
-  }
-
-  fn result(&mut self, res: std::io::Result<i32>) -> Self::Result {
-    let buf = self.buf.take().expect("ran Recv::result more than once.");
-    let out = buf.after(*res.as_ref().unwrap_or(&0) as usize);
-    (res, out)
   }
 }

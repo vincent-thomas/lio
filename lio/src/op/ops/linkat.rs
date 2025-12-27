@@ -9,7 +9,7 @@ use io_uring::types::Fd;
 
 use crate::op::DetachSafe;
 
-use crate::op::Operation;
+use crate::op::{Operation, OperationExt};
 
 pub struct LinkAt {
   old_dir_fd: RawFd,
@@ -37,6 +37,10 @@ impl LinkAt {
       new_path: CString::new(new_path_osstr.into_vec())?,
     })
   }
+}
+
+impl OperationExt for LinkAt {
+  type Result = std::io::Result<()>;
 }
 
 impl Operation for LinkAt {

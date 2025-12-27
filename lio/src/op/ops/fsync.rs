@@ -5,7 +5,7 @@ use io_uring::types::Fd;
 
 use crate::op::DetachSafe;
 
-use crate::op::Operation;
+use crate::op::{Operation, OperationExt};
 
 pub struct Fsync {
   fd: RawFd,
@@ -18,6 +18,10 @@ impl Fsync {
 }
 
 unsafe impl DetachSafe for Fsync {}
+
+impl OperationExt for Fsync {
+  type Result = std::io::Result<()>;
+}
 
 impl Operation for Fsync {
   impl_result!(());

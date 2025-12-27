@@ -1,4 +1,4 @@
-use crate::op::DetachSafe;
+use crate::op::{DetachSafe, OpMeta};
 use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -7,7 +7,7 @@ use std::time::Duration;
 #[cfg(linux)]
 use io_uring::{opcode, squeue, types::Timespec};
 
-use crate::op::Operation;
+use crate::op::{Operation, OperationExt};
 
 pub struct Timeout {
   duration: Duration,
@@ -85,9 +85,12 @@ impl Timeout {
   }
 }
 
-impl Operation for Timeout {
+impl OperationExt for Timeout {
   type Result = std::io::Result<()>;
-  fn result(&mut self, res: std::io::Result<i32>) -> Self::Result {
+}
+
+impl Operation for Timeout {
+  impl_result!(|_this, res: std::io::Result<i32>| -> std::io::Result<()> {
     match res {
       Ok(v) => {
         assert!(v == 0);
@@ -105,28 +108,30 @@ impl Operation for Timeout {
         }
       }
     }
+  });
+
+  #[cfg(kqueue)]
+  fn meta(&self) -> OpMeta {
+    OpMeta::CAP_TIMER
   }
 
-  #[cfg(linux)]
-  const OPCODE: u8 = 11;
+  #[cfg(not(kqueue))]
+  fn meta(&self) -> OpMeta {
+    OpMeta::CAP_FD | OpMeta::FD_READ
+  }
+
+  // #[cfg(linux)]
+  // const OPCODE: u8 = 11;
 
   #[cfg(linux)]
   fn create_entry(&mut self) -> squeue::Entry {
     opcode::Timeout::new(&self.timespec as *const _).build()
   }
 
-  #[cfg(linux)]
-  const INTEREST: Option<crate::backends::pollingv2::Interest> =
-    Some(crate::backends::pollingv2::Interest::READ);
-
-  #[cfg(kqueue)]
-  const INTEREST: Option<crate::backends::pollingv2::Interest> =
-    Some(crate::backends::pollingv2::Interest::Timer);
-
   /// Very special case here for kqueue.
   /// Return duration here.
   #[cfg(unix)]
-  fn fd(&self) -> Option<RawFd> {
+  fn cap(&self) -> RawFd {
     #[cfg(linux)]
     {
       Some(self.timer_fd.as_raw_fd())
@@ -134,7 +139,7 @@ impl Operation for Timeout {
     #[cfg(kqueue)]
     {
       // For kqueue, encode duration as milliseconds in the "fd"
-      Some(self.duration.as_millis() as RawFd)
+      self.duration.as_millis() as RawFd
     }
   }
 

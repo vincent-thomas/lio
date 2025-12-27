@@ -1,5 +1,6 @@
 use std::{
   cell::UnsafeCell,
+  io,
   mem::{self},
   net::SocketAddr,
   os::fd::RawFd,
@@ -8,7 +9,7 @@ use std::{
 #[cfg(linux)]
 use io_uring::{opcode, squeue, types::Fd};
 
-use crate::op::{OpMeta, net_utils::libc_socketaddr_into_std};
+use crate::op::{OpMeta, OperationExt, net_utils::libc_socketaddr_into_std};
 
 use crate::op::Operation;
 
@@ -30,18 +31,16 @@ impl Accept {
   }
 }
 
+impl OperationExt for Accept {
+  type Result = io::Result<(RawFd, SocketAddr)>;
+}
+
 impl Operation for Accept {
-  // type Result = std::io::Result<(RawFd, SocketAddr)>;
-  //
-  fn result(&mut self, res: std::io::Result<i32>) -> *const () {
-    fn nice(
-      this: &mut Accept,
-      res: std::io::Result<i32>,
-    ) -> std::io::Result<(RawFd, SocketAddr)> {
-      Ok((res?, libc_socketaddr_into_std(this.addr.get())?))
-    }
-    Box::into_raw(Box::new(nice(self, res))) as *const _
-  }
+  impl_result!(|this,
+                res: std::io::Result<i32>|
+   -> io::Result<(RawFd, SocketAddr)> {
+    Ok((res?, libc_socketaddr_into_std(this.addr.get())?))
+  });
 
   // #[cfg(linux)]
   // const OPCODE: u8 = 13;
@@ -55,10 +54,6 @@ impl Operation for Accept {
     )
     .build()
   }
-
-  // #[cfg(unix)]
-  // const INTEREST: Option<crate::backends::pollingv2::Interest> =
-  //   Some(crate::backends::pollingv2::Interest::READ);
 
   fn meta(&self) -> OpMeta {
     OpMeta::CAP_FD | OpMeta::FD_READ

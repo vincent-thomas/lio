@@ -1,7 +1,7 @@
 use std::io;
 use std::os::fd::RawFd;
 
-use crate::op::Operation;
+use crate::op::{Operation, OperationExt};
 
 // Not detach safe.
 pub struct Socket {
@@ -173,6 +173,10 @@ impl Socket {
 
     Ok(())
   }
+}
+
+impl OperationExt for Socket {
+  type Result = std::io::Result<RawFd>;
 }
 
 impl Operation for Socket {
