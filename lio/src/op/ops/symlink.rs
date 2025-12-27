@@ -7,7 +7,7 @@ use std::{
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-use crate::op::Operation;
+use crate::op::{Operation, OperationExt};
 
 pub struct SymlinkAt {
   fd: RawFd,
@@ -32,6 +32,10 @@ impl SymlinkAt {
       linkpath: CString::new(linkpath.into_vec())?,
     })
   }
+}
+
+impl OperationExt for SymlinkAt {
+  type Result = std::io::Result<()>;
 }
 
 impl Operation for SymlinkAt {

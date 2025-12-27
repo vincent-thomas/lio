@@ -370,10 +370,10 @@ impl ReadinessPoll for OsPoller {
   fn event_interest(event: &Self::NativeEvent) -> Interest {
     // kqueue returns one event per filter, so only one will be set
     match event.filter {
-      libc::EVFILT_READ => Interest::Read,
-      libc::EVFILT_WRITE => Interest::Write,
-      libc::EVFILT_TIMER => Interest::Timer,
-      _ => Interest::Read, // Fallback
+      libc::EVFILT_READ => Interest::READ,
+      libc::EVFILT_WRITE => Interest::WRITE,
+      libc::EVFILT_TIMER => Interest::TIMER,
+      _ => Interest::READ, // Fallback
     }
   }
 }

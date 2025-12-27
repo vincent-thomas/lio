@@ -31,13 +31,10 @@ pub trait Operation: Sealed {
   // }
 
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry;
+  fn create_entry(&self) -> io_uring::squeue::Entry;
 
   #[cfg(unix)]
   fn meta(&self) -> OpMeta;
-
-  // #[cfg(unix)]
-  // const INTEREST: Option<crate::backends::pollingv2::Interest> = None;
 
   #[cfg(unix)]
   fn cap(&self) -> i32 {
@@ -58,19 +55,25 @@ pub trait Operation: Sealed {
 
 pub trait OperationExt: Operation {
   type Result;
-
-  // Helper to get typed result without manual pointer casting
-  fn result_typed(&mut self, ret: io::Result<i32>) -> Self::Result {
-    unsafe {
-      let ptr = self.result(ret);
-      *Box::from_raw(ptr as *mut Self::Result)
-    }
-  }
 }
 
 /// Operation flags using bitflags pattern
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpMeta(u8);
+
+impl Into<u8> for OpMeta {
+  fn into(self) -> u8 {
+    self.0
+  }
+}
+
+impl BitOr for OpMeta {
+  type Output = Self;
+
+  fn bitor(self, rhs: Self) -> Self::Output {
+    Self(self.0 | rhs.0)
+  }
+}
 
 impl OpMeta {
   pub const CAP_NONE: Self = Self(0);
@@ -121,14 +124,6 @@ impl OpMeta {
   pub const fn is_fd_writable(self) -> bool {
     assert!(matches!(self, Self::CAP_FD));
     matches!(self, Self::FD_WRITE)
-  }
-}
-
-impl BitOr for OpMeta {
-  type Output = Self;
-
-  fn bitor(self, rhs: Self) -> Self::Output {
-    Self(self.0 | rhs.0)
   }
 }
 

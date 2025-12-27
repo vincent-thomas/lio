@@ -6,7 +6,7 @@ use io_uring::types::Fd;
 use crate::{
   BufResult,
   buf::{Buf, BufLike},
-  op::DetachSafe,
+  op::{DetachSafe, OpMeta, OperationExt},
 };
 
 use crate::op::Operation;
@@ -25,14 +25,25 @@ impl<T> Recv<T> {
   }
 }
 
-impl<T> Operation for Recv<T>
+impl<T> OperationExt for Recv<T>
 where
   T: BufLike,
 {
   type Result = BufResult<i32, T>;
+}
 
-  #[cfg(linux)]
-  const OPCODE: u8 = 27;
+impl<T> Operation for Recv<T>
+where
+  T: BufLike,
+{
+  impl_result!(|this, res: io::Result<i32>| -> BufResult<i32, T> {
+    let buf = this.buf.take().expect("ran Recv::result more than once.");
+    let out = buf.after(*res.as_ref().unwrap_or(&0) as usize);
+    (res, out)
+  });
+
+  // #[cfg(linux)]
+  // const OPCODE: u8 = 27;
 
   #[cfg(linux)]
   fn create_entry(&mut self) -> io_uring::squeue::Entry {
@@ -42,23 +53,17 @@ where
       .build()
   }
 
-  #[cfg(unix)]
-  const INTEREST: Option<crate::backends::pollingv2::Interest> =
-    Some(crate::backends::pollingv2::Interest::READ);
+  fn meta(&self) -> OpMeta {
+    OpMeta::CAP_FD | OpMeta::FD_READ
+  }
 
   #[cfg(unix)]
-  fn fd(&self) -> Option<RawFd> {
-    Some(self.fd)
+  fn cap(&self) -> i32 {
+    self.fd
   }
 
   fn run_blocking(&self) -> io::Result<i32> {
     let (ptr, len) = self.buf.as_ref().unwrap().get();
     syscall!(recv(self.fd, ptr as *mut _, len, self.flags)).map(|t| t as i32)
-  }
-
-  fn result(&mut self, res: io::Result<i32>) -> Self::Result {
-    let buf = self.buf.take().expect("ran Recv::result more than once.");
-    let out = buf.after(*res.as_ref().unwrap_or(&0) as usize);
-    (res, out)
   }
 }

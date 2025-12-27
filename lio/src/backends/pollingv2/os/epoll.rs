@@ -177,10 +177,10 @@ impl ReadinessPoll for OsPoller {
     let writable = (event.events & libc::EPOLLOUT as u32) != 0;
 
     match (readable, writable) {
-      (true, true) => Interest::ReadAndWrite,
-      (true, false) => Interest::Read,
-      (false, true) => Interest::Write,
-      (false, false) => Interest::Read, // Fallback, shouldn't happen
+      (true, true) => Interest::READ_AND_WRITE,
+      (true, false) => Interest::READ,
+      (false, true) => Interest::WRITE,
+      (false, false) => Interest::READ, // Fallback, shouldn't happen
     }
   }
 }

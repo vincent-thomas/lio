@@ -1,14 +1,14 @@
 use std::cell::UnsafeCell;
-use std::mem;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{io, mem};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-use crate::op::DetachSafe;
 use crate::op::net_utils::std_socketaddr_into_libc;
+use crate::op::{DetachSafe, OpMeta, OperationExt};
 
 use crate::op::Operation;
 
@@ -43,11 +43,15 @@ impl Connect {
   }
 }
 
+impl OperationExt for Connect {
+  type Result = io::Result<()>;
+}
+
 impl Operation for Connect {
   impl_result!(());
 
-  #[cfg(linux)]
-  const OPCODE: u8 = 16;
+  // #[cfg(linux)]
+  // const OPCODE: u8 = 16;
 
   #[cfg(linux)]
   fn create_entry(&mut self) -> io_uring::squeue::Entry {
@@ -59,15 +63,12 @@ impl Operation for Connect {
     .build()
   }
 
-  #[cfg(unix)]
-  const FLAGS: crate::op::OpFlags = crate::op::OpFlags::IS_CONNECT;
+  fn meta(&self) -> OpMeta {
+    OpMeta::CAP_FD | OpMeta::FD_WRITE
+  }
 
-  #[cfg(unix)]
-  const INTEREST: Option<crate::backends::pollingv2::Interest> =
-    Some(crate::backends::pollingv2::Interest::WRITE);
-
-  fn fd(&self) -> Option<RawFd> {
-    Some(self.fd)
+  fn cap(&self) -> i32 {
+    self.fd
   }
 
   fn run_blocking(&self) -> std::io::Result<i32> {

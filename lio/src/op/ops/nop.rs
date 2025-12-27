@@ -1,31 +1,29 @@
-use crate::op::Operation;
+use crate::op::{OpMeta, Operation, OperationExt};
 use std::io;
 
 pub struct Nop;
 
-impl Operation for Nop {
-  #[cfg(unix)]
-  const OPCODE: u8 = 0;
-
-  #[cfg(unix)]
+impl OperationExt for Nop {
   type Result = ();
-  /// File descriptor returned from the operation.
-  fn result(&mut self, _out: std::io::Result<i32>) -> Self::Result {
-    ()
+}
+
+impl Operation for Nop {
+  impl_result!(());
+
+  // #[cfg(unix)]
+  // const OPCODE: u8 = 0;
+
+  fn meta(&self) -> OpMeta {
+    OpMeta::CAP_NONE
   }
 
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Nop::new().build()
   }
 
   #[cfg(unix)]
-  fn fd(&self) -> Option<std::os::fd::RawFd> {
-    None
-  }
-
-  #[cfg(unix)]
   fn run_blocking(&self) -> io::Result<i32> {
-    panic!();
+    Ok(0)
   }
 }

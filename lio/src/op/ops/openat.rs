@@ -3,7 +3,7 @@ use std::{ffi::CString, os::fd::RawFd};
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-use crate::op::Operation;
+use crate::op::{Operation, OperationExt};
 
 pub struct OpenAt {
   fd: RawFd,
@@ -15,6 +15,10 @@ impl OpenAt {
   pub(crate) fn new(fd: RawFd, pathname: CString, flags: i32) -> Self {
     Self { fd, pathname, flags }
   }
+}
+
+impl OperationExt for OpenAt {
+  type Result = std::io::Result<RawFd>;
 }
 
 impl Operation for OpenAt {

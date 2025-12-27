@@ -6,7 +6,7 @@ use io_uring::types::Fd;
 
 use crate::op::DetachSafe;
 
-use crate::op::Operation;
+use crate::op::{Operation, OperationExt};
 
 pub struct Shutdown {
   fd: RawFd,
@@ -20,6 +20,10 @@ impl Shutdown {
 }
 
 unsafe impl DetachSafe for Shutdown {}
+
+impl OperationExt for Shutdown {
+  type Result = std::io::Result<()>;
+}
 
 impl Operation for Shutdown {
   impl_result!(());

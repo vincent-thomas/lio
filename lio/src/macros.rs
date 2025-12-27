@@ -12,23 +12,21 @@ macro_rules! syscall {
 
 macro_rules! impl_result {
   (()) => {
-    type Result = std::io::Result<()>;
-
-    fn result(&mut self, res: std::io::Result<i32>) -> Self::Result {
-      res.map(|code| {
-        assert!(code == 0);
-      })
-    }
+      impl_result!(|_this, res: std::io::Result<i32>| -> std::io::Result<()> {
+        res.map(drop)
+      });
   };
 
   (fd) => {
-    #[cfg(unix)]
-    type Result = std::io::Result<std::os::fd::RawFd>;
+    impl_result!(|_this, res: std::io::Result<i32>| -> std::io::Result<i32> {
+      res
+    });
+  };
 
-    /// File descriptor returned from the operation.
-    #[cfg(unix)]
-    fn result(&mut self, fd: std::io::Result<i32>) -> Self::Result {
-      fd
+  (|$this:ident, $res:ident: $res_ty:ty| -> $ret_ty:ty { $($body:tt)* }) => {
+    fn result(&mut self, res: std::io::Result<i32>) -> *const () {
+      let __impl_result = |$this: &mut Self, $res: $res_ty| -> $ret_ty { $($body)* };
+      Box::into_raw(Box::new(__impl_result(self, res))) as *const ()
     }
   };
 }
@@ -36,11 +34,8 @@ macro_rules! impl_result {
 macro_rules! impl_no_readyness {
   () => {
     #[cfg(unix)]
-    const INTEREST: Option<crate::backends::pollingv2::Interest> = None;
-
-    #[cfg(unix)]
-    fn fd(&self) -> Option<std::os::fd::RawFd> {
-      None
+    fn meta(&self) -> crate::op::OpMeta {
+      crate::op::OpMeta::CAP_NONE
     }
   };
 }
