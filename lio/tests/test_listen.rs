@@ -1,5 +1,4 @@
-use lio::{bind, listen, socket};
-use socket2::{Domain, Protocol, Type};
+use lio::{bind, listen};
 use std::{net::SocketAddr, sync::mpsc};
 
 #[cfg(linux)]
@@ -12,7 +11,7 @@ fn test_listen_basic() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s1.send(res).unwrap();
     },
@@ -74,7 +73,7 @@ fn test_listen_with_backlog() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s1.send(res).unwrap();
     },
@@ -131,7 +130,7 @@ fn test_listen_large_backlog() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s1.send(res).unwrap();
     },
@@ -186,7 +185,7 @@ fn test_listen_without_bind() {
   let (sender_sock, receiver_sock) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s1.send(res).unwrap();
     },
@@ -225,7 +224,7 @@ fn test_listen_ipv6() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  socket(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp6_socket().when_done(
     move |res| {
       sender_s1.send(res).unwrap();
     },
@@ -281,7 +280,7 @@ fn test_listen_on_udp() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  socket(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).when_done(
+  lio::test_utils::udp_socket().when_done(
     move |res| {
       sender_s1.send(res).unwrap();
     },
@@ -332,7 +331,7 @@ fn test_listen_twice() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s1.send(res).unwrap();
     },
@@ -390,7 +389,7 @@ fn test_listen_zero_backlog() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s1.send(res).unwrap();
     },
@@ -443,7 +442,7 @@ fn test_listen_after_close() {
   lio::init();
 
   let mut socket_recv =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -482,7 +481,7 @@ fn test_listen_concurrent() {
   // Test listening on multiple sockets concurrently
   for _ in 0..10 {
     let sender_sock = sender.clone();
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+    lio::test_utils::tcp_socket().when_done(
       move |res| {
         sender_sock.send(res).unwrap();
       },
@@ -555,7 +554,7 @@ fn test_listen_on_all_interfaces() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s1.send(res).unwrap();
     },

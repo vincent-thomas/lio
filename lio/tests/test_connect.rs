@@ -1,12 +1,9 @@
-use lio::{bind, connect, listen, socket};
-use socket2::{Domain, Protocol, Type};
+use lio::{bind, connect, listen};
 use std::{
   mem::MaybeUninit,
   net::SocketAddr,
   sync::mpsc::{self, TryRecvError},
 };
-#[cfg(feature = "tracing")]
-use tracing::Level;
 
 #[ignore = "flaky network test"]
 #[test]
@@ -18,7 +15,7 @@ fn test_connect_basic() {
 
   // Create server socket
   let sender_s = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s.send(res).unwrap();
     },
@@ -68,7 +65,7 @@ fn test_connect_basic() {
 
   // Create client socket and connect
   let sender_cs = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_cs.send(res).unwrap();
     },
@@ -118,7 +115,7 @@ fn test_connect_ipv6() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  socket(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp6_socket().when_done(
     move |res| {
       sender_s.send(res).unwrap();
     },
@@ -167,7 +164,7 @@ fn test_connect_ipv6() {
   receiver_unit.recv().unwrap().expect("Failed to listen");
 
   let sender_cs = sender_sock.clone();
-  socket(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp6_socket().when_done(
     move |res| {
       sender_cs.send(res).unwrap();
     },
@@ -215,7 +212,7 @@ fn test_connect_to_nonexistent() {
   let (sender, receiver) = mpsc::channel();
 
   let sender1 = sender.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender1.send(res).unwrap();
     },
@@ -259,7 +256,7 @@ fn test_connect_multiple_clients() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s.send(res).unwrap();
     },
@@ -311,7 +308,7 @@ fn test_connect_multiple_clients() {
   let mut client_socks = Vec::new();
   for _ in 0..5 {
     let sender_cs = sender_sock.clone();
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+    lio::test_utils::tcp_socket().when_done(
       move |res| {
         sender_cs.send(res).unwrap();
       },
@@ -361,7 +358,7 @@ fn test_connect_already_connected() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s.send(res).unwrap();
     },
@@ -410,7 +407,7 @@ fn test_connect_already_connected() {
   receiver_unit.recv().unwrap().expect("Failed to listen");
 
   let sender_cs = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_cs.send(res).unwrap();
     },
@@ -467,7 +464,7 @@ fn test_connect_to_localhost() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s.send(res).unwrap();
     },
@@ -516,7 +513,7 @@ fn test_connect_to_localhost() {
   receiver_unit.recv().unwrap().expect("Failed to listen");
 
   let sender_cs = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_cs.send(res).unwrap();
     },
@@ -567,7 +564,7 @@ fn test_connect_concurrent() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s.send(res).unwrap();
     },
@@ -619,7 +616,7 @@ fn test_connect_concurrent() {
   let mut client_socks = Vec::new();
   for _ in 0..10 {
     let sender_cs = sender_sock.clone();
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+    lio::test_utils::tcp_socket().when_done(
       move |res| {
         sender_cs.send(res).unwrap();
       },
@@ -666,7 +663,7 @@ fn test_connect_with_bind() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s.send(res).unwrap();
     },
@@ -716,7 +713,7 @@ fn test_connect_with_bind() {
 
   // Create client socket and bind it to a specific local address
   let sender_cs = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_cs.send(res).unwrap();
     },

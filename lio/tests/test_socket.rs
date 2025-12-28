@@ -1,6 +1,4 @@
-use lio::socket;
-use socket2::{Domain, Protocol, Type};
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::mpsc;
 
 #[ignore = "flaky network test"]
 #[test]
@@ -8,13 +6,9 @@ fn test_socket_simple() {
   lio::init();
 
   let (sender, receiver) = mpsc::channel();
-  let sender1 = sender.clone();
 
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
-    move |result| {
-      sender1.send(result).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket()
+    .send_with(sender.clone());
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -56,13 +50,10 @@ fn test_socket_tcp_ipv4() {
   lio::init();
 
   let (sender, receiver) = mpsc::channel();
-  let sender1 = sender.clone();
 
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
-    move |result| {
-      sender1.send(result).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |result| {
+    sender.send(result).unwrap();
+  });
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -96,7 +87,7 @@ fn test_socket_tcp_ipv6() {
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
-  socket(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp6_socket().when_done(
     move |result| {
       sender1.send(result).unwrap();
     },
@@ -134,7 +125,7 @@ fn test_socket_udp_ipv4() {
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
-  socket(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).when_done(
+  lio::test_utils::udp_socket().when_done(
     move |result| {
       sender1.send(result).unwrap();
     },
@@ -172,7 +163,7 @@ fn test_socket_udp_ipv6() {
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
-  socket(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).when_done(
+  lio::test_utils::udp6_socket().when_done(
     move |result| {
       sender1.send(result).unwrap();
     },
@@ -209,7 +200,7 @@ fn test_socket_without_protocol() {
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
-  socket(Domain::IPV4, Type::STREAM, None).when_done(move |result| {
+  lio::test_utils::tcp_socket().when_done(move |result| {
     sender1.send(result).unwrap();
   });
 
@@ -233,19 +224,7 @@ fn test_socket_without_protocol() {
 fn test_socket_unix_stream() {
   lio::init();
 
-  let (sender, receiver) = mpsc::channel();
-  let sender1 = sender.clone();
-
-  socket(Domain::UNIX, Type::STREAM, None).when_done(move |result| {
-    sender1.send(result).unwrap();
-  });
-
-  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  let sock =
-    receiver.recv().unwrap().expect("Failed to create Unix stream socket");
+  let sock = lio::test_utils::unix_stream_socket();
   assert!(sock >= 0, "Socket fd should be valid");
 
   unsafe {
@@ -268,19 +247,7 @@ fn test_socket_unix_stream() {
 fn test_socket_unix_dgram() {
   lio::init();
 
-  let (sender, receiver) = mpsc::channel();
-  let sender1 = sender.clone();
-
-  socket(Domain::UNIX, Type::DGRAM, None).when_done(move |result| {
-    sender1.send(result).unwrap();
-  });
-
-  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  let sock =
-    receiver.recv().unwrap().expect("Failed to create Unix datagram socket");
+  let sock = lio::test_utils::unix_dgram_socket();
   assert!(sock >= 0, "Socket fd should be valid");
 
   unsafe {
@@ -307,21 +274,21 @@ fn test_socket_multiple() {
 
   // Create multiple sockets
   let sender1 = sender.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |result| {
       sender1.send(("sock1", result)).unwrap();
     },
   );
 
   let sender2 = sender.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |result| {
       sender2.send(("sock2", result)).unwrap();
     },
   );
 
   let sender3 = sender.clone();
-  socket(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).when_done(
+  lio::test_utils::udp_socket().when_done(
     move |result| {
       sender3.send(("sock3", result)).unwrap();
     },
@@ -362,18 +329,23 @@ fn test_socket_concurrent() {
 
   // Test creating multiple sockets
   for i in 0..20 {
-    let domain = if i % 2 == 0 { Domain::IPV4 } else { Domain::IPV6 };
-    let ty = if i % 3 == 0 { Type::DGRAM } else { Type::STREAM };
-    let proto = if ty == Type::STREAM {
-      Some(Protocol::TCP)
-    } else {
-      Some(Protocol::UDP)
-    };
-
     let sender_clone = sender.clone();
-    socket(domain, ty, proto).when_done(move |result| {
-      sender_clone.send(result).unwrap();
-    });
+
+    // Alternate between TCP IPv4, TCP IPv6, UDP IPv4, UDP IPv6
+    match i % 4 {
+      0 => lio::test_utils::tcp_socket().when_done(move |result| {
+        sender_clone.send(result).unwrap();
+      }),
+      1 => lio::test_utils::tcp6_socket().when_done(move |result| {
+        sender_clone.send(result).unwrap();
+      }),
+      2 => lio::test_utils::udp_socket().when_done(move |result| {
+        sender_clone.send(result).unwrap();
+      }),
+      _ => lio::test_utils::udp6_socket().when_done(move |result| {
+        sender_clone.send(result).unwrap();
+      }),
+    };
   }
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -397,7 +369,7 @@ fn test_socket_options_after_creation() {
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |result| {
       sender1.send(result).unwrap();
     },
@@ -445,7 +417,7 @@ fn test_socket_nonblocking() {
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |result| {
       sender1.send(result).unwrap();
     },

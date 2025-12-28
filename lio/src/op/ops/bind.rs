@@ -12,6 +12,12 @@ pub struct Bind {
   addr: UnsafeCell<libc::sockaddr_storage>, // addr: SocketAddr,
 }
 
+// SAFETY: The UnsafeCell is only written during construction and read during
+// execution. No mutation occurs after the operation is created, making it safe
+// to send across threads and share references.
+unsafe impl Send for Bind {}
+unsafe impl Sync for Bind {}
+
 unsafe impl DetachSafe for Bind {}
 
 impl Bind {
@@ -19,6 +25,8 @@ impl Bind {
     Self { fd, addr: UnsafeCell::new(std_socketaddr_into_libc(addr)) }
   }
 }
+
+assert_op_max_size!(Bind);
 
 impl OperationExt for Bind {
   type Result = io::Result<()>;
@@ -32,7 +40,7 @@ impl Operation for Bind {
   // const OPCODE: u8 = 56;
 
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Bind::new(
       Fd(self.fd),
       self.addr.get().cast(),

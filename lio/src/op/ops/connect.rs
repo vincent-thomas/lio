@@ -18,6 +18,14 @@ pub struct Connect {
   connect_called: AtomicBool,
 }
 
+assert_op_max_size!(Connect);
+
+// SAFETY: The UnsafeCell is only written during construction and read during
+// execution. No mutation occurs after the operation is created, making it safe
+// to send across threads and share references.
+unsafe impl Send for Connect {}
+unsafe impl Sync for Connect {}
+
 unsafe impl DetachSafe for Connect {}
 
 impl Connect {
@@ -54,7 +62,7 @@ impl Operation for Connect {
   // const OPCODE: u8 = 16;
 
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Connect::new(
       Fd(self.fd),
       self.addr.get().cast(),

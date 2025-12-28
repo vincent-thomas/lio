@@ -3,6 +3,8 @@ use std::io;
 
 pub struct Nop;
 
+assert_op_max_size!(Nop);
+
 impl OperationExt for Nop {
   type Result = ();
 }

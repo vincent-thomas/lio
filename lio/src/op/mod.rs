@@ -16,7 +16,7 @@ impl<O: Operation> Sealed for O {}
 pub unsafe trait DetachSafe: Sealed {}
 
 // Things that implement this trait represent a command that can be executed using io-uring.
-pub trait Operation: Sealed {
+pub trait Operation: Sealed + Sync + std::marker::Send {
   // type Result;
   /// This is guarranteed to fire after this has completed and only fire ONCE.
   /// i32 is guarranteed to be >= 0.
@@ -110,20 +110,20 @@ impl OpMeta {
   }
   /// Check if this operation waits for read readiness
   pub const fn is_beh_run_before_noti(self) -> bool {
-    assert!(matches!(self, Self::CAP_FD));
-    matches!(self, Self::BEH_NEEDS_RUN)
+    assert!(self.0 & Self::CAP_FD.0 != 0);
+    self.0 & Self::BEH_NEEDS_RUN.0 != 0
   }
 
   /// Check if this operation waits for read readiness
   pub const fn is_fd_readable(self) -> bool {
-    assert!(matches!(self, Self::CAP_FD));
-    matches!(self, Self::FD_READ)
+    assert!(self.0 & Self::CAP_FD.0 != 0);
+    self.0 & Self::FD_READ.0 != 0
   }
 
   /// Check if this operation waits for write readiness
   pub const fn is_fd_writable(self) -> bool {
-    assert!(matches!(self, Self::CAP_FD));
-    matches!(self, Self::FD_WRITE)
+    assert!(self.0 & Self::CAP_FD.0 != 0);
+    self.0 & Self::FD_WRITE.0 != 0
   }
 }
 

@@ -20,6 +20,12 @@ pub struct Accept {
   len: UnsafeCell<libc::socklen_t>,
 }
 
+// SAFETY: The UnsafeCells are only written during construction and by the kernel
+// via syscall output parameters. The operation is consumed after completion, and
+// no concurrent mutation occurs, making it safe to send across threads and share references.
+unsafe impl Send for Accept {}
+unsafe impl Sync for Accept {}
+
 impl Accept {
   pub(crate) fn new(fd: RawFd) -> Self {
     let addr: libc::sockaddr_storage = unsafe { mem::zeroed() };
@@ -46,7 +52,7 @@ impl Operation for Accept {
   // const OPCODE: u8 = 13;
 
   #[cfg(linux)]
-  fn create_entry(&mut self) -> squeue::Entry {
+  fn create_entry(&self) -> squeue::Entry {
     opcode::Accept::new(
       Fd(self.fd),
       self.addr.get().cast::<libc::sockaddr>(),
@@ -118,3 +124,4 @@ impl Operation for Accept {
     Ok(fd)
   }
 }
+assert_op_max_size!(Accept);

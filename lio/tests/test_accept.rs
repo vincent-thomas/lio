@@ -1,5 +1,4 @@
-use lio::{accept, bind, connect, listen, socket};
-use socket2::{Domain, Protocol, Type};
+use lio::{accept, bind, connect, listen};
 use std::{mem::MaybeUninit, net::SocketAddr, sync::mpsc};
 
 #[test]
@@ -8,7 +7,7 @@ fn test_accept_basic() {
   lio::init();
 
   // Create and setup server socket
-  let mut recv = socket(Domain::IPV4, Type::STREAM, None).send();
+  let mut recv = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -51,7 +50,7 @@ fn test_accept_basic() {
     "listen syscall failed"
   );
 
-  let mut recv = socket(Domain::IPV4, Type::STREAM, None).send();
+  let mut recv = lio::test_utils::tcp_socket().send();
 
   // assert!(recv.try_recv().is_none());
 
@@ -98,11 +97,9 @@ fn test_accept_multiple() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   // Create server socket
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
-    move |res| {
-      sender_sock.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_sock.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -161,11 +158,9 @@ fn test_accept_multiple() {
     });
 
     // Create client socket
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
-      move |res| {
-        sender_s.send(res).unwrap();
-      },
-    );
+    lio::test_utils::tcp_socket().when_done(move |res| {
+      sender_s.send(res).unwrap();
+    });
 
     // assert_eq!(receiver_a.try_recv().unwrap_err(), TryRecvError::Empty);
     lio::tick();
@@ -226,11 +221,9 @@ fn test_accept_with_client_info() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel();
 
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
-    move |res| {
-      sender_sock.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_sock.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -282,11 +275,9 @@ fn test_accept_with_client_info() {
     sender_a.send(res).unwrap();
   });
 
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
-    move |res| {
-      sender_s.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_a.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -335,8 +326,7 @@ fn test_accept_ipv6() {
   // let (sender_sock, receiver_sock) = mpsc::channel();
   // let (sender_unit, receiver_unit) = mpsc::channel();
 
-  let mut socket_recv =
-    socket(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).send();
+  let mut socket_recv = lio::test_utils::tcp6_socket().send();
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -385,8 +375,7 @@ fn test_accept_ipv6() {
 
   let mut accept_recv = accept(server_sock).send();
 
-  let mut client_s_recv =
-    socket(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).send();
+  let mut client_s_recv = lio::test_utils::tcp6_socket().send();
 
   // assert_eq!(receiver_s.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -429,8 +418,7 @@ fn test_accept_ipv6() {
 fn test_accept_concurrent() {
   lio::init();
 
-  let mut socket_recv =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+  let mut socket_recv = lio::test_utils::tcp_socket().send();
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -479,7 +467,7 @@ fn test_accept_concurrent() {
   // Queue up all socket creations
   for _ in 0..3 {
     all_sockets
-      .push(socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send());
+      .push(lio::test_utils::tcp_socket().send());
   }
 
   lio::tick();

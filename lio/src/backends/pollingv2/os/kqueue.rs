@@ -1,7 +1,9 @@
+use scc::HashSet;
+
 use crate::backends::pollingv2::notifier::{NOTIFY_KEY, Notifier};
 use crate::backends::pollingv2::{Interest, ReadinessPoll, util};
 
-use dashmap::DashSet;
+// use dashmap::DashSet;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 use std::{io, ptr};
@@ -14,9 +16,9 @@ pub struct OsPoller {
   kq_fd: OwnedFd,
   /// Track registered fds to match epoll's strict add/modify semantics
   /// Uses DashSet for lock-free concurrent access
-  registered_fds: DashSet<RawFd>,
+  registered_fds: HashSet<RawFd>,
   /// Track registered timer keys separately (timers don't have fds)
-  registered_timers: DashSet<u64>,
+  registered_timers: HashSet<u64>,
   /// Notifier for waking up blocked kevent
   notifier: Notifier,
 }
@@ -30,8 +32,8 @@ impl OsPoller {
     // Create kqueue
     let kqueue = Self {
       kq_fd: unsafe { OwnedFd::from_raw_fd(syscall!(kqueue())?) },
-      registered_fds: DashSet::new(),
-      registered_timers: DashSet::new(),
+      registered_fds: HashSet::new(),
+      registered_timers: HashSet::new(),
       notifier,
     };
 
@@ -176,21 +178,21 @@ impl ReadinessPoll for OsPoller {
   fn add(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
     // For timers, track by key instead of fd
     if interest.is_timer() {
-      if !self.registered_timers.insert(key) {
+      if self.registered_timers.insert_sync(key).is_err() {
         return Err(io::Error::from_raw_os_error(libc::EEXIST));
       }
 
       match self.change_interests_batched(fd, key as usize, interest) {
         Ok(()) => Ok(()),
         Err(e) => {
-          self.registered_timers.remove(&key);
+          self.registered_timers.remove_sync(&key);
           Err(e)
         }
       }
     } else {
       // Check if fd is already registered (match epoll's EEXIST behavior)
       // DashSet::insert returns true if the value was newly inserted
-      if !self.registered_fds.insert(fd) {
+      if self.registered_fds.insert_sync(fd).is_err() {
         // Value already existed
         return Err(io::Error::from_raw_os_error(libc::EEXIST));
       }
@@ -200,14 +202,14 @@ impl ReadinessPoll for OsPoller {
         Ok(()) => {
           // Postcondition: fd must still be in registered_fds
           assert!(
-            self.registered_fds.contains(&fd),
+            self.registered_fds.contains_sync(&fd),
             "fd should be in registered_fds after successful add"
           );
           Ok(())
         }
         Err(e) => {
           // Rollback: remove from tracking if syscall failed
-          let removed = self.registered_fds.remove(&fd);
+          let removed = self.registered_fds.remove_sync(&fd);
           assert!(
             removed.is_some(),
             "fd should have been in registered_fds for rollback"
@@ -221,13 +223,13 @@ impl ReadinessPoll for OsPoller {
   fn modify(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
     if interest.is_timer() {
       // For timers, check if key is registered
-      if !self.registered_timers.contains(&key) {
+      if !self.registered_timers.contains_sync(&key) {
         return Err(io::Error::from_raw_os_error(libc::ENOENT));
       }
       self.change_interests_batched(fd, key as usize, interest)
     } else {
       // Check if fd is registered (match epoll's ENOENT behavior)
-      if !self.registered_fds.contains(&fd) {
+      if !self.registered_fds.contains_sync(&fd) {
         return Err(io::Error::from_raw_os_error(libc::ENOENT));
       }
 
@@ -235,7 +237,7 @@ impl ReadinessPoll for OsPoller {
 
       // Postcondition: fd should still be registered regardless of success/failure
       assert!(
-        self.registered_fds.contains(&fd),
+        self.registered_fds.contains_sync(&fd),
         "fd should still be in registered_fds after modify"
       );
 
@@ -245,13 +247,13 @@ impl ReadinessPoll for OsPoller {
 
   fn delete(&self, fd: RawFd) -> io::Result<()> {
     // Check if fd is registered, fail with ENOENT if not
-    if !self.registered_fds.remove(&fd).is_some() {
+    if !self.registered_fds.remove_sync(&fd).is_some() {
       return Err(io::Error::from_raw_os_error(libc::ENOENT));
     }
 
     // Postcondition: fd should no longer be in registered_fds
     assert!(
-      !self.registered_fds.contains(&fd),
+      !self.registered_fds.contains_sync(&fd),
       "fd should not be in registered_fds after remove"
     );
 
@@ -280,7 +282,7 @@ impl ReadinessPoll for OsPoller {
 
   fn delete_timer(&self, key: u64) -> io::Result<()> {
     // Check if timer key is registered, fail with ENOENT if not
-    if !self.registered_timers.remove(&key).is_some() {
+    if self.registered_timers.remove_sync(&key).is_none() {
       return Err(io::Error::from_raw_os_error(libc::ENOENT));
     }
 

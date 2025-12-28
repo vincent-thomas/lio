@@ -1,6 +1,5 @@
 #![cfg(feature = "high")]
-use lio::{accept, bind, connect, listen, shutdown, socket};
-use socket2::{Domain, Protocol, Type};
+use lio::{accept, bind, connect, listen, shutdown};
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 
@@ -11,7 +10,7 @@ fn test_shutdown_write() {
 
   // Create server socket
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -47,7 +46,7 @@ fn test_shutdown_write() {
 
   // Create client socket
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -116,7 +115,7 @@ fn test_shutdown_read() {
   lio::init();
 
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -152,7 +151,7 @@ fn test_shutdown_read() {
 
   // Create client socket
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -215,7 +214,7 @@ fn test_shutdown_both() {
   lio::init();
 
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -251,7 +250,7 @@ fn test_shutdown_both() {
 
   // Create client socket
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -332,7 +331,7 @@ fn test_shutdown_after_close() {
   lio::init();
 
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -367,7 +366,7 @@ fn test_shutdown_after_close() {
   listen_recv.try_recv().unwrap().expect("Failed to listen");
 
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -404,7 +403,7 @@ fn test_shutdown_twice() {
   lio::init();
 
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -440,7 +439,7 @@ fn test_shutdown_twice() {
 
   // Create client socket
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -491,7 +490,7 @@ fn test_shutdown_sequential_directions() {
   lio::init();
 
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -527,7 +526,7 @@ fn test_shutdown_sequential_directions() {
 
   // Create client socket
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -597,7 +596,7 @@ fn test_shutdown_before_data_sent() {
 
   // Create server socket
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -633,7 +632,7 @@ fn test_shutdown_before_data_sent() {
 
   // Create client socket
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -687,7 +686,7 @@ fn test_shutdown_ipv6() {
   lio::init();
 
   let mut server_sock =
-    socket(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp6_socket().send();
 
   lio::tick();
 
@@ -725,7 +724,7 @@ fn test_shutdown_ipv6() {
 
   // Create client socket
   let mut client_sock =
-    socket(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp6_socket().send();
 
   lio::tick();
 
@@ -782,7 +781,7 @@ fn test_shutdown_concurrent() {
   // Test shutting down multiple connections (sequentially)
   for _ in 0..5 {
     let mut server_sock =
-      socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+      lio::test_utils::tcp_socket().send();
 
     lio::tick();
 
@@ -818,7 +817,7 @@ fn test_shutdown_concurrent() {
 
     // Create and connect client
     let mut client_sock =
-      socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+      lio::test_utils::tcp_socket().send();
 
     lio::tick();
 
@@ -859,7 +858,7 @@ fn test_shutdown_with_pending_data() {
   lio::init();
 
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -895,7 +894,7 @@ fn test_shutdown_with_pending_data() {
 
   // Create client socket
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 

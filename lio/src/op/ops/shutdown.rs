@@ -13,6 +13,8 @@ pub struct Shutdown {
   how: i32,
 }
 
+assert_op_max_size!(Shutdown);
+
 impl Shutdown {
   pub(crate) fn new(fd: RawFd, how: i32) -> Self {
     Self { fd, how }
@@ -31,10 +33,9 @@ impl Operation for Shutdown {
   impl_no_readyness!();
 
   #[cfg(linux)]
-  const OPCODE: u8 = 34;
-
+  // const OPCODE: u8 = 34;
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Shutdown::new(Fd(self.fd), self.how).build()
   }
 

@@ -11,7 +11,7 @@ pub struct StoredOp {
 }
 
 impl StoredOp {
-  pub fn op_ref(&self) -> &dyn Operation {
+  pub fn op_ref<'a>(&'a self) -> &'a dyn Operation {
     self.op.as_ref()
   }
   pub fn new_waker<O>(op: O) -> Self

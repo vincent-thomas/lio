@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 #[test]
 fn test_timeout_basic() {
   lio::init();
-  lio::start().unwrap();
 
   let start = Instant::now();
   let timeout_duration = Duration::from_millis(500);
@@ -22,19 +21,15 @@ fn test_timeout_basic() {
   );
   assert!(
     elapsed < timeout_duration + Duration::from_millis(20),
-    "Timeout should not wait too much longer: {:?} < {:?}",
-    elapsed,
-    timeout_duration + Duration::from_millis(50)
+    "Timeout should not wait too much longer: time waited {elapsed:?}, time set waited: {timeout_duration:?}, wiggle: 20ms",
   );
 
-  lio::stop();
   lio::exit();
 }
 
 #[test]
 fn test_timeout_multiple() {
   lio::init();
-  lio::start().unwrap();
 
   let start = Instant::now();
 
@@ -53,9 +48,9 @@ fn test_timeout_multiple() {
   let result3 = recv3.recv();
   let elapsed3 = start.elapsed();
 
-  assert!(result1.is_ok());
-  assert!(result2.is_ok());
-  assert!(result3.is_ok());
+  assert!(result1.is_ok(), "err: {result1:?}");
+  assert!(result2.is_ok(), "err: {result1:?}");
+  assert!(result3.is_ok(), "err: {result1:?}");
 
   assert!(
     elapsed1 >= Duration::from_millis(50),
@@ -73,6 +68,5 @@ fn test_timeout_multiple() {
     elapsed3
   );
 
-  lio::stop();
   lio::exit();
 }

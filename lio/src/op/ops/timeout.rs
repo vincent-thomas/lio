@@ -19,6 +19,8 @@ pub struct Timeout {
   timer_id: u64,
 }
 
+assert_op_max_size!(Timeout);
+
 // wtf are you doing waiting and then not waiting??
 unsafe impl DetachSafe for Timeout {}
 
@@ -124,7 +126,7 @@ impl Operation for Timeout {
   // const OPCODE: u8 = 11;
 
   #[cfg(linux)]
-  fn create_entry(&mut self) -> squeue::Entry {
+  fn create_entry(&self) -> squeue::Entry {
     opcode::Timeout::new(&self.timespec as *const _).build()
   }
 
@@ -134,7 +136,7 @@ impl Operation for Timeout {
   fn cap(&self) -> RawFd {
     #[cfg(linux)]
     {
-      Some(self.timer_fd.as_raw_fd())
+      self.timer_fd.as_raw_fd()
     }
     #[cfg(kqueue)]
     {

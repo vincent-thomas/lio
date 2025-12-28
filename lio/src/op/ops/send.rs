@@ -5,22 +5,28 @@ use io_uring::types::Fd;
 
 use crate::{
   BufResult,
-  buf::{Buf, BufLike},
+  buf::BufLike,
   op::{DetachSafe, OpMeta},
 };
 
 use crate::op::{Operation, OperationExt};
 
-pub struct Send<B> {
+pub struct Send<B>
+where
+  B: std::marker::Send + std::marker::Sync,
+{
   fd: RawFd,
-  buf: Option<Buf<B>>,
+  buf: Option<B>,
   flags: i32,
 }
 
-unsafe impl<B> DetachSafe for Send<B> where B: BufLike {}
+unsafe impl<B> DetachSafe for Send<B> where B: BufLike + std::marker::Send + std::marker::Sync {}
 
-impl<B> Send<B> {
-  pub(crate) fn new(fd: RawFd, buf: Buf<B>, flags: Option<i32>) -> Self {
+impl<B> Send<B>
+where
+  B: std::marker::Send + std::marker::Sync,
+{
+  pub(crate) fn new(fd: RawFd, buf: B, flags: Option<i32>) -> Self {
     // assert!((buf.len()) <= u32::MAX as usize);
     Self { fd, buf: Some(buf), flags: flags.unwrap_or(0) }
   }
@@ -28,14 +34,14 @@ impl<B> Send<B> {
 
 impl<B> OperationExt for Send<B>
 where
-  B: BufLike,
+  B: BufLike + std::marker::Send + std::marker::Sync,
 {
   type Result = BufResult<i32, B>;
 }
 
 impl<B> Operation for Send<B>
 where
-  B: BufLike,
+  B: BufLike + std::marker::Send + std::marker::Sync,
 {
   impl_result!(|this, res: std::io::Result<i32>| -> BufResult<i32, B> {
     let buf = this.buf.take().expect("ran Recv::result more than once.");
@@ -47,8 +53,10 @@ where
   // const OPCODE: u8 = 26;
 
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry {
-    let (ptr, len) = self.buf.as_ref().unwrap().get();
+  fn create_entry(&self) -> io_uring::squeue::Entry {
+    let buf_slice = self.buf.as_ref().unwrap().buf();
+    let ptr = buf_slice.as_ptr();
+    let len = buf_slice.len();
     io_uring::opcode::Send::new(Fd(self.fd), ptr, len as u32)
       .flags(self.flags)
       .build()
@@ -63,7 +71,9 @@ where
   }
 
   fn run_blocking(&self) -> io::Result<i32> {
-    let (ptr, len) = self.buf.as_ref().unwrap().get();
+    let buf_slice = self.buf.as_ref().unwrap().buf();
+    let ptr = buf_slice.as_ptr();
+    let len = buf_slice.len();
     syscall!(send(self.fd, ptr as *mut _, len, self.flags)).map(|t| t as i32)
   }
 }

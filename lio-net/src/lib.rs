@@ -2,8 +2,6 @@ use std::io::{self};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::fd::{FromRawFd, RawFd};
 
-use socket2::{Domain, Protocol, Type};
-
 pub struct Fd(RawFd);
 
 impl FromRawFd for Fd {
@@ -14,7 +12,7 @@ impl FromRawFd for Fd {
 
 impl Drop for Fd {
   fn drop(&mut self) {
-    lio::close(self.0).detach();
+    let _ = lio::close(self.0).send();
   }
 }
 
@@ -30,11 +28,10 @@ impl TcpListener {
   pub async fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
     for value in addr.to_socket_addrs()? {
       let domain = match value {
-        SocketAddr::V6(_) => Domain::IPV6,
-        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => libc::AF_INET6,
+        SocketAddr::V4(_) => libc::AF_INET,
       };
-      let socket =
-        Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).await?;
+      let socket = Socket::new(domain, libc::SOCK_STREAM, 0).await?;
 
       socket.bind(value).await?;
       socket.listen().await?;
@@ -62,10 +59,10 @@ impl TcpStream {
   pub async fn connect(addr: impl ToSocketAddrs) -> io::Result<Self> {
     for value in addr.to_socket_addrs()? {
       let domain = match value {
-        SocketAddr::V6(_) => Domain::IPV6,
-        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => libc::AF_INET6,
+        SocketAddr::V4(_) => libc::AF_INET,
       };
-      let socket = Socket::new(domain, Type::STREAM, None).await?;
+      let socket = Socket::new(domain, libc::SOCK_STREAM, 0).await?;
 
       socket.connect(value).await?;
 
@@ -101,9 +98,9 @@ pub struct Socket(Fd);
 
 impl Socket {
   pub async fn new(
-    domain: Domain,
-    ty: Type,
-    proto: Option<Protocol>,
+    domain: libc::c_int,
+    ty: libc::c_int,
+    proto: libc::c_int,
   ) -> io::Result<Self> {
     let rawfd = lio::socket(domain, ty, proto).await?;
     // SAFETY: We literally just created it.
