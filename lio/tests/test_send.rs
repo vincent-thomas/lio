@@ -1,8 +1,7 @@
 #![cfg(feature = "buf")]
-use lio::{accept, bind, connect, listen, recv, send, socket};
+use lio::{accept, bind, connect, listen, recv, send};
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
-use socket2::{Domain, Protocol, Type};
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::sync::mpsc;
@@ -14,7 +13,7 @@ fn test_send_basic() {
 
   // Setup server
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -54,7 +53,7 @@ fn test_send_basic() {
 
   // Create client socket
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -101,7 +100,7 @@ fn test_send_large_data() {
   lio::init();
 
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -137,7 +136,7 @@ fn test_send_large_data() {
 
   // Create client socket
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -185,7 +184,7 @@ fn test_send_multiple() {
   lio::init();
 
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -221,7 +220,7 @@ fn test_send_multiple() {
 
   // Create client socket
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -270,7 +269,7 @@ fn test_send_with_flags() {
   lio::init();
 
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -306,7 +305,7 @@ fn test_send_with_flags() {
 
   // Create client socket
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -353,7 +352,7 @@ fn test_send_on_closed_socket() {
   lio::init();
 
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -389,7 +388,7 @@ fn test_send_on_closed_socket() {
 
   // Create client socket
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -437,7 +436,7 @@ fn test_send_concurrent() {
 
   // Test sending from multiple clients concurrently
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -475,7 +474,7 @@ fn test_send_concurrent() {
   for i in 0..5 {
     // Create and connect client
     let mut client_sock =
-      socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+      lio::test_utils::tcp_socket().send();
 
     lio::tick();
 
@@ -548,7 +547,7 @@ fn prop_test_send_arbitrary_data_run(
 
   // Create server socket
   let mut server_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -585,7 +584,7 @@ fn prop_test_send_arbitrary_data_run(
   listen_recv.try_recv().unwrap().expect("Failed to listen");
 
   let mut client_sock =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 

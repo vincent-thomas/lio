@@ -1,5 +1,4 @@
-use lio::{bind, socket};
-use socket2::{Domain, Protocol, Type};
+use lio::bind;
 use std::{
   net::SocketAddr,
   sync::mpsc::{self},
@@ -14,7 +13,7 @@ fn test_bind_ipv4_any_port() {
   let (sender_bind, receiver_bind) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s.send(res).unwrap();
     },
@@ -65,7 +64,7 @@ fn test_bind_ipv4_specific_port() {
   let (sender_bind, receiver_bind) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s.send(res).unwrap();
     },
@@ -128,7 +127,7 @@ fn test_bind_ipv6() {
   let (sender_bind, receiver_bind) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  socket(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp6_socket().when_done(
     move |res| {
       sender_s.send(res).unwrap();
     },
@@ -180,7 +179,7 @@ fn test_bind_udp() {
   let (sender_bind, receiver_bind) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  socket(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).when_done(
+  lio::test_utils::udp_socket().when_done(
     move |res| {
       sender_s.send(res).unwrap();
     },
@@ -231,7 +230,7 @@ fn test_bind_already_bound() {
   let (sender_bind, receiver_bind) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s1.send(res).unwrap();
     },
@@ -272,7 +271,7 @@ fn test_bind_already_bound() {
 
   // Try to bind another socket to the same address
   let sender_s2 = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s2.send(res).unwrap();
     },
@@ -319,7 +318,7 @@ fn test_bind_double_bind() {
   let (sender_bind, receiver_bind) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s.send(res).unwrap();
     },
@@ -375,7 +374,7 @@ fn test_bind_with_reuseaddr() {
   let (sender_bind, receiver_bind) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s1.send(res).unwrap();
     },
@@ -420,7 +419,7 @@ fn test_bind_with_reuseaddr() {
 
   // Immediately bind another socket to the same address with SO_REUSEADDR
   let sender_s2 = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s2.send(res).unwrap();
     },
@@ -473,7 +472,7 @@ fn test_bind_localhost() {
   let (sender_bind, receiver_bind) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s.send(res).unwrap();
     },
@@ -526,7 +525,7 @@ fn test_bind_concurrent() {
   // Test binding multiple sockets concurrently to different ports
   for port in 20000..20010 {
     let sender_s = sender_sock.clone();
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+    lio::test_utils::tcp_socket().when_done(
       move |res| {
         sender_s.send(res).unwrap();
       },

@@ -21,6 +21,8 @@ impl Close {
   }
 }
 
+assert_op_max_size!(Close);
+
 impl OperationExt for Close {
   type Result = io::Result<()>;
 }
@@ -33,7 +35,7 @@ impl Operation for Close {
   // const OPCODE: u8 = 19;
 
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> io_uring::squeue::Entry {
     opcode::Close::new(Fd(self.fd)).build()
   }
 

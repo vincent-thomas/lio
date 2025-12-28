@@ -16,22 +16,18 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-tracing = ["dep:tracing"]
+default = []
 unstable_ffi = []
-parking_lot = ["dep:parking_lot"]
-buf = ["dep:bytes"]
+bytes = ["dep:bytes"]
 zeroize = ["dep:zeroize"]
 
 [dependencies]
-parking_lot = { version = "0.12", optional = true }
-socket2 = { version = "0.6.0" }
-libc = { version = "0.2.174" }
-dashmap = { version = "6.1" }
+libc.workspace = true
 
-tracing = { version = "0.1.41", optional = true }
-bytes = { version = "1.11.0", optional = true }
+bytes = { version = "1.11.0", optional = true, default-features = false, features = ["std"] }
 crossbeam-queue = { version = "0.3.12", default-features = false, features = ["alloc"] }
-zeroize = { version = "1.8.2", optional = true }
+zeroize = { version = "1.8.2", optional = true, default-features = false, features = ["alloc"] }
+scc = { version = "3.4.8", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.9"

@@ -5,16 +5,18 @@ use crate::op::{Operation, OperationExt};
 
 // Not detach safe.
 pub struct Socket {
-  domain: socket2::Domain,
-  ty: socket2::Type,
-  proto: Option<socket2::Protocol>,
+  domain: libc::c_int,
+  ty: libc::c_int,
+  proto: libc::c_int,
 }
+
+assert_op_max_size!(Socket);
 
 impl Socket {
   pub(crate) fn new(
-    domain: socket2::Domain,
-    ty: socket2::Type,
-    proto: Option<socket2::Protocol>,
+    domain: libc::c_int,
+    ty: libc::c_int,
+    proto: libc::c_int,
   ) -> Self {
     Self { domain, ty, proto }
   }
@@ -184,14 +186,13 @@ impl Operation for Socket {
   impl_no_readyness!();
 
   #[cfg(linux)]
-  const OPCODE: u8 = 45;
-
+  // const OPCODE: u8 = 45;
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Socket::new(
-      self.domain.into(),
-      self.ty.into(),
-      self.proto.unwrap_or(0.into()).into(),
+      self.domain,
+      self.ty,
+      self.proto,
     )
     .build()
   }
@@ -214,9 +215,9 @@ impl Operation for Socket {
     let fd = {
       // Create socket with CLOEXEC set atomically (no race window)
       let fd = syscall!(socket(
-        self.domain.into(),
-        libc::c_int::from(self.ty) | libc::SOCK_CLOEXEC,
-        self.proto.unwrap_or(0.into()).into()
+        self.domain,
+        self.ty | libc::SOCK_CLOEXEC,
+        self.proto
       ))?;
 
       // CRITICAL ERROR CLEANUP: If setup fails, close FD before returning error
@@ -246,9 +247,9 @@ impl Operation for Socket {
     let fd = {
       // Create socket without CLOEXEC (will set separately)
       let fd = syscall!(socket(
-        self.domain.into(),
-        self.ty.into(),
-        self.proto.unwrap_or(0.into()).into()
+        self.domain,
+        self.ty,
+        self.proto
       ))?;
 
       // Set CLOEXEC if supported on this platform

@@ -66,18 +66,8 @@ pub extern "C" fn lio_exit() {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn lio_start() {
-  crate::start().unwrap()
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn lio_tick() {
   crate::tick()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn lio_stop() {
-  crate::stop()
 }
 
 /// Shut down part of a full-duplex connection.
@@ -289,15 +279,13 @@ pub extern "C" fn lio_socket(
   proto: i32,
   callback: extern "C" fn(i32),
 ) {
-  crate::socket(domain.into(), ty.into(), Some(proto.into())).when_done(
-    move |res| {
-      let result_code = match res {
-        Ok(fd) => fd,
-        Err(err) => err.raw_os_error().unwrap_or(-1),
-      };
-      callback(result_code);
-    },
-  );
+  crate::socket(domain, ty, proto).when_done(move |res| {
+    let result_code = match res {
+      Ok(fd) => fd,
+      Err(err) => err.raw_os_error().unwrap_or(-1),
+    };
+    callback(result_code);
+  });
 }
 
 /// Bind a socket to an address.

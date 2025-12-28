@@ -1,6 +1,6 @@
 use std::task::Waker;
 
-use crate::op::{Nop, OperationExt};
+use crate::op::OperationExt;
 
 use super::Registration;
 
@@ -19,13 +19,12 @@ impl Notifier {
     T: OperationExt,
     F: FnOnce(T::Result) + Send,
   {
-    panic!("{}", std::mem::size_of::<F>());
     Self::Callback(OpCallback::new::<T, F>(callback))
   }
   pub fn set_waker(&mut self, waker: Waker) -> bool {
     match self {
       Self::Waker(old) => {
-        std::mem::replace(old, Some(waker));
+        let _ = std::mem::replace(old, Some(waker));
         true
       }
       Self::Callback(_) => false,
@@ -85,9 +84,4 @@ impl OpCallback {
 #[test]
 fn test_op_reg_size() {
   assert_eq!(std::mem::size_of::<Notifier>(), 24);
-}
-
-#[test]
-fn test_call() {
-  let _ = Notifier::new_callback::<Nop, _>(|_t| {});
 }

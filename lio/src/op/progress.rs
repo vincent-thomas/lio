@@ -128,6 +128,12 @@ pub struct Progress<T> {
 }
 
 impl<T> Progress<T> {
+  pub(crate) fn from_op(op: T) -> Self {
+    Self { op }
+  }
+}
+
+impl<T> Progress<T> {
   /// Block the current thread until the operation completes and return the result.
   ///
   /// This method still makes use of lio's non-blocking core.
@@ -157,7 +163,7 @@ impl<T> Progress<T> {
   }
   /// Convert the operation into a channel receiver.
   ///
-  /// Returns a [`BlockingReceiver`] which receives the operation result when complete.
+  /// Returns a [`Receiver`](crate::op::Receiver) which receives the operation result when complete.
   /// Useful for integrating with channel-based async code or when you need to wait
   /// for the result in a different context than where the operation was started.
   ///

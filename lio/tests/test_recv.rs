@@ -1,8 +1,7 @@
 #![cfg(feature = "buf")]
-use lio::{accept, bind, connect, listen, recv, recv_with_buf, send, socket};
+use lio::{accept, bind, connect, listen, recv, recv_with_buf, send};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
-use socket2::{Domain, Protocol, Type};
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::sync::mpsc::{self, TryRecvError};
@@ -18,7 +17,7 @@ fn test_recv_multiple() {
 
   // Create server socket
   let sender_s1 = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_s1.send(res).unwrap();
     },
@@ -68,7 +67,7 @@ fn test_recv_multiple() {
 
   // Create client socket
   let sender_cs = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_cs.send(res).unwrap();
     },
@@ -202,7 +201,7 @@ fn test_recv_with_flags() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   // Create server socket
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+  lio::test_utils::tcp_socket()
     .send_with(sender_sock.clone());
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -246,7 +245,7 @@ fn test_recv_with_flags() {
 
   // Create client socket
   let sender_cs = sender_sock.clone();
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).when_done(
+  lio::test_utils::tcp_socket().when_done(
     move |res| {
       sender_cs.send(res).unwrap();
     },
@@ -332,7 +331,7 @@ fn test_recv_on_closed() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   // Create server socket
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+  lio::test_utils::tcp_socket()
     .send_with(sender_sock.clone());
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -372,7 +371,7 @@ fn test_recv_on_closed() {
   receiver_unit.try_recv().unwrap().expect("Failed to listen");
 
   // Create client socket
-  socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+  lio::test_utils::tcp_socket()
     .send_with(sender_sock.clone());
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -463,7 +462,7 @@ fn prop_test_recv_arbitrary_data_run(
     .collect();
 
   let mut socket_recv =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -506,7 +505,7 @@ fn prop_test_recv_arbitrary_data_run(
 
   // Create client socket
   let mut client_socket =
-    socket(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).send();
+    lio::test_utils::tcp_socket().send();
 
   lio::tick();
 

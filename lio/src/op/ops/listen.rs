@@ -12,6 +12,8 @@ pub struct Listen {
   backlog: i32,
 }
 
+assert_op_max_size!(Listen);
+
 unsafe impl DetachSafe for Listen {}
 
 impl Listen {
@@ -29,10 +31,9 @@ impl Operation for Listen {
   impl_no_readyness!();
 
   #[cfg(linux)]
-  const OPCODE: u8 = 57;
-
+  // const OPCODE: u8 = 57;
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Listen::new(Fd(self.fd), self.backlog).build()
   }
 

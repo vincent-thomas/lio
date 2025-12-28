@@ -33,7 +33,7 @@ use std::slice;
 use std::time::Duration;
 
 use crate::backends::{IoDriver, IoHandler, IoSubmitter, OpCompleted};
-use crate::{backends::SubmitErr, op::Operation, store::OpStore, sync::Mutex};
+use crate::{backends::SubmitErr, op::Operation, store::OpStore};
 
 /// Interest/Event flags for I/O readiness
 ///
@@ -164,7 +164,6 @@ impl AsMut<[<sys::OsPoller as ReadinessPoll>::NativeEvent]> for Events {
   }
 }
 
-// SAFETY: Events buffer is protected by Mutex and only used within the same thread
 // The raw pointers in NativeEvent (e.g., kevent) are never dereferenced across threads
 unsafe impl Send for Events {}
 unsafe impl Sync for Events {}
@@ -250,17 +249,12 @@ impl<'a> Iterator for EventsIter<'a> {
 /// Main polling structure
 pub struct Poller {
   inner: sys::OsPoller,
-  events: Mutex<Events>,
 }
 
 impl Poller {
   /// Create a new poller
   pub fn new() -> io::Result<Self> {
-    Ok(Self {
-      inner: sys::OsPoller::new()?,
-      // fd_map: Mutex::new(HashMap::default()),
-      events: Mutex::new(Events::new()),
-    })
+    Ok(Self { inner: sys::OsPoller::new()? })
   }
 
   /// Add interest for a file descriptor
@@ -304,21 +298,6 @@ impl Poller {
   /// Remove a timer by key
   pub unsafe fn delete_timer(&self, key: u64) -> io::Result<()> {
     self.inner.delete_timer(key)
-  }
-
-  /// Wait for events with optional timeout
-  /// Reuses the internal events buffer to avoid allocations
-  fn wait(&self, timeout: Option<Duration>) -> io::Result<()> {
-    let mut events = self.events.lock();
-    events.clear();
-
-    let n = self.inner.wait(events.as_buf_mut(), timeout)?;
-    assert!(
-      n <= events.events.capacity(),
-      "wait returned more events than buffer capacity"
-    );
-    unsafe { events.set_len(n) };
-    Ok(())
   }
 }
 

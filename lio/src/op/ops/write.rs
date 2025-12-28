@@ -1,7 +1,7 @@
 use crate::{
   BufResult,
-  buf::{Buf, BufLike},
-  op::{DetachSafe, Operation, OperationExt},
+  buf::BufLike,
+  op::{Operation, OperationExt},
 };
 
 #[cfg(linux)]
@@ -12,30 +12,36 @@ use std::{
   os::fd::RawFd,
 };
 
-pub struct Write<B> {
+pub struct Write<B>
+where
+  B: Send + Sync,
+{
   fd: RawFd,
-  buf: Option<Buf<B>>,
+  buf: Option<B>,
   offset: i64,
 }
 
-unsafe impl<B> DetachSafe for Write<B> where B: BufLike {}
+// unsafe impl<B> DetachSafe for Write<B> where B: BufLike {}
 
-impl<B> Write<B> {
-  pub(crate) fn new(fd: RawFd, buf: Buf<B>, offset: i64) -> Write<B> {
+impl<B> Write<B>
+where
+  B: Send + Sync,
+{
+  pub(crate) fn new(fd: RawFd, buf: B, offset: i64) -> Write<B> {
     Self { fd, buf: Some(buf), offset }
   }
 }
 
 impl<B> OperationExt for Write<B>
 where
-  B: BufLike,
+  B: BufLike + Send + Sync,
 {
   type Result = BufResult<i32, B>;
 }
 
 impl<B> Operation for Write<B>
 where
-  B: BufLike,
+  B: BufLike + Send + Sync,
 {
   impl_result!(|this, res: io::Result<i32>| -> BufResult<i32, B> {
     let buf = this.buf.take().expect("ran Recv::result more than once.");
@@ -46,11 +52,12 @@ where
   impl_no_readyness!();
 
   #[cfg(linux)]
-  const OPCODE: u8 = 23;
-
+  // const OPCODE: u8 = 23;
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry {
-    let (ptr, len) = self.buf.as_ref().unwrap().get();
+  fn create_entry(&self) -> io_uring::squeue::Entry {
+    let buf_slice = self.buf.as_ref().unwrap().buf();
+    let ptr = buf_slice.as_ptr();
+    let len = buf_slice.len();
     assert!(len <= u32::MAX as usize);
     io_uring::opcode::Write::new(Fd(self.fd), ptr.cast_mut(), len as u32)
       .offset(self.offset as u64)
@@ -58,7 +65,9 @@ where
   }
 
   fn run_blocking(&self) -> std::io::Result<i32> {
-    let (ptr, len) = self.buf.as_ref().unwrap().get();
+    let buf_slice = self.buf.as_ref().unwrap().buf();
+    let ptr = buf_slice.as_ptr();
+    let len = buf_slice.len();
 
     // For non-seekable fds (pipes, sockets, char devices) with offset -1,
     // use write() instead of pwrite()

@@ -5,36 +5,42 @@ use io_uring::types::Fd;
 
 use crate::{
   BufResult,
-  buf::{Buf, BufLike},
+  buf::BufLike,
   op::{DetachSafe, OpMeta, OperationExt},
 };
 
 use crate::op::Operation;
 
-pub struct Recv<T> {
+pub struct Recv<T>
+where
+  T: Send + Sync,
+{
   fd: RawFd,
-  buf: Option<Buf<T>>,
+  buf: Option<T>,
   flags: i32,
 }
 
-unsafe impl<T> DetachSafe for Recv<T> where T: BufLike {}
+unsafe impl<T> DetachSafe for Recv<T> where T: BufLike + Send + Sync {}
 
-impl<T> Recv<T> {
-  pub(crate) fn new(fd: RawFd, buf: Buf<T>, flags: Option<i32>) -> Self {
+impl<T> Recv<T>
+where
+  T: Send + Sync,
+{
+  pub(crate) fn new(fd: RawFd, buf: T, flags: Option<i32>) -> Self {
     Self { fd, buf: Some(buf), flags: flags.unwrap_or(0) }
   }
 }
 
 impl<T> OperationExt for Recv<T>
 where
-  T: BufLike,
+  T: BufLike + Send + Sync,
 {
   type Result = BufResult<i32, T>;
 }
 
 impl<T> Operation for Recv<T>
 where
-  T: BufLike,
+  T: BufLike + Send + Sync,
 {
   impl_result!(|this, res: io::Result<i32>| -> BufResult<i32, T> {
     let buf = this.buf.take().expect("ran Recv::result more than once.");
@@ -46,8 +52,10 @@ where
   // const OPCODE: u8 = 27;
 
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry {
-    let (ptr, len) = self.buf.as_ref().unwrap().get();
+  fn create_entry(&self) -> io_uring::squeue::Entry {
+    let buf_slice = self.buf.as_ref().unwrap().buf();
+    let ptr = buf_slice.as_ptr();
+    let len = buf_slice.len();
     io_uring::opcode::Recv::new(Fd(self.fd), ptr.cast_mut(), len as u32)
       .flags(self.flags)
       .build()
@@ -63,7 +71,9 @@ where
   }
 
   fn run_blocking(&self) -> io::Result<i32> {
-    let (ptr, len) = self.buf.as_ref().unwrap().get();
+    let buf_slice = self.buf.as_ref().unwrap().buf();
+    let ptr = buf_slice.as_ptr();
+    let len = buf_slice.len();
     syscall!(recv(self.fd, ptr as *mut _, len, self.flags)).map(|t| t as i32)
   }
 }

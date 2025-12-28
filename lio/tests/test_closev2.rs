@@ -25,15 +25,13 @@ fn test_close_basic() {
   let sender1 = sender.clone();
 
   // Close it
-  close(fd).when_done(move |t| {
-    sender1.send(t).unwrap();
-  });
+  close(fd).send_with(sender1.clone());
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
-  lio::tick();
+  // lio::tick();
 
-  assert_eq!(receiver.try_recv().unwrap().unwrap(), ());
+  assert_eq!(receiver.recv().unwrap().unwrap(), ());
 
   // Verify it's closed
   let result =
@@ -44,6 +42,7 @@ fn test_close_basic() {
   unsafe {
     libc::unlink(path.as_ptr());
   }
+  lio::exit();
 }
 
 #[test]

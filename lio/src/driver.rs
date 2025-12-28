@@ -1,33 +1,25 @@
 use crate::backends::SubmitErr;
-#[cfg(feature = "buf")]
 use crate::buf::{BufStore, LentBuf};
 use crate::store::OpStore;
-use crate::sync::Mutex;
+use crate::worker::Worker;
 use crate::{
-  backends::{self, Handler, IoDriver, IoHandler, IoSubmitter, Submitter},
+  backends::{self, Handler, IoDriver, Submitter},
   op::OperationExt,
 };
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::{fmt, io};
 use std::{
   ptr::NonNull,
-  sync::{
-    atomic::{AtomicPtr, Ordering},
-    mpsc,
-  },
-  thread::JoinHandle,
+  sync::atomic::{AtomicPtr, Ordering},
 };
 
 use crate::registration::StoredOp;
 
 pub struct Driver {
-  submitter: Submitter,
   store: Arc<OpStore>,
-  worker_shutdown: Mutex<Option<mpsc::Sender<()>>>,
-  worker_thread: Mutex<Option<JoinHandle<()>>>,
-  #[cfg(feature = "buf")]
+  worker: Worker,
   buf_store: BufStore,
 }
 
@@ -51,14 +43,9 @@ impl fmt::Display for TryInitError {
 static DRIVER: AtomicPtr<Driver> = AtomicPtr::new(std::ptr::null_mut());
 
 impl Driver {
-  pub(crate) fn try_init() -> Result<(), TryInitError> {
-    #[cfg(linux)]
-    pub type Default = backends::IoUring;
-    #[cfg(not(linux))]
-    pub type Default = backends::pollingv2::Poller;
-    Self::try_init_with_driver::<Default>()
-  }
-  pub(crate) fn try_init_with_driver<D>() -> Result<(), TryInitError>
+  pub(crate) fn try_init_with_driver_and_capacity<D>(
+    cap: usize,
+  ) -> Result<(), TryInitError>
   where
     D: IoDriver,
   {
@@ -69,17 +56,15 @@ impl Driver {
     let state = D::new_state().map_err(TryInitError::Io)?;
     let (subm, handler) = D::new(state).map_err(TryInitError::Io)?;
 
-    let store = Arc::new(OpStore::new());
-    // TODO
+    let store = Arc::new(OpStore::with_capacity(cap));
+
     let handler = Handler::new(Box::new(handler), store.clone(), state);
+    let submitter = Submitter::new(Box::new(subm), store.clone(), state);
 
     let driver_ptr = Box::into_raw(Box::new(Driver {
-      #[cfg(feature = "buf")]
       buf_store: BufStore::default(),
-      submitter: Submitter::new(Box::new(subm), store.clone(), state),
-      worker_shutdown: Mutex::new(None),
+      worker: Worker::spawn(submitter, handler),
       store: store.clone(),
-      worker_thread: Mutex::new(None),
     }));
 
     // Try to set the driver pointer atomically
@@ -94,8 +79,6 @@ impl Driver {
         // Another thread initialized first, clean up our allocation
         // This drops the state ptr in Submitter::new()
         let _ = unsafe { Box::from_raw(driver_ptr) };
-
-        drop(handler);
 
         D::drop_state(state);
         Err(TryInitError::AlreadyInit)
@@ -115,14 +98,13 @@ impl Driver {
     unsafe { &*ptr }
   }
 
-  pub fn exit() {
+  pub fn exit(&'static self) {
     let ptr = NonNull::new(DRIVER.swap(std::ptr::null_mut(), Ordering::AcqRel))
       .expect("driver not initialized");
     Self::deallocate(ptr);
   }
 
-  #[cfg(feature = "buf")]
-  pub(crate) fn try_lend_buf(&'static self) -> Option<LentBuf<'static>> {
+  pub(crate) fn try_lend_buf(&'static self) -> Option<LentBuf> {
     self.buf_store.try_get()
   }
 
@@ -140,9 +122,8 @@ impl Driver {
   }
 
   pub(crate) fn submit(stored: StoredOp) -> Result<u64, SubmitErr> {
-    panic!();
-    // let driver = Driver::get();
-    // driver.submitter.submit(stored)
+    let driver = Driver::get();
+    driver.worker.submit(stored)
   }
 
   pub(crate) fn tick(&self, can_wait: bool) {
@@ -166,69 +147,3 @@ impl Driver {
     self.store.get_mut(id, |entry| entry.set_waker(waker)).unwrap()
   }
 }
-
-mod utils {
-  use std::thread;
-
-  pub fn create_worker<F, T>(handle: F) -> thread::JoinHandle<T>
-  where
-    F: FnOnce() -> T,
-    F: Send + 'static,
-    T: Send + 'static,
-  {
-    thread::Builder::new()
-      .name("lio".into())
-      .spawn(handle)
-      .expect("failed to launch the worker thread")
-  }
-}
-// /// Spawns a background worker thread that continuously processes I/O operations.
-// ///
-// /// The worker thread will call `tick(true)` in a loop, blocking until operations complete.
-// /// This allows async operations to complete without manual `tick()` calls.
-// ///
-// /// Returns an error if a worker is already running.
-// pub fn spawn_worker(&'static self) -> Result<(), &'static str> {
-//   let mut worker_guard = self.worker_thread.lock();
-//
-//   if worker_guard.is_some() {
-//     return Err("Worker thread already running");
-//   }
-//
-//   let (shutdown_tx, shutdown_rx) = mpsc::channel();
-//
-//   let handle = utils::create_worker(move || {
-//     loop {
-//       // Check for shutdown signal (non-blocking)
-//       match shutdown_rx.try_recv() {
-//         Ok(()) => break,
-//         Err(mpsc::TryRecvError::Disconnected) => break,
-//         Err(mpsc::TryRecvError::Empty) => {}
-//       }
-//
-//       // Process I/O operations (blocking wait)
-//       self.tick(true);
-//     }
-//   });
-//   *self.worker_shutdown.lock() = Some(shutdown_tx);
-//   *worker_guard = Some(handle);
-//
-//   Ok(())
-// }
-
-// /// Stops the background worker thread gracefully.
-// ///
-// /// Sends a shutdown signal and waits for the thread to finish.
-// /// Does nothing if no worker is running.
-// pub fn stop_worker(&self) {
-//   // Send shutdown signal
-//   if let Some(tx) = self.worker_shutdown.lock().take() {
-//     let _ = tx.send(()); // Ignore error if receiver already dropped
-//     self.driver.notify(); // Wake up the worker if it's blocked in tick()
-//   }
-//
-//   // Wait for thread to finish
-//   if let Some(handle) = self.worker_thread.lock().take() {
-//     let _ = handle.join(); // Ignore join errors
-//   }
-// }

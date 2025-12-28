@@ -1,10 +1,7 @@
-use std::sync::{
-  atomic::{AtomicU32, Ordering},
-  mpsc,
-};
+use std::sync::atomic::{AtomicU32, Ordering};
 
-use crossbeam_queue::SegQueue;
-use dashmap::DashMap;
+use crossbeam_queue::{ArrayQueue, SegQueue};
+use scc::hash_map::Entry;
 
 use crate::registration::{Registration, StoredOp};
 
@@ -49,17 +46,22 @@ impl Index {
 }
 
 pub struct OpStore {
-  store: DashMap<u32, Record>,
+  store: scc::HashMap<u32, Record>,
   next_slot: AtomicU32,
-  free_slots: SegQueue<Index>,
+  free_slots: ArrayQueue<Index>,
 }
 
 impl OpStore {
+  #[cfg(test)]
   pub fn new() -> OpStore {
+    Self::with_capacity(1024)
+  }
+
+  pub fn with_capacity(cap: usize) -> OpStore {
     Self {
-      store: DashMap::new(),
+      store: scc::HashMap::with_capacity(cap),
       next_slot: AtomicU32::new(0),
-      free_slots: SegQueue::new(),
+      free_slots: ArrayQueue::new(cap),
     }
   }
 
@@ -102,31 +104,42 @@ impl OpStore {
       generation: index.generation(),
     };
 
-    let result = self.store.insert(index.slot(), record);
+    // Insert should always succeed since we have a unique index
+    // If the slot exists, it means we have a generation counter bug.
+    // upsert is used so we can assert.
+    let previous = self.store.upsert_sync(index.slot(), record);
     assert!(
-      result.is_none(),
-      "OpStore::insert: slot {} already exists (generation mismatch?)",
-      index.slot()
+      previous.is_none(),
+      "OpStore::insert: slot {} already exists (generation {}), previous generation: {:?}",
+      index.slot(),
+      index.generation(),
+      previous.map(|r| r.generation)
     );
+
     Ok(index.as_u64())
   }
 
   pub fn remove(&self, id: u64) -> bool {
     let index = Index::from_u64(id);
 
-    if let Some((_, record)) = self.store.remove(&index.slot()) {
-      // Verify generation matches to prevent ABA
-      if record.generation == index.generation() {
-        // Return slot to free list with current generation
-        let _ = self.free_slots.push(index);
-        true
-      } else {
-        // Stale ID - restore the record
-        self.store.insert(index.slot(), record);
+    match self.store.entry_sync(index.slot()) {
+      Entry::Occupied(entry) => {
+        // Check generation while holding the entry
+        if entry.get().generation == index.generation() {
+          // Generation matches - remove it
+          let _ = entry.remove();
+          // Return slot to free list
+          let _ = self.free_slots.push(index);
+          true
+        } else {
+          // Stale ID - generation mismatch, don't remove
+          false
+        }
+      }
+      Entry::Vacant(_) => {
+        // Slot doesn't exist
         false
       }
-    } else {
-      false
     }
   }
 
@@ -136,7 +149,7 @@ impl OpStore {
   {
     let index = Index::from_u64(id);
 
-    let mut entry = self.store.get_mut(&index.slot())?;
+    let mut entry = self.store.get_sync(&index.slot())?;
 
     // Verify generation matches
     if entry.generation == index.generation() {
@@ -156,7 +169,7 @@ mod tests {
 
   // Helper to create a dummy StoredOp
   fn dummy_stored_op() -> StoredOp {
-    use crate::op::ops::nop::Nop;
+    use crate::op::nop::Nop;
     StoredOp::new_waker(Nop)
   }
 
@@ -241,6 +254,7 @@ mod tests {
 
     let result = store.get_mut(id, |registration| {
       // Verify we can mutate through the closure
+      let _m: &mut _ = registration;
       42
     });
 
@@ -546,27 +560,48 @@ mod tests {
 
     let handles: Vec<_> = (0..num_threads)
       .map(|_| {
-        let store = Arc::clone(&store);
+        let _store = store.clone();
         thread::spawn(move || {
           let mut stale_ids = Vec::new();
 
-          for _ in 0..100 {
+          for i in 0..100 {
             // Allocate
-            let id = store.insert(dummy_stored_op());
+            let id = _store.insert(dummy_stored_op());
+            if i < 5 {
+              eprintln!("Thread {:?} inserted ID {}", std::thread::current().id(), id);
+            }
 
-            // Store as potentially stale
+            // Remove (makes it stale)
+            let removed = _store.remove(id);
+            if !removed {
+              let index = Index::from_u64(id);
+
+              // Try to find what generation is actually in the slot
+              if let Some(entry) = _store.store.get_sync(&index.slot()) {
+                eprintln!("Failed to remove id={} (slot={}, gen={}), actual gen in slot: {}",
+                  id, index.slot(), index.generation(), entry.generation);
+              } else {
+                eprintln!("Failed to remove id={} (slot={}, gen={}), slot is EMPTY!",
+                  id, index.slot(), index.generation());
+              }
+            }
+            assert!(
+              removed,
+              "couldn't find item which was just inserted before. ID: {}", id
+            );
+
+            // Store as stale after removal
             if fastrand::bool() {
               stale_ids.push(id);
             }
 
-            // Remove (makes it stale)
-            store.remove(id);
-
             // Try to use stale IDs - should all fail
             for &stale_id in &stale_ids {
-              if store.remove(stale_id) {
-                panic!("ABA bug: stale ID {} was accepted!", stale_id);
-              }
+              assert!(
+                !_store.remove(stale_id),
+                "ABA bug: stale ID {} was accepted!",
+                stale_id
+              );
             }
 
             // Clear some stale IDs
@@ -593,7 +628,6 @@ mod tests {
     let handles: Vec<_> = (0..num_threads)
       .map(|_| {
         let _store = store.clone();
-        let start = start;
         thread::spawn(move || {
           let mut count = 0u64;
           let mut active = Vec::new();

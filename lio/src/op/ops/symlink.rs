@@ -1,8 +1,4 @@
-use std::{
-  ffi::{CString, NulError},
-  os::{fd::RawFd, unix::ffi::OsStringExt},
-  path::Path,
-};
+use std::{ffi::CString, os::fd::RawFd};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
@@ -15,22 +11,18 @@ pub struct SymlinkAt {
   linkpath: CString,
 }
 
+assert_op_max_size!(SymlinkAt);
+
 // Not detach safe.
 
 // TODO: test
 impl SymlinkAt {
   pub(crate) fn new(
     new_dir_fd: RawFd,
-    target: impl AsRef<Path>,
-    linkpath: impl AsRef<Path>,
-  ) -> Result<Self, NulError> {
-    let target = target.as_ref().as_os_str().to_os_string();
-    let linkpath = linkpath.as_ref().as_os_str().to_os_string();
-    Ok(Self {
-      fd: new_dir_fd,
-      target: CString::new(target.into_vec())?,
-      linkpath: CString::new(linkpath.into_vec())?,
-    })
+    target: CString,
+    linkpath: CString,
+  ) -> Self {
+    Self { fd: new_dir_fd, target, linkpath }
   }
 }
 
@@ -43,10 +35,9 @@ impl Operation for SymlinkAt {
   impl_no_readyness!();
 
   #[cfg(linux)]
-  const OPCODE: u8 = 38;
-
+  // const OPCODE: u8 = 38;
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::SymlinkAt::new(
       Fd(self.fd),
       self.target.as_ptr(),

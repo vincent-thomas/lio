@@ -35,6 +35,9 @@ impl IoDriver for IoUring {
 pub struct IoUringSubmitter {
   sq: io_uring::SubmissionQueue<'static>,
 }
+
+unsafe impl Send for IoUringSubmitter {}
+unsafe impl Send for IoUringHandler {}
 pub struct IoUringHandler {
   cq: io_uring::CompletionQueue<'static>,
 }
@@ -114,7 +117,9 @@ impl IoUringHandler {
     can_block: bool,
     state: &IoUringState,
   ) -> io::Result<Vec<super::OpCompleted>> {
+    self.cq.sync();
     state._uring.submit_and_wait(if can_block { 1 } else { 0 })?;
+    self.cq.sync();
 
     let mut op_c = Vec::new();
 
@@ -123,7 +128,11 @@ impl IoUringHandler {
       let result = io_entry.result();
       op_c.push(OpCompleted::new(
         operation_id,
-        if result < 0 { Err(io::Error::last_os_error()) } else { Ok(result) },
+        if result < 0 {
+          Err(io::Error::from_raw_os_error(-result))
+        } else {
+          Ok(result)
+        },
       ));
     }
 

@@ -13,6 +13,8 @@ pub struct Tee {
   size: u32,
 }
 
+assert_op_max_size!(Tee);
+
 impl Tee {
   pub(crate) fn new(fd_in: RawFd, fd_out: RawFd, size: u32) -> Self {
     Self { fd_in, fd_out, size }
@@ -24,17 +26,14 @@ impl OperationExt for Tee {
 }
 
 impl Operation for Tee {
-  impl_result!(|_this, ret: io::Result<i32>| -> io::Result<i32> {
-    ret
-  });
+  impl_result!(|_this, ret: io::Result<i32>| -> io::Result<i32> { ret });
 
   impl_no_readyness!();
 
   #[cfg(linux)]
-  const OPCODE: u8 = 33;
-
+  // const OPCODE: u8 = 33;
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Tee::new(Fd(self.fd_in), Fd(self.fd_out), self.size)
       .build()
   }

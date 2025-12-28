@@ -10,6 +10,7 @@ use crate::op::{Operation, OperationExt};
 pub struct Fsync {
   fd: RawFd,
 }
+assert_op_max_size!(Fsync);
 
 impl Fsync {
   pub(crate) fn new(fd: RawFd) -> Self {
@@ -28,10 +29,9 @@ impl Operation for Fsync {
   impl_no_readyness!();
 
   #[cfg(linux)]
-  const OPCODE: u8 = 3;
-
+  // const OPCODE: u8 = 3;
   #[cfg(linux)]
-  fn create_entry(&mut self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Fsync::new(Fd(self.fd)).build()
   }
 

@@ -15,15 +15,13 @@ pub use iocp::*;
 pub mod pollingv2;
 // mod polling;
 // pub use polling::*;
-// mod threading;
-// #[allow(unused_imports)]
-// pub use threading::*;
 
 #[derive(Debug)]
 pub enum SubmitErr {
   Io(io::Error),
   Full,
   NotCompatible,
+  DriverShutdown,
 }
 
 impl From<io::Error> for SubmitErr {
@@ -33,8 +31,8 @@ impl From<io::Error> for SubmitErr {
 }
 
 pub struct OpCompleted {
-  op_id: u64,
-  result: io::Result<i32>,
+  pub op_id: u64,
+  pub result: io::Result<i32>,
 }
 
 impl OpCompleted {
@@ -53,7 +51,7 @@ pub trait IoDriver {
   fn new(state: *const ()) -> io::Result<(Self::Submitter, Self::Handler)>;
 }
 
-pub trait IoSubmitter {
+pub trait IoSubmitter: Send {
   fn submit(
     &mut self,
     state: *const (),
@@ -65,7 +63,7 @@ pub trait IoSubmitter {
   fn notify(&mut self, state: *const ()) -> Result<(), SubmitErr>;
 }
 
-pub trait IoHandler {
+pub trait IoHandler: Send {
   fn try_tick(
     &mut self,
     state: *const (),
@@ -84,6 +82,8 @@ pub struct Submitter {
   state: *const (),
 }
 
+unsafe impl Send for Submitter {}
+
 impl Submitter {
   pub fn new(
     sub: Box<dyn IoSubmitter>,
@@ -99,6 +99,10 @@ impl Submitter {
       Ok::<_, SubmitErr>(op)
     })
   }
+
+  pub fn notify(&mut self) -> Result<(), SubmitErr> {
+    self.sub.notify(self.state)
+  }
 }
 
 pub struct Handler {
@@ -106,6 +110,8 @@ pub struct Handler {
   state: *const (),
   store: Arc<OpStore>,
 }
+
+unsafe impl Send for Handler {}
 
 impl Handler {
   pub fn new(
@@ -116,16 +122,29 @@ impl Handler {
     Self { io, store, state }
   }
 
-  pub fn tick(&mut self) -> io::Result<Vec<OpCompleted>> {
+  pub fn tick(&mut self) -> io::Result<()> {
     let result = self.io.tick(self.state, &self.store)?;
     assert!(!result.is_empty());
-    Ok(result)
+
+    for one in result {
+      let _exists = self.store.get_mut(one.op_id, |reg| {
+        reg.set_done(one.result);
+      });
+    }
+    Ok(())
   }
 
-  pub fn try_tick(&mut self) -> io::Result<Vec<OpCompleted>> {
+  pub fn try_tick(&mut self) -> io::Result<()> {
     let result = self.io.try_tick(self.state, &self.store)?;
     assert!(!result.is_empty());
-    Ok(result)
+
+    for one in result {
+      let _exists = self.store.get_mut(one.op_id, |reg| {
+        reg.set_done(one.result);
+      });
+    }
+
+    Ok(())
   }
 }
 
