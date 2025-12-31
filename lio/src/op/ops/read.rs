@@ -1,9 +1,9 @@
-use std::{io, os::fd::RawFd};
+use std::os::fd::{AsFd, AsRawFd};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-use crate::{BufResult, buf::BufLike, op::DetachSafe};
+use crate::{BufResult, buf::BufLike, op::DetachSafe, resource::Resource};
 
 use crate::op::{Operation, OperationExt};
 
@@ -11,7 +11,7 @@ pub struct Read<T>
 where
   T: Send + Sync,
 {
-  fd: RawFd,
+  res: Resource,
   buf: Option<T>,
   offset: i64,
 }
@@ -23,11 +23,11 @@ where
   T: Send + Sync,
 {
   /// Will return errn 22 "EINVAL" if offset < 0
-  pub(crate) fn new(fd: RawFd, mem: T, offset: i64) -> Self
+  pub(crate) fn new(res: Resource, mem: T, offset: i64) -> Self
   where
     T: BufLike,
   {
-    Self { fd, buf: Some(mem), offset }
+    Self { res, buf: Some(mem), offset }
   }
 }
 
@@ -42,10 +42,16 @@ impl<T> Operation for Read<T>
 where
   T: BufLike + Send + Sync,
 {
-  impl_result!(|this, ret: io::Result<i32>| -> BufResult<i32, T> {
+  impl_result!(|this, res: isize| -> BufResult<i32, T> {
     let buf = this.buf.take().expect("ran Recv::result more than once.");
-    let out = buf.after(*ret.as_ref().unwrap_or(&0) as usize);
-    (ret, out)
+    let bytes = if res < 0 { 0 } else { res as usize };
+    let out = buf.after(bytes);
+    let result = if res < 0 {
+      Err(std::io::Error::from_raw_os_error((-res) as i32))
+    } else {
+      Ok(res as i32)
+    };
+    (result, out)
   });
 
   impl_no_readyness!();
@@ -55,15 +61,15 @@ where
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
-    io_uring::opcode::Read::new(Fd(self.fd), ptr.cast_mut(), len as u32)
+    io_uring::opcode::Read::new(Fd(self.res.as_fd().as_raw_fd()), ptr.cast_mut(), len as u32)
       .offset(self.offset as u64)
       .build()
   }
 
-  fn run_blocking(&self) -> io::Result<i32> {
+  fn run_blocking(&self) -> isize {
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
-    syscall!(pread(self.fd, ptr as *mut _, len, self.offset)).map(|t| t as i32)
+    syscall_raw!(pread(self.res.as_fd().as_raw_fd(), ptr as *mut _, len, self.offset))
   }
 }

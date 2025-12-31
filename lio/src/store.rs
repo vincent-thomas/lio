@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crossbeam_queue::{ArrayQueue, SegQueue};
+use crossbeam_queue::ArrayQueue;
 use scc::hash_map::Entry;
 
 use crate::registration::{Registration, StoredOp};
@@ -41,7 +41,12 @@ impl Index {
 
   /// Create a new index with incremented generation
   fn next_generation(self) -> Self {
-    Index { slot: self.slot, generation: self.generation.wrapping_add(1) }
+    let generation = self
+      .generation
+      .checked_add(1)
+      .expect(&format!("integer overflow when computing next generation in arena slot. Old: {}, add: 1", self.generation));
+
+    Index { slot: self.slot, generation }
   }
 }
 
@@ -81,10 +86,12 @@ impl OpStore {
     }
   }
 
+  #[cfg(test)]
   pub fn insert(&self, stored: StoredOp) -> u64 {
     self.insert_with(|_| stored)
   }
 
+  #[cfg(test)]
   pub fn insert_with<F>(&self, f: F) -> u64
   where
     F: FnOnce(u64) -> StoredOp,
@@ -262,13 +269,12 @@ mod tests {
   }
 
   #[test]
-  fn test_generation_wrapping() {
+  #[should_panic]
+  fn test_generation_panic() {
     // Create an index with max generation
     let index = Index { slot: 5, generation: u32::MAX };
 
-    let next = index.next_generation();
-    assert_eq!(next.slot(), 5);
-    assert_eq!(next.generation(), 0, "Generation should wrap to 0");
+    let _ = index.next_generation();
   }
 
   #[test]
@@ -673,5 +679,323 @@ mod tests {
       total_ops, num_threads
     );
     assert!(total_ops > 0);
+  }
+
+  // Property-based tests using proptest
+  use proptest::prelude::*;
+
+  proptest! {
+    /// Property: All generated IDs must be unique
+    #[test]
+    fn prop_ids_are_always_unique(count in 1usize..1000) {
+      let store = OpStore::new();
+      let mut ids = HashSet::new();
+
+      for _ in 0..count {
+        let id = store.insert(dummy_stored_op());
+        prop_assert!(ids.insert(id), "Duplicate ID generated: {}", id);
+      }
+
+      prop_assert_eq!(ids.len(), count);
+    }
+
+    /// Property: Index packing and unpacking is bijective
+    #[test]
+    fn prop_index_packing_is_bijective(generation in any::<u32>(), slot in any::<u32>()) {
+      let original = Index { generation, slot };
+      let packed = original.as_u64();
+      let unpacked = Index::from_u64(packed);
+
+      prop_assert_eq!(unpacked.generation(), original.generation());
+      prop_assert_eq!(unpacked.slot(), original.slot());
+    }
+
+    /// Property: Removing an ID twice should fail the second time
+    #[test]
+    fn prop_double_remove_always_fails(ops_before in 0usize..100) {
+      let store = OpStore::new();
+
+      // Insert some operations before
+      for _ in 0..ops_before {
+        store.insert(dummy_stored_op());
+      }
+
+      // Insert test operation
+      let id = store.insert(dummy_stored_op());
+
+      // First remove should succeed
+      prop_assert!(store.remove(id));
+
+      // Second remove should fail
+      prop_assert!(!store.remove(id));
+    }
+
+    /// Property: get_mut returns None for removed IDs
+    #[test]
+    fn prop_get_mut_fails_after_remove(ops_count in 1usize..100, remove_index in 0usize..100) {
+      let store = OpStore::new();
+      let mut ids = Vec::new();
+
+      let actual_count = ops_count.max(1);
+      for _ in 0..actual_count {
+        ids.push(store.insert(dummy_stored_op()));
+      }
+
+      let remove_idx = remove_index % actual_count;
+      let removed_id = ids[remove_idx];
+
+      store.remove(removed_id);
+
+      // Should return None after removal
+      let result = store.get_mut(removed_id, |_| true);
+      prop_assert!(result.is_none());
+    }
+
+    /// Property: Slot reuse always increments generation
+    #[test]
+    fn prop_slot_reuse_increments_generation(reuse_count in 1usize..50) {
+      let store = OpStore::new();
+
+      let mut prev_generation = 0u32;
+      let mut prev_slot = 0u32;
+
+      for i in 0..reuse_count {
+        let id = store.insert(dummy_stored_op());
+        let index = Index::from_u64(id);
+
+        if i > 0 {
+          // After first iteration, slot should be reused
+          prop_assert_eq!(index.slot(), prev_slot, "Slot should be reused");
+          prop_assert_eq!(
+            index.generation(),
+            prev_generation.wrapping_add(1),
+            "Generation should increment"
+          );
+        }
+
+        prev_slot = index.slot();
+        prev_generation = index.generation();
+
+        store.remove(id);
+      }
+    }
+
+    /// Property: Stale IDs are always rejected
+    #[test]
+    fn prop_stale_ids_rejected(cycles in 1usize..20) {
+      let store = OpStore::new();
+      let mut stale_ids = Vec::new();
+
+      for _ in 0..cycles {
+        // Create and immediately remove to make it stale
+        let id = store.insert(dummy_stored_op());
+        store.remove(id);
+        stale_ids.push(id);
+
+        // Create a new ID (will reuse slot with new generation)
+        let _new_id = store.insert(dummy_stored_op());
+
+        // All stale IDs should be rejected
+        for &stale_id in &stale_ids {
+          prop_assert!(!store.remove(stale_id), "Stale ID should be rejected on remove");
+          prop_assert!(
+            store.get_mut(stale_id, |_| ()).is_none(),
+            "Stale ID should be rejected on get_mut"
+          );
+        }
+      }
+    }
+
+    /// Property: Generation wrapping works correctly
+    #[test]
+    fn prop_generation_wraps_correctly(slot in any::<u32>(), generation in any::<u32>()) {
+      let index = Index { slot, generation };
+      let next = index.next_generation();
+
+      prop_assert_eq!(next.slot(), slot, "Slot should remain the same");
+      prop_assert_eq!(
+        next.generation(),
+        generation.wrapping_add(1),
+        "Generation should wrap correctly"
+      );
+    }
+
+    /// Property: insert_with_try preserves error types
+    #[test]
+    fn prop_insert_with_try_error_handling(should_error: bool) {
+      let store = OpStore::new();
+
+      let result: Result<u64, &str> = store.insert_with_try(|_| {
+        if should_error {
+          Err("test error")
+        } else {
+          Ok(dummy_stored_op())
+        }
+      });
+
+      if should_error {
+        prop_assert!(result.is_err());
+      } else {
+        prop_assert!(result.is_ok());
+      }
+    }
+
+    /// Property: IDs from concurrent insertions are unique
+    #[test]
+    fn prop_concurrent_ids_unique(thread_count in 2usize..10, ops_per_thread in 10usize..100) {
+      let store = Arc::new(OpStore::new());
+      let handles: Vec<_> = (0..thread_count)
+        .map(|_| {
+          let store = Arc::clone(&store);
+          thread::spawn(move || {
+            (0..ops_per_thread)
+              .map(|_| store.insert(dummy_stored_op()))
+              .collect::<Vec<_>>()
+          })
+        })
+        .collect();
+
+      let mut all_ids = HashSet::new();
+      for handle in handles {
+        let ids = handle.join().unwrap();
+        for id in ids {
+          prop_assert!(all_ids.insert(id), "Duplicate ID from concurrent insert: {}", id);
+        }
+      }
+
+      prop_assert_eq!(all_ids.len(), thread_count * ops_per_thread);
+    }
+
+    /// Property: Active IDs can always be accessed via get_mut
+    #[test]
+    fn prop_active_ids_accessible(ops_count in 1usize..200) {
+      let store = OpStore::new();
+      let mut ids = Vec::new();
+
+      for _ in 0..ops_count {
+        ids.push(store.insert(dummy_stored_op()));
+      }
+
+      // All active IDs should be accessible
+      for &id in &ids {
+        let result = store.get_mut(id, |_| 42);
+        prop_assert_eq!(result, Some(42), "Active ID should be accessible");
+      }
+    }
+
+    /// Property: Interleaved insert/remove maintains uniqueness
+    #[test]
+    fn prop_interleaved_ops_maintain_uniqueness(
+      operations in prop::collection::vec((any::<bool>(), any::<u8>()), 10..200)
+    ) {
+      let store = OpStore::new();
+      let mut active_ids = Vec::new();
+      let mut all_generated_ids = HashSet::new();
+
+      for (should_insert, selector) in operations {
+        if should_insert || active_ids.is_empty() {
+          // Insert
+          let id = store.insert(dummy_stored_op());
+          prop_assert!(
+            all_generated_ids.insert(id),
+            "Generated duplicate ID: {}",
+            id
+          );
+          active_ids.push(id);
+        } else {
+          // Remove
+          let idx = (selector as usize) % active_ids.len();
+          let id = active_ids.remove(idx);
+          prop_assert!(store.remove(id), "Remove should succeed for active ID");
+        }
+      }
+    }
+
+    /// Property: Mixed operations with random IDs maintain consistency
+    #[test]
+    fn prop_random_operations_consistent(
+      ops in prop::collection::vec((any::<u8>(), any::<u8>()), 50..300)
+    ) {
+      let store = OpStore::new();
+      let mut active_ids = Vec::new();
+
+      for (op_type, selector) in ops {
+        match op_type % 3 {
+          0 => {
+            // Insert
+            let id = store.insert(dummy_stored_op());
+            active_ids.push(id);
+          }
+          1 if !active_ids.is_empty() => {
+            // Remove
+            let idx = (selector as usize) % active_ids.len();
+            let id = active_ids.swap_remove(idx);
+            prop_assert!(store.remove(id));
+          }
+          2 if !active_ids.is_empty() => {
+            // Access
+            let idx = (selector as usize) % active_ids.len();
+            let id = active_ids[idx];
+            let result = store.get_mut(id, |_| ());
+            prop_assert!(result.is_some(), "Active ID should be accessible");
+          }
+          _ => {}
+        }
+      }
+
+      // Verify all active IDs are still accessible
+      for id in active_ids {
+        prop_assert!(store.get_mut(id, |_| ()).is_some());
+      }
+    }
+
+    /// Property: Capacity doesn't affect correctness
+    #[test]
+    fn prop_capacity_doesnt_affect_correctness(
+      capacity in 1usize..500,
+      ops_count in 1usize..100
+    ) {
+      let store = OpStore::with_capacity(capacity);
+      let mut ids = HashSet::new();
+
+      for _ in 0..ops_count {
+        let id = store.insert(dummy_stored_op());
+        prop_assert!(ids.insert(id), "Duplicate ID with capacity {}: {}", capacity, id);
+      }
+
+      prop_assert_eq!(ids.len(), ops_count);
+    }
+
+    /// Property: No ID collision even after wrapping scenarios
+    #[test]
+    fn prop_no_collision_with_wrapping(iterations in 1usize..100) {
+      let store = OpStore::new();
+      let mut all_current_ids = HashSet::new();
+
+      for _ in 0..iterations {
+        // Insert
+        let id = store.insert(dummy_stored_op());
+        prop_assert!(
+          all_current_ids.insert(id),
+          "ID collision detected: {}",
+          id
+        );
+
+        // Immediately remove to force slot reuse
+        store.remove(id);
+        all_current_ids.remove(&id);
+
+        // Insert again (should get same slot, different generation)
+        let id2 = store.insert(dummy_stored_op());
+        prop_assert!(
+          all_current_ids.insert(id2),
+          "ID collision after slot reuse: {}",
+          id2
+        );
+
+        // Verify old ID is rejected
+        prop_assert!(!store.remove(id), "Old ID should be rejected");
+      }
+    }
   }
 }

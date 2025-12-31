@@ -1,16 +1,17 @@
-use std::{ffi::CString, os::fd::RawFd};
+use std::{ffi::CString, os::fd::{AsFd, AsRawFd}};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
 
 use crate::op::DetachSafe;
+use crate::resource::Resource;
 
 use crate::op::{Operation, OperationExt};
 
 pub struct LinkAt {
-  old_dir_fd: RawFd,
+  old_dir_res: Resource,
   old_path: CString,
-  new_dir_fd: RawFd,
+  new_dir_res: Resource,
   new_path: CString,
 }
 
@@ -21,12 +22,12 @@ unsafe impl DetachSafe for LinkAt {}
 // TODO: test
 impl LinkAt {
   pub(crate) fn new(
-    old_dir_fd: RawFd,
+    old_dir_res: Resource,
     old_path: CString,
-    new_dir_fd: RawFd,
+    new_dir_res: Resource,
     new_path: CString,
   ) -> Self {
-    Self { old_dir_fd, old_path, new_dir_fd, new_path }
+    Self { old_dir_res, old_path, new_dir_res, new_path }
   }
 }
 
@@ -43,19 +44,19 @@ impl Operation for LinkAt {
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::LinkAt::new(
-      Fd(self.old_dir_fd),
+      Fd(self.old_dir_res.as_fd().as_raw_fd()),
       self.old_path.as_ptr(),
-      Fd(self.new_dir_fd),
+      Fd(self.new_dir_res.as_fd().as_raw_fd()),
       self.new_path.as_ptr(),
     )
     .build()
   }
 
-  fn run_blocking(&self) -> std::io::Result<i32> {
-    syscall!(linkat(
-      self.old_dir_fd,
+  fn run_blocking(&self) -> isize {
+    syscall_raw!(linkat(
+      self.old_dir_res.as_fd().as_raw_fd(),
       self.old_path.as_ptr(),
-      self.new_dir_fd,
+      self.new_dir_res.as_fd().as_raw_fd(),
       self.new_path.as_ptr(),
       0
     ))

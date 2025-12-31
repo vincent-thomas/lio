@@ -1,23 +1,24 @@
 #[cfg(not(linux))]
 use crate::op::EventType;
-use std::{io, os::fd::RawFd};
+use std::{io, os::fd::{AsFd, AsRawFd}};
 
 use io_uring::types::Fd;
 
 use crate::op::{Operation, OperationExt};
+use crate::resource::Resource;
 
 // TODO: not sure detach safe.
 pub struct Tee {
-  fd_in: RawFd,
-  fd_out: RawFd,
+  res_in: Resource,
+  res_out: Resource,
   size: u32,
 }
 
 assert_op_max_size!(Tee);
 
 impl Tee {
-  pub(crate) fn new(fd_in: RawFd, fd_out: RawFd, size: u32) -> Self {
-    Self { fd_in, fd_out, size }
+  pub(crate) fn new(res_in: Resource, res_out: Resource, size: u32) -> Self {
+    Self { res_in, res_out, size }
   }
 }
 
@@ -26,7 +27,13 @@ impl OperationExt for Tee {
 }
 
 impl Operation for Tee {
-  impl_result!(|_this, ret: io::Result<i32>| -> io::Result<i32> { ret });
+  impl_result!(|_this, ret: isize| -> io::Result<i32> {
+    if ret < 0 {
+      Err(io::Error::from_raw_os_error((-ret) as i32))
+    } else {
+      Ok(ret as i32)
+    }
+  });
 
   impl_no_readyness!();
 
@@ -34,12 +41,11 @@ impl Operation for Tee {
   // const OPCODE: u8 = 33;
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::Tee::new(Fd(self.fd_in), Fd(self.fd_out), self.size)
+    io_uring::opcode::Tee::new(Fd(self.res_in.as_fd().as_raw_fd()), Fd(self.res_out.as_fd().as_raw_fd()), self.size)
       .build()
   }
 
-  fn run_blocking(&self) -> std::io::Result<i32> {
-    syscall!(tee(self.fd_in, self.fd_out, self.size as usize, 0))
-      .map(|s| s as i32)
+  fn run_blocking(&self) -> isize {
+    syscall_raw!(tee(self.res_in.as_fd().as_raw_fd(), self.res_out.as_fd().as_raw_fd(), self.size as usize, 0))
   }
 }

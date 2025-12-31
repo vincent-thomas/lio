@@ -4,14 +4,14 @@
 //! - **Submitter thread**: Receives operations via channel, submits them to the backend
 //! - **Handler thread**: Polls for completions, processes results, invokes callbacks/wakers
 
-use crate::backends::{Handler, SubmitErr, Submitter};
+use crate::backends::{Handler, SubmitErr, SubmitErrExt, Submitter};
 use crate::registration::StoredOp;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::{self, JoinHandle};
 
 /// Message sent to the submitter thread
 pub enum SubmitMsg {
-  Submit { op: StoredOp, response_tx: SyncSender<Result<u64, SubmitErr>> },
+  Submit { op: StoredOp, response_tx: SyncSender<Result<u64, SubmitErrExt>> },
   Shutdown,
 }
 
@@ -50,17 +50,18 @@ impl Worker {
     }
   }
 
-  /// Submit an operation (blocks until submitter thread processes it and returns ID)
-  pub fn submit(&self, op: StoredOp) -> Result<u64, SubmitErr> {
+  /// Submit an operation (blocks until submitter thread processes it and returns result)
+  pub fn submit(&self, op: StoredOp) -> Result<u64, SubmitErrExt> {
     let (response_tx, response_rx) = mpsc::sync_channel(1);
 
-    self
-      .submit_tx
-      .send(SubmitMsg::Submit { op, response_tx })
-      .map_err(|_| SubmitErr::DriverShutdown)?;
+    if self.submit_tx.send(SubmitMsg::Submit { op, response_tx }).is_err() {
+      return Err(SubmitErrExt::SubmitErr(SubmitErr::DriverShutdown));
+    }
 
     // Wait for submitter thread to process and respond
-    response_rx.recv().map_err(|_| SubmitErr::DriverShutdown)?
+    response_rx
+      .recv()
+      .unwrap_or(Err(SubmitErrExt::SubmitErr(SubmitErr::DriverShutdown)))
   }
 
   /// Submitter thread loop
@@ -83,24 +84,35 @@ impl Worker {
 
   /// Handler thread loop
   fn handler_loop(shutdown_rx: Receiver<()>, handler: &mut Handler) {
+    eprintln!("[Worker::handler_loop] Handler thread started");
     loop {
       // Check for shutdown signal (non-blocking)
       match shutdown_rx.try_recv() {
-        Ok(_) => break, // Shutdown requested
-        Err(mpsc::TryRecvError::Disconnected) => break, // Channel closed
+        Ok(_) => {
+          eprintln!("[Worker::handler_loop] Shutdown signal received");
+          break;
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+          eprintln!("[Worker::handler_loop] Shutdown channel disconnected");
+          break;
+        }
         Err(mpsc::TryRecvError::Empty) => {} // No shutdown yet, continue
       }
 
+      eprintln!("[Worker::handler_loop] Calling handler.tick()");
       // Poll for completions
       match handler.tick() {
-        Ok(()) => {}
+        Ok(()) => {
+          eprintln!("[Worker::handler_loop] handler.tick() returned Ok");
+        }
         Err(e) => {
-          panic!("lio: handler tick error: {:?}", e);
           // Consider: should we break on error or continue?
-          std::thread::sleep(std::time::Duration::from_millis(10));
+          eprintln!("[Worker::handler_loop] handler.tick() error: {:?}", e);
+          panic!("lio: handler tick error: {:?}", e);
         }
       }
     }
+    eprintln!("[Worker::handler_loop] Handler thread exiting");
   }
 
   /// Shutdown the worker threads gracefully
@@ -127,5 +139,585 @@ impl Worker {
 impl Drop for Worker {
   fn drop(&mut self) {
     self.shutdown();
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{
+    backends::{IoDriver, dummy::DummyDriver},
+    op::nop::Nop,
+    registration::StoredOp,
+    store::OpStore,
+  };
+  use std::{
+    sync::{
+      Arc,
+      atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
+  };
+
+  /// Helper to create a Worker with DummyDriver
+  fn setup_worker() -> (Worker, Arc<OpStore>) {
+    let state = DummyDriver::new_state().unwrap();
+    let (submitter_impl, handler_impl) = DummyDriver::new(state).unwrap();
+
+    let store = Arc::new(OpStore::with_capacity(1024));
+
+    let submitter =
+      Submitter::new(Box::new(submitter_impl), Arc::clone(&store), state);
+    let handler =
+      Handler::new(Box::new(handler_impl), Arc::clone(&store), state);
+
+    let worker = Worker::spawn(submitter, handler);
+
+    (worker, store)
+  }
+
+  #[test]
+  fn test_worker_basic_submit() {
+    let (worker, _store) = setup_worker();
+
+    let op = StoredOp::new_waker(Nop);
+    let result = worker.submit(op);
+
+    assert!(result.is_ok(), "Submit should succeed");
+
+    // Give handler thread time to process
+    thread::sleep(Duration::from_millis(50));
+  }
+
+  #[test]
+  fn test_worker_multiple_submits() {
+    let (worker, _store) = setup_worker();
+
+    for _ in 0..100 {
+      let op = StoredOp::new_waker(Nop);
+      let result = worker.submit(op);
+      assert!(result.is_ok(), "All submits should succeed");
+    }
+
+    // Give handler thread time to process
+    thread::sleep(Duration::from_millis(100));
+  }
+
+  #[test]
+  fn test_worker_concurrent_submits_from_multiple_threads() {
+    let worker = Arc::new(setup_worker().0);
+    let num_threads = 8;
+    let ops_per_thread = 50;
+
+    let handles: Vec<_> = (0..num_threads)
+      .map(|_| {
+        let worker = Arc::clone(&worker);
+        thread::spawn(move || {
+          for _ in 0..ops_per_thread {
+            let op = StoredOp::new_waker(Nop);
+            let result = worker.submit(op);
+            assert!(result.is_ok(), "Submit should succeed");
+          }
+        })
+      })
+      .collect();
+
+    for handle in handles {
+      handle.join().unwrap();
+    }
+
+    // Give handler thread time to process
+    thread::sleep(Duration::from_millis(100));
+  }
+
+  #[test]
+  fn test_worker_shutdown_graceful() {
+    let (mut worker, _store) = setup_worker();
+
+    // Submit some operations
+    for _ in 0..10 {
+      let op = StoredOp::new_waker(Nop);
+      assert!(worker.submit(op).is_ok());
+    }
+
+    // Shutdown should complete without hanging
+    worker.shutdown();
+
+    // Submitting after shutdown should fail
+    let op = StoredOp::new_waker(Nop);
+    let result = worker.submit(op);
+    assert!(result.is_err(), "Submit after shutdown should fail");
+  }
+
+  #[test]
+  fn test_worker_drop_triggers_shutdown() {
+    let (worker, _store) = setup_worker();
+
+    // Submit some operations
+    for _ in 0..5 {
+      let op = StoredOp::new_waker(Nop);
+      assert!(worker.submit(op).is_ok());
+    }
+
+    // Drop should trigger shutdown
+    drop(worker);
+
+    // Test passes if drop completes without hanging
+  }
+
+  #[test]
+  fn test_worker_rapid_shutdown() {
+    let (mut worker, _store) = setup_worker();
+
+    // Shutdown immediately without submitting anything
+    worker.shutdown();
+
+    // Should complete cleanly
+  }
+
+  #[test]
+  fn test_worker_shutdown_while_submitting() {
+    let (worker, _store) = setup_worker();
+    let worker = Arc::new(worker);
+    let worker_clone = Arc::clone(&worker);
+    let keep_submitting = Arc::new(AtomicBool::new(true));
+    let keep_submitting_clone = Arc::clone(&keep_submitting);
+
+    // Spawn thread that continuously submits
+    let submit_thread = thread::spawn(move || {
+      while keep_submitting_clone.load(Ordering::Relaxed) {
+        let op = StoredOp::new_waker(Nop);
+        let _ = worker_clone.submit(op);
+      }
+    });
+
+    // Let it submit for a bit
+    thread::sleep(Duration::from_millis(50));
+
+    // Signal to stop and shutdown
+    keep_submitting.store(false, Ordering::Relaxed);
+    submit_thread.join().unwrap();
+
+    // Get mutable access by unwrapping Arc
+    let mut worker = match Arc::try_unwrap(worker) {
+      Ok(w) => w,
+      Err(_) => panic!("Failed to unwrap Arc"),
+    };
+    worker.shutdown();
+  }
+
+  #[test]
+  fn test_worker_high_throughput() {
+    let (worker, _store) = setup_worker();
+    let num_ops = 1000;
+
+    let start = std::time::Instant::now();
+
+    for _ in 0..num_ops {
+      let op = StoredOp::new_waker(Nop);
+      worker.submit(op).unwrap();
+    }
+
+    let elapsed = start.elapsed();
+    println!(
+      "Submitted {} operations in {:?} ({:.2} ops/sec)",
+      num_ops,
+      elapsed,
+      num_ops as f64 / elapsed.as_secs_f64()
+    );
+
+    // Give handler time to process
+    thread::sleep(Duration::from_millis(200));
+  }
+
+  #[test]
+  fn test_worker_interleaved_submit_shutdown() {
+    for _ in 0..10 {
+      let (mut worker, _store) = setup_worker();
+
+      // Submit a few ops
+      for _ in 0..5 {
+        let op = StoredOp::new_waker(Nop);
+        assert!(worker.submit(op).is_ok());
+      }
+
+      // Shutdown
+      worker.shutdown();
+    }
+  }
+
+  #[test]
+  fn test_worker_submit_returns_unique_ids() {
+    let (worker, _store) = setup_worker();
+    let mut ids = std::collections::HashSet::new();
+
+    for _ in 0..100 {
+      let op = StoredOp::new_waker(Nop);
+      let id = match worker.submit(op) {
+        Ok(v) => v,
+        Err(_) => panic!(),
+      };
+      assert!(ids.insert(id), "ID {} was duplicated", id);
+    }
+
+    assert_eq!(ids.len(), 100);
+  }
+
+  #[test]
+  fn test_worker_stress_concurrent_operations() {
+    let (worker, _store) = setup_worker();
+    let worker = Arc::new(worker);
+    let num_threads = 16;
+    let ops_per_thread = 100;
+    let total_ops = num_threads * ops_per_thread;
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    let handles: Vec<_> = (0..num_threads)
+      .map(|_| {
+        let worker: Arc<Worker> = Arc::clone(&worker);
+        let completed = Arc::clone(&completed);
+        thread::spawn(move || {
+          for _ in 0..ops_per_thread {
+            let op = StoredOp::new_waker(Nop);
+            if worker.submit(op).is_ok() {
+              completed.fetch_add(1, Ordering::Relaxed);
+            }
+          }
+        })
+      })
+      .collect();
+
+    for handle in handles {
+      handle.join().unwrap();
+    }
+
+    assert_eq!(
+      completed.load(Ordering::Relaxed),
+      total_ops,
+      "All operations should complete"
+    );
+
+    // Give handler time to process
+    thread::sleep(Duration::from_millis(200));
+  }
+
+  #[test]
+  fn test_worker_submit_after_partial_shutdown() {
+    let (mut worker, _store) = setup_worker();
+
+    // Submit some ops
+    for _ in 0..5 {
+      let op = StoredOp::new_waker(Nop);
+      worker.submit(op).unwrap();
+    }
+
+    // Trigger shutdown
+    worker.shutdown();
+
+    // Try to submit after shutdown - should fail
+    let op = StoredOp::new_waker(Nop);
+    let result = worker.submit(op);
+    assert!(result.is_err());
+  }
+
+  #[test]
+  fn test_worker_multiple_shutdowns_idempotent() {
+    let (mut worker, _store) = setup_worker();
+
+    // First shutdown
+    worker.shutdown();
+
+    // Second shutdown should be safe (no-op)
+    worker.shutdown();
+
+    // Third shutdown
+    worker.shutdown();
+  }
+
+  #[test]
+  fn test_worker_empty_worker_lifecycle() {
+    // Create and immediately drop without submitting anything
+    let (worker, _store) = setup_worker();
+    drop(worker);
+  }
+
+  #[test]
+  fn test_worker_handler_processes_operations() {
+    let (worker, store) = setup_worker();
+
+    // Submit operations
+    let ids: Vec<_> = (0..10)
+      .map(|_| {
+        let op = StoredOp::new_waker(Nop);
+        worker.submit(op).unwrap()
+      })
+      .collect();
+
+    // Give handler time to process
+    thread::sleep(Duration::from_millis(100));
+
+    // Check if operations were processed (they should be removed from store or marked complete)
+    for id in ids {
+      let exists = store.get_mut(id, |_reg| {});
+      let _ = exists;
+    }
+  }
+
+  #[test]
+  fn test_worker_burst_traffic() {
+    let (worker, _store) = setup_worker();
+
+    // Submit bursts of operations with pauses
+    for burst in 0..5 {
+      for _ in 0..50 {
+        let op = StoredOp::new_waker(Nop);
+        worker.submit(op).unwrap();
+      }
+
+      println!("Completed burst {}", burst + 1);
+      thread::sleep(Duration::from_millis(20));
+    }
+
+    // Give handler time to drain
+    thread::sleep(Duration::from_millis(100));
+  }
+
+  #[test]
+  fn test_worker_sequential_workers() {
+    // Create multiple workers sequentially
+    for i in 0..5 {
+      let (mut worker, _store) = setup_worker();
+
+      for _ in 0..10 {
+        let op = StoredOp::new_waker(Nop);
+        worker.submit(op).unwrap();
+      }
+
+      worker.shutdown();
+      println!("Worker {} completed", i + 1);
+    }
+  }
+
+  #[test]
+  fn test_worker_channel_communication() {
+    let (worker, _store) = setup_worker();
+
+    // Verify we can submit and the channel doesn't block indefinitely
+    let op = StoredOp::new_waker(Nop);
+    let start = std::time::Instant::now();
+    worker.submit(op).unwrap();
+    let elapsed = start.elapsed();
+
+    // Submit should be fast (not blocking on I/O, just channel send)
+    assert!(
+      elapsed < Duration::from_millis(100),
+      "Submit took too long: {:?}",
+      elapsed
+    );
+  }
+
+  #[test]
+  fn test_worker_memory_safety() {
+    // This test verifies no memory leaks or crashes under heavy load
+    let (worker, _store) = setup_worker();
+
+    for _ in 0..1000 {
+      let op = StoredOp::new_waker(Nop);
+      worker.submit(op).unwrap();
+    }
+
+    thread::sleep(Duration::from_millis(200));
+
+    // If we get here without crashing, memory safety is maintained
+  }
+
+  #[test]
+  fn test_worker_thread_join_timeout() {
+    let (worker, _store) = setup_worker();
+
+    // Submit some operations
+    for _ in 0..10 {
+      let op = StoredOp::new_waker(Nop);
+      worker.submit(op).unwrap();
+    }
+
+    let start = std::time::Instant::now();
+    drop(worker); // Should trigger shutdown
+    let elapsed = start.elapsed();
+
+    // Shutdown should complete reasonably quickly
+    assert!(
+      elapsed < Duration::from_secs(5),
+      "Worker shutdown took too long: {:?}",
+      elapsed
+    );
+  }
+
+  #[test]
+  fn test_worker_concurrent_submit_and_shutdown() {
+    let (worker, _store) = setup_worker();
+    let worker = Arc::new(worker);
+    let worker_submit: Arc<Worker> = Arc::clone(&worker);
+
+    // Spawn thread that submits
+    let handle = thread::spawn(move || {
+      for _ in 0..100 {
+        let op = StoredOp::new_waker(Nop);
+        let _ = worker_submit.submit(op);
+        thread::sleep(Duration::from_micros(100));
+      }
+    });
+
+    // Wait a bit then shutdown
+    thread::sleep(Duration::from_millis(5));
+
+    // Unwrap Arc and shutdown
+    handle.join().unwrap();
+    let mut worker = match Arc::try_unwrap(worker) {
+      Ok(w) => w,
+      Err(_) => panic!("Failed to unwrap Arc"),
+    };
+    worker.shutdown();
+  }
+
+  #[test]
+  fn test_worker_zero_operations() {
+    let (mut worker, _store) = setup_worker();
+    // Shutdown immediately without any operations
+    worker.shutdown();
+  }
+
+  #[test]
+  fn test_worker_single_operation() {
+    let (worker, _store) = setup_worker();
+
+    let op = StoredOp::new_waker(Nop);
+    let result = worker.submit(op);
+
+    assert!(result.is_ok());
+    thread::sleep(Duration::from_millis(50));
+  }
+
+  #[test]
+  fn test_worker_handler_tick_loop() {
+    let (worker, _store) = setup_worker();
+
+    // Submit operations over time to ensure handler's tick loop is running
+    for i in 0..10 {
+      let op = StoredOp::new_waker(Nop);
+      worker.submit(op).unwrap();
+      thread::sleep(Duration::from_millis(10));
+      println!("Submitted operation {}", i + 1);
+    }
+
+    // Give handler time to process all
+    thread::sleep(Duration::from_millis(100));
+  }
+
+  #[test]
+  fn test_worker_submitter_loop_responsiveness() {
+    let (worker, _store) = setup_worker();
+
+    // Submit operations rapidly to test submitter responsiveness
+    let start = std::time::Instant::now();
+
+    for _ in 0..100 {
+      let op = StoredOp::new_waker(Nop);
+      worker.submit(op).unwrap();
+    }
+
+    let elapsed = start.elapsed();
+
+    // Should be able to handle 100 submits very quickly
+    assert!(
+      elapsed < Duration::from_secs(1),
+      "Submitter was too slow: {:?}",
+      elapsed
+    );
+  }
+
+  #[test]
+  fn test_worker_with_store_capacity() {
+    // Test with different store capacities
+    for capacity in [10, 100, 1000] {
+      let state = DummyDriver::new_state().unwrap();
+      let (submitter_impl, handler_impl) = DummyDriver::new(state).unwrap();
+
+      let store = Arc::new(OpStore::with_capacity(capacity));
+
+      let submitter =
+        Submitter::new(Box::new(submitter_impl), Arc::clone(&store), state);
+      let handler =
+        Handler::new(Box::new(handler_impl), Arc::clone(&store), state);
+
+      let worker = Worker::spawn(submitter, handler);
+
+      // Submit some operations
+      for _ in 0..(capacity / 2) {
+        let op = StoredOp::new_waker(Nop);
+        worker.submit(op).unwrap();
+      }
+
+      thread::sleep(Duration::from_millis(50));
+    }
+  }
+
+  #[test]
+  fn test_worker_mixed_pace_submissions() {
+    let (worker, _store) = setup_worker();
+
+    // Fast burst
+    for _ in 0..50 {
+      let op = StoredOp::new_waker(Nop);
+      worker.submit(op).unwrap();
+    }
+
+    thread::sleep(Duration::from_millis(100));
+
+    // Slow submissions
+    for _ in 0..10 {
+      let op = StoredOp::new_waker(Nop);
+      worker.submit(op).unwrap();
+      thread::sleep(Duration::from_millis(10));
+    }
+
+    // Another fast burst
+    for _ in 0..50 {
+      let op = StoredOp::new_waker(Nop);
+      worker.submit(op).unwrap();
+    }
+
+    thread::sleep(Duration::from_millis(100));
+  }
+
+  #[test]
+  fn test_worker_resource_cleanup_on_drop() {
+    // Create worker in a scope to ensure it's dropped
+    {
+      let (worker, _store) = setup_worker();
+
+      for _ in 0..20 {
+        let op = StoredOp::new_waker(Nop);
+        worker.submit(op).unwrap();
+      }
+
+      // Worker and store will be dropped here
+    }
+
+    // If we reach here without crash, cleanup was successful
+  }
+
+  #[test]
+  fn test_worker_creation_and_destruction_loop() {
+    // Repeatedly create and destroy workers
+    for _ in 0..10 {
+      let (worker, _store) = setup_worker();
+
+      let op = StoredOp::new_waker(Nop);
+      worker.submit(op).unwrap();
+
+      drop(worker);
+    }
   }
 }

@@ -1,20 +1,21 @@
 use crate::op::{DetachSafe, OpMeta};
-use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::time::Duration;
+use std::{io::Error, os::fd::RawFd};
 
 #[cfg(linux)]
 use io_uring::{opcode, squeue, types::Timespec};
 
 use crate::op::{Operation, OperationExt};
+use crate::resource::Resource;
 
 pub struct Timeout {
   duration: Duration,
   #[cfg(linux)]
   timespec: Timespec,
   #[cfg(target_os = "linux")]
-  timer_fd: OwnedFd,
+  timer_res: Resource,
   #[cfg(all(unix, not(target_os = "linux")))]
   timer_id: u64,
 }
@@ -44,7 +45,7 @@ impl Timeout {
         .sec(duration.as_secs())
         .nsec(duration.subsec_nanos()),
       #[cfg(target_os = "linux")]
-      timer_fd: unsafe { OwnedFd::from_raw_fd(timer_fd) },
+      timer_res: unsafe { Resource::from_raw_fd(timer_fd) },
       #[cfg(kqueue)]
       timer_id: id,
     }
@@ -92,23 +93,13 @@ impl OperationExt for Timeout {
 }
 
 impl Operation for Timeout {
-  impl_result!(|_this, res: std::io::Result<i32>| -> std::io::Result<()> {
-    match res {
-      Ok(v) => {
-        assert!(v == 0);
-        Ok(())
-      }
-      Err(err) => {
-        if let Some(inner_err) = err.raw_os_error() {
-          // io_uring returns -ETIME, pollingv2 returns ETIME
-          match inner_err.abs() {
-            libc::ETIME => Ok(()),
-            _ => Err(err),
-          }
-        } else {
-          Err(err)
-        }
-      }
+  impl_result!(|_this, res: isize| -> std::io::Result<()> {
+    if res == 0 {
+      return Ok(());
+    }
+    match res.abs() as i32 {
+      libc::ETIME => Ok(()),
+      _ => Err(Error::last_os_error()),
     }
   });
 
@@ -136,7 +127,7 @@ impl Operation for Timeout {
   fn cap(&self) -> RawFd {
     #[cfg(linux)]
     {
-      self.timer_fd.as_raw_fd()
+      self.timer_res.as_fd().as_raw_fd()
     }
     #[cfg(kqueue)]
     {
@@ -145,24 +136,24 @@ impl Operation for Timeout {
     }
   }
 
-  fn run_blocking(&self) -> std::io::Result<i32> {
+  fn run_blocking(&self) -> isize {
     #[cfg(linux)]
     {
       // When the timer expires, read from the timerfd to clear it
       let mut buf = [0u8; 8];
-      syscall!(read(
-        self.timer_fd.as_raw_fd(),
+      syscall_raw!(read(
+        self.timer_res.as_fd().as_raw_fd(),
         buf.as_mut_ptr() as *mut libc::c_void,
         8
-      ))?;
-      return Ok(0);
+      ));
+      return 0;
     }
 
     #[cfg(kqueue)]
     {
       // For kqueue timers, run_blocking is called AFTER the timer fires
       // from EVFILT_TIMER, so we just return success immediately
-      return Ok(0);
+      return 0;
     }
   }
 }

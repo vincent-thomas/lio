@@ -5,6 +5,10 @@ edition = "2024"
 description = "reserved name"
 license = "MIT"
 
+[features]
+bytes = ["lio/bytes"]
+zeroize = ["lio/zeroize"]
+
 [dependencies]
 lio = { path = "../lio", version = "0.3.0" }
 libc.workspace = true

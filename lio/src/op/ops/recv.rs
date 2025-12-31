@@ -1,4 +1,4 @@
-use std::{io, os::fd::RawFd};
+use std::os::fd::{AsFd, AsRawFd};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
@@ -7,6 +7,7 @@ use crate::{
   BufResult,
   buf::BufLike,
   op::{DetachSafe, OpMeta, OperationExt},
+  resource::Resource,
 };
 
 use crate::op::Operation;
@@ -15,7 +16,7 @@ pub struct Recv<T>
 where
   T: Send + Sync,
 {
-  fd: RawFd,
+  res: Resource,
   buf: Option<T>,
   flags: i32,
 }
@@ -26,8 +27,8 @@ impl<T> Recv<T>
 where
   T: Send + Sync,
 {
-  pub(crate) fn new(fd: RawFd, buf: T, flags: Option<i32>) -> Self {
-    Self { fd, buf: Some(buf), flags: flags.unwrap_or(0) }
+  pub(crate) fn new(res: Resource, buf: T, flags: Option<i32>) -> Self {
+    Self { res, buf: Some(buf), flags: flags.unwrap_or(0) }
   }
 }
 
@@ -42,10 +43,16 @@ impl<T> Operation for Recv<T>
 where
   T: BufLike + Send + Sync,
 {
-  impl_result!(|this, res: io::Result<i32>| -> BufResult<i32, T> {
+  impl_result!(|this, res: isize| -> BufResult<i32, T> {
     let buf = this.buf.take().expect("ran Recv::result more than once.");
-    let out = buf.after(*res.as_ref().unwrap_or(&0) as usize);
-    (res, out)
+    let bytes = if res < 0 { 0 } else { res as usize };
+    let out = buf.after(bytes);
+    let result = if res < 0 {
+      Err(std::io::Error::from_raw_os_error((-res) as i32))
+    } else {
+      Ok(res as i32)
+    };
+    (result, out)
   });
 
   // #[cfg(linux)]
@@ -56,7 +63,7 @@ where
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
-    io_uring::opcode::Recv::new(Fd(self.fd), ptr.cast_mut(), len as u32)
+    io_uring::opcode::Recv::new(Fd(self.res.as_fd().as_raw_fd()), ptr.cast_mut(), len as u32)
       .flags(self.flags)
       .build()
   }
@@ -67,13 +74,13 @@ where
 
   #[cfg(unix)]
   fn cap(&self) -> i32 {
-    self.fd
+    self.res.as_fd().as_raw_fd()
   }
 
-  fn run_blocking(&self) -> io::Result<i32> {
+  fn run_blocking(&self) -> isize {
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
-    syscall!(recv(self.fd, ptr as *mut _, len, self.flags)).map(|t| t as i32)
+    syscall_raw!(recv(self.res.as_fd().as_raw_fd(), ptr as *mut _, len, self.flags))
   }
 }

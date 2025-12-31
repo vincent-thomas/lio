@@ -7,7 +7,7 @@ use crate::{
   op::OperationExt,
 };
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::Waker;
 use std::{fmt, io};
 use std::{
@@ -19,7 +19,8 @@ use crate::registration::StoredOp;
 
 pub struct Driver {
   store: Arc<OpStore>,
-  worker: Worker,
+  primary_worker: Worker,
+  blocking_worker: Worker,
   buf_store: BufStore,
 }
 
@@ -43,8 +44,9 @@ impl fmt::Display for TryInitError {
 static DRIVER: AtomicPtr<Driver> = AtomicPtr::new(std::ptr::null_mut());
 
 impl Driver {
-  pub(crate) fn try_init_with_driver_and_capacity<D>(
+  pub(crate) fn try_init_with_capacity_and_bufstore<D>(
     cap: usize,
+    buf_store: BufStore,
   ) -> Result<(), TryInitError>
   where
     D: IoDriver,
@@ -53,17 +55,35 @@ impl Driver {
     if !DRIVER.load(Ordering::Acquire).is_null() {
       return Err(TryInitError::AlreadyInit);
     }
-    let state = D::new_state().map_err(TryInitError::Io)?;
-    let (subm, handler) = D::new(state).map_err(TryInitError::Io)?;
+
+    // Initialize primary backend
+    let primary_state = D::new_state().map_err(TryInitError::Io)?;
+    let (primary_subm, primary_handler) =
+      D::new(primary_state).map_err(TryInitError::Io)?;
+
+    // Initialize blocking backend
+    let blocking_state = backends::blocking::BlockingBackend::new_state()
+      .map_err(TryInitError::Io)?;
+    let (blocking_subm, blocking_handler) =
+      backends::blocking::BlockingBackend::new(blocking_state)
+        .map_err(TryInitError::Io)?;
 
     let store = Arc::new(OpStore::with_capacity(cap));
 
-    let handler = Handler::new(Box::new(handler), store.clone(), state);
-    let submitter = Submitter::new(Box::new(subm), store.clone(), state);
+    let primary_handler =
+      Handler::new(Box::new(primary_handler), store.clone(), primary_state);
+    let primary_submitter =
+      Submitter::new(Box::new(primary_subm), store.clone(), primary_state);
+
+    let blocking_handler =
+      Handler::new(Box::new(blocking_handler), store.clone(), blocking_state);
+    let blocking_submitter =
+      Submitter::new(Box::new(blocking_subm), store.clone(), blocking_state);
 
     let driver_ptr = Box::into_raw(Box::new(Driver {
-      buf_store: BufStore::default(),
-      worker: Worker::spawn(submitter, handler),
+      buf_store,
+      primary_worker: Worker::spawn(primary_submitter, primary_handler),
+      blocking_worker: Worker::spawn(blocking_submitter, blocking_handler),
       store: store.clone(),
     }));
 
@@ -77,10 +97,12 @@ impl Driver {
       Ok(_) => Ok(()),
       Err(_) => {
         // Another thread initialized first, clean up our allocation
-        // This drops the state ptr in Submitter::new()
+        // This drops the driver and its workers
         let _ = unsafe { Box::from_raw(driver_ptr) };
 
-        D::drop_state(state);
+        // Clean up the states
+        D::drop_state(primary_state);
+        backends::blocking::BlockingBackend::drop_state(blocking_state);
         Err(TryInitError::AlreadyInit)
       }
     }
@@ -104,7 +126,7 @@ impl Driver {
     Self::deallocate(ptr);
   }
 
-  pub(crate) fn try_lend_buf(&'static self) -> Option<LentBuf> {
+  pub(crate) fn try_lend_buf<'a>(&'a self) -> Option<LentBuf<'a>> {
     self.buf_store.try_get()
   }
 
@@ -123,10 +145,26 @@ impl Driver {
 
   pub(crate) fn submit(stored: StoredOp) -> Result<u64, SubmitErr> {
     let driver = Driver::get();
-    driver.worker.submit(stored)
+
+    // Try primary worker first
+    match driver.primary_worker.submit(stored) {
+      Ok(id) => Ok(id),
+      Err(backends::SubmitErrExt::NotCompatible(op)) => {
+        // Fallback to blocking worker for incompatible operations
+        match driver.blocking_worker.submit(op) {
+          Ok(id) => Ok(id),
+          Err(backends::SubmitErrExt::NotCompatible(_)) => {
+            // Blocking backend should never return NotCompatible
+            panic!("blocking backend returned NotCompatible")
+          }
+          Err(backends::SubmitErrExt::SubmitErr(e)) => Err(e),
+        }
+      }
+      Err(backends::SubmitErrExt::SubmitErr(e)) => Err(e),
+    }
   }
 
-  pub(crate) fn tick(&self, can_wait: bool) {
+  pub(crate) fn tick(&self, _can_wait: bool) {
     // self.driver.tick(&self.store, can_wait)
   }
 

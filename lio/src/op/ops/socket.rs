@@ -1,7 +1,8 @@
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, RawFd};
 
 use crate::op::{Operation, OperationExt};
+use crate::resource::Resource;
 
 // Not detach safe.
 pub struct Socket {
@@ -178,26 +179,30 @@ impl Socket {
 }
 
 impl OperationExt for Socket {
-  type Result = std::io::Result<RawFd>;
+  type Result = std::io::Result<Resource>;
 }
 
 impl Operation for Socket {
-  impl_result!(fd);
+  impl_result!(|_this, res: isize| -> io::Result<Resource> {
+    if res < 0 {
+      Err(io::Error::from_raw_os_error((-res) as i32))
+    } else {
+      Ok(unsafe { Resource::from_raw_fd(res as RawFd) })
+    }
+  });
   impl_no_readyness!();
 
   #[cfg(linux)]
   // const OPCODE: u8 = 45;
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::Socket::new(
-      self.domain,
-      self.ty,
-      self.proto,
-    )
-    .build()
+    io_uring::opcode::Socket::new(self.domain, self.ty, self.proto).build()
   }
 
-  fn run_blocking(&self) -> io::Result<i32> {
+  fn run_blocking(&self) -> isize {
+    eprintln!("[Socket::run_blocking] Starting socket creation: domain={}, type={}, proto={}",
+              self.domain, self.ty, self.proto);
+
     // Path 1: Platforms with SOCK_CLOEXEC support (atomic CLOEXEC flag)
     #[cfg(any(
       target_os = "android",
@@ -213,21 +218,33 @@ impl Operation for Socket {
       target_os = "solaris",
     ))]
     let fd = {
+      eprintln!("[Socket::run_blocking] Using SOCK_CLOEXEC path");
       // Create socket with CLOEXEC set atomically (no race window)
-      let fd = syscall!(socket(
+      let fd = syscall_raw!(socket(
         self.domain,
         self.ty | libc::SOCK_CLOEXEC,
         self.proto
-      ))?;
+      ));
+
+      eprintln!("[Socket::run_blocking] socket() returned fd={}", fd);
+
+      if fd < 0 {
+        eprintln!("[Socket::run_blocking] socket() failed with error code: {}", fd);
+        return fd;
+      }
 
       // CRITICAL ERROR CLEANUP: If setup fails, close FD before returning error
-      match self.setup_socket_options(fd) {
-        Ok(()) => Ok(fd),
-        Err(e) => {
-          unsafe { libc::close(fd) };
-          Err(e)
+      match self.setup_socket_options(fd as i32) {
+        Ok(()) => {
+          eprintln!("[Socket::run_blocking] Socket options setup successful");
+          fd
         }
-      }?
+        Err(e) => {
+          eprintln!("[Socket::run_blocking] Socket options setup failed: {:?}", e);
+          unsafe { libc::close(fd as i32) };
+          return -(e.raw_os_error().unwrap_or(libc::EIO) as isize);
+        }
+      }
     };
 
     // Path 2: Platforms without SOCK_CLOEXEC (macOS, etc.)
@@ -245,12 +262,16 @@ impl Operation for Socket {
       target_os = "solaris",
     )))]
     let fd = {
+      eprintln!("[Socket::run_blocking] Using non-SOCK_CLOEXEC path (macOS)");
       // Create socket without CLOEXEC (will set separately)
-      let fd = syscall!(socket(
-        self.domain,
-        self.ty,
-        self.proto
-      ))?;
+      let fd = syscall_raw!(socket(self.domain, self.ty, self.proto));
+
+      eprintln!("[Socket::run_blocking] socket() returned fd={}", fd);
+
+      if fd < 0 {
+        eprintln!("[Socket::run_blocking] socket() failed with error code: {}", fd);
+        return fd;
+      }
 
       // Set CLOEXEC if supported on this platform
       #[cfg(not(any(
@@ -263,23 +284,32 @@ impl Operation for Socket {
         target_os = "vxworks",
       )))]
       {
+        eprintln!("[Socket::run_blocking] Setting CLOEXEC");
         // CRITICAL ERROR CLEANUP: If CLOEXEC fails, close FD before returning error
-        if let Err(e) = Self::set_cloexec(fd) {
-          let _ = unsafe { libc::close(fd) };
-          return Err(e);
+        if let Err(e) = Self::set_cloexec(fd as i32) {
+          eprintln!("[Socket::run_blocking] CLOEXEC failed: {:?}", e);
+          let _ = unsafe { libc::close(fd as i32) };
+          return -(e.raw_os_error().unwrap_or(libc::EIO) as isize);
         }
+        eprintln!("[Socket::run_blocking] CLOEXEC set successfully");
       }
 
+      eprintln!("[Socket::run_blocking] Setting socket options");
       // CRITICAL ERROR CLEANUP: If setup fails, close FD before returning error
-      match self.setup_socket_options(fd) {
-        Ok(()) => Ok(fd),
-        Err(e) => {
-          let _ = unsafe { libc::close(fd) };
-          Err(e)
+      match self.setup_socket_options(fd as i32) {
+        Ok(()) => {
+          eprintln!("[Socket::run_blocking] Socket options setup successful");
+          fd
         }
-      }?
+        Err(e) => {
+          eprintln!("[Socket::run_blocking] Socket options setup failed: {:?}", e);
+          let _ = unsafe { libc::close(fd as i32) };
+          return -(e.raw_os_error().unwrap_or(libc::EIO) as isize);
+        }
+      }
     };
 
-    Ok(fd)
+    eprintln!("[Socket::run_blocking] Returning fd={}", fd);
+    fd
   }
 }

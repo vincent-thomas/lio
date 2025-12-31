@@ -29,7 +29,7 @@ pub use connect::*;
 pub use fsync::*;
 pub use linkat::*;
 pub use listen::*;
-pub(crate) use nop::*;
+pub use nop::*;
 pub use openat::*;
 pub use read::*;
 pub use recv::*;

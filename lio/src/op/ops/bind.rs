@@ -1,4 +1,5 @@
-use std::{cell::UnsafeCell, io, mem, net::SocketAddr, os::fd::RawFd};
+use std::os::fd::{AsFd, AsRawFd};
+use std::{cell::UnsafeCell, io, mem, net::SocketAddr};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
@@ -6,9 +7,10 @@ use io_uring::types::Fd;
 use crate::op::{DetachSafe, net_utils::std_socketaddr_into_libc};
 
 use crate::op::{Operation, OperationExt};
+use crate::resource::Resource;
 
 pub struct Bind {
-  fd: RawFd,
+  res: Resource,
   addr: UnsafeCell<libc::sockaddr_storage>, // addr: SocketAddr,
 }
 
@@ -21,8 +23,8 @@ unsafe impl Sync for Bind {}
 unsafe impl DetachSafe for Bind {}
 
 impl Bind {
-  pub(crate) fn new(fd: RawFd, addr: SocketAddr) -> Self {
-    Self { fd, addr: UnsafeCell::new(std_socketaddr_into_libc(addr)) }
+  pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {
+    Self { res, addr: UnsafeCell::new(std_socketaddr_into_libc(addr)) }
   }
 }
 
@@ -42,14 +44,14 @@ impl Operation for Bind {
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Bind::new(
-      Fd(self.fd),
+      Fd(self.res.as_fd().as_raw_fd()),
       self.addr.get().cast(),
       mem::size_of_val(&self.addr) as libc::socklen_t,
     )
     .build()
   }
 
-  fn run_blocking(&self) -> io::Result<i32> {
+  fn run_blocking(&self) -> isize {
     let storage = unsafe { &*self.addr.get() };
     let addrlen = if storage.ss_family == libc::AF_INET as libc::sa_family_t {
       mem::size_of::<libc::sockaddr_in>()
@@ -59,6 +61,10 @@ impl Operation for Bind {
       mem::size_of::<libc::sockaddr_storage>()
     };
 
-    syscall!(bind(self.fd, self.addr.get().cast(), addrlen as libc::socklen_t,))
+    syscall_raw!(bind(
+      self.res.as_fd().as_raw_fd(),
+      self.addr.get().cast(),
+      addrlen as libc::socklen_t,
+    ))
   }
 }

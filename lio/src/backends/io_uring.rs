@@ -42,16 +42,8 @@ pub struct IoUringHandler {
   cq: io_uring::CompletionQueue<'static>,
 }
 pub struct IoUringState {
-  // subm: io_uring::Submitter<'static>,
   _uring: io_uring::IoUring,
 }
-
-//   fn drop(&mut self) {
-//     impl Drop for IoUringState {
-//     // SAFETY: We leaked this pointer in new(), so we need to reclaim it here
-//     // let _ = unsafe { Box::from_raw(self._uring) };
-//   }
-// }
 
 fn into_shared<'a>(ptr: *const ()) -> &'a IoUringState {
   unsafe { &*(ptr as *const IoUringState) }
@@ -126,87 +118,10 @@ impl IoUringHandler {
     for io_entry in &mut self.cq {
       let operation_id = io_entry.user_data();
       let result = io_entry.result();
-      op_c.push(OpCompleted::new(
-        operation_id,
-        if result < 0 {
-          Err(io::Error::from_raw_os_error(-result))
-        } else {
-          Ok(result)
-        },
-      ));
+      // io_uring returns negative errno on error, positive result on success
+      op_c.push(OpCompleted::new(operation_id, result as isize));
     }
 
     Ok(op_c)
   }
 }
-
-// impl IoBackend for IoUring {
-//   fn submit(&self, op: &dyn Operation, id: u64) -> Result<(), SubmitErr> {
-//     // if T::entry_supported(&self.probe) {
-//     // let operation_id = store.next_id();
-//     let entry = op.create_entry().user_data(id);
-//
-//     // Insert the operation into wakers first
-//     // store.insert(id, op);
-//
-//     // Then submit to io_uring
-//     // SAFETY: because of references rules, a "fake" lock has to be implemented here, but because
-//     // of it, this is safe.
-//     let _g = self.submission_guard.lock();
-//     unsafe {
-//       let mut sub = self.inner.submission_shared();
-//       // FIXME
-//       sub.push(&entry).map_err(|_| SubmitErr::Full)?;
-//       sub.sync();
-//       drop(sub);
-//     }
-//     drop(_g);
-//
-//     self.inner.submit()?;
-//     Ok(())
-//     // OperationProgress::<T>::new_store_tracked(operation_id)
-//     // } else {
-//     //   self.polling.submit(op, store)
-//     // }
-//   }
-//
-//   fn notify(&self) {
-//     // Submit a NOP operation to wake up submit_and_wait
-//     // Use a special user_data value (u64::MAX) that won't match any real operation
-//     // Submit a NOP operation to wake up submit_and_wait
-//     // Use a special user_data value that won't match any real operation
-//     let nop_entry = io_uring::opcode::Nop::new().build().user_data(u64::MAX);
-//
-//     let _g = self.submission_guard.lock();
-//     unsafe {
-//       let mut sub = self.inner.submission_shared();
-//       // If queue is full, just skip - the tick will happen soon anyway
-//       let _ = sub.push(&nop_entry);
-//       sub.sync();
-//     }
-//     drop(_g);
-//
-//     // Submit to wake up any blocked submit_and_wait
-//     let _ = self.inner.submit();
-//   }
-//
-//   fn tick(&self, store: &OpStore, can_wait: bool) {
-//     self.polling.tick(store, false);
-//
-//     self.inner.submit_and_wait(if can_wait { 1 } else { 0 }).unwrap();
-//
-//     // SAFETY: lio guarrantees that only one tick impl is running at any time.
-//     for io_entry in unsafe { self.inner.completion_shared() } {
-//       let operation_id = io_entry.user_data();
-//
-//       // If the operation id is not registered (e.g., wake-up NOP), skip.
-//       let exists = store.get_mut(operation_id, |entry| {
-//         entry.set_done(Self::from_i32_to_io_result(io_entry.result()))
-//       });
-//
-//       assert!(exists.is_some());
-//       assert!(store.remove(operation_id));
-//     }
-//     unsafe { self.inner.completion_shared() }.sync();
-//   }
-// }
