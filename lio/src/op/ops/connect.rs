@@ -1,6 +1,6 @@
 use std::cell::UnsafeCell;
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, mem};
 
@@ -9,11 +9,12 @@ use io_uring::types::Fd;
 
 use crate::op::net_utils::std_socketaddr_into_libc;
 use crate::op::{DetachSafe, OpMeta, OperationExt};
+use crate::resource::Resource;
 
 use crate::op::Operation;
 
 pub struct Connect {
-  fd: RawFd,
+  res: Resource,
   addr: UnsafeCell<libc::sockaddr_storage>,
   connect_called: AtomicBool,
 }
@@ -29,9 +30,9 @@ unsafe impl Sync for Connect {}
 unsafe impl DetachSafe for Connect {}
 
 impl Connect {
-  pub(crate) fn new(fd: RawFd, addr: SocketAddr) -> Self {
+  pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {
     Self {
-      fd,
+      res,
       addr: UnsafeCell::new(std_socketaddr_into_libc(addr)),
       connect_called: AtomicBool::new(false),
     }
@@ -64,7 +65,7 @@ impl Operation for Connect {
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Connect::new(
-      Fd(self.fd),
+      Fd(self.res.as_fd().as_raw_fd()),
       self.addr.get().cast(),
       self.get_addrlen(),
     )
@@ -76,31 +77,25 @@ impl Operation for Connect {
   }
 
   fn cap(&self) -> i32 {
-    self.fd
+    self.res.as_fd().as_raw_fd()
   }
 
-  fn run_blocking(&self) -> std::io::Result<i32> {
-    let result =
-      syscall!(connect(self.fd, self.addr.get().cast(), self.get_addrlen()));
+  fn run_blocking(&self) -> isize {
+    let result = unsafe {
+      libc::connect(self.res.as_fd().as_raw_fd(), self.addr.get().cast(), self.get_addrlen())
+    } as isize;
 
     // Track if this is the first connect() call for this operation
     let is_first_call = !self.connect_called.swap(true, Ordering::SeqCst);
 
     // - If this is a subsequent call: connection just completed (success)
     // - If this is the first connect() call: socket was already connected (error)
-    if let Err(Some(errno)) = result.as_ref().map_err(|e| e.raw_os_error()) {
-      if errno == libc::EISCONN {
-        if is_first_call {
-          //   // First connect() returned EISCONN = socket was already connected
-          return Err(std::io::Error::from_raw_os_error(libc::EISCONN));
-        } else {
-          //   // Subsequent connect() returned EISCONN = connection completed
-          return Ok(0);
-        }
-      } else {
-        return result;
-      }
-    };
+    // if result < 0 {
+    if result == -libc::EISCONN as isize && is_first_call {
+      //   // First connect() returned EISCONN = socket was already connected
+      return -libc::EISCONN as isize;
+    }
+
     result
   }
 }

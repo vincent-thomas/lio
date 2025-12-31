@@ -1,4 +1,4 @@
-use std::{io, task::Waker};
+use std::task::Waker;
 
 use crate::{
   op::{Operation, OperationExt},
@@ -46,7 +46,7 @@ impl StoredOp {
   }
 
   /// Caller guarrantees that type 'R' is the same as Box<dyn Operation>::result -> *const R is.
-  pub unsafe fn get_result<R>(&mut self, res: io::Result<i32>) -> R {
+  pub unsafe fn get_result<R>(&mut self, res: isize) -> R {
     let ptr: *mut () = self.op.result(res).cast_mut();
     // SAFETY: Callers responsibility.
     let boxed: Box<R> = unsafe { Box::from_raw(ptr.cast()) };

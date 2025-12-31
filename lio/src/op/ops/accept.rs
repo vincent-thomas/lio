@@ -1,21 +1,25 @@
+#[cfg(unix)]
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
 use std::{
   cell::UnsafeCell,
-  io,
+  io::{self, Error},
   mem::{self},
   net::SocketAddr,
-  os::fd::RawFd,
 };
 
 #[cfg(linux)]
 use io_uring::{opcode, squeue, types::Fd};
 
-use crate::op::{OpMeta, OperationExt, net_utils::libc_socketaddr_into_std};
+use crate::{
+  op::{OpMeta, OperationExt, net_utils::libc_socketaddr_into_std},
+  resource::Resource,
+};
 
 use crate::op::Operation;
 
 // Not detach safe.
 pub struct Accept {
-  fd: RawFd,
+  res: Resource,
   addr: UnsafeCell<libc::sockaddr_storage>,
   len: UnsafeCell<libc::socklen_t>,
 }
@@ -27,10 +31,10 @@ unsafe impl Send for Accept {}
 unsafe impl Sync for Accept {}
 
 impl Accept {
-  pub(crate) fn new(fd: RawFd) -> Self {
+  pub(crate) fn new(res: impl Into<Resource>) -> Self {
     let addr: libc::sockaddr_storage = unsafe { mem::zeroed() };
     Self {
-      fd,
+      res: res.into(),
       addr: UnsafeCell::new(addr),
       len: UnsafeCell::new(mem::size_of_val(&addr) as libc::socklen_t),
     }
@@ -38,14 +42,20 @@ impl Accept {
 }
 
 impl OperationExt for Accept {
-  type Result = io::Result<(RawFd, SocketAddr)>;
+  type Result = io::Result<(Resource, SocketAddr)>;
 }
 
 impl Operation for Accept {
-  impl_result!(|this,
-                res: std::io::Result<i32>|
-   -> io::Result<(RawFd, SocketAddr)> {
-    Ok((res?, libc_socketaddr_into_std(this.addr.get())?))
+  impl_result!(|this, res: isize| -> io::Result<(Resource, SocketAddr)> {
+    let result = if res < 0 {
+      return Err(Error::from_raw_os_error(-res as i32));
+    } else {
+      res as RawFd
+    };
+
+    let res = unsafe { Resource::from_raw_fd(result) };
+
+    Ok((res, libc_socketaddr_into_std(this.addr.get())?))
   });
 
   // #[cfg(linux)]
@@ -54,7 +64,7 @@ impl Operation for Accept {
   #[cfg(linux)]
   fn create_entry(&self) -> squeue::Entry {
     opcode::Accept::new(
-      Fd(self.fd),
+      Fd(self.res.as_fd().as_raw_fd()),
       self.addr.get().cast::<libc::sockaddr>(),
       self.len.get(),
     )
@@ -67,10 +77,10 @@ impl Operation for Accept {
 
   #[cfg(unix)]
   fn cap(&self) -> i32 {
-    self.fd
+    self.res.as_fd().as_raw_fd()
   }
 
-  fn run_blocking(&self) -> std::io::Result<i32> {
+  fn run_blocking(&self) -> isize {
     #[cfg(any(
       target_os = "android",
       target_os = "dragonfly",
@@ -83,12 +93,12 @@ impl Operation for Accept {
       target_os = "cygwin",
     ))]
     let fd = {
-      syscall!(accept4(
-        self.fd,
+      syscall_raw!(accept4(
+        self.res.as_fd().as_raw_fd(),
         self.addr.get() as *mut libc::sockaddr,
         self.len.get() as *mut libc::socklen_t,
         libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK
-      ))?
+      ))
     };
 
     #[cfg(not(any(
@@ -102,26 +112,43 @@ impl Operation for Accept {
       target_os = "openbsd",
       target_os = "cygwin",
     )))]
-    let fd = syscall!(accept(
-      self.fd,
-      self.addr.get() as *mut libc::sockaddr,
-      self.len.get() as *mut libc::socklen_t
-    ))
-    .and_then(|socket| {
-      // Ensure the socket is closed if either of the `fcntl` calls
-      // error below.
-      // let s = unsafe { net::UnixStream::from_raw_fd(socket) };
+    let fd = {
+      let socket = syscall_raw!(accept(
+        self.res.as_fd().as_raw_fd(),
+        self.addr.get() as *mut libc::sockaddr,
+        self.len.get() as *mut libc::socklen_t
+      ));
+
+      if socket < 0 {
+        return socket;
+      }
+
+      // Ensure the socket is closed if either of the `fcntl` calls error below
       #[cfg(not(any(target_os = "espidf", target_os = "vita")))]
-      syscall!(fcntl(socket, libc::F_SETFD, libc::FD_CLOEXEC))?;
+      {
+        let res =
+          syscall_raw!(fcntl(socket as i32, libc::F_SETFD, libc::FD_CLOEXEC));
+        if res < 0 {
+          unsafe { libc::close(socket as i32) };
+          return res;
+        }
+      }
 
       // See https://github.com/tokio-rs/mio/issues/1450
       #[cfg(not(any(target_os = "espidf", target_os = "vita")))]
-      syscall!(fcntl(socket, libc::F_SETFL, libc::O_NONBLOCK))?;
+      {
+        let res =
+          syscall_raw!(fcntl(socket as i32, libc::F_SETFL, libc::O_NONBLOCK));
+        if res < 0 {
+          unsafe { libc::close(socket as i32) };
+          return res;
+        }
+      }
 
-      Ok(socket)
-    })?;
+      socket
+    };
 
-    Ok(fd)
+    fd
   }
 }
 assert_op_max_size!(Accept);

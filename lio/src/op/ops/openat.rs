@@ -1,12 +1,16 @@
-use std::{ffi::CString, os::fd::RawFd};
+use std::{
+  ffi::CString,
+  os::fd::{AsFd, AsRawFd},
+};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
 
 use crate::op::{Operation, OperationExt};
+use crate::resource::Resource;
 
 pub struct OpenAt {
-  fd: RawFd,
+  dir_res: Resource,
   pathname: CString,
   flags: i32,
 }
@@ -14,28 +18,35 @@ pub struct OpenAt {
 assert_op_max_size!(OpenAt);
 
 impl OpenAt {
-  pub(crate) fn new(fd: RawFd, pathname: CString, flags: i32) -> Self {
-    Self { fd, pathname, flags }
+  pub(crate) fn new(dir_res: Resource, pathname: CString, flags: i32) -> Self {
+    Self { dir_res, pathname, flags }
   }
 }
 
 impl OperationExt for OpenAt {
-  type Result = std::io::Result<RawFd>;
+  type Result = std::io::Result<Resource>;
 }
 
 impl Operation for OpenAt {
-  impl_result!(fd);
+  impl_result!(res);
   impl_no_readyness!();
 
   #[cfg(linux)]
   // const OPCODE: u8 = 18;
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::OpenAt::new(Fd(self.fd), self.pathname.as_ptr())
-      .flags(self.flags)
-      .build()
+    io_uring::opcode::OpenAt::new(
+      Fd(self.dir_res.as_fd().as_raw_fd()),
+      self.pathname.as_ptr(),
+    )
+    .flags(self.flags)
+    .build()
   }
-  fn run_blocking(&self) -> std::io::Result<i32> {
-    syscall!(openat(self.fd, self.pathname.as_ptr(), self.flags))
+  fn run_blocking(&self) -> isize {
+    syscall_raw!(openat(
+      self.dir_res.as_fd().as_raw_fd(),
+      self.pathname.as_ptr(),
+      self.flags
+    ))
   }
 }

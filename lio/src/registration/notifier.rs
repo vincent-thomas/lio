@@ -5,7 +5,7 @@ use crate::op::OperationExt;
 use super::Registration;
 
 // Option's is for ownership rules.
-pub enum Notifier {
+pub(crate) enum Notifier {
   Waker(Option<Waker>),
   Callback(OpCallback),
 }
@@ -39,7 +39,7 @@ impl Notifier {
   }
 }
 
-struct OpCallback {
+pub(crate) struct OpCallback {
   callback: *const (),
   call_callback_fn: for<'a> fn(*const (), &'a mut Registration),
 }

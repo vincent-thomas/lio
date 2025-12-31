@@ -19,6 +19,8 @@
 //! }
 //! ```
 
+use crate::blocking_queue::BlockingCoordinator;
+
 /// Result type for operations that return both a result and a buffer.
 ///
 /// This is commonly used for read/write operations where the buffer
@@ -46,10 +48,20 @@ pub trait BufLike: Sealed {
 impl BufLike for Vec<u8> {
   fn buf<'a>(&'a self) -> &'a [u8] {
     let cap = self.capacity();
+
+    // Why capacity?
+    // Because if consumer Vec::pop's, this lowers length, which means
+    // that consumer would manually need to set length everytime.
+    //
+    // SAFETY: Safe as we use Vec::set_len in Self::after
     unsafe { slice::from_raw_parts(self.as_ptr(), cap) }
   }
 
   fn after(mut self, bw: usize) -> Self {
+    // As we use capacity as buffer length, we need to set the valid
+    // length of the vec.
+    //
+    // SAFETY: `bw` is from the kernel of how much it filled up the buffer.
     unsafe { self.set_len(bw) };
     self
   }
@@ -64,6 +76,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crossbeam_queue::ArrayQueue;
+use std::time::Duration;
 
 /// A borrowed buffer from a `BufStore` pool.
 ///
@@ -73,19 +86,20 @@ use crossbeam_queue::ArrayQueue;
 ///
 /// **Make sure to drop**.
 /// Doing any [`std::mem::forget`] will lead to bad things.
-pub struct LentBuf {
+pub struct LentBuf<'a> {
   index: u32,
-  pool: &'static BufStore,
+  pool: &'a BufStore,
 }
 
-// SAFETY: LentBuf just holds an index and reference to 'static data.
+// SAFETY: LentBuf just holds an index and reference to data.
 // The actual buffer access is synchronized via AtomicBool in BufCell.
 // Each LentBuf has exclusive access to its buffer (enforced by in_use flag).
-unsafe impl Send for LentBuf {}
-unsafe impl Sync for LentBuf {}
+unsafe impl<'a> Send for LentBuf<'a> {}
+// SAFETY: ---- :: ----
+unsafe impl<'a> Sync for LentBuf<'a> {}
 
-impl super::BufLike for LentBuf {
-  fn buf<'a>(&'a self) -> &'a [u8] {
+impl<'a> super::BufLike for LentBuf<'a> {
+  fn buf<'b>(&'b self) -> &'b [u8] {
     let cell = &self.pool.buffers[self.index as usize];
     // SAFETY: We have exclusive access via in_use flag
     unsafe { &*cell.buf.get() }
@@ -104,7 +118,7 @@ impl super::BufLike for LentBuf {
   }
 }
 
-impl AsRef<[u8]> for LentBuf {
+impl<'a> AsRef<[u8]> for LentBuf<'a> {
   fn as_ref(&self) -> &[u8] {
     let cell = &self.pool.buffers[self.index as usize];
     let pos = cell.pos.load(Ordering::Acquire);
@@ -114,7 +128,7 @@ impl AsRef<[u8]> for LentBuf {
   }
 }
 
-impl Drop for LentBuf {
+impl<'a> Drop for LentBuf<'a> {
   fn drop(&mut self) {
     let cell = &self.pool.buffers[self.index as usize];
 
@@ -124,33 +138,37 @@ impl Drop for LentBuf {
         // SAFETY: We have exclusive access via in_use flag
         unsafe { &mut *cell.buf.get() },
       );
-      cell.len.store(0, Ordering::Relaxed);
-      cell.pos.store(0, Ordering::Relaxed);
     }
+
+    cell.len.store(0, Ordering::Relaxed);
+    cell.pos.store(0, Ordering::Relaxed);
 
     // Mark buffer as available
     cell.in_use.store(false, Ordering::Release);
 
     // Return index to free list (zero allocations)
     let _ = self.pool.free_list.push(self.index);
+
+    // Notify any waiting threads that a buffer is now available
+    self.pool.blocking.notify_one();
   }
 }
 
-impl<'a> IntoIterator for &'a LentBuf {
+impl<'a, 'b> IntoIterator for &'a LentBuf<'b> {
   type Item = u8;
-  type IntoIter = LentBufIter<'a>;
+  type IntoIter = LentBufIter<'a, 'b>;
 
   fn into_iter(self) -> Self::IntoIter {
     LentBufIter { buf: self, index: 0 }
   }
 }
 
-pub struct LentBufIter<'a> {
-  buf: &'a LentBuf,
+pub struct LentBufIter<'a, 'b> {
+  buf: &'a LentBuf<'b>,
   index: usize,
 }
 
-impl<'a> Iterator for LentBufIter<'a> {
+impl<'a, 'b> Iterator for LentBufIter<'a, 'b> {
   type Item = u8;
   fn next(&mut self) -> Option<Self::Item> {
     let cell = &self.buf.pool.buffers[self.buf.index as usize];
@@ -190,7 +208,7 @@ impl<'a> Iterator for LentBufIter<'a> {
 /// let bytes = buf.copy_to_bytes(4);
 /// ```
 #[cfg(feature = "bytes")]
-impl bytes::Buf for LentBuf {
+impl<'a> bytes::Buf for LentBuf<'a> {
   fn remaining(&self) -> usize {
     let cell = &self.pool.buffers[self.index as usize];
     let pos = cell.pos.load(Ordering::Acquire);
@@ -222,7 +240,7 @@ impl bytes::Buf for LentBuf {
   }
 }
 
-impl LentBuf {
+impl<'a> LentBuf<'a> {
   /// Returns an iterator over `chunk_size` chunks of the buffer.
   ///
   /// The last chunk may be shorter if the buffer length is not evenly divisible.
@@ -230,7 +248,7 @@ impl LentBuf {
   /// # Panics
   ///
   /// Panics if `chunk_size` is 0.
-  pub fn chunks<'a>(&'a self, chunk_size: usize) -> std::slice::Chunks<'a, u8> {
+  pub fn chunks(&self, chunk_size: usize) -> std::slice::Chunks<'_, u8> {
     self.as_ref().chunks(chunk_size)
   }
 
@@ -241,10 +259,7 @@ impl LentBuf {
   /// # Panics
   ///
   /// Panics if `window_size` is 0 or greater than buffer length.
-  pub fn windows<'a>(
-    &'a self,
-    window_size: usize,
-  ) -> std::slice::Windows<'a, u8> {
+  pub fn windows(&self, window_size: usize) -> std::slice::Windows<'_, u8> {
     self.as_ref().windows(window_size)
   }
 }
@@ -303,6 +318,7 @@ impl BufCell {
 pub struct BufStore {
   buffers: Box<[BufCell]>,
   free_list: ArrayQueue<u32>,
+  blocking: BlockingCoordinator,
 }
 
 impl Default for BufStore {
@@ -329,7 +345,11 @@ impl BufStore {
       assert!(free_list.push(i as u32).is_ok());
     }
 
-    Self { buffers: buffers.into_boxed_slice(), free_list }
+    Self {
+      buffers: buffers.into_boxed_slice(),
+      free_list,
+      blocking: BlockingCoordinator::new(),
+    }
   }
 
   /// Tries to borrow a buffer from the pool.
@@ -345,9 +365,44 @@ impl BufStore {
   ///
   /// - `Some(LentBuf)`: A borrowed buffer from the pool
   /// - `None`: All buffers are in use
-  pub fn try_get(&'static self) -> Option<LentBuf> {
+  pub fn try_get(&self) -> Option<LentBuf<'_>> {
     let index = self.free_list.pop()?;
+    Some(self.acquire_buffer(index))
+  }
 
+  /// Blocks until a buffer is available and returns it.
+  ///
+  /// This will wait indefinitely until a buffer becomes available.
+  /// The buffer is automatically returned to the pool when dropped.
+  ///
+  /// # Returns
+  ///
+  /// A borrowed buffer from the pool
+  pub fn get(&self) -> LentBuf<'_> {
+    let index = self.blocking.blocking_pop(|| self.free_list.pop());
+    self.acquire_buffer(index)
+  }
+
+  /// Tries to borrow a buffer with a timeout.
+  ///
+  /// Returns `None` if no buffer becomes available within the timeout period.
+  ///
+  /// # Arguments
+  ///
+  /// * `timeout` - Maximum time to wait for a buffer
+  ///
+  /// # Returns
+  ///
+  /// - `Some(LentBuf)`: A borrowed buffer from the pool
+  /// - `None`: Timeout expired before a buffer became available
+  pub fn get_timeout(&self, timeout: Duration) -> Option<LentBuf<'_>> {
+    let index =
+      self.blocking.blocking_pop_timeout(|| self.free_list.pop(), timeout)?;
+    Some(self.acquire_buffer(index))
+  }
+
+  /// Internal helper to acquire a buffer by index.
+  fn acquire_buffer(&self, index: u32) -> LentBuf<'_> {
     let cell = &self.buffers[index as usize];
     let was_in_use = cell.in_use.swap(true, Ordering::Acquire);
 
@@ -361,7 +416,19 @@ impl BufStore {
     cell.len.store(0, Ordering::Relaxed);
     cell.pos.store(0, Ordering::Relaxed);
 
-    Some(LentBuf { index, pool: self })
+    LentBuf { index, pool: self }
+  }
+
+  /// Returns the total capacity of the buffer pool.
+  pub fn capacity(&self) -> usize {
+    self.free_list.capacity()
+  }
+
+  /// Returns the number of currently available buffers.
+  ///
+  /// Note: This is a snapshot and may be stale immediately.
+  pub fn available(&self) -> usize {
+    self.free_list.len()
   }
 }
 

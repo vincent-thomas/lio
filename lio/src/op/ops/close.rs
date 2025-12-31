@@ -1,23 +1,24 @@
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, AsRawFd};
 
 #[cfg(linux)]
 use io_uring::{opcode, types::Fd};
 
 use crate::op::DetachSafe;
+use crate::resource::Resource;
 
 use crate::op::Operation;
 use crate::op::OperationExt;
 
 pub struct Close {
-  fd: RawFd,
+  res: Resource,
 }
 
 unsafe impl DetachSafe for Close {}
 
 impl Close {
-  pub(crate) fn new(fd: RawFd) -> Self {
-    Self { fd }
+  pub(crate) fn new(res: Resource) -> Self {
+    Self { res }
   }
 }
 
@@ -36,10 +37,10 @@ impl Operation for Close {
 
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
-    opcode::Close::new(Fd(self.fd)).build()
+    opcode::Close::new(Fd(self.res.as_fd().as_raw_fd())).build()
   }
 
-  fn run_blocking(&self) -> std::io::Result<i32> {
-    syscall!(close(self.fd))
+  fn run_blocking(&self) -> isize {
+    syscall_raw!(close(self.res.as_fd().as_raw_fd()))
   }
 }

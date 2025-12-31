@@ -48,28 +48,31 @@
 //! You can consume it in multiple ways:
 //!
 //! ```rust
-//! # use std::os::fd::RawFd;
-//! # lio::init();
-//! # let fd: RawFd = 1;
-//! # let data = b"Hello\n".to_vec();
+//! use lio::resource::Resource;
+//!
+//! lio::init();
+//!
+//! let resource: Resource = 1;
+//! let data = b"Hello\n".to_vec();
+//!
 //! // 1. Async/await (requires async runtime, lio is runtime-independent)
-//! async fn async_example(fd: RawFd, data: Vec<u8>) {
-//!     let (result, buf) = lio::write_with_buf(fd, data, 0).await;
+//! async fn async_example(res: Resource, data: Vec<u8>) {
+//!     let (result, buf) = lio::write_with_buf(res, data, 0).await;
 //!     println!("Wrote {} bytes", result.unwrap());
 //! }
 //!
 //! // 2. Blocking call
-//! let (result, buf) = lio::write_with_buf(fd, data.clone(), 0).blocking();
+//! let (result, buf) = lio::write_with_buf(resource, data.clone(), 0).blocking();
 //!
 //! // 3. Channel-based
-//! let receiver = lio::write_with_buf(fd, data.clone(), 0).send();
+//! let receiver = lio::write_with_buf(resource, data.clone(), 0).send();
 //! let (result, buf) = receiver.recv();
 //!
 //! // 4. Callback-based
-//! lio::write_with_buf(fd, data, 0).when_done(|(result, buf)| {
+//! lio::write_with_buf(resource, data, 0).when_done(|(result, buf)| {
 //!     println!("Operation completed: {:?}", result);
 //! });
-//! # lio::exit();
+//! lio::exit();
 //! ```
 //!
 //! ## Resource Management
@@ -119,8 +122,10 @@
 pub mod buf;
 #[cfg(feature = "unstable_ffi")]
 pub mod ffi;
+pub mod resource;
 mod store;
 use std::{ffi::CString, net::SocketAddr, os::fd::RawFd, time::Duration};
+mod blocking_queue;
 
 pub use buf::BufResult;
 
@@ -139,13 +144,13 @@ mod backends;
 mod worker;
 
 #[cfg_attr(docsrs, doc(hidden))]
-// #[doc(hidden)]
 pub mod test_utils;
 
 use crate::{
   backends::IoDriver,
-  buf::BufLike,
+  buf::{BufLike, BufStore},
   driver::{Driver, TryInitError},
+  resource::Resource,
 };
 
 doc_op! {
@@ -156,8 +161,8 @@ doc_op! {
     ///
     /// Shuts down the read, write, or both halves of this connection.
     /// Read more about how [`Shutdown`] affects this call.
-    pub fn shutdown(res: i32, how: i32) -> Progress<Shutdown> {
-        Progress::from_op(Shutdown::new(res, how))
+    pub fn shutdown(res: impl Into<Resource>, how: i32) -> Progress<Shutdown> {
+        Progress::from_op(Shutdown::new(res.into(), how))
     }
 }
 
@@ -174,8 +179,8 @@ doc_op!(
   syscall: "symlinkat(2)",
   doc_link: "https://man7.org/linux/man-pages/man2/symlink.2.html",
 
-  pub fn symlinkat(new_dir_fd: RawFd, target: CString, linkpath: CString) -> Progress<SymlinkAt> {
-    Progress::from_op(SymlinkAt::new(new_dir_fd, target, linkpath))
+  pub fn symlinkat(dir_res: impl Into<Resource>, target: CString, linkpath: CString) -> Progress<SymlinkAt> {
+    Progress::from_op(SymlinkAt::new(dir_res.into(), target, linkpath))
   }
 );
 
@@ -184,8 +189,8 @@ doc_op!(
   syscall: "linkat(2)",
   doc_link: "https://man7.org/linux/man-pages/man2/linkat.2.html",
 
-  pub fn linkat(old_dir_fd: RawFd,  old_path: CString, new_dir_fd: RawFd, linkpath: CString) -> Progress<LinkAt> {
-    Progress::from_op(LinkAt::new(old_dir_fd, old_path, new_dir_fd, linkpath))
+  pub fn linkat(old_dir_res: impl Into<Resource>, old_path: CString, new_dir_res: impl Into<Resource>, linkpath: CString) -> Progress<LinkAt> {
+    Progress::from_op(LinkAt::new(old_dir_res.into(), old_path, new_dir_res.into(), linkpath))
   }
 );
 
@@ -203,8 +208,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn fsync(fd: RawFd) -> Progress<Fsync> {
-        Progress::from_op(Fsync::new(fd))
+    pub fn fsync(res: impl Into<Resource>) -> Progress<Fsync> {
+        Progress::from_op(Fsync::new(res.into()))
     }
 }
 
@@ -235,11 +240,11 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn write_with_buf<B>(fd: RawFd, buf: B, offset: i64) -> Progress<Write<B>>
+    pub fn write_with_buf<B>(res: impl Into<Resource>, buf: B, offset: i64) -> Progress<Write<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
-        Progress::from_op(Write::new(fd, buf, offset))
+        Progress::from_op(Write::new(res.into(), buf, offset))
     }
 }
 
@@ -248,19 +253,19 @@ doc_op! {
     syscall: "pread(2)",
     doc_link: "https://man7.org/linux/man-pages/man2/pwrite.2.html",
 
-    pub fn read_with_buf<B>(fd: RawFd, mem: B, offset: i64) -> Progress<Read<B>>
+    pub fn read_with_buf<B>(res: impl Into<Resource>, mem: B, offset: i64) -> Progress<Read<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
-        Progress::from_op(Read::new(fd, mem, offset))
+        Progress::from_op(Read::new(res.into(), mem, offset))
     }
 }
 
 doc_op! {
   short: "Shortcut, uses [`lio::read_with_buf`](crate::read_with_buf) with [`LentBuf`](crate::buf::LentBuf) as mem field.",
-  pub fn read(fd: RawFd, offset: i64) -> Progress<Read<crate::buf::LentBuf>> {
+  pub fn read<'a>(res: impl Into<Resource>, offset: i64) -> Progress<Read<crate::buf::LentBuf<'a>>> {
     let buf = Driver::get().try_lend_buf().unwrap();
-    Progress::from_op(Read::new(fd, buf, offset))
+    Progress::from_op(Read::new(res.into(), buf, offset))
   }
 }
 
@@ -278,8 +283,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn truncate(fd: RawFd, len: u64) -> Progress<Truncate> {
-        Progress::from_op(Truncate::new(fd, len))
+    pub fn truncate(res: impl Into<Resource>, len: u64) -> Progress<Truncate> {
+        Progress::from_op(Truncate::new(res.into(), len))
     }
 }
 
@@ -320,8 +325,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn bind(fd: RawFd, addr: SocketAddr) -> Progress<Bind> {
-        Progress::from_op(Bind::new(fd, addr))
+    pub fn bind(resource: impl Into<Resource>, addr: SocketAddr) -> Progress<Bind> {
+        Progress::from_op(Bind::new(resource.into(), addr))
     }
 }
 
@@ -343,8 +348,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn accept(fd: RawFd) -> Progress<Accept> {
-        Progress::from_op(Accept::new(fd))
+    pub fn accept(fd: impl Into<Resource>) -> Progress<Accept> {
+        Progress::from_op(Accept::new(fd.into()))
     }
 }
 
@@ -365,8 +370,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn listen(fd: RawFd, backlog: i32) -> Progress<Listen> {
-        Progress::from_op(Listen::new(fd, backlog))
+    pub fn listen(res: impl Into<Resource>, backlog: i32) -> Progress<Listen> {
+        Progress::from_op(Listen::new(res.into(), backlog))
     }
 }
 
@@ -388,8 +393,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn connect(fd: RawFd, addr: SocketAddr) -> Progress<Connect> {
-        Progress::from_op(Connect::new(fd, addr))
+    pub fn connect(res: impl Into<Resource>, addr: SocketAddr) -> Progress<Connect> {
+        Progress::from_op(Connect::new(res.into(), addr))
     }
 }
 
@@ -409,11 +414,11 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn send_with_buf<B>(fd: RawFd, buf: B, flags: Option<i32>) -> Progress<Send<B>>
+    pub fn send_with_buf<B>(res: impl Into<Resource>, buf: B, flags: Option<i32>) -> Progress<Send<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
-        Progress::from_op(Send::new(fd, buf, flags))
+        Progress::from_op(Send::new(res.into(), buf, flags))
     }
 }
 
@@ -433,9 +438,9 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn recv(fd: RawFd, flags: Option<i32>) -> Progress<Recv<crate::buf::LentBuf>>
+    pub fn recv<'a>(res: impl Into<Resource>, flags: Option<i32>) -> Progress<Recv<crate::buf::LentBuf<'a>>>
     {
-        Progress::from_op(Recv::new(fd, Driver::get().try_lend_buf().unwrap(), flags))
+        Progress::from_op(Recv::new(res.into(), Driver::get().try_lend_buf().unwrap(), flags))
     }
 }
 
@@ -457,11 +462,11 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn recv_with_buf<B>(fd: RawFd, buf: B, flags: Option<i32>) -> Progress<Recv<B>>
+    pub fn recv_with_buf<B>(res: impl Into<Resource>, buf: B, flags: Option<i32>) -> Progress<Recv<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
-        Progress::from_op(Recv::new(fd, buf, flags))
+        Progress::from_op(Recv::new(res.into(), buf, flags))
     }
 }
 
@@ -480,8 +485,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn close(fd: RawFd) -> Progress<Close> {
-        Progress::from_op(Close::new(fd))
+    pub fn close(res: impl Into<Resource>) -> Progress<Close> {
+        Progress::from_op(Close::new(res.into()))
     }
 }
 
@@ -502,8 +507,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn openat(fd: RawFd, path: CString, flags: i32) -> Progress<OpenAt> {
-        Progress::from_op(OpenAt::new(fd, path, flags))
+    pub fn openat(dir_res: impl Into<Resource>, path: CString, flags: i32) -> Progress<OpenAt> {
+        Progress::from_op(OpenAt::new(dir_res.into(), path, flags))
     }
 }
 
@@ -528,8 +533,8 @@ doc_op! {
     /// ```
     #[cfg(linux)]
     #[cfg_attr(docsrs, doc(cfg(linux)))]
-    pub fn tee(fd_in: RawFd, fd_out: RawFd, size: u32) -> Progress<Tee> {
-        Progress::from_op(Tee::new(fd_in, fd_out, size))
+    pub fn tee(res_in: impl Into<Resource>, res_out: impl Into<Resource>, size: u32) -> Progress<Tee> {
+        Progress::from_op(Tee::new(res_in.into(), res_out.into(), size))
     }
 }
 
@@ -570,15 +575,21 @@ pub fn try_init_with_driver<B: IoDriver>() -> Result<(), TryInitError> {
   crate::try_init_with_driver_and_capacity::<B>(1024)
 }
 
-pub fn try_init_with_capacity(cap: usize) -> Result<(), TryInitError> {
-  crate::try_init_with_driver_and_capacity::<Default>(cap)
-}
-
 pub fn try_init_with_driver_and_capacity<D>(
   cap: usize,
 ) -> Result<(), TryInitError>
 where
   D: IoDriver,
 {
-  Driver::try_init_with_driver_and_capacity::<D>(cap)
+  Driver::try_init_with_capacity_and_bufstore::<D>(cap, BufStore::default())
+}
+
+pub fn try_init_with_driver_and_capacity_and_bufstore<D>(
+  cap: usize,
+  buf_store: BufStore,
+) -> Result<(), TryInitError>
+where
+  D: IoDriver,
+{
+  Driver::try_init_with_capacity_and_bufstore::<D>(cap, buf_store)
 }

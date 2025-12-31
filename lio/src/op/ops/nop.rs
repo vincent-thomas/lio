@@ -1,5 +1,4 @@
 use crate::op::{OpMeta, Operation, OperationExt};
-use std::io;
 
 pub struct Nop;
 
@@ -25,7 +24,7 @@ impl Operation for Nop {
   }
 
   #[cfg(unix)]
-  fn run_blocking(&self) -> io::Result<i32> {
-    Ok(0)
+  fn run_blocking(&self) -> isize {
+    0
   }
 }

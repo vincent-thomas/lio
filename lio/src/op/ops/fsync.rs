@@ -1,20 +1,21 @@
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, AsRawFd};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
 
 use crate::op::DetachSafe;
+use crate::resource::Resource;
 
 use crate::op::{Operation, OperationExt};
 
 pub struct Fsync {
-  fd: RawFd,
+  res: Resource,
 }
 assert_op_max_size!(Fsync);
 
 impl Fsync {
-  pub(crate) fn new(fd: RawFd) -> Self {
-    Self { fd }
+  pub(crate) fn new(res: Resource) -> Self {
+    Self { res }
   }
 }
 
@@ -32,10 +33,10 @@ impl Operation for Fsync {
   // const OPCODE: u8 = 3;
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::Fsync::new(Fd(self.fd)).build()
+    io_uring::opcode::Fsync::new(Fd(self.res.as_fd().as_raw_fd())).build()
   }
 
-  fn run_blocking(&self) -> std::io::Result<i32> {
-    syscall!(fsync(self.fd))
+  fn run_blocking(&self) -> isize {
+    syscall_raw!(fsync(self.res.as_fd().as_raw_fd()))
   }
 }

@@ -12,6 +12,9 @@ mod iocp;
 #[cfg(windows)]
 pub use iocp::*;
 
+pub mod blocking;
+#[cfg(test)]
+pub mod dummy;
 pub mod pollingv2;
 // mod polling;
 // pub use polling::*;
@@ -24,6 +27,22 @@ pub enum SubmitErr {
   DriverShutdown,
 }
 
+pub enum SubmitErrExt {
+  NotCompatible(StoredOp),
+  SubmitErr(SubmitErr),
+}
+
+impl std::fmt::Debug for SubmitErrExt {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::NotCompatible(_) => {
+        f.debug_tuple("NotCompatible").field(&"<StoredOp>").finish()
+      }
+      Self::SubmitErr(err) => f.debug_tuple("SubmitErr").field(err).finish(),
+    }
+  }
+}
+
 impl From<io::Error> for SubmitErr {
   fn from(value: io::Error) -> Self {
     Self::Io(value)
@@ -32,11 +51,14 @@ impl From<io::Error> for SubmitErr {
 
 pub struct OpCompleted {
   pub op_id: u64,
-  pub result: io::Result<i32>,
+  /// Result of the operation:
+  /// - >= 0 on success (the result value)
+  /// - < 0 on error (negative errno value)
+  pub result: isize,
 }
 
 impl OpCompleted {
-  pub fn new(op_id: u64, result: io::Result<i32>) -> Self {
+  pub fn new(op_id: u64, result: isize) -> Self {
     Self { op_id, result }
   }
 }
@@ -93,10 +115,15 @@ impl Submitter {
     Self { sub, store, state }
   }
 
-  pub fn submit(&mut self, op: StoredOp) -> Result<u64, SubmitErr> {
+  pub fn submit(&mut self, op: StoredOp) -> Result<u64, SubmitErrExt> {
     self.store.insert_with_try(|id| {
-      self.sub.submit(self.state, id, op.op_ref())?;
-      Ok::<_, SubmitErr>(op)
+      match self.sub.submit(self.state, id, op.op_ref()) {
+        Ok(()) => Ok(op),
+        Err(err) => match err {
+          SubmitErr::NotCompatible => Err(SubmitErrExt::NotCompatible(op)),
+          _ => Err(SubmitErrExt::SubmitErr(err)),
+        },
+      }
     })
   }
 
@@ -124,19 +151,24 @@ impl Handler {
 
   pub fn tick(&mut self) -> io::Result<()> {
     let result = self.io.tick(self.state, &self.store)?;
-    assert!(!result.is_empty());
+    // assert!(!result.is_empty());
+
+    eprintln!("[Handler::tick] Processing {} completed operations", result.len());
 
     for one in result {
-      let _exists = self.store.get_mut(one.op_id, |reg| {
+      eprintln!("[Handler::tick] Setting op_id={} as done with result={}", one.op_id, one.result);
+      let exists = self.store.get_mut(one.op_id, |reg| {
         reg.set_done(one.result);
       });
+      eprintln!("[Handler::tick] Op {} exists in store: {:?}", one.op_id, exists.is_some());
     }
     Ok(())
   }
 
+  #[cfg(test)]
   pub fn try_tick(&mut self) -> io::Result<()> {
     let result = self.io.try_tick(self.state, &self.store)?;
-    assert!(!result.is_empty());
+    // assert!(!result.is_empty());
 
     for one in result {
       let _exists = self.store.get_mut(one.op_id, |reg| {
@@ -147,56 +179,3 @@ impl Handler {
     Ok(())
   }
 }
-
-// /// Trait defining the interface for I/O operation execution backends.
-// ///
-// /// Backends handle the lifecycle of operations from submission through completion,
-// /// managing resources and notifying the driver when operations finish.
-// ///
-// /// # Contract
-// ///
-// /// Implementations must:
-// /// - Eventually complete all submitted operations
-// /// - Have operation state synced with [OpStore].
-// /// - Deliver notifications to wakers or callbacks when operations complete
-// pub trait IoBackend: Send + Sync {
-//   /// Processes completed operations and advances the backend's internal state.
-//   ///
-//   /// `store` is the operation store containing all submitted operations.
-//   ///  This method is only allowed to block/wait-for-completion if `can_block`
-//   ///  is `true`.
-//   ///
-//   /// # Contract
-//   ///
-//   /// For each completed operation, implementations must:
-//   /// 1. Retrieve the operation result
-//   /// 2. Call `OpStore::get_mut()` to mark it as done via `set_done()`
-//   /// 3. Handle any extracted notifications (wakers or callbacks)
-//   /// 4. Clean up backend-specific resources
-//   fn tick(&self, store: &OpStore, can_wait: bool);
-//
-//   /// Submits an operation to the backend for execution.
-//   ///
-//   /// `op` is the operation to execute and `store` is the operation store where
-//   /// in-progress operations are tracked.
-//   ///
-//   /// # Returns
-//   ///
-//   /// Returns an `OperationProgress` indicating how the operation will be handled.
-//   ///
-//   /// # Contract
-//   ///
-//   /// Implementations must:
-//   /// - Either complete the operation immediately or arrange for it to complete asynchronously
-//   /// - If completing asynchronously, insert the operation into the `OpStore` with a unique ID
-//   /// - Return an appropriate `OperationProgress` matching the chosen completion path
-//   fn submit(&self, op: &dyn Operation, id: u64) -> Result<(), SubmitErr>;
-//
-//   /// Wakes up a potentially blocking `tick()` call.
-//   ///
-//   /// # Contract
-//   ///
-//   /// Implementations must cause any concurrent `tick()` call with `can_wait = true`
-//   /// to return, even if no operations have completed.
-//   fn notify(&self);
-// }

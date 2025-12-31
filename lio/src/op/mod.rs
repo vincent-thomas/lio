@@ -4,7 +4,6 @@ mod ops;
 mod progress;
 pub use ops::*;
 pub use progress::*;
-use std::io;
 use std::ops::BitOr;
 
 trait Sealed {}
@@ -19,8 +18,10 @@ pub unsafe trait DetachSafe: Sealed {}
 pub trait Operation: Sealed + Sync + std::marker::Send {
   // type Result;
   /// This is guarranteed to fire after this has completed and only fire ONCE.
-  /// i32 is guarranteed to be >= 0.
-  fn result(&mut self, _ret: io::Result<i32>) -> *const ();
+  /// Returns:
+  /// - >= 0 on success (the result value)
+  /// - < 0 on error (negative errno value)
+  fn result(&mut self, _ret: isize) -> *const ();
 
   // #[cfg(linux)]
   // const OPCODE: u8;
@@ -50,7 +51,11 @@ pub trait Operation: Sealed + Sync + std::marker::Send {
     }
   }
 
-  fn run_blocking(&self) -> io::Result<i32>;
+  /// Run the operation synchronously in blocking mode.
+  /// Returns:
+  /// - >= 0 on success (the result value)
+  /// - < 0 on error (negative errno value)
+  fn run_blocking(&self) -> isize;
 }
 
 pub trait OperationExt: Operation {

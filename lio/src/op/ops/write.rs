@@ -2,21 +2,19 @@ use crate::{
   BufResult,
   buf::BufLike,
   op::{Operation, OperationExt},
+  resource::Resource,
 };
 
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-use std::{
-  io::{self},
-  os::fd::RawFd,
-};
+use std::os::fd::{AsFd, AsRawFd};
 
 pub struct Write<B>
 where
   B: Send + Sync,
 {
-  fd: RawFd,
+  res: Resource,
   buf: Option<B>,
   offset: i64,
 }
@@ -27,8 +25,8 @@ impl<B> Write<B>
 where
   B: Send + Sync,
 {
-  pub(crate) fn new(fd: RawFd, buf: B, offset: i64) -> Write<B> {
-    Self { fd, buf: Some(buf), offset }
+  pub(crate) fn new(res: Resource, buf: B, offset: i64) -> Write<B> {
+    Self { res, buf: Some(buf), offset }
   }
 }
 
@@ -43,10 +41,16 @@ impl<B> Operation for Write<B>
 where
   B: BufLike + Send + Sync,
 {
-  impl_result!(|this, res: io::Result<i32>| -> BufResult<i32, B> {
-    let buf = this.buf.take().expect("ran Recv::result more than once.");
-    let out = buf.after(*res.as_ref().unwrap_or(&0) as usize);
-    (res, out)
+  impl_result!(|this, res: isize| -> BufResult<i32, B> {
+    let buf = this.buf.take().expect("ran Write::result more than once.");
+    let bytes_written = if res < 0 { 0 } else { res as usize };
+    let out = buf.after(bytes_written);
+    let result = if res < 0 {
+      Err(std::io::Error::from_raw_os_error((-res) as i32))
+    } else {
+      Ok(res as i32)
+    };
+    (result, out)
   });
 
   impl_no_readyness!();
@@ -59,44 +63,32 @@ where
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
     assert!(len <= u32::MAX as usize);
-    io_uring::opcode::Write::new(Fd(self.fd), ptr.cast_mut(), len as u32)
+    io_uring::opcode::Write::new(Fd(self.res.as_fd().as_raw_fd()), ptr.cast_mut(), len as u32)
       .offset(self.offset as u64)
       .build()
   }
 
-  fn run_blocking(&self) -> std::io::Result<i32> {
+  fn run_blocking(&self) -> isize {
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
 
     // For non-seekable fds (pipes, sockets, char devices) with offset -1,
     // use write() instead of pwrite()
-    // Try pwrite first
-    let result =
-      syscall!(pwrite(self.fd, ptr.cast::<libc::c_void>(), len, self.offset))
-        .map(|i| i as i32);
+    let result = syscall_raw!(pwrite(self.res.as_fd().as_raw_fd(), ptr.cast::<libc::c_void>(), len, self.offset));
 
-    if self.offset == -1 {
-      // If pwrite fails with EINVAL (InvalidInput) or ESPIPE (NotSeekable),
-      // fall back to write() for non-seekable fds
-      if let Err(ref err) = result {
-        // I have no idea but InvalidInput is keeping this from
-        // killing the process.
-        if err.kind() == io::ErrorKind::InvalidInput
-          || err.kind() == io::ErrorKind::NotSeekable
-        {
-          return syscall!(write(
-            self.fd,
-            ptr.cast::<libc::c_void>() as *const _,
-            len,
-          ))
-          .map(|out| out as i32);
-        }
+    if self.offset == -1 && result < 0 {
+      // If pwrite fails with EINVAL or ESPIPE, fall back to write() for non-seekable fds
+      let errno = (-result) as i32;
+      if errno == libc::EINVAL || errno == libc::ESPIPE {
+        return syscall_raw!(write(
+          self.res.as_fd().as_raw_fd(),
+          ptr.cast::<libc::c_void>() as *const _,
+          len,
+        ));
       }
-
-      return result.map(|out| out as i32);
-    } else {
-      result
     }
+
+    result
   }
 }

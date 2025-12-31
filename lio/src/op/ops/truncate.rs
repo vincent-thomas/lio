@@ -1,12 +1,13 @@
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, AsRawFd};
 
 #[cfg(linux)]
 use io_uring::{opcode, squeue, types::Fd};
 
 use crate::op::{DetachSafe, Operation, OperationExt};
+use crate::resource::Resource;
 
 pub struct Truncate {
-  fd: RawFd,
+  res: Resource,
   size: u64,
 }
 
@@ -15,8 +16,8 @@ assert_op_max_size!(Truncate);
 unsafe impl DetachSafe for Truncate {}
 
 impl Truncate {
-  pub(crate) fn new(fd: RawFd, size: u64) -> Self {
-    Self { fd, size }
+  pub(crate) fn new(res: Resource, size: u64) -> Self {
+    Self { res, size }
   }
 }
 
@@ -32,10 +33,10 @@ impl Operation for Truncate {
   // const OPCODE: u8 = 55;
   #[cfg(linux)]
   fn create_entry(&self) -> squeue::Entry {
-    opcode::Ftruncate::new(Fd(self.fd), self.size).build()
+    opcode::Ftruncate::new(Fd(self.res.as_fd().as_raw_fd()), self.size).build()
   }
 
-  fn run_blocking(&self) -> std::io::Result<i32> {
-    syscall!(ftruncate(self.fd, self.size as i64))
+  fn run_blocking(&self) -> isize {
+    syscall_raw!(ftruncate(self.res.as_fd().as_raw_fd(), self.size as i64))
   }
 }

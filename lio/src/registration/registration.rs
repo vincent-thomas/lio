@@ -1,4 +1,4 @@
-use std::{io, mem};
+use std::mem;
 
 mod notifier;
 mod stored;
@@ -19,7 +19,7 @@ unsafe impl Send for Registration {}
 #[repr(u8)]
 enum Status {
   Waiting,
-  Done { ret: Option<io::Result<i32>> },
+  Done { ret: Option<isize> },
 }
 
 impl Registration {
@@ -40,7 +40,7 @@ impl Registration {
   }
 
   // TODO: Way to remove
-  pub fn set_done(&mut self, res: io::Result<i32>) {
+  pub fn set_done(&mut self, res: isize) {
     match mem::replace(&mut self.status, Status::Done { ret: Some(res) }) {
       Status::Waiting => {
         let noti = self.stored.take_notifier();
@@ -52,7 +52,7 @@ impl Registration {
     }
   }
 
-  pub fn run_blocking(&self) -> io::Result<i32> {
+  pub fn run_blocking(&self) -> isize {
     self.stored.op_ref().run_blocking()
   }
 

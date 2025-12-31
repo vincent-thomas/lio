@@ -27,7 +27,7 @@ mod util;
 pub(crate) mod tests;
 
 use std::collections::HashMap;
-use std::io::{self, ErrorKind};
+use std::io;
 use std::os::fd::RawFd;
 use std::slice;
 use std::time::Duration;
@@ -342,31 +342,33 @@ impl PollerHandle {
         .get_mut(operation_id, |entry| entry.run_blocking())
         .expect("couldn't find entry");
 
-      match result {
-        // Special-case.
-        Err(err)
-          if err.kind() == ErrorKind::WouldBlock
-            || err.raw_os_error() == Some(libc::EINPROGRESS) =>
+      // Check for EAGAIN/EINPROGRESS (would block)
+      if result < 0 {
+        let errno = (-result) as i32;
+        if errno == libc::EAGAIN
+          || errno == libc::EWOULDBLOCK
+          || errno == libc::EINPROGRESS
         {
           state.sys.modify(entry_fd, operation_id, event.interest)?;
-
           continue;
         }
-        _ => {
-          // Clean up - use delete_timer for timer events, delete for fd-based events
-          if event.interest.is_timer() {
-            state.sys.delete_timer(operation_id)?;
-          } else {
-            state.sys.delete(entry_fd)?;
-          }
-          self.fd_map.remove(&operation_id);
+      }
 
-          completed.push(OpCompleted::new(operation_id, result));
-
-          // let exists = store.get_mut(operation_id, |reg| reg.set_done(result));
-          // assert!(exists.is_some(), "Cannot find matching operation");
-          // assert!(store.remove(operation_id));
+      // Operation completed (success or error other than would-block)
+      {
+        // Clean up - use delete_timer for timer events, delete for fd-based events
+        if event.interest.is_timer() {
+          state.sys.delete_timer(operation_id)?;
+        } else {
+          state.sys.delete(entry_fd)?;
         }
+        self.fd_map.remove(&operation_id);
+
+        completed.push(OpCompleted::new(operation_id, result));
+
+        // let exists = store.get_mut(operation_id, |reg| reg.set_done(result));
+        // assert!(exists.is_some(), "Cannot find matching operation");
+        // assert!(store.remove(operation_id));
       };
     }
 
@@ -446,10 +448,7 @@ impl IoSubmitter for PollerSubmitter {
 
     let result = op.run_blocking();
 
-    if result
-      .as_ref()
-      .is_err_and(|err| err.raw_os_error() == Some(libc::EINPROGRESS))
-    {
+    if result == libc::EINPROGRESS as isize {
       self.new_polling(into_shared(state), id, op)
     } else {
       panic!("Not sure what todo here");

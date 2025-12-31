@@ -164,21 +164,91 @@ macro_rules! syscall {
   }};
 }
 
+/// Raw syscall wrapper with early return on error.
+///
+/// Returns the syscall result as `isize` on success, or returns early with `-errno`.
+/// Works with the `?` operator by implementing a custom `Try` conversion.
+///
+/// # Returns
+///
+/// - On success: Continues execution with result as `isize` (>= 0)
+/// - On error: Returns `-errno` from the enclosing function
+///
+/// # Platform-specific behavior
+///
+/// - Unix: Returns `-errno` on error
+/// - Windows: Returns `-GetLastError()` on error
+///
+/// # Example
+///
+/// ```ignore
+/// fn do_io(fd: i32) -> isize {
+///     // Chain multiple syscalls - returns -errno on first error
+///     let n = syscall_raw!(read(fd, buf.as_mut_ptr() as *mut libc::c_void, len));
+///     let m = syscall_raw!(write(fd, data.as_ptr() as *const libc::c_void, data.len()));
+///     n + m  // Returns sum if all succeed
+/// }
+///
+/// let result = do_io(fd);
+/// if result < 0 {
+///     let errno = -result;
+///     eprintln!("Error: errno {}", errno);
+/// }
+/// ```
+macro_rules! syscall_raw {
+  ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
+      #[allow(unused_unsafe)]
+      let res = unsafe { libc::$fn($($arg, )*) };
+      if res == -1 {
+          // Return negative errno - this will cause early return from function
+          #[cfg(target_os = "linux")]
+          {
+              let errno = unsafe { *libc::__errno_location() };
+              return -(errno as isize);
+          }
+          #[cfg(target_os = "macos")]
+          {
+              let errno = unsafe { *libc::__error() };
+              return -(errno as isize);
+          }
+          #[cfg(target_os = "freebsd")]
+          {
+              let errno = unsafe { *libc::__error() };
+              return -(errno as isize);
+          }
+          #[cfg(windows)]
+          {
+              let last_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+              return -(last_error as isize);
+          }
+      }
+      res as isize
+  }};
+}
+
 macro_rules! impl_result {
   (()) => {
-      impl_result!(|_this, res: std::io::Result<i32>| -> std::io::Result<()> {
-        res.map(drop)
+      impl_result!(|_this, res: isize| -> std::io::Result<()> {
+        if res < 0 {
+          Err(std::io::Error::from_raw_os_error((-res) as i32))
+        } else {
+          Ok(())
+        }
       });
   };
 
-  (fd) => {
-    impl_result!(|_this, res: std::io::Result<i32>| -> std::io::Result<i32> {
-      res
+  (res) => {
+    impl_result!(|_this, res: isize| -> std::io::Result<crate::resource::Resource> {
+      if res < 0 {
+        Err(std::io::Error::from_raw_os_error((-res) as i32))
+      } else {
+        Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(res as i32) })
+      }
     });
   };
 
   (|$this:ident, $res:ident: $res_ty:ty| -> $ret_ty:ty { $($body:tt)* }) => {
-    fn result(&mut self, res: std::io::Result<i32>) -> *const () {
+    fn result(&mut self, res: isize) -> *const () {
       let __impl_result = |$this: &mut Self, $res: $res_ty| -> $ret_ty { $($body)* };
       Box::into_raw(Box::new(__impl_result(self, res))) as *const ()
     }
@@ -194,8 +264,9 @@ macro_rules! impl_no_readyness {
   };
 }
 
+#[cfg(test)]
 pub(crate) mod __internal {
-  pub const MAX_OP_SIZE: usize = 136;
+  pub const MAX_OP_SIZE: usize = 144;
 }
 
 macro_rules! assert_op_max_size {

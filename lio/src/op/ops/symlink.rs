@@ -1,12 +1,13 @@
-use std::{ffi::CString, os::fd::RawFd};
+use std::{ffi::CString, os::fd::{AsFd, AsRawFd}};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
 
 use crate::op::{Operation, OperationExt};
+use crate::resource::Resource;
 
 pub struct SymlinkAt {
-  fd: RawFd,
+  dir_res: Resource,
   target: CString,
   linkpath: CString,
 }
@@ -18,11 +19,11 @@ assert_op_max_size!(SymlinkAt);
 // TODO: test
 impl SymlinkAt {
   pub(crate) fn new(
-    new_dir_fd: RawFd,
+    dir_res: Resource,
     target: CString,
     linkpath: CString,
   ) -> Self {
-    Self { fd: new_dir_fd, target, linkpath }
+    Self { dir_res, target, linkpath }
   }
 }
 
@@ -39,14 +40,18 @@ impl Operation for SymlinkAt {
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::SymlinkAt::new(
-      Fd(self.fd),
+      Fd(self.dir_res.as_fd().as_raw_fd()),
       self.target.as_ptr(),
       self.linkpath.as_ptr(),
     )
     .build()
   }
 
-  fn run_blocking(&self) -> std::io::Result<i32> {
-    syscall!(symlinkat(self.target.as_ptr(), self.fd, self.linkpath.as_ptr()))
+  fn run_blocking(&self) -> isize {
+    syscall_raw!(symlinkat(
+      self.target.as_ptr(),
+      self.dir_res.as_fd().as_raw_fd(),
+      self.linkpath.as_ptr()
+    ))
   }
 }

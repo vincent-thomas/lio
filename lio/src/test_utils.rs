@@ -3,22 +3,21 @@
 //! This module provides helper functions for creating sockets using lio's
 //! async operations. Only available when building tests.
 
-use crate::{op::Progress, socket};
-use std::os::fd::RawFd;
+use crate::{op::Progress, resource::Resource, socket};
 
 /// Creates a Unix stream socket using lio operations (blocking).
 ///
-/// Returns the file descriptor which must be closed by the caller using `lio::close()`.
+/// Returns the Resource which must be closed by the caller using `lio::close()`.
 #[doc(hidden)]
-pub fn unix_stream_socket() -> RawFd {
+pub fn unix_stream_socket() -> Resource {
   socket(libc::AF_UNIX, libc::SOCK_STREAM, 0).blocking().unwrap()
 }
 
 /// Creates a Unix datagram socket using lio operations (blocking).
 ///
-/// Returns the file descriptor which must be closed by the caller using `lio::close()`.
+/// Returns the Resource which must be closed by the caller using `lio::close()`.
 #[doc(hidden)]
-pub fn unix_dgram_socket() -> RawFd {
+pub fn unix_dgram_socket() -> Resource {
   socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0).blocking().unwrap()
 }
 
