@@ -1,4 +1,4 @@
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 
 #[cfg(linux)]
 use io_uring::types::Fd;
@@ -21,7 +21,10 @@ where
   flags: i32,
 }
 
-unsafe impl<B> DetachSafe for Send<B> where B: BufLike + std::marker::Send + std::marker::Sync {}
+unsafe impl<B> DetachSafe for Send<B> where
+  B: BufLike + std::marker::Send + std::marker::Sync
+{
+}
 
 impl<B> Send<B>
 where
@@ -64,7 +67,7 @@ where
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
-    io_uring::opcode::Send::new(Fd(self.res.as_fd().as_raw_fd()), ptr, len as u32)
+    io_uring::opcode::Send::new(Fd(self.res.as_raw_fd()), ptr, len as u32)
       .flags(self.flags)
       .build()
   }
@@ -74,13 +77,13 @@ where
   }
   #[cfg(unix)]
   fn cap(&self) -> i32 {
-    self.res.as_fd().as_raw_fd()
+    self.res.as_raw_fd()
   }
 
   fn run_blocking(&self) -> isize {
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
-    syscall_raw!(send(self.res.as_fd().as_raw_fd(), ptr as *mut _, len, self.flags))
+    syscall_raw!(send(self.res.as_raw_fd(), ptr as *mut _, len, self.flags))
   }
 }

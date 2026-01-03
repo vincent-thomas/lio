@@ -1,4 +1,4 @@
-use std::{ffi::CString, os::fd::{AsFd, AsRawFd}};
+use std::{ffi::CString, os::fd::AsRawFd};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
@@ -44,9 +44,9 @@ impl Operation for LinkAt {
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::LinkAt::new(
-      Fd(self.old_dir_res.as_fd().as_raw_fd()),
+      Fd(self.old_dir_res.as_raw_fd()),
       self.old_path.as_ptr(),
-      Fd(self.new_dir_res.as_fd().as_raw_fd()),
+      Fd(self.new_dir_res.as_raw_fd()),
       self.new_path.as_ptr(),
     )
     .build()
@@ -54,9 +54,9 @@ impl Operation for LinkAt {
 
   fn run_blocking(&self) -> isize {
     syscall_raw!(linkat(
-      self.old_dir_res.as_fd().as_raw_fd(),
+      self.old_dir_res.as_raw_fd(),
       self.old_path.as_ptr(),
-      self.new_dir_res.as_fd().as_raw_fd(),
+      self.new_dir_res.as_raw_fd(),
       self.new_path.as_ptr(),
       0
     ))

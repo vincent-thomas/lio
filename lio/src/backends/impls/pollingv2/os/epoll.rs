@@ -1,5 +1,5 @@
-use super::super::notifier::{NOTIFY_KEY, Notifier};
 use super::super::{Interest, ReadinessPoll};
+use super::NOTIFY_KEY;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 use std::{io, ptr};
@@ -7,7 +7,7 @@ use std::{io, ptr};
 /// Wrapper around an epoll file descriptor
 pub struct OsPoller {
   epoll_fd: OwnedFd,
-  /// Notifier for waking up blocked epoll_wait
+  // /// Notifier for waking up blocked epoll_wait
   notifier: Notifier,
 }
 
@@ -20,7 +20,7 @@ impl OsPoller {
       OwnedFd::from_raw_fd(fd)
     };
 
-    // Create notifier (uses pipe for portability)
+    // // Create notifier (uses pipe for portability)
     let notifier = Notifier::new()?;
 
     let epoll = Self { epoll_fd, notifier };
@@ -129,6 +129,7 @@ impl ReadinessPoll for OsPoller {
     Err(io::Error::from_raw_os_error(libc::ENOENT))
   }
 
+  /// Returns [`libc::EINVAL`] if events.is_empty()
   fn wait(
     &self,
     events: &mut [Self::NativeEvent],
@@ -142,6 +143,8 @@ impl ReadinessPoll for OsPoller {
       }
       None => -1,
     };
+
+    println!("timeout {timeout_ms}");
 
     assert!(timeout_ms >= -1, "timeout_ms must be >= -1, got {}", timeout_ms);
 
@@ -185,9 +188,45 @@ impl ReadinessPoll for OsPoller {
   }
 }
 
+pub struct Notifier {
+  /// Read end of the pipe
+  read_fd: OwnedFd,
+  /// Write end of the pipe
+  write_fd: OwnedFd,
+}
+
+impl Notifier {
+  pub fn new() -> io::Result<Self> {
+    let mut fds = [0i32; 2];
+    syscall!(pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK))?;
+
+    Ok(Self {
+      read_fd: unsafe { OwnedFd::from_raw_fd(fds[0]) },
+      write_fd: unsafe { OwnedFd::from_raw_fd(fds[1]) },
+    })
+  }
+
+  pub fn read_fd(&self) -> Option<RawFd> {
+    Some(self.read_fd.as_raw_fd())
+  }
+
+  pub fn notify(&self) -> io::Result<()> {
+    let byte: u8 = 1;
+    let result = syscall!(write(
+      self.write_fd.as_raw_fd(),
+      &byte as *const u8 as *const libc::c_void,
+      1,
+    ));
+
+    match result {
+      Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
+      other => other.map(|_| ()),
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
-
   crate::generate_tests!(OsPoller::new().unwrap());
 }

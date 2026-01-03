@@ -13,7 +13,7 @@ mod socket;
 
 mod fsync;
 mod linkat;
-pub mod nop;
+mod nop;
 mod shutdown;
 mod symlink;
 #[cfg(linux)]
@@ -21,6 +21,7 @@ mod tee;
 mod timeout;
 mod truncate;
 mod write;
+mod write_at;
 
 pub use accept::*;
 pub use bind::*;
@@ -44,3 +45,4 @@ pub use tee::*;
 
 pub use truncate::*;
 pub use write::*;
+pub use write_at::*;

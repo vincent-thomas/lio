@@ -1,5 +1,5 @@
-use lio::truncate;
-use std::{ffi::CString, sync::mpsc};
+use lio::{resource::Resource, truncate};
+use std::{ffi::CString, os::fd::FromRawFd, sync::mpsc};
 
 #[test]
 fn test_truncate_shrink_file() {
@@ -22,7 +22,7 @@ fn test_truncate_shrink_file() {
   let sender1 = sender.clone();
 
   // Truncate to 5 bytes
-  truncate(fd, 5).when_done(move |res| {
+  truncate(unsafe { Resource::from_raw_fd(fd) }, 5).when_done(move |res| {
     sender1.send(res).unwrap();
   });
 
@@ -70,7 +70,7 @@ fn test_truncate_extend_file() {
   let sender1 = sender.clone();
 
   // Extend to 20 bytes
-  truncate(fd, 20).when_done(move |res| {
+  truncate(unsafe { Resource::from_raw_fd(fd) },20).when_done(move |res| {
     sender1.send(res).unwrap();
   });
 
@@ -119,7 +119,7 @@ fn test_truncate_to_zero() {
   let sender1 = sender.clone();
 
   // Truncate to 0 bytes
-  truncate(fd, 0).when_done(move |res| {
+  truncate(unsafe { Resource::from_raw_fd(fd) },0).when_done(move |res| {
     sender1.send(res).unwrap();
   });
 
@@ -168,7 +168,7 @@ fn test_truncate_same_size() {
   let sender1 = sender.clone();
 
   // Truncate to same size
-  truncate(fd, test_data.len() as u64).when_done(move |res| {
+  truncate(unsafe { Resource::from_raw_fd(fd) },test_data.len() as u64).when_done(move |res| {
     sender1.send(res).unwrap();
   });
 
@@ -216,7 +216,7 @@ fn test_truncate_then_write() {
   let sender1 = sender.clone();
 
   // Truncate to 5 bytes
-  truncate(fd, 5).when_done(move |res| {
+  truncate(unsafe { Resource::from_raw_fd(fd) }, 5).when_done(move |res| {
     sender1.send(res).unwrap();
   });
 
@@ -270,7 +270,7 @@ fn test_truncate_large_file() {
   let sender1 = sender.clone();
 
   // Truncate to 1KB
-  truncate(fd, 1024).when_done(move |res| {
+  truncate(unsafe { Resource::from_raw_fd(fd) },1024).when_done(move |res| {
     sender1.send(res).unwrap();
   });
 
@@ -319,7 +319,7 @@ fn test_truncate_multiple_times() {
 
   // Truncate multiple times
   let sender1 = sender.clone();
-  truncate(fd, 8).when_done(move |res| {
+  truncate(unsafe { Resource::from_raw_fd(fd) },8).when_done(move |res| {
     sender1.send(res).unwrap();
   });
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -327,7 +327,7 @@ fn test_truncate_multiple_times() {
   receiver.recv().unwrap().expect("First truncate failed");
 
   let sender2 = sender.clone();
-  truncate(fd, 5).when_done(move |res| {
+  truncate(unsafe { Resource::from_raw_fd(fd) }, 5).when_done(move |res| {
     sender2.send(res).unwrap();
   });
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -335,7 +335,7 @@ fn test_truncate_multiple_times() {
   receiver.recv().unwrap().expect("Second truncate failed");
 
   let sender3 = sender.clone();
-  truncate(fd, 10).when_done(move |res| {
+  truncate(unsafe { Resource::from_raw_fd(fd) },10).when_done(move |res| {
     sender3.send(res).unwrap();
   });
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -343,7 +343,7 @@ fn test_truncate_multiple_times() {
   receiver.recv().unwrap().expect("Third truncate failed");
 
   let sender4 = sender.clone();
-  truncate(fd, 3).when_done(move |res| {
+  truncate(unsafe { Resource::from_raw_fd(fd) },3).when_done(move |res| {
     sender4.send(res).unwrap();
   });
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -390,7 +390,7 @@ fn test_truncate_concurrent() {
     let (sender, receiver) = mpsc::channel();
     let sender1 = sender.clone();
 
-    truncate(fd, 5).when_done(move |res| {
+    truncate(unsafe { Resource::from_raw_fd(fd) }, 5).when_done(move |res| {
       sender1.send(res).unwrap();
     });
 

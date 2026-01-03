@@ -1,25 +1,20 @@
-// #[test]
-// fn test_driver() {
-//   lio::init();
-//   // Note: Removed lio::exit() to prevent shutting down the shared Driver
-//   // during parallel test execution
-// }
-
 #[test]
 fn test_worker_start_stop() {
-  use std::time::Duration;
+  use lio::resource::Resource;
+  use std::{os::fd::FromRawFd, time::Duration};
 
-  let _ = lio::try_init();
-
-  std::thread::sleep(Duration::from_millis(100));
+  let _ = lio::try_init_with_driver::<lio::backends::Poller>();
 
   let thing = "hello".as_bytes().to_vec();
 
-  let send = lio::write_with_buf(2, thing, -1).send();
+  let (res, _buf) =
+    lio::write_with_buf(unsafe { Resource::from_raw_fd(2) }, thing)
+      .send()
+      .recv_timeout(Duration::from_millis(1))
+      .unwrap();
 
-  let (res, _buf) = send.recv();
+  // panic!();
 
   assert_eq!(res.unwrap(), 5);
-
   lio::exit();
 }

@@ -5,14 +5,10 @@
 //! in the submitter thread, with results collected by the handler thread.
 
 use std::io;
-use std::sync::Arc;
-
-use crossbeam_queue::SegQueue;
 
 use crate::backends::{
   IoDriver, IoHandler, IoSubmitter, OpCompleted, SubmitErr,
 };
-use crate::blocking_queue::BlockingCoordinator;
 use crate::op::Operation;
 use crate::store::OpStore;
 
@@ -23,28 +19,30 @@ struct PendingOp {
 }
 
 /// Shared state between submitter and handler
-pub(crate) struct BlockingState {
-  completed: SegQueue<PendingOp>,
-  coordinator: BlockingCoordinator,
-}
+pub(crate) struct BlockingState {}
 
 pub struct BlockingSubmitter {
-  state: Arc<BlockingState>,
+  completed_tx: crossbeam_channel::Sender<SubmitMsg>,
 }
 
 pub struct BlockingHandler {
-  state: Arc<BlockingState>,
+  completed_rx: crossbeam_channel::Receiver<SubmitMsg>,
+}
+
+pub enum SubmitMsg {
+  Op(PendingOp),
+  Notify,
 }
 
 impl BlockingSubmitter {
-  pub fn new(state: Arc<BlockingState>) -> Self {
-    Self { state }
+  pub fn new(state: crossbeam_channel::Sender<SubmitMsg>) -> Self {
+    Self { completed_tx: state }
   }
 }
 
 impl BlockingHandler {
-  pub fn new(state: Arc<BlockingState>) -> Self {
-    Self { state }
+  pub fn new(state: crossbeam_channel::Receiver<SubmitMsg>) -> Self {
+    Self { completed_rx: state }
   }
 }
 
@@ -59,25 +57,22 @@ impl IoSubmitter for BlockingSubmitter {
     // Execute the operation immediately in the submitter thread
     let result = op.run_blocking();
 
-    eprintln!("[BlockingSubmitter::submit] Operation id={} completed with result={}", id, result);
+    eprintln!(
+      "[BlockingSubmitter::submit] Operation id={} completed with result={}",
+      id, result
+    );
 
     // Store the result for the handler to pick up
-    self.state.completed.push(PendingOp { id, result });
-
-    eprintln!("[BlockingSubmitter::submit] Pushed to completed queue, notifying handler");
-
-    // Notify the handler that a new result is available
-    self.state.coordinator.notify_one();
-
-    eprintln!("[BlockingSubmitter::submit] Handler notified");
+    self.completed_tx.send(SubmitMsg::Op(PendingOp { id, result })).unwrap();
 
     Ok(())
   }
 
   fn notify(&mut self, _state: *const ()) -> Result<(), SubmitErr> {
-    // Wake up the handler in case it's waiting
-    self.state.coordinator.notify_one();
-    Ok(())
+    self
+      .completed_tx
+      .send(SubmitMsg::Notify)
+      .map_err(|_| SubmitErr::DriverShutdown)
   }
 }
 
@@ -87,23 +82,26 @@ impl IoHandler for BlockingHandler {
     _state: *const (),
     _store: &OpStore,
   ) -> io::Result<Vec<OpCompleted>> {
-    eprintln!("[BlockingHandler::tick] Waiting for operations...");
-    // Wait for at least one operation to complete
-    let first =
-      self.state.coordinator.blocking_pop(|| self.state.completed.pop());
+    let mut vec = Vec::new();
+    let first = self.completed_rx.recv().map_err(|_| {
+      io::Error::new(io::ErrorKind::BrokenPipe, "channel disconnected")
+    })?;
 
-    eprintln!("[BlockingHandler::tick] Got first operation: id={}, result={}", first.id, first.result);
+    vec.push(first);
 
-    let mut completed = vec![OpCompleted::new(first.id, first.result)];
-
-    // Collect any additional completed operations without blocking
-    while let Some(pending) = self.state.completed.pop() {
-      eprintln!("[BlockingHandler::tick] Got additional operation: id={}, result={}", pending.id, pending.result);
-      completed.push(OpCompleted::new(pending.id, pending.result));
+    while let Ok(pending) = self.completed_rx.try_recv() {
+      vec.push(pending);
     }
 
-    eprintln!("[BlockingHandler::tick] Returning {} completed operations", completed.len());
-    Ok(completed)
+    let result = vec
+      .into_iter()
+      .filter_map(|x| match x {
+        SubmitMsg::Op(op) => Some(OpCompleted::new(op.id, op.result)),
+        SubmitMsg::Notify => None,
+      })
+      .collect();
+
+    Ok(result)
   }
 
   fn try_tick(
@@ -114,8 +112,13 @@ impl IoHandler for BlockingHandler {
     // Non-blocking: collect all available operations
     let mut completed = Vec::new();
 
-    while let Some(pending) = self.state.completed.pop() {
-      completed.push(OpCompleted::new(pending.id, pending.result));
+    while let Ok(pending) = self.completed_rx.try_recv() {
+      match pending {
+        SubmitMsg::Notify => {}
+        SubmitMsg::Op(op) => {
+          completed.push(OpCompleted::new(op.id, op.result));
+        }
+      };
     }
 
     Ok(completed)
@@ -129,38 +132,26 @@ impl IoDriver for BlockingBackend {
   type Handler = BlockingHandler;
 
   fn new_state() -> io::Result<*const ()> {
-    let state = Arc::new(BlockingState {
-      completed: SegQueue::new(),
-      coordinator: BlockingCoordinator::new(),
-    });
-
-    Ok(Arc::into_raw(state) as *const ())
+    Ok(std::ptr::null())
   }
 
   fn drop_state(state: *const ()) {
-    let _ = unsafe { Arc::from_raw(state as *const BlockingState) };
+    assert!(state.is_null());
   }
 
-  fn new(state: *const ()) -> io::Result<(Self::Submitter, Self::Handler)> {
-    // Reconstruct Arc temporarily to clone it
-    let state_arc = unsafe { Arc::from_raw(state as *const BlockingState) };
-    let state_clone = Arc::clone(&state_arc);
-    // Prevent dropping the original
-    let _ = Arc::into_raw(state_arc);
-
-    Ok((
-      BlockingSubmitter::new(state_clone.clone()),
-      BlockingHandler::new(state_clone),
-    ))
+  fn new(_: *const ()) -> io::Result<(Self::Submitter, Self::Handler)> {
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Ok((BlockingSubmitter::new(sender), BlockingHandler::new(receiver)))
   }
 }
+
+#[cfg(test)]
+test_io_driver!(BlockingBackend);
 
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::op::nop::Nop;
-  use std::sync::Arc;
-  use std::thread;
   use std::time::{Duration, Instant};
 
   // #[test]

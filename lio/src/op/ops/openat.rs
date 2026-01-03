@@ -1,7 +1,4 @@
-use std::{
-  ffi::CString,
-  os::fd::{AsFd, AsRawFd},
-};
+use std::{ffi::CString, os::fd::AsRawFd};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
@@ -36,7 +33,7 @@ impl Operation for OpenAt {
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::OpenAt::new(
-      Fd(self.dir_res.as_fd().as_raw_fd()),
+      Fd(self.dir_res.as_raw_fd()),
       self.pathname.as_ptr(),
     )
     .flags(self.flags)
@@ -44,7 +41,7 @@ impl Operation for OpenAt {
   }
   fn run_blocking(&self) -> isize {
     syscall_raw!(openat(
-      self.dir_res.as_fd().as_raw_fd(),
+      self.dir_res.as_raw_fd(),
       self.pathname.as_ptr(),
       self.flags
     ))

@@ -24,7 +24,7 @@ impl Notifier {
   pub fn set_waker(&mut self, waker: Waker) -> bool {
     match self {
       Self::Waker(old) => {
-        let _ = std::mem::replace(old, Some(waker));
+        let _ = old.replace(waker);
         true
       }
       Self::Callback(_) => false,

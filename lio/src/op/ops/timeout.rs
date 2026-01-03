@@ -1,6 +1,6 @@
 use crate::op::{DetachSafe, OpMeta};
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::time::Duration;
 use std::{io::Error, os::fd::RawFd};
 
@@ -8,6 +8,7 @@ use std::{io::Error, os::fd::RawFd};
 use io_uring::{opcode, squeue, types::Timespec};
 
 use crate::op::{Operation, OperationExt};
+#[cfg(linux)]
 use crate::resource::Resource;
 
 pub struct Timeout {
@@ -127,7 +128,7 @@ impl Operation for Timeout {
   fn cap(&self) -> RawFd {
     #[cfg(linux)]
     {
-      self.timer_res.as_fd().as_raw_fd()
+      self.timer_res.as_raw_fd()
     }
     #[cfg(kqueue)]
     {
@@ -142,7 +143,7 @@ impl Operation for Timeout {
       // When the timer expires, read from the timerfd to clear it
       let mut buf = [0u8; 8];
       syscall_raw!(read(
-        self.timer_res.as_fd().as_raw_fd(),
+        self.timer_res.as_raw_fd(),
         buf.as_mut_ptr() as *mut libc::c_void,
         8
       ));

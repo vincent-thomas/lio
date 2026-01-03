@@ -1,6 +1,7 @@
-use lio::close;
+use lio::{close, resource::Resource};
 use std::{
   ffi::CString,
+  os::fd::FromRawFd,
   sync::mpsc::{self, TryRecvError},
 };
 
@@ -25,7 +26,8 @@ fn test_close_basic() {
   let sender1 = sender.clone();
 
   // Close it
-  close(fd).send_with(sender1.clone());
+  let resource = unsafe { Resource::from_raw_fd(fd) };
+  close(resource).send_with(sender1.clone());
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -76,7 +78,7 @@ fn test_close_after_read() {
   let sender1 = sender.clone();
 
   // Close it
-  close(fd).when_done(move |t| {
+  close(unsafe { Resource::from_raw_fd(fd) }).when_done(move |t| {
     sender1.send(t).unwrap();
   });
 
@@ -118,7 +120,7 @@ fn test_close_after_write() {
   let sender1 = sender.clone();
 
   // Close it
-  close(fd).when_done(move |t| {
+  close(unsafe { Resource::from_raw_fd(fd) }).when_done(move |t| {
     sender1.send(t).unwrap();
   });
 
@@ -156,7 +158,7 @@ fn test_close_socket() {
   let sender1 = sender.clone();
 
   // Close it
-  close(sock_fd).when_done(move |t| {
+  close(unsafe { Resource::from_raw_fd(sock_fd) }).when_done(move |t| {
     sender1.send(t).unwrap();
   });
 
@@ -197,7 +199,7 @@ fn test_close_invalid_fd() {
   let sender1 = sender.clone();
 
   // Close it
-  close(-1).when_done(move |t| {
+  close(unsafe { Resource::from_raw_fd(-1) }).when_done(move |t| {
     sender1.send(t).unwrap();
   });
 
@@ -228,7 +230,7 @@ fn test_close_already_closed() {
   let sender1 = sender.clone();
 
   // Close it once
-  close(fd).when_done(move |t| {
+  close(unsafe { Resource::from_raw_fd(fd) }).when_done(move |t| {
     sender1.send(t).unwrap();
   });
 
@@ -242,7 +244,7 @@ fn test_close_already_closed() {
   let sender3 = sender2.clone();
 
   // Try to close again - should fail
-  close(fd).when_done(move |t| {
+  close(unsafe { Resource::from_raw_fd(fd) }).when_done(move |t| {
     sender3.send(t).unwrap();
   });
 
@@ -286,7 +288,7 @@ fn test_close_concurrent() {
 
   for (fd, _) in &fds {
     let sender_clone = sender.clone();
-    close(*fd).when_done(move |t| {
+    close(unsafe { Resource::from_raw_fd(*fd) }).when_done(move |t| {
       sender_clone.send(t).unwrap();
     });
   }
@@ -325,11 +327,11 @@ fn test_close_pipe() {
   let sender2 = sender.clone();
 
   // Close both ends
-  close(write_fd).when_done(move |t| {
+  close(unsafe { Resource::from_raw_fd(write_fd) }).when_done(move |t| {
     sender1.send(t).unwrap();
   });
 
-  close(read_fd).when_done(move |t| {
+  close(unsafe { Resource::from_raw_fd(read_fd) }).when_done(move |t| {
     sender2.send(t).unwrap();
   });
 

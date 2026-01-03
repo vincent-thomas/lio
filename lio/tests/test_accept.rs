@@ -1,5 +1,5 @@
 use lio::{accept, bind, connect, listen};
-use std::{mem::MaybeUninit, net::SocketAddr, sync::mpsc};
+use std::{mem::MaybeUninit, net::SocketAddr, os::fd::{AsFd, AsRawFd}, sync::mpsc};
 
 #[test]
 #[ignore = "flaky network test"]
@@ -18,7 +18,7 @@ fn test_accept_basic() {
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  let mut recv = bind(server_sock, addr).send();
+  let mut recv = bind(&server_sock, addr).send();
 
   // assert!(recv.try_recv().is_none());
   lio::tick();
@@ -30,7 +30,7 @@ fn test_accept_basic() {
     let mut addr_len =
       std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     libc::getsockname(
-      server_sock,
+      server_sock.as_fd().as_raw_fd(),
       addr_storage.as_mut_ptr() as *mut libc::sockaddr,
       &mut addr_len,
     );
@@ -39,7 +39,7 @@ fn test_accept_basic() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  let mut recv = listen(server_sock, 128).send();
+  let mut recv = listen(&server_sock, 128).send();
 
   // assert!(recv.try_recv().is_none());
 
@@ -61,8 +61,8 @@ fn test_accept_basic() {
     .expect("socket didn't finish after tick")
     .expect("failed socket syscall");
 
-  let mut connect_recv = connect(client_sock, bound_addr).send();
-  let mut accept_recv = accept(server_sock).send();
+  let mut connect_recv = connect(&client_sock, bound_addr).send();
+  let mut accept_recv = accept(&server_sock).send();
 
   println!("nice");
   // assert!(connect_recv.try_recv().is_none());
@@ -78,13 +78,13 @@ fn test_accept_basic() {
     .expect("accept syscall didn't return after a tick");
   // .expect("accept syscall failed");
 
-  assert!(accepted_fd >= 0, "Accepted fd should be valid");
+  assert!(accepted_fd.as_fd().as_raw_fd() >= 0, "Accepted fd should be valid");
 
   // Cleanup
   unsafe {
-    libc::close(accepted_fd);
-    libc::close(server_sock);
-    libc::close(client_sock);
+    libc::close(accepted_fd.as_fd().as_raw_fd());
+    libc::close(server_sock.as_fd().as_raw_fd());
+    libc::close(client_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -110,7 +110,7 @@ fn test_accept_multiple() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(server_sock, addr).when_done(move |res| {
+  bind(&server_sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -124,7 +124,7 @@ fn test_accept_multiple() {
     let mut addr_len =
       std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     libc::getsockname(
-      server_sock,
+      server_sock.as_fd().as_raw_fd(),
       addr_storage.as_mut_ptr() as *mut libc::sockaddr,
       &mut addr_len,
     );
@@ -134,7 +134,7 @@ fn test_accept_multiple() {
   };
 
   let sender_l = sender_unit.clone();
-  listen(server_sock, 128).when_done(move |res| {
+  listen(&server_sock, 128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -153,7 +153,7 @@ fn test_accept_multiple() {
     let (sender_c, receiver_c) = mpsc::channel();
 
     // Accept connection
-    accept(server_sock).when_done(move |res| {
+    accept(&server_sock).when_done(move |res| {
       sender_a.send(res).unwrap();
     });
 
@@ -168,7 +168,7 @@ fn test_accept_multiple() {
     let client_sock =
       receiver_s.recv().unwrap().expect("Failed to create client socket");
 
-    connect(client_sock, bound_addr).when_done(move |res| {
+    connect(&client_sock, bound_addr).when_done(move |res| {
       sender_c.send(res).unwrap();
     });
 
@@ -204,12 +204,12 @@ fn test_accept_multiple() {
   // Cleanup
   unsafe {
     for fd in accepted_fds {
-      libc::close(fd);
+      libc::close(fd.as_fd().as_raw_fd());
     }
     for fd in client_fds {
-      libc::close(fd);
+      libc::close(fd.as_fd().as_raw_fd());
     }
-    libc::close(server_sock);
+    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -234,7 +234,7 @@ fn test_accept_with_client_info() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(server_sock, addr).when_done(move |res| {
+  bind(&server_sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -248,7 +248,7 @@ fn test_accept_with_client_info() {
     let mut addr_len =
       std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     libc::getsockname(
-      server_sock,
+      server_sock.as_fd().as_raw_fd(),
       addr_storage.as_mut_ptr() as *mut libc::sockaddr,
       &mut addr_len,
     );
@@ -258,7 +258,7 @@ fn test_accept_with_client_info() {
   };
 
   let sender_l = sender_unit.clone();
-  listen(server_sock, 128).when_done(move |res| {
+  listen(&server_sock, 128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -271,7 +271,7 @@ fn test_accept_with_client_info() {
   let (sender_s, receiver_s) = mpsc::channel();
   let (sender_c, receiver_c) = mpsc::channel();
 
-  accept(server_sock).when_done(move |res| {
+  accept(&server_sock).when_done(move |res| {
     sender_a.send(res).unwrap();
   });
 
@@ -285,7 +285,7 @@ fn test_accept_with_client_info() {
   let client_sock =
     receiver_s.recv().unwrap().expect("Failed to create client socket");
 
-  connect(client_sock, bound_addr).when_done(move |res| {
+  connect(&client_sock, bound_addr).when_done(move |res| {
     sender_c.send(res).unwrap();
   });
 
@@ -312,9 +312,9 @@ fn test_accept_with_client_info() {
 
   // Cleanup
   unsafe {
-    libc::close(client_sock);
-    libc::close(accepted_fd);
-    libc::close(server_sock);
+    libc::close(client_sock.as_fd().as_raw_fd());
+    libc::close(accepted_fd.as_fd().as_raw_fd());
+    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -339,7 +339,7 @@ fn test_accept_ipv6() {
   let addr: SocketAddr = "[::1]:0".parse().unwrap();
 
   // let sender_b = sender_unit.clone();
-  let mut bind_recv = bind(server_sock, addr).send();
+  let mut bind_recv = bind(&server_sock, addr).send();
 
   // assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -354,7 +354,7 @@ fn test_accept_ipv6() {
     let mut addr_len =
       std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
     libc::getsockname(
-      server_sock,
+      server_sock.as_fd().as_raw_fd(),
       addr_storage.as_mut_ptr() as *mut libc::sockaddr,
       &mut addr_len,
     );
@@ -363,7 +363,7 @@ fn test_accept_ipv6() {
     format!("[::1]:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  let mut listen_recv = listen(server_sock, 128).send();
+  let mut listen_recv = listen(&server_sock, 128).send();
 
   // assert_eq!(receiver_unit.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -373,7 +373,7 @@ fn test_accept_ipv6() {
     .expect("listen didn't complete")
     .expect("Failed to listen");
 
-  let mut accept_recv = accept(server_sock).send();
+  let mut accept_recv = accept(&server_sock).send();
 
   let mut client_s_recv = lio::test_utils::tcp6_socket().send();
 
@@ -385,7 +385,7 @@ fn test_accept_ipv6() {
     .unwrap()
     .expect("Failed to create IPv6 client socket");
 
-  let mut connect_recv = connect(client_sock, bound_addr).send();
+  let mut connect_recv = connect(&client_sock, bound_addr).send();
 
   // assert_eq!(receiver_c.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -403,13 +403,13 @@ fn test_accept_ipv6() {
     .expect("accept didn't finish")
     .expect("Failed to accept IPv6");
 
-  assert!(accepted_fd >= 0);
+  assert!(accepted_fd.as_fd().as_raw_fd() >= 0);
 
   // Cleanup
   unsafe {
-    libc::close(client_sock);
-    libc::close(accepted_fd);
-    libc::close(server_sock);
+    libc::close(client_sock.as_fd().as_raw_fd());
+    libc::close(accepted_fd.as_fd().as_raw_fd());
+    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -428,7 +428,7 @@ fn test_accept_concurrent() {
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  let mut bind_recv = bind(server_sock, addr).send();
+  let mut bind_recv = bind(&server_sock, addr).send();
 
   // assert_eq!(bind_recv.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -440,7 +440,7 @@ fn test_accept_concurrent() {
     let mut addr_len =
       std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     libc::getsockname(
-      server_sock,
+      server_sock.as_fd().as_raw_fd(),
       addr_storage.as_mut_ptr() as *mut libc::sockaddr,
       &mut addr_len,
     );
@@ -449,7 +449,7 @@ fn test_accept_concurrent() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  let mut listen_recv = listen(server_sock, 128).send();
+  let mut listen_recv = listen(&server_sock, 128).send();
 
   // assert_eq!(listen_recv.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -459,15 +459,14 @@ fn test_accept_concurrent() {
   let mut accept_queue = Vec::new();
   // Queue up all accepts
   for _ in 0..3 {
-    accept_queue.push(accept(server_sock).send());
+    accept_queue.push(accept(&server_sock).send());
   }
 
   let mut all_sockets = Vec::new();
 
   // Queue up all socket creations
   for _ in 0..3 {
-    all_sockets
-      .push(lio::test_utils::tcp_socket().send());
+    all_sockets.push(lio::test_utils::tcp_socket().send());
   }
 
   lio::tick();
@@ -483,7 +482,7 @@ fn test_accept_concurrent() {
   let mut connect_recvs = Vec::new();
 
   // Connect all clients
-  for &client_sock in &client_fds {
+  for client_sock in &client_fds {
     let connect_fd = connect(client_sock, bound_addr).send();
     connect_recvs.push(connect_fd);
   }
@@ -509,11 +508,11 @@ fn test_accept_concurrent() {
   // Cleanup
   unsafe {
     for fd in accepted_fds {
-      libc::close(fd);
+      libc::close(fd.as_fd().as_raw_fd());
     }
     for fd in client_fds {
-      libc::close(fd);
+      libc::close(fd.as_fd().as_raw_fd());
     }
-    libc::close(server_sock);
+    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }

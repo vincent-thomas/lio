@@ -1,4 +1,4 @@
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 
 #[cfg(linux)]
 use io_uring::types::Fd;
@@ -63,9 +63,13 @@ where
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
-    io_uring::opcode::Recv::new(Fd(self.res.as_fd().as_raw_fd()), ptr.cast_mut(), len as u32)
-      .flags(self.flags)
-      .build()
+    io_uring::opcode::Recv::new(
+      Fd(self.res.as_raw_fd()),
+      ptr.cast_mut(),
+      len as u32,
+    )
+    .flags(self.flags)
+    .build()
   }
 
   fn meta(&self) -> OpMeta {
@@ -74,13 +78,13 @@ where
 
   #[cfg(unix)]
   fn cap(&self) -> i32 {
-    self.res.as_fd().as_raw_fd()
+    self.res.as_raw_fd()
   }
 
   fn run_blocking(&self) -> isize {
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
-    syscall_raw!(recv(self.res.as_fd().as_raw_fd(), ptr as *mut _, len, self.flags))
+    syscall_raw!(recv(self.res.as_raw_fd(), ptr as *mut _, len, self.flags))
   }
 }

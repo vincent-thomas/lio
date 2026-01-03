@@ -1,4 +1,4 @@
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 
 #[cfg(linux)]
 use io_uring::{opcode, squeue, types::Fd};
@@ -33,10 +33,10 @@ impl Operation for Truncate {
   // const OPCODE: u8 = 55;
   #[cfg(linux)]
   fn create_entry(&self) -> squeue::Entry {
-    opcode::Ftruncate::new(Fd(self.res.as_fd().as_raw_fd()), self.size).build()
+    opcode::Ftruncate::new(Fd(self.res.as_raw_fd()), self.size).build()
   }
 
   fn run_blocking(&self) -> isize {
-    syscall_raw!(ftruncate(self.res.as_fd().as_raw_fd(), self.size as i64))
+    syscall_raw!(ftruncate(self.res.as_raw_fd(), self.size as i64))
   }
 }

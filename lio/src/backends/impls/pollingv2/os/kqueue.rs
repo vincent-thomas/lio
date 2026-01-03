@@ -1,7 +1,8 @@
+use super::{
+  super::{Interest, ReadinessPoll},
+  NOTIFY_KEY,
+};
 use scc::HashSet;
-
-use crate::backends::pollingv2::notifier::{NOTIFY_KEY, Notifier};
-use crate::backends::pollingv2::{Interest, ReadinessPoll, util};
 
 // use dashmap::DashSet;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -19,22 +20,16 @@ pub struct OsPoller {
   registered_fds: HashSet<RawFd>,
   /// Track registered timer keys separately (timers don't have fds)
   registered_timers: HashSet<u64>,
-  /// Notifier for waking up blocked kevent
-  notifier: Notifier,
 }
 
 impl OsPoller {
   /// Create a new kqueue instance
   pub fn new() -> io::Result<Self> {
-    // Create notifier
-    let notifier = Notifier::new()?;
-
     // Create kqueue
     let kqueue = Self {
       kq_fd: unsafe { OwnedFd::from_raw_fd(syscall!(kqueue())?) },
       registered_fds: HashSet::new(),
       registered_timers: HashSet::new(),
-      notifier,
     };
 
     // Register EVFILT_USER for notifications
@@ -166,7 +161,7 @@ impl OsPoller {
     ));
 
     match result {
-      Err(err) if !util::is_not_found_error(&err) => Err(err),
+      Err(err) if !utils::is_not_found_error(&err) => Err(err),
       _ => Ok(()),
     }
   }
@@ -191,7 +186,6 @@ impl ReadinessPoll for OsPoller {
       }
     } else {
       // Check if fd is already registered (match epoll's EEXIST behavior)
-      // DashSet::insert returns true if the value was newly inserted
       if self.registered_fds.insert_sync(fd).is_err() {
         // Value already existed
         return Err(io::Error::from_raw_os_error(libc::EEXIST));
@@ -222,7 +216,6 @@ impl ReadinessPoll for OsPoller {
 
   fn modify(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
     if interest.is_timer() {
-      // For timers, check if key is registered
       if !self.registered_timers.contains_sync(&key) {
         return Err(io::Error::from_raw_os_error(libc::ENOENT));
       }
@@ -247,7 +240,7 @@ impl ReadinessPoll for OsPoller {
 
   fn delete(&self, fd: RawFd) -> io::Result<()> {
     // Check if fd is registered, fail with ENOENT if not
-    if !self.registered_fds.remove_sync(&fd).is_some() {
+    if self.registered_fds.remove_sync(&fd).is_none() {
       return Err(io::Error::from_raw_os_error(libc::ENOENT));
     }
 
@@ -267,9 +260,9 @@ impl ReadinessPoll for OsPoller {
       (Ok(()), _) | (_, Ok(())) => Ok(()),
       (Err(read_err), Err(write_err)) => {
         // Both failed - check if either is a real error (not ENOENT)
-        if !util::is_not_found_error(&read_err) {
+        if !utils::is_not_found_error(&read_err) {
           Err(read_err)
-        } else if !util::is_not_found_error(&write_err) {
+        } else if !utils::is_not_found_error(&write_err) {
           Err(write_err)
         } else {
           // Both were ENOENT - this shouldn't happen since fd was in registered_fds
@@ -306,7 +299,7 @@ impl ReadinessPoll for OsPoller {
     ));
 
     match result {
-      Err(err) if !util::is_not_found_error(&err) => Err(err),
+      Err(err) if !utils::is_not_found_error(&err) => Err(err),
       _ => Ok(()),
     }
   }
@@ -317,7 +310,7 @@ impl ReadinessPoll for OsPoller {
     timeout: Option<Duration>,
   ) -> io::Result<usize> {
     // Convert timeout and create pointer from storage reference
-    let timeout_storage = util::timeout_to_timespec(timeout);
+    let timeout_storage = utils::timeout_to_timespec(timeout);
     let timeout_ptr = timeout_storage
       .as_ref()
       .map_or(std::ptr::null(), |ts| ts as *const libc::timespec);
@@ -385,4 +378,88 @@ mod tests {
   use super::*;
 
   crate::generate_tests!(OsPoller::new().unwrap());
+}
+
+mod utils {
+  use std::io;
+  use std::time::Duration;
+
+  /// Convert Duration to libc::timespec
+  ///
+  /// Shared between kqueue and epoll implementations
+  pub fn duration_to_timespec(duration: Duration) -> libc::timespec {
+    libc::timespec {
+      tv_sec: duration.as_secs() as libc::time_t,
+      tv_nsec: duration.subsec_nanos() as libc::c_long,
+    }
+  }
+
+  /// Convert Option<Duration> to timespec storage
+  ///
+  /// Returns the timespec value that must be kept alive for the duration of the syscall.
+  /// The caller should create a pointer from a reference to this storage.
+  pub fn timeout_to_timespec(
+    timeout: Option<Duration>,
+  ) -> Option<libc::timespec> {
+    timeout.map(duration_to_timespec)
+  }
+
+  /// Check if an error is "not found" (ENOENT)
+  ///
+  /// Used when deleting non-existent fd interests - should not error
+  pub fn is_not_found_error(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ENOENT)
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use super::*;
+
+    #[test]
+    fn test_duration_to_timespec() {
+      let dur = Duration::from_millis(1500);
+      let ts = duration_to_timespec(dur);
+      assert_eq!(ts.tv_sec, 1);
+      assert_eq!(ts.tv_nsec, 500_000_000);
+    }
+
+    #[test]
+    fn test_timeout_to_timespec_some() {
+      let dur = Duration::from_millis(2500);
+      let timeout = Some(dur);
+      let storage = timeout_to_timespec(timeout);
+
+      // Verify storage contains the correct value
+      assert!(storage.is_some());
+      let ts = storage.unwrap();
+      assert_eq!(ts.tv_sec, 2);
+      assert_eq!(ts.tv_nsec, 500_000_000);
+
+      // Verify that creating a pointer from storage is valid
+      // This mimics what the caller should do
+      let ptr = &ts as *const libc::timespec;
+      assert!(!ptr.is_null());
+
+      // Verify the pointer points to valid data
+      unsafe {
+        assert_eq!((*ptr).tv_sec, 2);
+        assert_eq!((*ptr).tv_nsec, 500_000_000);
+      }
+    }
+
+    #[test]
+    fn test_timeout_to_timespec_none() {
+      let storage = timeout_to_timespec(None);
+      assert!(storage.is_none());
+    }
+
+    #[test]
+    fn test_is_not_found_error() {
+      let err = io::Error::from_raw_os_error(libc::ENOENT);
+      assert!(is_not_found_error(&err));
+
+      let err = io::Error::from_raw_os_error(libc::EINVAL);
+      assert!(!is_not_found_error(&err));
+    }
+  }
 }

@@ -4,14 +4,14 @@
 //! - **Submitter thread**: Receives operations via channel, submits them to the backend
 //! - **Handler thread**: Polls for completions, processes results, invokes callbacks/wakers
 
-use crate::backends::{Handler, SubmitErr, SubmitErrExt, Submitter};
+use crate::backends::{Handler, SubmitErr, Submitter};
 use crate::registration::StoredOp;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::{self, JoinHandle};
 
 /// Message sent to the submitter thread
 pub enum SubmitMsg {
-  Submit { op: StoredOp, response_tx: SyncSender<Result<u64, SubmitErrExt>> },
+  Submit { op: StoredOp, response_tx: SyncSender<Result<u64, SubmitErr>> },
   Shutdown,
 }
 
@@ -51,17 +51,15 @@ impl Worker {
   }
 
   /// Submit an operation (blocks until submitter thread processes it and returns result)
-  pub fn submit(&self, op: StoredOp) -> Result<u64, SubmitErrExt> {
+  pub fn submit(&self, op: StoredOp) -> Result<u64, SubmitErr> {
     let (response_tx, response_rx) = mpsc::sync_channel(1);
 
     if self.submit_tx.send(SubmitMsg::Submit { op, response_tx }).is_err() {
-      return Err(SubmitErrExt::SubmitErr(SubmitErr::DriverShutdown));
+      return Err(SubmitErr::DriverShutdown);
     }
 
     // Wait for submitter thread to process and respond
-    response_rx
-      .recv()
-      .unwrap_or(Err(SubmitErrExt::SubmitErr(SubmitErr::DriverShutdown)))
+    response_rx.recv().unwrap_or(Err(SubmitErr::DriverShutdown))
   }
 
   /// Submitter thread loop
@@ -69,14 +67,21 @@ impl Worker {
     loop {
       match rx.recv() {
         Ok(SubmitMsg::Submit { op, response_tx }) => {
+          println!("took submit");
           // Submit to backend and send result back
           let result = submitter.submit(op);
+          // Notify handler thread to wake up from blocking tick() and process the operation
+          // let _ = submitter.notify();
           let _ = response_tx.send(result); // Ignore if receiver dropped
         }
-        Ok(SubmitMsg::Shutdown) | Err(_) => {
+        Ok(SubmitMsg::Shutdown) => {
           let _ = submitter.notify();
+          println!("shutting down submitter");
           // Channel closed or shutdown requested
           break;
+        }
+        Err(_) => {
+          panic!("lio error: invalid shutdown logic");
         }
       }
     }
@@ -117,19 +122,18 @@ impl Worker {
 
   /// Shutdown the worker threads gracefully
   pub fn shutdown(&mut self) {
+    // Signal handler to shutdown
+    if let Some(tx) = self.shutdown_tx.take() {
+      tx.send(()).unwrap();
+    }
     // Signal submitter to shutdown
     let _ = self.submit_tx.send(SubmitMsg::Shutdown);
 
-    // Signal handler to shutdown
-    if let Some(tx) = self.shutdown_tx.take() {
-      let _ = tx.send(());
-    }
-
-    // Wait for threads to finish
+    // // Wait for threads to finish
     if let Some(handle) = self.submitter_thread.take() {
       let _ = handle.join();
     }
-
+    //
     if let Some(handle) = self.handler_thread.take() {
       let _ = handle.join();
     }
@@ -146,7 +150,7 @@ impl Drop for Worker {
 mod tests {
   use super::*;
   use crate::{
-    backends::{IoDriver, dummy::DummyDriver},
+    backends::{DummyDriver, IoDriver},
     op::nop::Nop,
     registration::StoredOp,
     store::OpStore,
@@ -181,13 +185,45 @@ mod tests {
   fn test_worker_basic_submit() {
     let (worker, _store) = setup_worker();
 
-    let op = StoredOp::new_waker(Nop);
+    let (sender, recv) = mpsc::channel();
+
+    let op = StoredOp::new_callback(Box::new(Nop), |_| {
+      sender.send(()).unwrap();
+    });
     let result = worker.submit(op);
 
-    assert!(result.is_ok(), "Submit should succeed");
+    let _id = result.expect("Submit should succeed");
 
     // Give handler thread time to process
     thread::sleep(Duration::from_millis(50));
+
+    recv.try_recv().unwrap();
+  }
+
+  #[test]
+  fn test_storedop_completes_with_timeout() {
+    let (mut worker, _store) = setup_worker();
+
+    let (sender, recv) = mpsc::channel();
+
+    let op = StoredOp::new_callback(Box::new(Nop), move |res| {
+      sender.send(res).unwrap();
+    });
+
+    let result = worker.submit(op);
+    assert!(result.is_ok(), "Submit should succeed");
+
+    // Use recv_timeout to detect if operation completes
+    // If notify is not called, handler won't process and this will timeout
+    let completion = recv.recv_timeout(Duration::from_secs(2));
+
+    assert!(
+      completion.is_ok(),
+      "StoredOp should complete within 2 seconds. If this fails, handler may not be notified after submit."
+    );
+
+    // Shutdown worker to cleanup threads
+    worker.shutdown();
   }
 
   #[test]
@@ -640,7 +676,7 @@ mod tests {
   #[test]
   fn test_worker_with_store_capacity() {
     // Test with different store capacities
-    for capacity in [10, 100, 1000] {
+    for capacity in [16, 128, 1024] {
       let state = DummyDriver::new_state().unwrap();
       let (submitter_impl, handler_impl) = DummyDriver::new(state).unwrap();
 

@@ -1,5 +1,5 @@
 use lio::{bind, listen};
-use std::{net::SocketAddr, sync::mpsc};
+use std::{net::SocketAddr, os::fd::{AsFd, AsRawFd}, sync::mpsc};
 
 #[cfg(linux)]
 #[ignore = "flaky network test"]
@@ -24,7 +24,7 @@ fn test_listen_basic() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(sock, addr).when_done(move |res| {
+  bind(&sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -33,7 +33,7 @@ fn test_listen_basic() {
   receiver_unit.recv().unwrap().expect("Failed to bind socket");
 
   let sender_l = sender_unit.clone();
-  listen(sock, 128).when_done(move |res| {
+  listen(&sock,128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -59,7 +59,7 @@ fn test_listen_basic() {
       "Socket should be in listening state {:?}",
       std::io::Error::last_os_error()
     );
-    libc::close(sock);
+    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -86,7 +86,7 @@ fn test_listen_with_backlog() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(sock, addr).when_done(move |res| {
+  bind(&sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -96,7 +96,7 @@ fn test_listen_with_backlog() {
 
   // Listen with custom backlog
   let sender_l = sender_unit.clone();
-  listen(sock, 10).when_done(move |res| {
+  listen(&sock,10).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -109,14 +109,14 @@ fn test_listen_with_backlog() {
     let mut accept_val: i32 = 0;
     let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
     libc::getsockopt(
-      sock,
+      sock.as_fd().as_raw_fd(),
       libc::SOL_SOCKET,
       libc::SO_ACCEPTCONN,
       &mut accept_val as *mut _ as *mut libc::c_void,
       &mut len,
     );
     assert_eq!(accept_val, 1);
-    libc::close(sock);
+    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -143,7 +143,7 @@ fn test_listen_large_backlog() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(sock, addr).when_done(move |res| {
+  bind(&sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -153,7 +153,7 @@ fn test_listen_large_backlog() {
 
   // Listen with large backlog
   let sender_l = sender_unit.clone();
-  listen(sock, 1024).when_done(move |res| {
+  listen(&sock,1024).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -166,14 +166,14 @@ fn test_listen_large_backlog() {
     let mut accept_val: i32 = 0;
     let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
     libc::getsockopt(
-      sock,
+      sock.as_fd().as_raw_fd(),
       libc::SOL_SOCKET,
       libc::SO_ACCEPTCONN,
       &mut accept_val as *mut _ as *mut libc::c_void,
       &mut len,
     );
     assert_eq!(accept_val, 1);
-    libc::close(sock);
+    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -199,7 +199,7 @@ fn test_listen_without_bind() {
   let sender_l1 = sender_l.clone();
 
   // Try to listen without binding first
-  listen(sock, 128).when_done(move |res| {
+  listen(&sock, 128).when_done(move |res| {
     sender_l1.send(res).unwrap();
   });
 
@@ -210,7 +210,7 @@ fn test_listen_without_bind() {
   // On most systems this will succeed (bind to INADDR_ANY:0)
   // but behavior may vary by platform
   unsafe {
-    libc::close(sock);
+    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -238,7 +238,7 @@ fn test_listen_ipv6() {
   let addr: SocketAddr = "[::1]:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(sock, addr).when_done(move |res| {
+  bind(&sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -247,7 +247,7 @@ fn test_listen_ipv6() {
   receiver_unit.recv().unwrap().expect("Failed to bind IPv6 socket");
 
   let sender_l = sender_unit.clone();
-  listen(sock, 128).when_done(move |res| {
+  listen(&sock,128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -260,14 +260,14 @@ fn test_listen_ipv6() {
     let mut accept_val: i32 = 0;
     let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
     libc::getsockopt(
-      sock,
+      sock.as_fd().as_raw_fd(),
       libc::SOL_SOCKET,
       libc::SO_ACCEPTCONN,
       &mut accept_val as *mut _ as *mut libc::c_void,
       &mut len,
     );
     assert_eq!(accept_val, 1);
-    libc::close(sock);
+    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -294,7 +294,7 @@ fn test_listen_on_udp() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(sock, addr).when_done(move |res| {
+  bind(&sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -306,7 +306,7 @@ fn test_listen_on_udp() {
   let sender_l1 = sender_l.clone();
 
   // Try to listen on UDP socket (should fail)
-  listen(sock, 128).when_done(move |res| {
+  listen(&sock,128).when_done(move |res| {
     sender_l1.send(res).unwrap();
   });
 
@@ -318,7 +318,7 @@ fn test_listen_on_udp() {
 
   // Cleanup
   unsafe {
-    libc::close(sock);
+    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -344,7 +344,7 @@ fn test_listen_twice() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(sock, addr).when_done(move |res| {
+  bind(&sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -353,7 +353,7 @@ fn test_listen_twice() {
   receiver_unit.recv().unwrap().expect("Failed to bind socket");
 
   let sender_l = sender_unit.clone();
-  listen(sock, 128).when_done(move |res| {
+  listen(&sock,128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -365,7 +365,7 @@ fn test_listen_twice() {
   let sender_l3 = sender_l2.clone();
 
   // Try to listen again on the same socket
-  listen(sock, 256).when_done(move |res| {
+  listen(&sock,256).when_done(move |res| {
     sender_l3.send(res).unwrap();
   });
 
@@ -375,7 +375,7 @@ fn test_listen_twice() {
 
   // Behavior may vary - some systems allow it, some don't
   unsafe {
-    libc::close(sock);
+    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -402,7 +402,7 @@ fn test_listen_zero_backlog() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(sock, addr).when_done(move |res| {
+  bind(&sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -412,7 +412,7 @@ fn test_listen_zero_backlog() {
 
   // Listen with backlog of 0 (system may adjust to minimum)
   let sender_l = sender_unit.clone();
-  listen(sock, 0).when_done(move |res| {
+  listen(&sock,0).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -425,14 +425,14 @@ fn test_listen_zero_backlog() {
     let mut accept_val: i32 = 0;
     let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
     libc::getsockopt(
-      sock,
+      sock.as_fd().as_raw_fd(),
       libc::SOL_SOCKET,
       libc::SO_ACCEPTCONN,
       &mut accept_val as *mut _ as *mut libc::c_void,
       &mut len,
     );
     assert_eq!(accept_val, 1);
-    libc::close(sock);
+    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -450,18 +450,18 @@ fn test_listen_after_close() {
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  let mut bind_recv = bind(sock, addr).send();
+  let mut bind_recv = bind(&sock, addr).send();
 
   lio::tick();
 
   bind_recv.try_recv().unwrap().expect("Failed to bind socket");
 
   unsafe {
-    libc::close(sock);
+    libc::close(sock.as_fd().as_raw_fd());
   }
 
   // Try to listen on closed socket
-  let mut listen_recv = listen(sock, 128).send();
+  let mut listen_recv = listen(&sock, 128).send();
 
   lio::tick();
 
@@ -501,7 +501,7 @@ fn test_listen_concurrent() {
   for &sock in &sockets {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let sender_b = sender_bind.clone();
-    bind(sock, addr).when_done(move |res| {
+    bind(&sock, addr).when_done(move |res| {
       sender_b.send(res).unwrap();
     });
   }
@@ -516,7 +516,7 @@ fn test_listen_concurrent() {
 
   for &sock in &sockets {
     let sender_l = sender_listen.clone();
-    listen(sock, 128).when_done(move |res| {
+    listen(&sock,128).when_done(move |res| {
       sender_l.send(res).unwrap();
     });
   }
@@ -539,7 +539,7 @@ fn test_listen_concurrent() {
         &mut len,
       );
       assert_eq!(accept_val, 1);
-      libc::close(sock);
+      libc::close(sock.as_fd().as_raw_fd());
     }
   }
 }
@@ -568,7 +568,7 @@ fn test_listen_on_all_interfaces() {
   let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(sock, addr).when_done(move |res| {
+  bind(&sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -577,7 +577,7 @@ fn test_listen_on_all_interfaces() {
   receiver_unit.recv().unwrap().expect("Failed to bind to all interfaces");
 
   let sender_l = sender_unit.clone();
-  listen(sock, 128).when_done(move |res| {
+  listen(&sock,128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -590,13 +590,13 @@ fn test_listen_on_all_interfaces() {
     let mut accept_val: i32 = 0;
     let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
     libc::getsockopt(
-      sock,
+      sock.as_fd().as_raw_fd(),
       libc::SOL_SOCKET,
       libc::SO_ACCEPTCONN,
       &mut accept_val as *mut _ as *mut libc::c_void,
       &mut len,
     );
     assert_eq!(accept_val, 1);
-    libc::close(sock);
+    libc::close(sock.as_fd().as_raw_fd());
   }
 }

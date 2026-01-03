@@ -5,7 +5,7 @@ mod stored;
 
 use std::task::Waker;
 
-use crate::op::OperationExt;
+use crate::op::{Operation, OperationExt};
 pub use stored::StoredOp;
 
 // NOTE: OpRegistration should **NEVER** impl Sync.
@@ -16,13 +16,15 @@ pub struct Registration {
 
 unsafe impl Send for Registration {}
 
-#[repr(u8)]
 enum Status {
   Waiting,
   Done { ret: Option<isize> },
 }
 
 impl Registration {
+  pub fn op_ref(&self) -> &dyn Operation {
+    self.stored.op_ref()
+  }
   pub fn new(stored: StoredOp) -> Self {
     Self { stored, status: Status::Waiting }
   }

@@ -91,14 +91,14 @@ impl IoHandler for IoUringHandler {
     &mut self,
     state: *const (),
     _s: &OpStore,
-  ) -> io::Result<Vec<super::OpCompleted>> {
+  ) -> io::Result<Vec<OpCompleted>> {
     self.tick_inner(false, into_shared(state))
   }
   fn tick(
     &mut self,
     state: *const (),
     _s: &OpStore,
-  ) -> io::Result<Vec<super::OpCompleted>> {
+  ) -> io::Result<Vec<OpCompleted>> {
     self.tick_inner(true, into_shared(state))
   }
 }
@@ -108,7 +108,7 @@ impl IoUringHandler {
     &mut self,
     can_block: bool,
     state: &IoUringState,
-  ) -> io::Result<Vec<super::OpCompleted>> {
+  ) -> io::Result<Vec<OpCompleted>> {
     self.cq.sync();
     state._uring.submit_and_wait(if can_block { 1 } else { 0 })?;
     self.cq.sync();
@@ -125,3 +125,6 @@ impl IoUringHandler {
     Ok(op_c)
   }
 }
+
+#[cfg(test)]
+test_io_driver!(IoUring);

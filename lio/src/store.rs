@@ -44,7 +44,7 @@ impl Index {
     let generation = self
       .generation
       .checked_add(1)
-      .expect(&format!("integer overflow when computing next generation in arena slot. Old: {}, add: 1", self.generation));
+      .unwrap_or_else(|| panic!("integer overflow when computing next generation in arena slot. Old: {}, add: 1", self.generation));
 
     Index { slot: self.slot, generation }
   }
@@ -63,6 +63,14 @@ impl OpStore {
   }
 
   pub fn with_capacity(cap: usize) -> OpStore {
+    let adjusted_capacity =
+      cap.min(1_usize << (usize::BITS - 2)).next_power_of_two();
+
+    assert!(
+      adjusted_capacity == cap,
+      "capacity provided was not power of 2, provided value = {cap}"
+    );
+
     Self {
       store: scc::HashMap::with_capacity(cap),
       next_slot: AtomicU32::new(0),
@@ -86,12 +94,10 @@ impl OpStore {
     }
   }
 
-  #[cfg(test)]
   pub fn insert(&self, stored: StoredOp) -> u64 {
     self.insert_with(|_| stored)
   }
 
-  #[cfg(test)]
   pub fn insert_with<F>(&self, f: F) -> u64
   where
     F: FnOnce(u64) -> StoredOp,
@@ -164,6 +170,24 @@ impl OpStore {
     } else {
       None
     }
+  }
+
+  pub fn get<F, R>(&self, id: u64, f: F) -> Option<R>
+  where
+    F: FnOnce(&Registration) -> R,
+  {
+    let index = Index::from_u64(id);
+
+    self
+      .store
+      .read_sync(&index.slot(), |_, rec| {
+        if rec.generation == index.generation() {
+          Some(f(&rec.registration))
+        } else {
+          None
+        }
+      })
+      .flatten()
   }
 }
 
@@ -560,6 +584,39 @@ mod tests {
   }
 
   #[test]
+  fn test_get_rejects_stale_generation() {
+    let store = OpStore::new();
+
+    // Insert and remove to create a stale ID
+    let id1 = store.insert(dummy_stored_op());
+    let index1 = Index::from_u64(id1);
+    store.remove(id1);
+
+    // Insert new operation with same slot but different generation
+    let id2 = store.insert(dummy_stored_op());
+    let index2 = Index::from_u64(id2);
+
+    assert_eq!(index1.slot(), index2.slot(), "Slot should be reused");
+    assert_ne!(
+      index1.generation(),
+      index2.generation(),
+      "Generation should differ"
+    );
+
+    // store.get() with stale ID should return None (not access wrong generation)
+    let result = store.get(id1, |_| 42);
+    assert!(
+      result.is_none(),
+      "store.get() should reject stale ID, but got: {:?}",
+      result
+    );
+
+    // store.get() with current ID should work
+    let result = store.get(id2, |_| 42);
+    assert_eq!(result, Some(42), "store.get() should work with current ID");
+  }
+
+  #[test]
   fn test_concurrent_aba_scenarios() {
     let store = Arc::new(OpStore::new());
     let num_threads = 8;
@@ -732,11 +789,11 @@ mod tests {
 
     /// Property: get_mut returns None for removed IDs
     #[test]
-    fn prop_get_mut_fails_after_remove(ops_count in 1usize..100, remove_index in 0usize..100) {
-      let store = OpStore::new();
+    fn prop_get_mut_fails_after_remove(ops_count_exponent in 1u32..8, remove_index in 0usize..100) {
+      let actual_count = 2usize.pow(ops_count_exponent);
+      let store = OpStore::with_capacity(actual_count);
       let mut ids = Vec::new();
 
-      let actual_count = ops_count.max(1);
       for _ in 0..actual_count {
         ids.push(store.insert(dummy_stored_op()));
       }
@@ -952,15 +1009,16 @@ mod tests {
     /// Property: Capacity doesn't affect correctness
     #[test]
     fn prop_capacity_doesnt_affect_correctness(
-      capacity in 1usize..500,
+      capacity_exp in 1u32..8,
       ops_count in 1usize..100
     ) {
-      let store = OpStore::with_capacity(capacity);
+      let cap = 2usize.pow(capacity_exp);
+      let store = OpStore::with_capacity(cap);
       let mut ids = HashSet::new();
 
       for _ in 0..ops_count {
         let id = store.insert(dummy_stored_op());
-        prop_assert!(ids.insert(id), "Duplicate ID with capacity {}: {}", capacity, id);
+        prop_assert!(ids.insert(id), "Duplicate ID with capacity {}: {}", cap, id);
       }
 
       prop_assert_eq!(ids.len(), ops_count);

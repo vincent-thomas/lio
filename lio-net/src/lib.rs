@@ -1,20 +1,11 @@
-use std::io::{self};
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::os::fd::{FromRawFd, RawFd};
+mod socket;
 
-pub struct Fd(RawFd);
+use std::{
+  io,
+  net::{SocketAddr, ToSocketAddrs},
+};
 
-impl FromRawFd for Fd {
-  unsafe fn from_raw_fd(fd: RawFd) -> Self {
-    Self(fd)
-  }
-}
-
-impl Drop for Fd {
-  fn drop(&mut self) {
-    let _ = lio::close(self.0).send();
-  }
-}
+use crate::socket::Socket;
 
 pub struct TcpListener(Socket);
 
@@ -31,7 +22,7 @@ impl TcpListener {
         SocketAddr::V6(_) => libc::AF_INET6,
         SocketAddr::V4(_) => libc::AF_INET,
       };
-      let socket = Socket::new(domain, libc::SOCK_STREAM, 0).await?;
+      let socket: Socket = Socket::new(domain, libc::SOCK_STREAM, 0).await?;
 
       socket.bind(value).await?;
       socket.listen().await?;
@@ -45,11 +36,8 @@ impl TcpListener {
   }
 
   pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-    let (rawfd, addr) = lio::accept(self.0.0.0).await?;
-
-    let socket = Socket::from(unsafe { Fd::from_raw_fd(rawfd) });
-
-    Ok((TcpStream(socket), addr))
+    let (resource, addr) = lio::accept(self.0.as_resource()).await?;
+    Ok((TcpStream(Socket::from_resource_unchecked(resource)), addr))
   }
 }
 
@@ -62,7 +50,7 @@ impl TcpStream {
         SocketAddr::V6(_) => libc::AF_INET6,
         SocketAddr::V4(_) => libc::AF_INET,
       };
-      let socket = Socket::new(domain, libc::SOCK_STREAM, 0).await?;
+      let socket: Socket = Socket::new(domain, libc::SOCK_STREAM, 0).await?;
 
       socket.connect(value).await?;
 

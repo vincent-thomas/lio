@@ -1579,7 +1579,7 @@ macro_rules! generate_tests {
     fn test_add_read_no_data() {
       println!("Running test: add read interest with no data available");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_add_read_no_data(poller)
+      crate::backends::impls::pollingv2::tests::test_add_read_no_data(poller)
         .expect("test_add_read_no_data: failed to add read interest with no data");
     }
 
@@ -1587,7 +1587,7 @@ macro_rules! generate_tests {
     fn test_read_becomes_ready() {
       println!("Running test: read interest triggers when data is written");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_read_becomes_ready(poller)
+      crate::backends::impls::pollingv2::tests::test_read_becomes_ready(poller)
         .expect("test_read_becomes_ready: failed when testing read interest triggers on data write");
     }
 
@@ -1595,7 +1595,7 @@ macro_rules! generate_tests {
     fn test_write_immediately_ready() {
       println!("Running test: write interest triggers immediately");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_write_immediately_ready(poller)
+      crate::backends::impls::pollingv2::tests::test_write_immediately_ready(poller)
         .expect("test_write_immediately_ready: failed when testing immediate write readiness");
     }
 
@@ -1603,7 +1603,7 @@ macro_rules! generate_tests {
     fn test_add_both_interests() {
       println!("Running test: adding both read and write interests simultaneously");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_add_both_interests(poller)
+      crate::backends::impls::pollingv2::tests::test_add_both_interests(poller)
         .expect("test_add_both_interests: failed when adding both read and write interests");
     }
 
@@ -1611,7 +1611,7 @@ macro_rules! generate_tests {
     fn test_modify_interest() {
       println!("Running test: modifying interest on existing fd");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_modify_interest(poller)
+      crate::backends::impls::pollingv2::tests::test_modify_interest(poller)
         .expect("test_modify_interest: failed when modifying interest on existing fd");
     }
 
@@ -1619,7 +1619,7 @@ macro_rules! generate_tests {
     fn test_delete_interest() {
       println!("Running test: deleting interest prevents further events");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_delete_interest(poller)
+      crate::backends::impls::pollingv2::tests::test_delete_interest(poller)
         .expect("test_delete_interest: failed when testing delete prevents events");
     }
 
@@ -1627,7 +1627,7 @@ macro_rules! generate_tests {
     fn test_multiple_fds() {
       println!("Running test: monitoring multiple file descriptors simultaneously");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_multiple_fds(poller)
+      crate::backends::impls::pollingv2::tests::test_multiple_fds(poller)
         .expect("test_multiple_fds: failed when monitoring multiple file descriptors");
     }
 
@@ -1635,7 +1635,7 @@ macro_rules! generate_tests {
     fn test_notify_wakes_wait() {
       println!("Running test: notify() wakes up blocking wait");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_notify_wakes_wait(poller)
+      crate::backends::impls::pollingv2::tests::test_notify_wakes_wait(poller)
         .expect("test_notify_wakes_wait: failed when testing notify() waking up blocking wait");
     }
 
@@ -1643,7 +1643,7 @@ macro_rules! generate_tests {
     fn test_delete_nonexistent_fd() {
       println!("Running test: deleting non-existent fd returns ENOENT");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_delete_nonexistent_fd(poller)
+      crate::backends::impls::pollingv2::tests::test_delete_nonexistent_fd(poller)
         .expect("test_delete_nonexistent_fd: failed when testing deletion of non-existent fd");
     }
 
@@ -1651,7 +1651,7 @@ macro_rules! generate_tests {
     fn test_reregister_same_fd() {
       println!("Running test: modifying same fd with different keys");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_reregister_same_fd(poller)
+      crate::backends::impls::pollingv2::tests::test_reregister_same_fd(poller)
         .expect("test_reregister_same_fd: failed when modifying same fd with different keys");
     }
 
@@ -1659,7 +1659,7 @@ macro_rules! generate_tests {
     fn test_timeout_no_events() {
       println!("Running test: timeout works correctly when no events are ready");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_timeout_no_events(poller)
+      crate::backends::impls::pollingv2::tests::test_timeout_no_events(poller)
         .expect("test_timeout_no_events: failed when testing timeout with no events");
     }
 
@@ -1667,7 +1667,7 @@ macro_rules! generate_tests {
     fn test_zero_timeout() {
       println!("Running test: zero timeout returns immediately");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_zero_timeout(poller)
+      crate::backends::impls::pollingv2::tests::test_zero_timeout(poller)
         .expect("test_zero_timeout: failed when testing zero timeout immediate return");
     }
 
@@ -1675,7 +1675,7 @@ macro_rules! generate_tests {
     fn test_many_fds() {
       println!("Running test: handling many file descriptors");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_many_fds(poller)
+      crate::backends::impls::pollingv2::tests::test_many_fds(poller)
         .expect("test_many_fds: failed when handling many file descriptors");
     }
 
@@ -1683,7 +1683,7 @@ macro_rules! generate_tests {
     fn test_partial_read() {
       println!("Running test: reads work with partial data");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_partial_read(poller)
+      crate::backends::impls::pollingv2::tests::test_partial_read(poller)
         .expect("test_partial_read: failed when testing partial read handling");
     }
 
@@ -1691,7 +1691,7 @@ macro_rules! generate_tests {
     fn test_rapid_add_delete() {
       println!("Running test: rapid add/delete cycles");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_rapid_add_delete(poller)
+      crate::backends::impls::pollingv2::tests::test_rapid_add_delete(poller)
         .expect("test_rapid_add_delete: failed when testing rapid add/delete cycles");
     }
 
@@ -1699,7 +1699,7 @@ macro_rules! generate_tests {
     fn test_modify_read_to_write() {
       println!("Running test: modifying from read to write interest");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_modify_read_to_write(poller)
+      crate::backends::impls::pollingv2::tests::test_modify_read_to_write(poller)
         .expect("test_modify_read_to_write: failed when modifying from read to write interest");
     }
 
@@ -1707,7 +1707,7 @@ macro_rules! generate_tests {
     fn test_close_registered_fd() {
       println!("Running test: closing a registered fd doesn't crash");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_close_registered_fd(poller)
+      crate::backends::impls::pollingv2::tests::test_close_registered_fd(poller)
         .expect("test_close_registered_fd: failed when testing closing registered fd");
     }
 
@@ -1715,7 +1715,7 @@ macro_rules! generate_tests {
     fn test_multiple_notifies() {
       println!("Running test: multiple notifies in quick succession");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_multiple_notifies(poller)
+      crate::backends::impls::pollingv2::tests::test_multiple_notifies(poller)
         .expect("test_multiple_notifies: failed when testing multiple notifies in succession");
     }
 
@@ -1723,7 +1723,7 @@ macro_rules! generate_tests {
     fn test_modify_write_to_read() {
       println!("Running test: modifying from write to read interest");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_modify_write_to_read(poller)
+      crate::backends::impls::pollingv2::tests::test_modify_write_to_read(poller)
         .expect("test_modify_write_to_read: failed when modifying from write to read interest");
     }
 
@@ -1731,7 +1731,7 @@ macro_rules! generate_tests {
     fn test_readd_after_delete() {
       println!("Running test: re-adding file descriptor after deletion");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_readd_after_delete(poller)
+      crate::backends::impls::pollingv2::tests::test_readd_after_delete(poller)
         .expect("test_readd_after_delete: failed when re-adding fd after deletion");
     }
 
@@ -1739,7 +1739,7 @@ macro_rules! generate_tests {
     fn test_simultaneous_read_write() {
       println!("Running test: simultaneous read and write events on same fd");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_simultaneous_read_write(poller)
+      crate::backends::impls::pollingv2::tests::test_simultaneous_read_write(poller)
         .expect("test_simultaneous_read_write: failed when testing simultaneous read/write events");
     }
 
@@ -1747,7 +1747,7 @@ macro_rules! generate_tests {
     fn test_peer_closed() {
       println!("Running test: handling socket peer close (HUP/ERR conditions)");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_peer_closed(poller)
+      crate::backends::impls::pollingv2::tests::test_peer_closed(poller)
         .expect("test_peer_closed: failed when testing socket peer close handling");
     }
 
@@ -1755,7 +1755,7 @@ macro_rules! generate_tests {
     fn test_modify_to_no_interest() {
       println!("Running test: modifying interest to none (edge case)");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_modify_to_no_interest(poller)
+      crate::backends::impls::pollingv2::tests::test_modify_to_no_interest(poller)
         .expect("test_modify_to_no_interest: failed when modifying interest to none");
     }
 
@@ -1763,7 +1763,7 @@ macro_rules! generate_tests {
     fn test_buffer_smaller_than_ready_events() {
       println!("Running test: buffer too small for all ready events");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_buffer_smaller_than_ready_events(poller)
+      crate::backends::impls::pollingv2::tests::test_buffer_smaller_than_ready_events(poller)
         .expect("test_buffer_smaller_than_ready_events: failed when testing small buffer with many ready events");
     }
 
@@ -1771,7 +1771,7 @@ macro_rules! generate_tests {
     fn test_oneshot_no_redelivery() {
       println!("Running test: ONESHOT events should not re-deliver without re-arm");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_oneshot_no_redelivery(poller)
+      crate::backends::impls::pollingv2::tests::test_oneshot_no_redelivery(poller)
         .expect("test_oneshot_no_redelivery: failed when verifying ONESHOT semantics");
     }
 
@@ -1779,7 +1779,7 @@ macro_rules! generate_tests {
     fn test_wait_infinite_timeout() {
       println!("Running test: infinite timeout (None) should wait indefinitely");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_wait_infinite_timeout(poller)
+      crate::backends::impls::pollingv2::tests::test_wait_infinite_timeout(poller)
         .expect("test_wait_infinite_timeout: failed when testing None timeout");
     }
 
@@ -1787,7 +1787,7 @@ macro_rules! generate_tests {
     fn test_add_duplicate_fd() {
       println!("Running test: adding already-registered fd");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_add_duplicate_fd(poller)
+      crate::backends::impls::pollingv2::tests::test_add_duplicate_fd(poller)
         .expect("test_add_duplicate_fd: failed when testing duplicate fd registration");
     }
 
@@ -1795,7 +1795,7 @@ macro_rules! generate_tests {
     fn test_same_key_different_fds() {
       println!("Running test: same key used for different fds");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_same_key_different_fds(poller)
+      crate::backends::impls::pollingv2::tests::test_same_key_different_fds(poller)
         .expect("test_same_key_different_fds: failed when testing key collision");
     }
 
@@ -1803,7 +1803,7 @@ macro_rules! generate_tests {
     fn test_wait_empty_buffer() {
       println!("Running test: wait with empty event buffer");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_wait_empty_buffer(poller)
+      crate::backends::impls::pollingv2::tests::test_wait_empty_buffer(poller)
         .expect("test_wait_empty_buffer: failed when testing empty buffer");
     }
 
@@ -1811,7 +1811,7 @@ macro_rules! generate_tests {
     fn test_add_invalid_fd() {
       println!("Running test: adding invalid file descriptor (-1)");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_add_invalid_fd(poller)
+      crate::backends::impls::pollingv2::tests::test_add_invalid_fd(poller)
         .expect("test_add_invalid_fd: failed when testing invalid fd");
     }
 
@@ -1819,7 +1819,7 @@ macro_rules! generate_tests {
     fn test_add_closed_fd() {
       println!("Running test: adding already-closed file descriptor");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_add_closed_fd(poller)
+      crate::backends::impls::pollingv2::tests::test_add_closed_fd(poller)
         .expect("test_add_closed_fd: failed when testing closed fd");
     }
 
@@ -1827,7 +1827,7 @@ macro_rules! generate_tests {
     fn test_edge_key_values() {
       println!("Running test: edge key values (0, MAX, MAX-1)");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_edge_key_values(poller)
+      crate::backends::impls::pollingv2::tests::test_edge_key_values(poller)
         .expect("test_edge_key_values: failed when testing edge key values");
     }
 
@@ -1835,7 +1835,7 @@ macro_rules! generate_tests {
     fn test_read_interest_filtering() {
       println!("Running test: READ interest filtering");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_read_interest_filtering(poller)
+      crate::backends::impls::pollingv2::tests::test_read_interest_filtering(poller)
         .expect("test_read_interest_filtering: failed when testing READ interest filtering");
     }
 
@@ -1843,7 +1843,7 @@ macro_rules! generate_tests {
     fn test_write_interest_filtering() {
       println!("Running test: WRITE interest filtering");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_write_interest_filtering(poller)
+      crate::backends::impls::pollingv2::tests::test_write_interest_filtering(poller)
         .expect("test_write_interest_filtering: failed when testing WRITE interest filtering");
     }
 
@@ -1851,7 +1851,7 @@ macro_rules! generate_tests {
     fn test_modify_nonexistent_fd() {
       println!("Running test: modifying non-existent fd");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_modify_nonexistent_fd(poller)
+      crate::backends::impls::pollingv2::tests::test_modify_nonexistent_fd(poller)
         .expect("test_modify_nonexistent_fd: failed when testing modify on non-existent fd");
     }
 
@@ -1859,7 +1859,7 @@ macro_rules! generate_tests {
     fn test_fd_reuse_after_delete() {
       println!("Running test: fd reuse after delete");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_fd_reuse_after_delete(poller)
+      crate::backends::impls::pollingv2::tests::test_fd_reuse_after_delete(poller)
         .expect("test_fd_reuse_after_delete: failed when testing fd reuse after delete");
     }
 
@@ -1867,7 +1867,7 @@ macro_rules! generate_tests {
     fn test_concurrent_add() {
       println!("Running test: concurrent add operations");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_concurrent_add(poller)
+      crate::backends::impls::pollingv2::tests::test_concurrent_add(poller)
         .expect("test_concurrent_add: failed when testing concurrent add operations");
     }
 
@@ -1875,7 +1875,7 @@ macro_rules! generate_tests {
     fn test_concurrent_modify() {
       println!("Running test: concurrent modify operations");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_concurrent_modify(poller)
+      crate::backends::impls::pollingv2::tests::test_concurrent_modify(poller)
         .expect("test_concurrent_modify: failed when testing concurrent modify operations");
     }
 
@@ -1883,7 +1883,7 @@ macro_rules! generate_tests {
     fn test_concurrent_wait() {
       println!("Running test: concurrent wait operations");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_concurrent_wait(poller)
+      crate::backends::impls::pollingv2::tests::test_concurrent_wait(poller)
         .expect("test_concurrent_wait: failed when testing concurrent wait operations");
     }
 
@@ -1891,7 +1891,7 @@ macro_rules! generate_tests {
     fn test_concurrent_add_delete() {
       println!("Running test: concurrent add/delete operations");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_concurrent_add_delete(poller)
+      crate::backends::impls::pollingv2::tests::test_concurrent_add_delete(poller)
         .expect("test_concurrent_add_delete: failed when testing concurrent add/delete operations");
     }
 
@@ -1899,7 +1899,7 @@ macro_rules! generate_tests {
     fn test_concurrent_mixed_operations() {
       println!("Running test: concurrent mixed operations");
       let poller = $poller;
-      $crate::backends::pollingv2::tests::test_concurrent_mixed_operations(poller)
+      crate::backends::impls::pollingv2::tests::test_concurrent_mixed_operations(poller)
         .expect("test_concurrent_mixed_operations: failed when testing concurrent mixed operations");
     }
   };
