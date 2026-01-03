@@ -2,18 +2,91 @@
 //!
 //! This module provides the [`Resource`] type, which is lio's wrapper around
 //! platform-specific I/O resources (file descriptors on Unix, handles on Windows).
+//!
+//! # Resource Management
+//!
+//! **NOTE**: [`Resource`] does **not** automatically close the underlying file descriptor
+//! when dropped. You must explicitly call [`crate::close()`] when you're done with the resource:
+//!
+//! ```rust
+//! use std::ffi::CString;
+//! use lio::resource::Resource;
+//!
+//! # lio::init();
+//! async fn example() -> std::io::Result<()> {
+//!     let path = CString::new("/tmp/test").unwrap();
+//!     let fd: Resource = lio::openat(libc::AT_FDCWD, path, libc::O_RDONLY).await?;
+//!
+//!     // Use the resource...
+//!
+//!     // IMPORTANT: Close when done
+//!     fd.close();
+//!     Ok(())
+//! }
+//! # lio::exit();
+//! ```
+//!
+//! # Cloning and Sharing
+//!
+//! [`Resource`] uses `Arc` internally, so cloning is cheap and creates a new reference to the
+//! same underlying file descriptor:
+//!
+//! ```rust
+//! use lio::resource::Resource;
+//!
+//! # lio::init();
+//! async fn share_resource(fd: Resource) {
+//!     let fd_clone = fd.clone(); // Points to the same file descriptor
+//!
+//!     // Both fd and fd_clone refer to the same resource
+//!     // Only one close call is needed (the resource will be closed when all clones are dropped)
+//! }
+//! # lio::exit();
+//! ```
+//!
+//! # Creating Resources
+//!
+//! Resources are typically obtained from lio I/O operations:
+//!
+//! ```rust
+//! use std::ffi::CString;
+//! use lio::resource::Resource;
+//!
+//! # lio::init();
+//! async fn open_file() -> std::io::Result<Resource> {
+//!     let path = CString::new("/tmp/test").unwrap();
+//!     let resource: Resource = lio::openat(libc::AT_FDCWD, path, libc::O_RDONLY).await?;
+//!     Ok(resource)
+//! }
+//!
+//! async fn create_socket() -> std::io::Result<Resource> {
+//!     let sock: Resource = lio::socket(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+//!     Ok(sock)
+//! }
+//! # lio::exit();
+//! ```
+//!
+//! Or from raw file descriptors (Unix):
+//!
+//! ```rust
+//! use std::os::fd::{FromRawFd, RawFd};
+//! use lio::resource::Resource;
+//!
+//! # lio::init();
+//! fn from_raw(raw_fd: RawFd) -> Resource {
+//!     // Safe if raw_fd is a valid, open file descriptor
+//!     unsafe { Resource::from_raw_fd(raw_fd) }
+//! }
+//! # lio::exit();
+//! ```
 
-#[cfg(unix)]
-use std::os::fd::{AsFd, BorrowedFd, FromRawFd, RawFd};
-#[cfg(windows)]
-use std::os::windows::io::RawHandle;
 use std::sync::{
   Arc,
   atomic::{AtomicBool, Ordering},
 };
 
 #[cfg(unix)]
-type Inner = RawFd;
+type Inner = std::os::fd::RawFd;
 
 #[cfg(windows)]
 type Inner = RawHandle;
@@ -51,124 +124,59 @@ impl Drop for Owned {
   }
 }
 
-/// A reference-counted OS-dependent I/O resource, whilst itself being
-/// platform-independent.
+/// A reference-counted, platform-independent wrapper around OS I/O resources.
 ///
-/// # Resource Management
-///
-/// **NOTE**: `Resource` does **not** automatically
-/// close the underlying file descriptor when dropped. You must explicitly call [`crate::close()`]
-/// when you're done with the resource:
-///
-/// ```rust
-/// use std::ffi::CString;
-/// use lio::resource::Resource;
-///
-/// # lio::init();
-/// async fn example() -> std::io::Result<()> {
-///     let path = CString::new("/tmp/test").unwrap();
-///     let fd: Resource = lio::openat(libc::AT_FDCWD, path, libc::O_RDONLY).await?;
-///
-///     // Use the resource...
-///
-///     // IMPORTANT: Close when done
-///     fd.close();
-///     Ok(())
-/// }
-/// # lio::exit();
-/// ```
-///
-/// # Cloning and Sharing
-///
-/// `Resource` uses `Arc` internally, so cloning is cheap and creates a new reference to the
-/// same underlying file descriptor:
-///
-/// ```rust
-/// use lio::resource::Resource;
-///
-/// # lio::init();
-/// async fn share_resource(fd: Resource) {
-///     let fd_clone = fd.clone(); // Points to the same file descriptor
-///
-///     // Both fd and fd_clone refer to the same resource
-///     // Only one close call is needed (the resource will be closed when all clones are dropped)
-/// }
-/// # lio::exit();
-/// ```
-///
-/// # Creating Resources
-///
-/// Resources are typically obtained from lio I/O operations:
-///
-/// ```rust
-/// use std::ffi::CString;
-/// use lio::resource::Resource;
-///
-/// # lio::init();
-/// async fn open_file() -> std::io::Result<Resource> {
-///     let path = CString::new("/tmp/test").unwrap();
-///     let resource: Resource = lio::openat(libc::AT_FDCWD, path, libc::O_RDONLY).await?;
-///     Ok(resource)
-/// }
-///
-/// async fn create_socket() -> std::io::Result<Resource> {
-///     let sock: Resource = lio::socket(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
-///     Ok(sock)
-/// }
-/// # lio::exit();
-/// ```
-///
-/// Or from raw file descriptors (Unix):
-///
-/// ```rust
-/// use std::os::fd::{FromRawFd, RawFd};
-/// use lio::resource::Resource;
-///
-/// # lio::init();
-/// fn from_raw(raw_fd: RawFd) -> Resource {
-///     // Safe if raw_fd is a valid, open file descriptor
-///     unsafe { Resource::from_raw_fd(raw_fd) }
-/// }
-/// # lio::exit();
-/// ```
+/// See the [module documentation](self) for usage examples and details.
 #[derive(Clone)]
 pub struct Resource(Arc<Owned>);
 
 #[cfg(unix)]
-impl FromRawFd for Resource {
-  /// Creates a `Resource` from a raw file descriptor.
-  ///
-  /// # Safety
-  ///
-  /// The caller must ensure that:
-  /// - `fd` is a valid, open file descriptor
-  /// - No other code will close this file descriptor while the `Resource` exists
-  /// - The file descriptor is not used in ways that conflict with lio's assumptions
-  ///
-  /// # Examples
-  ///
-  /// ```rust
-  /// use std::os::fd::{FromRawFd, RawFd};
-  /// use lio::resource::Resource;
-  ///
-  /// # lio::init();
-  /// let fd: RawFd = 1; // stdout
-  /// let resource = unsafe { Resource::from_raw_fd(fd) };
-  /// # lio::exit();
-  /// ```
-  unsafe fn from_raw_fd(fd: RawFd) -> Self {
+impl std::os::fd::FromRawFd for Resource {
+  unsafe fn from_raw_fd(fd: std::os::fd::RawFd) -> Self {
     Resource(Arc::new(Owned::new(fd)))
   }
 }
 
 #[cfg(unix)]
-impl AsFd for Resource {
-  fn as_fd(&self) -> BorrowedFd<'_> {
-    unsafe { BorrowedFd::borrow_raw(self.0.inner) }
+impl std::os::fd::AsFd for Resource {
+  fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+    unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0.inner) }
   }
 }
 
-// TODO: impl FromRawHandle + AsHandle
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for Resource {
+  fn as_raw_fd(&self) -> std::os::fd::RawFd {
+    self.0.inner
+  }
+}
+
+impl<'a> Into<Resource> for &'a Resource {
+  fn into(self) -> Resource {
+    self.clone()
+  }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::FromRawHandle for Resource {
+  unsafe fn from_raw_handle(handle: RawHandle) -> Self {
+    Resource(Arc::new(Owned::new(handle)))
+  }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsHandle for Resource {
+  fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+    unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(self.0.inner) }
+  }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsRawHandle for Resource {
+  fn as_raw_handle(&self) -> RawHandle {
+    self.0.inner
+  }
+}
 
 impl Resource {
   /// Marks this resource to be automatically closed when the last reference is dropped.
@@ -181,13 +189,13 @@ impl Resource {
   /// # lio::init();
   /// async fn future_example() -> std::io::Result<()> {
   ///     let fd = lio::openat(libc::AT_FDCWD, c"/tmp/test", libc::O_RDONLY).await?;
-  ///     fd.close(); // Mark for auto-close
+  ///     fd.mark_close(); // Mark for auto-close
   ///     // fd is automatically closed when it goes out of scope
   ///     Ok(())
   /// }
   /// # lio::exit();
   /// ```
-  fn close(&self) {
+  pub fn mark_close(self) {
     self.0.should_close.store(true, Ordering::Release);
   }
 }

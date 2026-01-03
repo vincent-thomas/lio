@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::{
   cell::UnsafeCell,
   io::{self, Error},
@@ -64,7 +64,7 @@ impl Operation for Accept {
   #[cfg(linux)]
   fn create_entry(&self) -> squeue::Entry {
     opcode::Accept::new(
-      Fd(self.res.as_fd().as_raw_fd()),
+      Fd(self.res.as_raw_fd()),
       self.addr.get().cast::<libc::sockaddr>(),
       self.len.get(),
     )
@@ -77,7 +77,7 @@ impl Operation for Accept {
 
   #[cfg(unix)]
   fn cap(&self) -> i32 {
-    self.res.as_fd().as_raw_fd()
+    self.res.as_raw_fd()
   }
 
   fn run_blocking(&self) -> isize {
@@ -94,7 +94,7 @@ impl Operation for Accept {
     ))]
     let fd = {
       syscall_raw!(accept4(
-        self.res.as_fd().as_raw_fd(),
+        self.res.as_raw_fd(),
         self.addr.get() as *mut libc::sockaddr,
         self.len.get() as *mut libc::socklen_t,
         libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK
@@ -114,7 +114,7 @@ impl Operation for Accept {
     )))]
     let fd = {
       let socket = syscall_raw!(accept(
-        self.res.as_fd().as_raw_fd(),
+        self.res.as_raw_fd(),
         self.addr.get() as *mut libc::sockaddr,
         self.len.get() as *mut libc::socklen_t
       ));

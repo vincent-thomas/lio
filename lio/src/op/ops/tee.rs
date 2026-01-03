@@ -1,6 +1,6 @@
 #[cfg(not(linux))]
 use crate::op::EventType;
-use std::{io, os::fd::{AsFd, AsRawFd}};
+use std::{io, os::fd::AsRawFd};
 
 use io_uring::types::Fd;
 
@@ -41,11 +41,20 @@ impl Operation for Tee {
   // const OPCODE: u8 = 33;
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::Tee::new(Fd(self.res_in.as_fd().as_raw_fd()), Fd(self.res_out.as_fd().as_raw_fd()), self.size)
-      .build()
+    io_uring::opcode::Tee::new(
+      Fd(self.res_in.as_raw_fd()),
+      Fd(self.res_out.as_raw_fd()),
+      self.size,
+    )
+    .build()
   }
 
   fn run_blocking(&self) -> isize {
-    syscall_raw!(tee(self.res_in.as_fd().as_raw_fd(), self.res_out.as_fd().as_raw_fd(), self.size as usize, 0))
+    syscall_raw!(tee(
+      self.res_in.as_raw_fd(),
+      self.res_out.as_raw_fd(),
+      self.size as usize,
+      0
+    ))
   }
 }

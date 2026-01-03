@@ -11,3 +11,5 @@ pub mod epoll;
   target_os = "netbsd"
 ))]
 pub mod kqueue;
+
+const NOTIFY_KEY: u64 = u64::MAX;

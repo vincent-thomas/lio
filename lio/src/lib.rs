@@ -3,49 +3,33 @@
 
 //! # Lio - Low-Level Async I/O Library
 //!
-//! Lio is a low-level, high-performance async I/O library that provides direct access to
-//! platform-native I/O mechanisms. It uses the most efficient I/O available (io_uring/IOCP(soon),
-//! kqueue/epoll, regular syscalls).
+//! Lio is a non-blocking, platform-independent, zero-copy (when possible)
+//! I/O library that provides control back to the user. It does so by giving
+//! raw access to the syscall arguments, which it then builds upon. For
+//! example Lio (optionally) can [manage buffers in a zero-copy way](crate::buf),
+//! and [can integrate with zeroize](crate::buf#`zeroize`).
 //!
-//! ## Key Characteristics
+//! It uses the most efficient I/O available based on OS. It uses:
+//! - **Linux**: io_uring with it's completion based model and epoll as backup.
+//! - **BSD/Apple**: kqueue.
+//! - **Windows**: I/O Completion Ports.
 //!
-//! - **Low-level**: Direct syscall wrappers with minimal abstraction
-//! - **Manual resource management**: File descriptors and buffers are user-managed
-//! - **Zero-copy where possible**: Buffer ownership is transferred to avoid copies
-//! - **Platform-native**: Uses the most efficient I/O mechanism per platform
-//! - **Flexible APIs**: Choose between async/await, callbacks, or channels
+//! As lio is platform-independent it needs to abstract over id'ing
+//! files/sockets (unix and some other platforms these would be file descriptors,
+//! and on windows these are Handels). `lio` calls these [resources](crate::resource).
+//! Resources are reference counted OS-native identifiers (fd's/handles/etc),
+//! which means that cloning is cheap. `lio` will automatically drop/close these
+//! on the last reference's drop.
 //!
-//! ## Platform Support
+//! ## Synchronisation
 //!
-//! | Platform   | I/O Mechanism | Status      |
-//! |------------|---------------|-------------|
-//! | Linux      | io_uring      | Supported   |
-//! | macOS      | kqueue        | Supported   |
-//! | Other Unix | epoll/poll    | Supported   |
-//! | Windows    | IOCP          | Planned     |
+//! Lio is compatible with any synchronisation method:
+//! - [async](crate::op::Progress#impl-IntoFuture-for-Progress<T>) (runtime-independent).
+//! - [Callbacks](crate::op::Progress::when_done).
+//! - **Channels**: [1](crate::op::Progress::send_with) or [2](crate::op::Progress::send).
 //!
-//! ## Getting Started
-//!
-//! All I/O operations require initializing the driver first:
-//!
-//! ```rust
-//! # use std::os::fd::RawFd;
-//! lio::init();
-//!
-//! // Perform I/O operations...
-//! # let fd: RawFd = 1;
-//! # let data = b"Hello, World!\n".to_vec();
-//!
-//! // Clean up when done
-//! lio::exit();
-//! ```
-//!
-//! ## Core Concepts
-//!
-//! ### The Progress Type
-//!
-//! All operations return a [`Progress<T>`] which represents an in-flight I/O operation.
-//! You can consume it in multiple ways:
+//! ### Example
+//! All operations return a [`Progress<T>`] which represents an in-flight I/O operation:
 //!
 //! ```rust
 //! use lio::resource::Resource;
@@ -75,28 +59,6 @@
 //! lio::exit();
 //! ```
 //!
-//! ## Resource Management
-//!
-//! This library does **not** automatically close file descriptors or clean up resources.
-//! You must manually call [`close`] on file descriptors when done:
-//!
-//! ```rust
-//! use std::ffi::CString;
-//! # lio::init();
-//!
-//! async fn proper_cleanup() -> std::io::Result<()> {
-//!     let path = CString::new("/tmp/test").unwrap();
-//!     let fd = lio::openat(libc::AT_FDCWD, path, libc::O_RDONLY).await?;
-//!
-//!     // Use fd...
-//!
-//!     // Always close when done
-//!     lio::close(fd).await?;
-//!     Ok(())
-//! }
-//! # lio::exit();
-//! ```
-//!
 //! ## Buffer Ownership
 //!
 //! Operations that use buffers (read, write, send, recv) take ownership and return
@@ -124,8 +86,7 @@ pub mod buf;
 pub mod ffi;
 pub mod resource;
 mod store;
-use std::{ffi::CString, net::SocketAddr, os::fd::RawFd, time::Duration};
-mod blocking_queue;
+use std::{ffi::CString, net::SocketAddr, time::Duration};
 
 pub use buf::BufResult;
 
@@ -137,10 +98,11 @@ pub mod driver;
 pub mod op;
 use op::*;
 
-#[path = "./registration/registration.rs"]
+#[path = "registration/registration.rs"]
 mod registration;
 
-mod backends;
+#[path = "backends/backends.rs"]
+pub mod backends;
 mod worker;
 
 #[cfg_attr(docsrs, doc(hidden))]
@@ -215,6 +177,31 @@ doc_op! {
 
 doc_op! {
     short: "Writes data from buffer to file descriptor.",
+    syscall: "write(2)",
+    doc_link: "https://man7.org/linux/man-pages/man2/write.2.html",
+
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// async fn write_example() -> std::io::Result<()> {
+    ///     # let fd = 0;
+    ///     let data = b"Hello, World!".to_vec();
+    ///     let (result_bytes_written, _buf) = lio::write_with_buf(fd, data, 0).await;
+    ///     println!("Wrote {} bytes", result_bytes_written?);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn write_with_buf<B>(res: impl Into<Resource>, buf: B) -> Progress<Write<B>>
+    where
+        B: BufLike + std::marker::Send + Sync
+    {
+        Progress::from_op(Write::new(res.into(), buf))
+    }
+}
+
+doc_op! {
+    short: "Writes data from buffer to file descriptor.",
     syscall: "pwrite(2)",
     doc_link: "https://man7.org/linux/man-pages/man2/pwrite.2.html",
 
@@ -240,11 +227,11 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn write_with_buf<B>(res: impl Into<Resource>, buf: B, offset: i64) -> Progress<Write<B>>
+    pub fn write_at_with_buf<B>(res: impl Into<Resource>, buf: B, offset: i64) -> Progress<WriteAt<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
-        Progress::from_op(Write::new(res.into(), buf, offset))
+        Progress::from_op(WriteAt::new(res.into(), buf, offset))
     }
 }
 
@@ -563,7 +550,7 @@ pub fn init() {
 }
 
 #[cfg(linux)]
-type Default = backends::IoUring;
+type Default = backends::io_uring::IoUring;
 #[cfg(not(linux))]
 type Default = backends::pollingv2::Poller;
 

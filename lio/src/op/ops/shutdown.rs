@@ -1,4 +1,4 @@
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 
 #[cfg(linux)]
 use io_uring::types::Fd;
@@ -36,10 +36,10 @@ impl Operation for Shutdown {
   // const OPCODE: u8 = 34;
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::Shutdown::new(Fd(self.res.as_fd().as_raw_fd()), self.how).build()
+    io_uring::opcode::Shutdown::new(Fd(self.res.as_raw_fd()), self.how).build()
   }
 
   fn run_blocking(&self) -> isize {
-    syscall_raw!(shutdown(self.res.as_fd().as_raw_fd(), self.how))
+    syscall_raw!(shutdown(self.res.as_raw_fd(), self.how))
   }
 }

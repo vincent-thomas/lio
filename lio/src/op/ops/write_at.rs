@@ -10,31 +10,34 @@ use io_uring::types::Fd;
 
 use std::os::fd::AsRawFd;
 
-pub struct Write<B>
+pub struct WriteAt<B>
 where
   B: Send + Sync,
 {
   res: Resource,
   buf: Option<B>,
+  offset: i64,
 }
 
-impl<B> Write<B>
+// unsafe impl<B> DetachSafe for Write<B> where B: BufLike {}
+
+impl<B> WriteAt<B>
 where
   B: Send + Sync,
 {
-  pub(crate) fn new(res: Resource, buf: B) -> Write<B> {
-    Self { res, buf: Some(buf) }
+  pub(crate) fn new(res: Resource, buf: B, offset: i64) -> WriteAt<B> {
+    Self { res, buf: Some(buf), offset }
   }
 }
 
-impl<B> OperationExt for Write<B>
+impl<B> OperationExt for WriteAt<B>
 where
   B: BufLike + Send + Sync,
 {
   type Result = BufResult<i32, B>;
 }
 
-impl<B> Operation for Write<B>
+impl<B> Operation for WriteAt<B>
 where
   B: BufLike + Send + Sync,
 {
@@ -65,7 +68,7 @@ where
       ptr.cast_mut(),
       len as u32,
     )
-    .offset(-1i64 as u64)
+    .offset(self.offset as u64)
     .build()
   }
 
@@ -73,8 +76,14 @@ where
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
-    let fd = self.res.as_raw_fd();
 
-    syscall_raw!(write(fd, ptr.cast::<libc::c_void>() as *const _, len,))
+    // For non-seekable fds (pipes, sockets, char devices) with offset -1,
+    // use write() instead of pwrite()
+    syscall_raw!(pwrite(
+      self.res.as_raw_fd(),
+      ptr.cast::<libc::c_void>(),
+      len,
+      self.offset
+    ))
   }
 }

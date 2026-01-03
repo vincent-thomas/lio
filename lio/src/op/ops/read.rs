@@ -1,4 +1,4 @@
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 
 #[cfg(linux)]
 use io_uring::types::Fd;
@@ -61,15 +61,19 @@ where
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
-    io_uring::opcode::Read::new(Fd(self.res.as_fd().as_raw_fd()), ptr.cast_mut(), len as u32)
-      .offset(self.offset as u64)
-      .build()
+    io_uring::opcode::Read::new(
+      Fd(self.res.as_raw_fd()),
+      ptr.cast_mut(),
+      len as u32,
+    )
+    .offset(self.offset as u64)
+    .build()
   }
 
   fn run_blocking(&self) -> isize {
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
-    syscall_raw!(pread(self.res.as_fd().as_raw_fd(), ptr as *mut _, len, self.offset))
+    syscall_raw!(pread(self.res.as_raw_fd(), ptr as *mut _, len, self.offset))
   }
 }

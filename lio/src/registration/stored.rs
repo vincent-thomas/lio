@@ -11,14 +11,14 @@ pub struct StoredOp {
 }
 
 impl StoredOp {
-  pub fn op_ref<'a>(&'a self) -> &'a dyn Operation {
+  pub fn op_ref(&self) -> &dyn Operation {
     self.op.as_ref()
   }
   pub fn new_waker<O>(op: O) -> Self
   where
     O: OperationExt + 'static,
   {
-    Self { op: Box::new(op), notifier: Some(Notifier::Waker(None)) }
+    Self { op: Box::new(op), notifier: Some(Notifier::new_waker()) }
   }
   pub fn new_callback<O, F>(op: Box<O>, f: F) -> Self
   where
@@ -41,7 +41,7 @@ impl StoredOp {
     true
   }
 
-  pub fn take_notifier(&mut self) -> Notifier {
+  pub(crate) fn take_notifier(&mut self) -> Notifier {
     self.notifier.take().unwrap()
   }
 

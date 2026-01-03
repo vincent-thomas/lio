@@ -1,4 +1,4 @@
-use std::{ffi::CString, os::fd::{AsFd, AsRawFd}};
+use std::{ffi::CString, os::fd::AsRawFd};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
@@ -40,7 +40,7 @@ impl Operation for SymlinkAt {
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::SymlinkAt::new(
-      Fd(self.dir_res.as_fd().as_raw_fd()),
+      Fd(self.dir_res.as_raw_fd()),
       self.target.as_ptr(),
       self.linkpath.as_ptr(),
     )
@@ -50,7 +50,7 @@ impl Operation for SymlinkAt {
   fn run_blocking(&self) -> isize {
     syscall_raw!(symlinkat(
       self.target.as_ptr(),
-      self.dir_res.as_fd().as_raw_fd(),
+      self.dir_res.as_raw_fd(),
       self.linkpath.as_ptr()
     ))
   }

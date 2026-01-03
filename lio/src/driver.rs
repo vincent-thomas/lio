@@ -1,26 +1,26 @@
-use crate::backends::SubmitErr;
-use crate::buf::{BufStore, LentBuf};
-use crate::store::OpStore;
-use crate::worker::Worker;
 use crate::{
-  backends::{self, Handler, IoDriver, Submitter},
+  backends::{Handler, IoDriver, SubmitErr, Submitter},
+  buf::{BufStore, LentBuf},
   op::OperationExt,
+  registration::StoredOp,
+  store::OpStore,
+  worker::Worker,
 };
 
-use std::sync::Arc;
-use std::task::Waker;
-use std::{fmt, io};
 use std::{
+  fmt, io,
   ptr::NonNull,
-  sync::atomic::{AtomicPtr, Ordering},
+  sync::{
+    Arc,
+    atomic::{AtomicPtr, Ordering},
+  },
+  task::Waker,
 };
-
-use crate::registration::StoredOp;
 
 pub struct Driver {
   store: Arc<OpStore>,
   primary_worker: Worker,
-  blocking_worker: Worker,
+  // blocking_worker: Worker,
   buf_store: BufStore,
 }
 
@@ -61,13 +61,6 @@ impl Driver {
     let (primary_subm, primary_handler) =
       D::new(primary_state).map_err(TryInitError::Io)?;
 
-    // Initialize blocking backend
-    let blocking_state = backends::blocking::BlockingBackend::new_state()
-      .map_err(TryInitError::Io)?;
-    let (blocking_subm, blocking_handler) =
-      backends::blocking::BlockingBackend::new(blocking_state)
-        .map_err(TryInitError::Io)?;
-
     let store = Arc::new(OpStore::with_capacity(cap));
 
     let primary_handler =
@@ -75,15 +68,9 @@ impl Driver {
     let primary_submitter =
       Submitter::new(Box::new(primary_subm), store.clone(), primary_state);
 
-    let blocking_handler =
-      Handler::new(Box::new(blocking_handler), store.clone(), blocking_state);
-    let blocking_submitter =
-      Submitter::new(Box::new(blocking_subm), store.clone(), blocking_state);
-
     let driver_ptr = Box::into_raw(Box::new(Driver {
       buf_store,
       primary_worker: Worker::spawn(primary_submitter, primary_handler),
-      blocking_worker: Worker::spawn(blocking_submitter, blocking_handler),
       store: store.clone(),
     }));
 
@@ -102,7 +89,6 @@ impl Driver {
 
         // Clean up the states
         D::drop_state(primary_state);
-        backends::blocking::BlockingBackend::drop_state(blocking_state);
         Err(TryInitError::AlreadyInit)
       }
     }
@@ -133,6 +119,7 @@ impl Driver {
   /// Deallocates the Driver, freeing all resources.
   /// This will panic if the driver is not initialized or if shutdown has not been called first.
   pub(crate) fn deallocate(ptr: NonNull<Driver>) {
+    println!("deallocating driver");
     // SAFETY: This pointer was created via Box::into_raw in init()
     let _ = unsafe { Box::from_raw(ptr.as_ptr()) };
   }
@@ -144,23 +131,27 @@ impl Driver {
   }
 
   pub(crate) fn submit(stored: StoredOp) -> Result<u64, SubmitErr> {
-    let driver = Driver::get();
-
     // Try primary worker first
-    match driver.primary_worker.submit(stored) {
-      Ok(id) => Ok(id),
-      Err(backends::SubmitErrExt::NotCompatible(op)) => {
-        // Fallback to blocking worker for incompatible operations
-        match driver.blocking_worker.submit(op) {
-          Ok(id) => Ok(id),
-          Err(backends::SubmitErrExt::NotCompatible(_)) => {
-            // Blocking backend should never return NotCompatible
-            panic!("blocking backend returned NotCompatible")
-          }
-          Err(backends::SubmitErrExt::SubmitErr(e)) => Err(e),
-        }
-      }
-      Err(backends::SubmitErrExt::SubmitErr(e)) => Err(e),
+    match Driver::get().primary_worker.submit(stored) {
+      Ok(id) => dbg!(Ok(id)),
+      Err(err) => Err(err), //   match driver.blocking_worker.submit(op) {
+                            //     Ok(v) => Ok(v),
+                            //     Err(err) => match err {
+                            //       SubmitErrExt::NotCompatible(_)
+                            //       | SubmitErrExt::SubmitErr(SubmitErr::NotCompatible) => {
+                            //         unreachable!()
+                            //       }
+                            //       SubmitErrExt::SubmitErr(err) => match err {
+                            //         SubmitErr::NotCompatible => unreachable!(),
+                            //         _ => Err(err),
+                            //       },
+                            //     },
+                            //   }
+                            // }
+                            // SubmitErrExt::SubmitErr(err) => match err {
+                            //   SubmitErr::NotCompatible => unreachable!(),
+                            //   _ => Err(err),
+                            // },
     }
   }
 

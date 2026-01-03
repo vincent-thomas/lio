@@ -1,4 +1,4 @@
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 
 #[cfg(linux)]
 use io_uring::types::Fd;
@@ -35,10 +35,11 @@ impl Operation for Listen {
   // const OPCODE: u8 = 57;
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::Listen::new(Fd(self.res.as_fd().as_raw_fd()), self.backlog).build()
+    io_uring::opcode::Listen::new(Fd(self.res.as_raw_fd()), self.backlog)
+      .build()
   }
 
   fn run_blocking(&self) -> isize {
-    syscall_raw!(listen(self.res.as_fd().as_raw_fd(), self.backlog))
+    syscall_raw!(listen(self.res.as_raw_fd(), self.backlog))
   }
 }

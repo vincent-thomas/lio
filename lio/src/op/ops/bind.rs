@@ -1,4 +1,4 @@
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 use std::{cell::UnsafeCell, io, mem, net::SocketAddr};
 
 #[cfg(linux)]
@@ -44,7 +44,7 @@ impl Operation for Bind {
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Bind::new(
-      Fd(self.res.as_fd().as_raw_fd()),
+      Fd(self.res.as_raw_fd()),
       self.addr.get().cast(),
       mem::size_of_val(&self.addr) as libc::socklen_t,
     )
@@ -62,7 +62,7 @@ impl Operation for Bind {
     };
 
     syscall_raw!(bind(
-      self.res.as_fd().as_raw_fd(),
+      self.res.as_raw_fd(),
       self.addr.get().cast(),
       addrlen as libc::socklen_t,
     ))

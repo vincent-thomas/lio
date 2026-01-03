@@ -42,6 +42,7 @@
               pkg-config-unwrapped
 
               cargo-nextest
+              cargo-llvm-lines
             ];
           in
           {

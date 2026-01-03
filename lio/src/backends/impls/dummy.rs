@@ -4,10 +4,7 @@
 //! and completes them immediately when polled. Useful for testing Worker behavior
 //! without dealing with actual I/O operations.
 
-use std::{
-  io,
-  sync::{Arc, Mutex},
-};
+use std::io;
 
 use crate::{
   backends::{IoDriver, IoHandler, IoSubmitter, OpCompleted, SubmitErr},
@@ -17,12 +14,17 @@ use crate::{
 
 #[derive(Clone)]
 struct DummyState {
-  pending: Arc<Mutex<Vec<(u64, i32)>>>,
+  pending_tx: crossbeam_channel::Sender<(u64, i32)>,
+  pending_rx: crossbeam_channel::Receiver<(u64, i32)>,
 }
 
 impl DummyState {
   fn new() -> Self {
-    Self { pending: Arc::new(Mutex::new(Vec::new())) }
+    let (pending_tx, pending_rx) = crossbeam_channel::unbounded();
+    Self {
+      pending_tx,
+      pending_rx,
+    }
   }
 }
 
@@ -64,13 +66,12 @@ impl IoSubmitter for DummySubmitter {
     _op: &dyn Operation,
   ) -> Result<(), SubmitErr> {
     // For dummy driver, we just queue the operation with a successful result
-    let mut pending = self.state.pending.lock().unwrap();
-    pending.push((id, 0)); // 0 represents success
+    let _ = self.state.pending_tx.send((id, 0)); // 0 represents success
     Ok(())
   }
 
   fn notify(&mut self, _state: *const ()) -> Result<(), SubmitErr> {
-    // Dummy implementation - nothing to do
+    // Nothing to do - channel already handles notification
     Ok(())
   }
 }
@@ -85,21 +86,38 @@ impl IoHandler for DummyHandler {
     _state: *const (),
     _store: &OpStore,
   ) -> io::Result<Vec<OpCompleted>> {
-    let mut pending = self.state.pending.lock().unwrap();
-    let completed = pending
-      .drain(..)
-      .map(|(op_id, result)| OpCompleted::new(op_id, result as isize))
-      .collect();
+    let mut completed = Vec::new();
+
+    // Drain all available operations without blocking
+    while let Ok((op_id, result)) = self.state.pending_rx.try_recv() {
+      completed.push(OpCompleted::new(op_id, result as isize));
+    }
+
     Ok(completed)
   }
 
   fn tick(
     &mut self,
-    state: *const (),
-    store: &OpStore,
+    _state: *const (),
+    _store: &OpStore,
   ) -> io::Result<Vec<OpCompleted>> {
-    // For dummy driver, tick and try_tick behave the same
-    self.try_tick(state, store)
+    // Block with timeout to allow handler_loop to check shutdown signals
+    let first_op = self.state.pending_rx
+      .recv_timeout(std::time::Duration::from_millis(100));
+
+    let mut completed = Vec::new();
+
+    // If we got an operation, add it to completed
+    if let Ok((op_id, result)) = first_op {
+      completed.push(OpCompleted::new(op_id, result as isize));
+    }
+
+    // Collect any additional operations that arrived
+    while let Ok((op_id, result)) = self.state.pending_rx.try_recv() {
+      completed.push(OpCompleted::new(op_id, result as isize));
+    }
+
+    Ok(completed)
   }
 }
 

@@ -22,21 +22,11 @@ pub struct Receiver<T> {
   recv: Option<std_mpsc::Receiver<T>>,
 }
 
-/// Error returned when [`BlockingReceiver::recv_timeout`] times out.
+/// Error returned when [`Receiver::recv_timeout`] times out.
 #[derive(Debug)]
 pub struct RecvTimeoutError;
 
 impl<T> Receiver<T> {
-  fn get_inner(&mut self) -> Option<std_mpsc::Receiver<T>> {
-    mem::replace(&mut self.recv, None)
-  }
-
-  fn set_inner(&mut self, value: std_mpsc::Receiver<T>) {
-    if let Some(_) = mem::replace(&mut self.recv, Some(value)) {
-      panic!("internal lio error");
-    };
-  }
-
   /// Blocks the current thread until the operation completes and returns the result.
   ///
   /// This method will block indefinitely until the I/O operation finishes
@@ -123,6 +113,18 @@ impl<T> Receiver<T> {
   }
 }
 
+impl<T> Receiver<T> {
+  fn get_inner(&mut self) -> Option<std_mpsc::Receiver<T>> {
+    self.recv.take()
+  }
+
+  fn set_inner(&mut self, value: std_mpsc::Receiver<T>) {
+    if let Some(_) = self.recv.replace(value) {
+      panic!("internal lio error");
+    };
+  }
+}
+
 pub struct Progress<T> {
   op: T,
 }
@@ -153,6 +155,7 @@ impl<T> Progress<T> {
   /// lio::stop();
   /// lio::exit();
   /// ```
+  #[inline]
   pub fn blocking(self) -> T::Result
   where
     T: OperationExt + 'static,
@@ -177,6 +180,7 @@ impl<T> Progress<T> {
   /// let (result, buffer) = receiver.recv();
   /// let _ = result.unwrap();
   /// ```
+  #[inline]
   pub fn send(self) -> Receiver<T::Result>
   where
     T: OperationExt + Send + 'static,
@@ -213,6 +217,7 @@ impl<T> Progress<T> {
   ///     Ok(())
   /// }
   /// ```
+  #[inline]
   pub fn send_with(self, sender: std_mpsc::Sender<T::Result>)
   where
     T: OperationExt + Send + 'static,

@@ -1,5 +1,14 @@
 //! # `lio` C API
 //!
+//! ## Cross-Platform Compatibility
+//!
+//! This FFI uses `intptr_t` for file descriptors/handles to support both Unix and Windows:
+//! - **Unix/POSIX**: File descriptors are `int` (32-bit), which fits in `intptr_t`
+//! - **Windows**: Handles are `HANDLE` (pointer-sized), which fit exactly in `intptr_t`
+//!
+//! This follows the C ecosystem standard (used by libuv, etc.) for cross-platform I/O APIs.
+//! Include `<stdint.h>` in your C code to use `intptr_t`.
+//!
 //! ## Compiling
 //! `lio` can be compiled using cargo with command:
 //! ```sh
@@ -38,7 +47,41 @@ use std::{ptr, time::Duration};
 use crate::{
   driver::TryInitError,
   op::net_utils::{self, sockaddr_to_socketaddr},
+  resource::Resource,
 };
+
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+
+#[cfg(windows)]
+use std::os::windows::io::FromRawHandle;
+
+/// Converts a C file descriptor/handle (intptr_t) to a Resource.
+///
+/// # Safety
+/// The caller must ensure the fd/handle is valid.
+#[cfg(unix)]
+unsafe fn fd_to_resource(fd: libc::intptr_t) -> Resource {
+  Resource::from_raw_fd(fd as i32)
+}
+
+#[cfg(windows)]
+unsafe fn fd_to_resource(fd: libc::intptr_t) -> Resource {
+  Resource::from_raw_handle(fd as *mut std::ffi::c_void)
+}
+
+/// Converts a Resource to a C file descriptor/handle (intptr_t).
+#[cfg(unix)]
+fn resource_to_fd(resource: &Resource) -> libc::intptr_t {
+  use std::os::fd::{AsFd, AsRawFd};
+  resource.as_fd().as_raw_fd() as libc::intptr_t
+}
+
+#[cfg(windows)]
+fn resource_to_fd(resource: &Resource) -> libc::intptr_t {
+  use std::os::windows::io::{AsHandle, AsRawHandle};
+  resource.as_handle().as_raw_handle() as libc::intptr_t
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_init() {
@@ -73,17 +116,18 @@ pub extern "C" fn lio_tick() {
 /// Shut down part of a full-duplex connection.
 ///
 /// # Parameters
-/// - `fd`: Socket file descriptor
+/// - `fd`: Socket file descriptor (intptr_t for cross-platform compatibility)
 /// - `how`: How to shutdown (SHUT_RD=0, SHUT_WR=1, SHUT_RDWR=2)
 /// - `callback(result)`: Called when complete
 ///   - `result`: 0 on success, or negative errno on error
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_shutdown(
-  fd: libc::c_int,
+  fd: libc::intptr_t,
   how: i32,
   callback: extern "C" fn(i32),
 ) {
-  crate::shutdown(fd, how).when_done(move |res| {
+  let resource = unsafe { fd_to_resource(fd) };
+  crate::shutdown(resource, how).when_done(move |res| {
     let result_code = match res {
       Ok(_) => 0,
       Err(err) => err.raw_os_error().unwrap_or(-1),
@@ -96,13 +140,14 @@ pub extern "C" fn lio_shutdown(
 #[allow(unused)]
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_symlinkat(
-  new_dir_fd: libc::c_int,
+  new_dir_fd: libc::intptr_t,
   target: *const libc::c_char,
   linkpath: *const libc::c_char,
   callback: extern "C" fn(i32),
 ) {
   todo!();
-  // crate::symlinkat(new_dir_fd, target.).when_done(move |res| {
+  // let resource = unsafe { fd_to_resource(new_dir_fd) };
+  // crate::symlinkat(resource, target.).when_done(move |res| {
   //   let result_code = match res {
   //     Ok(_) => 0,
   //     Err(err) => err.raw_os_error().unwrap_or(-1),
@@ -115,14 +160,16 @@ pub extern "C" fn lio_symlinkat(
 #[allow(unused)]
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_linkat(
-  old_dir_fd: libc::c_int,
+  old_dir_fd: libc::intptr_t,
   old_path: *const libc::c_char,
-  new_dir_fd: libc::c_int,
+  new_dir_fd: libc::intptr_t,
   new_path: *const libc::c_char,
   callback: extern "C" fn(i32),
 ) {
   todo!();
-  // crate::linkat(new_dir_fd, target.).when_done(move |res| {
+  // let old_resource = unsafe { fd_to_resource(old_dir_fd) };
+  // let new_resource = unsafe { fd_to_resource(new_dir_fd) };
+  // crate::linkat(old_resource, target.).when_done(move |res| {
   //   let result_code = match res {
   //     Ok(_) => 0,
   //     Err(err) => err.raw_os_error().unwrap_or(-1),
@@ -134,12 +181,13 @@ pub extern "C" fn lio_linkat(
 /// Synchronize a file's in-core state with storage device.
 ///
 /// # Parameters
-/// - `fd`: File descriptor
+/// - `fd`: File descriptor (intptr_t for cross-platform compatibility)
 /// - `callback(result)`: Called when complete
 ///   - `result`: 0 on success, or negative errno on error
 #[unsafe(no_mangle)]
-pub extern "C" fn lio_fsync(fd: libc::c_int, callback: extern "C" fn(i32)) {
-  crate::fsync(fd).when_done(move |res| {
+pub extern "C" fn lio_fsync(fd: libc::intptr_t, callback: extern "C" fn(i32)) {
+  let resource = unsafe { fd_to_resource(fd) };
+  crate::fsync(resource).when_done(move |res| {
     let result_code = match res {
       Ok(_) => 0,
       Err(err) => err.raw_os_error().unwrap_or(-1),
@@ -153,7 +201,7 @@ pub extern "C" fn lio_fsync(fd: libc::c_int, callback: extern "C" fn(i32)) {
 /// Ownership of `buf` transfers to lio and returns via callback. See module docs for details.
 ///
 /// # Parameters
-/// - `fd`: File descriptor
+/// - `fd`: File descriptor (intptr_t for cross-platform compatibility)
 /// - `buf`: malloc-allocated buffer containing data to write
 /// - `buf_len`: Buffer length in bytes
 /// - `offset`: File offset, or -1 for current position
@@ -162,8 +210,8 @@ pub extern "C" fn lio_fsync(fd: libc::c_int, callback: extern "C" fn(i32)) {
 ///   - `buf`: Original buffer pointer (must free)
 ///   - `len`: Original buffer length
 #[unsafe(no_mangle)]
-pub extern "C" fn lio_write(
-  fd: libc::c_int,
+pub extern "C" fn lio_write_at(
+  fd: libc::intptr_t,
   buf: *mut u8,
   buf_len: usize,
   offset: i64,
@@ -175,8 +223,9 @@ pub extern "C" fn lio_write(
   // 2. We're taking exclusive ownership (C must not touch it anymore)
   // 3. We'll return it via the callback where C can free it
   let buf_vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  let resource = unsafe { fd_to_resource(fd) };
 
-  crate::write_with_buf(fd, buf_vec, offset).when_done(
+  crate::write_at_with_buf(resource, buf_vec, offset).when_done(
     move |(res, mut buf)| {
       let result_code = match res {
         Ok(n) => n,
@@ -201,7 +250,7 @@ pub extern "C" fn lio_write(
 /// Ownership of `buf` transfers to lio and returns via callback. See module docs for details.
 ///
 /// # Parameters
-/// - `fd`: File descriptor
+/// - `fd`: File descriptor (intptr_t for cross-platform compatibility)
 /// - `buf`: malloc-allocated buffer to read into
 /// - `buf_len`: Buffer length in bytes
 /// - `offset`: File offset, or -1 for current position
@@ -211,7 +260,7 @@ pub extern "C" fn lio_write(
 ///   - `len`: Original buffer length
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_read(
-  fd: libc::c_int,
+  fd: libc::intptr_t,
   buf: *mut u8,
   buf_len: usize,
   offset: i64,
@@ -223,39 +272,43 @@ pub extern "C" fn lio_read(
   // 2. We're taking exclusive ownership (C must not touch it anymore)
   // 3. We'll return it via the callback where C can free it
   let buf_vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  let resource = unsafe { fd_to_resource(fd) };
 
-  crate::read_with_buf(fd, buf_vec, offset).when_done(move |(res, mut buf)| {
-    let result_code = match res {
-      Ok(n) => n,
-      Err(err) => err.raw_os_error().unwrap_or(-1),
-    };
+  crate::read_with_buf(resource, buf_vec, offset).when_done(
+    move |(res, mut buf)| {
+      let result_code = match res {
+        Ok(n) => n,
+        Err(err) => err.raw_os_error().unwrap_or(-1),
+      };
 
-    // Return buffer ownership to C caller
-    let buf_ptr = buf.as_mut_ptr();
-    let buf_len = buf.len();
+      // Return buffer ownership to C caller
+      let buf_ptr = buf.as_mut_ptr();
+      let buf_len = buf.len();
 
-    // SAFETY: Prevent Rust from freeing the buffer since we're giving ownership back to C.
-    // C must now free this buffer to avoid memory leak.
-    std::mem::forget(buf);
+      // SAFETY: Prevent Rust from freeing the buffer since we're giving ownership back to C.
+      // C must now free this buffer to avoid memory leak.
+      std::mem::forget(buf);
 
-    callback(result_code, buf_ptr, buf_len);
-  });
+      callback(result_code, buf_ptr, buf_len);
+    },
+  );
 }
 
 /// Truncate a file to a specified length.
 ///
 /// # Parameters
-/// - `fd`: File descriptor
+/// - `fd`: File descriptor (intptr_t for cross-platform compatibility)
 /// - `len`: New file length in bytes
 /// - `callback(result)`: Called when complete
 ///   - `result`: 0 on success, or negative errno on error
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_truncate(
-  fd: libc::c_int,
+  fd: libc::intptr_t,
   len: u64,
   callback: extern "C" fn(i32),
 ) {
-  crate::truncate(fd, len).when_done(move |res| {
+  let resource = unsafe { fd_to_resource(fd) };
+  crate::truncate(resource, len).when_done(move |res| {
     let result_code = match res {
       Ok(_) => 0,
       Err(err) => err.raw_os_error().unwrap_or(-1),
@@ -271,18 +324,18 @@ pub extern "C" fn lio_truncate(
 /// - `ty`: Socket type (SOCK_STREAM=1, SOCK_DGRAM=2, etc.)
 /// - `proto`: Protocol (IPPROTO_TCP=6, IPPROTO_UDP=17, or 0 for default)
 /// - `callback(result)`: Called when complete
-///   - `result`: Socket file descriptor on success, or negative errno on error
+///   - `result`: Socket file descriptor (intptr_t) on success, or negative errno on error
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_socket(
   domain: i32,
   ty: i32,
   proto: i32,
-  callback: extern "C" fn(i32),
+  callback: extern "C" fn(libc::intptr_t),
 ) {
   crate::socket(domain, ty, proto).when_done(move |res| {
     let result_code = match res {
-      Ok(fd) => fd,
-      Err(err) => err.raw_os_error().unwrap_or(-1),
+      Ok(resource) => resource_to_fd(&resource),
+      Err(err) => err.raw_os_error().unwrap_or(-1) as libc::intptr_t,
     };
     callback(result_code);
   });
@@ -291,22 +344,23 @@ pub extern "C" fn lio_socket(
 /// Bind a socket to an address.
 ///
 /// # Parameters
-/// - `fd`: Socket file descriptor
+/// - `fd`: Socket file descriptor (intptr_t for cross-platform compatibility)
 /// - `sock`: Pointer to sockaddr structure (sockaddr_in or sockaddr_in6)
 /// - `sock_len`: Pointer to size of sockaddr structure
 /// - `callback(result)`: Called when complete
 ///   - `result`: 0 on success, or negative errno on error
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_bind(
-  fd: libc::c_int,
+  fd: libc::intptr_t,
   sock: *const libc::sockaddr,
   sock_len: *const libc::socklen_t,
   callback: extern "C" fn(i32),
 ) {
   // TODO: fix unwrap.
   let addr = sockaddr_to_socketaddr(sock, unsafe { *sock_len }).unwrap();
+  let resource = unsafe { fd_to_resource(fd) };
   // TODO: Optimise
-  crate::bind(fd, addr).when_done(move |res| {
+  crate::bind(resource, addr).when_done(move |res| {
     let result_code = match res {
       Ok(_) => 0,
       Err(err) => err.raw_os_error().unwrap_or(-1),
@@ -318,24 +372,26 @@ pub extern "C" fn lio_bind(
 /// Accept a connection on a socket.
 ///
 /// # Parameters
-/// - `fd`: Listening socket file descriptor
+/// - `fd`: Listening socket file descriptor (intptr_t for cross-platform compatibility)
 /// - `callback(result, addr)`: Called when complete
-///   - `result`: New socket file descriptor on success, or negative errno on error
+///   - `result`: New socket file descriptor (intptr_t) on success, or negative errno on error
 ///   - `addr`: Pointer to peer address (null on error, caller must free on success)
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_accept(
-  fd: libc::c_int,
-  callback: extern "C" fn(i32, *const libc::sockaddr_storage),
+  fd: libc::intptr_t,
+  callback: extern "C" fn(libc::intptr_t, *const libc::sockaddr_storage),
 ) {
-  // TODO: fix unwrap.
-  crate::accept(fd).when_done(move |res| {
+  let resource = unsafe { fd_to_resource(fd) };
+  crate::accept(resource).when_done(move |res| {
     let (res, addr) = match res {
-      Ok((fd, addr)) => (
-        fd,
+      Ok((new_resource, addr)) => (
+        resource_to_fd(&new_resource),
         Box::into_raw(Box::new(net_utils::std_socketaddr_into_libc(addr)))
           as *const _,
       ),
-      Err(err) => (err.raw_os_error().unwrap_or(-1), ptr::null()),
+      Err(err) => {
+        (err.raw_os_error().unwrap_or(-1) as libc::intptr_t, ptr::null())
+      }
     };
 
     callback(res, addr)
@@ -345,17 +401,18 @@ pub extern "C" fn lio_accept(
 /// Listen for connections on a socket.
 ///
 /// # Parameters
-/// - `fd`: Socket file descriptor
+/// - `fd`: Socket file descriptor (intptr_t for cross-platform compatibility)
 /// - `backlog`: Maximum length of pending connections queue
 /// - `callback(result)`: Called when complete
 ///   - `result`: 0 on success, or negative errno on error
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_listen(
-  fd: libc::c_int,
+  fd: libc::intptr_t,
   backlog: i32,
   callback: extern "C" fn(i32),
 ) {
-  crate::listen(fd, backlog).when_done(move |res| {
+  let resource = unsafe { fd_to_resource(fd) };
+  crate::listen(resource, backlog).when_done(move |res| {
     let result_code = match res {
       Ok(_) => 0,
       Err(err) => err.raw_os_error().unwrap_or(-1),
@@ -369,7 +426,7 @@ pub extern "C" fn lio_listen(
 /// Ownership of `buf` transfers to lio and returns via callback. See module docs for details.
 ///
 /// # Parameters
-/// - `fd`: Socket file descriptor
+/// - `fd`: Socket file descriptor (intptr_t for cross-platform compatibility)
 /// - `buf`: malloc-allocated buffer containing data to send
 /// - `buf_len`: Buffer length in bytes
 /// - `flags`: Send flags (e.g., MSG_DONTWAIT, MSG_NOSIGNAL)
@@ -379,7 +436,7 @@ pub extern "C" fn lio_listen(
 ///   - `len`: Original buffer length
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_send(
-  fd: libc::c_int,
+  fd: libc::intptr_t,
   buf: *mut u8,
   buf_len: usize,
   flags: i32,
@@ -391,8 +448,9 @@ pub extern "C" fn lio_send(
   // 2. We're taking exclusive ownership (C must not touch it anymore)
   // 3. We'll return it via the callback where C can free it
   let buf_vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  let resource = unsafe { fd_to_resource(fd) };
 
-  crate::send_with_buf(fd, buf_vec, Some(flags)).when_done(
+  crate::send_with_buf(resource, buf_vec, Some(flags)).when_done(
     move |(res, mut buf)| {
       let result_code = match res {
         Ok(n) => n,
@@ -417,7 +475,7 @@ pub extern "C" fn lio_send(
 /// Ownership of `buf` transfers to lio and returns via callback. See module docs for details.
 ///
 /// # Parameters
-/// - `fd`: Socket file descriptor
+/// - `fd`: Socket file descriptor (intptr_t for cross-platform compatibility)
 /// - `buf`: malloc-allocated buffer to receive into
 /// - `buf_len`: Buffer length in bytes
 /// - `flags`: Receive flags (e.g., MSG_PEEK, MSG_WAITALL)
@@ -427,7 +485,7 @@ pub extern "C" fn lio_send(
 ///   - `len`: Original buffer length
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_recv(
-  fd: libc::c_int,
+  fd: libc::intptr_t,
   buf: *mut u8,
   buf_len: usize,
   flags: i32,
@@ -439,8 +497,9 @@ pub extern "C" fn lio_recv(
   // 2. We're taking exclusive ownership (C must not touch it anymore)
   // 3. We'll return it via the callback where C can free it
   let buf_vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  let resource = unsafe { fd_to_resource(fd) };
 
-  crate::recv_with_buf(fd, buf_vec, Some(flags)).when_done(
+  crate::recv_with_buf(resource, buf_vec, Some(flags)).when_done(
     move |(res, mut buf)| {
       let result_code = match res {
         Ok(n) => n,
@@ -463,12 +522,13 @@ pub extern "C" fn lio_recv(
 /// Close a file descriptor.
 ///
 /// # Parameters
-/// - `fd`: File descriptor to close
+/// - `fd`: File descriptor to close (intptr_t for cross-platform compatibility)
 /// - `callback(result)`: Called when complete
 /// - `result`: 0 on success, or negative errno on error
 #[unsafe(no_mangle)]
-pub extern "C" fn lio_close(fd: libc::c_int, callback: extern "C" fn(i32)) {
-  crate::close(fd).when_done(move |res| {
+pub extern "C" fn lio_close(fd: libc::intptr_t, callback: extern "C" fn(i32)) {
+  let resource = unsafe { fd_to_resource(fd) };
+  crate::close(resource).when_done(move |res| {
     let result_code = match res {
       Ok(_) => 0,
       Err(err) => err.raw_os_error().unwrap_or(-1),

@@ -18,8 +18,10 @@
 //!     // All buffers in use, fallback to Vec::with_capacity(4096)
 //! }
 //! ```
-
-use crate::blocking_queue::BlockingCoordinator;
+//!
+//! # `zeroize`
+//!
+//! testing
 
 /// Result type for operations that return both a result and a buffer.
 ///
@@ -75,7 +77,7 @@ use std::array;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crossbeam_queue::ArrayQueue;
+use crossbeam_channel::{Receiver, Sender};
 use std::time::Duration;
 
 /// A borrowed buffer from a `BufStore` pool.
@@ -146,11 +148,8 @@ impl<'a> Drop for LentBuf<'a> {
     // Mark buffer as available
     cell.in_use.store(false, Ordering::Release);
 
-    // Return index to free list (zero allocations)
-    let _ = self.pool.free_list.push(self.index);
-
-    // Notify any waiting threads that a buffer is now available
-    self.pool.blocking.notify_one();
+    // Return index to free list
+    let _ = self.pool.free_tx.send(self.index);
   }
 }
 
@@ -317,8 +316,8 @@ impl BufCell {
 /// ```
 pub struct BufStore {
   buffers: Box<[BufCell]>,
-  free_list: ArrayQueue<u32>,
-  blocking: BlockingCoordinator,
+  free_tx: Sender<u32>,
+  free_rx: Receiver<u32>,
 }
 
 impl Default for BufStore {
@@ -338,18 +337,15 @@ impl BufStore {
   /// - `cap`: Number of 4096-byte buffers to allocate in the pool
   pub fn with_capacity(cap: usize) -> Self {
     let mut buffers = Vec::with_capacity(cap);
-    let free_list = ArrayQueue::new(cap);
+    let (free_tx, free_rx) = crossbeam_channel::unbounded();
 
     for i in 0..cap {
       buffers.push(BufCell::new());
-      assert!(free_list.push(i as u32).is_ok());
+      // Pre-populate the channel with all buffer indices
+      free_tx.send(i as u32).expect("channel should not be full");
     }
 
-    Self {
-      buffers: buffers.into_boxed_slice(),
-      free_list,
-      blocking: BlockingCoordinator::new(),
-    }
+    Self { buffers: buffers.into_boxed_slice(), free_tx, free_rx }
   }
 
   /// Tries to borrow a buffer from the pool.
@@ -366,7 +362,7 @@ impl BufStore {
   /// - `Some(LentBuf)`: A borrowed buffer from the pool
   /// - `None`: All buffers are in use
   pub fn try_get(&self) -> Option<LentBuf<'_>> {
-    let index = self.free_list.pop()?;
+    let index = self.free_rx.try_recv().ok()?;
     Some(self.acquire_buffer(index))
   }
 
@@ -379,7 +375,7 @@ impl BufStore {
   ///
   /// A borrowed buffer from the pool
   pub fn get(&self) -> LentBuf<'_> {
-    let index = self.blocking.blocking_pop(|| self.free_list.pop());
+    let index = self.free_rx.recv().expect("channel should not disconnect");
     self.acquire_buffer(index)
   }
 
@@ -396,9 +392,10 @@ impl BufStore {
   /// - `Some(LentBuf)`: A borrowed buffer from the pool
   /// - `None`: Timeout expired before a buffer became available
   pub fn get_timeout(&self, timeout: Duration) -> Option<LentBuf<'_>> {
-    let index =
-      self.blocking.blocking_pop_timeout(|| self.free_list.pop(), timeout)?;
-    Some(self.acquire_buffer(index))
+    match self.free_rx.recv_timeout(timeout) {
+      Ok(index) => Some(self.acquire_buffer(index)),
+      Err(_) => None,
+    }
   }
 
   /// Internal helper to acquire a buffer by index.
@@ -421,14 +418,14 @@ impl BufStore {
 
   /// Returns the total capacity of the buffer pool.
   pub fn capacity(&self) -> usize {
-    self.free_list.capacity()
+    self.buffers.len()
   }
 
   /// Returns the number of currently available buffers.
   ///
   /// Note: This is a snapshot and may be stale immediately.
   pub fn available(&self) -> usize {
-    self.free_list.len()
+    self.free_rx.len()
   }
 }
 
@@ -437,7 +434,7 @@ mod tests {
   use super::*;
 
   #[test]
-  fn nice() {
+  fn make_sure_send_and_sync() {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
     assert_send::<super::BufStore>();

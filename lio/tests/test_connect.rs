@@ -2,6 +2,7 @@ use lio::{bind, connect, listen};
 use std::{
   mem::MaybeUninit,
   net::SocketAddr,
+  os::fd::{AsFd, AsRawFd},
   sync::mpsc::{self, TryRecvError},
 };
 
@@ -30,7 +31,7 @@ fn test_connect_basic() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(server_sock, addr).when_done(move |res| {
+  bind(&server_sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -44,7 +45,7 @@ fn test_connect_basic() {
     let mut addr_len =
       std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     libc::getsockname(
-      server_sock,
+      server_sock.as_fd().as_raw_fd(),
       addr_storage.as_mut_ptr() as *mut libc::sockaddr,
       &mut addr_len,
     );
@@ -54,7 +55,7 @@ fn test_connect_basic() {
   };
 
   let sender_l = sender_unit.clone();
-  listen(server_sock, 128).when_done(move |res| {
+  listen(&server_sock, 128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -80,7 +81,7 @@ fn test_connect_basic() {
   let (sender_c, receiver_c) = mpsc::channel();
   let sender_c1 = sender_c.clone();
 
-  connect(client_sock, bound_addr).when_done(move |res| {
+  connect(&client_sock, bound_addr).when_done(move |res| {
     sender_c1.send(res).unwrap();
   });
 
@@ -95,14 +96,14 @@ fn test_connect_basic() {
     let mut peer_len =
       std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     let result = libc::getpeername(
-      client_sock,
+      client_sock.as_fd().as_raw_fd(),
       peer_addr.as_mut_ptr() as *mut libc::sockaddr,
       &mut peer_len,
     );
     assert_eq!(result, 0, "Should be able to get peer name after connect");
 
-    libc::close(client_sock);
-    libc::close(server_sock);
+    libc::close(client_sock.as_fd().as_raw_fd());
+    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -130,7 +131,7 @@ fn test_connect_ipv6() {
   let addr: SocketAddr = "[::1]:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(server_sock, addr).when_done(move |res| {
+  bind(&server_sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -144,7 +145,7 @@ fn test_connect_ipv6() {
     let mut addr_len =
       std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
     libc::getsockname(
-      server_sock,
+      server_sock.as_fd().as_raw_fd(),
       addr_storage.as_mut_ptr() as *mut libc::sockaddr,
       &mut addr_len,
     );
@@ -154,7 +155,7 @@ fn test_connect_ipv6() {
   };
 
   let sender_l = sender_unit.clone();
-  listen(server_sock, 128).when_done(move |res| {
+  listen(&server_sock, 128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -179,7 +180,7 @@ fn test_connect_ipv6() {
   let (sender_c, receiver_c) = mpsc::channel();
   let sender_c1 = sender_c.clone();
 
-  connect(client_sock, bound_addr).when_done(move |res| {
+  connect(&client_sock, bound_addr).when_done(move |res| {
     sender_c1.send(res).unwrap();
   });
 
@@ -193,14 +194,14 @@ fn test_connect_ipv6() {
     let mut peer_len =
       std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     let result = libc::getpeername(
-      client_sock,
+      client_sock.as_fd().as_raw_fd(),
       peer_addr.as_mut_ptr() as *mut libc::sockaddr,
       &mut peer_len,
     );
     assert_eq!(result, 0);
 
-    libc::close(client_sock);
-    libc::close(server_sock);
+    libc::close(client_sock.as_fd().as_raw_fd());
+    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -230,7 +231,7 @@ fn test_connect_to_nonexistent() {
   let (sender_c, receiver_c) = mpsc::channel();
   let sender_c1 = sender_c.clone();
 
-  connect(client_sock, addr).when_done(move |res| {
+  connect(&client_sock, addr).when_done(move |res| {
     sender_c1.send(res).unwrap();
   });
 
@@ -243,7 +244,7 @@ fn test_connect_to_nonexistent() {
   assert!(result.is_err(), "Connect to non-listening port should fail");
 
   unsafe {
-    libc::close(client_sock);
+    libc::close(client_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -271,7 +272,7 @@ fn test_connect_multiple_clients() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(server_sock, addr).when_done(move |res| {
+  bind(&server_sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -285,7 +286,7 @@ fn test_connect_multiple_clients() {
     let mut addr_len =
       std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     libc::getsockname(
-      server_sock,
+      server_sock.as_fd().as_raw_fd(),
       addr_storage.as_mut_ptr() as *mut libc::sockaddr,
       &mut addr_len,
     );
@@ -295,7 +296,7 @@ fn test_connect_multiple_clients() {
   };
 
   let sender_l = sender_unit.clone();
-  listen(server_sock, 128).when_done(move |res| {
+  listen(&server_sock, 128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -323,7 +324,7 @@ fn test_connect_multiple_clients() {
     let (sender_c, receiver_c) = mpsc::channel();
     let sender_c1 = sender_c.clone();
 
-    connect(client_sock, bound_addr).when_done(move |res| {
+    connect(&client_sock, bound_addr).when_done(move |res| {
       sender_c1.send(res).unwrap();
     });
 
@@ -340,9 +341,9 @@ fn test_connect_multiple_clients() {
   // Cleanup
   unsafe {
     for sock in client_socks {
-      libc::close(sock);
+      libc::close(sock.as_fd().as_raw_fd());
     }
-    libc::close(server_sock);
+    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -373,7 +374,7 @@ fn test_connect_already_connected() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(server_sock, addr).when_done(move |res| {
+  bind(&server_sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -387,7 +388,7 @@ fn test_connect_already_connected() {
     let mut addr_len =
       std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     libc::getsockname(
-      server_sock,
+      server_sock.as_fd().as_raw_fd(),
       addr_storage.as_mut_ptr() as *mut libc::sockaddr,
       &mut addr_len,
     );
@@ -397,7 +398,7 @@ fn test_connect_already_connected() {
   };
 
   let sender_l = sender_unit.clone();
-  listen(server_sock, 128).when_done(move |res| {
+  listen(&server_sock, 128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -422,7 +423,7 @@ fn test_connect_already_connected() {
   let (sender_c, receiver_c) = mpsc::channel();
   let sender_c1 = sender_c.clone();
 
-  connect(client_sock, bound_addr).when_done(move |res| {
+  connect(&client_sock, bound_addr).when_done(move |res| {
     sender_c1.send(res).unwrap();
   });
 
@@ -435,7 +436,7 @@ fn test_connect_already_connected() {
   let (sender_c2, receiver_c2) = mpsc::channel();
   let sender_c3 = sender_c2.clone();
 
-  connect(client_sock, bound_addr).when_done(move |res| {
+  connect(&client_sock, bound_addr).when_done(move |res| {
     sender_c3.send(res).unwrap();
   });
 
@@ -450,8 +451,8 @@ fn test_connect_already_connected() {
   assert!(result.is_err(), "Second connect should fail: err {result:#?}");
 
   unsafe {
-    libc::close(client_sock);
-    libc::close(server_sock);
+    libc::close(client_sock.as_fd().as_raw_fd());
+    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -479,7 +480,7 @@ fn test_connect_to_localhost() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(server_sock, addr).when_done(move |res| {
+  bind(&server_sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -493,7 +494,7 @@ fn test_connect_to_localhost() {
     let mut addr_len =
       std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     libc::getsockname(
-      server_sock,
+      server_sock.as_fd().as_raw_fd(),
       addr_storage.as_mut_ptr() as *mut libc::sockaddr,
       &mut addr_len,
     );
@@ -503,7 +504,7 @@ fn test_connect_to_localhost() {
   };
 
   let sender_l = sender_unit.clone();
-  listen(server_sock, 128).when_done(move |res| {
+  listen(&server_sock, 128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -528,7 +529,7 @@ fn test_connect_to_localhost() {
   let (sender_c, receiver_c) = mpsc::channel();
   let sender_c1 = sender_c.clone();
 
-  connect(client_sock, bound_addr).when_done(move |res| {
+  connect(&client_sock, bound_addr).when_done(move |res| {
     sender_c1.send(res).unwrap();
   });
 
@@ -543,15 +544,15 @@ fn test_connect_to_localhost() {
     let mut peer_len =
       std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     libc::getpeername(
-      client_sock,
+      client_sock.as_fd().as_raw_fd(),
       peer_addr.as_mut_ptr() as *mut libc::sockaddr,
       &mut peer_len,
     );
     let sockaddr_in = peer_addr.assume_init();
     assert_eq!(u32::from_be(sockaddr_in.sin_addr.s_addr), 0x7f000001);
 
-    libc::close(client_sock);
-    libc::close(server_sock);
+    libc::close(client_sock.as_fd().as_raw_fd());
+    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -579,7 +580,7 @@ fn test_connect_concurrent() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(server_sock, addr).when_done(move |res| {
+  bind(&server_sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -593,7 +594,7 @@ fn test_connect_concurrent() {
     let mut addr_len =
       std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     libc::getsockname(
-      server_sock,
+      server_sock.as_fd().as_raw_fd(),
       addr_storage.as_mut_ptr() as *mut libc::sockaddr,
       &mut addr_len,
     );
@@ -603,7 +604,7 @@ fn test_connect_concurrent() {
   };
 
   let sender_l = sender_unit.clone();
-  listen(server_sock, 128).when_done(move |res| {
+  listen(&server_sock, 128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -631,7 +632,7 @@ fn test_connect_concurrent() {
     let (sender_c, receiver_c) = mpsc::channel();
     let sender_c1 = sender_c.clone();
 
-    connect(client_sock, bound_addr).when_done(move |res| {
+    connect(&client_sock, bound_addr).when_done(move |res| {
       sender_c1.send(res).unwrap();
     });
 
@@ -648,9 +649,9 @@ fn test_connect_concurrent() {
   // Cleanup
   unsafe {
     for sock in client_socks {
-      libc::close(sock);
+      libc::close(sock.as_fd().as_raw_fd());
     }
-    libc::close(server_sock);
+    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -678,7 +679,7 @@ fn test_connect_with_bind() {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_b = sender_unit.clone();
-  bind(server_sock, addr).when_done(move |res| {
+  bind(&server_sock, addr).when_done(move |res| {
     sender_b.send(res).unwrap();
   });
 
@@ -692,7 +693,7 @@ fn test_connect_with_bind() {
     let mut addr_len =
       std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     libc::getsockname(
-      server_sock,
+      server_sock.as_fd().as_raw_fd(),
       addr_storage.as_mut_ptr() as *mut libc::sockaddr,
       &mut addr_len,
     );
@@ -702,7 +703,7 @@ fn test_connect_with_bind() {
   };
 
   let sender_l = sender_unit.clone();
-  listen(server_sock, 128).when_done(move |res| {
+  listen(&server_sock, 128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -728,7 +729,7 @@ fn test_connect_with_bind() {
   let client_bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let sender_bc = sender_unit.clone();
-  bind(client_sock, client_bind_addr).when_done(move |res| {
+  bind(&client_sock, client_bind_addr).when_done(move |res| {
     sender_bc.send(res).unwrap();
   });
 
@@ -741,7 +742,7 @@ fn test_connect_with_bind() {
   let (sender_c, receiver_c) = mpsc::channel();
   let sender_c1 = sender_c.clone();
 
-  connect(client_sock, bound_addr).when_done(move |res| {
+  connect(&client_sock, bound_addr).when_done(move |res| {
     sender_c1.send(res).unwrap();
   });
 
@@ -751,7 +752,7 @@ fn test_connect_with_bind() {
   receiver_c.recv().unwrap().expect("Failed to connect");
 
   unsafe {
-    libc::close(client_sock);
-    libc::close(server_sock);
+    libc::close(client_sock.as_fd().as_raw_fd());
+    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }

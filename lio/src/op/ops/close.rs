@@ -1,5 +1,5 @@
 use std::io;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 
 #[cfg(linux)]
 use io_uring::{opcode, types::Fd};
@@ -37,10 +37,10 @@ impl Operation for Close {
 
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
-    opcode::Close::new(Fd(self.res.as_fd().as_raw_fd())).build()
+    opcode::Close::new(Fd(self.res.as_raw_fd())).build()
   }
 
   fn run_blocking(&self) -> isize {
-    syscall_raw!(close(self.res.as_fd().as_raw_fd()))
+    syscall_raw!(close(self.res.as_raw_fd()))
   }
 }

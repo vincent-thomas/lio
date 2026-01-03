@@ -1,6 +1,6 @@
 use std::cell::UnsafeCell;
 use std::net::SocketAddr;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, mem};
 
@@ -65,7 +65,7 @@ impl Operation for Connect {
   #[cfg(linux)]
   fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Connect::new(
-      Fd(self.res.as_fd().as_raw_fd()),
+      Fd(self.res.as_raw_fd()),
       self.addr.get().cast(),
       self.get_addrlen(),
     )
@@ -77,12 +77,16 @@ impl Operation for Connect {
   }
 
   fn cap(&self) -> i32 {
-    self.res.as_fd().as_raw_fd()
+    self.res.as_raw_fd()
   }
 
   fn run_blocking(&self) -> isize {
     let result = unsafe {
-      libc::connect(self.res.as_fd().as_raw_fd(), self.addr.get().cast(), self.get_addrlen())
+      libc::connect(
+        self.res.as_raw_fd(),
+        self.addr.get().cast(),
+        self.get_addrlen(),
+      )
     } as isize;
 
     // Track if this is the first connect() call for this operation
