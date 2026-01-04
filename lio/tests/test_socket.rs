@@ -1,4 +1,7 @@
-use std::{os::fd::{AsFd, AsRawFd}, sync::mpsc};
+use std::{
+  os::fd::{AsFd, AsRawFd},
+  sync::mpsc,
+};
 
 #[ignore = "flaky network test"]
 #[test]
@@ -7,8 +10,7 @@ fn test_socket_simple() {
 
   let (sender, receiver) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
-    .send_with(sender.clone());
+  lio::test_utils::tcp_socket().send_with(sender.clone());
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -89,11 +91,9 @@ fn test_socket_tcp_ipv6() {
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
-  lio::test_utils::tcp6_socket().when_done(
-    move |result| {
-      sender1.send(result).unwrap();
-    },
-  );
+  lio::test_utils::tcp6_socket().when_done(move |result| {
+    sender1.send(result).unwrap();
+  });
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -127,11 +127,9 @@ fn test_socket_udp_ipv4() {
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
-  lio::test_utils::udp_socket().when_done(
-    move |result| {
-      sender1.send(result).unwrap();
-    },
-  );
+  lio::test_utils::udp_socket().when_done(move |result| {
+    sender1.send(result).unwrap();
+  });
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -165,11 +163,9 @@ fn test_socket_udp_ipv6() {
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
-  lio::test_utils::udp6_socket().when_done(
-    move |result| {
-      sender1.send(result).unwrap();
-    },
-  );
+  lio::test_utils::udp6_socket().when_done(move |result| {
+    sender1.send(result).unwrap();
+  });
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -276,25 +272,19 @@ fn test_socket_multiple() {
 
   // Create multiple sockets
   let sender1 = sender.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |result| {
-      sender1.send(("sock1", result)).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |result| {
+    sender1.send(("sock1", result)).unwrap();
+  });
 
   let sender2 = sender.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |result| {
-      sender2.send(("sock2", result)).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |result| {
+    sender2.send(("sock2", result)).unwrap();
+  });
 
   let sender3 = sender.clone();
-  lio::test_utils::udp_socket().when_done(
-    move |result| {
-      sender3.send(("sock3", result)).unwrap();
-    },
-  );
+  lio::test_utils::udp_socket().when_done(move |result| {
+    sender3.send(("sock3", result)).unwrap();
+  });
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -371,11 +361,9 @@ fn test_socket_options_after_creation() {
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
-  lio::test_utils::tcp_socket().when_done(
-    move |result| {
-      sender1.send(result).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |result| {
+    sender1.send(result).unwrap();
+  });
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -419,11 +407,9 @@ fn test_socket_nonblocking() {
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
-  lio::test_utils::tcp_socket().when_done(
-    move |result| {
-      sender1.send(result).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |result| {
+    sender1.send(result).unwrap();
+  });
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 

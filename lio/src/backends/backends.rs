@@ -53,11 +53,17 @@ impl From<io::Error> for SubmitErr {
 }
 
 pub trait IoDriver {
-  type Submitter: IoSubmitter + 'static;
-  type Handler: IoHandler + 'static;
+  type Submitter: IoSubmitter + Send + 'static;
+  type Handler: IoHandler + Send + 'static;
+  type State: Send + Sync + 'static;
 
-  fn new_state() -> io::Result<*const ()>;
-  fn drop_state(state: *const ());
+  fn new_state() -> io::Result<Self::State>;
 
-  fn new(state: *const ()) -> io::Result<(Self::Submitter, Self::Handler)>;
+  unsafe fn state_from_ptr<'a>(ptr: *const ()) -> &'a Self::State {
+    unsafe { &*(ptr as *const Self::State) }
+  }
+
+  fn new(
+    state: &'static mut Self::State,
+  ) -> io::Result<(Self::Submitter, Self::Handler)>;
 }

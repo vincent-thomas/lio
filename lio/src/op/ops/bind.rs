@@ -4,7 +4,7 @@ use std::{cell::UnsafeCell, io, mem, net::SocketAddr};
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-use crate::op::{DetachSafe, net_utils::std_socketaddr_into_libc};
+use crate::op::net_utils::std_socketaddr_into_libc;
 
 use crate::op::{Operation, OperationExt};
 use crate::resource::Resource;
@@ -19,8 +19,6 @@ pub struct Bind {
 // to send across threads and share references.
 unsafe impl Send for Bind {}
 unsafe impl Sync for Bind {}
-
-unsafe impl DetachSafe for Bind {}
 
 impl Bind {
   pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {

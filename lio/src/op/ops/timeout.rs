@@ -1,4 +1,4 @@
-use crate::op::{DetachSafe, OpMeta};
+use crate::op::OpMeta;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::time::Duration;
@@ -24,7 +24,6 @@ pub struct Timeout {
 assert_op_max_size!(Timeout);
 
 // wtf are you doing waiting and then not waiting??
-unsafe impl DetachSafe for Timeout {}
 
 impl Timeout {
   pub(crate) fn new(duration: Duration) -> Self {
@@ -154,7 +153,7 @@ impl Operation for Timeout {
     {
       // For kqueue timers, run_blocking is called AFTER the timer fires
       // from EVFILT_TIMER, so we just return success immediately
-      return 0;
+      0
     }
   }
 }

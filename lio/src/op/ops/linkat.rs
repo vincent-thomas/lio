@@ -3,7 +3,6 @@ use std::{ffi::CString, os::fd::AsRawFd};
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-use crate::op::DetachSafe;
 use crate::resource::Resource;
 
 use crate::op::{Operation, OperationExt};
@@ -16,8 +15,6 @@ pub struct LinkAt {
 }
 
 assert_op_max_size!(LinkAt);
-
-unsafe impl DetachSafe for LinkAt {}
 
 // TODO: test
 impl LinkAt {

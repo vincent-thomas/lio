@@ -200,8 +200,10 @@ impl Operation for Socket {
   }
 
   fn run_blocking(&self) -> isize {
-    eprintln!("[Socket::run_blocking] Starting socket creation: domain={}, type={}, proto={}",
-              self.domain, self.ty, self.proto);
+    eprintln!(
+      "[Socket::run_blocking] Starting socket creation: domain={}, type={}, proto={}",
+      self.domain, self.ty, self.proto
+    );
 
     // Path 1: Platforms with SOCK_CLOEXEC support (atomic CLOEXEC flag)
     #[cfg(any(
@@ -229,7 +231,10 @@ impl Operation for Socket {
       eprintln!("[Socket::run_blocking] socket() returned fd={}", fd);
 
       if fd < 0 {
-        eprintln!("[Socket::run_blocking] socket() failed with error code: {}", fd);
+        eprintln!(
+          "[Socket::run_blocking] socket() failed with error code: {}",
+          fd
+        );
         return fd;
       }
 
@@ -240,7 +245,10 @@ impl Operation for Socket {
           fd
         }
         Err(e) => {
-          eprintln!("[Socket::run_blocking] Socket options setup failed: {:?}", e);
+          eprintln!(
+            "[Socket::run_blocking] Socket options setup failed: {:?}",
+            e
+          );
           unsafe { libc::close(fd as i32) };
           return -(e.raw_os_error().unwrap_or(libc::EIO) as isize);
         }
@@ -269,7 +277,10 @@ impl Operation for Socket {
       eprintln!("[Socket::run_blocking] socket() returned fd={}", fd);
 
       if fd < 0 {
-        eprintln!("[Socket::run_blocking] socket() failed with error code: {}", fd);
+        eprintln!(
+          "[Socket::run_blocking] socket() failed with error code: {}",
+          fd
+        );
         return fd;
       }
 
@@ -302,7 +313,10 @@ impl Operation for Socket {
           fd
         }
         Err(e) => {
-          eprintln!("[Socket::run_blocking] Socket options setup failed: {:?}", e);
+          eprintln!(
+            "[Socket::run_blocking] Socket options setup failed: {:?}",
+            e
+          );
           let _ = unsafe { libc::close(fd as i32) };
           return -(e.raw_os_error().unwrap_or(libc::EIO) as isize);
         }

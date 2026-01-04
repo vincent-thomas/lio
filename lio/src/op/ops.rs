@@ -14,6 +14,7 @@ mod socket;
 mod fsync;
 mod linkat;
 mod nop;
+mod read_at;
 mod shutdown;
 mod symlink;
 #[cfg(linux)]
@@ -33,6 +34,7 @@ pub use listen::*;
 pub use nop::*;
 pub use openat::*;
 pub use read::*;
+pub use read_at::*;
 pub use recv::*;
 pub use send::*;
 pub use shutdown::*;

@@ -2,7 +2,7 @@ use std::{io, sync::Arc};
 
 use crate::{backends::OpCompleted, store::OpStore};
 
-pub trait IoHandler: Send {
+pub trait IoHandler {
   fn try_tick(
     &mut self,
     state: *const (),

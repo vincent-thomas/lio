@@ -57,16 +57,20 @@ impl Driver {
     }
 
     // Initialize primary backend
-    let primary_state = D::new_state().map_err(TryInitError::Io)?;
+    let owned_state = D::new_state().map_err(TryInitError::Io)?;
+    let state_ptr = Box::into_raw(Box::new(owned_state));
+
     let (primary_subm, primary_handler) =
-      D::new(primary_state).map_err(TryInitError::Io)?;
+      D::new(unsafe { &mut *state_ptr }).map_err(TryInitError::Io)?;
 
     let store = Arc::new(OpStore::with_capacity(cap));
 
+    let ptr = state_ptr.cast_const().cast::<()>();
+
     let primary_handler =
-      Handler::new(Box::new(primary_handler), store.clone(), primary_state);
+      Handler::new(Box::new(primary_handler), store.clone(), ptr);
     let primary_submitter =
-      Submitter::new(Box::new(primary_subm), store.clone(), primary_state);
+      Submitter::new(Box::new(primary_subm), store.clone(), ptr);
 
     let driver_ptr = Box::into_raw(Box::new(Driver {
       buf_store,
@@ -86,9 +90,8 @@ impl Driver {
         // Another thread initialized first, clean up our allocation
         // This drops the driver and its workers
         let _ = unsafe { Box::from_raw(driver_ptr) };
+        let _t = unsafe { Box::from_raw(state_ptr) };
 
-        // Clean up the states
-        D::drop_state(primary_state);
         Err(TryInitError::AlreadyInit)
       }
     }
@@ -130,9 +133,9 @@ impl Driver {
     todo!();
   }
 
-  pub(crate) fn submit(stored: StoredOp) -> Result<u64, SubmitErr> {
+  pub(crate) fn submit(&self, stored: StoredOp) -> Result<u64, SubmitErr> {
     // Try primary worker first
-    match Driver::get().primary_worker.submit(stored) {
+    match self.primary_worker.submit(stored) {
       Ok(id) => dbg!(Ok(id)),
       Err(err) => Err(err), //   match driver.blocking_worker.submit(op) {
                             //     Ok(v) => Ok(v),

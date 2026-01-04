@@ -19,7 +19,7 @@ impl OpCompleted {
   }
 }
 
-pub trait IoSubmitter: Send {
+pub trait IoSubmitter {
   /// Caller can assume op is in the OpStore.
   fn submit(
     &mut self,

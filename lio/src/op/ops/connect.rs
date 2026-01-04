@@ -8,7 +8,7 @@ use std::{io, mem};
 use io_uring::types::Fd;
 
 use crate::op::net_utils::std_socketaddr_into_libc;
-use crate::op::{DetachSafe, OpMeta, OperationExt};
+use crate::op::{OpMeta, OperationExt};
 use crate::resource::Resource;
 
 use crate::op::Operation;
@@ -26,8 +26,6 @@ assert_op_max_size!(Connect);
 // to send across threads and share references.
 unsafe impl Send for Connect {}
 unsafe impl Sync for Connect {}
-
-unsafe impl DetachSafe for Connect {}
 
 impl Connect {
   pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {

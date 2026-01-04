@@ -6,7 +6,7 @@ use io_uring::types::Fd;
 use crate::{
   BufResult,
   buf::BufLike,
-  op::{DetachSafe, OpMeta, OperationExt},
+  op::{OpMeta, OperationExt},
   resource::Resource,
 };
 
@@ -20,8 +20,6 @@ where
   buf: Option<T>,
   flags: i32,
 }
-
-unsafe impl<T> DetachSafe for Recv<T> where T: BufLike + Send + Sync {}
 
 impl<T> Recv<T>
 where

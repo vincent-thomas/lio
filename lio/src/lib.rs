@@ -1,4 +1,11 @@
 #![allow(private_bounds)]
+#![deny(
+  clippy::unnecessary_safety_comment,
+  clippy::unsafe_removed_from_name,
+  clippy::unnecessary_safety_doc,
+  clippy::not_unsafe_ptr_arg_deref,
+  clippy::undocumented_unsafe_blocks
+)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! # Lio - Low-Level Async I/O Library
@@ -93,7 +100,7 @@ pub use buf::BufResult;
 #[macro_use]
 mod macros;
 
-pub mod driver;
+mod driver;
 
 pub mod op;
 use op::*;
@@ -112,7 +119,7 @@ use crate::{
   backends::IoDriver,
   buf::{BufLike, BufStore},
   driver::{Driver, TryInitError},
-  resource::Resource,
+  resource::{Resource, UniqueResource},
 };
 
 doc_op! {
@@ -192,7 +199,7 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn write_with_buf<B>(res: impl Into<Resource>, buf: B) -> Progress<Write<B>>
+    pub fn write<B>(res: impl Into<Resource>, buf: B) -> Progress<Write<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
@@ -227,7 +234,7 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn write_at_with_buf<B>(res: impl Into<Resource>, buf: B, offset: i64) -> Progress<WriteAt<B>>
+    pub fn write_at<B>(res: impl Into<Resource>, buf: B, offset: i64) -> Progress<WriteAt<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
@@ -235,24 +242,47 @@ doc_op! {
     }
 }
 
-doc_op! {
-    short: "Reads resource into provided buffer.",
-    syscall: "pread(2)",
-    doc_link: "https://man7.org/linux/man-pages/man2/pwrite.2.html",
+// doc_op! {
+//     short: "Reads resource into provided buffer.",
+//     syscall: "read(2)",
+//     doc_link: "https://man7.org/linux/man-pages/man2/read.2.html",
+//
+//     pub fn read<B>(res: impl Into<Resource>, mem: B) -> Progress<ReadBuilder<B>>
+//     where
+//         B: BufLike + std::marker::Send + Sync
+//     {
+//         Progress::from_op(ReadBuilder::new(res.into(), mem))
+//     }
+// }
 
-    pub fn read_with_buf<B>(res: impl Into<Resource>, mem: B, offset: i64) -> Progress<Read<B>>
-    where
-        B: BufLike + std::marker::Send + Sync
-    {
-        Progress::from_op(Read::new(res.into(), mem, offset))
-    }
-}
+// /// Shortcut, uses [`lio::read_with_buf`](crate::read_with_buf) with
+// /// [`LentBuf`](crate::buf::LentBuf) as mem field.
+// pub fn read<'a>(
+//   res: impl Into<Resource>,
+// ) -> Progress<Read<crate::buf::LentBuf<'a>>> {
+//   let buf = Driver::get().try_lend_buf().unwrap();
+//   read_with_buf(res, buf)
+// }
+
+// /// Shortcut, uses [`lio::read_at_with_buf`](crate::read_at_with_buf) with
+// /// [`LentBuf`](crate::buf::LentBuf) as mem field.
+// pub fn read_at_hmm<'a>(
+//   res: impl Into<Resource>,
+//   offset: i64,
+// ) -> Progress<ReadAt<crate::buf::LentBuf<'a>>> {
+//   read_at(res, Driver::get().try_lend_buf().unwrap(), offset)
+// }
 
 doc_op! {
-  short: "Shortcut, uses [`lio::read_with_buf`](crate::read_with_buf) with [`LentBuf`](crate::buf::LentBuf) as mem field.",
-  pub fn read<'a>(res: impl Into<Resource>, offset: i64) -> Progress<Read<crate::buf::LentBuf<'a>>> {
-    let buf = Driver::get().try_lend_buf().unwrap();
-    Progress::from_op(Read::new(res.into(), buf, offset))
+  short: "Reads resource into provided buffer with a offset.",
+  syscall: "pread(2)",
+  doc_link: "https://man7.org/linux/man-pages/man2/pwrite.2.html",
+
+  pub fn read_at<B>(res: impl Into<Resource>, mem: B, offset: i64) -> Progress<ReadAt<B>>
+  where
+      B: BufLike + std::marker::Send + Sync
+  {
+    Progress::from_op(ReadAt::new(res.into(), mem, offset))
   }
 }
 
@@ -401,7 +431,7 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn send_with_buf<B>(res: impl Into<Resource>, buf: B, flags: Option<i32>) -> Progress<Send<B>>
+    pub fn send<B>(res: impl Into<Resource>, buf: B, flags: Option<i32>) -> Progress<Send<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
@@ -409,27 +439,27 @@ doc_op! {
     }
 }
 
-doc_op! {
-    short: "Shortcut, uses [`lio::recv_with_buf`](crate::recv_with_buf) with [`crate::buf::LentBuf`] as mem field.",
-
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// async fn recv_example() -> std::io::Result<()> {
-    ///     # let fd = 0;
-    ///     let mut buffer = vec![0u8; 1024];
-    ///     let (res_bytes_received, buf) = lio::recv_with_buf(fd, buffer, None).await;
-    ///     let bytes_received = res_bytes_received?;
-    ///     println!("Received {} bytes: {:?}", bytes_received, &buf[..bytes_received as usize]);
-    ///     Ok(())
-    /// }
-    /// ```
-    pub fn recv<'a>(res: impl Into<Resource>, flags: Option<i32>) -> Progress<Recv<crate::buf::LentBuf<'a>>>
-    {
-        Progress::from_op(Recv::new(res.into(), Driver::get().try_lend_buf().unwrap(), flags))
-    }
-}
+// doc_op! {
+//     short: "Shortcut, uses [`lio::recv_with_buf`](crate::recv_with_buf) with [`crate::buf::LentBuf`] as mem field.",
+//
+//     ///
+//     /// # Examples
+//     ///
+//     /// ```rust
+//     /// async fn recv_example() -> std::io::Result<()> {
+//     ///     # let fd = 0;
+//     ///     let mut buffer = vec![0u8; 1024];
+//     ///     let (res_bytes_received, buf) = lio::recv_with_buf(fd, buffer, None).await;
+//     ///     let bytes_received = res_bytes_received?;
+//     ///     println!("Received {} bytes: {:?}", bytes_received, &buf[..bytes_received as usize]);
+//     ///     Ok(())
+//     /// }
+//     /// ```
+//     pub fn recv<'a>(res: impl Into<Resource>, flags: Option<i32>) -> Progress<Recv<crate::buf::LentBuf<'a>>>
+//     {
+//         Progress::from_op(Recv::new(res.into(), Driver::get().try_lend_buf().unwrap(), flags))
+//     }
+// }
 
 doc_op! {
     short: "Receives data over a socket into provided buffer.",
@@ -449,7 +479,7 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn recv_with_buf<B>(res: impl Into<Resource>, buf: B, flags: Option<i32>) -> Progress<Recv<B>>
+    pub fn recv<B>(res: impl Into<Resource>, buf: B, flags: Option<i32>) -> Progress<Recv<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
@@ -472,8 +502,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn close(res: impl Into<Resource>) -> Progress<Close> {
-        Progress::from_op(Close::new(res.into()))
+    pub fn close(res: UniqueResource) -> Progress<Close> {
+        Progress::from_op(Close::new(res))
     }
 }
 

@@ -22,7 +22,7 @@ enum Status {
 }
 
 impl Registration {
-  pub fn op_ref(&self) -> &dyn Operation {
+  pub(crate) fn op_ref(&self) -> &dyn Operation {
     self.stored.op_ref()
   }
   pub fn new(stored: StoredOp) -> Self {

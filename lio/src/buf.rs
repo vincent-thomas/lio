@@ -19,9 +19,15 @@
 //! }
 //! ```
 //!
-//! # `zeroize`
+//! # Feature `zeroize`
 //!
-//! testing
+//! When the `zeroize` feature is enabled, [`LentBuf`]fers are
+//! automatically and securely zeroed out on drop. This provides
+//! defense-in-depth against memory disclosure vulnerabilities by ensuring sensitive
+//! data doesn't persist in pooled buffers.
+//!
+//! This uses the [`zeroize`](https://docs.rs/zeroize) crate, which guarantees that
+//! compiler optimizations won't eliminate the zeroing operation.
 
 /// Result type for operations that return both a result and a buffer.
 ///
@@ -35,7 +41,7 @@ trait Sealed {}
 
 /// A interface over buffers.
 pub trait BufLike: Sealed {
-  fn buf<'a>(&'a self) -> &'a [u8];
+  fn buf(&self) -> &[u8];
 
   /// Called after I/O completes with the number of bytes transferred.
   ///
@@ -48,7 +54,7 @@ pub trait BufLike: Sealed {
 }
 
 impl BufLike for Vec<u8> {
-  fn buf<'a>(&'a self) -> &'a [u8] {
+  fn buf(&self) -> &[u8] {
     let cap = self.capacity();
 
     // Why capacity?
@@ -101,7 +107,7 @@ unsafe impl<'a> Send for LentBuf<'a> {}
 unsafe impl<'a> Sync for LentBuf<'a> {}
 
 impl<'a> super::BufLike for LentBuf<'a> {
-  fn buf<'b>(&'b self) -> &'b [u8] {
+  fn buf(&self) -> &[u8] {
     let cell = &self.pool.buffers[self.index as usize];
     // SAFETY: We have exclusive access via in_use flag
     unsafe { &*cell.buf.get() }
@@ -135,21 +141,63 @@ impl<'a> Drop for LentBuf<'a> {
     let cell = &self.pool.buffers[self.index as usize];
 
     #[cfg(feature = "zeroize")]
-    {
-      zeroize::Zeroize::zeroize(
-        // SAFETY: We have exclusive access via in_use flag
-        unsafe { &mut *cell.buf.get() },
-      );
-    }
-
-    cell.len.store(0, Ordering::Relaxed);
-    cell.pos.store(0, Ordering::Relaxed);
+    self.zeroize();
 
     // Mark buffer as available
     cell.in_use.store(false, Ordering::Release);
 
     // Return index to free list
     let _ = self.pool.free_tx.send(self.index);
+  }
+}
+
+impl<'a> LentBuf<'a> {
+  /// Securely erases the buffer contents and resets position/length.
+  ///
+  /// # When to Use
+  ///
+  /// Call this method explicitly when you want to ensure sensitive data is cleared
+  /// before the buffer is returned to the pool. Note that `zeroize()` is automatically
+  /// called in the `Drop` implementation when the `zeroize` feature is enabled, so
+  /// manual calls are typically only needed for early cleanup.
+  ///
+  /// # Security Properties
+  ///
+  /// - Guarantees memory is overwritten (compiler cannot optimize away)
+  /// - Clears the full buffer capacity (4096 bytes), not just the valid data range
+  /// - Resets `pos` and `len` to 0
+  /// - Uses [`zeroize::Zeroize`](https://docs.rs/zeroize) trait for secure erasure
+  ///
+  /// # Performance
+  ///
+  /// This is equivalent to a 4096-byte `memset(0)` operation. For most use cases,
+  /// the overhead is negligible compared to I/O costs.
+  ///
+  /// # Example
+  ///
+  /// ```ignore
+  /// let pool = BufStore::default();
+  /// let mut buf = pool.get();
+  ///
+  /// // Read sensitive data (e.g., password)
+  /// // ... perform I/O operations ...
+  ///
+  /// // Explicitly clear before continuing to use the buffer
+  /// buf.zeroize();
+  ///
+  /// // Buffer is now zeroed and reset
+  /// assert_eq!(buf.as_ref().len(), 0);
+  /// ```
+  #[cfg(feature = "zeroize")]
+  pub fn zeroize(&mut self) {
+    let cell = &self.pool.buffers[self.index as usize];
+    zeroize::Zeroize::zeroize(
+      // SAFETY: We have exclusive access via in_use flag
+      unsafe { &mut *cell.buf.get() },
+    );
+
+    cell.pos.store(0, Ordering::Release);
+    cell.len.store(0, Ordering::Release);
   }
 }
 

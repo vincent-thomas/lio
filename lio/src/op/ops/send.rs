@@ -6,7 +6,7 @@ use io_uring::types::Fd;
 use crate::{
   BufResult,
   buf::BufLike,
-  op::{DetachSafe, OpMeta},
+  op::OpMeta,
   resource::Resource,
 };
 
@@ -19,11 +19,6 @@ where
   res: Resource,
   buf: Option<B>,
   flags: i32,
-}
-
-unsafe impl<B> DetachSafe for Send<B> where
-  B: BufLike + std::marker::Send + std::marker::Sync
-{
 }
 
 impl<B> Send<B>

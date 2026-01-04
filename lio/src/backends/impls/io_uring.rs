@@ -10,21 +10,16 @@ pub struct IoUring;
 impl IoDriver for IoUring {
   type Handler = IoUringHandler;
   type Submitter = IoUringSubmitter;
+  type State = IoUringState;
 
-  fn new_state() -> io::Result<*const ()> {
-    let uring = io_uring::IoUring::new(128)?;
-    let ptr = Box::new(IoUringState { _uring: uring });
-    Ok(Box::into_raw(ptr) as *const _)
+  fn new_state() -> io::Result<Self::State> {
+    Ok(IoUringState { _uring: io_uring::IoUring::new(128)? })
   }
 
-  fn drop_state(state: *const ()) {
-    let ptr = unsafe { Box::from_raw(state as *mut IoUringState) };
-    drop(ptr);
-  }
-
-  fn new(ptr: *const ()) -> io::Result<(Self::Submitter, Self::Handler)> {
-    let tet = unsafe { &mut *(ptr as *mut IoUringState) };
-    let (_, sq, cq) = tet._uring.split();
+  fn new(
+    state: &'static mut Self::State,
+  ) -> io::Result<(Self::Submitter, Self::Handler)> {
+    let (_, sq, cq) = state._uring.split();
     let handle = IoUringHandler { cq };
     let submitter = IoUringSubmitter { sq };
 
@@ -63,7 +58,10 @@ impl IoSubmitter for IoUringSubmitter {
 
     self.sq.sync();
     // TODO: Make more efficient
-    into_shared(state)._uring.submit().map_err(SubmitErr::Io)?;
+    unsafe { IoUring::state_from_ptr(state) }
+      ._uring
+      .submit()
+      .map_err(SubmitErr::Io)?;
     self.sq.sync();
 
     Ok(())
@@ -74,7 +72,7 @@ impl IoSubmitter for IoUringSubmitter {
   // Submit a NOP operation to wake up submit_and_wait
   // Use a special user_data value that won't match any real operation
   fn notify(&mut self, state: *const ()) -> Result<(), SubmitErr> {
-    let state = into_shared(state);
+    let state = unsafe { IoUring::state_from_ptr(state) };
     let nop_entry = io_uring::opcode::Nop::new().build().user_data(u64::MAX);
     unsafe { self.sq.push(&nop_entry) }.map_err(|_| SubmitErr::Full)?;
 
