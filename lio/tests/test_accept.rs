@@ -1,5 +1,10 @@
 use lio::{accept, bind, connect, listen};
-use std::{mem::MaybeUninit, net::SocketAddr, os::fd::{AsFd, AsRawFd}, sync::mpsc};
+use std::{
+  mem::MaybeUninit,
+  net::SocketAddr,
+  os::fd::{AsFd, AsRawFd},
+  sync::mpsc,
+};
 
 #[test]
 #[ignore = "flaky network test"]

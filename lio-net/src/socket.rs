@@ -46,14 +46,14 @@ impl Socket {
     &self,
     vec: Vec<u8>,
   ) -> impl Future<Output = lio::BufResult<i32, Vec<u8>>> {
-    lio::recv_with_buf(&self.0, vec, None).into_future()
+    lio::recv(&self.0, vec, None).into_future()
   }
 
   pub fn send(
     &self,
     vec: Vec<u8>,
   ) -> impl Future<Output = lio::BufResult<i32, Vec<u8>>> {
-    lio::send_with_buf(&self.0, vec, None).into_future()
+    lio::send(&self.0, vec, None).into_future()
   }
   pub fn shutdown(&self, how: i32) -> impl Future<Output = io::Result<()>> {
     lio::shutdown(&self.0, how).into_future()

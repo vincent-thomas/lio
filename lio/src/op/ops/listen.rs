@@ -3,7 +3,6 @@ use std::os::fd::AsRawFd;
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-use crate::op::DetachSafe;
 use crate::resource::Resource;
 
 use crate::op::{Operation, OperationExt};
@@ -14,8 +13,6 @@ pub struct Listen {
 }
 
 assert_op_max_size!(Listen);
-
-unsafe impl DetachSafe for Listen {}
 
 impl Listen {
   pub(crate) fn new(res: Resource, backlog: i32) -> Self {

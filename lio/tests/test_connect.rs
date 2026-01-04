@@ -16,11 +16,9 @@ fn test_connect_basic() {
 
   // Create server socket
   let sender_s = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -66,11 +64,9 @@ fn test_connect_basic() {
 
   // Create client socket and connect
   let sender_cs = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_cs.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_cs.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -116,11 +112,9 @@ fn test_connect_ipv6() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  lio::test_utils::tcp6_socket().when_done(
-    move |res| {
-      sender_s.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp6_socket().when_done(move |res| {
+    sender_s.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -165,11 +159,9 @@ fn test_connect_ipv6() {
   receiver_unit.recv().unwrap().expect("Failed to listen");
 
   let sender_cs = sender_sock.clone();
-  lio::test_utils::tcp6_socket().when_done(
-    move |res| {
-      sender_cs.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp6_socket().when_done(move |res| {
+    sender_cs.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -213,11 +205,9 @@ fn test_connect_to_nonexistent() {
   let (sender, receiver) = mpsc::channel();
 
   let sender1 = sender.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender1.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender1.send(res).unwrap();
+  });
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -257,11 +247,9 @@ fn test_connect_multiple_clients() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -309,11 +297,9 @@ fn test_connect_multiple_clients() {
   let mut client_socks = Vec::new();
   for _ in 0..5 {
     let sender_cs = sender_sock.clone();
-    lio::test_utils::tcp_socket().when_done(
-      move |res| {
-        sender_cs.send(res).unwrap();
-      },
-    );
+    lio::test_utils::tcp_socket().when_done(move |res| {
+      sender_cs.send(res).unwrap();
+    });
 
     // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
     lio::tick();
@@ -359,11 +345,9 @@ fn test_connect_already_connected() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -408,11 +392,9 @@ fn test_connect_already_connected() {
   receiver_unit.recv().unwrap().expect("Failed to listen");
 
   let sender_cs = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_cs.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_cs.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -465,11 +447,9 @@ fn test_connect_to_localhost() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -514,11 +494,9 @@ fn test_connect_to_localhost() {
   receiver_unit.recv().unwrap().expect("Failed to listen");
 
   let sender_cs = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_cs.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_cs.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -565,11 +543,9 @@ fn test_connect_concurrent() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -617,11 +593,9 @@ fn test_connect_concurrent() {
   let mut client_socks = Vec::new();
   for _ in 0..10 {
     let sender_cs = sender_sock.clone();
-    lio::test_utils::tcp_socket().when_done(
-      move |res| {
-        sender_cs.send(res).unwrap();
-      },
-    );
+    lio::test_utils::tcp_socket().when_done(move |res| {
+      sender_cs.send(res).unwrap();
+    });
 
     // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
     lio::tick();
@@ -664,11 +638,9 @@ fn test_connect_with_bind() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -714,11 +686,9 @@ fn test_connect_with_bind() {
 
   // Create client socket and bind it to a specific local address
   let sender_cs = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_cs.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_cs.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();

@@ -19,8 +19,6 @@ where
   offset: i64,
 }
 
-// unsafe impl<B> DetachSafe for Write<B> where B: BufLike {}
-
 impl<B> WriteAt<B>
 where
   B: Send + Sync,

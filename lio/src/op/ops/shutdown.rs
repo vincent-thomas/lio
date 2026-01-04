@@ -3,7 +3,6 @@ use std::os::fd::AsRawFd;
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-use crate::op::DetachSafe;
 use crate::resource::Resource;
 
 use crate::op::{Operation, OperationExt};
@@ -20,8 +19,6 @@ impl Shutdown {
     Self { res, how }
   }
 }
-
-unsafe impl DetachSafe for Shutdown {}
 
 impl OperationExt for Shutdown {
   type Result = std::io::Result<()>;

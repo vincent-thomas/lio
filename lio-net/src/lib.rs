@@ -17,7 +17,7 @@ impl From<Socket> for TcpListener {
 
 impl TcpListener {
   pub async fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
-    for value in addr.to_socket_addrs()? {
+    if let Some(value) = addr.to_socket_addrs()?.next() {
       let domain = match value {
         SocketAddr::V6(_) => libc::AF_INET6,
         SocketAddr::V4(_) => libc::AF_INET,
@@ -45,7 +45,7 @@ pub struct TcpStream(Socket);
 
 impl TcpStream {
   pub async fn connect(addr: impl ToSocketAddrs) -> io::Result<Self> {
-    for value in addr.to_socket_addrs()? {
+    if let Some(value) = addr.to_socket_addrs()?.next() {
       let domain = match value {
         SocketAddr::V6(_) => libc::AF_INET6,
         SocketAddr::V4(_) => libc::AF_INET,

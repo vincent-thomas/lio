@@ -17,11 +17,9 @@ fn test_recv_multiple() {
 
   // Create server socket
   let sender_s1 = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s1.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s1.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -67,11 +65,9 @@ fn test_recv_multiple() {
 
   // Create client socket
   let sender_cs = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_cs.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_cs.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -201,8 +197,7 @@ fn test_recv_with_flags() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   // Create server socket
-  lio::test_utils::tcp_socket()
-    .send_with(sender_sock.clone());
+  lio::test_utils::tcp_socket().send_with(sender_sock.clone());
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -245,11 +240,9 @@ fn test_recv_with_flags() {
 
   // Create client socket
   let sender_cs = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_cs.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_cs.send(res).unwrap();
+  });
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -331,8 +324,7 @@ fn test_recv_on_closed() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   // Create server socket
-  lio::test_utils::tcp_socket()
-    .send_with(sender_sock.clone());
+  lio::test_utils::tcp_socket().send_with(sender_sock.clone());
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -371,8 +363,7 @@ fn test_recv_on_closed() {
   receiver_unit.try_recv().unwrap().expect("Failed to listen");
 
   // Create client socket
-  lio::test_utils::tcp_socket()
-    .send_with(sender_sock.clone());
+  lio::test_utils::tcp_socket().send_with(sender_sock.clone());
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -461,8 +452,7 @@ fn prop_test_recv_arbitrary_data_run(
     .map(|i| ((seed.wrapping_add(i as u64)) % 256) as u8)
     .collect();
 
-  let mut socket_recv =
-    lio::test_utils::tcp_socket().send();
+  let mut socket_recv = lio::test_utils::tcp_socket().send();
 
   // assert_eq!(receiver_sock.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -504,8 +494,7 @@ fn prop_test_recv_arbitrary_data_run(
   listen_recv.try_recv().expect("listen done").unwrap();
 
   // Create client socket
-  let mut client_socket =
-    lio::test_utils::tcp_socket().send();
+  let mut client_socket = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 

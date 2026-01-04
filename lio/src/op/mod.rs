@@ -10,10 +10,6 @@ trait Sealed {}
 /// Done to disallow someone creating a operation outside of lio, which will cause issues.
 impl<O: Operation> Sealed for O {}
 
-// Safety: Decides if resources can be leaked when using OperationProgress::detach
-#[allow(private_bounds)]
-pub unsafe trait DetachSafe: Sealed {}
-
 // Things that implement this trait represent a command that can be executed using io-uring.
 pub trait Operation: Sealed + Sync + std::marker::Send {
   // type Result;

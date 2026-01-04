@@ -9,8 +9,7 @@ fn test_shutdown_write() {
   lio::init();
 
   // Create server socket
-  let mut server_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut server_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -45,8 +44,7 @@ fn test_shutdown_write() {
   listen_recv.try_recv().unwrap().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -114,8 +112,7 @@ fn test_shutdown_write() {
 fn test_shutdown_read() {
   lio::init();
 
-  let mut server_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut server_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -150,8 +147,7 @@ fn test_shutdown_read() {
   listen_recv.try_recv().unwrap().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -213,8 +209,7 @@ fn test_shutdown_read() {
 fn test_shutdown_both() {
   lio::init();
 
-  let mut server_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut server_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -249,8 +244,7 @@ fn test_shutdown_both() {
   listen_recv.try_recv().unwrap().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -330,8 +324,7 @@ fn test_shutdown_invalid_fd() {
 fn test_shutdown_after_close() {
   lio::init();
 
-  let mut server_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut server_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -365,8 +358,7 @@ fn test_shutdown_after_close() {
 
   listen_recv.try_recv().unwrap().expect("Failed to listen");
 
-  let mut client_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -402,8 +394,7 @@ fn test_shutdown_after_close() {
 fn test_shutdown_twice() {
   lio::init();
 
-  let mut server_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut server_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -438,8 +429,7 @@ fn test_shutdown_twice() {
   listen_recv.try_recv().unwrap().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -489,8 +479,7 @@ fn test_shutdown_twice() {
 fn test_shutdown_sequential_directions() {
   lio::init();
 
-  let mut server_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut server_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -525,8 +514,7 @@ fn test_shutdown_sequential_directions() {
   listen_recv.try_recv().unwrap().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -595,8 +583,7 @@ fn test_shutdown_before_data_sent() {
   lio::init();
 
   // Create server socket
-  let mut server_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut server_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -631,8 +618,7 @@ fn test_shutdown_before_data_sent() {
   listen_recv.try_recv().unwrap().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -685,8 +671,7 @@ fn test_shutdown_before_data_sent() {
 fn test_shutdown_ipv6() {
   lio::init();
 
-  let mut server_sock =
-    lio::test_utils::tcp6_socket().send();
+  let mut server_sock = lio::test_utils::tcp6_socket().send();
 
   lio::tick();
 
@@ -723,8 +708,7 @@ fn test_shutdown_ipv6() {
   listen_recv.try_recv().unwrap().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock =
-    lio::test_utils::tcp6_socket().send();
+  let mut client_sock = lio::test_utils::tcp6_socket().send();
 
   lio::tick();
 
@@ -780,8 +764,7 @@ fn test_shutdown_concurrent() {
 
   // Test shutting down multiple connections (sequentially)
   for _ in 0..5 {
-    let mut server_sock =
-      lio::test_utils::tcp_socket().send();
+    let mut server_sock = lio::test_utils::tcp_socket().send();
 
     lio::tick();
 
@@ -816,8 +799,7 @@ fn test_shutdown_concurrent() {
     listen_recv.try_recv().unwrap().expect("Failed to listen");
 
     // Create and connect client
-    let mut client_sock =
-      lio::test_utils::tcp_socket().send();
+    let mut client_sock = lio::test_utils::tcp_socket().send();
 
     lio::tick();
 
@@ -857,8 +839,7 @@ fn test_shutdown_concurrent() {
 fn test_shutdown_with_pending_data() {
   lio::init();
 
-  let mut server_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut server_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -893,8 +874,7 @@ fn test_shutdown_with_pending_data() {
   listen_recv.try_recv().unwrap().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock =
-    lio::test_utils::tcp_socket().send();
+  let mut client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 

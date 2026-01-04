@@ -7,11 +7,10 @@ fn test_worker_start_stop() {
 
   let thing = "hello".as_bytes().to_vec();
 
-  let (res, _buf) =
-    lio::write_with_buf(unsafe { Resource::from_raw_fd(2) }, thing)
-      .send()
-      .recv_timeout(Duration::from_millis(1))
-      .unwrap();
+  let (res, _buf) = lio::write(unsafe { Resource::from_raw_fd(2) }, thing)
+    .send()
+    .recv_timeout(Duration::from_millis(1))
+    .unwrap();
 
   // panic!();
 

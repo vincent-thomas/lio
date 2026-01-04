@@ -1,5 +1,9 @@
 use lio::{bind, listen};
-use std::{net::SocketAddr, os::fd::{AsFd, AsRawFd}, sync::mpsc};
+use std::{
+  net::SocketAddr,
+  os::fd::{AsFd, AsRawFd},
+  sync::mpsc,
+};
 
 #[cfg(linux)]
 #[ignore = "flaky network test"]
@@ -11,11 +15,9 @@ fn test_listen_basic() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s1.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s1.send(res).unwrap();
+  });
 
   lio::tick();
 
@@ -33,7 +35,7 @@ fn test_listen_basic() {
   receiver_unit.recv().unwrap().expect("Failed to bind socket");
 
   let sender_l = sender_unit.clone();
-  listen(&sock,128).when_done(move |res| {
+  listen(&sock, 128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -73,11 +75,9 @@ fn test_listen_with_backlog() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s1.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s1.send(res).unwrap();
+  });
 
   lio::tick();
 
@@ -96,7 +96,7 @@ fn test_listen_with_backlog() {
 
   // Listen with custom backlog
   let sender_l = sender_unit.clone();
-  listen(&sock,10).when_done(move |res| {
+  listen(&sock, 10).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -130,11 +130,9 @@ fn test_listen_large_backlog() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s1.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s1.send(res).unwrap();
+  });
 
   lio::tick();
 
@@ -153,7 +151,7 @@ fn test_listen_large_backlog() {
 
   // Listen with large backlog
   let sender_l = sender_unit.clone();
-  listen(&sock,1024).when_done(move |res| {
+  listen(&sock, 1024).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -185,11 +183,9 @@ fn test_listen_without_bind() {
   let (sender_sock, receiver_sock) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s1.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s1.send(res).unwrap();
+  });
 
   lio::tick();
 
@@ -224,11 +220,9 @@ fn test_listen_ipv6() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  lio::test_utils::tcp6_socket().when_done(
-    move |res| {
-      sender_s1.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp6_socket().when_done(move |res| {
+    sender_s1.send(res).unwrap();
+  });
 
   lio::tick();
 
@@ -247,7 +241,7 @@ fn test_listen_ipv6() {
   receiver_unit.recv().unwrap().expect("Failed to bind IPv6 socket");
 
   let sender_l = sender_unit.clone();
-  listen(&sock,128).when_done(move |res| {
+  listen(&sock, 128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -280,11 +274,9 @@ fn test_listen_on_udp() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  lio::test_utils::udp_socket().when_done(
-    move |res| {
-      sender_s1.send(res).unwrap();
-    },
-  );
+  lio::test_utils::udp_socket().when_done(move |res| {
+    sender_s1.send(res).unwrap();
+  });
 
   lio::tick();
 
@@ -306,7 +298,7 @@ fn test_listen_on_udp() {
   let sender_l1 = sender_l.clone();
 
   // Try to listen on UDP socket (should fail)
-  listen(&sock,128).when_done(move |res| {
+  listen(&sock, 128).when_done(move |res| {
     sender_l1.send(res).unwrap();
   });
 
@@ -331,11 +323,9 @@ fn test_listen_twice() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s1.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s1.send(res).unwrap();
+  });
 
   lio::tick();
 
@@ -353,7 +343,7 @@ fn test_listen_twice() {
   receiver_unit.recv().unwrap().expect("Failed to bind socket");
 
   let sender_l = sender_unit.clone();
-  listen(&sock,128).when_done(move |res| {
+  listen(&sock, 128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -365,7 +355,7 @@ fn test_listen_twice() {
   let sender_l3 = sender_l2.clone();
 
   // Try to listen again on the same socket
-  listen(&sock,256).when_done(move |res| {
+  listen(&sock, 256).when_done(move |res| {
     sender_l3.send(res).unwrap();
   });
 
@@ -389,11 +379,9 @@ fn test_listen_zero_backlog() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s1.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s1.send(res).unwrap();
+  });
 
   lio::tick();
 
@@ -412,7 +400,7 @@ fn test_listen_zero_backlog() {
 
   // Listen with backlog of 0 (system may adjust to minimum)
   let sender_l = sender_unit.clone();
-  listen(&sock,0).when_done(move |res| {
+  listen(&sock, 0).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 
@@ -441,8 +429,7 @@ fn test_listen_zero_backlog() {
 fn test_listen_after_close() {
   lio::init();
 
-  let mut socket_recv =
-    lio::test_utils::tcp_socket().send();
+  let mut socket_recv = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -481,11 +468,9 @@ fn test_listen_concurrent() {
   // Test listening on multiple sockets concurrently
   for _ in 0..10 {
     let sender_sock = sender.clone();
-    lio::test_utils::tcp_socket().when_done(
-      move |res| {
-        sender_sock.send(res).unwrap();
-      },
-    );
+    lio::test_utils::tcp_socket().when_done(move |res| {
+      sender_sock.send(res).unwrap();
+    });
   }
 
   lio::tick();
@@ -516,7 +501,7 @@ fn test_listen_concurrent() {
 
   for &sock in &sockets {
     let sender_l = sender_listen.clone();
-    listen(&sock,128).when_done(move |res| {
+    listen(&sock, 128).when_done(move |res| {
       sender_l.send(res).unwrap();
     });
   }
@@ -554,11 +539,9 @@ fn test_listen_on_all_interfaces() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   let sender_s1 = sender_sock.clone();
-  lio::test_utils::tcp_socket().when_done(
-    move |res| {
-      sender_s1.send(res).unwrap();
-    },
-  );
+  lio::test_utils::tcp_socket().when_done(move |res| {
+    sender_s1.send(res).unwrap();
+  });
 
   lio::tick();
 
@@ -577,7 +560,7 @@ fn test_listen_on_all_interfaces() {
   receiver_unit.recv().unwrap().expect("Failed to bind to all interfaces");
 
   let sender_l = sender_unit.clone();
-  listen(&sock,128).when_done(move |res| {
+  listen(&sock, 128).when_done(move |res| {
     sender_l.send(res).unwrap();
   });
 

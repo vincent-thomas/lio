@@ -44,6 +44,8 @@
 
 use std::{ptr, time::Duration};
 
+#[cfg(unix)]
+use crate::resource::UniqueResource;
 use crate::{
   driver::TryInitError,
   op::net_utils::{self, sockaddr_to_socketaddr},
@@ -62,7 +64,18 @@ use std::os::windows::io::FromRawHandle;
 /// The caller must ensure the fd/handle is valid.
 #[cfg(unix)]
 unsafe fn fd_to_resource(fd: libc::intptr_t) -> Resource {
-  Resource::from_raw_fd(fd as i32)
+  unsafe { Resource::from_raw_fd(fd as i32) }
+}
+
+/// Converts a C file descriptor/handle (intptr_t) to a Resource.
+///
+/// # Safety
+/// The caller must ensure the fd/handle is valid.
+#[cfg(unix)]
+unsafe fn fd_to_unique(fd: libc::intptr_t) -> UniqueResource {
+  use crate::resource::UniqueResource;
+
+  unsafe { UniqueResource::from_raw_fd(fd as i32) }
 }
 
 #[cfg(windows)]
@@ -259,7 +272,7 @@ pub extern "C" fn lio_write_at(
 ///   - `buf`: Original buffer pointer containing data (must free)
 ///   - `len`: Original buffer length
 #[unsafe(no_mangle)]
-pub extern "C" fn lio_read(
+pub extern "C" fn lio_read_at(
   fd: libc::intptr_t,
   buf: *mut u8,
   buf_len: usize,
@@ -274,7 +287,7 @@ pub extern "C" fn lio_read(
   let buf_vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
   let resource = unsafe { fd_to_resource(fd) };
 
-  crate::read_with_buf(resource, buf_vec, offset).when_done(
+  crate::read_at_with_buf(resource, buf_vec, offset).when_done(
     move |(res, mut buf)| {
       let result_code = match res {
         Ok(n) => n,
@@ -527,7 +540,7 @@ pub extern "C" fn lio_recv(
 /// - `result`: 0 on success, or negative errno on error
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_close(fd: libc::intptr_t, callback: extern "C" fn(i32)) {
-  let resource = unsafe { fd_to_resource(fd) };
+  let resource = unsafe { fd_to_unique(fd) };
   crate::close(resource).when_done(move |res| {
     let result_code = match res {
       Ok(_) => 0,

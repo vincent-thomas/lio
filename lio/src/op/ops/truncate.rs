@@ -3,7 +3,7 @@ use std::os::fd::AsRawFd;
 #[cfg(linux)]
 use io_uring::{opcode, squeue, types::Fd};
 
-use crate::op::{DetachSafe, Operation, OperationExt};
+use crate::op::{Operation, OperationExt};
 use crate::resource::Resource;
 
 pub struct Truncate {
@@ -12,8 +12,6 @@ pub struct Truncate {
 }
 
 assert_op_max_size!(Truncate);
-
-unsafe impl DetachSafe for Truncate {}
 
 impl Truncate {
   pub(crate) fn new(res: Resource, size: u64) -> Self {

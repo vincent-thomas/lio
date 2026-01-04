@@ -249,57 +249,6 @@ impl<'a> Iterator for EventsIter<'a> {
   }
 }
 
-//
-// impl Poller {
-//   // /// Create a new poller
-//   // pub fn new() -> io::Result<Self> {
-//   //   Ok(Self { inner: sys::OsPoller::new()? })
-//   // }
-//
-//   /// Add interest for a file descriptor
-//   pub unsafe fn add(
-//     &self,
-//     fd: RawFd,
-//     key: u64,
-//     interest: Interest,
-//   ) -> io::Result<()> {
-//     assert!(fd >= 0, "Poller::add: fd must be >= 0, got {}", fd);
-//     assert!(!interest.is_none(), "Poller::add: interest cannot be None");
-//
-//     self.inner.add(fd, key, interest)
-//   }
-//
-//   /// Modify interest for a file descriptor
-//   pub unsafe fn modify(
-//     &self,
-//     fd: RawFd,
-//     key: u64,
-//     interest: Interest,
-//   ) -> io::Result<()> {
-//     if fd < 0 {
-//       return Err(io::Error::from_raw_os_error(libc::EBADF));
-//     }
-//
-//     assert!(!interest.is_none(), "Poller::modify: interest cannot be None");
-//
-//     self.inner.modify(fd, key, interest)
-//   }
-//
-//   /// Remove interest for a file descriptor
-//   pub unsafe fn delete(&self, fd: RawFd) -> io::Result<()> {
-//     if fd < 0 {
-//       return Err(io::Error::from_raw_os_error(libc::EBADF));
-//     }
-//
-//     self.inner.delete(fd)
-//   }
-//
-//   /// Remove a timer by key
-//   pub unsafe fn delete_timer(&self, key: u64) -> io::Result<()> {
-//     self.inner.delete_timer(key)
-//   }
-// }
-
 struct BlockingCompletion {
   id: u64,
   result: isize,
@@ -330,10 +279,14 @@ impl PollerHandle {
 
     self.events.clear();
     let items_written = state.sys.wait(
+      // SAFETY: as_raw_buf() provides mutable access to the entire capacity of the events buffer,
+      // which the OS will fill with events. The buffer is properly allocated and sized.
       unsafe { self.events.as_raw_buf() },
       if can_wait { None } else { Some(Duration::from_millis(0)) },
     )?;
 
+    // SAFETY: The OS's wait() call filled items_written events into our buffer.
+    // set_len is safe because items_written <= capacity (guaranteed by wait implementation).
     unsafe { self.events.set_len(items_written) };
 
     for event in self.events.iter() {
@@ -394,7 +347,7 @@ impl IoHandler for PollerHandle {
     state: *const (),
     store: &OpStore,
   ) -> io::Result<Vec<OpCompleted>> {
-    self.tick_inner(into_shared(state), store, true)
+    self.tick_inner(unsafe { Poller::state_from_ptr(state) }, store, true)
   }
 
   fn try_tick(
@@ -402,7 +355,7 @@ impl IoHandler for PollerHandle {
     state: *const (),
     store: &OpStore,
   ) -> io::Result<Vec<OpCompleted>> {
-    self.tick_inner(into_shared(state), store, false)
+    self.tick_inner(unsafe { Poller::state_from_ptr(state) }, store, false)
   }
 }
 pub struct PollerSubmitter {
@@ -438,27 +391,24 @@ impl PollerSubmitter {
   }
 }
 
-fn into_shared<'a>(ptr: *const ()) -> &'a PollerState {
-  unsafe { &*(ptr as *const _) }
-}
-
 impl IoSubmitter for PollerSubmitter {
   fn submit(
     &mut self,
-    state: *const (),
+    ptr: *const (),
     id: u64,
     op: &dyn Operation,
   ) -> Result<(), SubmitErr> {
+    let state = unsafe { Poller::state_from_ptr(ptr) };
     let meta = op.meta();
     if meta.is_cap_none() {
       let result = op.run_blocking();
       let _ = self.blocking_sender.send(BlockingCompletion { id, result });
-      self.notify(state)?;
+      self.notify(ptr)?;
       return Ok(());
     };
 
     if !meta.is_beh_run_before_noti() {
-      return self.new_polling(into_shared(state), id, op);
+      return self.new_polling(state, id, op);
     }
 
     // CONNECT
@@ -466,16 +416,17 @@ impl IoSubmitter for PollerSubmitter {
     let result = op.run_blocking();
 
     if result == libc::EINPROGRESS as isize {
-      self.new_polling(into_shared(state), id, op)
+      self.new_polling(state, id, op)
     } else {
       let result = op.run_blocking();
       let _ = self.blocking_sender.send(BlockingCompletion { id, result });
-      self.notify(state)?;
+      self.notify(ptr)?;
       Ok(())
     }
   }
   fn notify(&mut self, state: *const ()) -> Result<(), SubmitErr> {
-    Ok(into_shared(state).sys.notify()?)
+    let state = unsafe { Poller::state_from_ptr(state) };
+    Ok(state.sys.notify()?)
   }
 }
 
@@ -485,15 +436,15 @@ pub struct Poller(());
 impl IoDriver for Poller {
   type Handler = PollerHandle;
   type Submitter = PollerSubmitter;
+  type State = PollerState;
 
-  fn new_state() -> io::Result<*const ()> {
-    let state = PollerState { sys: sys::OsPoller::new()? };
-    Ok(Box::into_raw(Box::new(state)) as *const _)
+  fn new_state() -> io::Result<Self::State> {
+    Ok(PollerState { sys: sys::OsPoller::new()? })
   }
-  fn drop_state(state: *const ()) {
-    let _ = unsafe { Box::from_raw(state as *mut PollerState) };
-  }
-  fn new(_ptr: *const ()) -> io::Result<(Self::Submitter, Self::Handler)> {
+
+  fn new(
+    _ptr: &mut Self::State,
+  ) -> io::Result<(Self::Submitter, Self::Handler)> {
     let (blocking_sender, blocking_recv) = crossbeam_channel::unbounded();
     Ok((
       PollerSubmitter { blocking_sender },

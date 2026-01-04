@@ -2,7 +2,6 @@ use crate::op::OperationExt;
 use crate::registration::StoredOp;
 
 use std::marker::PhantomData;
-use std::mem;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 use std::{
@@ -119,7 +118,7 @@ impl<T> Receiver<T> {
   }
 
   fn set_inner(&mut self, value: std_mpsc::Receiver<T>) {
-    if let Some(_) = self.recv.replace(value) {
+    if self.recv.replace(value).is_some() {
       panic!("internal lio error");
     };
   }
@@ -127,11 +126,22 @@ impl<T> Receiver<T> {
 
 pub struct Progress<T> {
   op: T,
+  handle: Option<&'static Driver>,
 }
 
 impl<T> Progress<T> {
   pub(crate) fn from_op(op: T) -> Self {
-    Self { op }
+    Self { op, handle: None }
+  }
+  pub fn with_driver(mut self, driver: &'static Driver) -> Self {
+    self.handle = Some(driver);
+    self
+  }
+  fn get_driver(&self) -> &'static Driver {
+    match self.handle.as_ref() {
+      Some(handle) => *handle,
+      None => Driver::get(),
+    }
   }
 }
 
@@ -264,8 +274,9 @@ impl<T> Progress<T> {
     T: OperationExt + Send + 'static,
     F: FnOnce(T::Result) + Send,
   {
+    let driver = self.get_driver();
     let stored = StoredOp::new_callback(Box::new(self.op), f);
-    Driver::submit(stored).expect("lio error: lio should handle this");
+    driver.submit(stored).expect("lio error: lio should handle this");
   }
 }
 
@@ -277,15 +288,26 @@ where
   type IntoFuture = FutRecv<T>;
 
   fn into_future(self) -> Self::IntoFuture {
+    let driver = self.get_driver();
     let stored = StoredOp::new_waker(self.op);
-    let id = Driver::submit(stored).expect("lio error: lio should handle this");
-    FutRecv { id, _m: PhantomData }
+    let id = driver.submit(stored).expect("lio error: lio should handle this");
+    FutRecv { id, driver: self.handle, _m: PhantomData }
   }
 }
 
 pub struct FutRecv<T> {
   id: u64,
+  driver: Option<&'static Driver>,
   _m: PhantomData<T>,
+}
+
+impl<T> FutRecv<T> {
+  fn get_driver(&self) -> &'static Driver {
+    match self.driver.as_ref() {
+      Some(handle) => *handle,
+      None => Driver::get(),
+    }
+  }
 }
 
 impl<T> Future for FutRecv<T>
@@ -295,7 +317,7 @@ where
   type Output = T::Result;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    match Driver::get().check_done::<T>(self.id) {
+    match self.get_driver().check_done::<T>(self.id) {
       Some(result) => Poll::Ready(result),
       None => {
         Driver::get().set_waker(self.id, cx.waker().clone());

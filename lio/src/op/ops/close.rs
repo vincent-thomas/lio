@@ -4,20 +4,17 @@ use std::os::fd::AsRawFd;
 #[cfg(linux)]
 use io_uring::{opcode, types::Fd};
 
-use crate::op::DetachSafe;
-use crate::resource::Resource;
-
-use crate::op::Operation;
-use crate::op::OperationExt;
+use crate::{
+  op::{Operation, OperationExt},
+  resource::UniqueResource,
+};
 
 pub struct Close {
-  res: Resource,
+  res: UniqueResource,
 }
 
-unsafe impl DetachSafe for Close {}
-
 impl Close {
-  pub(crate) fn new(res: Resource) -> Self {
+  pub(crate) fn new(res: UniqueResource) -> Self {
     Self { res }
   }
 }

@@ -3,7 +3,6 @@ use std::os::fd::AsRawFd;
 #[cfg(linux)]
 use io_uring::types::Fd;
 
-use crate::op::DetachSafe;
 use crate::resource::Resource;
 
 use crate::op::{Operation, OperationExt};
@@ -18,8 +17,6 @@ impl Fsync {
     Self { res }
   }
 }
-
-unsafe impl DetachSafe for Fsync {}
 
 impl OperationExt for Fsync {
   type Result = std::io::Result<()>;
