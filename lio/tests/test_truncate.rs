@@ -1,4 +1,4 @@
-use lio::{resource::Resource, truncate};
+use lio::{api::truncate, api::resource::Resource};
 use std::{ffi::CString, os::fd::FromRawFd, sync::mpsc};
 
 #[test]
@@ -22,9 +22,7 @@ fn test_truncate_shrink_file() {
   let sender1 = sender.clone();
 
   // Truncate to 5 bytes
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 5).when_done(move |res| {
-    sender1.send(res).unwrap();
-  });
+  truncate(unsafe { Resource::from_raw_fd(fd) }, 5).send_with(sender1);
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -70,9 +68,7 @@ fn test_truncate_extend_file() {
   let sender1 = sender.clone();
 
   // Extend to 20 bytes
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 20).when_done(move |res| {
-    sender1.send(res).unwrap();
-  });
+  truncate(unsafe { Resource::from_raw_fd(fd) }, 20).send_with(sender1);
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -119,9 +115,7 @@ fn test_truncate_to_zero() {
   let sender1 = sender.clone();
 
   // Truncate to 0 bytes
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 0).when_done(move |res| {
-    sender1.send(res).unwrap();
-  });
+  truncate(unsafe { Resource::from_raw_fd(fd) }, 0).send_with(sender1);
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -169,9 +163,7 @@ fn test_truncate_same_size() {
 
   // Truncate to same size
   truncate(unsafe { Resource::from_raw_fd(fd) }, test_data.len() as u64)
-    .when_done(move |res| {
-      sender1.send(res).unwrap();
-    });
+    .send_with(sender1);
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -217,9 +209,7 @@ fn test_truncate_then_write() {
   let sender1 = sender.clone();
 
   // Truncate to 5 bytes
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 5).when_done(move |res| {
-    sender1.send(res).unwrap();
-  });
+  truncate(unsafe { Resource::from_raw_fd(fd) }, 5).send_with(sender1);
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -271,9 +261,7 @@ fn test_truncate_large_file() {
   let sender1 = sender.clone();
 
   // Truncate to 1KB
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 1024).when_done(move |res| {
-    sender1.send(res).unwrap();
-  });
+  truncate(unsafe { Resource::from_raw_fd(fd) }, 1024).send_with(sender1);
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
@@ -320,9 +308,7 @@ fn test_truncate_multiple_times() {
 
   // Truncate multiple times
   let sender1 = sender.clone();
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 8).when_done(move |res| {
-    sender1.send(res).unwrap();
-  });
+  truncate(unsafe { Resource::from_raw_fd(fd) }, 8).send_with(sender1);
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
   lio::tick();
   receiver.recv().unwrap().expect("First truncate failed");

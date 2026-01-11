@@ -20,39 +20,82 @@ pub struct OsPoller {
   registered_fds: HashSet<RawFd>,
   /// Track registered timer keys separately (timers don't have fds)
   registered_timers: HashSet<u64>,
+  notify: notify::Notify,
 }
 
 impl OsPoller {
   /// Create a new kqueue instance
   pub fn new() -> io::Result<Self> {
     // Create kqueue
+    let kqueue_fd = unsafe { OwnedFd::from_raw_fd(syscall!(kqueue())?) };
+    syscall!(fcntl(kqueue_fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC))?;
+
     let kqueue = Self {
-      kq_fd: unsafe { OwnedFd::from_raw_fd(syscall!(kqueue())?) },
+      kq_fd: kqueue_fd,
       registered_fds: HashSet::new(),
       registered_timers: HashSet::new(),
+      notify: notify::Notify::new()?,
     };
 
-    // Register EVFILT_USER for notifications
-    // Using EV_CLEAR for edge-triggered behavior to avoid event storms
-    let kev = libc::kevent {
-      ident: NOTIFY_IDENT as libc::uintptr_t,
-      filter: libc::EVFILT_USER,
-      flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-      fflags: 0,
-      data: 0,
-      udata: NOTIFY_IDENT as *mut libc::c_void,
-    };
+    kqueue.notify.register(&kqueue)?;
+
+    // // Register EVFILT_USER for notifications
+    // // Using EV_CLEAR for edge-triggered behavior to avoid event storms
+    // let kev = libc::kevent {
+    //   ident: NOTIFY_IDENT as libc::uintptr_t,
+    //   filter: libc::EVFILT_USER,
+    //   flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+    //   fflags: 0,
+    //   data: 0,
+    //   udata: NOTIFY_IDENT as *mut libc::c_void,
+    // };
+    //
+    // syscall!(kevent(
+    //   kqueue.kq_fd.as_raw_fd(),
+    //   &kev as *const libc::kevent,
+    //   1,
+    //   ptr::null_mut(),
+    //   0,
+    //   ptr::null(),
+    // ))?;
+
+    Ok(kqueue)
+  }
+
+  pub(crate) fn submit_changes(
+    &self,
+    changelist: &[<Self as ReadinessPoll>::NativeEvent],
+  ) -> io::Result<()> {
+    let changes = changelist.as_ref();
+    let nchanges = changes.len();
+
+    let mut eventlist: Vec<<Self as ReadinessPoll>::NativeEvent> =
+      Vec::with_capacity(nchanges);
+
+    // Safety: spare_capacity_mut() gives mutable uninit slice.
+    let spare = eventlist.spare_capacity_mut();
+    let nevents = spare.len();
 
     syscall!(kevent(
-      kqueue.kq_fd.as_raw_fd(),
-      &kev as *const libc::kevent,
-      1,
-      ptr::null_mut(),
-      0,
+      self.kq_fd.as_raw_fd(),
+      changes.as_ptr(),
+      nchanges as libc::c_int,
+      spare.as_mut_ptr().cast(),
+      nevents as libc::c_int,
       ptr::null(),
     ))?;
 
-    Ok(kqueue)
+    for ev in &eventlist {
+      if (ev.flags & libc::EV_ERROR as u16) != 0 {
+        let err_code = ev.data as i32;
+        if err_code != 0 && err_code != libc::ENOENT && err_code != libc::EPIPE
+        {
+          return Err(io::Error::from_raw_os_error(err_code));
+        }
+      }
+    }
+
+    Ok(())
   }
 
   /// Add or modify multiple interests in a single syscall (batched)
@@ -173,7 +216,7 @@ impl ReadinessPoll for OsPoller {
   fn add(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
     // For timers, track by key instead of fd
     if interest.is_timer() {
-      if self.registered_timers.insert_sync(key).is_err() {
+      if dbg!(self.registered_timers.insert_sync(key)).is_err() {
         return Err(io::Error::from_raw_os_error(libc::EEXIST));
       }
 
@@ -186,7 +229,7 @@ impl ReadinessPoll for OsPoller {
       }
     } else {
       // Check if fd is already registered (match epoll's EEXIST behavior)
-      if self.registered_fds.insert_sync(fd).is_err() {
+      if dbg!(self.registered_fds.insert_sync(fd)).is_err() {
         // Value already existed
         return Err(io::Error::from_raw_os_error(libc::EEXIST));
       }
@@ -460,6 +503,164 @@ mod utils {
 
       let err = io::Error::from_raw_os_error(libc::EINVAL);
       assert!(!is_not_found_error(&err));
+    }
+  }
+}
+
+#[cfg(any(
+  target_os = "freebsd",
+  target_os = "dragonfly",
+  target_vendor = "apple",
+))]
+mod notify {
+  use super::*;
+  use crate::backends::pollingv2::os::NOTIFY_KEY;
+  use std::io;
+
+  /// A notification pipe.
+  ///
+  /// This implementation uses `EVFILT_USER` to avoid allocating a pipe.
+  #[derive(Debug)]
+  pub(super) struct Notify;
+
+  impl Notify {
+    /// Creates a new notification pipe.
+    pub(super) fn new() -> io::Result<Self> {
+      Ok(Self)
+    }
+
+    /// Registers this notification pipe in the `Poller`.
+    pub(super) fn register(&self, poller: &OsPoller) -> io::Result<()> {
+      // Register an EVFILT_USER event.
+      // IMPORTANT: ident must match what notify() uses to trigger the event
+      poller.submit_changes(&[libc::kevent {
+        ident: NOTIFY_IDENT as libc::uintptr_t,
+        filter: libc::EVFILT_USER,
+        flags: (libc::EV_ADD | libc::EV_RECEIPT | libc::EV_CLEAR) as _,
+        fflags: 0,
+        data: 0,
+        udata: NOTIFY_KEY as *mut _,
+      }])
+    }
+
+    /// Reregister this notification pipe in the `Poller`.
+    pub(super) fn reregister(&self, _poller: &OsPoller) -> io::Result<()> {
+      // We don't need to do anything, it's already registered as EV_CLEAR.
+      Ok(())
+    }
+
+    /// Notifies the `Poller`.
+    pub(super) fn notify(&self, poller: &OsPoller) -> io::Result<()> {
+      // Trigger the EVFILT_USER event.
+      poller.submit_changes(&[libc::kevent {
+        ident: 0,
+        filter: libc::EVFILT_USER as _,
+        flags: (libc::EV_ADD | libc::EV_RECEIPT) as _,
+        fflags: libc::NOTE_TRIGGER,
+        data: 0,
+        udata: NOTIFY_KEY as *mut _,
+      }])?;
+
+      Ok(())
+    }
+
+    /// Deregisters this notification pipe from the `Poller`.
+    pub(super) fn deregister(&self, poller: &OsPoller) -> io::Result<()> {
+      // Deregister the EVFILT_USER event.
+      poller.submit_changes(&[libc::kevent {
+        ident: 0,
+        filter: libc::EVFILT_USER as _,
+        flags: (libc::EV_DELETE | libc::EV_RECEIPT) as _,
+        fflags: 0,
+        data: 0,
+        udata: NOTIFY_KEY as *mut _,
+      }])
+    }
+  }
+}
+
+#[cfg(not(any(
+  target_os = "freebsd",
+  target_os = "dragonfly",
+  target_vendor = "apple",
+)))]
+mod notify {
+  use super::Poller;
+  use crate::{Event, NOTIFY_KEY, PollMode};
+  use std::io::{self, prelude::*};
+  #[cfg(feature = "tracing")]
+  use std::os::unix::io::BorrowedFd;
+  use std::os::unix::{
+    io::{AsFd, AsRawFd},
+    net::UnixStream,
+  };
+
+  /// A notification pipe.
+  ///
+  /// This implementation uses a pipe to send notifications.
+  #[derive(Debug)]
+  pub(super) struct Notify {
+    /// The read end of the pipe.
+    read_stream: UnixStream,
+
+    /// The write end of the pipe.
+    write_stream: UnixStream,
+  }
+
+  impl Notify {
+    /// Creates a new notification pipe.
+    pub(super) fn new() -> io::Result<Self> {
+      let (read_stream, write_stream) = UnixStream::pair()?;
+      read_stream.set_nonblocking(true)?;
+      write_stream.set_nonblocking(true)?;
+
+      Ok(Self { read_stream, write_stream })
+    }
+
+    /// Registers this notification pipe in the `Poller`.
+    pub(super) fn register(&self, poller: &Poller) -> io::Result<()> {
+      // Register the read end of this pipe.
+      unsafe {
+        poller.add(
+          self.read_stream.as_raw_fd(),
+          Event::readable(NOTIFY_KEY),
+          PollMode::Oneshot,
+        )
+      }
+    }
+
+    /// Reregister this notification pipe in the `Poller`.
+    pub(super) fn reregister(&self, poller: &Poller) -> io::Result<()> {
+      // Clear out the notification.
+      while (&self.read_stream).read(&mut [0; 64]).is_ok() {}
+
+      // Reregister the read end of this pipe.
+      poller.modify(
+        self.read_stream.as_fd(),
+        Event::readable(NOTIFY_KEY),
+        PollMode::Oneshot,
+      )
+    }
+
+    /// Notifies the `Poller`.
+    #[allow(clippy::unused_io_amount)]
+    pub(super) fn notify(&self, _poller: &Poller) -> io::Result<()> {
+      // Write to the write end of the pipe
+      (&self.write_stream).write(&[1])?;
+
+      Ok(())
+    }
+
+    /// Deregisters this notification pipe from the `Poller`.
+    pub(super) fn deregister(&self, poller: &Poller) -> io::Result<()> {
+      // Deregister the read end of the pipe.
+      poller.delete(self.read_stream.as_fd())
+    }
+
+    /// Whether this raw file descriptor is associated with this pipe.
+    #[cfg(feature = "tracing")]
+    pub(super) fn has_fd(&self, fd: BorrowedFd<'_>) -> bool {
+      self.read_stream.as_raw_fd() == fd.as_raw_fd()
     }
   }
 }

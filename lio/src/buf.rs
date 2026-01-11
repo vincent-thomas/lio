@@ -34,7 +34,13 @@
 /// This is commonly used for read/write operations where the buffer
 /// is returned along with the operation result.
 ///
-/// Example: See [`lio::read_with_buf`](crate::read_with_buf).
+/// # Example
+///
+/// ```ignore
+/// let buf = vec![0u8; 1024];
+/// let (result, buf) = lio::recv(socket, buf, None).await;
+/// // buffer is returned and can be reused
+/// ```
 pub type BufResult<T, B> = (std::io::Result<T>, B);
 
 trait Sealed {}

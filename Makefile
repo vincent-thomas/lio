@@ -18,7 +18,7 @@ test-doc:
 	RUST_BACKTRACE=1 cargo test --doc
 
 test-lib:
-	cargo nextest r --release -p lio --all-features --stress-count 10
+	cargo nextest r -p lio --all-features --stress-count 10
 
 test-ffi:
 	./lio/tests/ffi/test.sh

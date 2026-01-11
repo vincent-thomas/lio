@@ -19,10 +19,10 @@ macro_rules! test_io_driver {
   ($driver:ident) => {
     mod io_driver_tests {
       use super::*;
-      use $crate::backends::{IoDriver, IoHandler, IoSubmitter, SubmitErr};
-      use $crate::op::nop::Nop;
+      use $crate::api::ops::Nop;
+      use $crate::backends::OpStore;
+      use $crate::backends::{IoBackend, IoDriver, IoSubmitter, SubmitErr};
       use $crate::registration::StoredOp;
-      use $crate::store::OpStore;
       //
       // #[test]
       // fn test_state_lifecycle() {
@@ -378,8 +378,9 @@ macro_rules! test_io_driver {
         drop(submitter);
         drop(handler);
 
-        drop(state_ptr);
-        drop(state);
+        let _ = unsafe {
+          Box::from_raw(state_ptr as *mut <$driver as IoBackend>::State)
+        };
       }
     }
   };

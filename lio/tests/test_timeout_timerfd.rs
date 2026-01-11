@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use lio::api;
+
 #[test]
 fn test_timeout_basic() {
   lio::init();
@@ -7,7 +9,7 @@ fn test_timeout_basic() {
   let start = Instant::now();
   let timeout_duration = Duration::from_millis(500);
 
-  let recv = lio::timeout(timeout_duration).send();
+  let recv = api::timeout(timeout_duration).send();
   let result = recv.recv();
 
   let elapsed = start.elapsed();
@@ -34,9 +36,9 @@ fn test_timeout_multiple() {
   let start = Instant::now();
 
   // Start 3 timeouts with different durations
-  let recv1 = lio::timeout(Duration::from_millis(50)).send();
-  let recv2 = lio::timeout(Duration::from_millis(100)).send();
-  let recv3 = lio::timeout(Duration::from_millis(150)).send();
+  let recv1 = api::timeout(Duration::from_millis(50)).send();
+  let recv2 = api::timeout(Duration::from_millis(100)).send();
+  let recv3 = api::timeout(Duration::from_millis(150)).send();
 
   // They should complete in order
   let result1 = recv1.recv();

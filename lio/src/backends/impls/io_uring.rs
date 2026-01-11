@@ -1,14 +1,16 @@
+//! `lio`-provided [`IoBackend`] impl for `io_uring`.
 use crate::{
-  backends::{IoDriver, IoHandler, IoSubmitter, OpCompleted, SubmitErr},
-  op::Operation,
-  store::OpStore,
+  backends::{
+    IoBackend, IoDriver, IoSubmitter, OpCompleted, OpStore, SubmitErr,
+  },
+  operation::Operation,
 };
 use std::io;
 
 pub struct IoUring;
 
-impl IoDriver for IoUring {
-  type Handler = IoUringHandler;
+impl IoBackend for IoUring {
+  type Driver = IoUringDriver;
   type Submitter = IoUringSubmitter;
   type State = IoUringState;
 
@@ -18,9 +20,9 @@ impl IoDriver for IoUring {
 
   fn new(
     state: &'static mut Self::State,
-  ) -> io::Result<(Self::Submitter, Self::Handler)> {
+  ) -> io::Result<(Self::Submitter, Self::Driver)> {
     let (_, sq, cq) = state._uring.split();
-    let handle = IoUringHandler { cq };
+    let handle = IoUringDriver { cq };
     let submitter = IoUringSubmitter { sq };
 
     Ok((submitter, handle))
@@ -32,8 +34,8 @@ pub struct IoUringSubmitter {
 }
 
 unsafe impl Send for IoUringSubmitter {}
-unsafe impl Send for IoUringHandler {}
-pub struct IoUringHandler {
+unsafe impl Send for IoUringDriver {}
+pub struct IoUringDriver {
   cq: io_uring::CompletionQueue<'static>,
 }
 pub struct IoUringState {
@@ -84,7 +86,7 @@ impl IoSubmitter for IoUringSubmitter {
   }
 }
 
-impl IoHandler for IoUringHandler {
+impl IoDriver for IoUringDriver {
   fn try_tick(
     &mut self,
     state: *const (),
@@ -101,7 +103,7 @@ impl IoHandler for IoUringHandler {
   }
 }
 
-impl IoUringHandler {
+impl IoUringDriver {
   pub fn tick_inner(
     &mut self,
     can_block: bool,

@@ -1,26 +1,58 @@
+//! Operation submission for I/O backends.
+//!
+//! This module defines the traits and types for submitting operations to backends.
+//! Operations are registered in the [`OpStore`] before being submitted to the backend.
+
 use std::sync::Arc;
 
 use crate::{
-  backends::SubmitErr, op::Operation, registration::StoredOp, store::OpStore,
+  backends::{OpStore, SubmitErr},
+  operation::Operation,
+  registration::StoredOp,
 };
 
+/// Represents a completed I/O operation.
+///
+/// This type is returned by backend handlers when an operation completes,
+/// containing the operation ID and its result.
 #[derive(Debug)]
 pub struct OpCompleted {
+  /// The unique identifier of the completed operation.
   pub(crate) op_id: u64,
+
   /// Result of the operation:
-  /// - >= 0 on success (the result value)
-  /// - < 0 on error (negative errno value)
+  /// - `>= 0` on success (the return value, e.g., bytes transferred)
+  /// - `< 0` on error (negative errno value)
   pub(crate) result: isize,
 }
 
 impl OpCompleted {
+  /// Creates a new completed operation result.
+  ///
+  /// # Parameters
+  ///
+  /// - `op_id`: The unique ID of the operation
+  /// - `result`: The operation result (non-negative for success, negative errno for error)
   pub fn new(op_id: u64, result: isize) -> Self {
     Self { op_id, result }
   }
 }
 
+/// Trait for backend-specific operation submission.
+///
+/// This trait is implemented by each backend to handle submitting operations
+/// to the underlying I/O mechanism (io_uring, kqueue, IOCP, etc.).
 pub trait IoSubmitter {
-  /// Caller can assume op is in the OpStore.
+  /// Submits an operation to the backend.
+  ///
+  /// The caller guarantees that the operation is already registered in the [`OpStore`]
+  /// with the given `id`.
+  ///
+  /// # Parameters
+  ///
+  /// - `state`: Type-erased pointer to the backend state
+  /// - `id`: The [OpStore] key for op.
+  /// - `op`: Operation to submit
   fn submit(
     &mut self,
     state: *const (),
@@ -28,10 +60,19 @@ pub trait IoSubmitter {
     op: &dyn Operation,
   ) -> Result<(), SubmitErr>;
 
-  /// TODO: move to already existing id api.
+  /// Notifies the backend that operations have been submitted. [`Handler::tick`](super::Handler::tick)'s must wake up.
+  ///
+  /// # Parameters
+  ///
+  /// - `state`: Type-erased pointer to the backend state
   fn notify(&mut self, state: *const ()) -> Result<(), SubmitErr>;
 }
 
+/// Type-erased submitter wrapper.
+///
+/// This wraps a backend-specific [`IoSubmitter`] implementation and provides
+/// a unified interface for operation submission. It manages the connection
+/// to the [`OpStore`] and backend state.
 pub struct Submitter {
   sub: Box<dyn IoSubmitter>,
   store: Arc<OpStore>,
@@ -41,6 +82,13 @@ pub struct Submitter {
 unsafe impl Send for Submitter {}
 
 impl Submitter {
+  /// Creates a new submitter wrapper.
+  ///
+  /// # Parameters
+  ///
+  /// - `sub`: The backend-specific submitter implementation
+  /// - `store`: The operation store for tracking in-flight operations
+  /// - `state`: Type-erased pointer to the backend state
   pub fn new(
     sub: Box<dyn IoSubmitter>,
     store: Arc<OpStore>,
@@ -49,6 +97,18 @@ impl Submitter {
     Self { sub, store, state }
   }
 
+  /// Submits an operation to the backend.
+  ///
+  /// # Returns
+  ///
+  /// - `Ok(u64)`: The unique operation ID
+  /// - `Err(SubmitErr)`: Submission failed
+  ///
+  /// # Panics
+  ///
+  /// Panics if the backend returns `NotCompatible` after the operation was
+  /// already inserted into the store. This indicates a bug in the backend
+  /// selection logic.
   pub fn submit(&mut self, op: StoredOp) -> Result<u64, SubmitErr> {
     let id = self.store.insert(op);
     let _ref = self
@@ -78,6 +138,16 @@ impl Submitter {
     }
   }
 
+  /// Notifies the backend to process submitted operations.
+  ///
+  /// Some backends batch operations and require an explicit notification
+  /// to begin processing. This method should be called after one or more
+  /// operations have been submitted.
+  ///
+  /// # Returns
+  ///
+  /// - `Ok(())`: Notification successful
+  /// - `Err(SubmitErr)`: Notification failed
   pub fn notify(&mut self) -> Result<(), SubmitErr> {
     self.sub.notify(self.state)
   }

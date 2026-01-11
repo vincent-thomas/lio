@@ -1,9 +1,7 @@
 use crate::{
-  backends::{Handler, IoDriver, SubmitErr, Submitter},
-  buf::{BufStore, LentBuf},
-  op::OperationExt,
+  backends::{self, IoBackend, OpStore, SubmitErr, Submitter},
+  operation::OperationExt,
   registration::StoredOp,
-  store::OpStore,
   worker::Worker,
 };
 
@@ -20,8 +18,6 @@ use std::{
 pub struct Driver {
   store: Arc<OpStore>,
   primary_worker: Worker,
-  // blocking_worker: Worker,
-  buf_store: BufStore,
 }
 
 #[derive(Debug)]
@@ -44,12 +40,11 @@ impl fmt::Display for TryInitError {
 static DRIVER: AtomicPtr<Driver> = AtomicPtr::new(std::ptr::null_mut());
 
 impl Driver {
-  pub(crate) fn try_init_with_capacity_and_bufstore<D>(
+  pub(crate) fn try_init_with_capacity<D>(
     cap: usize,
-    buf_store: BufStore,
   ) -> Result<(), TryInitError>
   where
-    D: IoDriver,
+    D: IoBackend,
   {
     // Check if already initialized
     if !DRIVER.load(Ordering::Acquire).is_null() {
@@ -68,12 +63,12 @@ impl Driver {
     let ptr = state_ptr.cast_const().cast::<()>();
 
     let primary_handler =
-      Handler::new(Box::new(primary_handler), store.clone(), ptr);
+      backends::Driver::new(Box::new(primary_handler), store.clone(), ptr);
     let primary_submitter =
       Submitter::new(Box::new(primary_subm), store.clone(), ptr);
 
     let driver_ptr = Box::into_raw(Box::new(Driver {
-      buf_store,
+      // buf_store,
       primary_worker: Worker::spawn(primary_submitter, primary_handler),
       store: store.clone(),
     }));
@@ -115,14 +110,9 @@ impl Driver {
     Self::deallocate(ptr);
   }
 
-  pub(crate) fn try_lend_buf<'a>(&'a self) -> Option<LentBuf<'a>> {
-    self.buf_store.try_get()
-  }
-
   /// Deallocates the Driver, freeing all resources.
   /// This will panic if the driver is not initialized or if shutdown has not been called first.
   pub(crate) fn deallocate(ptr: NonNull<Driver>) {
-    println!("deallocating driver");
     // SAFETY: This pointer was created via Box::into_raw in init()
     let _ = unsafe { Box::from_raw(ptr.as_ptr()) };
   }
@@ -136,25 +126,8 @@ impl Driver {
   pub(crate) fn submit(&self, stored: StoredOp) -> Result<u64, SubmitErr> {
     // Try primary worker first
     match self.primary_worker.submit(stored) {
-      Ok(id) => dbg!(Ok(id)),
-      Err(err) => Err(err), //   match driver.blocking_worker.submit(op) {
-                            //     Ok(v) => Ok(v),
-                            //     Err(err) => match err {
-                            //       SubmitErrExt::NotCompatible(_)
-                            //       | SubmitErrExt::SubmitErr(SubmitErr::NotCompatible) => {
-                            //         unreachable!()
-                            //       }
-                            //       SubmitErrExt::SubmitErr(err) => match err {
-                            //         SubmitErr::NotCompatible => unreachable!(),
-                            //         _ => Err(err),
-                            //       },
-                            //     },
-                            //   }
-                            // }
-                            // SubmitErrExt::SubmitErr(err) => match err {
-                            //   SubmitErr::NotCompatible => unreachable!(),
-                            //   _ => Err(err),
-                            // },
+      Ok(id) => Ok(id),
+      Err(err) => Err(err),
     }
   }
 

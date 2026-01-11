@@ -1,6 +1,6 @@
 #![cfg(linux)]
 
-use lio::tee;
+use lio::{api::{tee}, api::resource::Resource};
 use std::sync::mpsc::{self, TryRecvError};
 
 #[test]
@@ -34,12 +34,10 @@ fn test_tee_basic() {
   }
 
   let (sender, receiver) = mpsc::channel();
-  let sender1 = sender.clone();
 
   // Use tee to copy data from pipe1 to pipe2
-  tee(pipe1_read, pipe2_write, test_data.len() as u32).when_done(move |t| {
-    sender1.send(t).unwrap();
-  });
+  tee(pipe1_read, pipe2_write, test_data.len() as u32)
+    .send_with(sender.clone());
 
   assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -79,18 +77,10 @@ fn test_tee_basic() {
   let sender5 = sender2.clone();
   let sender6 = sender2.clone();
 
-  lio::close(pipe1_fds[0]).when_done(move |t| {
-    sender3.send(t).unwrap();
-  });
-  lio::close(pipe1_fds[1]).when_done(move |t| {
-    sender4.send(t).unwrap();
-  });
-  lio::close(pipe2_fds[0]).when_done(move |t| {
-    sender5.send(t).unwrap();
-  });
-  lio::close(pipe2_fds[1]).when_done(move |t| {
-    sender6.send(t).unwrap();
-  });
+  lio::close(pipe1_fds[0]).send_with(sender3);
+  lio::close(pipe1_fds[1]).send_with(sender4);
+  lio::close(pipe2_fds[0]).send_with(sender5);
+  lio::close(pipe2_fds[1]).send_with(sender6);
 
   assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -168,18 +158,10 @@ fn test_tee_large_data() {
   let sender5 = sender2.clone();
   let sender6 = sender2.clone();
 
-  lio::close(pipe1_fds[0]).when_done(move |t| {
-    sender3.send(t).unwrap();
-  });
-  lio::close(pipe1_fds[1]).when_done(move |t| {
-    sender4.send(t).unwrap();
-  });
-  lio::close(pipe2_fds[0]).when_done(move |t| {
-    sender5.send(t).unwrap();
-  });
-  lio::close(pipe2_fds[1]).when_done(move |t| {
-    sender6.send(t).unwrap();
-  });
+  lio::close(pipe1_fds[0]).send_with(sender3);
+  lio::close(pipe1_fds[1]).send_with(sender4);
+  lio::close(pipe2_fds[0]).send_with(sender5);
+  lio::close(pipe2_fds[1]).send_with(sender6);
 
   assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -223,9 +205,7 @@ fn test_tee_partial() {
 
   // Tee only part of the data
   let bytes_to_tee = 8;
-  tee(pipe1_read, pipe2_write, bytes_to_tee).when_done(move |t| {
-    sender1.send(t).unwrap();
-  });
+  tee(pipe1_read, pipe2_write, bytes_to_tee).send_with(sender1);
 
   assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -265,15 +245,9 @@ fn test_tee_partial() {
   let sender4 = sender2.clone();
   let sender5 = sender2.clone();
 
-  lio::close(pipe1_fds[1]).when_done(move |t| {
-    sender3.send(t).unwrap();
-  });
-  lio::close(pipe2_fds[0]).when_done(move |t| {
-    sender4.send(t).unwrap();
-  });
-  lio::close(pipe2_fds[1]).when_done(move |t| {
-    sender5.send(t).unwrap();
-  });
+  lio::close(pipe1_fds[1]).send_with(sender3);
+  lio::close(pipe2_fds[0]).send_with(sender4);
+  lio::close(pipe2_fds[1]).send_with(sender5);
 
   assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -310,9 +284,7 @@ fn test_tee_empty_pipe() {
   let sender1 = sender.clone();
 
   // Try to tee from empty pipe
-  tee(pipe1_read, pipe2_write, 100).when_done(move |t| {
-    sender1.send(t).unwrap();
-  });
+  tee(pipe1_read, pipe2_write, 100).send_with(sender1);
 
   assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -330,18 +302,10 @@ fn test_tee_empty_pipe() {
   let sender5 = sender2.clone();
   let sender6 = sender2.clone();
 
-  lio::close(pipe1_fds[0]).when_done(move |t| {
-    sender3.send(t).unwrap();
-  });
-  lio::close(pipe1_fds[1]).when_done(move |t| {
-    sender4.send(t).unwrap();
-  });
-  lio::close(pipe2_fds[0]).when_done(move |t| {
-    sender5.send(t).unwrap();
-  });
-  lio::close(pipe2_fds[1]).when_done(move |t| {
-    sender6.send(t).unwrap();
-  });
+  lio::close(pipe1_fds[0]).send_with(sender3);
+  lio::close(pipe1_fds[1]).send_with(sender4);
+  lio::close(pipe2_fds[0]).send_with(sender5);
+  lio::close(pipe2_fds[1]).send_with(sender6);
 
   assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -383,9 +347,7 @@ fn test_tee_zero_size() {
   let sender1 = sender.clone();
 
   // Tee with size 0
-  tee(pipe1_read, pipe2_write, 0).when_done(move |t| {
-    sender1.send(t).unwrap();
-  });
+  tee(pipe1_read, pipe2_write, 0).send_with(sender1);
 
   assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -402,18 +364,10 @@ fn test_tee_zero_size() {
   let sender5 = sender2.clone();
   let sender6 = sender2.clone();
 
-  lio::close(pipe1_fds[0]).when_done(move |t| {
-    sender3.send(t).unwrap();
-  });
-  lio::close(pipe1_fds[1]).when_done(move |t| {
-    sender4.send(t).unwrap();
-  });
-  lio::close(pipe2_fds[0]).when_done(move |t| {
-    sender5.send(t).unwrap();
-  });
-  lio::close(pipe2_fds[1]).when_done(move |t| {
-    sender6.send(t).unwrap();
-  });
+  lio::close(pipe1_fds[0]).send_with(sender3);
+  lio::close(pipe1_fds[1]).send_with(sender4);
+  lio::close(pipe2_fds[0]).send_with(sender5);
+  lio::close(pipe2_fds[1]).send_with(sender6);
 
   assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -476,9 +430,7 @@ fn test_tee_multiple() {
   let sender3 = sender2.clone();
 
   // Tee to pipe3 (data still in pipe1)
-  tee(pipe1_read, pipe3_write, test_data.len() as u32).when_done(move |t| {
-    sender3.send(t).unwrap();
-  });
+  tee(pipe1_read, pipe3_write, test_data.len() as u32).send_with(sender3);
 
   assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -510,24 +462,12 @@ fn test_tee_multiple() {
   let sender9 = sender4.clone();
   let sender10 = sender4.clone();
 
-  lio::close(pipe1_fds[0]).when_done(move |t| {
-    sender5.send(t).unwrap();
-  });
-  lio::close(pipe1_fds[1]).when_done(move |t| {
-    sender6.send(t).unwrap();
-  });
-  lio::close(pipe2_fds[0]).when_done(move |t| {
-    sender7.send(t).unwrap();
-  });
-  lio::close(pipe2_fds[1]).when_done(move |t| {
-    sender8.send(t).unwrap();
-  });
-  lio::close(pipe3_fds[0]).when_done(move |t| {
-    sender9.send(t).unwrap();
-  });
-  lio::close(pipe3_fds[1]).when_done(move |t| {
-    sender10.send(t).unwrap();
-  });
+  lio::close(pipe1_fds[0]).send_with(sender5);
+  lio::close(pipe1_fds[1]).send_with(sender6);
+  lio::close(pipe2_fds[0]).send_with(sender7);
+  lio::close(pipe2_fds[1]).send_with(sender8);
+  lio::close(pipe3_fds[0]).send_with(sender9);
+  lio::close(pipe3_fds[1]).send_with(sender10);
 
   assert_eq!(receiver4.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -575,9 +515,12 @@ fn test_tee_concurrent() {
   for (pipe1_fds, pipe2_fds, data) in &tasks {
     let sender_clone = sender.clone();
     let data_len = data.len();
-    tee(pipe1_fds[0], pipe2_fds[1], data_len as u32).when_done(move |t| {
-      sender_clone.send(t).unwrap();
-    });
+    api::tee(
+      unsafe { Resource::from_raw_fd(pipe1_fds[0]) },
+      unsafe { Resource::from_raw_fd(pipe2_fds[1],
+      data_len as u32,
+    )
+    .send_with(sender_clone);
   }
 
   assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -598,18 +541,10 @@ fn test_tee_concurrent() {
     let sender5 = sender2.clone();
     let sender6 = sender2.clone();
 
-    lio::close(pipe1_fds[0]).when_done(move |t| {
-      sender3.send(t).unwrap();
-    });
-    lio::close(pipe1_fds[1]).when_done(move |t| {
-      sender4.send(t).unwrap();
-    });
-    lio::close(pipe2_fds[0]).when_done(move |t| {
-      sender5.send(t).unwrap();
-    });
-    lio::close(pipe2_fds[1]).when_done(move |t| {
-      sender6.send(t).unwrap();
-    });
+    lio::close(pipe1_fds[0]).send_with(sender3);
+    lio::close(pipe1_fds[1]).send_with(sender4);
+    lio::close(pipe2_fds[0]).send_with(sender5);
+    lio::close(pipe2_fds[1]).send_with(sender6);
   }
 
   assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
