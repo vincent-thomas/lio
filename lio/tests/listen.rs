@@ -356,7 +356,7 @@ fn test_listen_after_close() {
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  let mut bind_recv = api::bind(&sock, addr).send();
+  let bind_recv = api::bind(&sock, addr).send();
 
   lio::tick();
 
