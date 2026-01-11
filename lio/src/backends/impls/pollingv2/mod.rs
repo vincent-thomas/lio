@@ -1,7 +1,4 @@
-//! Simple OS-specific polling implementation
-//!
-//! This module provides a minimal polling interface for async I/O.
-//! Uses kqueue on BSD/macOS, epoll on Linux (future), IOCP on Windows (future).
+//! `lio`-provided [`IoDriver`] impl for `epoll`/`kqueue` (platform-specific).
 
 mod os;
 
@@ -24,72 +21,14 @@ use os::kqueue as sys;
 pub(crate) mod tests;
 
 use core::slice;
-use std::collections::HashMap;
 use std::io;
 use std::os::fd::RawFd;
 use std::time::Duration;
 
-use crate::backends::{IoDriver, IoHandler, IoSubmitter, OpCompleted};
-use crate::{backends::SubmitErr, op::Operation, store::OpStore};
-
-/// Interest/Event flags for I/O readiness
-///
-/// This type is used for both:
-/// - Registering interest (what you want to be notified about)
-/// - Receiving events (what actually happened)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Interest {
-  bits: u8,
-}
-
-impl Interest {
-  pub const NONE: Self = Self { bits: 0 };
-  pub const READ: Self = Self { bits: 1 << 0 };
-  pub const WRITE: Self = Self { bits: 1 << 1 };
-  pub const TIMER: Self = Self { bits: 1 << 2 };
-  pub const READ_AND_WRITE: Self =
-    Self { bits: Self::READ.bits | Self::WRITE.bits };
-
-  pub const fn is_readable(self) -> bool {
-    self.bits & Self::READ.bits != 0
-  }
-
-  pub const fn is_writable(self) -> bool {
-    self.bits & Self::WRITE.bits != 0
-  }
-
-  pub const fn is_timer(self) -> bool {
-    self.bits & Self::TIMER.bits != 0
-  }
-
-  pub const fn is_none(self) -> bool {
-    self.bits == 0
-  }
-
-  /// Combine interests using bitwise OR
-  pub const fn or(self, other: Self) -> Self {
-    Self { bits: self.bits | other.bits }
-  }
-
-  /// Check if this interest contains all bits from another
-  pub const fn contains(self, other: Self) -> bool {
-    (self.bits & other.bits) == other.bits
-  }
-}
-
-impl std::ops::BitOr for Interest {
-  type Output = Self;
-
-  fn bitor(self, rhs: Self) -> Self::Output {
-    self.or(rhs)
-  }
-}
-
-impl std::ops::BitOrAssign for Interest {
-  fn bitor_assign(&mut self, rhs: Self) {
-    *self = self.or(rhs);
-  }
-}
+use crate::backends::pollingv2::interest::Interest;
+use crate::backends::{IoBackend, IoDriver, IoSubmitter, OpCompleted, OpStore};
+use crate::{backends::SubmitErr, operation::Operation};
+mod interest;
 
 /// Trait for OS-specific readiness polling implementations
 ///
@@ -256,10 +195,10 @@ struct BlockingCompletion {
 
 pub struct PollerState {
   sys: sys::OsPoller,
+  fd_map: scc::HashMap<u64, RawFd>,
 }
 pub struct PollerHandle {
   events: Events,
-  fd_map: HashMap<u64, RawFd>,
   blocking_sender: crossbeam_channel::Receiver<BlockingCompletion>,
 }
 
@@ -285,6 +224,11 @@ impl PollerHandle {
       if can_wait { None } else { Some(Duration::from_millis(0)) },
     )?;
 
+    // Blocking calls may have run notify() to get values.
+    while let Ok(blocking) = self.blocking_sender.try_recv() {
+      completed.push(OpCompleted::new(blocking.id, blocking.result));
+    }
+
     // SAFETY: The OS's wait() call filled items_written events into our buffer.
     // set_len is safe because items_written <= capacity (guaranteed by wait implementation).
     unsafe { self.events.set_len(items_written) };
@@ -297,15 +241,15 @@ impl PollerHandle {
         continue;
       }
 
-      // Look up fd from our internal map
-      let entry_fd = *self
-        .fd_map
-        .get(&operation_id)
-        .expect("couldn't find fd for operation");
-
       let result = store
         .get_mut(operation_id, |entry| entry.run_blocking())
         .expect("couldn't find entry");
+
+      // Look up fd from our internal map
+      let Some(entry_fd) = state.fd_map.get_sync(&operation_id).map(|fd| *fd)
+      else {
+        panic!("couldn't find fd for operation");
+      };
 
       // Check for EAGAIN/EINPROGRESS (would block)
       if result < 0 {
@@ -314,7 +258,7 @@ impl PollerHandle {
           || errno == libc::EWOULDBLOCK
           || errno == libc::EINPROGRESS
         {
-          dbg!(state.sys.modify(entry_fd, operation_id, event.interest))?;
+          state.sys.modify(entry_fd, operation_id, event.interest)?;
           continue;
         }
       }
@@ -323,17 +267,14 @@ impl PollerHandle {
       {
         // Clean up - use delete_timer for timer events, delete for fd-based events
         if event.interest.is_timer() {
-          dbg!(state.sys.delete_timer(operation_id))?;
+          state.sys.delete_timer(operation_id)?;
         } else {
-          dbg!(state.sys.delete(entry_fd))?;
+          state.sys.delete(entry_fd)?;
         }
-        self.fd_map.remove(&operation_id);
+        let was_deleted = state.fd_map.remove_sync(&operation_id).is_some();
+        assert!(was_deleted);
 
         completed.push(OpCompleted::new(operation_id, result));
-
-        // let exists = store.get_mut(operation_id, |reg| reg.set_done(result));
-        // assert!(exists.is_some(), "Cannot find matching operation");
-        // assert!(store.remove(operation_id));
       };
     }
 
@@ -341,7 +282,7 @@ impl PollerHandle {
   }
 }
 
-impl IoHandler for PollerHandle {
+impl IoDriver for PollerHandle {
   fn tick(
     &mut self,
     state: *const (),
@@ -386,7 +327,9 @@ impl PollerSubmitter {
       panic!()
     };
 
+    state.fd_map.insert_sync(id, op.cap()).unwrap();
     state.sys.add(op.cap(), id, interest).map_err(SubmitErr::Io)?;
+
     Ok(())
   }
 }
@@ -400,14 +343,27 @@ impl IoSubmitter for PollerSubmitter {
   ) -> Result<(), SubmitErr> {
     let state = unsafe { Poller::state_from_ptr(ptr) };
     let meta = op.meta();
+
+    eprintln!(
+      "[PollerSubmitter::submit] op_id={}, meta={:?}, is_cap_none={}, is_beh_run_before_noti={}",
+      id,
+      meta,
+      meta.is_cap_none(),
+      !meta.is_cap_none() && meta.is_beh_run_before_noti()
+    );
+
     if meta.is_cap_none() {
+      eprintln!("[PollerSubmitter::submit] CAP_NONE path");
       let result = op.run_blocking();
       let _ = self.blocking_sender.send(BlockingCompletion { id, result });
-      self.notify(ptr)?;
+      dbg!(self.notify(ptr))?;
       return Ok(());
     };
 
     if !meta.is_beh_run_before_noti() {
+      eprintln!(
+        "[PollerSubmitter::submit] new_polling path (no BEH_NEEDS_RUN)"
+      );
       return self.new_polling(state, id, op);
     }
 
@@ -415,42 +371,53 @@ impl IoSubmitter for PollerSubmitter {
 
     let result = op.run_blocking();
 
-    if result == libc::EINPROGRESS as isize {
+    eprintln!(
+      "[PollerSubmitter CONNECT] result={}, -EINPROGRESS={}",
+      result,
+      -(libc::EINPROGRESS as isize)
+    );
+
+    if result == -(libc::EINPROGRESS as isize) {
+      eprintln!("[PollerSubmitter CONNECT] Match! Registering for polling");
       self.new_polling(state, id, op)
     } else {
-      let result = op.run_blocking();
+      eprintln!(
+        "[PollerSubmitter CONNECT] No match, sending via blocking channel"
+      );
       let _ = self.blocking_sender.send(BlockingCompletion { id, result });
-      self.notify(ptr)?;
+      dbg!(self.notify(ptr))?;
       Ok(())
     }
   }
   fn notify(&mut self, state: *const ()) -> Result<(), SubmitErr> {
     let state = unsafe { Poller::state_from_ptr(state) };
-    Ok(state.sys.notify()?)
+    Ok(dbg!(state.sys.notify())?)
   }
 }
 
 /// Main polling structure
 pub struct Poller(());
 
-impl IoDriver for Poller {
-  type Handler = PollerHandle;
+impl IoBackend for Poller {
+  type Driver = PollerHandle;
   type Submitter = PollerSubmitter;
   type State = PollerState;
 
   fn new_state() -> io::Result<Self::State> {
-    Ok(PollerState { sys: sys::OsPoller::new()? })
+    Ok(PollerState {
+      sys: sys::OsPoller::new()?,
+      fd_map: scc::HashMap::default(),
+    })
   }
 
   fn new(
     _ptr: &mut Self::State,
-  ) -> io::Result<(Self::Submitter, Self::Handler)> {
+  ) -> io::Result<(Self::Submitter, Self::Driver)> {
     let (blocking_sender, blocking_recv) = crossbeam_channel::unbounded();
     Ok((
       PollerSubmitter { blocking_sender },
       PollerHandle {
         events: Events::default(),
-        fd_map: HashMap::new(),
         blocking_sender: blocking_recv,
       },
     ))

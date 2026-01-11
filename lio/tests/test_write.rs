@@ -1,11 +1,18 @@
-#![cfg(feature = "buf")]
-
 /// write in append mode is not tested since `pwrite` doesn't support it.
 mod common;
 
-use lio::write;
+use lio::{
+  api::{self, write},
+  resource::Resource,
+};
 use proptest::{prelude::*, test_runner::TestRunner};
-use std::{ffi::CString, sync::mpsc, thread, time::Duration};
+use std::{
+  ffi::CString,
+  os::fd::{AsRawFd, FromRawFd},
+  sync::mpsc,
+  thread,
+  time::Duration,
+};
 
 #[test]
 fn test_write_large_buffer() {
@@ -25,12 +32,9 @@ fn test_write_large_buffer() {
   let large_data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
 
   let (sender, receiver) = mpsc::channel();
-  let sender1 = sender.clone();
   let large_data_clone = large_data.clone();
 
-  lio::write_with_buf(fd, large_data.clone(), 0).when_done(move |res| {
-    sender1.send(res).unwrap();
-  });
+  api::write(fd, large_data.clone(), 0).send_with(sender.clone());
 
   // assert_eq!(
   //   receiver.try_recv().map(|nice| nice.0).unwrap_err(),
@@ -90,12 +94,9 @@ fn test_write_concurrent() {
     };
 
     let (sender, receiver) = mpsc::channel();
-    let sender1 = sender.clone();
     let data_clone = data.clone();
 
-    lio::write_with_buf(fd, data.clone(), 0).when_done(move |res| {
-      sender1.send(res).unwrap();
-    });
+    api::write(fd, data.clone(), 0).send_with(sender.clone());
 
     // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
@@ -185,8 +186,12 @@ fn prop_test_write_arbitrary_data_and_offsets_run(
   // Perform the write operation with channel pattern
   let test_data_clone = test_data.clone();
 
-  let mut receiver =
-    lio::write_with_buf(fd, test_data.clone(), write_offset).send();
+  let mut receiver = api::write_at(
+    unsafe { Resource::from_raw_fd(fd) },
+    test_data,
+    write_offset,
+  )
+  .send();
 
   // Poll until the write completes (may take multiple ticks on some backends)
   let (write_result, returned_buf) = {

@@ -45,7 +45,7 @@
 use std::{ptr, time::Duration};
 
 #[cfg(unix)]
-use crate::resource::UniqueResource;
+use crate::api::resource::UniqueResource;
 use crate::{
   driver::TryInitError,
   op::net_utils::{self, sockaddr_to_socketaddr},
@@ -73,7 +73,7 @@ unsafe fn fd_to_resource(fd: libc::intptr_t) -> Resource {
 /// The caller must ensure the fd/handle is valid.
 #[cfg(unix)]
 unsafe fn fd_to_unique(fd: libc::intptr_t) -> UniqueResource {
-  use crate::resource::UniqueResource;
+  use crate::api::resource::UniqueResource;
 
   unsafe { UniqueResource::from_raw_fd(fd as i32) }
 }

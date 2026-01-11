@@ -1,6 +1,6 @@
 use std::task::Waker;
 
-use crate::op::OperationExt;
+use crate::operation::OperationExt;
 
 use super::Registration;
 
@@ -11,8 +11,8 @@ pub(crate) enum Notifier {
 }
 
 impl Notifier {
-  pub fn new_waker() -> Self {
-    Self::Waker(None)
+  pub fn new_waker(waker: Waker) -> Self {
+    Self::Waker(Some(waker))
   }
   pub fn new_callback<T, F>(callback: F) -> Self
   where

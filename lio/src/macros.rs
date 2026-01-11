@@ -153,76 +153,47 @@ macro_rules! doc_op {
 }
 
 macro_rules! syscall {
-  ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
-      #[allow(unused_unsafe)]
-      let res = unsafe { libc::$fn($($arg, )*) };
-      if res == -1 {
-          Err(std::io::Error::last_os_error())
-      } else {
-          Ok(res)
-      }
-  }};
-}
+  (raw $fn: ident ( $($arg: expr),* $(,)* ) ? ) => {{
+      let val = syscall!(raw $fn ($($arg),*));
 
-/// Raw syscall wrapper with early return on error.
-///
-/// Returns the syscall result as `isize` on success, or returns early with `-errno`.
-/// Works with the `?` operator by implementing a custom `Try` conversion.
-///
-/// # Returns
-///
-/// - On success: Continues execution with result as `isize` (>= 0)
-/// - On error: Returns `-errno` from the enclosing function
-///
-/// # Platform-specific behavior
-///
-/// - Unix: Returns `-errno` on error
-/// - Windows: Returns `-GetLastError()` on error
-///
-/// # Example
-///
-/// ```ignore
-/// fn do_io(fd: i32) -> isize {
-///     // Chain multiple syscalls - returns -errno on first error
-///     let n = syscall_raw!(read(fd, buf.as_mut_ptr() as *mut libc::c_void, len));
-///     let m = syscall_raw!(write(fd, data.as_ptr() as *const libc::c_void, data.len()));
-///     n + m  // Returns sum if all succeed
-/// }
-///
-/// let result = do_io(fd);
-/// if result < 0 {
-///     let errno = -result;
-///     eprintln!("Error: errno {}", errno);
-/// }
-/// ```
-macro_rules! syscall_raw {
-  ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
-      #[allow(unused_unsafe)]
-      let res = unsafe { libc::$fn($($arg, )*) };
-      if res == -1 {
-          // Return negative errno - this will cause early return from function
-          #[cfg(target_os = "linux")]
-          {
-              let errno = unsafe { *libc::__errno_location() };
-              return -(errno as isize);
-          }
-          #[cfg(target_os = "macos")]
-          {
-              let errno = unsafe { *libc::__error() };
-              return -(errno as isize);
-          }
-          #[cfg(target_os = "freebsd")]
-          {
-              let errno = unsafe { *libc::__error() };
-              return -(errno as isize);
-          }
-          #[cfg(windows)]
-          {
-              let last_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-              return -(last_error as isize);
-          }
+      if val < 0 {
+          return val;
       }
+
+      val
+  }};
+  (raw $fn: ident ( $($arg: expr),* $(,)* ) ) => {{
+    #[allow(unused_unsafe)]
+    let res = unsafe { libc::$fn($($arg, )*) };
+    if res != -1 {
       res as isize
+    }
+    else {
+      // Return negative errno - this will cause early return from function
+      #[cfg(target_os = "linux")]
+      {
+        let errno = unsafe { *libc::__errno_location() };
+        -(errno as isize)
+      }
+      #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+      {
+        let errno = unsafe { *libc::__error() };
+        -(errno as isize)
+      }
+      #[cfg(windows)]
+      {
+        let last_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        -(last_error as isize)
+      }
+    }
+  }};
+  ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
+      let result = syscall!(raw $fn($($arg),*));
+      if result >= 0 {
+          Ok(result as i32)
+      } else {
+          Err(std::io::Error::from_raw_os_error(-(result as i32)))
+      }
   }};
 }
 
@@ -238,7 +209,7 @@ macro_rules! impl_result {
   };
 
   (res) => {
-    impl_result!(|_this, res: isize| -> std::io::Result<crate::resource::Resource> {
+    impl_result!(|_this, res: isize| -> std::io::Result<crate::api::resource::Resource> {
       if res < 0 {
         Err(std::io::Error::from_raw_os_error((-res) as i32))
       } else {
@@ -258,8 +229,8 @@ macro_rules! impl_result {
 macro_rules! impl_no_readyness {
   () => {
     #[cfg(unix)]
-    fn meta(&self) -> crate::op::OpMeta {
-      crate::op::OpMeta::CAP_NONE
+    fn meta(&self) -> crate::operation::OpMeta {
+      crate::operation::OpMeta::CAP_NONE
     }
   };
 }

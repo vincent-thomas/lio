@@ -20,6 +20,7 @@ default = []
 unstable_ffi = []
 bytes = ["dep:bytes"]
 zeroize = ["dep:zeroize"]
+high = []
 
 [dependencies]
 

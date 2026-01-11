@@ -7,13 +7,14 @@
 use std::io;
 
 use crate::{
-  backends::{IoDriver, IoHandler, IoSubmitter, OpCompleted, SubmitErr},
-  op::Operation,
-  store::OpStore,
+  backends::{
+    IoBackend, IoDriver, IoSubmitter, OpCompleted, OpStore, SubmitErr,
+  },
+  operation::Operation,
 };
 
 #[derive(Clone)]
-struct DummyState {
+pub struct DummyState {
   pending_tx: crossbeam_channel::Sender<(u64, i32)>,
   pending_rx: crossbeam_channel::Receiver<(u64, i32)>,
 }
@@ -27,22 +28,18 @@ impl DummyState {
 
 pub struct DummyDriver;
 
-impl IoDriver for DummyDriver {
+impl IoBackend for DummyDriver {
   type Submitter = DummySubmitter;
-  type Handler = DummyHandler;
+  type Driver = DummyHandler;
+  type State = DummyState;
 
-  fn new_state() -> io::Result<*const ()> {
-    let state = Box::new(DummyState::new());
-    Ok(Box::into_raw(state) as *const ())
+  fn new_state() -> io::Result<Self::State> {
+    Ok(DummyState::new())
   }
 
-  fn drop_state(state: *const ()) {
-    unsafe {
-      let _ = Box::from_raw(state as *mut DummyState);
-    }
-  }
-
-  fn new(state: *const ()) -> io::Result<(Self::Submitter, Self::Handler)> {
+  fn new(
+    state: &mut Self::State,
+  ) -> io::Result<(Self::Submitter, Self::Driver)> {
     let state_ref = unsafe { &*(state as *const DummyState) };
     Ok((
       DummySubmitter { state: state_ref.clone() },
@@ -77,7 +74,7 @@ pub struct DummyHandler {
   state: DummyState,
 }
 
-impl IoHandler for DummyHandler {
+impl IoDriver for DummyHandler {
   fn try_tick(
     &mut self,
     _state: *const (),

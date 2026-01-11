@@ -1,44 +1,73 @@
 use super::super::{Interest, ReadinessPoll};
 use super::NOTIFY_KEY;
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 use std::{io, ptr};
 
 /// Wrapper around an epoll file descriptor
 pub struct OsPoller {
+  /// File descriptor for the epoll instance.
   epoll_fd: OwnedFd,
-  // /// Notifier for waking up blocked epoll_wait
+  // /// Notifier used to wake up epoll.
   notifier: Notifier,
+
+  /// File descriptor for the timerfd that produces timeouts.
+  ///
+  /// Redox does not support timerfd.
+  #[cfg(not(target_os = "redox"))]
+  timer_fd: Option<OwnedFd>,
 }
 
 impl OsPoller {
   /// Create a new epoll instance
   pub fn new() -> io::Result<Self> {
     // Create epoll instance with CLOEXEC
-    let epoll_fd = unsafe {
+    let epoll_fd = {
       let fd = syscall!(epoll_create1(libc::EPOLL_CLOEXEC))?;
-      OwnedFd::from_raw_fd(fd)
+      unsafe { OwnedFd::from_raw_fd(fd) }
     };
 
     // // Create notifier (uses pipe for portability)
     let notifier = Notifier::new()?;
 
-    let epoll = Self { epoll_fd, notifier };
+    #[cfg(not(target_os = "redox"))]
+    let timer_fd = {
+      let fd: RawFd =
+        syscall!(timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC))?;
+      unsafe { OwnedFd::from_raw_fd(fd) }
+    };
 
-    // Register notifier's read fd for read events with special key
-    if let Some(notify_fd) = epoll.notifier.read_fd() {
-      let mut event =
-        libc::epoll_event { events: libc::EPOLLIN as u32, u64: NOTIFY_KEY };
+    let epoll = Self {
+      epoll_fd,
+      notifier,
 
-      syscall!(epoll_ctl(
-        epoll.epoll_fd.as_raw_fd(),
-        libc::EPOLL_CTL_ADD,
-        notify_fd,
-        &mut event as *mut libc::epoll_event,
-      ))?;
+      #[cfg(not(target_os = "redox"))]
+      timer_fd: Some(timer_fd),
+    };
+
+    #[cfg(not(target_os = "redox"))]
+    if let Some(ref timer_fd) = epoll.timer_fd {
+      epoll.add(timer_fd.as_raw_fd(), NOTIFY_KEY, Interest::NONE)?;
     }
 
+    epoll.add(
+      epoll.notifier.as_fd().as_raw_fd(),
+      NOTIFY_KEY,
+      Interest::READ,
+    )?;
+
     Ok(epoll)
+  }
+}
+impl Drop for OsPoller {
+  fn drop(&mut self) {
+    #[cfg(not(target_os = "redox"))]
+    if let Some(timer_fd) = self.timer_fd.take() {
+      let _ = self.delete(timer_fd.as_fd().as_raw_fd());
+    }
+    let _ = self.delete(self.notifier.as_fd().as_raw_fd());
   }
 }
 
@@ -57,11 +86,8 @@ impl ReadinessPoll for OsPoller {
 
     // Use EPOLLONESHOT for consistency with kqueue's EV_ONESHOT behavior
     events |= libc::EPOLLONESHOT as u32;
-
-    assert!(
-      events & libc::EPOLLONESHOT as u32 != 0,
-      "EPOLLONESHOT must be set"
-    );
+    events |= libc::EPOLLPRI as u32;
+    events |= libc::EPOLLHUP as u32;
 
     let mut event = libc::epoll_event { events, u64: key as u64 };
 
@@ -89,11 +115,8 @@ impl ReadinessPoll for OsPoller {
 
     // Use EPOLLONESHOT for consistency with kqueue's EV_ONESHOT behavior
     events |= libc::EPOLLONESHOT as u32;
-
-    assert!(
-      events & libc::EPOLLONESHOT as u32 != 0,
-      "EPOLLONESHOT must be set"
-    );
+    events |= libc::EPOLLPRI as u32;
+    events |= libc::EPOLLHUP as u32;
 
     let mut event = libc::epoll_event { events, u64: key as u64 };
 
@@ -135,39 +158,82 @@ impl ReadinessPoll for OsPoller {
     events: &mut [Self::NativeEvent],
     timeout: Option<Duration>,
   ) -> io::Result<usize> {
-    // Convert timeout to milliseconds (-1 for infinite wait)
-    let timeout_ms = match timeout {
-      Some(d) => {
-        let ms = d.as_millis();
-        if ms > i32::MAX as u128 { i32::MAX } else { ms as i32 }
-      }
-      None => -1,
+    /// `timespec` value that equals zero.
+    #[cfg(not(target_os = "redox"))]
+    const TS_ZERO: libc::timespec = unsafe {
+      std::mem::transmute([0u8; std::mem::size_of::<libc::timespec>()])
+    };
+    const ITS_ZERO: libc::itimerspec = unsafe {
+      std::mem::transmute([0u8; std::mem::size_of::<libc::itimerspec>()])
     };
 
-    println!("timeout {timeout_ms}");
+    #[cfg(not(target_os = "redox"))]
+    if let Some(ref timer_fd) = self.timer_fd {
+      // Configure the timeout using timerfd.
+      let mut new_val = libc::itimerspec {
+        it_interval: TS_ZERO,
+        it_value: match timeout {
+          None => TS_ZERO,
+          Some(t) => {
+            let mut ts = TS_ZERO;
+            ts.tv_sec = t.as_secs() as _;
+            ts.tv_nsec = t.subsec_nanos() as _;
+            ts
+          }
+        },
+        ..unsafe { std::mem::zeroed() }
+      };
 
-    assert!(timeout_ms >= -1, "timeout_ms must be >= -1, got {}", timeout_ms);
+      let mut result = MaybeUninit::<libc::itimerspec>::uninit();
+      syscall!(timerfd_settime(
+        timer_fd.as_raw_fd(),
+        0,
+        &mut new_val as *mut _,
+        result.as_mut_ptr()
+      ))?;
 
-    let ret = syscall!(epoll_wait(
+      // Set interest in timerfd.
+      self.modify(timer_fd.as_raw_fd(), NOTIFY_KEY, Interest::READ)?;
+    }
+
+    #[cfg(not(target_os = "redox"))]
+    let timer_fd = &self.timer_fd;
+    #[cfg(target_os = "redox")]
+    let timer_fd: Option<core::convert::Infallible> = None;
+
+    // Timeout for epoll. In case of overflow, use no timeout.
+    let timeout = match (timer_fd, timeout) {
+      (_, Some(t)) if t == Duration::from_secs(0) => Some(TS_ZERO),
+      (None, Some(t)) => Some(libc::timespec {
+        tv_sec: t.as_secs() as i64,
+        tv_nsec: t.subsec_nanos() as i64,
+      }),
+      _ => None,
+    };
+
+    // Wait for I/O events.
+    let n = syscall!(epoll_pwait2(
       self.epoll_fd.as_raw_fd(),
       events.as_mut_ptr(),
       events.len() as i32,
-      timeout_ms,
+      timeout.as_ref().map(|v| v as *const _).unwrap_or(ptr::null()),
+      ptr::null_mut()
     ))?;
 
-    let n = ret as usize;
-    assert!(
-      n <= events.len(),
-      "epoll_wait returned more events ({}) than buffer size ({})",
-      n,
-      events.len()
-    );
+    // Clear the notification (if received) and re-register interest in it.
+    self.notifier.clear();
+    self.modify(
+      self.notifier.as_fd().as_raw_fd(),
+      NOTIFY_KEY,
+      Interest::READ,
+    )?;
 
-    Ok(n)
+    Ok(n as usize)
   }
 
   fn notify(&self) -> io::Result<()> {
-    self.notifier.notify()
+    self.notifier.notify();
+    Ok(())
   }
 
   fn event_key(event: &Self::NativeEvent) -> u64 {
@@ -188,39 +254,125 @@ impl ReadinessPoll for OsPoller {
   }
 }
 
-pub struct Notifier {
-  /// Read end of the pipe
-  read_fd: OwnedFd,
-  /// Write end of the pipe
-  write_fd: OwnedFd,
+enum Notifier {
+  /// The primary notifier, using eventfd.
+  #[cfg(not(target_os = "redox"))]
+  EventFd(OwnedFd),
+
+  /// The fallback notifier, using a pipe.
+  Pipe {
+    /// The read end of the pipe.
+    read_pipe: OwnedFd,
+
+    /// The write end of the pipe.
+    write_pipe: OwnedFd,
+  },
+}
+
+impl AsFd for Notifier {
+  fn as_fd(&self) -> BorrowedFd<'_> {
+    match self {
+      #[cfg(not(target_os = "redox"))]
+      Notifier::EventFd(fd) => fd.as_fd(),
+      Notifier::Pipe { read_pipe: read, .. } => read.as_fd(),
+    }
+  }
+}
+
+fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+  let mut result = MaybeUninit::<[OwnedFd; 2]>::uninit();
+  match syscall!(pipe2(result.as_mut_ptr().cast::<_>(), libc::O_CLOEXEC)) {
+    Ok(_) => {
+      let [read, write] = unsafe { result.assume_init() };
+      Ok((read, write))
+    }
+    Err(_) => {
+      use libc::{F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC, O_NONBLOCK};
+      syscall!(pipe(result.as_mut_ptr().cast::<_>()))?;
+      let [read, write] = unsafe { result.assume_init() };
+
+      let flags = syscall!(fcntl(read.as_raw_fd(), F_GETFD))?;
+      syscall!(fcntl(read.as_raw_fd(), F_SETFD, flags | FD_CLOEXEC))?;
+
+      let flags = syscall!(fcntl(write.as_raw_fd(), F_GETFD))?;
+      syscall!(fcntl(write.as_raw_fd(), F_SETFD, flags | FD_CLOEXEC))?;
+
+      Ok((read, write))
+    }
+  }
 }
 
 impl Notifier {
-  pub fn new() -> io::Result<Self> {
-    let mut fds = [0i32; 2];
-    syscall!(pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK))?;
+  fn new() -> io::Result<Self> {
+    // Skip eventfd for testing if necessary.
+    #[cfg(not(target_os = "redox"))]
+    {
+      // Try to create an eventfd.
+      match syscall!(eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) {
+        Ok(fd) => {
+          let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+          return Ok(Notifier::EventFd(owned));
+        }
 
-    Ok(Self {
-      read_fd: unsafe { OwnedFd::from_raw_fd(fds[0]) },
-      write_fd: unsafe { OwnedFd::from_raw_fd(fds[1]) },
-    })
+        Err(_err) => {}
+      }
+    }
+
+    let (read, write) = pipe()?;
+    let flags = syscall!(fcntl(read.as_raw_fd(), libc::F_GETFL))?;
+    syscall!(fcntl(read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK))?;
+
+    Ok(Notifier::Pipe { read_pipe: read, write_pipe: write })
   }
 
-  pub fn read_fd(&self) -> Option<RawFd> {
-    Some(self.read_fd.as_raw_fd())
+  pub fn notify(&self) {
+    match self {
+      #[cfg(not(target_os = "redox"))]
+      Self::EventFd(fd) => {
+        let buf: [u8; 8] = 1u64.to_ne_bytes();
+        let _ = syscall!(write(
+          fd.as_raw_fd(),
+          buf.as_ptr().cast::<libc::c_void>(),
+          buf.len()
+        ));
+      }
+
+      Self::Pipe { write_pipe, .. } => {
+        let buf = [0; 1];
+        syscall!(write(
+          write_pipe.as_raw_fd(),
+          buf.as_ptr().cast::<libc::c_void>(),
+          buf.len()
+        ))
+        .ok();
+      }
+    }
   }
 
-  pub fn notify(&self) -> io::Result<()> {
-    let byte: u8 = 1;
-    let result = syscall!(write(
-      self.write_fd.as_raw_fd(),
-      &byte as *const u8 as *const libc::c_void,
-      1,
-    ));
+  /// Clear the notification.
+  fn clear(&self) {
+    match self {
+      #[cfg(not(target_os = "redox"))]
+      Self::EventFd(fd) => {
+        const SIZE: usize = 8;
+        let mut buf = [0u8; SIZE];
+        let _ = syscall!(read(
+          fd.as_raw_fd(),
+          buf.as_mut_ptr().cast::<libc::c_void>(),
+          SIZE
+        ));
+      }
 
-    match result {
-      Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
-      other => other.map(|_| ()),
+      Self::Pipe { read_pipe, .. } => {
+        const SIZE: usize = 1024;
+        while syscall!(read(
+          read_pipe.as_raw_fd(),
+          [0u8; SIZE].as_mut_ptr().cast::<libc::c_void>(),
+          SIZE
+        ))
+        .is_ok()
+        {}
+      }
     }
   }
 }
