@@ -82,6 +82,7 @@ macro_rules! impl_native_convervions {
     #[cfg(unix)]
     impl std::os::fd::AsFd for $nice {
       fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: Owned guarrantees it's valid.
         unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0.inner) }
       }
     }
@@ -217,6 +218,10 @@ pub trait AsResource {
   fn as_resource(&self) -> &Resource;
 }
 
+/// Blanket implementation for references to types implementing [`AsResource`].
+///
+/// This allows passing `&T` where `T: AsResource` to functions that accept
+/// `impl AsResource`, avoiding the need to explicitly call `.as_resource()`.
 impl<R> AsResource for &R
 where
   R: AsResource,
@@ -226,6 +231,9 @@ where
   }
 }
 
+/// Direct implementation for [`Resource`] itself.
+///
+/// This allows using a `Resource` directly where `AsResource` is expected.
 impl AsResource for Resource {
   fn as_resource(&self) -> &Resource {
     &self

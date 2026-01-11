@@ -75,6 +75,14 @@ use progress::Progress;
 use std::{ffi::CString, net::SocketAddr, time::Duration};
 
 doc_op! {
+    short: "does nothing. maybe useful for testing?",
+
+    pub fn nop() -> Progress<'static, ops::Nop> {
+        Progress::from_op(ops::Nop)
+    }
+}
+
+doc_op! {
     short: "very nice",
     syscall: "shutdown(2)",
     doc_link: "https://man7.org/linux/man-pages/man2/shutdown.2.html",

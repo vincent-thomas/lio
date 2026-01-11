@@ -31,7 +31,6 @@ pub use connect::*;
 pub use fsync::*;
 pub use linkat::*;
 pub use listen::*;
-#[cfg(test)]
 pub use nop::*;
 pub use openat::*;
 pub use read::*;
