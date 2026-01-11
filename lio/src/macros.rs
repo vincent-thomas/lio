@@ -164,26 +164,30 @@ macro_rules! syscall {
   }};
   (raw $fn: ident ( $($arg: expr),* $(,)* ) ) => {{
     #[allow(unused_unsafe)]
-    let res = unsafe { libc::$fn($($arg, )*) };
-    if res != -1 {
-      res as isize
-    }
-    else {
-      // Return negative errno - this will cause early return from function
-      #[cfg(target_os = "linux")]
-      {
-        let errno = unsafe { *libc::__errno_location() };
-        -(errno as isize)
+    {
+      // SAFETY: This exists on the platform in cfg.
+      let res = unsafe { libc::$fn($($arg, )*) };
+      if res != -1 {
+        res as isize
       }
-      #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-      {
-        let errno = unsafe { *libc::__error() };
-        -(errno as isize)
-      }
-      #[cfg(windows)]
-      {
-        let last_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        -(last_error as isize)
+      else {
+        // Return negative errno - this will cause early return from function
+        #[cfg(target_os = "linux")]
+        {
+          let errno = unsafe { *libc::__errno_location() };
+          -(errno as isize)
+        }
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        {
+          // SAFETY: This exists on the platform in cfg.
+          let errno = unsafe { *libc::__error() };
+          -(errno as isize)
+        }
+        #[cfg(windows)]
+        {
+          let last_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+          -(last_error as isize)
+        }
       }
     }
   }};

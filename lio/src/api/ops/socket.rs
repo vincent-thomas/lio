@@ -123,7 +123,9 @@ impl Operation for Socket {
     if res < 0 {
       Err(io::Error::from_raw_os_error((-res) as i32))
     } else {
-      Ok(unsafe { Resource::from_raw_fd(res as RawFd) })
+      // SAFETY: 'res' is valid fd.
+      let resource = unsafe { Resource::from_raw_fd(res as RawFd) };
+      Ok(resource)
     }
   });
   impl_no_readyness!();
@@ -203,14 +205,14 @@ impl Operation for Socket {
       {
         let result = Self::set_cloexec(fd as i32);
         if result < 0 {
-          let _ = unsafe { libc::close(fd as i32) };
+          let _ = syscall!(raw close(fd as i32));
           return result;
         }
       }
 
       let result = Self::setup_socket_options(fd as i32);
       if result < 0 {
-        let _ = unsafe { libc::close(fd as i32) };
+        let _ = syscall!(raw close(fd as i32));
         return result;
       }
       fd

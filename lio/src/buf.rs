@@ -802,7 +802,6 @@ mod tests {
   #[test]
   #[cfg(not(miri))] // Skip under miri - too slow
   fn test_bufstore_stress_concurrent() {
-    use std::sync::Arc;
     use std::thread;
 
     let store: &'static BufStore =

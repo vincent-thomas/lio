@@ -96,7 +96,7 @@ fn test_write_concurrent() {
     let (sender, receiver) = mpsc::channel();
     let data_clone = data.clone();
 
-    api::write(fd, data.clone(), 0).send_with(sender.clone());
+    api::write_at(fd, data.clone(), 0).send_with(sender.clone());
 
     // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
 
