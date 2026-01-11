@@ -15,7 +15,7 @@ fn test_shutdown_write() {
   let server_sock = server_sock.recv().unwrap();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-  let mut bind_recv = api::bind(&server_sock, addr).send();
+  let bind_recv = api::bind(&server_sock, addr).send();
 
   lio::tick();
 
@@ -56,7 +56,7 @@ fn test_shutdown_write() {
   connect_recv.recv().unwrap();
 
   // Accept connection on server
-  let mut accept_recv = api::accept(&server_sock).send();
+  let accept_recv = api::accept(&server_sock).send();
 
   lio::tick();
   lio::tick();
@@ -64,7 +64,7 @@ fn test_shutdown_write() {
   let (server_client_fd, _addr) = accept_recv.recv().unwrap();
 
   // Shutdown write on client
-  let mut shutdown_recv = api::shutdown(&client_sock, libc::SHUT_WR).send();
+  let shutdown_recv = api::shutdown(&client_sock, libc::SHUT_WR).send();
 
   lio::tick();
 
@@ -72,7 +72,7 @@ fn test_shutdown_write() {
 
   // Try to send data (should fail or return 0)
   let data = b"Test data".to_vec();
-  let mut send_recv = api::send(&client_sock, data, None).send();
+  let send_recv = api::send(&client_sock, data, None).send();
 
   lio::tick();
 
@@ -86,7 +86,7 @@ fn test_shutdown_write() {
 
   // Server should be able to read EOF
   let buf = vec![0u8; 100];
-  let mut recv_recv = api::recv(&server_client_fd, buf, None).send();
+  let recv_recv = api::recv(&server_client_fd, buf, None).send();
 
   lio::tick();
 
@@ -109,14 +109,14 @@ fn test_shutdown_write() {
 fn test_shutdown_read() {
   lio::init();
 
-  let mut server_sock = lio::test_utils::tcp_socket().send();
+  let server_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
   let server_sock = server_sock.recv().unwrap();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-  let mut bind_recv = api::bind(&server_sock, addr).send();
+  let bind_recv = api::bind(&server_sock, addr).send();
 
   lio::tick();
 
@@ -136,28 +136,28 @@ fn test_shutdown_read() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  let mut listen_recv = api::listen(&server_sock, 128).send();
+  let listen_recv = api::listen(&server_sock, 128).send();
 
   lio::tick();
 
   listen_recv.recv().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock = lio::test_utils::tcp_socket().send();
+  let client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
   let client_sock = client_sock.recv().unwrap();
 
   // Connect client to server
-  let mut connect_recv = api::connect(&client_sock, bound_addr).send();
+  let connect_recv = api::connect(&client_sock, bound_addr).send();
 
   lio::tick();
 
   connect_recv.recv().unwrap();
 
   // Accept connection on server
-  let mut accept_recv = api::accept(&server_sock).send();
+  let accept_recv = api::accept(&server_sock).send();
 
   lio::tick();
   lio::tick();
@@ -165,7 +165,7 @@ fn test_shutdown_read() {
   let (server_client_fd, _addr) = accept_recv.recv().unwrap();
 
   // Shutdown read on client
-  let mut shutdown_recv = api::shutdown(&client_sock, libc::SHUT_RD).send();
+  let shutdown_recv = api::shutdown(&client_sock, libc::SHUT_RD).send();
 
   lio::tick();
 
@@ -173,7 +173,7 @@ fn test_shutdown_read() {
 
   // Client can still send
   let data = b"Hello".to_vec();
-  let mut send_recv = api::send(&client_sock, data.clone(), None).send();
+  let send_recv = api::send(&client_sock, data.clone(), None).send();
 
   lio::tick();
 
@@ -182,7 +182,7 @@ fn test_shutdown_read() {
 
   // Server can receive
   let buf = vec![0u8; 100];
-  let mut recv_recv = api::recv(&server_client_fd, buf, None).send();
+  let recv_recv = api::recv(&server_client_fd, buf, None).send();
 
   lio::tick();
 
@@ -204,14 +204,14 @@ fn test_shutdown_read() {
 fn test_shutdown_both() {
   lio::init();
 
-  let mut server_sock = lio::test_utils::tcp_socket().send();
+  let server_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
   let server_sock = server_sock.recv().unwrap();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-  let mut bind_recv = api::bind(&server_sock, addr).send();
+  let bind_recv = api::bind(&server_sock, addr).send();
 
   lio::tick();
 
@@ -231,28 +231,28 @@ fn test_shutdown_both() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  let mut listen_recv = api::listen(&server_sock, 128).send();
+  let listen_recv = api::listen(&server_sock, 128).send();
 
   lio::tick();
 
   listen_recv.recv().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock = lio::test_utils::tcp_socket().send();
+  let client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
   let client_sock = client_sock.recv().unwrap();
 
   // Connect client to server
-  let mut connect_recv = api::connect(&client_sock, bound_addr).send();
+  let connect_recv = api::connect(&client_sock, bound_addr).send();
 
   lio::tick();
 
   connect_recv.recv().unwrap();
 
   // Accept connection on server
-  let mut accept_recv = api::accept(&server_sock).send();
+  let accept_recv = api::accept(&server_sock).send();
 
   lio::tick();
   lio::tick();
@@ -260,7 +260,7 @@ fn test_shutdown_both() {
   let (server_client_fd, _addr) = accept_recv.recv().unwrap();
 
   // Shutdown both directions on client
-  let mut shutdown_recv = api::shutdown(&client_sock, libc::SHUT_RDWR).send();
+  let shutdown_recv = api::shutdown(&client_sock, libc::SHUT_RDWR).send();
 
   lio::tick();
 
@@ -268,7 +268,7 @@ fn test_shutdown_both() {
 
   // Send should fail
   let data = b"Test".to_vec();
-  let mut send_recv = api::send(&client_sock, data, None).send();
+  let send_recv = api::send(&client_sock, data, None).send();
 
   lio::tick();
 
@@ -280,7 +280,7 @@ fn test_shutdown_both() {
 
   // Server should receive EOF
   let buf = vec![0u8; 100];
-  let mut recv_recv = api::recv(&server_client_fd, buf, None).send();
+  let recv_recv = api::recv(&server_client_fd, buf, None).send();
 
   lio::tick();
 
@@ -343,13 +343,13 @@ fn test_shutdown_after_close() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  let mut listen_recv = api::listen(&server_sock, 128).send();
+  let listen_recv = api::listen(&server_sock, 128).send();
 
   lio::tick();
 
   listen_recv.recv().expect("Failed to listen");
 
-  let mut client_sock = lio::test_utils::tcp_socket().send();
+  let client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
@@ -411,28 +411,28 @@ fn test_shutdown_twice() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  let mut listen_recv = api::listen(&server_sock, 128).send();
+  let listen_recv = api::listen(&server_sock, 128).send();
 
   lio::tick();
 
   listen_recv.recv().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock = lio::test_utils::tcp_socket().send();
+  let client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
   let client_sock = client_sock.recv().unwrap();
 
   // Connect client to server
-  let mut connect_recv = api::connect(&client_sock, bound_addr).send();
+  let connect_recv = api::connect(&client_sock, bound_addr).send();
 
   lio::tick();
 
   connect_recv.recv().unwrap();
 
   // Accept connection on server
-  let mut accept_recv = api::accept(&server_sock).send();
+  let accept_recv = api::accept(&server_sock).send();
 
   lio::tick();
   lio::tick();
@@ -440,14 +440,14 @@ fn test_shutdown_twice() {
   let (server_client_fd, _addr) = accept_recv.recv().unwrap();
 
   // First shutdown
-  let mut shutdown_recv = api::shutdown(&client_sock, libc::SHUT_WR).send();
+  let shutdown_recv = api::shutdown(&client_sock, libc::SHUT_WR).send();
 
   lio::tick();
 
   shutdown_recv.recv().expect("First shutdown should succeed");
 
   // Second shutdown on same direction
-  let mut shutdown_recv2 = api::shutdown(&client_sock, libc::SHUT_WR).send();
+  let shutdown_recv2 = api::shutdown(&client_sock, libc::SHUT_WR).send();
 
   lio::tick();
 
@@ -467,14 +467,14 @@ fn test_shutdown_twice() {
 fn test_shutdown_sequential_directions() {
   lio::init();
 
-  let mut server_sock = lio::test_utils::tcp_socket().send();
+  let server_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
   let server_sock = server_sock.recv().unwrap();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-  let mut bind_recv = api::bind(&server_sock, addr).send();
+  let bind_recv = api::bind(&server_sock, addr).send();
 
   lio::tick();
 
@@ -494,28 +494,28 @@ fn test_shutdown_sequential_directions() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  let mut listen_recv = api::listen(&server_sock, 128).send();
+  let listen_recv = api::listen(&server_sock, 128).send();
 
   lio::tick();
 
   listen_recv.recv().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock = lio::test_utils::tcp_socket().send();
+  let client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
   let client_sock = client_sock.recv().unwrap();
 
   // Connect client to server
-  let mut connect_recv = api::connect(&client_sock, bound_addr).send();
+  let connect_recv = api::connect(&client_sock, bound_addr).send();
 
   lio::tick();
 
   connect_recv.recv().unwrap();
 
   // Accept connection on server
-  let mut accept_recv = api::accept(&server_sock).send();
+  let accept_recv = api::accept(&server_sock).send();
 
   lio::tick();
   lio::tick();
@@ -523,7 +523,7 @@ fn test_shutdown_sequential_directions() {
   let (server_client_fd, _addr) = accept_recv.recv().unwrap();
 
   // Shutdown write first
-  let mut shutdown_recv = api::shutdown(&client_sock, libc::SHUT_WR).send();
+  let shutdown_recv = api::shutdown(&client_sock, libc::SHUT_WR).send();
 
   lio::tick();
 
@@ -531,7 +531,7 @@ fn test_shutdown_sequential_directions() {
 
   // Client can still receive - send from server
   let data = b"From server".to_vec();
-  let mut send_recv = api::send(&server_client_fd, data, None).send();
+  let send_recv = api::send(&server_client_fd, data, None).send();
 
   lio::tick();
 
@@ -575,7 +575,7 @@ fn test_shutdown_before_data_sent() {
   let server_sock = server_sock.recv().expect("Failed to create server socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-  let mut bind_recv = api::bind(&server_sock, addr).send();
+  let bind_recv = api::bind(&server_sock, addr).send();
 
   lio::tick();
 
@@ -595,28 +595,28 @@ fn test_shutdown_before_data_sent() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  let mut listen_recv = api::listen(&server_sock, 128).send();
+  let listen_recv = api::listen(&server_sock, 128).send();
 
   lio::tick();
 
   listen_recv.recv().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock = lio::test_utils::tcp_socket().send();
+  let client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
   let client_sock = client_sock.recv().unwrap();
 
   // Connect client to server
-  let mut connect_recv = api::connect(&client_sock, bound_addr).send();
+  let connect_recv = api::connect(&client_sock, bound_addr).send();
 
   lio::tick();
 
   connect_recv.recv().unwrap();
 
   // Accept connection on server
-  let mut accept_recv = api::accept(&server_sock).send();
+  let accept_recv = api::accept(&server_sock).send();
 
   lio::tick();
   lio::tick();
@@ -624,7 +624,7 @@ fn test_shutdown_before_data_sent() {
   let (server_client_fd, _addr) = accept_recv.recv().unwrap();
 
   // Shutdown immediately after connection, before any data transfer
-  let mut shutdown_recv = api::shutdown(&client_sock, libc::SHUT_RDWR).send();
+  let shutdown_recv = api::shutdown(&client_sock, libc::SHUT_RDWR).send();
 
   lio::tick();
 
@@ -632,7 +632,7 @@ fn test_shutdown_before_data_sent() {
 
   // Verify server sees EOF
   let buf = vec![0u8; 100];
-  let mut recv_recv = api::recv(&server_client_fd, buf, None).send();
+  let recv_recv = api::recv(&server_client_fd, buf, None).send();
 
   lio::tick();
 
@@ -659,7 +659,7 @@ fn test_shutdown_ipv6() {
     server_sock.recv().expect("Failed to create IPv6 server socket");
 
   let addr: SocketAddr = "[::1]:0".parse().unwrap();
-  let mut bind_recv = api::bind(&server_sock, addr).send();
+  let bind_recv = api::bind(&server_sock, addr).send();
 
   lio::tick();
 
@@ -701,7 +701,7 @@ fn test_shutdown_ipv6() {
   connect_recv.recv().expect("Failed to connect IPv6");
 
   // Accept connection on server
-  let mut accept_recv = api::accept(&server_sock).send();
+  let accept_recv = api::accept(&server_sock).send();
 
   lio::tick();
   lio::tick();
@@ -710,7 +710,7 @@ fn test_shutdown_ipv6() {
     accept_recv.recv().expect("Failed to accept IPv6");
 
   // Shutdown write on IPv6 socket
-  let mut shutdown_recv = api::shutdown(&client_sock, libc::SHUT_WR).send();
+  let shutdown_recv = api::shutdown(&client_sock, libc::SHUT_WR).send();
 
   lio::tick();
 
@@ -718,7 +718,7 @@ fn test_shutdown_ipv6() {
 
   // Verify EOF
   let buf = vec![0u8; 100];
-  let mut recv_recv = api::recv(&server_client_fd, buf, None).send();
+  let recv_recv = api::recv(&server_client_fd, buf, None).send();
 
   lio::tick();
 
@@ -739,7 +739,7 @@ fn test_shutdown_concurrent() {
 
   // Test shutting down multiple connections (sequentially)
   for _ in 0..5 {
-    let mut server_sock = lio::test_utils::tcp_socket().send();
+    let server_sock = lio::test_utils::tcp_socket().send();
 
     lio::tick();
 
@@ -747,7 +747,7 @@ fn test_shutdown_concurrent() {
       server_sock.recv().expect("Failed to create server socket");
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let mut bind_recv = api::bind(&server_sock, addr).send();
+    let bind_recv = api::bind(&server_sock, addr).send();
 
     lio::tick();
 
@@ -767,7 +767,7 @@ fn test_shutdown_concurrent() {
       format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
     };
 
-    let mut listen_recv = api::listen(&server_sock, 128).send();
+    let listen_recv = api::listen(&server_sock, 128).send();
 
     lio::tick();
 
@@ -795,7 +795,7 @@ fn test_shutdown_concurrent() {
     let (server_client_fd, _addr) = accept_recv.recv().unwrap();
 
     // Shutdown
-    let mut shutdown_recv = api::shutdown(&client_sock, libc::SHUT_RDWR).send();
+    let shutdown_recv = api::shutdown(&client_sock, libc::SHUT_RDWR).send();
 
     lio::tick();
 
@@ -814,14 +814,14 @@ fn test_shutdown_concurrent() {
 fn test_shutdown_with_pending_data() {
   lio::init();
 
-  let mut server_sock = lio::test_utils::tcp_socket().send();
+  let server_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
   let server_sock = server_sock.recv().unwrap();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-  let mut bind_recv = api::bind(&server_sock, addr).send();
+  let bind_recv = api::bind(&server_sock, addr).send();
 
   lio::tick();
 
@@ -841,28 +841,28 @@ fn test_shutdown_with_pending_data() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  let mut listen_recv = api::listen(&server_sock, 128).send();
+  let listen_recv = api::listen(&server_sock, 128).send();
 
   lio::tick();
 
   listen_recv.recv().expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock = lio::test_utils::tcp_socket().send();
+  let client_sock = lio::test_utils::tcp_socket().send();
 
   lio::tick();
 
   let client_sock = client_sock.recv().unwrap();
 
   // Connect client to server
-  let mut connect_recv = api::connect(&client_sock, bound_addr).send();
+  let connect_recv = api::connect(&client_sock, bound_addr).send();
 
   lio::tick();
 
   connect_recv.recv().unwrap();
 
   // Accept connection on server
-  let mut accept_recv = api::accept(&server_sock).send();
+  let accept_recv = api::accept(&server_sock).send();
 
   lio::tick();
   lio::tick();
@@ -871,7 +871,7 @@ fn test_shutdown_with_pending_data() {
 
   // Send some data from client
   let data = b"Data before shutdown".to_vec();
-  let mut send_recv = api::send(&client_sock, data.clone(), None).send();
+  let send_recv = api::send(&client_sock, data.clone(), None).send();
 
   lio::tick();
 
@@ -879,7 +879,7 @@ fn test_shutdown_with_pending_data() {
   assert!(bytes_sent.is_ok(), "Send should succeed");
 
   // Shutdown write immediately (data may still be in transit)
-  let mut shutdown_recv = api::shutdown(&client_sock, libc::SHUT_WR).send();
+  let shutdown_recv = api::shutdown(&client_sock, libc::SHUT_WR).send();
 
   lio::tick();
 
@@ -887,7 +887,7 @@ fn test_shutdown_with_pending_data() {
 
   // Server should still be able to receive the data
   let buf = vec![0u8; 100];
-  let mut recv_recv = api::recv(&server_client_fd, buf, None).send();
+  let recv_recv = api::recv(&server_client_fd, buf, None).send();
 
   lio::tick();
 
@@ -900,7 +900,7 @@ fn test_shutdown_with_pending_data() {
 
     // Next read should be EOF
     let buf2 = vec![0u8; 100];
-    let mut recv_recv2 = api::recv(&server_client_fd, buf2, None).send();
+    let recv_recv2 = api::recv(&server_client_fd, buf2, None).send();
 
     lio::tick();
 

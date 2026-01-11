@@ -478,7 +478,7 @@ enum PFStatus<T> {
 impl<'a, T> ProgressFuture<'a, T> {
   fn get_driver(&self) -> &'static Driver {
     match self.driver {
-      LioHandle::Driver(driver) => unimplemented!(),
+      LioHandle::Driver(_driver) => unimplemented!(),
       LioHandle::GlobalDriver => Driver::get(),
       _ => unimplemented!(),
     }
