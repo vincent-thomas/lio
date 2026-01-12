@@ -44,7 +44,15 @@ pub(crate) struct OpCallback {
   call_callback_fn: for<'a> fn(*const (), &'a mut Registration),
 }
 
+// SAFETY: OpCallback is Send because:
+// - The callback pointer points to a `F: FnOnce(T::Result) + Send` type (boxed in `new`)
+// - We maintain exclusive ownership and only call it once via `call`
+// - The function pointer is a static function, which is Send
 unsafe impl Send for OpCallback {}
+// SAFETY: OpCallback is Sync because:
+// - The callback is only called once and consumed via `call` (takes self, not &self)
+// - The function pointer is a static function pointer, which is Sync
+// - While the callback itself may not be Sync, we never access it through a shared reference
 unsafe impl Sync for OpCallback {}
 
 impl OpCallback {

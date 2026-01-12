@@ -61,12 +61,6 @@
 //! All types in this module are `Send`, allowing results to be consumed on different
 //! threads than where operations were initiated. This is particularly useful for
 //! delegating I/O completion handling to dedicated threads.
-//!
-//! # Driver Integration
-//!
-//! Operations submitted through this module are processed by the lio runtime driver.
-//! By default, they use the global driver instance, but can be explicitly bound to
-//! a specific driver using [`with_driver()`](Progress::with_driver).
 
 use crate::{
   backends::{SubmitErr, Submitter},
@@ -284,7 +278,7 @@ where
   }
   /// Convert the operation into a channel receiver.
   ///
-  /// Returns a [`Receiver`](crate::operation::Receiver) which receives the operation result when complete.
+  /// Returns a [`Receiver`] which receives the operation result when complete.
   /// Useful for integrating with channel-based async code or when you need to wait
   /// for the result in a different context than where the operation was started.
   ///
@@ -515,7 +509,7 @@ where
         let id =
           driver.submit(stored).expect("lio error: lio should handle this");
         self.status = PFStatus::HasPolled(id);
-        return Poll::Pending;
+        Poll::Pending
       }
     }
   }

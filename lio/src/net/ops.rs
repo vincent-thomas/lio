@@ -1,17 +1,17 @@
 //! Internal operation types for network I/O.
 //!
 //! This module contains specialized operation types that adapt low-level I/O operations
-//! to work with the high-level [`Socket`](crate::net::Socket) type. These types implement
+//! to work with the high-level [`Socket`] type. These types implement
 //! the [`Operation`] trait and are used internally by the networking API.
 //!
 //! Most users will not need to use these types directly, as they are returned by methods
-//! on [`Socket`](crate::net::Socket), [`TcpListener`](crate::net::TcpListener), and
-//! [`TcpSocket`](crate::net::TcpSocket).
+//! on [`Socket`], [`TcpListener`](crate::net::TcpListener), and
+//! [`TcpSocket`].
 //!
 //! # Available Operations
 //!
-//! - [`SocketAccept`]: Accept operation that returns a [`Socket`](crate::net::Socket)
-//! - [`SocketNew`]: Socket creation operation that returns a [`Socket`](crate::net::Socket)
+//! - [`SocketAccept`]: Accept operation that returns a [`Socket`]
+//! - [`SocketNew`]: Socket creation operation that returns a [`Socket`]
 
 use std::{io, net::SocketAddr};
 
@@ -23,7 +23,7 @@ use crate::{
 
 /// Accept operation specialized for [`Socket`].
 ///
-/// This type wraps the low-level [`Accept`](crate::operation::ops::Accept) operation and adapts
+/// This type wraps the low-level [`Accept`](crate::api::ops::Accept) operation and adapts
 /// its result to return a [`Socket`] instead of a raw [`Resource`](crate::api::resource::Resource).
 ///
 /// You typically won't create this directly; it's returned by [`Socket::accept()`](crate::net::Socket::accept).

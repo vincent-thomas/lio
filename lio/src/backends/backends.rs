@@ -8,15 +8,15 @@
 //!
 //! The backend system is built around three main components:
 //!
-//! - **[`IoDriver`]**: The main trait that defines a backend's capabilities. Each platform
+//! - **[`IoBackend`]**: The main trait that defines a backend's capabilities. Each platform
 //!   has specific implementations (io_uring on Linux, kqueue on macOS/BSD, IOCP on Windows).
 //! - **[`IoSubmitter`]**: Handles submitting operations to the backend.
-//! - **[`IoHandler`]**: Processes completion events from the backend.
+//! - **[`IoDriver`]**: Processes completion events from the backend.
 //!
 //! # Custom Backends
 //!
-//! To implement a custom backend, you need to implement the [`IoDriver`], [`IoSubmitter`],
-//! and [`IoHandler`] traits:
+//! To implement a custom backend, you need to implement the [`IoBackend`], [`IoSubmitter`],
+//! and [`IoDriver`] traits:
 //!
 //! ```rust,ignore
 //! use lio::backends::{IoDriver, IoSubmitter, IoHandler, SubmitErr};
@@ -24,9 +24,9 @@
 //!
 //! struct MyBackend;
 //!
-//! impl IoDriver for MyBackend {
+//! impl IoBackend for MyBackend {
 //!     type Submitter = MySubmitter;
-//!     type Handler = MyHandler;
+//!     type Driver = MyDriver;
 //!     type State = MyState;
 //!
 //!     fn new_state() -> io::Result<Self::State> {
@@ -34,7 +34,7 @@
 //!         todo!()
 //!     }
 //!
-//!     fn new(state: &'static mut Self::State) -> io::Result<(Self::Submitter, Self::Handler)> {
+//!     fn new(state: &'static mut Self::State) -> io::Result<(Self::Submitter, Self::Driver)> {
 //!         // Create submitter and handler
 //!         todo!()
 //!     }
@@ -82,7 +82,7 @@ pub use handler::*;
 mod submitter;
 pub use submitter::*;
 
-use std::io;
+use std::{io, sync::Arc};
 
 /// Error types that can occur when submitting operations to the backend.
 #[derive(Debug)]
@@ -135,30 +135,21 @@ pub trait IoBackend {
   /// any shared state needed by both the submitter and handler.
   fn new_state() -> io::Result<Self::State>;
 
-  /// Converts a type-erased pointer back to a reference to the state.
-  ///
-  /// IoSubmitter & IoDriver helper util, not used by `lio impl`.
-  /// # Safety
-  ///
-  /// Assume safe if called and inside the stack from any of the
-  /// [IoHandler]/[IoSubmitter] impl methods.
-  unsafe fn state_from_ptr<'a>(ptr: *const ()) -> &'a Self::State {
-    unsafe { &*(ptr as *const Self::State) }
-  }
-
-  /// Creates a new submitter and handler from the given state.
+  /// Creates a new submitter and driver from the given state.
   ///
   /// This splits the backend into its two halves: the submitter (which runs on
-  /// worker threads) and the handler (which processes completions).
+  /// worker threads) and the driver (which processes completions).
+  ///
+  /// Both the submitter and driver will hold references to the state internally.
   ///
   /// # Parameters
   ///
-  /// - `state`: A static reference to the backend state
+  /// - `state`: A static reference to the backend state that will be shared
   ///
   /// # Returns
   ///
-  /// A tuple of (Submitter, Handler) on success.
+  /// A tuple of (Submitter, Driver) on success.
   fn new(
-    state: &'static mut Self::State,
+    state: Arc<Self::State>,
   ) -> io::Result<(Self::Submitter, Self::Driver)>;
 }

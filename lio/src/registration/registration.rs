@@ -64,6 +64,9 @@ impl Registration {
       Status::Waiting => None,
       Status::Done { ret } => {
         if let Some(res) = ret {
+          // SAFETY: The stored operation's type matches T because this is only called
+          // from Progress<T>, which ensures type consistency. The result value `res` is
+          // valid because it was set via set_done() and we're extracting it exactly once.
           Some(unsafe { self.stored.get_result::<T::Result>(res) })
         } else {
           panic!();

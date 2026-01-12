@@ -1,4 +1,4 @@
-use std::{cell::UnsafeCell, io, mem, net::SocketAddr, os::fd::AsRawFd};
+use std::{io, mem, net::SocketAddr, os::fd::AsRawFd};
 
 #[cfg(linux)]
 use io_uring::types::Fd;
@@ -11,18 +11,12 @@ use crate::{
 
 pub struct Bind {
   res: Resource,
-  addr: UnsafeCell<libc::sockaddr_storage>, // addr: SocketAddr,
+  addr: libc::sockaddr_storage,
 }
-
-// SAFETY: The UnsafeCell is only written during construction and read during
-// execution. No mutation occurs after the operation is created, making it safe
-// to send across threads and share references.
-unsafe impl Send for Bind {}
-unsafe impl Sync for Bind {}
 
 impl Bind {
   pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {
-    Self { res, addr: UnsafeCell::new(std_socketaddr_into_libc(addr)) }
+    Self { res, addr: std_socketaddr_into_libc(addr) }
   }
 }
 
@@ -43,14 +37,14 @@ impl Operation for Bind {
   fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Bind::new(
       Fd(self.res.as_raw_fd()),
-      self.addr.get().cast(),
+      (&self.addr as *const libc::sockaddr_storage).cast(),
       mem::size_of_val(&self.addr) as libc::socklen_t,
     )
     .build()
   }
 
   fn run_blocking(&self) -> isize {
-    let storage = unsafe { &*self.addr.get() };
+    let storage = self.addr;
     let addrlen = if storage.ss_family == libc::AF_INET as libc::sa_family_t {
       mem::size_of::<libc::sockaddr_in>()
     } else if storage.ss_family == libc::AF_INET6 as libc::sa_family_t {
@@ -61,7 +55,7 @@ impl Operation for Bind {
 
     syscall!(raw bind(
       self.res.as_raw_fd(),
-      self.addr.get().cast(),
+      (&self.addr as *const libc::sockaddr_storage).cast(),
       addrlen as libc::socklen_t,
     ))
   }

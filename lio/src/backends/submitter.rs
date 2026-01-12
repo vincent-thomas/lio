@@ -42,6 +42,8 @@ impl OpCompleted {
 ///
 /// This trait is implemented by each backend to handle submitting operations
 /// to the underlying I/O mechanism (io_uring, kqueue, IOCP, etc.).
+///
+/// Implementations hold their own state internally (e.g., a reference to shared backend state).
 pub trait IoSubmitter {
   /// Submits an operation to the backend.
   ///
@@ -50,36 +52,29 @@ pub trait IoSubmitter {
   ///
   /// # Parameters
   ///
-  /// - `state`: Type-erased pointer to the backend state
   /// - `id`: The [OpStore] key for op.
   /// - `op`: Operation to submit
   fn submit(
     &mut self,
-    state: *const (),
     id: u64,
     op: &dyn Operation,
   ) -> Result<(), SubmitErr>;
 
-  /// Notifies the backend that operations have been submitted. [`Handler::tick`](super::Handler::tick)'s must wake up.
+  /// Notifies the backend that operations have been submitted.
   ///
-  /// # Parameters
-  ///
-  /// - `state`: Type-erased pointer to the backend state
-  fn notify(&mut self, state: *const ()) -> Result<(), SubmitErr>;
+  /// This wakes up any blocked [`Driver::tick`](super::Driver::tick) calls.
+  fn notify(&mut self) -> Result<(), SubmitErr>;
 }
 
 /// Type-erased submitter wrapper.
 ///
 /// This wraps a backend-specific [`IoSubmitter`] implementation and provides
 /// a unified interface for operation submission. It manages the connection
-/// to the [`OpStore`] and backend state.
+/// to the [`OpStore`].
 pub struct Submitter {
   sub: Box<dyn IoSubmitter>,
   store: Arc<OpStore>,
-  state: *const (),
 }
-
-unsafe impl Send for Submitter {}
 
 impl Submitter {
   /// Creates a new submitter wrapper.
@@ -88,13 +83,8 @@ impl Submitter {
   ///
   /// - `sub`: The backend-specific submitter implementation
   /// - `store`: The operation store for tracking in-flight operations
-  /// - `state`: Type-erased pointer to the backend state
-  pub fn new(
-    sub: Box<dyn IoSubmitter>,
-    store: Arc<OpStore>,
-    state: *const (),
-  ) -> Self {
-    Self { sub, store, state }
+  pub fn new(sub: Box<dyn IoSubmitter>, store: Arc<OpStore>) -> Self {
+    Self { sub, store }
   }
 
   /// Submits an operation to the backend.
@@ -113,7 +103,7 @@ impl Submitter {
     let id = self.store.insert(op);
     let _ref = self
       .store
-      .get(id, |_r| self.sub.submit(self.state, id, _r.op_ref()))
+      .get(id, |_r| self.sub.submit(id, _r.op_ref()))
       .expect("what");
 
     match _ref {
@@ -149,6 +139,6 @@ impl Submitter {
   /// - `Ok(())`: Notification successful
   /// - `Err(SubmitErr)`: Notification failed
   pub fn notify(&mut self) -> Result<(), SubmitErr> {
-    self.sub.notify(self.state)
+    self.sub.notify()
   }
 }

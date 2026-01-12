@@ -85,7 +85,7 @@ pub trait Operation: Sealed + Send {
   /// A type-erased pointer to the operation's result. The pointer is valid until
   /// the operation is dropped.
   ///
-  /// # Safety
+  /// # Implementation Requirements
   ///
   /// The returned pointer must point to a valid result of type `Self::Result`
   /// (from [`OperationExt`]) and remain valid for the lifetime of the operation.
@@ -229,9 +229,9 @@ pub trait OperationExt: Operation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpMeta(u8);
 
-impl Into<u8> for OpMeta {
-  fn into(self) -> u8 {
-    self.0
+impl From<OpMeta> for u8 {
+  fn from(val: OpMeta) -> Self {
+    val.0
   }
 }
 

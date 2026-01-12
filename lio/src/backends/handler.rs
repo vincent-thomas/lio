@@ -27,11 +27,12 @@ pub trait IoDriver {
   ///
   /// - `Ok(Vec<OpCompleted>)`: List of completed operations (may be empty)
   /// - `Err(io::Error)`: An error occurred while polling
-  fn try_tick(
-    &mut self,
-    state: *const (),
-    store: &OpStore,
-  ) -> io::Result<Vec<OpCompleted>>;
+  ///
+  // / # Safety
+  // /
+  // / The caller must ensure that `state` is a valid pointer to the backend's state
+  // / type and remains valid for the duration of this call.
+  fn try_tick(&mut self, store: &OpStore) -> io::Result<Vec<OpCompleted>>;
 
   /// Polls for completed operations, blocking if necessary.
   ///
@@ -47,16 +48,17 @@ pub trait IoDriver {
   ///
   /// - `Ok(Vec<OpCompleted>)`: List of completed operations (at least one)
   /// - `Err(io::Error)`: An error occurred while polling
-  fn tick(
-    &mut self,
-    state: *const (),
-    store: &OpStore,
-  ) -> io::Result<Vec<OpCompleted>>;
+  ///
+  // / # Safety
+  // /
+  // / The caller must ensure that `state` is a valid pointer to the backend's state
+  // / type and remains valid for the duration of this call.
+  fn tick(&mut self, store: &OpStore) -> io::Result<Vec<OpCompleted>>;
 }
 
 /// Type-erased handler wrapper.
 ///
-/// This wraps a backend-specific [`IoHandler`] implementation and provides
+/// This wraps a backend-specific [`IoDriver`] implementation and provides
 /// a unified interface for processing completions. It manages the connection
 /// to the [`OpStore`] and backend state.
 pub struct Driver {
@@ -65,6 +67,7 @@ pub struct Driver {
   store: Arc<OpStore>,
 }
 
+// SAFETY: state is Send + Sync by IoBackend trait.
 unsafe impl Send for Driver {}
 
 impl Driver {

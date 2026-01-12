@@ -222,7 +222,8 @@ impl OpStore {
     F: FnOnce(u64) -> StoredOp,
   {
     let result = self.insert_with_try(|idx| Ok::<_, ()>(f(idx)));
-    unsafe { result.unwrap_unchecked() }
+    // We wrap insert_with_try with Ok(..)
+    result.unwrap()
   }
 
   /// Inserts an operation with fallible initialization.

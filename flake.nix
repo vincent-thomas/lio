@@ -43,6 +43,8 @@
 
               cargo-nextest
               cargo-llvm-lines
+              clang
+              rust-bindgen-unwrapped
             ];
           in
           {
@@ -55,8 +57,10 @@
               ];
             };
             default = pkgs.mkShell {
-              buildInputs = nativeBuildInputs;
+              buildInputs = nativeBuildInputs ++ [ pkgs.stdenv.cc.cc.lib ];
               RUST_BACKTRACE = "1";
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+              LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib";
             };
           };
       }

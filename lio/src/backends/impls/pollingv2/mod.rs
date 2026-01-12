@@ -23,6 +23,7 @@ pub(crate) mod tests;
 use core::slice;
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::backends::pollingv2::interest::Interest;
@@ -100,9 +101,9 @@ impl AsMut<[<sys::OsPoller as ReadinessPoll>::NativeEvent]> for Events {
   }
 }
 
-// The raw pointers in NativeEvent (e.g., kevent) are never dereferenced across threads
+// SAFETY: The raw pointers in NativeEvent (e.g., kevent) are never dereferenced across threads
 unsafe impl Send for Events {}
-unsafe impl Sync for Events {}
+// unsafe impl Sync for Events {}
 
 impl Default for Events {
   fn default() -> Self {
@@ -113,6 +114,8 @@ impl Default for Events {
 impl Events {
   /// Create a new empty events collection with specified capacity
   pub fn with_capacity(capacity: usize) -> Self {
+    // SAFETY: The native event type (libc::kevent or libc::epoll_event) is a C struct
+    // that is safe to zero-initialize. All fields are primitive types where zero is valid.
     Self { events: vec![unsafe { std::mem::zeroed() }; capacity] }
   }
 
@@ -135,6 +138,10 @@ impl Events {
   unsafe fn as_raw_buf(
     &mut self,
   ) -> &mut [<sys::OsPoller as ReadinessPoll>::NativeEvent] {
+    // SAFETY: We create a slice spanning the full capacity of the vector.
+    // The caller must ensure they call set_len() with the actual number of events
+    // written by the OS before reading the events. The pointer is valid because
+    // it comes from a Vec that owns the allocation.
     unsafe {
       slice::from_raw_parts_mut(
         self.events.as_mut_ptr(),
@@ -145,6 +152,8 @@ impl Events {
 
   unsafe fn set_len(&mut self, len: usize) {
     assert!(len <= self.events.capacity(), "set_len: len must be <= capacity");
+    // SAFETY: The caller guarantees that the first `len` elements have been initialized
+    // by the OS's wait() call. We've verified len <= capacity above.
     unsafe { self.events.set_len(len) }
   }
 
@@ -200,15 +209,16 @@ pub struct PollerState {
 pub struct PollerHandle {
   events: Events,
   blocking_sender: crossbeam_channel::Receiver<BlockingCompletion>,
+  state: &'static PollerState,
 }
 
 impl PollerHandle {
   fn tick_inner(
     &mut self,
-    state: &PollerState,
     store: &OpStore,
     can_wait: bool,
   ) -> io::Result<Vec<OpCompleted>> {
+    let state = self.state;
     let mut completed = Vec::new();
 
     // First, collect all blocking completions from the channel
@@ -283,33 +293,22 @@ impl PollerHandle {
 }
 
 impl IoDriver for PollerHandle {
-  fn tick(
-    &mut self,
-    state: *const (),
-    store: &OpStore,
-  ) -> io::Result<Vec<OpCompleted>> {
-    self.tick_inner(unsafe { Poller::state_from_ptr(state) }, store, true)
+  fn tick(&mut self, store: &OpStore) -> io::Result<Vec<OpCompleted>> {
+    self.tick_inner(store, true)
   }
 
-  fn try_tick(
-    &mut self,
-    state: *const (),
-    store: &OpStore,
-  ) -> io::Result<Vec<OpCompleted>> {
-    self.tick_inner(unsafe { Poller::state_from_ptr(state) }, store, false)
+  fn try_tick(&mut self, store: &OpStore) -> io::Result<Vec<OpCompleted>> {
+    self.tick_inner(store, false)
   }
 }
 pub struct PollerSubmitter {
   blocking_sender: crossbeam_channel::Sender<BlockingCompletion>,
+  state: &'static PollerState,
 }
 
 impl PollerSubmitter {
-  fn new_polling(
-    &self,
-    state: &PollerState,
-    id: u64,
-    op: &dyn Operation,
-  ) -> Result<(), SubmitErr> {
+  fn new_polling(&self, id: u64, op: &dyn Operation) -> Result<(), SubmitErr> {
+    let state = self.state;
     let meta = op.meta();
     let interest = if meta.is_cap_fd() {
       if meta.is_fd_readable() && meta.is_fd_writable() {
@@ -335,63 +334,34 @@ impl PollerSubmitter {
 }
 
 impl IoSubmitter for PollerSubmitter {
-  fn submit(
-    &mut self,
-    ptr: *const (),
-    id: u64,
-    op: &dyn Operation,
-  ) -> Result<(), SubmitErr> {
-    let state = unsafe { Poller::state_from_ptr(ptr) };
+  fn submit(&mut self, id: u64, op: &dyn Operation) -> Result<(), SubmitErr> {
     let meta = op.meta();
 
-    eprintln!(
-      "[PollerSubmitter::submit] op_id={}, meta={:?}, is_cap_none={}, is_beh_run_before_noti={}",
-      id,
-      meta,
-      meta.is_cap_none(),
-      !meta.is_cap_none() && meta.is_beh_run_before_noti()
-    );
-
     if meta.is_cap_none() {
-      eprintln!("[PollerSubmitter::submit] CAP_NONE path");
       let result = op.run_blocking();
       let _ = self.blocking_sender.send(BlockingCompletion { id, result });
-      dbg!(self.notify(ptr))?;
+      dbg!(self.notify())?;
       return Ok(());
     };
 
     if !meta.is_beh_run_before_noti() {
-      eprintln!(
-        "[PollerSubmitter::submit] new_polling path (no BEH_NEEDS_RUN)"
-      );
-      return self.new_polling(state, id, op);
+      return self.new_polling(id, op);
     }
 
     // CONNECT
 
     let result = op.run_blocking();
 
-    eprintln!(
-      "[PollerSubmitter CONNECT] result={}, -EINPROGRESS={}",
-      result,
-      -(libc::EINPROGRESS as isize)
-    );
-
     if result == -(libc::EINPROGRESS as isize) {
-      eprintln!("[PollerSubmitter CONNECT] Match! Registering for polling");
-      self.new_polling(state, id, op)
+      self.new_polling(id, op)
     } else {
-      eprintln!(
-        "[PollerSubmitter CONNECT] No match, sending via blocking channel"
-      );
       let _ = self.blocking_sender.send(BlockingCompletion { id, result });
-      dbg!(self.notify(ptr))?;
+      dbg!(self.notify())?;
       Ok(())
     }
   }
-  fn notify(&mut self, state: *const ()) -> Result<(), SubmitErr> {
-    let state = unsafe { Poller::state_from_ptr(state) };
-    Ok(dbg!(state.sys.notify())?)
+  fn notify(&mut self) -> Result<(), SubmitErr> {
+    Ok(self.state.sys.notify()?)
   }
 }
 
@@ -411,14 +381,19 @@ impl IoBackend for Poller {
   }
 
   fn new(
-    _ptr: &mut Self::State,
+    state: Arc<Self::State>,
   ) -> io::Result<(Self::Submitter, Self::Driver)> {
     let (blocking_sender, blocking_recv) = crossbeam_channel::unbounded();
+
     Ok((
-      PollerSubmitter { blocking_sender },
+      PollerSubmitter {
+        blocking_sender: blocking_sender.clone(),
+        state: state.clone(),
+      },
       PollerHandle {
         events: Events::default(),
         blocking_sender: blocking_recv,
+        state: state.clone(),
       },
     ))
   }

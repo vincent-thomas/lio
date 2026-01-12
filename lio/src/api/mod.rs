@@ -21,7 +21,7 @@
 //!
 //! # Buffer Ownership
 //!
-//! Operations that use buffers ([`read`], [`write`], [`recv`], [`send`]) take
+//! Operations that use buffers ([`read`], [`write`](write()), [`recv`], [`send`]) take
 //! ownership of the buffer and return it along with the result. This enables
 //! zero-copy I/O while ensuring memory safety:
 //!
@@ -64,7 +64,7 @@
 //! # See Also
 //!
 //! - [`Progress`] - Operation handle with multiple completion modes
-//! - [`Resource`] - Reference-counted file descriptor wrapper
+//! - [`Resource`](crate::api::resource::Resource) - Reference-counted file descriptor wrapper
 //! - [`crate::buf`] - Buffer types and pooling
 
 pub mod ops;
@@ -89,7 +89,6 @@ doc_op! {
 
     ///
     /// Shuts down the read, write, or both halves of this connection.
-    /// Read more about how [`Shutdown`] affects this call.
     pub fn shutdown(res: impl AsResource, how: i32) -> Progress<'static, ops::Shutdown> {
         Progress::from_op(ops::Shutdown::new(res.as_resource().clone(), how))
     }
@@ -464,7 +463,7 @@ doc_op! {
     /// ```
     #[cfg(linux)]
     #[cfg_attr(docsrs, doc(cfg(linux)))]
-    pub fn tee(res_in: impl AsResource, res_out: impl Into<Resource>, size: u32) -> Progress<'static, ops::Tee> {
-        Progress::from_op(ops::Tee::new(res_in.into(), res_out.into(), size))
+    pub fn tee(res_in: impl AsResource, res_out: impl AsResource, size: u32) -> Progress<'static, ops::Tee> {
+        Progress::from_op(ops::Tee::new(res_in.as_resource().clone(), res_out.as_resource().clone(), size))
     }
 }
