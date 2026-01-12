@@ -27,6 +27,8 @@ impl OsPoller {
   /// Create a new kqueue instance
   pub fn new() -> io::Result<Self> {
     // Create kqueue
+    // SAFETY: syscall!(kqueue()) returns a valid file descriptor or error.
+    // If successful, we immediately take ownership of it via OwnedFd.
     let kqueue_fd = unsafe { OwnedFd::from_raw_fd(syscall!(kqueue())?) };
     syscall!(fcntl(kqueue_fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC))?;
 
@@ -66,13 +68,12 @@ impl OsPoller {
     &self,
     changelist: &[<Self as ReadinessPoll>::NativeEvent],
   ) -> io::Result<()> {
-    let changes = changelist.as_ref();
+    let changes = changelist;
     let nchanges = changes.len();
 
     let mut eventlist: Vec<<Self as ReadinessPoll>::NativeEvent> =
       Vec::with_capacity(nchanges);
 
-    // Safety: spare_capacity_mut() gives mutable uninit slice.
     let spare = eventlist.spare_capacity_mut();
     let nevents = spare.len();
 
@@ -86,7 +87,7 @@ impl OsPoller {
     ))?;
 
     for ev in &eventlist {
-      if (ev.flags & libc::EV_ERROR as u16) != 0 {
+      if (ev.flags & libc::EV_ERROR) != 0 {
         let err_code = ev.data as i32;
         if err_code != 0 && err_code != libc::ENOENT && err_code != libc::EPIPE
         {
@@ -133,6 +134,8 @@ impl OsPoller {
       return Ok(());
     }
 
+    // SAFETY: libc::kevent is a C struct that is safe to zero-initialize.
+    // All fields are primitive integers/pointers where zero is a valid bit pattern.
     let mut changes: [libc::kevent; 2] = unsafe { std::mem::zeroed() };
     let mut n = 0;
 

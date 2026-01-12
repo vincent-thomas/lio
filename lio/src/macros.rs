@@ -217,7 +217,11 @@ macro_rules! impl_result {
       if res < 0 {
         Err(std::io::Error::from_raw_os_error((-res) as i32))
       } else {
-        Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(res as i32) })
+        // SAFETY: Caller guarrantees this is valid fd.
+        let resource = unsafe {
+          std::os::fd::FromRawFd::from_raw_fd(res as i32)
+        };
+        Ok(resource)
       }
     });
   };

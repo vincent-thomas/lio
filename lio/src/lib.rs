@@ -28,7 +28,7 @@
 //! on the last reference's drop.
 //!
 //! ### Example
-//! All operations return a [`Progress<T>`](crate::operation::Progress) which represents an in-flight I/O operation:
+//! All operations return a [`Progress<T>`](crate::api::progress::Progress) which represents an in-flight I/O operation:
 //!
 //! ```rust
 //! use lio::api::{self, resource::Resource};

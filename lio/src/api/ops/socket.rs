@@ -70,7 +70,6 @@ impl Socket {
   fn setup_socket_options(fd: RawFd) -> isize {
     // SIGPIPE handling (BSD/macOS only)
     {
-      let fd = fd;
       #[cfg(any(
         target_os = "freebsd",
         target_os = "netbsd",
@@ -87,19 +86,17 @@ impl Socket {
           std::mem::size_of::<i32>() as libc::socklen_t
         )?);
       }
-    };
+    }
 
     // Non-blocking mode (required for kqueue/epoll, not needed on Linux with io_uring)
     #[cfg(not(linux))]
     {
-      let fd = fd;
       let mut nonblocking = true as libc::c_int;
       syscall!(raw ioctl(fd, libc::FIONBIO, &mut nonblocking)?)
     };
 
     // SO_REUSEADDR (allows quick rebind)
     {
-      let fd = fd;
       let opt: i32 = 1;
       syscall!(raw setsockopt(
         fd,

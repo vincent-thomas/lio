@@ -32,6 +32,9 @@ pub struct Accept {
 
 impl Accept {
   pub(crate) fn new(res: Resource) -> Self {
+    // SAFETY: libc::sockaddr_storage is a C struct that is safe to zero-initialize.
+    // It consists of primitive integer fields where zero is a valid value. The kernel
+    // will fill this structure via the accept syscall's output parameter.
     let addr: libc::sockaddr_storage = unsafe { mem::zeroed() };
     Self { res, addr, len: mem::size_of_val(&addr) as libc::socklen_t }
   }
@@ -49,9 +52,12 @@ impl Operation for Accept {
       res as RawFd
     };
 
+    // SAFETY: result is valid fd.
     let res = unsafe { Resource::from_raw_fd(result) };
+    // SAFETY: valid pointer.
+    let addr = unsafe { libc_socketaddr_into_std(&this.addr as *const _) }?;
 
-    Ok((res, libc_socketaddr_into_std(&this.addr as *const _)?))
+    Ok((res, addr))
   });
 
   // #[cfg(linux)]
@@ -125,7 +131,7 @@ impl Operation for Accept {
         let res =
           syscall!(raw fcntl(socket as i32, libc::F_SETFD, libc::FD_CLOEXEC));
         if res < 0 {
-          unsafe { libc::close(socket as i32) };
+          syscall!(raw close(socket as i32));
           return res;
         }
       }
@@ -136,7 +142,7 @@ impl Operation for Accept {
         let res =
           syscall!(raw fcntl(socket as i32, libc::F_SETFL, libc::O_NONBLOCK));
         if res < 0 {
-          unsafe { libc::close(socket as i32) };
+          let _ = syscall!(raw close(socket as i32));
           return res;
         }
       }

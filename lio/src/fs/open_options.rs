@@ -1,6 +1,12 @@
 use std::{io, path::Path};
 
-use crate::api::resource::{FromResource, Resource};
+use crate::{
+  api::{
+    progress::Progress,
+    resource::{FromResource, Resource},
+  },
+  fs::ops::OpenatFile,
+};
 
 /// Options and flags which can be used to configure how a file is opened.
 ///
@@ -124,7 +130,7 @@ impl OpenOptions {
   /// This function will return an error if the file does not exist, the user lacks
   /// permission to access the file, or if any of the options specified are invalid
   /// for the given file.
-  pub fn open<P: AsRef<Path>>(&self, path: P) -> std::io::Result<File> {
+  pub fn open<P: AsRef<Path>>(&self, path: P) -> Progress<'_, OpenatFile> {
     let flags = self.make_flags()?;
 
     // let path_bytes = path.as_ref().as_os_str().as_bytes();
@@ -167,27 +173,28 @@ impl OpenOptions {
     Ok(flags)
   }
 
-  #[cfg(unix)]
+  // #[cfg(unix)]
   fn open_inner(
     &self,
     flags: libc::c_int,
     path: &Path,
-  ) -> std::io::Result<File> {
+  ) -> Progress<'_, OpenatFile> {
+    todo!();
     // TODO: Implement for Windows using NtCreateFile or similar
-    Err(std::io::Error::new(
-      std::io::ErrorKind::Unsupported,
-      "OpenOptions is currently only supported on Unix platforms",
-    ))
+    // Err(std::io::Error::new(
+    //   std::io::ErrorKind::Unsupported,
+    //   "OpenOptions is currently only supported on Unix platforms",
+    // ))
   }
 
-  #[cfg(not(unix))]
-  async fn open_inner(&self, _path: &Path) -> std::io::Result<Resource> {
-    // TODO: Implement for Windows using NtCreateFile or similar
-    Err(std::io::Error::new(
-      std::io::ErrorKind::Unsupported,
-      "OpenOptions is currently only supported on Unix platforms",
-    ))
-  }
+  // #[cfg(not(unix))]
+  // async fn open_inner(&self, _path: &Path) -> std::io::Result<Resource> {
+  //   // TODO: Implement for Windows using NtCreateFile or similar
+  //   Err(std::io::Error::new(
+  //     std::io::ErrorKind::Unsupported,
+  //     "OpenOptions is currently only supported on Unix platforms",
+  //   ))
+  // }
 }
 
 pub struct File(Resource);

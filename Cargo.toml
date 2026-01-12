@@ -1,5 +1,5 @@
 [workspace]
-members = ["iouring-sys", "lio"]
+members = ["lio", "lio-uring"]
 resolver = "3"
 
 [workspace.dependencies]

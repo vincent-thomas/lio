@@ -236,7 +236,7 @@ where
 /// This allows using a `Resource` directly where `AsResource` is expected.
 impl AsResource for Resource {
   fn as_resource(&self) -> &Resource {
-    &self
+    self
   }
 }
 

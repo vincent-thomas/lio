@@ -5,19 +5,24 @@ use std::{
   ptr,
 };
 
-pub fn libc_socketaddr_into_std(
+pub unsafe fn libc_socketaddr_into_std(
   storage: *const libc::sockaddr_storage,
 ) -> io::Result<SocketAddr> {
+  // SAFETY: correct pointer.
   let sockaddr = unsafe { *storage };
 
   if sockaddr.ss_family == libc::AF_INET as libc::sa_family_t {
     let ipv4_ptr = storage.cast::<libc::sockaddr_in>();
+    // SAFETY: We've verified ss_family is AF_INET, so the storage pointer can be safely
+    // cast to sockaddr_in. The caller guarantees storage points to valid memory.
     let ipv4 = Ipv4Addr::from(unsafe { *ipv4_ptr }.sin_addr.s_addr.to_be());
+    // SAFETY: Same as above - pointer is valid and properly aligned for sockaddr_in.
     let port = u16::from_be(unsafe { *ipv4_ptr }.sin_port);
 
     Ok(SocketAddr::from(SocketAddrV4::new(ipv4, port)))
   } else if sockaddr.ss_family == libc::AF_INET6 as libc::sa_family_t {
     let ipv6_ptr = storage.cast::<libc::sockaddr_in6>();
+    // SAFETY: correct.
     let in6 = unsafe { *ipv6_ptr };
     let ipv6 =
       Ipv6Addr::from(u128::from_le_bytes(in6.sin6_addr.s6_addr).to_be());
@@ -35,9 +40,17 @@ pub fn libc_socketaddr_into_std(
 }
 
 pub fn std_socketaddr_into_libc(addr: SocketAddr) -> libc::sockaddr_storage {
+  // SAFETY: sockaddr_storage is a C struct designed to hold any socket address type.
+  // Zero-initialization is valid - all fields are primitive types where zero is safe.
   let storage: UnsafeCell<libc::sockaddr_storage> =
     UnsafeCell::new(unsafe { mem::zeroed() });
   match addr {
+    // SAFETY: copy_nonoverlapping is safe because:
+    // 1. Source (&into_addr(v4)) is a valid, aligned sockaddr_in on the stack
+    // 2. Destination (storage.get()) is valid - we just created it
+    // 3. Size is correct (size_of::<sockaddr_in>())
+    // 4. Regions don't overlap (source is on stack, dest is in UnsafeCell)
+    // 5. sockaddr_in fits in sockaddr_storage by design
     SocketAddr::V4(v4) => unsafe {
       // We copy the bytes from the source pointer (&v4)
       // to the destination pointer (&mut storage)
@@ -48,6 +61,12 @@ pub fn std_socketaddr_into_libc(addr: SocketAddr) -> libc::sockaddr_storage {
         mem::size_of::<libc::sockaddr_in>(),
       );
     },
+    // SAFETY: copy_nonoverlapping is safe because:
+    // 1. Source (&into_addr6(v6)) is a valid, aligned sockaddr_in6 on the stack
+    // 2. Destination (storage.get()) is valid - we just created it
+    // 3. Size is correct (size_of::<sockaddr_in6>())
+    // 4. Regions don't overlap (source is on stack, dest is in UnsafeCell)
+    // 5. sockaddr_in6 fits in sockaddr_storage by design
     SocketAddr::V6(v6) => unsafe {
       // We copy the bytes from the source pointer (&v6)
       // to the destination pointer (&mut storage)
@@ -137,6 +156,8 @@ pub fn sockaddr_to_socketaddr(
 }
 
 fn into_addr(addr: SocketAddrV4) -> libc::sockaddr_in {
+  // SAFETY: sockaddr_in is a C struct with primitive integer fields.
+  // Zero-initialization is safe - all fields accept zero as a valid value.
   let mut _addr: libc::sockaddr_in = unsafe { mem::zeroed() };
 
   #[cfg(any(
@@ -158,6 +179,8 @@ fn into_addr(addr: SocketAddrV4) -> libc::sockaddr_in {
 }
 
 fn into_addr6(addr: SocketAddrV6) -> libc::sockaddr_in6 {
+  // SAFETY: sockaddr_in6 is a C struct with primitive integer/array fields.
+  // Zero-initialization is safe - all fields accept zero as a valid value.
   let mut _addr: libc::sockaddr_in6 = unsafe { mem::zeroed() };
 
   #[cfg(any(

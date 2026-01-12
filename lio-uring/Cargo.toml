@@ -1,0 +1,13 @@
+[package]
+name = "lio-uring"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "reserved"
+
+[dependencies]
+libc.workspace = true
+
+[build-dependencies]
+bindgen = "0.72.1"
+# cc = "1.2.52"

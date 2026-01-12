@@ -1,5 +1,4 @@
 use std::{
-  cell::UnsafeCell,
   io, mem,
   net::SocketAddr,
   os::fd::AsRawFd,
@@ -17,32 +16,25 @@ use crate::{
 
 pub struct Connect {
   res: Resource,
-  addr: UnsafeCell<libc::sockaddr_storage>,
+  addr: libc::sockaddr_storage,
   connect_called: AtomicBool,
 }
 
 assert_op_max_size!(Connect);
 
-// SAFETY: The UnsafeCell is only written during construction and read during
-// execution. No mutation occurs after the operation is created, making it safe
-// to send across threads and share references.
-unsafe impl Send for Connect {}
-unsafe impl Sync for Connect {}
-
 impl Connect {
   pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {
     Self {
       res,
-      addr: UnsafeCell::new(std_socketaddr_into_libc(addr)),
+      addr: std_socketaddr_into_libc(addr),
       connect_called: AtomicBool::new(false),
     }
   }
 
   fn get_addrlen(&self) -> libc::socklen_t {
-    let storage = unsafe { &*self.addr.get() };
-    let addrlen = if storage.ss_family == libc::AF_INET as libc::sa_family_t {
+    let addrlen = if self.addr.ss_family == libc::AF_INET as libc::sa_family_t {
       mem::size_of::<libc::sockaddr_in>()
-    } else if storage.ss_family == libc::AF_INET6 as libc::sa_family_t {
+    } else if self.addr.ss_family == libc::AF_INET6 as libc::sa_family_t {
       mem::size_of::<libc::sockaddr_in6>()
     } else {
       mem::size_of::<libc::sockaddr_storage>()
@@ -66,7 +58,7 @@ impl Operation for Connect {
   fn create_entry(&self) -> io_uring::squeue::Entry {
     io_uring::opcode::Connect::new(
       Fd(self.res.as_raw_fd()),
-      self.addr.get().cast(),
+      (&self.addr as *const libc::sockaddr_storage).cast(),
       self.get_addrlen(),
     )
     .build()
@@ -83,7 +75,7 @@ impl Operation for Connect {
   fn run_blocking(&self) -> isize {
     let result = syscall!(raw connect(
       self.res.as_raw_fd(),
-      self.addr.get().cast(),
+      (&self.addr as *const libc::sockaddr_storage).cast(),
       self.get_addrlen(),
     ));
 
@@ -95,7 +87,7 @@ impl Operation for Connect {
     // if result < 0 {
     if !is_first_call && result == -libc::EISCONN as isize {
       //   // First connect() returned EISCONN = socket was already connected
-      return 0;
+      0
     } else {
       result
     }
