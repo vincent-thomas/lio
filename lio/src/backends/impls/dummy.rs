@@ -4,7 +4,7 @@
 //! and completes them immediately when polled. Useful for testing Worker behavior
 //! without dealing with actual I/O operations.
 
-use std::io;
+use std::{io, sync::Arc};
 
 use crate::{
   backends::{
@@ -38,48 +38,36 @@ impl IoBackend for DummyDriver {
   }
 
   fn new(
-    state: &mut Self::State,
+    state: Arc<Self::State>,
   ) -> io::Result<(Self::Submitter, Self::Driver)> {
-    let state_ref = unsafe { &*(state as *const DummyState) };
-    Ok((
-      DummySubmitter { state: state_ref.clone() },
-      DummyHandler { state: state_ref.clone() },
-    ))
+    // let state_ref = unsafe { &*(state as *const DummyState) };
+    Ok((DummySubmitter { state: state.clone() }, DummyHandler { state }))
   }
 }
 
 pub struct DummySubmitter {
-  state: DummyState,
+  state: Arc<DummyState>,
 }
 
 impl IoSubmitter for DummySubmitter {
-  fn submit(
-    &mut self,
-    _state: *const (),
-    id: u64,
-    _op: &dyn Operation,
-  ) -> Result<(), SubmitErr> {
+  fn submit(&mut self, id: u64, _op: &dyn Operation) -> Result<(), SubmitErr> {
     // For dummy driver, we just queue the operation with a successful result
     let _ = self.state.pending_tx.send((id, 0)); // 0 represents success
     Ok(())
   }
 
-  fn notify(&mut self, _state: *const ()) -> Result<(), SubmitErr> {
+  fn notify(&mut self) -> Result<(), SubmitErr> {
     // Nothing to do - channel already handles notification
     Ok(())
   }
 }
 
 pub struct DummyHandler {
-  state: DummyState,
+  state: Arc<DummyState>,
 }
 
 impl IoDriver for DummyHandler {
-  fn try_tick(
-    &mut self,
-    _state: *const (),
-    _store: &OpStore,
-  ) -> io::Result<Vec<OpCompleted>> {
+  fn try_tick(&mut self, _store: &OpStore) -> io::Result<Vec<OpCompleted>> {
     let mut completed = Vec::new();
 
     // Drain all available operations without blocking
@@ -90,11 +78,7 @@ impl IoDriver for DummyHandler {
     Ok(completed)
   }
 
-  fn tick(
-    &mut self,
-    _state: *const (),
-    _store: &OpStore,
-  ) -> io::Result<Vec<OpCompleted>> {
+  fn tick(&mut self, _store: &OpStore) -> io::Result<Vec<OpCompleted>> {
     // Block with timeout to allow handler_loop to check shutdown signals
     let first_op =
       self.state.pending_rx.recv_timeout(std::time::Duration::from_millis(100));

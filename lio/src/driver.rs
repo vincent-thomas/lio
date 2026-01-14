@@ -53,17 +53,16 @@ impl Driver {
 
     // Initialize primary backend
     let owned_state = D::new_state().map_err(TryInitError::Io)?;
-    let state_ptr = Box::into_raw(Box::new(owned_state));
+    let state = Arc::new(owned_state);
+    let state_ptr = Arc::as_ptr(&state) as *const ();
 
-    // SAFETY: state_ptr was just created from Box::into_raw, so it's valid, properly aligned,
-    // and points to initialized memory. We have exclusive access to it.
     let (primary_subm, primary_handler) =
-      D::new(unsafe { &mut *state_ptr }).map_err(TryInitError::Io)?;
+      D::new(state).map_err(TryInitError::Io)?;
 
     let store = Arc::new(OpStore::with_capacity(cap));
 
     let primary_handler =
-      backends::Driver::new(Box::new(primary_handler), store.clone());
+      backends::Driver::new(Box::new(primary_handler), store.clone(), state_ptr);
     let primary_submitter = Submitter::new(Box::new(primary_subm), store.clone());
 
     let driver_ptr = Box::into_raw(Box::new(Driver {
@@ -86,9 +85,6 @@ impl Driver {
         // SAFETY: driver_ptr was created via Box::into_raw just above, and the CAS failed
         // so we own it and must clean it up. It's valid and properly aligned.
         let _ = unsafe { Box::from_raw(driver_ptr) };
-        // SAFETY: state_ptr was created via Box::into_raw earlier in this function.
-        // Since we're cleaning up after failed initialization, we own it and must drop it.
-        let _t = unsafe { Box::from_raw(state_ptr) };
 
         Err(TryInitError::AlreadyInit)
       }

@@ -19,8 +19,8 @@ impl Operation for Nop {
   }
 
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::Nop::new().build()
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::Nop::new().build()
   }
 
   #[cfg(unix)]

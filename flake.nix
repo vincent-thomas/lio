@@ -35,33 +35,31 @@
 
         devShells =
           let
-            nativeBuildInputs = with pkgs; [
-              (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-              gcc
-              gnumake
-              pkg-config-unwrapped
+            sharedEnvVars = {
+              nativeBuildInputs = with pkgs; [
+                (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+                stdenv.cc.cc
+                gnumake
+                cargo-nextest
 
-              cargo-nextest
-              cargo-llvm-lines
-              clang
-              rust-bindgen-unwrapped
-            ];
-          in
-          {
-            ci = pkgs.mkShell {
-              inherit nativeBuildInputs;
-              packages = with pkgs; [
-                cargo-deny
-                cargo-audit
-                cargo-hack
+                clang
               ];
-            };
-            default = pkgs.mkShell {
-              buildInputs = nativeBuildInputs ++ [ pkgs.stdenv.cc.cc.lib ];
               RUST_BACKTRACE = "1";
               LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-              LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib";
+              # LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib";
             };
+          in
+          {
+            ci = pkgs.mkShell (
+              sharedEnvVars
+              // {
+                packages = with pkgs; [
+                  cargo-deny
+                  cargo-hack
+                ];
+              }
+            );
+            default = pkgs.mkShell sharedEnvVars;
           };
       }
     );

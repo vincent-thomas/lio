@@ -5,9 +5,6 @@ use crate::{
   operation::{Operation, OperationExt},
 };
 
-#[cfg(linux)]
-use io_uring::types::Fd;
-
 use std::os::fd::AsRawFd;
 
 pub struct WriteAt<B>
@@ -56,13 +53,13 @@ where
   #[cfg(linux)]
   // const OPCODE: u8 = 23;
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> lio_uring::submission::Entry {
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
     assert!(len <= u32::MAX as usize);
-    io_uring::opcode::Write::new(
-      Fd(self.res.as_raw_fd()),
+    lio_uring::operation::Write::new(
+      self.res.as_raw_fd(),
       ptr.cast_mut(),
       len as u32,
     )

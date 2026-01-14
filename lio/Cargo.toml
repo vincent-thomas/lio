@@ -35,7 +35,8 @@ bytes = { version = "1.11.0", optional = true, default-features = false, feature
 zeroize = { version = "1.8.2", optional = true, default-features = false, features = ["alloc"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7.9"
+lio-uring.path = "../lio-uring"
+# io-uring = "0.7.9"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_IO"] }

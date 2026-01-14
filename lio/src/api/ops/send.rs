@@ -1,8 +1,5 @@
 use std::os::fd::AsRawFd;
 
-#[cfg(linux)]
-use io_uring::types::Fd;
-
 use crate::{BufResult, api::resource::Resource, buf::BufLike};
 
 use crate::operation::{OpMeta, Operation, OperationExt};
@@ -53,11 +50,11 @@ where
   // const OPCODE: u8 = 26;
 
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> lio_uring::submission::Entry {
     let buf_slice = self.buf.as_ref().unwrap().buf();
     let ptr = buf_slice.as_ptr();
     let len = buf_slice.len();
-    io_uring::opcode::Send::new(Fd(self.res.as_raw_fd()), ptr, len as u32)
+    lio_uring::operation::Send::new(self.res.as_raw_fd(), ptr, len as u32)
       .flags(self.flags)
       .build()
   }

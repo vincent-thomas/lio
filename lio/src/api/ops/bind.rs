@@ -1,8 +1,5 @@
 use std::{io, mem, net::SocketAddr, os::fd::AsRawFd};
 
-#[cfg(linux)]
-use io_uring::types::Fd;
-
 use crate::{
   api::resource::Resource,
   net_utils::std_socketaddr_into_libc,
@@ -34,9 +31,9 @@ impl Operation for Bind {
   // const OPCODE: u8 = 56;
 
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::Bind::new(
-      Fd(self.res.as_raw_fd()),
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::Bind::new(
+      self.res.as_raw_fd(),
       (&self.addr as *const libc::sockaddr_storage).cast(),
       mem::size_of_val(&self.addr) as libc::socklen_t,
     )

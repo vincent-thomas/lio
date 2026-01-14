@@ -1,8 +1,5 @@
 use std::os::fd::AsRawFd;
 
-#[cfg(linux)]
-use io_uring::types::Fd;
-
 use crate::api::resource::Resource;
 
 use crate::operation::{Operation, OperationExt};
@@ -29,8 +26,8 @@ impl Operation for Fsync {
   #[cfg(linux)]
   // const OPCODE: u8 = 3;
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::Fsync::new(Fd(self.res.as_raw_fd())).build()
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::Fsync::new(self.res.as_raw_fd()).build()
   }
 
   fn run_blocking(&self) -> isize {

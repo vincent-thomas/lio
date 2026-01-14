@@ -209,7 +209,7 @@ pub struct PollerState {
 pub struct PollerHandle {
   events: Events,
   blocking_sender: crossbeam_channel::Receiver<BlockingCompletion>,
-  state: &'static PollerState,
+  state: Arc<PollerState>,
 }
 
 impl PollerHandle {
@@ -218,7 +218,7 @@ impl PollerHandle {
     store: &OpStore,
     can_wait: bool,
   ) -> io::Result<Vec<OpCompleted>> {
-    let state = self.state;
+    let state = &self.state;
     let mut completed = Vec::new();
 
     // First, collect all blocking completions from the channel
@@ -303,12 +303,12 @@ impl IoDriver for PollerHandle {
 }
 pub struct PollerSubmitter {
   blocking_sender: crossbeam_channel::Sender<BlockingCompletion>,
-  state: &'static PollerState,
+  state: Arc<PollerState>,
 }
 
 impl PollerSubmitter {
   fn new_polling(&self, id: u64, op: &dyn Operation) -> Result<(), SubmitErr> {
-    let state = self.state;
+    let state = &self.state;
     let meta = op.meta();
     let interest = if meta.is_cap_fd() {
       if meta.is_fd_readable() && meta.is_fd_writable() {
@@ -393,7 +393,7 @@ impl IoBackend for Poller {
       PollerHandle {
         events: Events::default(),
         blocking_sender: blocking_recv,
-        state: state.clone(),
+        state,
       },
     ))
   }

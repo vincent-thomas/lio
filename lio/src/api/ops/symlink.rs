@@ -1,8 +1,5 @@
 use std::{ffi::CString, os::fd::AsRawFd};
 
-#[cfg(linux)]
-use io_uring::types::Fd;
-
 use crate::operation::{Operation, OperationExt};
 use crate::api::resource::Resource;
 
@@ -38,9 +35,9 @@ impl Operation for SymlinkAt {
   #[cfg(linux)]
   // const OPCODE: u8 = 38;
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::SymlinkAt::new(
-      Fd(self.dir_res.as_raw_fd()),
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::SymlinkAt::new(
+      self.dir_res.as_raw_fd(),
       self.target.as_ptr(),
       self.linkpath.as_ptr(),
     )

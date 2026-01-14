@@ -5,9 +5,6 @@ use std::{
   sync::atomic::{AtomicBool, Ordering},
 };
 
-#[cfg(linux)]
-use io_uring::types::Fd;
-
 use crate::{
   api::resource::Resource,
   net_utils::std_socketaddr_into_libc,
@@ -55,9 +52,9 @@ impl Operation for Connect {
   // const OPCODE: u8 = 16;
 
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::Connect::new(
-      Fd(self.res.as_raw_fd()),
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::Connect::new(
+      self.res.as_raw_fd(),
       (&self.addr as *const libc::sockaddr_storage).cast(),
       self.get_addrlen(),
     )

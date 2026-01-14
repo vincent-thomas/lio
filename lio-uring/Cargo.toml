@@ -3,11 +3,25 @@ name = "lio-uring"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "reserved"
+description = "Production-ready, safe, and ergonomic Rust interface to Linux io_uring"
+repository = "https://github.com/vincent-thomas/lio"
+documentation = "https://docs.rs/lio-uring"
+keywords = ["io_uring", "async", "io", "linux"]
+categories = ["asynchronous", "os::linux-apis", "network-programming"]
+
+[package.metadata.docs.rs]
+# Build & show docs **only** for this target
+default-target = "x86_64-unknown-linux-gnu"
+
+# Optional but very strongly recommended when the crate is Linux-only:
+# Explicitly limit to just one (or few) targets
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
 [dependencies]
 libc.workspace = true
 
 [build-dependencies]
 bindgen = "0.72.1"
-# cc = "1.2.52"
+
+[dev-dependencies]
+pastey = "0.2.1"

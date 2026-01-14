@@ -1,8 +1,5 @@
 use std::{ffi::CString, os::fd::AsRawFd};
 
-#[cfg(linux)]
-use io_uring::types::Fd;
-
 use crate::operation::{Operation, OperationExt};
 use crate::api::resource::Resource;
 
@@ -31,9 +28,9 @@ impl Operation for OpenAt {
   #[cfg(linux)]
   // const OPCODE: u8 = 18;
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::OpenAt::new(
-      Fd(self.dir_res.as_raw_fd()),
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::OpenAt::new(
+      self.dir_res.as_raw_fd(),
       self.pathname.as_ptr(),
     )
     .flags(self.flags)

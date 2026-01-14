@@ -1,5 +1,7 @@
 //! `lio`-provided [`IoBackend`] impl for `io_uring`.
 
+use lio_uring::{completion::CompletionQueue, submission::SubmissionQueue};
+
 use crate::{
   backends::{
     IoBackend, IoDriver, IoSubmitter, OpCompleted, OpStore, SubmitErr,
@@ -13,70 +15,51 @@ pub struct IoUring;
 impl IoBackend for IoUring {
   type Driver = IoUringDriver;
   type Submitter = IoUringSubmitter;
-  type State = IoUringState;
+  type State = ();
 
   fn new_state() -> io::Result<Self::State> {
-    Ok(IoUringState { _uring: io_uring::IoUring::new(128)? })
+    Ok(())
   }
 
-  fn new(
-    state: Arc<Self::State>,
-  ) -> io::Result<(Self::Submitter, Self::Driver)> {
-    let (_, sq, cq) = state._uring.split();
-    let handle = IoUringDriver { cq, state: Arc::clone(&state) };
-    let submitter = IoUringSubmitter { sq, state: Arc::clone(&state) };
+  fn new(_: Arc<Self::State>) -> io::Result<(Self::Submitter, Self::Driver)> {
+    let (sq, cq) = lio_uring::with_capacity(1024)?;
 
-    Ok((submitter, handle))
+    Ok((IoUringSubmitter { sq }, IoUringDriver { cq }))
   }
 }
 
 pub struct IoUringSubmitter {
-  sq: io_uring::SubmissionQueue<'static>,
-  state: Arc<IoUringState>,
+  sq: SubmissionQueue,
 }
 
 unsafe impl Send for IoUringSubmitter {}
 unsafe impl Send for IoUringDriver {}
 
 pub struct IoUringDriver {
-  cq: io_uring::CompletionQueue<'static>,
-  state: Arc<IoUringState>,
-}
-pub struct IoUringState {
-  _uring: io_uring::IoUring,
-}
-
-fn into_shared<'a>(ptr: *const ()) -> &'a IoUringState {
-  unsafe { &*(ptr as *const IoUringState) }
+  cq: CompletionQueue,
 }
 
 impl IoSubmitter for IoUringSubmitter {
   fn submit(&mut self, id: u64, op: &dyn Operation) -> Result<(), SubmitErr> {
     // Convert OpId to u64 for io_uring user_data
-    let entry = op.create_entry().user_data(id);
+    let entry = op.create_entry();
 
-    unsafe { self.sq.push(&entry) }.map_err(|_| SubmitErr::Full)?;
+    unsafe { self.sq.push(entry, id) }.map_err(|_| SubmitErr::Full)?;
 
-    self.sq.sync();
     // TODO: Make more efficient
-    self.state._uring.submit().map_err(SubmitErr::Io)?;
-    self.sq.sync();
+    self.sq.submit().map_err(SubmitErr::Io)?;
 
     Ok(())
   }
 
-  // Submit a NOP operation to wake up submit_and_wait
-  // Use a special user_data value (u64::MAX) that won't match any real operation
-  // Submit a NOP operation to wake up submit_and_wait
-  // Use a special user_data value that won't match any real operation
+  // Submit a NOP operation to wake up next
   fn notify(&mut self) -> Result<(), SubmitErr> {
-    let nop_entry = io_uring::opcode::Nop::new().build().user_data(u64::MAX);
-    unsafe { self.sq.push(&nop_entry) }.map_err(|_| SubmitErr::Full)?;
+    let nop_entry = lio_uring::operation::Nop::new().build();
+    unsafe { self.sq.push(nop_entry, u64::MAX) }
+      .map_err(|_| SubmitErr::Full)?;
 
-    self.sq.sync();
     // Submit to wake up any blocked submit_and_wait
-    self.state._uring.submit()?;
-    self.sq.sync();
+    self.sq.submit()?;
     Ok(())
   }
 }
@@ -95,20 +78,31 @@ impl IoUringDriver {
     &mut self,
     can_block: bool,
   ) -> io::Result<Vec<OpCompleted>> {
-    self.cq.sync();
-    self.state._uring.submit_and_wait(if can_block { 1 } else { 0 })?;
-    self.cq.sync();
+    let mut total_completions = vec![];
+    if can_block {
+      // next blocks.
+      let first = self.cq.next()?;
+      total_completions.push(first);
+    } else {
+      match self.cq.try_next()? {
+        Some(op) => {
+          total_completions.push(op);
+        }
+        None => return Ok(vec![]),
+      }
+    };
 
-    let mut op_c = Vec::new();
-
-    for io_entry in &mut self.cq {
-      let operation_id = io_entry.user_data();
-      let result = io_entry.result();
-      // io_uring returns negative errno on error, positive result on success
-      op_c.push(OpCompleted::new(operation_id, result as isize));
+    while let Ok(Some(operation)) = self.cq.try_next() {
+      total_completions.push(operation);
     }
 
-    Ok(op_c)
+    let op_completed = total_completions
+      .iter()
+      .into_iter()
+      .map(|op| OpCompleted::new(op.user_data(), op.result() as isize))
+      .collect();
+
+    Ok(op_completed)
   }
 }
 
