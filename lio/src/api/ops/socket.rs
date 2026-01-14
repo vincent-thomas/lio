@@ -130,8 +130,8 @@ impl Operation for Socket {
   #[cfg(linux)]
   // const OPCODE: u8 = 45;
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::Socket::new(self.domain, self.ty, self.proto).build()
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::Socket::new(self.domain, self.ty, self.proto).build()
   }
 
   fn run_blocking(&self) -> isize {

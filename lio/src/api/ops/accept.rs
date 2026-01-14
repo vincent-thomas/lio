@@ -6,8 +6,6 @@ use std::{
   net::SocketAddr,
 };
 
-#[cfg(linux)]
-use io_uring::{opcode, squeue, types::Fd};
 
 use crate::{
   api::resource::Resource,
@@ -64,9 +62,9 @@ impl Operation for Accept {
   // const OPCODE: u8 = 13;
 
   #[cfg(linux)]
-  fn create_entry(&self) -> squeue::Entry {
-    opcode::Accept::new(
-      Fd(self.res.as_raw_fd()),
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::Accept::new(
+      self.res.as_raw_fd(),
       &self.addr as *const _ as *mut libc::sockaddr,
       (&self.len as *const libc::socklen_t).cast_mut(),
     )

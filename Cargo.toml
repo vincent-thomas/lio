@@ -1,5 +1,6 @@
 [workspace]
 members = ["lio", "lio-uring"]
+default-members = ["lio"]
 resolver = "3"
 
 [workspace.dependencies]

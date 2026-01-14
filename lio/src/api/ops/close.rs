@@ -1,9 +1,6 @@
 use std::io;
 use std::os::fd::AsRawFd;
 
-#[cfg(linux)]
-use io_uring::{opcode, types::Fd};
-
 use crate::{
   op::{Operation, OperationExt},
   // resource::UniqueResource,
@@ -33,8 +30,8 @@ impl Operation for Close {
   // const OPCODE: u8 = 19;
 
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
-    opcode::Close::new(Fd(self.res.as_raw_fd())).build()
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::Close::new(self.res.as_raw_fd()).build()
   }
 
   fn run_blocking(&self) -> isize {

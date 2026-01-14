@@ -38,7 +38,7 @@ fn test_listen_basic() {
     let mut accept_val: i32 = 0;
     let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
     let res = libc::getsockopt(
-      sock,
+      sock.as_raw_fd(),
       libc::SOL_SOCKET,
       libc::SO_ACCEPTCONN,
       &mut accept_val as *mut _ as *mut libc::c_void,
@@ -61,7 +61,7 @@ fn test_listen_with_backlog() {
   lio::init();
 
   let (sender_sock, receiver_sock) = mpsc::channel();
-  let (sender_unit, receiver_unit) = mpsc::channel();
+  let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
   lio::test_utils::tcp_socket().send_with(sender_sock.clone());
 
@@ -106,7 +106,7 @@ fn test_listen_large_backlog() {
   lio::init();
 
   let (sender_sock, receiver_sock) = mpsc::channel();
-  let (sender_unit, receiver_unit) = mpsc::channel();
+  let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
   lio::test_utils::tcp_socket().send_with(sender_sock.clone());
 
@@ -179,7 +179,7 @@ fn test_listen_ipv6() {
   lio::init();
 
   let (sender_sock, receiver_sock) = mpsc::channel();
-  let (sender_unit, receiver_unit) = mpsc::channel();
+  let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
   lio::test_utils::tcp6_socket().send_with(sender_sock.clone());
 
@@ -392,7 +392,7 @@ fn test_listen_concurrent() {
 
   let mut sockets = Vec::new();
   for _ in 0..10 {
-    let sock = receiver.recv().expect("Failed to create socket");
+    let sock = receiver.recv().expect("Failed to create socket").expect("Socket creation failed");
     sockets.push(sock);
   }
 
@@ -411,8 +411,8 @@ fn test_listen_concurrent() {
 
   let (sender_listen, receiver_listen) = mpsc::channel();
 
-  for &sock in &sockets {
-    api::listen(&sock, 128).send_with(sender_listen.clone());
+  for sock in &sockets {
+    api::listen(sock, 128).send_with(sender_listen.clone());
   }
 
   lio::tick();

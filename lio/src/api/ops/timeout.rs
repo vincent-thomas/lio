@@ -4,8 +4,6 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::time::Duration;
 use std::{io::Error, os::fd::RawFd};
 
-#[cfg(linux)]
-use io_uring::{opcode, squeue, types::Timespec};
 
 #[cfg(linux)]
 use crate::api::resource::Resource;
@@ -14,7 +12,7 @@ use crate::operation::{Operation, OperationExt};
 pub struct Timeout {
   duration: Duration,
   #[cfg(linux)]
-  timespec: Timespec,
+  timespec: libc::timespec,
   #[cfg(target_os = "linux")]
   timer_res: Resource,
   #[cfg(all(unix, not(target_os = "linux")))]
@@ -41,9 +39,10 @@ impl Timeout {
     Self {
       duration,
       #[cfg(linux)]
-      timespec: Timespec::new()
-        .sec(duration.as_secs())
-        .nsec(duration.subsec_nanos()),
+      timespec: libc::timespec {
+        tv_sec: duration.as_secs() as libc::time_t,
+        tv_nsec: duration.subsec_nanos() as libc::c_long,
+      },
       #[cfg(target_os = "linux")]
       timer_res: unsafe { Resource::from_raw_fd(timer_fd) },
       #[cfg(kqueue)]
@@ -117,8 +116,8 @@ impl Operation for Timeout {
   // const OPCODE: u8 = 11;
 
   #[cfg(linux)]
-  fn create_entry(&self) -> squeue::Entry {
-    opcode::Timeout::new(&self.timespec as *const _).build()
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::Timeout::new(&self.timespec as *const _ as *const _).build()
   }
 
   /// Very special case here for kqueue.

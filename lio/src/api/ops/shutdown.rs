@@ -1,8 +1,5 @@
 use std::os::fd::AsRawFd;
 
-#[cfg(linux)]
-use io_uring::types::Fd;
-
 use crate::api::resource::Resource;
 
 use crate::operation::{Operation, OperationExt};
@@ -32,8 +29,8 @@ impl Operation for Shutdown {
   #[cfg(linux)]
   // const OPCODE: u8 = 34;
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::Shutdown::new(Fd(self.res.as_raw_fd()), self.how).build()
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::Shutdown::new(self.res.as_raw_fd(), self.how).build()
   }
 
   fn run_blocking(&self) -> isize {

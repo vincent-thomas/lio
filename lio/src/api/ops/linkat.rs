@@ -1,8 +1,5 @@
 use std::{ffi::CString, os::fd::AsRawFd};
 
-#[cfg(linux)]
-use io_uring::types::Fd;
-
 use crate::api::resource::Resource;
 
 use crate::operation::{Operation, OperationExt};
@@ -39,11 +36,11 @@ impl Operation for LinkAt {
   #[cfg(linux)]
   // const OPCODE: u8 = 39;
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::LinkAt::new(
-      Fd(self.old_dir_res.as_raw_fd()),
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::LinkAt::new(
+      self.old_dir_res.as_raw_fd(),
       self.old_path.as_ptr(),
-      Fd(self.new_dir_res.as_raw_fd()),
+      self.new_dir_res.as_raw_fd(),
       self.new_path.as_ptr(),
     )
     .build()

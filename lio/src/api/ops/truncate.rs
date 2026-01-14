@@ -1,8 +1,5 @@
 use std::os::fd::AsRawFd;
 
-#[cfg(linux)]
-use io_uring::{opcode, squeue, types::Fd};
-
 use crate::api::resource::Resource;
 use crate::operation::{Operation, OperationExt};
 
@@ -30,8 +27,8 @@ impl Operation for Truncate {
   #[cfg(linux)]
   // const OPCODE: u8 = 55;
   #[cfg(linux)]
-  fn create_entry(&self) -> squeue::Entry {
-    opcode::Ftruncate::new(Fd(self.res.as_raw_fd()), self.size).build()
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::Ftruncate::new(self.res.as_raw_fd(), self.size).build()
   }
 
   fn run_blocking(&self) -> isize {

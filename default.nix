@@ -8,8 +8,6 @@ let
 in
 pkgs.rustPlatform.buildRustPackage {
   inherit pname version;
-  # useNextest = true;
-  doCheck = false;
 
   src = ./.;
 
@@ -22,7 +20,7 @@ pkgs.rustPlatform.buildRustPackage {
     gnumake
   ];
 
-  buildInputs = with pkgs; [ stdenv.cc.cc.lib ];
+  buildInputs = with pkgs; [ stdenv.cc.cc ];
 
   buildPhase = ''
     runHook preBuild

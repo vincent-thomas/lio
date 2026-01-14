@@ -70,7 +70,7 @@ impl<O: Operation> Sealed for O {}
 /// Operation results follow Unix conventions:
 /// - `>= 0`: Success (the result value, e.g., bytes transferred)
 /// - `< 0`: Error (negative errno value)
-pub trait Operation: Sealed + Send {
+pub trait Operation: Sealed + Send + Sync {
   /// Processes the operation result and returns a pointer to the typed result.
   ///
   /// This method is called exactly once when an operation completes. It converts
@@ -100,7 +100,7 @@ pub trait Operation: Sealed + Send {
   ///
   /// An io_uring SQE (submission queue entry) configured for this operation.
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry;
+  fn create_entry(&self) -> lio_uring::submission::Entry;
 
   /// Returns metadata about this operation.
   ///

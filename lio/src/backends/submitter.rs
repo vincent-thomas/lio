@@ -44,7 +44,7 @@ impl OpCompleted {
 /// to the underlying I/O mechanism (io_uring, kqueue, IOCP, etc.).
 ///
 /// Implementations hold their own state internally (e.g., a reference to shared backend state).
-pub trait IoSubmitter {
+pub trait IoSubmitter: Send {
   /// Submits an operation to the backend.
   ///
   /// The caller guarantees that the operation is already registered in the [`OpStore`]

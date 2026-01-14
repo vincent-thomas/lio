@@ -2,8 +2,6 @@
 use crate::operation::EventType;
 use std::{io, os::fd::AsRawFd};
 
-use io_uring::types::Fd;
-
 use crate::api::resource::Resource;
 use crate::operation::{Operation, OperationExt};
 
@@ -40,10 +38,10 @@ impl Operation for Tee {
   #[cfg(linux)]
   // const OPCODE: u8 = 33;
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
-    io_uring::opcode::Tee::new(
-      Fd(self.res_in.as_raw_fd()),
-      Fd(self.res_out.as_raw_fd()),
+  fn create_entry(&self) -> lio_uring::submission::Entry {
+    lio_uring::operation::Tee::new(
+      self.res_in.as_raw_fd(),
+      self.res_out.as_raw_fd(),
       self.size,
     )
     .build()

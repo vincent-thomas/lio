@@ -100,7 +100,7 @@ impl Driver {
   /// - `Ok(())`: Successfully processed completions
   /// - `Err(io::Error)`: An error occurred while polling
   pub fn tick(&mut self) -> io::Result<()> {
-    let result = self.io.tick(self.state, &self.store)?;
+    let result = self.io.tick(&self.store)?;
 
     for one in result {
       eprintln!(
@@ -130,7 +130,7 @@ impl Driver {
   /// - `Err(io::Error)`: An error occurred while polling
   #[cfg(test)]
   pub fn try_tick(&mut self) -> io::Result<()> {
-    let result = self.io.try_tick(self.state, &self.store)?;
+    let result = self.io.try_tick(&self.store)?;
     // assert!(!result.is_empty());
 
     for one in result {
