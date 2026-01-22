@@ -27,7 +27,6 @@ high = []
 # Required
 libc.workspace = true
 scc = { version = "3.4.8", default-features = false }
-crossbeam-queue = { version = "0.3.12", default-features = false, features = ["alloc"] }
 crossbeam-channel = { version = "0.5", default-features = false, features = ["std"] }
 
 # Optional
@@ -36,10 +35,15 @@ zeroize = { version = "1.8.2", optional = true, default-features = false, featur
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lio-uring.path = "../lio-uring"
-# io-uring = "0.7.9"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_IO"] }
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_IO",
+  "Win32_Storage_FileSystem",    # ReadFile, WriteFile, CreateFileW
+  "Win32_Networking_WinSock",    # WSARecv, WSASend, AcceptEx, ConnectEx
+  "Win32_Security",              # Security attributes for file operations
+] }
 
 [build-dependencies]
 cfg_aliases = "0.2.1"

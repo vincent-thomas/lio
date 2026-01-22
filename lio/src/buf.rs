@@ -83,14 +83,15 @@ impl BufLike for Vec<u8> {
 
 impl<B> Sealed for B where B: BufLike {}
 
-use std::slice;
-
-use std::array;
-use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::{
+  array,
+  cell::UnsafeCell,
+  slice,
+  sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+  time::Duration,
+};
 
 use crossbeam_channel::{Receiver, Sender};
-use std::time::Duration;
 
 /// A borrowed buffer from a `BufStore` pool.
 ///
@@ -112,7 +113,7 @@ unsafe impl<'a> Send for LentBuf<'a> {}
 // SAFETY: ---- :: ----
 unsafe impl<'a> Sync for LentBuf<'a> {}
 
-impl<'a> super::BufLike for LentBuf<'a> {
+impl<'a> BufLike for LentBuf<'a> {
   fn buf(&self) -> &[u8] {
     let cell = &self.pool.buffers[self.index as usize];
     // SAFETY: We have exclusive access via in_use flag

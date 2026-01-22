@@ -1,12 +1,37 @@
 #![cfg(linux)]
 
-use lio::{api::{tee}, api::resource::Resource};
-use std::sync::mpsc::{self, TryRecvError};
+use lio::Lio;
+use lio::api::{self, resource::Resource};
+use std::os::fd::FromRawFd;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+/// Helper to poll until we receive a result
+fn poll_until_recv<T>(lio: &mut Lio, receiver: &mpsc::Receiver<T>) -> T {
+  let mut attempts = 0;
+  loop {
+    lio.try_run().unwrap();
+    match receiver.try_recv() {
+      Ok(result) => return result,
+      Err(mpsc::TryRecvError::Empty) => {
+        attempts += 1;
+        if attempts > 10 {
+          panic!("Operation did not complete after 10 attempts");
+        }
+        thread::sleep(Duration::from_micros(100));
+      }
+      Err(mpsc::TryRecvError::Disconnected) => {
+        panic!("Channel disconnected");
+      }
+    }
+  }
+}
 
 #[test]
 #[ignore]
 fn test_tee_basic() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   // Create two pipes
   let mut pipe1_fds = [0i32; 2];
@@ -36,14 +61,16 @@ fn test_tee_basic() {
   let (sender, receiver) = mpsc::channel();
 
   // Use tee to copy data from pipe1 to pipe2
-  tee(pipe1_read, pipe2_write, test_data.len() as u32)
-    .send_with(sender.clone());
+  api::tee(
+    &unsafe { Resource::from_raw_fd(pipe1_read) },
+    &unsafe { Resource::from_raw_fd(pipe2_write) },
+    test_data.len() as u32,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender.clone());
 
-  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  let bytes_copied = receiver.recv().unwrap().expect("Failed to tee data");
+  let bytes_copied =
+    poll_until_recv(&mut lio, &receiver).expect("Failed to tee data");
   assert_eq!(bytes_copied as usize, test_data.len());
 
   // Read from pipe2 to verify
@@ -71,31 +98,18 @@ fn test_tee_basic() {
   assert_eq!(&buf1, test_data);
 
   // Cleanup
-  let (sender2, receiver2) = mpsc::channel();
-  let sender3 = sender2.clone();
-  let sender4 = sender2.clone();
-  let sender5 = sender2.clone();
-  let sender6 = sender2.clone();
-
-  lio::close(pipe1_fds[0]).send_with(sender3);
-  lio::close(pipe1_fds[1]).send_with(sender4);
-  lio::close(pipe2_fds[0]).send_with(sender5);
-  lio::close(pipe2_fds[1]).send_with(sender6);
-
-  assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
+  unsafe {
+    libc::close(pipe1_fds[0]);
+    libc::close(pipe1_fds[1]);
+    libc::close(pipe2_fds[0]);
+    libc::close(pipe2_fds[1]);
+  }
 }
 
 #[test]
 #[ignore]
 fn test_tee_large_data() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let mut pipe1_fds = [0i32; 2];
   let mut pipe2_fds = [0i32; 2];
@@ -122,19 +136,18 @@ fn test_tee_large_data() {
   }
 
   let (sender, receiver) = mpsc::channel();
-  let sender1 = sender.clone();
 
   // Tee the data
-  tee(pipe1_read, pipe2_write, test_data.len() as u32).when_done(move |t| {
-    sender1.send(t).unwrap();
-  });
-
-  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
+  api::tee(
+    &unsafe { Resource::from_raw_fd(pipe1_read) },
+    &unsafe { Resource::from_raw_fd(pipe2_write) },
+    test_data.len() as u32,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender);
 
   let bytes_copied =
-    receiver.recv().unwrap().expect("Failed to tee large data");
+    poll_until_recv(&mut lio, &receiver).expect("Failed to tee large data");
 
   assert!(bytes_copied > 0);
   assert!(bytes_copied as usize <= test_data.len());
@@ -152,31 +165,18 @@ fn test_tee_large_data() {
   assert_eq!(&buf2, &test_data[..bytes_copied as usize]);
 
   // Cleanup
-  let (sender2, receiver2) = mpsc::channel();
-  let sender3 = sender2.clone();
-  let sender4 = sender2.clone();
-  let sender5 = sender2.clone();
-  let sender6 = sender2.clone();
-
-  lio::close(pipe1_fds[0]).send_with(sender3);
-  lio::close(pipe1_fds[1]).send_with(sender4);
-  lio::close(pipe2_fds[0]).send_with(sender5);
-  lio::close(pipe2_fds[1]).send_with(sender6);
-
-  assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
+  unsafe {
+    libc::close(pipe1_fds[0]);
+    libc::close(pipe1_fds[1]);
+    libc::close(pipe2_fds[0]);
+    libc::close(pipe2_fds[1]);
+  }
 }
 
 #[test]
 #[ignore]
 fn test_tee_partial() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let mut pipe1_fds = [0i32; 2];
   let mut pipe2_fds = [0i32; 2];
@@ -201,18 +201,19 @@ fn test_tee_partial() {
   }
 
   let (sender, receiver) = mpsc::channel();
-  let sender1 = sender.clone();
 
   // Tee only part of the data
   let bytes_to_tee = 8;
-  tee(pipe1_read, pipe2_write, bytes_to_tee).send_with(sender1);
-
-  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
+  api::tee(
+    &unsafe { Resource::from_raw_fd(pipe1_read) },
+    &unsafe { Resource::from_raw_fd(pipe2_write) },
+    bytes_to_tee,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender);
 
   let bytes_copied =
-    receiver.recv().unwrap().expect("Failed to tee partial data");
+    poll_until_recv(&mut lio, &receiver).expect("Failed to tee partial data");
   assert_eq!(bytes_copied, bytes_to_tee as i32);
 
   // Read from pipe2
@@ -240,28 +241,17 @@ fn test_tee_partial() {
   assert_eq!(&buf1, test_data);
 
   // Cleanup
-  let (sender2, receiver2) = mpsc::channel();
-  let sender3 = sender2.clone();
-  let sender4 = sender2.clone();
-  let sender5 = sender2.clone();
-
-  lio::close(pipe1_fds[1]).send_with(sender3);
-  lio::close(pipe2_fds[0]).send_with(sender4);
-  lio::close(pipe2_fds[1]).send_with(sender5);
-
-  assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
+  unsafe {
+    libc::close(pipe1_fds[1]);
+    libc::close(pipe2_fds[0]);
+    libc::close(pipe2_fds[1]);
+  }
 }
 
 #[test]
 #[ignore]
 fn test_tee_empty_pipe() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let mut pipe1_fds = [0i32; 2];
   let mut pipe2_fds = [0i32; 2];
@@ -281,46 +271,34 @@ fn test_tee_empty_pipe() {
   }
 
   let (sender, receiver) = mpsc::channel();
-  let sender1 = sender.clone();
 
   // Try to tee from empty pipe
-  tee(pipe1_read, pipe2_write, 100).send_with(sender1);
+  api::tee(
+    &unsafe { Resource::from_raw_fd(pipe1_read) },
+    &unsafe { Resource::from_raw_fd(pipe2_write) },
+    100,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender);
 
-  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  let result = receiver.recv().unwrap();
+  let result = poll_until_recv(&mut lio, &receiver);
 
   // Should fail with EAGAIN or similar
   assert!(result.is_err(), "Tee from empty pipe should fail");
 
   // Cleanup
-  let (sender2, receiver2) = mpsc::channel();
-  let sender3 = sender2.clone();
-  let sender4 = sender2.clone();
-  let sender5 = sender2.clone();
-  let sender6 = sender2.clone();
-
-  lio::close(pipe1_fds[0]).send_with(sender3);
-  lio::close(pipe1_fds[1]).send_with(sender4);
-  lio::close(pipe2_fds[0]).send_with(sender5);
-  lio::close(pipe2_fds[1]).send_with(sender6);
-
-  assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
+  unsafe {
+    libc::close(pipe1_fds[0]);
+    libc::close(pipe1_fds[1]);
+    libc::close(pipe2_fds[0]);
+    libc::close(pipe2_fds[1]);
+  }
 }
 
 #[test]
 #[ignore]
 fn test_tee_zero_size() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let mut pipe1_fds = [0i32; 2];
   let mut pipe2_fds = [0i32; 2];
@@ -344,46 +322,34 @@ fn test_tee_zero_size() {
   }
 
   let (sender, receiver) = mpsc::channel();
-  let sender1 = sender.clone();
 
   // Tee with size 0
-  tee(pipe1_read, pipe2_write, 0).send_with(sender1);
+  api::tee(
+    &unsafe { Resource::from_raw_fd(pipe1_read) },
+    &unsafe { Resource::from_raw_fd(pipe2_write) },
+    0,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender);
 
-  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  let bytes_copied =
-    receiver.recv().unwrap().expect("Tee with size 0 should succeed");
+  let bytes_copied = poll_until_recv(&mut lio, &receiver)
+    .expect("Tee with size 0 should succeed");
   assert_eq!(bytes_copied, 0);
 
   // Cleanup
-  let (sender2, receiver2) = mpsc::channel();
-  let sender3 = sender2.clone();
-  let sender4 = sender2.clone();
-  let sender5 = sender2.clone();
-  let sender6 = sender2.clone();
-
-  lio::close(pipe1_fds[0]).send_with(sender3);
-  lio::close(pipe1_fds[1]).send_with(sender4);
-  lio::close(pipe2_fds[0]).send_with(sender5);
-  lio::close(pipe2_fds[1]).send_with(sender6);
-
-  assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
-  receiver2.recv().unwrap().unwrap();
+  unsafe {
+    libc::close(pipe1_fds[0]);
+    libc::close(pipe1_fds[1]);
+    libc::close(pipe2_fds[0]);
+    libc::close(pipe2_fds[1]);
+  }
 }
 
 #[cfg(target_os = "linux")]
 #[ignore]
 #[test]
 fn test_tee_multiple() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let mut pipe1_fds = [0i32; 2];
   let mut pipe2_fds = [0i32; 2];
@@ -412,31 +378,32 @@ fn test_tee_multiple() {
   }
 
   let (sender, receiver) = mpsc::channel();
-  let sender1 = sender.clone();
 
   // Tee to pipe2
-  tee(pipe1_read, pipe2_write, test_data.len() as u32).when_done(move |t| {
-    sender1.send(t).unwrap();
-  });
+  api::tee(
+    &unsafe { Resource::from_raw_fd(pipe1_read) },
+    &unsafe { Resource::from_raw_fd(pipe2_write) },
+    test_data.len() as u32,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender.clone());
 
-  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  let bytes1 = receiver.recv().unwrap().expect("First tee failed");
+  let bytes1 = poll_until_recv(&mut lio, &receiver).expect("First tee failed");
   assert_eq!(bytes1 as usize, test_data.len());
 
   let (sender2, receiver2) = mpsc::channel();
-  let sender3 = sender2.clone();
 
   // Tee to pipe3 (data still in pipe1)
-  tee(pipe1_read, pipe3_write, test_data.len() as u32).send_with(sender3);
+  api::tee(
+    &unsafe { Resource::from_raw_fd(pipe1_read) },
+    &unsafe { Resource::from_raw_fd(pipe3_write) },
+    test_data.len() as u32,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender2);
 
-  assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  let bytes2 = receiver2.recv().unwrap().expect("Second tee failed");
+  let bytes2 =
+    poll_until_recv(&mut lio, &receiver2).expect("Second tee failed");
   assert_eq!(bytes2 as usize, test_data.len());
 
   // Verify data in pipe2
@@ -454,37 +421,20 @@ fn test_tee_multiple() {
   assert_eq!(&buf3, test_data);
 
   // Cleanup
-  let (sender4, receiver4) = mpsc::channel();
-  let sender5 = sender4.clone();
-  let sender6 = sender4.clone();
-  let sender7 = sender4.clone();
-  let sender8 = sender4.clone();
-  let sender9 = sender4.clone();
-  let sender10 = sender4.clone();
-
-  lio::close(pipe1_fds[0]).send_with(sender5);
-  lio::close(pipe1_fds[1]).send_with(sender6);
-  lio::close(pipe2_fds[0]).send_with(sender7);
-  lio::close(pipe2_fds[1]).send_with(sender8);
-  lio::close(pipe3_fds[0]).send_with(sender9);
-  lio::close(pipe3_fds[1]).send_with(sender10);
-
-  assert_eq!(receiver4.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  receiver4.recv().unwrap().unwrap();
-  receiver4.recv().unwrap().unwrap();
-  receiver4.recv().unwrap().unwrap();
-  receiver4.recv().unwrap().unwrap();
-  receiver4.recv().unwrap().unwrap();
-  receiver4.recv().unwrap().unwrap();
+  unsafe {
+    libc::close(pipe1_fds[0]);
+    libc::close(pipe1_fds[1]);
+    libc::close(pipe2_fds[0]);
+    libc::close(pipe2_fds[1]);
+    libc::close(pipe3_fds[0]);
+    libc::close(pipe3_fds[1]);
+  }
 }
 
 #[test]
 #[ignore]
 fn test_tee_concurrent() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   // Test multiple concurrent tee operations
   let tasks: Vec<_> = (0..5)
@@ -513,45 +463,29 @@ fn test_tee_concurrent() {
   let (sender, receiver) = mpsc::channel();
 
   for (pipe1_fds, pipe2_fds, data) in &tasks {
-    let sender_clone = sender.clone();
     let data_len = data.len();
     api::tee(
-      unsafe { Resource::from_raw_fd(pipe1_fds[0]) },
-      unsafe { Resource::from_raw_fd(pipe2_fds[1],
+      &unsafe { Resource::from_raw_fd(pipe1_fds[0]) },
+      &unsafe { Resource::from_raw_fd(pipe2_fds[1]) },
       data_len as u32,
     )
-    .send_with(sender_clone);
+    .with_lio(&mut lio)
+    .send_with(sender.clone());
   }
 
-  assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
   for (_, _, data) in &tasks {
-    let bytes_copied = receiver.recv().unwrap().expect("Concurrent tee failed");
+    let bytes_copied =
+      poll_until_recv(&mut lio, &receiver).expect("Concurrent tee failed");
     assert_eq!(bytes_copied as usize, data.len());
   }
 
   // Cleanup
-  let (sender2, receiver2) = mpsc::channel();
-
   for (pipe1_fds, pipe2_fds, _) in &tasks {
-    let sender3 = sender2.clone();
-    let sender4 = sender2.clone();
-    let sender5 = sender2.clone();
-    let sender6 = sender2.clone();
-
-    lio::close(pipe1_fds[0]).send_with(sender3);
-    lio::close(pipe1_fds[1]).send_with(sender4);
-    lio::close(pipe2_fds[0]).send_with(sender5);
-    lio::close(pipe2_fds[1]).send_with(sender6);
-  }
-
-  assert_eq!(receiver2.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  lio::tick();
-
-  for _ in 0..20 {
-    receiver2.recv().unwrap().unwrap();
+    unsafe {
+      libc::close(pipe1_fds[0]);
+      libc::close(pipe1_fds[1]);
+      libc::close(pipe2_fds[0]);
+      libc::close(pipe2_fds[1]);
+    }
   }
 }

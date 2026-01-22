@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
 use core::{cell::Cell, marker::PhantomData, ptr};
 use std::io;
+use std::time::Duration;
 
 use crate::{IoUring, bindings};
 
@@ -145,6 +146,49 @@ impl CompletionQueue {
     unsafe { bindings::io_uring_cqe_seen(self.uring.ring.get(), cqe_ptr) };
 
     Ok(completion)
+  }
+
+  /// Wait for and retrieve the next completion with a timeout
+  ///
+  /// This blocks until at least one completion is available or the timeout expires.
+  /// Returns `Ok(None)` if the timeout expires with no completions.
+  ///
+  /// # Errors
+  /// Returns an error if waiting fails (other than timeout).
+  pub fn next_timeout(
+    &mut self,
+    timeout: Duration,
+  ) -> io::Result<Option<Completion>> {
+    let mut cqe_ptr = ptr::null_mut();
+    let mut ts = bindings::__kernel_timespec {
+      tv_sec: timeout.as_secs() as i64,
+      tv_nsec: timeout.subsec_nanos() as i64,
+    };
+
+    let ret = unsafe {
+      bindings::io_uring_wait_cqe_timeout(
+        self.uring.ring.get(),
+        &raw mut cqe_ptr,
+        &raw mut ts,
+      )
+    };
+
+    if ret < 0 {
+      let errno = -ret;
+      // ETIME means timeout expired with no completions
+      if errno == libc::ETIME {
+        return Ok(None);
+      }
+      return Err(io::Error::from_raw_os_error(errno));
+    }
+
+    let cqe = unsafe { &*cqe_ptr };
+    let completion =
+      Completion { user_data: cqe.user_data, res: cqe.res, flags: cqe.flags };
+
+    unsafe { bindings::io_uring_cqe_seen(self.uring.ring.get(), cqe_ptr) };
+
+    Ok(Some(completion))
   }
 
   /// Try to retrieve the next completion without blocking

@@ -218,22 +218,15 @@ pub trait AsResource {
   fn as_resource(&self) -> &Resource;
 }
 
-/// Blanket implementation for references to types implementing [`AsResource`].
-///
-/// This allows passing `&T` where `T: AsResource` to functions that accept
-/// `impl AsResource`, avoiding the need to explicitly call `.as_resource()`.
-impl<R> AsResource for &R
-where
-  R: AsResource,
-{
-  fn as_resource(&self) -> &Resource {
-    (*self).as_resource()
-  }
-}
-
 /// Direct implementation for [`Resource`] itself.
 ///
 /// This allows using a `Resource` directly where `AsResource` is expected.
+impl<'a> AsResource for &'a Resource {
+  fn as_resource(&self) -> &Resource {
+    self
+  }
+}
+
 impl AsResource for Resource {
   fn as_resource(&self) -> &Resource {
     self

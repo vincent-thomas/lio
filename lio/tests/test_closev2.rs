@@ -3,8 +3,6 @@ use std::{ffi::CString, os::fd::FromRawFd};
 
 #[test]
 fn test_close_basic() {
-  lio::init();
-
   let path = CString::new("/tmp/lio_test_close_basic.txt").unwrap();
 
   // Open a file
@@ -33,5 +31,4 @@ fn test_close_basic() {
 
   // Cleanup
   unsafe { libc::unlink(path.as_ptr()) };
-  lio::exit();
 }

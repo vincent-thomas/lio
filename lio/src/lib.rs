@@ -28,7 +28,7 @@
 //! on the last reference's drop.
 //!
 //! ### Example
-//! All operations return a [`Progress<T>`](crate::api::progress::Progress) which represents an in-flight I/O operation:
+//! All operations return a [`Io<'a, T>`](crate::api::io::Io) which represents an in-flight I/O operation:
 //!
 //! ```rust
 //! use lio::api::{self, resource::Resource};
@@ -74,8 +74,6 @@ pub mod fs;
 
 pub use buf::BufResult;
 
-mod driver;
-
 pub mod operation;
 
 #[path = "registration/registration.rs"]
@@ -89,46 +87,6 @@ pub mod api;
 #[cfg_attr(docsrs, doc(hidden))]
 pub mod test_utils;
 
-use crate::{
-  backends::IoBackend,
-  buf::BufLike,
-  driver::{Driver, TryInitError},
-};
-
-pub fn tick() {
-  Driver::get().tick(false)
-}
-
-/// Deallocates the lio I/O driver, freeing all resources.
-///
-/// This must be called after `exit()` to properly clean up the driver.
-/// Calling this before `exit()` or when the driver is not initialized will panic.
-pub fn exit() {
-  Driver::get().exit()
-}
-
-pub fn init() {
-  crate::try_init().expect("lio is already initialised.");
-}
-
-// #[cfg(linux)]
-// type Default = backends::io_uring::IoUring;
-// #[cfg(not(linux))]
-type Default = backends::pollingv2::Poller;
-
-pub fn try_init() -> Result<(), TryInitError> {
-  crate::try_init_with_driver::<Default>()
-}
-
-pub fn try_init_with_driver<B: IoBackend>() -> Result<(), TryInitError> {
-  crate::try_init_with_driver_and_capacity::<B>(1024)
-}
-
-pub fn try_init_with_driver_and_capacity<D>(
-  cap: usize,
-) -> Result<(), TryInitError>
-where
-  D: IoBackend,
-{
-  Driver::try_init_with_capacity::<D>(cap)
-}
+// Re-export core types
+mod lio;
+pub use lio::Lio;

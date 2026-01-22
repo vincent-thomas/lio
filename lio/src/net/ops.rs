@@ -58,7 +58,7 @@ impl Operation for SocketAccept {
   }
 
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> lio_uring::submission::Entry {
     self.0.create_entry()
   }
 }
@@ -99,7 +99,7 @@ impl Operation for SocketNew {
   }
 
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> lio_uring::submission::Entry {
     self.0.create_entry()
   }
 }
@@ -135,7 +135,7 @@ impl Operation for TcpAccept {
   }
 
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> lio_uring::submission::Entry {
     self.0.create_entry()
   }
 }

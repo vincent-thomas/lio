@@ -1,5 +1,6 @@
 use super::super::{Interest, ReadinessPoll};
 use super::NOTIFY_KEY;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -7,6 +8,8 @@ use std::time::Duration;
 use std::{io, ptr};
 
 /// Wrapper around an epoll file descriptor
+///
+/// This type is intentionally `!Send` to ensure it's only used from a single thread.
 pub struct OsPoller {
   /// File descriptor for the epoll instance.
   epoll_fd: OwnedFd,
@@ -18,6 +21,9 @@ pub struct OsPoller {
   /// Redox does not support timerfd.
   #[cfg(not(target_os = "redox"))]
   timer_fd: Option<OwnedFd>,
+
+  /// Marker to make this type `!Send`
+  _not_send: PhantomData<*const ()>,
 }
 
 impl OsPoller {
@@ -45,6 +51,8 @@ impl OsPoller {
 
       #[cfg(not(target_os = "redox"))]
       timer_fd: Some(timer_fd),
+
+      _not_send: PhantomData,
     };
 
     #[cfg(not(target_os = "redox"))]
@@ -86,8 +94,7 @@ impl ReadinessPoll for OsPoller {
 
     // Use EPOLLONESHOT for consistency with kqueue's EV_ONESHOT behavior
     events |= libc::EPOLLONESHOT as u32;
-    events |= libc::EPOLLPRI as u32;
-    events |= libc::EPOLLHUP as u32;
+    // Note: EPOLLHUP and EPOLLERR are always reported by the kernel regardless of registration
 
     let mut event = libc::epoll_event { events, u64: key as u64 };
 
@@ -115,8 +122,7 @@ impl ReadinessPoll for OsPoller {
 
     // Use EPOLLONESHOT for consistency with kqueue's EV_ONESHOT behavior
     events |= libc::EPOLLONESHOT as u32;
-    events |= libc::EPOLLPRI as u32;
-    events |= libc::EPOLLHUP as u32;
+    // Note: EPOLLHUP and EPOLLERR are always reported by the kernel regardless of registration
 
     let mut event = libc::epoll_event { events, u64: key as u64 };
 
@@ -228,7 +234,19 @@ impl ReadinessPoll for OsPoller {
       Interest::READ,
     )?;
 
-    Ok(n as usize)
+    // Filter out internal NOTIFY_KEY events before returning to caller
+    // This includes both the notifier and timerfd events
+    let mut write_idx = 0;
+    for read_idx in 0..n as usize {
+      if events[read_idx].u64 != NOTIFY_KEY {
+        if write_idx != read_idx {
+          events[write_idx] = events[read_idx];
+        }
+        write_idx += 1;
+      }
+    }
+
+    Ok(write_idx)
   }
 
   fn notify(&self) -> io::Result<()> {
@@ -245,7 +263,16 @@ impl ReadinessPoll for OsPoller {
     let readable = (event.events & libc::EPOLLIN as u32) != 0;
     let writable = (event.events & libc::EPOLLOUT as u32) != 0;
 
-    match (readable, writable) {
+    // EPOLLHUP, EPOLLERR, and EPOLLRDHUP should be treated as making the fd readable
+    // so that operations can be attempted and will return appropriate errors
+    let is_hup = (event.events & libc::EPOLLHUP as u32) != 0;
+    let is_err = (event.events & libc::EPOLLERR as u32) != 0;
+    let is_rdhup = (event.events & libc::EPOLLRDHUP as u32) != 0;
+
+    let error_or_hup = is_hup || is_err || is_rdhup;
+    let effective_readable = readable || error_or_hup;
+
+    match (effective_readable, writable) {
       (true, true) => Interest::READ_AND_WRITE,
       (true, false) => Interest::READ,
       (false, true) => Interest::WRITE,

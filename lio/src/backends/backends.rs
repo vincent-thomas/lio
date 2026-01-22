@@ -1,44 +1,41 @@
 //! I/O backend implementations for lio.
 //!
 //! This module provides the abstraction layer for different I/O backends and their
-//! implementations. It defines the core traits that all backends must implement and
-//! manages the lifecycle of I/O operations.
+//! implementations. It defines the core trait [`IoBackend`] that all backends must
+//! implement and manages the lifecycle of I/O operations.
 //!
 //! # Architecture
 //!
-//! The backend system is built around three main components:
+//! The backend system is designed for thread-per-core runtime integration:
 //!
-//! - **[`IoBackend`]**: The main trait that defines a backend's capabilities. Each platform
-//!   has specific implementations (io_uring on Linux, kqueue on macOS/BSD, IOCP on Windows).
-//! - **[`IoSubmitter`]**: Handles submitting operations to the backend.
-//! - **[`IoDriver`]**: Processes completion events from the backend.
+//! - **[`IoBackend`]**: Unified trait for submission and completion. Each platform has
+//!   specific implementations (io_uring on Linux, kqueue on macOS/BSD, IOCP on Windows).
+//! - **[`OpStore`]**: Thread-local storage for in-flight operations.
 //!
-//! # Custom Backends
+//! # Design Goals
 //!
-//! To implement a custom backend, you need to implement the [`IoBackend`], [`IoSubmitter`],
-//! and [`IoDriver`] traits:
+//! - **Zero runtime allocation**: All capacity is pre-allocated via [`init`](IoBackend::init)
+//! - **Dyn-compatible**: Backends can be used as `Box<dyn IoBackend>`
+//! - **Thread-local ownership**: Each thread owns its backend instance (`&mut self`)
+//! - **Batched submission**: Push multiple ops, flush once
+//!
+//! # Example
 //!
 //! ```rust,ignore
-//! use lio::backends::{IoDriver, IoSubmitter, IoHandler, SubmitErr};
-//! use std::io;
+//! use lio::backends::{IoBackend, OpStore};
 //!
-//! struct MyBackend;
+//! // Create and initialize backend
+//! let mut backend = IoUring::default();
+//! backend.init(1024)?;  // Pre-allocate for 1024 concurrent ops
 //!
-//! impl IoBackend for MyBackend {
-//!     type Submitter = MySubmitter;
-//!     type Driver = MyDriver;
-//!     type State = MyState;
+//! let mut store = OpStore::with_capacity(1024);
 //!
-//!     fn new_state() -> io::Result<Self::State> {
-//!         // Initialize backend state
-//!         todo!()
-//!     }
+//! // Submit operations
+//! backend.push(id, &op)?;
+//! backend.flush()?;
 //!
-//!     fn new(state: &'static mut Self::State) -> io::Result<(Self::Submitter, Self::Driver)> {
-//!         // Create submitter and handler
-//!         todo!()
-//!     }
-//! }
+//! // Poll for completions
+//! let completions = backend.poll(&mut store)?;
 //! ```
 
 #[cfg(test)]
@@ -76,13 +73,10 @@ mod impls {
 mod store;
 pub use store::*;
 
-mod handler;
-pub use handler::*;
+use std::io;
+use std::time::Duration;
 
-mod submitter;
-pub use submitter::*;
-
-use std::{io, sync::Arc};
+use crate::operation::Operation;
 
 /// Error types that can occur when submitting operations to the backend.
 #[derive(Debug)]
@@ -91,13 +85,6 @@ pub enum SubmitErr {
   Io(io::Error),
   /// The submission queue is full and cannot accept more operations.
   Full,
-  /// The operation is not compatible with this backend.
-  ///
-  /// When this occurs, the operation should be retried with a different backend
-  /// (typically the blocking worker).
-  NotCompatible,
-  /// The driver has been shut down and is no longer accepting operations.
-  DriverShutdown,
 }
 
 impl From<io::Error> for SubmitErr {
@@ -106,50 +93,102 @@ impl From<io::Error> for SubmitErr {
   }
 }
 
-/// The main trait defining an I/O backend implementation.
+/// Represents a completed I/O operation.
 ///
-/// `IoDriver` is the core abstraction for platform-specific I/O backends. Each backend
-/// implementation (io_uring, kqueue, IOCP) implements this trait to provide async I/O
-/// capabilities for lio.
-///
-/// # Associated Types
-///
-/// - `Submitter`: The type used to submit operations to the backend
-/// - `Handler`: The type used to process completion events
-/// - `State`: Shared state between the submitter and handler
-///
-/// Undefined behavior is allowed if caller drops State, before Submitter or Handler.
-pub trait IoBackend {
-  /// The submitter type for this backend.
-  type Submitter: IoSubmitter + Send + 'static;
+/// This type is returned by backend handlers when an operation completes,
+/// containing the operation ID and its result.
+#[derive(Debug)]
+pub struct OpCompleted {
+  /// The unique identifier of the completed operation.
+  pub(crate) op_id: u64,
 
-  /// The handler type for this backend.
-  type Driver: IoDriver + Send + 'static;
+  /// Result of the operation:
+  /// - `>= 0` on success (the return value, e.g., bytes transferred)
+  /// - `< 0` on error (negative errno value)
+  pub(crate) result: isize,
+}
 
-  /// The shared state type for this backend.
-  type State: Send + Sync + 'static;
-
-  /// Creates a new instance of the backend state.
-  ///
-  /// This is called once when initializing the backend to allocate and initialize
-  /// any shared state needed by both the submitter and handler.
-  fn new_state() -> io::Result<Self::State>;
-
-  /// Creates a new submitter and driver from the given state.
-  ///
-  /// This splits the backend into its two halves: the submitter (which runs on
-  /// worker threads) and the driver (which processes completions).
-  ///
-  /// Both the submitter and driver will hold references to the state internally.
+impl OpCompleted {
+  /// Creates a new completed operation result.
   ///
   /// # Parameters
   ///
-  /// - `state`: A static reference to the backend state that will be shared
+  /// - `op_id`: The unique ID of the operation
+  /// - `result`: The operation result (non-negative for success, negative errno for error)
+  pub fn new(op_id: u64, result: isize) -> Self {
+    Self { op_id, result }
+  }
+}
+
+/// Unified I/O backend trait for thread-per-core runtimes.
+///
+/// This trait combines submission and completion handling in a single interface,
+/// designed to be owned by a single thread (`&mut self` everywhere). It's
+/// dyn-compatible, allowing runtime selection of backends via `Box<dyn IoBackend>`.
+///
+/// # Lifecycle
+///
+/// 1. Create backend with `Default::default()` or backend-specific constructor
+/// 2. Call [`init`](Self::init) to pre-allocate resources (zero runtime allocation)
+/// 3. Use [`push`](Self::push) + [`flush`](Self::flush) to submit operations
+/// 4. Use [`poll`](Self::poll) or [`wait`](Self::wait) to retrieve completions
+///
+/// # Thread Safety
+///
+/// Backends are designed for single-thread ownership. They are intentionally
+/// not `Send` by default. Runtime authors control threading by creating one
+/// backend per thread.
+pub trait IoBackend {
+  /// Initialize the backend with the given capacity.
+  ///
+  /// This pre-allocates all resources needed for `cap` concurrent operations.
+  /// Must be called before any other methods. Calling init multiple times
+  /// is undefined behavior.
+  ///
+  /// # Parameters
+  ///
+  /// - `cap`: Maximum number of concurrent in-flight operations
+  ///
+  /// # Errors
+  ///
+  /// Returns an error if resource allocation fails (e.g., io_uring setup fails).
+  fn init(&mut self, cap: usize) -> io::Result<()>;
+
+  /// Pushes an operation to the backend's submission queue without syscall.
+  ///
+  /// The operation is queued internally but not yet submitted to the kernel.
+  /// Call [`flush`](Self::flush) to actually submit the queued operations.
+  ///
+  /// The caller guarantees that the operation is already registered in the [`OpStore`]
+  /// with the given `id`.
+  ///
+  /// # Errors
+  ///
+  /// - [`SubmitErr::Full`]: Submission queue is full (call flush first)
+  fn push(&mut self, id: u64, op: &dyn Operation) -> io::Result<()>;
+
+  /// Flushes all queued operations to the kernel.
+  ///
+  /// This submits all operations queued via [`push`](Self::push) in a single syscall.
+  /// After this call, the submission queue is empty and ready for new operations.
   ///
   /// # Returns
   ///
-  /// A tuple of (Submitter, Driver) on success.
-  fn new(
-    state: Arc<Self::State>,
-  ) -> io::Result<(Self::Submitter, Self::Driver)>;
+  /// The number of operations submitted.
+  fn flush(&mut self) -> io::Result<usize>;
+
+  /// Waits for completed operations with an optional timeout.
+  ///
+  /// - `timeout = None`: Block indefinitely until at least one operation completes
+  /// - `timeout = Some(Duration::ZERO)`: Non-blocking poll, return immediately
+  /// - `timeout = Some(duration)`: Wait up to `duration` for completions
+  ///
+  /// Returns an empty slice if the timeout expires with no completions.
+  ///
+  /// The returned slice is valid until the next call to `wait_timeout`, or `push`.
+  fn wait_timeout(
+    &mut self,
+    store: &mut OpStore,
+    timeout: Option<Duration>,
+  ) -> io::Result<&[OpCompleted]>;
 }

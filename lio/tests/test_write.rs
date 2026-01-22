@@ -2,8 +2,8 @@
 mod common;
 
 use lio::{
-  api::{self, write},
-  resource::Resource,
+  Lio,
+  api::{self, resource::Resource},
 };
 use proptest::{prelude::*, test_runner::TestRunner};
 use std::{
@@ -16,16 +16,16 @@ use std::{
 
 #[test]
 fn test_write_large_buffer() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let path = CString::new("/tmp/lio_test_write_large.txt").unwrap();
 
   let fd = unsafe {
-    libc::open(
+    Resource::from_raw_fd(libc::open(
       path.as_ptr(),
       libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
       0o644,
-    )
+    ))
   };
 
   // Write large buffer (1MB)
@@ -34,18 +34,15 @@ fn test_write_large_buffer() {
   let (sender, receiver) = mpsc::channel();
   let large_data_clone = large_data.clone();
 
-  api::write(fd, large_data.clone(), 0).send_with(sender.clone());
-
-  // assert_eq!(
-  //   receiver.try_recv().map(|nice| nice.0).unwrap_err(),
-  //   TryRecvError::Empty
-  // );
+  api::write(&fd, large_data.clone())
+    .with_lio(&mut lio)
+    .send_with(sender.clone());
 
   // Poll until the write completes (may take multiple ticks on some backends)
   let (bytes_written, returned_buf) = {
     let mut attempts = 0;
     loop {
-      lio::tick();
+      lio.try_run().unwrap();
       match receiver.try_recv() {
         Ok(result) => break result,
         Err(_) => {
@@ -67,16 +64,15 @@ fn test_write_large_buffer() {
   // Verify file size
   unsafe {
     let mut stat: libc::stat = std::mem::zeroed();
-    libc::fstat(fd, &mut stat);
+    libc::fstat(fd.as_raw_fd(), &mut stat);
     assert_eq!(stat.st_size as usize, large_data_clone.len());
-    libc::close(fd);
     libc::unlink(path.as_ptr());
   }
 }
 
 #[test]
 fn test_write_concurrent() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   // Test multiple concurrent write operations on different files
   for i in 0..10 {
@@ -86,25 +82,25 @@ fn test_write_concurrent() {
     let data = format!("Task {}", i).into_bytes();
 
     let fd = unsafe {
-      libc::open(
+      Resource::from_raw_fd(libc::open(
         path.as_ptr(),
         libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
         0o644,
-      )
+      ))
     };
 
     let (sender, receiver) = mpsc::channel();
     let data_clone = data.clone();
 
-    api::write_at(fd, data.clone(), 0).send_with(sender.clone());
-
-    // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
+    api::write_at(&fd, data.clone(), 0)
+      .with_lio(&mut lio)
+      .send_with(sender.clone());
 
     // Poll until the write completes (may take multiple ticks on some backends)
     let (bytes_written, returned_buf) = {
       let mut attempts = 0;
       loop {
-        lio::tick();
+        lio.try_run().unwrap();
         match receiver.try_recv() {
           Ok(result) => break result,
           Err(_) => {
@@ -123,7 +119,6 @@ fn test_write_concurrent() {
     assert_eq!(returned_buf, data_clone);
 
     unsafe {
-      libc::close(fd);
       libc::unlink(path.as_ptr());
     }
   }
@@ -131,7 +126,6 @@ fn test_write_concurrent() {
 
 #[test]
 fn prop_test_write_arbitrary_data_and_offsets() {
-  lio::init();
   let mut runner = TestRunner::new(ProptestConfig::default());
 
   runner
@@ -141,12 +135,14 @@ fn prop_test_write_arbitrary_data_and_offsets() {
     .unwrap();
 }
 
-// proptest! {
 fn prop_test_write_arbitrary_data_and_offsets_run(
   data_size: usize,
   write_offset: i64,
   seed: u64,
 ) -> Result<(), TestCaseError> {
+  let mut lio = Lio::new(64)
+    .map_err(|e| TestCaseError::fail(format!("Failed to create Lio: {}", e)))?;
+
   // Generate deterministic random data based on seed
   let test_data: Vec<u8> = (0..data_size)
     .map(|i| ((seed.wrapping_add(i as u64)) % 256) as u8)
@@ -187,17 +183,20 @@ fn prop_test_write_arbitrary_data_and_offsets_run(
   let test_data_clone = test_data.clone();
 
   let mut receiver = api::write_at(
-    unsafe { Resource::from_raw_fd(fd) },
+    &unsafe { Resource::from_raw_fd(fd) },
     test_data,
     write_offset,
   )
+  .with_lio(&mut lio)
   .send();
 
   // Poll until the write completes (may take multiple ticks on some backends)
   let (write_result, returned_buf) = {
     let mut attempts = 0;
     loop {
-      lio::tick();
+      lio.try_run().map_err(|e| {
+        TestCaseError::fail(format!("Lio try_run failed: {}", e))
+      })?;
       match receiver.try_recv() {
         Some(result) => break result,
         None => {

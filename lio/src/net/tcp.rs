@@ -6,8 +6,8 @@ use std::{
 use crate::{
   api::{
     self,
+    io::Io,
     ops::{self, Accept, Recv, Shutdown},
-    progress::Progress,
     resource::{AsResource, FromResource, IntoResource, Resource},
   },
   net::ops::TcpAccept,
@@ -173,10 +173,10 @@ impl TcpListener {
   /// }
   /// # lio::exit();
   /// ```
-  pub fn accept(&self) -> Progress<'_, TcpAccept> {
+  pub fn accept(&self) -> Io<'_, TcpAccept> {
     // Create Accept operation and wrap it in SocketAccept
     let socket_accept_op = TcpAccept(Accept::new(self.0.as_resource().clone()));
-    Progress::from_op(socket_accept_op)
+    Io::from_op(socket_accept_op)
   }
 }
 
@@ -282,7 +282,7 @@ impl TcpSocket {
   /// ```
   pub async fn connect_async(addr: SocketAddr) -> io::Result<Self> {
     let socket = Socket::new(libc::SOCK_STREAM, libc::AF_INET, 0).await?;
-    api::connect(socket.as_resource(), addr).await?;
+    api::connect(&socket, addr).await?;
     Ok(TcpSocket(socket))
   }
 
@@ -346,7 +346,7 @@ impl TcpSocket {
   /// }
   /// # lio::exit();
   /// ```
-  pub fn recv(&self, vec: Vec<u8>) -> Progress<'_, Recv<Vec<u8>>> {
+  pub fn recv(&self, vec: Vec<u8>) -> Io<'_, Recv<Vec<u8>>> {
     self.0.recv(vec)
   }
 
@@ -382,7 +382,7 @@ impl TcpSocket {
   /// }
   /// # lio::exit();
   /// ```
-  pub fn send(&self, vec: Vec<u8>) -> Progress<'_, ops::Send<Vec<u8>>> {
+  pub fn send(&self, vec: Vec<u8>) -> Io<'_, ops::Send<Vec<u8>>> {
     self.0.send(vec)
   }
 
@@ -425,7 +425,7 @@ impl TcpSocket {
   /// }
   /// # lio::exit();
   /// ```
-  pub fn shutdown(&self, how: i32) -> Progress<'_, Shutdown> {
+  pub fn shutdown(&self, how: i32) -> Io<'_, Shutdown> {
     self.0.shutdown(how)
   }
 }

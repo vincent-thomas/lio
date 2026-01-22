@@ -28,7 +28,6 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
-        inherit (nixpkgs) lib;
       in
       {
         packages.default = import ./default.nix { inherit pkgs; };

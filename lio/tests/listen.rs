@@ -1,37 +1,61 @@
-use lio::api;
+use lio::api::{self, bind, listen};
+use lio::Lio;
 use std::{
   net::SocketAddr,
   os::fd::{AsFd, AsRawFd},
   sync::mpsc,
+  thread,
+  time::Duration,
 };
+
+/// Helper to poll until we receive a result
+fn poll_until_recv<T>(lio: &mut Lio, receiver: &mpsc::Receiver<T>) -> T {
+  let mut attempts = 0;
+  loop {
+    lio.try_run().unwrap();
+    match receiver.try_recv() {
+      Ok(result) => return result,
+      Err(mpsc::TryRecvError::Empty) => {
+        attempts += 1;
+        if attempts > 10 {
+          panic!("Operation did not complete after 10 attempts");
+        }
+        thread::sleep(Duration::from_micros(100));
+      }
+      Err(mpsc::TryRecvError::Disconnected) => {
+        panic!("Channel disconnected");
+      }
+    }
+  }
+}
 
 #[cfg(linux)]
 #[test]
 fn test_listen_basic() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let (sender_sock, receiver_sock) = mpsc::channel();
-  let (sender_unit, receiver_unit) = mpsc::channel();
+  let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp_socket().send_with(sender_sock.clone());
+  lio::test_utils::tcp_socket()
+    .with_lio(&mut lio)
+    .send_with(sender_sock.clone());
 
-  lio::tick();
-
-  let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
+  let sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  api::bind(&sock, addr).send_with(sender_unit.clone());
+  api::bind(&sock, addr)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  lio::tick();
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind socket");
 
-  receiver_unit.recv().unwrap().expect("Failed to bind socket");
+  api::listen(&sock, 128)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  api::listen(&sock, 128).send_with(sender_unit.clone());
-
-  lio::tick();
-
-  receiver_unit.recv().unwrap().expect("Failed to listen on socket");
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen on socket");
 
   // Verify socket is in listening state by checking it accepts connections
   unsafe {
@@ -58,31 +82,31 @@ fn test_listen_basic() {
 #[cfg(linux)]
 #[test]
 fn test_listen_with_backlog() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp_socket().send_with(sender_sock.clone());
+  lio::test_utils::tcp_socket()
+    .with_lio(&mut lio)
+    .send_with(sender_sock.clone());
 
-  lio::tick();
-
-  let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
+  let sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  bind(&sock, addr).send_with(sender_unit.clone());
+  bind(&sock, addr)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  lio::tick();
-
-  receiver_unit.recv().unwrap().expect("Failed to bind socket");
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind socket");
 
   // Listen with custom backlog
-  listen(&sock, 10).send_with(sender_unit.clone());
+  listen(&sock, 10)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  lio::tick();
-
-  receiver_unit.recv().unwrap().expect("Failed to listen with backlog 10");
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen with backlog 10");
 
   // Verify listening state
   unsafe {
@@ -103,31 +127,31 @@ fn test_listen_with_backlog() {
 #[cfg(linux)]
 #[test]
 fn test_listen_large_backlog() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp_socket().send_with(sender_sock.clone());
+  lio::test_utils::tcp_socket()
+    .with_lio(&mut lio)
+    .send_with(sender_sock.clone());
 
-  lio::tick();
-
-  let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
+  let sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  bind(&sock, addr).send_with(sender_unit.clone());
+  bind(&sock, addr)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  lio::tick();
-
-  receiver_unit.recv().unwrap().expect("Failed to bind socket");
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind socket");
 
   // Listen with large backlog
-  listen(&sock, 1024).send_with(sender_unit.clone());
+  listen(&sock, 1024)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  lio::tick();
-
-  receiver_unit.recv().unwrap().expect("Failed to listen with large backlog");
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen with large backlog");
 
   // Verify listening state
   unsafe {
@@ -147,24 +171,24 @@ fn test_listen_large_backlog() {
 
 #[test]
 fn test_listen_without_bind() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let (sender_sock, receiver_sock) = mpsc::channel();
 
-  lio::test_utils::tcp_socket().send_with(sender_sock.clone());
+  lio::test_utils::tcp_socket()
+    .with_lio(&mut lio)
+    .send_with(sender_sock.clone());
 
-  lio::tick();
+  let sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
 
-  let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
-
-  let (sender_l, receiver_l) = mpsc::channel();
+  let (sender_l, receiver_l) = mpsc::channel::<std::io::Result<()>>();
 
   // Try to listen without binding first
-  api::listen(&sock, 128).send_with(sender_l.clone());
+  api::listen(&sock, 128)
+    .with_lio(&mut lio)
+    .send_with(sender_l.clone());
 
-  lio::tick();
-
-  let _ = receiver_l.recv().unwrap();
+  let _ = poll_until_recv(&mut lio, &receiver_l);
 
   // On most systems this will succeed (bind to INADDR_ANY:0)
   // but behavior may vary by platform
@@ -176,31 +200,30 @@ fn test_listen_without_bind() {
 #[cfg(linux)]
 #[test]
 fn test_listen_ipv6() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp6_socket().send_with(sender_sock.clone());
+  lio::test_utils::tcp6_socket()
+    .with_lio(&mut lio)
+    .send_with(sender_sock.clone());
 
-  lio::tick();
-
-  let sock =
-    receiver_sock.recv().unwrap().expect("Failed to create IPv6 socket");
+  let sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create IPv6 socket");
 
   let addr: SocketAddr = "[::1]:0".parse().unwrap();
 
-  bind(&sock, addr).send_with(sender_unit.clone());
+  bind(&sock, addr)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  lio::tick();
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind IPv6 socket");
 
-  receiver_unit.recv().unwrap().expect("Failed to bind IPv6 socket");
+  listen(&sock, 128)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  listen(&sock, 128).send_with(sender_unit.clone());
-
-  lio::tick();
-
-  receiver_unit.recv().unwrap().expect("Failed to listen on IPv6 socket");
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen on IPv6 socket");
 
   // Verify listening state
   unsafe {
@@ -220,34 +243,33 @@ fn test_listen_ipv6() {
 
 #[test]
 fn test_listen_on_udp() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let (sender_sock, receiver_sock) = mpsc::channel();
-  let (sender_unit, receiver_unit) = mpsc::channel();
+  let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::udp_socket().send_with(sender_sock.clone());
+  lio::test_utils::udp_socket()
+    .with_lio(&mut lio)
+    .send_with(sender_sock.clone());
 
-  lio::tick();
-
-  let sock =
-    receiver_sock.recv().unwrap().expect("Failed to create UDP socket");
+  let sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create UDP socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  api::bind(&sock, addr).send_with(sender_unit.clone());
+  api::bind(&sock, addr)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  lio::tick();
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind UDP socket");
 
-  receiver_unit.recv().unwrap().expect("Failed to bind UDP socket");
-
-  let (sender_l, receiver_l) = mpsc::channel();
+  let (sender_l, receiver_l) = mpsc::channel::<std::io::Result<()>>();
 
   // Try to listen on UDP socket (should fail)
-  api::listen(&sock, 128).send_with(sender_l.clone());
+  api::listen(&sock, 128)
+    .with_lio(&mut lio)
+    .send_with(sender_l.clone());
 
-  lio::tick();
-
-  let result = receiver_l.recv().unwrap();
+  let result = poll_until_recv(&mut lio, &receiver_l);
 
   assert!(result.is_err(), "Listen should fail on UDP socket");
 
@@ -259,39 +281,39 @@ fn test_listen_on_udp() {
 
 #[test]
 fn test_listen_twice() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let (sender_sock, receiver_sock) = mpsc::channel();
-  let (sender_unit, receiver_unit) = mpsc::channel();
+  let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp_socket().send_with(sender_sock.clone());
+  lio::test_utils::tcp_socket()
+    .with_lio(&mut lio)
+    .send_with(sender_sock.clone());
 
-  lio::tick();
-
-  let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
+  let sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  api::bind(&sock, addr).send_with(sender_unit.clone());
+  api::bind(&sock, addr)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  lio::tick();
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind socket");
 
-  receiver_unit.recv().unwrap().expect("Failed to bind socket");
+  api::listen(&sock, 128)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  api::listen(&sock, 128).send_with(sender_unit.clone());
+  poll_until_recv(&mut lio, &receiver_unit).expect("First listen should succeed");
 
-  lio::tick();
-
-  receiver_unit.recv().unwrap().expect("First listen should succeed");
-
-  let (sender_l2, receiver_l2) = mpsc::channel();
+  let (sender_l2, receiver_l2) = mpsc::channel::<std::io::Result<()>>();
 
   // Try to listen again on the same socket
-  api::listen(&sock, 256).send_with(sender_l2.clone());
+  api::listen(&sock, 256)
+    .with_lio(&mut lio)
+    .send_with(sender_l2.clone());
 
-  lio::tick();
-
-  let _ = receiver_l2.recv().unwrap();
+  let _ = poll_until_recv(&mut lio, &receiver_l2);
 
   // Behavior may vary - some systems allow it, some don't
   unsafe {
@@ -302,31 +324,31 @@ fn test_listen_twice() {
 #[cfg(linux)]
 #[test]
 fn test_listen_zero_backlog() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let (sender_sock, receiver_sock) = mpsc::channel();
-  let (sender_unit, receiver_unit) = mpsc::channel();
+  let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp_socket().send_with(sender_sock.clone());
+  lio::test_utils::tcp_socket()
+    .with_lio(&mut lio)
+    .send_with(sender_sock.clone());
 
-  lio::tick();
-
-  let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
+  let sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  api::bind(&sock, addr).send_with(sender_unit.clone());
+  api::bind(&sock, addr)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  lio::tick();
-
-  receiver_unit.recv().unwrap().expect("Failed to bind socket");
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind socket");
 
   // Listen with backlog of 0 (system may adjust to minimum)
-  api::listen(&sock, 0).send_with(sender_unit.clone());
+  api::listen(&sock, 0)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  lio::tick();
-
-  receiver_unit.recv().unwrap().expect("Failed to listen with backlog 0");
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen with backlog 0");
 
   // Verify listening state
   unsafe {
@@ -346,32 +368,36 @@ fn test_listen_zero_backlog() {
 
 #[test]
 fn test_listen_after_close() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
-  let mut socket_recv = lio::test_utils::tcp_socket().send();
+  let (sender_sock, receiver_sock) = mpsc::channel();
 
-  lio::tick();
+  lio::test_utils::tcp_socket()
+    .with_lio(&mut lio)
+    .send_with(sender_sock.clone());
 
-  let sock = socket_recv.try_recv().unwrap().expect("Failed to create socket");
+  let sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  let bind_recv = api::bind(&sock, addr).send();
+  let (sender_bind, receiver_bind) = mpsc::channel();
+  api::bind(&sock, addr)
+    .with_lio(&mut lio)
+    .send_with(sender_bind);
 
-  lio::tick();
-
-  bind_recv.recv().expect("Failed to bind socket");
+  poll_until_recv(&mut lio, &receiver_bind).expect("Failed to bind socket");
 
   unsafe {
     libc::close(sock.as_fd().as_raw_fd());
   }
 
   // Try to listen on closed socket
-  let mut listen_recv = api::listen(&sock, 128).send();
+  let (sender_l, receiver_l) = mpsc::channel();
+  api::listen(&sock, 128)
+    .with_lio(&mut lio)
+    .send_with(sender_l);
 
-  lio::tick();
-
-  let result = listen_recv.try_recv().unwrap();
+  let result = poll_until_recv(&mut lio, &receiver_l);
 
   assert!(result.is_err(), "Listen should fail on closed socket");
 }
@@ -379,46 +405,46 @@ fn test_listen_after_close() {
 #[cfg(linux)]
 #[test]
 fn test_listen_concurrent() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let (sender, receiver) = mpsc::channel();
 
   // Test listening on multiple sockets concurrently
   for _ in 0..10 {
-    lio::test_utils::tcp_socket().send_with(sender.clone());
+    lio::test_utils::tcp_socket()
+      .with_lio(&mut lio)
+      .send_with(sender.clone());
   }
-
-  lio::tick();
 
   let mut sockets = Vec::new();
   for _ in 0..10 {
-    let sock = receiver.recv().expect("Failed to create socket").expect("Socket creation failed");
+    let sock = poll_until_recv(&mut lio, &receiver).expect("Socket creation failed");
     sockets.push(sock);
   }
 
-  let (sender_bind, receiver_bind) = mpsc::channel();
+  let (sender_bind, receiver_bind) = mpsc::channel::<std::io::Result<()>>();
 
   for sock in &sockets {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    api::bind(&sock, addr).send_with(sender_bind.clone());
+    api::bind(&sock, addr)
+      .with_lio(&mut lio)
+      .send_with(sender_bind.clone());
   }
-
-  lio::tick();
 
   for _ in 0..10 {
-    receiver_bind.recv().unwrap().expect("Failed to bind socket");
+    poll_until_recv(&mut lio, &receiver_bind).expect("Failed to bind socket");
   }
 
-  let (sender_listen, receiver_listen) = mpsc::channel();
+  let (sender_listen, receiver_listen) = mpsc::channel::<std::io::Result<()>>();
 
   for sock in &sockets {
-    api::listen(sock, 128).send_with(sender_listen.clone());
+    api::listen(sock, 128)
+      .with_lio(&mut lio)
+      .send_with(sender_listen.clone());
   }
 
-  lio::tick();
-
   for _ in 0..10 {
-    receiver_listen.recv().unwrap().expect("Failed to listen");
+    poll_until_recv(&mut lio, &receiver_listen).expect("Failed to listen");
   }
 
   for sock in sockets {
@@ -441,31 +467,31 @@ fn test_listen_concurrent() {
 #[cfg(linux)]
 #[test]
 fn test_listen_on_all_interfaces() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let (sender_sock, receiver_sock) = mpsc::channel();
-  let (sender_unit, receiver_unit) = mpsc::channel();
+  let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp_socket().send_with(sender_sock.clone());
+  lio::test_utils::tcp_socket()
+    .with_lio(&mut lio)
+    .send_with(sender_sock.clone());
 
-  lio::tick();
-
-  let sock = receiver_sock.recv().unwrap().expect("Failed to create socket");
+  let sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
 
   // Bind to 0.0.0.0 (all interfaces)
   let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-  api::bind(&sock, addr).send_with(sender_unit.clone());
+  api::bind(&sock, addr)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  lio::tick();
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind to all interfaces");
 
-  receiver_unit.recv().unwrap().expect("Failed to bind to all interfaces");
+  listen(&sock, 128)
+    .with_lio(&mut lio)
+    .send_with(sender_unit.clone());
 
-  listen(&sock, 128).send_with(sender_unit.clone());
-
-  lio::tick();
-
-  receiver_unit.recv().unwrap().expect("Failed to listen on all interfaces");
+  poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen on all interfaces");
 
   // Verify listening state
   unsafe {

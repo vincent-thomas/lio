@@ -36,7 +36,7 @@ impl Operation for OpenatFile {
   }
 
   #[cfg(linux)]
-  fn create_entry(&self) -> io_uring::squeue::Entry {
+  fn create_entry(&self) -> lio_uring::submission::Entry {
     self.0.create_entry()
   }
 }

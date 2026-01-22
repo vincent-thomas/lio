@@ -1,4 +1,10 @@
-use crate::operation::{OpMeta, Operation, OperationExt};
+use crate::operation::{Operation, OperationExt};
+
+#[cfg(unix)]
+use crate::operation::OpMeta;
+
+#[cfg(windows)]
+use crate::operation::IocpStartResult;
 
 pub struct Nop;
 
@@ -11,9 +17,7 @@ impl OperationExt for Nop {
 impl Operation for Nop {
   impl_result!(());
 
-  // #[cfg(unix)]
-  // const OPCODE: u8 = 0;
-
+  #[cfg(unix)]
   fn meta(&self) -> OpMeta {
     OpMeta::CAP_NONE
   }
@@ -23,8 +27,20 @@ impl Operation for Nop {
     lio_uring::operation::Nop::new().build()
   }
 
-  #[cfg(unix)]
   fn run_blocking(&self) -> isize {
     0
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Windows IOCP Support
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  #[cfg(windows)]
+  fn start_iocp(
+    &self,
+    _overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+  ) -> IocpStartResult {
+    // NOP completes immediately with result 0
+    IocpStartResult::Completed(0)
   }
 }
