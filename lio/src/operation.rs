@@ -45,7 +45,36 @@
 //! The [`Operation`] trait is sealed and can only be implemented within lio. This ensures
 //! that all operations are properly integrated with the runtime and backends.
 
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::OVERLAPPED;
+
 trait Sealed {}
+
+/// Result of starting an IOCP operation.
+///
+/// This enum describes what happened when an operation was submitted to Windows IOCP.
+/// Operations can complete immediately, start asynchronously, or indicate they don't
+/// support IOCP (requiring fallback to blocking mode).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IocpStartResult {
+  /// Operation started asynchronously and will complete via IOCP.
+  ///
+  /// The completion will be delivered through `GetQueuedCompletionStatus`.
+  Pending,
+
+  /// Operation completed synchronously with the given result.
+  ///
+  /// The value follows the same convention as `run_blocking()`:
+  /// - `>= 0`: Success (e.g., bytes transferred)
+  /// - `< 0`: Error (negative Windows error code)
+  Completed(isize),
+
+  /// Operation doesn't support IOCP and should use `run_blocking()` fallback.
+  ///
+  /// This allows incremental implementation of Windows async support.
+  Unsupported,
+}
 
 /// Seal implementation to prevent external implementations of [`Operation`].
 ///
@@ -150,6 +179,69 @@ implemntee error: operation has cap, but cap fn isn't defined."
   /// - `>= 0` on success (the result value, e.g., bytes read/written)
   /// - `< 0` on error (negative errno value)
   fn run_blocking(&self) -> isize;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Windows IOCP Support
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// Starts the operation using Windows IOCP (I/O Completion Ports).
+  ///
+  /// This method initiates an asynchronous I/O operation on Windows. The operation
+  /// uses the provided OVERLAPPED structure for tracking and will complete via
+  /// the I/O completion port.
+  ///
+  /// # Parameters
+  ///
+  /// - `overlapped`: Pointer to an OVERLAPPED structure owned by the operation.
+  ///   The operation must keep this structure alive until completion.
+  ///
+  /// # Returns
+  ///
+  /// - [`IocpStartResult::Pending`]: Operation started asynchronously
+  /// - [`IocpStartResult::Completed`]: Operation completed synchronously
+  /// - [`IocpStartResult::Unsupported`]: Use `run_blocking()` fallback
+  ///
+  /// # Default Implementation
+  ///
+  /// Returns `Unsupported`, allowing incremental Windows support.
+  #[cfg(windows)]
+  fn start_iocp(&self, overlapped: *mut OVERLAPPED) -> IocpStartResult {
+    let _ = overlapped;
+    IocpStartResult::Unsupported
+  }
+
+  /// Returns a pointer to this operation's OVERLAPPED structure.
+  ///
+  /// Operations that support IOCP must store an OVERLAPPED structure and return
+  /// a pointer to it here. The backend uses this pointer to identify completions.
+  ///
+  /// # Returns
+  ///
+  /// Pointer to the OVERLAPPED structure, or null if not supported.
+  ///
+  /// # Default Implementation
+  ///
+  /// Returns null pointer.
+  #[cfg(windows)]
+  fn overlapped_ptr(&self) -> *const OVERLAPPED {
+    std::ptr::null()
+  }
+
+  /// Returns the Windows HANDLE for this operation's resource.
+  ///
+  /// Used by the IOCP backend to associate handles with the completion port.
+  ///
+  /// # Returns
+  ///
+  /// The handle if the operation uses one, or `None` for operations like NOP.
+  ///
+  /// # Default Implementation
+  ///
+  /// Returns `None`.
+  #[cfg(windows)]
+  fn handle(&self) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    None
+  }
 }
 
 /// Extension trait that associates a typed result with an operation.
@@ -337,7 +429,7 @@ impl OpMeta {
   ///
   /// Panics if the operation doesn't use a file descriptor ([`CAP_FD`](Self::CAP_FD) not set).
   pub const fn is_beh_run_before_noti(self) -> bool {
-    assert!(self.0 & Self::CAP_FD.0 != 0);
+    assert!(self.0 & Self::CAP_FD.0 != 0, "OpMeta::is_beh_run_before_noti");
     self.0 & Self::BEH_NEEDS_RUN.0 != 0
   }
 

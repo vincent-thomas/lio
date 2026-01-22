@@ -6,20 +6,20 @@
 //!
 //! # Overview
 //!
-//! The [`Progress<T>`] type is the core abstraction that wraps an I/O operation and
+//! The [`Io<T>`] type is the core abstraction that wraps an I/O operation and
 //! provides various methods to consume its result:
 //!
 //! - **Async/await**: Implements `IntoFuture`, allowing direct `.await` syntax
-//! - **Blocking**: [`wait()`](Progress::wait) blocks until completion
-//! - **Callbacks**: [`when_done()`](Progress::when_done) executes a closure on completion
-//! - **Channels**: [`send()`](Progress::send) and [`send_with()`](Progress::send_with)
+//! - **Blocking**: [`wait()`](Io::wait) blocks until completion
+//! - **Callbacks**: [`when_done()`](Io::when_done) executes a closure on completion
+//! - **Channels**: [`send()`](Io::send) and [`send_with()`](Io::send_with)
 //!   deliver results via channels
 //!
 //! # Architecture
 //!
 //! ```text
-//! Progress<T>
-//!   ├─> IntoFuture ──> ProgressFuture<T> (async/await)
+//! Io<T>
+//!   ├─> IntoFuture ──> IoFuture<T> (async/await)
 //!   ├─> wait()        (blocking)
 //!   ├─> when_done(F)  (callback)
 //!   ├─> send()    ──> Receiver<T>        (channel-based blocking)
@@ -28,29 +28,21 @@
 //!
 //! # Usage Patterns
 //!
-//! ## Async/await
-//!
 //! ```ignore
+//!
+//! // Async/await
 //! let (result, buf) = lio::read_with_buf(fd, vec![0; 1024], 0).await;
-//! ```
 //!
-//! ## Blocking
-//!
-//! ```ignore
+//! // Blocking
 //! let (result, buf) = lio::write_with_buf(fd, vec![0; 10], 0).wait();
-//! ```
 //!
-//! ## Callbacks
-//!
-//! ```ignore
+//! // Callbacks
 //! lio::read_with_buf(fd, vec![0; 1024], 0).when_done(|(result, buf)| {
 //!     println!("Read {} bytes", result.unwrap());
 //! });
-//! ```
 //!
-//! ## Channels
+//! // Channels
 //!
-//! ```ignore
 //! let receiver = lio::write_with_buf(fd, vec![0; 10], 0).send();
 //! // Do other work...
 //! let (result, buf) = receiver.recv();
@@ -62,12 +54,7 @@
 //! threads than where operations were initiated. This is particularly useful for
 //! delegating I/O completion handling to dedicated threads.
 
-use crate::{
-  backends::{SubmitErr, Submitter},
-  operation::OperationExt,
-  registration::StoredOp,
-  worker::Worker,
-};
+use crate::{lio::Lio, operation::OperationExt, registration::StoredOp};
 
 use std::{
   future::Future,
@@ -77,7 +64,13 @@ use std::{
   time::Duration,
 };
 
-use crate::Driver;
+/// Internal handle for accessing the Lio instance.
+enum LioHandle<'a> {
+  /// No Lio bound - will panic if used. This is the default from `from_op()`.
+  GloballyInstalled,
+  /// User-provided Lio instance via `.with_lio()`.
+  Custom(&'a mut Lio),
+}
 
 /// A blocking receiver for operation results.
 ///
@@ -197,23 +190,26 @@ impl<T> Receiver<T> {
 
 /// Represents an in-progress I/O operation with multiple consumption patterns.
 ///
-/// `Progress<T>` is the primary interface for consuming I/O operation results in lio.
+/// [`Io<T>`] is the primary interface for consuming I/O operation results in lio.
 /// It wraps an operation of type `T` and provides methods to retrieve the result through
 /// various patterns suited to different programming models.
 ///
-/// # Examples
-/// See examples in each methods docs.
+/// # Thread-Per-Core Design
 ///
-/// # Driver Binding
-///
-/// Operations use the global driver by default but can be bound to a specific
-/// driver instance:
+/// In the thread-per-core model, each thread owns its own `Lio` instance. Use
+/// `.with_lio()` to bind your Lio instance before consuming the operation:
 ///
 /// ```ignore
-/// let progress = lio::read_with_buf(fd, vec![0; 1024], 0)
-///     .with_driver(custom_driver);
+/// let mut lio = Lio::new_with_backend(backend, 1024)?;
+/// let (result, buf) = lio::read(fd, buffer)
+///     .with_lio(&mut lio)
+///     .await;
 /// ```
-pub struct Progress<'a, T>
+///
+/// # Examples
+/// See examples in each method's docs.
+#[must_use = "Io doesn't schedule any operation on itself."]
+pub struct Io<'a, T>
 where
   T: Send,
 {
@@ -221,32 +217,54 @@ where
   handle: LioHandle<'a>,
 }
 
-enum LioHandle<'a> {
-  Submitter(&'a mut Submitter),
-  Driver(&'a Worker),
-  GlobalDriver,
-}
-
-impl<'a> LioHandle<'a> {
-  pub fn submit(&mut self, op: StoredOp) -> Result<u64, SubmitErr> {
-    match self {
-      Self::Submitter(submitter) => submitter.submit(op),
-      Self::GlobalDriver => Driver::get().submit(op),
-      Self::Driver(driver) => driver.submit(op),
-    }
-  }
-}
-
-impl<'a, T> Progress<'a, T>
+impl<T> Io<'static, T>
 where
   T: Send,
 {
-  pub(crate) fn from_op(op: T) -> Self {
-    Self { op, handle: LioHandle::GlobalDriver }
+  /// Creates a new Io from an operation.
+  ///
+  /// The returned Io has no Lio instance bound. You must call
+  /// `.with_lio()` before consuming the operation.
+  pub fn from_op(op: T) -> Self {
+    Self { op, handle: LioHandle::GloballyInstalled }
   }
 }
 
-impl<'a, T> Progress<'a, T>
+impl<'a, T> Io<'a, T>
+where
+  T: Send,
+{
+  /// Binds a Lio instance to this operation.
+  ///
+  /// This must be called before consuming the operation via `.await`, `.wait()`,
+  /// `.send()`, or `.when_done()`.
+  ///
+  /// # Example
+  ///
+  /// ```ignore
+  /// let mut lio = Lio::new_with_backend(backend, 1024)?;
+  /// let (result, buf) = lio::read(fd, buffer)
+  ///     .with_lio(&mut lio)
+  ///     .await;
+  /// ```
+  pub fn with_lio<'b>(self, lio: &'b mut Lio) -> Io<'b, T> {
+    Io { op: self.op, handle: LioHandle::Custom(lio) }
+  }
+
+  fn into_lio(self) -> (&'a mut Lio, T) {
+    let lio = match self.handle {
+      LioHandle::GloballyInstalled => {
+        panic!(
+          "No Lio instance bound. Call .with_lio(&mut lio) before consuming the operation."
+        )
+      }
+      LioHandle::Custom(lio) => lio,
+    };
+    (lio, self.op)
+  }
+}
+
+impl<'a, T> Io<'a, T>
 where
   T: OperationExt + 'static,
 {
@@ -369,76 +387,32 @@ where
   ///     Ok(())
   /// }
   /// ```
-  pub fn when_done<F>(mut self, f: F)
+  pub fn when_done<F>(self, f: F)
   where
-    F: FnOnce(T::Result) + Send,
+    F: FnOnce(T::Result) + Send + 'static,
   {
-    // let driver = self.get_driver();
-    let stored = StoredOp::new_callback(Box::new(self.op), f);
-    self.handle.submit(stored).expect("lio error: lio should handle this");
+    let (lio, op) = self.into_lio();
+    let stored = StoredOp::new_callback(Box::new(op), f);
+    lio.schedule(stored).expect("lio error: lio should handle this");
   }
-
-  // /// Binds this operation to a specific driver instance.
-  // ///
-  // /// By default, operations use the global driver obtained via [`Driver::get()`].
-  // /// This method allows you to explicitly specify which driver should process the operation,
-  // /// which is useful when managing multiple driver instances for workload isolation or
-  // /// resource partitioning.
-  // ///
-  // /// # Arguments
-  // ///
-  // /// * `driver` - A static reference to the driver that should process this operation
-  // ///
-  // /// # Examples
-  // ///
-  // /// ```ignore
-  // /// // Create a custom driver for high-priority operations
-  // /// static HIGH_PRIORITY_DRIVER: Driver = Driver::new();
-  // ///
-  // /// // Bind the operation to the custom driver
-  // /// let progress = lio::read_with_buf(fd, vec![0; 1024], 0)
-  // ///     .with_driver(&HIGH_PRIORITY_DRIVER);
-  // ///
-  // /// let (result, buf) = progress.await;
-  // /// ```
-  // ///
-  // /// # Use Cases
-  // ///
-  // /// - **Workload isolation**: Separate critical I/O from background tasks
-  // /// - **Resource partitioning**: Dedicate driver instances to specific workloads
-  // /// - **Testing**: Use controlled driver instances in unit tests
-  // pub fn with_driver(mut self, driver: &'static Worker) -> Self {
-  //   self.handle = LioHandle::Driver(driver);
-  //   self
-  // }
-  //
-  // pub fn with_submitter(
-  //   mut self,
-  //   submitter: &'a mut Submitter,
-  // ) -> Progress<'a, T> {
-  //   self.handle = LioHandle::Submitter(submitter);
-  //   self
-  // }
 }
 
-impl<'a, T> IntoFuture for Progress<'a, T>
+impl<'a, T> IntoFuture for Io<'a, T>
 where
   T: OperationExt + Unpin + 'static,
 {
   type Output = T::Result;
-  type IntoFuture = ProgressFuture<'a, T>;
+  type IntoFuture = IoFuture<'a, T>;
 
   fn into_future(self) -> Self::IntoFuture {
-    ProgressFuture {
-      status: PFStatus::NeverPolled(Some(self.op)),
-      driver: self.handle,
-    }
+    let (lio, op) = self.into_lio();
+    IoFuture { status: PFStatus::NeverPolled(Some(op)), lio }
   }
 }
 
 /// A future representing an in-progress I/O operation.
 ///
-/// Created when a [`Progress<T>`] is converted into a future via the `IntoFuture` trait,
+/// Created when a [`Io<T>`] is converted into a future via the `IntoFuture` trait,
 /// typically through `.await` syntax. This type implements the `Future` trait and integrates
 /// with async runtimes to provide non-blocking I/O.
 ///
@@ -452,16 +426,16 @@ where
 /// # Usage
 ///
 /// This type is typically not constructed directly. Instead, it's created automatically
-/// when awaiting a `Progress<T>`:
+/// when awaiting a [`Io<T>`]:
 ///
 /// ```ignore
 /// let (result, buf) = lio::read_with_buf(fd, vec![0; 1024], 0).await;
 /// //                                                          ^^^^^^
-/// //                                          IntoFuture creates ProgressFuture
+/// //                                          IntoFuture creates IoFuture
 /// ```
-pub struct ProgressFuture<'a, T> {
+pub struct IoFuture<'a, T> {
   status: PFStatus<T>,
-  driver: LioHandle<'a>,
+  lio: &'a mut Lio,
 }
 
 enum PFStatus<T> {
@@ -469,17 +443,7 @@ enum PFStatus<T> {
   NeverPolled(Option<T>),
 }
 
-impl<'a, T> ProgressFuture<'a, T> {
-  fn get_driver(&self) -> &'static Driver {
-    match self.driver {
-      LioHandle::Driver(_driver) => unimplemented!(),
-      LioHandle::GlobalDriver => Driver::get(),
-      _ => unimplemented!(),
-    }
-  }
-}
-
-impl<'a, T> Future for ProgressFuture<'a, T>
+impl<'a, T> Future for IoFuture<'a, T>
 where
   T: OperationExt + Unpin + 'static,
 {
@@ -489,27 +453,36 @@ where
     mut self: Pin<&mut Self>,
     cx: &mut Context<'_>,
   ) -> Poll<Self::Output> {
-    let driver = self.get_driver();
+    // Get mutable access to self fields
+    let this = &mut *self;
 
-    match self.status {
+    match &mut this.status {
       PFStatus::HasPolled(id) => {
-        match driver.check_done::<T>(id) {
-          Some(result) => Poll::Ready(result),
-          None => {
+        match this.lio.check_done::<T>(*id) {
+          Ok(result) => Poll::Ready(result),
+          Err(crate::lio::Error::EntryNotCompleted) => {
             // Update waker in case it changed
-            driver.set_waker(id, cx.waker().clone());
+            this.lio.set_waker(*id, cx.waker().clone());
             Poll::Pending
+          }
+          Err(crate::lio::Error::EntryNotFound) => {
+            panic!("lio bookkeeping bug: operation entry not found");
           }
         }
       }
-      PFStatus::NeverPolled(ref mut op) => {
-        assert!(op.is_some());
-        let stored =
-          StoredOp::new_waker(op.take().unwrap(), cx.waker().clone());
-        let id =
-          driver.submit(stored).expect("lio error: lio should handle this");
-        self.status = PFStatus::HasPolled(id);
-        Poll::Pending
+      PFStatus::NeverPolled(op) => {
+        if let Some(taken_op) = op.take() {
+          let stored =
+            StoredOp::new_waker(Box::new(taken_op), cx.waker().clone());
+          let id = this
+            .lio
+            .schedule(stored)
+            .expect("lio error: lio should handle this");
+          this.status = PFStatus::HasPolled(id);
+          Poll::Pending
+        } else {
+          unreachable!()
+        }
       }
     }
   }
@@ -519,14 +492,9 @@ where
 mod tests {
   use super::*;
 
-  #[test]
-  fn test_operation_progress_is_send() {
-    fn assert_send<T: Send>() {}
-
-    // Test with a mock operation type
-    // We use () as a placeholder since we just need to verify the trait bound
-    assert_send::<Progress<()>>();
-  }
+  // Note: Io<'a, T> is not Send because it holds &'a mut Lio.
+  // This is intentional for thread-per-core design where operations
+  // are tied to their owning thread's Lio instance.
 
   #[test]
   fn test_blocking_receiver_is_send() {

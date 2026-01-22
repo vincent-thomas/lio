@@ -1,7 +1,7 @@
 //! lio's low-level I/O API.
 //!
 //! This module contains all the syscall-oriented I/O operations provided by lio.
-//! Each function maps directly to a system call and returns a [`Progress`] handle
+//! Each function maps directly to a system call and returns a [`Io`] handle
 //! representing the in-flight operation.
 //!
 //! # Design Philosophy
@@ -14,10 +14,10 @@
 //!
 //! ## Synchronisation
 //!
-//! Lio is compatible with any synchronisation method, through the [`Progress`] type:
-//! - [async](progress::Progress#impl-IntoFuture-for-Progress<'a,+T>) (runtime-independent).
-//! - [Callbacks](progress::Progress::when_done).
-//! - Channels: [get receiver](progress::Progress::send) *or* [send with your own](progress::Progress::send_with).
+//! Lio is compatible with any synchronisation method, through the [`Io`] type:
+//! - [async](io::IoFuture) (runtime-independent).
+//! - [Callbacks](io::Io::when_done).
+//! - Channels: [get receiver](io::Io::send) *or* [send with your own](io::Io::send_with).
 //!
 //! # Buffer Ownership
 //!
@@ -63,22 +63,22 @@
 //!
 //! # See Also
 //!
-//! - [`Progress`] - Operation handle with multiple completion modes
+//! - [`Io`] - Operation handle with multiple completion modes
 //! - [`Resource`](crate::api::resource::Resource) - Reference-counted file descriptor wrapper
 //! - [`crate::buf`] - Buffer types and pooling
 
+pub mod io;
 pub mod ops;
-pub mod progress;
 pub mod resource;
 use crate::{api::resource::AsResource, buf::BufLike};
-use progress::Progress;
+use io::Io;
 use std::{ffi::CString, net::SocketAddr, time::Duration};
 
 doc_op! {
     short: "does nothing. maybe useful for testing?",
 
-    pub fn nop() -> Progress<'static, ops::Nop> {
-        Progress::from_op(ops::Nop)
+    pub fn nop() -> Io<'static, ops::Nop> {
+        Io::from_op(ops::Nop)
     }
 }
 
@@ -89,16 +89,16 @@ doc_op! {
 
     ///
     /// Shuts down the read, write, or both halves of this connection.
-    pub fn shutdown(res: impl AsResource, how: i32) -> Progress<'static, ops::Shutdown> {
-        Progress::from_op(ops::Shutdown::new(res.as_resource().clone(), how))
+    pub fn shutdown(res: &impl AsResource, how: i32) -> Io<'static, ops::Shutdown> {
+        Io::from_op(ops::Shutdown::new(res.as_resource().clone(), how))
     }
 }
 
 doc_op! {
     short: "Issues a timeout that returns after duration seconds.",
 
-    pub fn timeout(duration: Duration) -> Progress<'static, ops::Timeout> {
-        Progress::from_op(ops::Timeout::new(duration))
+    pub fn timeout(duration: Duration) -> Io<'static, ops::Timeout> {
+        Io::from_op(ops::Timeout::new(duration))
     }
 }
 
@@ -107,8 +107,8 @@ doc_op!(
   syscall: "symlinkat(2)",
   doc_link: "https://man7.org/linux/man-pages/man2/symlink.2.html",
 
-  pub fn symlinkat(dir_res: impl AsResource, target: CString, linkpath: CString) -> Progress<'static, ops::SymlinkAt> {
-    Progress::from_op(ops::SymlinkAt::new(dir_res.as_resource().clone(), target, linkpath))
+  pub fn symlinkat(dir_res: &impl AsResource, target: CString, linkpath: CString) -> Io<'static, ops::SymlinkAt> {
+    Io::from_op(ops::SymlinkAt::new(dir_res.as_resource().clone(), target, linkpath))
   }
 );
 
@@ -117,8 +117,8 @@ doc_op!(
   syscall: "linkat(2)",
   doc_link: "https://man7.org/linux/man-pages/man2/linkat.2.html",
 
-  pub fn linkat(old_dir_res: impl AsResource, old_path: CString, new_dir_res: impl AsResource, linkpath: CString) -> Progress<'static, ops::LinkAt> {
-    Progress::from_op(ops::LinkAt::new(old_dir_res.as_resource().clone(), old_path, new_dir_res.as_resource().clone(), linkpath))
+  pub fn linkat(old_dir_res: &impl AsResource, old_path: CString, new_dir_res: impl AsResource, linkpath: CString) -> Io<'static, ops::LinkAt> {
+    Io::from_op(ops::LinkAt::new(old_dir_res.as_resource().clone(), old_path, new_dir_res.as_resource().clone(), linkpath))
   }
 );
 
@@ -136,8 +136,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn fsync(res: impl AsResource) -> Progress<'static, ops::Fsync> {
-        Progress::from_op(ops::Fsync::new(res.as_resource().clone()))
+    pub fn fsync(res: &impl AsResource) -> Io<'static, ops::Fsync> {
+        Io::from_op(ops::Fsync::new(res.as_resource().clone()))
     }
 }
 
@@ -158,11 +158,11 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn write<B>(res: impl AsResource, buf: B) -> Progress<'static, ops::Write<B>>
+    pub fn write<B>(res: &impl AsResource, buf: B) -> Io<'static, ops::Write<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
-        Progress::from_op(ops::Write::new(res.as_resource().clone(), buf))
+        Io::from_op(ops::Write::new(res.as_resource().clone(), buf))
     }
 }
 
@@ -187,11 +187,11 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn write_at<B>(res: impl AsResource, buf: B, offset: i64) -> Progress<'static, ops::WriteAt<B>>
+    pub fn write_at<B>(res: &impl AsResource, buf: B, offset: i64) -> Io<'static, ops::WriteAt<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
-        Progress::from_op(ops::WriteAt::new(res.as_resource().clone(), buf, offset))
+        Io::from_op(ops::WriteAt::new(res.as_resource().clone(), buf, offset))
     }
 }
 
@@ -200,11 +200,11 @@ doc_op! {
     syscall: "read(2)",
     doc_link: "https://man7.org/linux/man-pages/man2/read.2.html",
 
-    pub fn read<B>(res: impl AsResource, mem: B) -> Progress<'static, ops::Read<B>>
+    pub fn read<B>(res: &impl AsResource, mem: B) -> Io<'static, ops::Read<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
-        Progress::from_op(ops::Read::new(res.as_resource().clone(), mem))
+        Io::from_op(ops::Read::new(res.as_resource().clone(), mem))
     }
 }
 
@@ -213,11 +213,11 @@ doc_op! {
   syscall: "pread(2)",
   doc_link: "https://man7.org/linux/man-pages/man2/pwrite.2.html",
 
-  pub fn read_at<B>(res: impl AsResource, mem: B, offset: i64) -> Progress<'static, ops::ReadAt<B>>
+  pub fn read_at<B>(res: &impl AsResource, mem: B, offset: i64) -> Io<'static, ops::ReadAt<B>>
   where
       B: BufLike + std::marker::Send + Sync
   {
-    Progress::from_op(ops::ReadAt::new(res.as_resource().clone(), mem, offset))
+    Io::from_op(ops::ReadAt::new(res.as_resource().clone(), mem, offset))
   }
 }
 
@@ -235,8 +235,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn truncate(res: impl AsResource, len: u64) -> Progress<'static, ops::Truncate> {
-        Progress::from_op(ops::Truncate::new(res.as_resource().clone(), len))
+    pub fn truncate(res: &impl AsResource, len: u64) -> Io<'static, ops::Truncate> {
+        Io::from_op(ops::Truncate::new(res.as_resource().clone(), len))
     }
 }
 
@@ -255,8 +255,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn socket(domain: libc::c_int, ty: libc::c_int, proto: libc::c_int) -> Progress<'static, ops::Socket> {
-        Progress::from_op(ops::Socket::new(domain, ty, proto))
+    pub fn socket(domain: libc::c_int, ty: libc::c_int, proto: libc::c_int) -> Io<'static, ops::Socket> {
+        Io::from_op(ops::Socket::new(domain, ty, proto))
     }
 }
 
@@ -277,8 +277,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn bind(resource: impl AsResource, addr: SocketAddr) -> Progress<'static, ops::Bind> {
-        Progress::from_op(ops::Bind::new(resource.as_resource().clone(), addr))
+    pub fn bind(resource: &impl AsResource, addr: SocketAddr) -> Io<'static, ops::Bind> {
+        Io::from_op(ops::Bind::new(resource.as_resource().clone(), addr))
     }
 }
 
@@ -300,8 +300,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn accept(res: impl AsResource) -> Progress<'static, ops::Accept> {
-        Progress::from_op(ops::Accept::new(res.as_resource().clone()))
+    pub fn accept(res: &impl AsResource) -> Io<'static, ops::Accept> {
+        Io::from_op(ops::Accept::new(res.as_resource().clone()))
     }
 }
 
@@ -322,8 +322,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn listen(res: impl AsResource, backlog: i32) -> Progress<'static, ops::Listen> {
-        Progress::from_op(ops::Listen::new(res.as_resource().clone(), backlog))
+    pub fn listen(res: &impl AsResource, backlog: i32) -> Io<'static, ops::Listen> {
+        Io::from_op(ops::Listen::new(res.as_resource().clone(), backlog))
     }
 }
 
@@ -345,8 +345,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn connect(res: impl AsResource, addr: SocketAddr) -> Progress<'static, ops::Connect> {
-        Progress::from_op(ops::Connect::new(res.as_resource().clone(), addr))
+    pub fn connect(res: &impl AsResource, addr: SocketAddr) -> Io<'static, ops::Connect> {
+        Io::from_op(ops::Connect::new(res.as_resource().clone(), addr))
     }
 }
 
@@ -366,11 +366,11 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn send<B>(res: impl AsResource, buf: B, flags: Option<i32>) -> Progress<'static, ops::Send<B>>
+    pub fn send<B>(res: &impl AsResource, buf: B, flags: Option<i32>) -> Io<'static, ops::Send<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
-        Progress::from_op(ops::Send::new(res.as_resource().clone(), buf, flags))
+        Io::from_op(ops::Send::new(res.as_resource().clone(), buf, flags))
     }
 }
 
@@ -392,33 +392,13 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn recv<B>(res: impl AsResource, buf: B, flags: Option<i32>) -> Progress<'static, ops::Recv<B>>
+    pub fn recv<B>(res: &impl AsResource, buf: B, flags: Option<i32>) -> Io<'static, ops::Recv<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
-        Progress::from_op(ops::Recv::new(res.as_resource().clone(), buf, flags))
+        Io::from_op(ops::Recv::new(res.as_resource().clone(), buf, flags))
     }
 }
-
-// doc_op! {
-//     short: "Closes a file descriptor.",
-//     syscall: "close(2)",
-//
-//     ///
-//     /// # Examples
-//     ///
-//     /// ```rust
-//     /// async fn close_example() -> std::io::Result<()> {
-//     ///     # let fd = 0;
-//     ///     lio::close(fd).await?;
-//     ///     println!("File descriptor closed successfully");
-//     ///     Ok(())
-//     /// }
-//     /// ```
-//     pub fn close(res: UniqueResource) -> Progress<'static, ops::Close> {
-//         Progress::from_op(ops::Close::new(res))
-//     }
-// }
 
 doc_op! {
     short: "Opens a file relative to a directory file descriptor.",
@@ -437,8 +417,8 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn openat(dir_res: impl AsResource, path: CString, flags: i32) -> Progress<'static, ops::OpenAt> {
-        Progress::from_op(ops::OpenAt::new(dir_res.as_resource().clone(), path, flags))
+    pub fn openat(dir_res: &impl AsResource, path: CString, flags: i32) -> Io<'static, ops::OpenAt> {
+        Io::from_op(ops::OpenAt::new(dir_res.as_resource().clone(), path, flags))
     }
 }
 
@@ -463,7 +443,7 @@ doc_op! {
     /// ```
     #[cfg(linux)]
     #[cfg_attr(docsrs, doc(cfg(linux)))]
-    pub fn tee(res_in: impl AsResource, res_out: impl AsResource, size: u32) -> Progress<'static, ops::Tee> {
-        Progress::from_op(ops::Tee::new(res_in.as_resource().clone(), res_out.as_resource().clone(), size))
+    pub fn tee(res_in: &impl AsResource, res_out: impl AsResource, size: u32) -> Io<'static, ops::Tee> {
+        Io::from_op(ops::Tee::new(res_in.as_resource().clone(), res_out.as_resource().clone(), size))
     }
 }

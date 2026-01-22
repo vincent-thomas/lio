@@ -1,3 +1,3 @@
 fn main() {
-  let _ = lio::init();
+  let _ = lio::Lio::new(10);
 }

@@ -14,11 +14,11 @@ impl StoredOp {
   pub fn op_ref(&self) -> &dyn Operation {
     self.op.as_ref()
   }
-  pub fn new_waker<O>(op: O, waker: Waker) -> Self
+  pub fn new_waker<O>(op: Box<O>, waker: Waker) -> Self
   where
     O: OperationExt + 'static,
   {
-    Self { op: Box::new(op), notifier: Some(Notifier::new_waker(waker)) }
+    Self { op, notifier: Some(Notifier::new_waker(waker)) }
   }
   pub fn new_callback<O, F>(op: Box<O>, f: F) -> Self
   where

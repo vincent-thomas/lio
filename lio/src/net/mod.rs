@@ -12,7 +12,7 @@
 //!
 //! # Features
 //!
-//! - **Async-first design**: All I/O operations return [`Progress<T>`](crate::api::progress::Progress)
+//! - **Async-first design**: All I/O operations return [`Io<T>`](crate::api::io::Io)
 //!   which can be awaited
 //! - **Efficient buffer management**: Operations take ownership of buffers and return them,
 //!   avoiding unnecessary copies
@@ -131,7 +131,7 @@
 //! # See Also
 //!
 //! - [`crate::api::resource`]: Resource management for file descriptors
-//! - [`crate::api::progress`]: Progress type for async operations
+//! - [`crate::api::io`]: Io type for async operations
 
 mod socket;
 mod tcp;

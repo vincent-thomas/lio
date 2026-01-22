@@ -1,9 +1,12 @@
-use lio::{api::truncate, api::resource::Resource};
+use lio::{
+  Lio,
+  api::{resource::Resource, truncate},
+};
 use std::{ffi::CString, os::fd::FromRawFd, sync::mpsc};
 
 #[test]
 fn test_truncate_shrink_file() {
-  lio::init();
+  let mut lio = Lio::new(256).unwrap();
 
   let path = CString::new("/tmp/lio_test_truncate_shrink.txt").unwrap();
 
@@ -22,10 +25,12 @@ fn test_truncate_shrink_file() {
   let sender1 = sender.clone();
 
   // Truncate to 5 bytes
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 5).send_with(sender1);
+  truncate(&unsafe { Resource::from_raw_fd(fd) }, 5)
+    .with_lio(&mut lio)
+    .send_with(sender1);
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio::tick();
+  lio.try_run().unwrap();
 
   receiver.recv().unwrap().expect("Failed to truncate file");
 
@@ -49,7 +54,7 @@ fn test_truncate_shrink_file() {
 
 #[test]
 fn test_truncate_extend_file() {
-  lio::init();
+  let mut lio = Lio::new(256).unwrap();
 
   let path = CString::new("/tmp/lio_test_truncate_extend.txt").unwrap();
 
@@ -68,12 +73,15 @@ fn test_truncate_extend_file() {
   let sender1 = sender.clone();
 
   // Extend to 20 bytes
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 20).send_with(sender1);
+  truncate(&unsafe { Resource::from_raw_fd(fd) }, 20)
+    .with_lio(&mut lio)
+    .send_with(sender1);
+
+  lio.try_run().unwrap();
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio::tick();
 
-  receiver.recv().unwrap().expect("Failed to truncate file");
+  receiver.try_recv().unwrap().expect("Failed to truncate file");
 
   // Verify size
   unsafe {
@@ -96,7 +104,7 @@ fn test_truncate_extend_file() {
 
 #[test]
 fn test_truncate_to_zero() {
-  lio::init();
+  let mut lio = Lio::new(256).unwrap();
 
   let path = CString::new("/tmp/lio_test_truncate_zero.txt").unwrap();
 
@@ -115,12 +123,14 @@ fn test_truncate_to_zero() {
   let sender1 = sender.clone();
 
   // Truncate to 0 bytes
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 0).send_with(sender1);
+  truncate(&unsafe { Resource::from_raw_fd(fd) }, 0)
+    .with_lio(&mut lio)
+    .send_with(sender1);
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio::tick();
+  lio.try_run().unwrap();
 
-  receiver.recv().unwrap().expect("Failed to truncate file to zero");
+  receiver.try_recv().unwrap().expect("Failed to truncate file to zero");
 
   // Verify size
   unsafe {
@@ -141,7 +151,7 @@ fn test_truncate_to_zero() {
 
 #[test]
 fn test_truncate_same_size() {
-  lio::init();
+  let mut lio = Lio::new(256).unwrap();
 
   let path = CString::new("/tmp/lio_test_truncate_same.txt").unwrap();
 
@@ -162,13 +172,14 @@ fn test_truncate_same_size() {
   let sender1 = sender.clone();
 
   // Truncate to same size
-  truncate(unsafe { Resource::from_raw_fd(fd) }, test_data.len() as u64)
+  truncate(&unsafe { Resource::from_raw_fd(fd) }, test_data.len() as u64)
+    .with_lio(&mut lio)
     .send_with(sender1);
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio::tick();
+  lio.try_run().unwrap();
 
-  receiver.recv().unwrap().expect("Failed to truncate file");
+  receiver.try_recv().unwrap().expect("Failed to truncate file");
 
   // Verify size and content unchanged
   unsafe {
@@ -190,7 +201,7 @@ fn test_truncate_same_size() {
 
 #[test]
 fn test_truncate_then_write() {
-  lio::init();
+  let mut lio = Lio::new(256).unwrap();
 
   let path = CString::new("/tmp/lio_test_truncate_write.txt").unwrap();
 
@@ -209,12 +220,14 @@ fn test_truncate_then_write() {
   let sender1 = sender.clone();
 
   // Truncate to 5 bytes
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 5).send_with(sender1);
+  truncate(&unsafe { Resource::from_raw_fd(fd) }, 5)
+    .with_lio(&mut lio)
+    .send_with(sender1);
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio::tick();
+  lio.try_run().unwrap();
 
-  receiver.recv().unwrap().expect("Failed to truncate file");
+  receiver.try_recv().unwrap().expect("Failed to truncate file");
 
   // Write new data
   unsafe {
@@ -237,7 +250,7 @@ fn test_truncate_then_write() {
 
 #[test]
 fn test_truncate_large_file() {
-  lio::init();
+  let mut lio = lio::Lio::new(256).unwrap();
 
   let path = CString::new("/tmp/lio_test_truncate_large.txt").unwrap();
 
@@ -261,12 +274,14 @@ fn test_truncate_large_file() {
   let sender1 = sender.clone();
 
   // Truncate to 1KB
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 1024).send_with(sender1);
+  truncate(&unsafe { Resource::from_raw_fd(fd) }, 1024)
+    .with_lio(&mut lio)
+    .send_with(sender1);
 
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio::tick();
+  lio.try_run().unwrap();
 
-  receiver.recv().unwrap().expect("Failed to truncate large file");
+  receiver.try_recv().unwrap().expect("Failed to truncate large file");
 
   // Verify size
   unsafe {
@@ -289,7 +304,7 @@ fn test_truncate_large_file() {
 
 #[test]
 fn test_truncate_multiple_times() {
-  lio::init();
+  let mut lio = lio::Lio::new(256).unwrap();
 
   let path = CString::new("/tmp/lio_test_truncate_multiple.txt").unwrap();
 
@@ -308,33 +323,41 @@ fn test_truncate_multiple_times() {
 
   // Truncate multiple times
   let sender1 = sender.clone();
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 8).send_with(sender1);
+  truncate(&unsafe { Resource::from_raw_fd(fd) }, 8)
+    .with_lio(&mut lio)
+    .send_with(sender1);
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio::tick();
-  receiver.recv().unwrap().expect("First truncate failed");
+  lio.try_run().unwrap();
+  receiver.try_recv().unwrap().expect("First truncate failed");
 
   let sender2 = sender.clone();
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 5).when_done(move |res| {
-    sender2.send(res).unwrap();
-  });
+  truncate(&unsafe { Resource::from_raw_fd(fd) }, 5)
+    .with_lio(&mut lio)
+    .when_done(move |res| {
+      sender2.send(res).unwrap();
+    });
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio::tick();
+  lio.try_run().unwrap();
   receiver.recv().unwrap().expect("Second truncate failed");
 
   let sender3 = sender.clone();
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 10).when_done(move |res| {
-    sender3.send(res).unwrap();
-  });
+  truncate(&unsafe { Resource::from_raw_fd(fd) }, 10)
+    .with_lio(&mut lio)
+    .when_done(move |res| {
+      sender3.send(res).unwrap();
+    });
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio::tick();
+  lio.try_run().unwrap();
   receiver.recv().unwrap().expect("Third truncate failed");
 
   let sender4 = sender.clone();
-  truncate(unsafe { Resource::from_raw_fd(fd) }, 3).when_done(move |res| {
-    sender4.send(res).unwrap();
-  });
+  truncate(&unsafe { Resource::from_raw_fd(fd) }, 3)
+    .with_lio(&mut lio)
+    .when_done(move |res| {
+      sender4.send(res).unwrap();
+    });
   // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio::tick();
+  lio.try_run().unwrap();
   receiver.recv().unwrap().expect("Fourth truncate failed");
 
   // Verify final size
@@ -356,7 +379,7 @@ fn test_truncate_multiple_times() {
 
 #[test]
 fn test_truncate_concurrent() {
-  lio::init();
+  let mut lio = lio::Lio::new(256).unwrap();
 
   // Test truncating multiple files concurrently
   for i in 0..10 {
@@ -375,16 +398,16 @@ fn test_truncate_concurrent() {
     };
 
     let (sender, receiver) = mpsc::channel();
-    let sender1 = sender.clone();
 
-    truncate(unsafe { Resource::from_raw_fd(fd) }, 5).when_done(move |res| {
-      sender1.send(res).unwrap();
-    });
+    truncate(&unsafe { Resource::from_raw_fd(fd) }, 5)
+      .with_lio(&mut lio)
+      .send_with(sender.clone());
 
     // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-    lio::tick();
+    // lio::tick();
+    lio.try_run().unwrap();
 
-    receiver.recv().unwrap().expect("Failed to truncate");
+    receiver.try_recv().unwrap().expect("Failed to truncate");
 
     unsafe {
       let mut stat: libc::stat = std::mem::zeroed();

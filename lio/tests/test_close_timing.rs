@@ -1,12 +1,13 @@
 #![cfg(feature = "high")]
 #![cfg(linux)]
 
+use lio::Lio;
 use std::time::Instant;
 
 #[test]
 #[ignore]
 fn test_close_timing() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let start = Instant::now();
   let mut pipe1_fds = [0i32; 2];
@@ -28,12 +29,13 @@ fn test_close_timing() {
 
   // Do a tee operation
   let tee_start = Instant::now();
-  let mut tee_recv =
-    lio::tee(pipe1_fds[0], pipe2_fds[1], test_data.len() as u32).send();
+  let mut tee_recv = lio::tee(pipe1_fds[0], pipe2_fds[1], test_data.len() as u32)
+    .with_lio(&mut lio)
+    .send();
 
   // Try multiple ticks - some operations need more than one
   for i in 0..10 {
-    lio::tick();
+    lio.try_run().unwrap();
     if let Some(result) = tee_recv.try_recv() {
       result.expect("test_close_timing: tee operation failed");
       break;
@@ -47,14 +49,14 @@ fn test_close_timing() {
   println!("Tee took: {:?}", tee_start.elapsed());
 
   // Close all file descriptors
-  let mut close1_recv = lio::close(pipe1_fds[0]).send();
-  let mut close2_recv = lio::close(pipe1_fds[1]).send();
-  let mut close3_recv = lio::close(pipe2_fds[0]).send();
-  let mut close4_recv = lio::close(pipe2_fds[1]).send();
+  let mut close1_recv = lio::close(pipe1_fds[0]).with_lio(&mut lio).send();
+  let mut close2_recv = lio::close(pipe1_fds[1]).with_lio(&mut lio).send();
+  let mut close3_recv = lio::close(pipe2_fds[0]).with_lio(&mut lio).send();
+  let mut close4_recv = lio::close(pipe2_fds[1]).with_lio(&mut lio).send();
 
   // Try multiple ticks for close operations too
   for i in 0..10 {
-    lio::tick();
+    lio.try_run().unwrap();
 
     let close1_done = close1_recv.try_recv().is_some();
     let close2_done = close2_recv.try_recv().is_some();

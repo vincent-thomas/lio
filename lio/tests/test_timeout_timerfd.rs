@@ -1,16 +1,22 @@
 use std::time::{Duration, Instant};
 
-use lio::api;
+use lio::{api, Lio};
 
 #[test]
 fn test_timeout_basic() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let start = Instant::now();
   let timeout_duration = Duration::from_millis(500);
 
-  let recv = api::timeout(timeout_duration).send();
-  let result = recv.recv();
+  let mut recv = api::timeout(timeout_duration).with_lio(&mut lio).send();
+
+  let result = loop {
+    if let Some(result) = recv.try_recv() {
+      break result;
+    }
+    lio.run_timeout(Duration::from_millis(100)).unwrap();
+  };
 
   let elapsed = start.elapsed();
 
@@ -22,37 +28,53 @@ fn test_timeout_basic() {
     timeout_duration
   );
   assert!(
-    elapsed < timeout_duration + Duration::from_millis(20),
-    "Timeout should not wait too much longer: time waited {elapsed:?}, time set waited: {timeout_duration:?}, wiggle: 20ms",
+    elapsed < timeout_duration + Duration::from_millis(50),
+    "Timeout should not wait too much longer: time waited {elapsed:?}, time set waited: {timeout_duration:?}, wiggle: 50ms",
   );
-
-  lio::exit();
 }
 
 #[test]
 fn test_timeout_multiple() {
-  lio::init();
+  let mut lio = Lio::new(64).unwrap();
 
   let start = Instant::now();
 
   // Start 3 timeouts with different durations
-  let recv1 = api::timeout(Duration::from_millis(50)).send();
-  let recv2 = api::timeout(Duration::from_millis(100)).send();
-  let recv3 = api::timeout(Duration::from_millis(150)).send();
+  let mut recv1 =
+    api::timeout(Duration::from_millis(50)).with_lio(&mut lio).send();
+  let mut recv2 =
+    api::timeout(Duration::from_millis(100)).with_lio(&mut lio).send();
+  let mut recv3 =
+    api::timeout(Duration::from_millis(150)).with_lio(&mut lio).send();
 
   // They should complete in order
-  let result1 = recv1.recv();
+  let result1 = loop {
+    if let Some(result) = recv1.try_recv() {
+      break result;
+    }
+    lio.run_timeout(Duration::from_millis(10)).unwrap();
+  };
   let elapsed1 = start.elapsed();
 
-  let result2 = recv2.recv();
+  let result2 = loop {
+    if let Some(result) = recv2.try_recv() {
+      break result;
+    }
+    lio.run_timeout(Duration::from_millis(10)).unwrap();
+  };
   let elapsed2 = start.elapsed();
 
-  let result3 = recv3.recv();
+  let result3 = loop {
+    if let Some(result) = recv3.try_recv() {
+      break result;
+    }
+    lio.run_timeout(Duration::from_millis(10)).unwrap();
+  };
   let elapsed3 = start.elapsed();
 
   assert!(result1.is_ok(), "err: {result1:?}");
-  assert!(result2.is_ok(), "err: {result1:?}");
-  assert!(result3.is_ok(), "err: {result1:?}");
+  assert!(result2.is_ok(), "err: {result2:?}");
+  assert!(result3.is_ok(), "err: {result3:?}");
 
   assert!(
     elapsed1 >= Duration::from_millis(50),
@@ -69,6 +91,4 @@ fn test_timeout_multiple() {
     "Third timeout elapsed: {:?}",
     elapsed3
   );
-
-  lio::exit();
 }

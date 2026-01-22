@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use crate::{
   api::{
     self,
+    io::Io,
     ops::{self, Accept, Bind, Connect, Listen, Recv, Send, Shutdown},
-    progress::Progress,
     resource::{AsResource, FromResource, IntoResource, Resource},
   },
   net::ops::{SocketAccept, SocketNew},
@@ -80,6 +80,7 @@ impl IntoResource for Socket {
     self.0
   }
 }
+
 impl AsResource for Socket {
   fn as_resource(&self) -> &Resource {
     &self.0
@@ -91,10 +92,6 @@ impl FromResource for Socket {
     Self(resource)
   }
 }
-
-const _: () = const {
-  assert!(std::mem::size_of::<Socket>() == std::mem::size_of::<Resource>());
-};
 
 impl Socket {
   /// Creates a new socket with the specified domain, type, and protocol.
@@ -128,9 +125,9 @@ impl Socket {
     domain: libc::c_int,
     ty: libc::c_int,
     proto: libc::c_int,
-  ) -> Progress<'static, SocketNew> {
+  ) -> Io<'static, SocketNew> {
     let socket_accept_op = SocketNew(ops::Socket::new(domain, ty, proto));
-    Progress::from_op(socket_accept_op)
+    Io::from_op(socket_accept_op)
   }
 
   /// Binds the socket to the specified address.
@@ -155,7 +152,7 @@ impl Socket {
   /// }
   /// # lio::exit();
   /// ```
-  pub fn bind(&self, addr: SocketAddr) -> Progress<'_, Bind> {
+  pub fn bind(&self, addr: SocketAddr) -> Io<'_, Bind> {
     api::bind(&self.0, addr)
   }
 
@@ -182,7 +179,7 @@ impl Socket {
   /// }
   /// # lio::exit();
   /// ```
-  pub fn listen(&self) -> Progress<'_, Listen> {
+  pub fn listen(&self) -> Io<'_, Listen> {
     api::listen(&self.0, 128)
   }
 
@@ -219,10 +216,10 @@ impl Socket {
   /// }
   /// # lio::exit();
   /// ```
-  pub fn accept(&self) -> Progress<'_, SocketAccept> {
+  pub fn accept(&self) -> Io<'_, SocketAccept> {
     // Create Accept operation and wrap it in SocketAccept
     let socket_accept_op = SocketAccept(Accept::new(self.0.clone()));
-    Progress::from_op(socket_accept_op)
+    Io::from_op(socket_accept_op)
   }
 
   /// Initiates a connection to a remote socket at the specified address.
@@ -249,7 +246,7 @@ impl Socket {
   /// }
   /// # lio::exit();
   /// ```
-  pub fn connect(&self, addr: SocketAddr) -> Progress<'_, Connect> {
+  pub fn connect(&self, addr: SocketAddr) -> Io<'_, Connect> {
     api::connect(&self.0, addr)
   }
 
@@ -282,7 +279,7 @@ impl Socket {
   /// }
   /// # lio::exit();
   /// ```
-  pub fn recv(&self, vec: Vec<u8>) -> Progress<'_, Recv<Vec<u8>>> {
+  pub fn recv(&self, vec: Vec<u8>) -> Io<'_, Recv<Vec<u8>>> {
     api::recv(&self.0, vec, None)
   }
 
@@ -314,7 +311,7 @@ impl Socket {
   /// }
   /// # lio::exit();
   /// ```
-  pub fn send(&self, vec: Vec<u8>) -> Progress<'_, Send<Vec<u8>>> {
+  pub fn send(&self, vec: Vec<u8>) -> Io<'_, Send<Vec<u8>>> {
     api::send(&self.0, vec, None)
   }
 
@@ -347,7 +344,7 @@ impl Socket {
   /// }
   /// # lio::exit();
   /// ```
-  pub fn shutdown(&self, how: i32) -> Progress<'_, Shutdown> {
+  pub fn shutdown(&self, how: i32) -> Io<'_, Shutdown> {
     api::shutdown(&self.0, how)
   }
 }

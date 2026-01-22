@@ -1,4 +1,4 @@
-//! `lio`-provided [`IoDriver`] impl for `epoll`/`kqueue` (platform-specific).
+//! `lio`-provided [`IoBackend`] impl for `epoll`/`kqueue` (platform-specific).
 
 mod os;
 
@@ -23,12 +23,11 @@ pub(crate) mod tests;
 use core::slice;
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::backends::pollingv2::interest::Interest;
-use crate::backends::{IoBackend, IoDriver, IoSubmitter, OpCompleted, OpStore};
-use crate::{backends::SubmitErr, operation::Operation};
+use crate::backends::{IoBackend, OpCompleted, OpStore};
+use crate::operation::Operation;
 mod interest;
 
 /// Trait for OS-specific readiness polling implementations
@@ -40,6 +39,12 @@ mod interest;
 /// - **epoll**: Registers both read/write interest on a single fd
 /// - **kqueue**: Registers read and write separately as different filters
 /// - This trait accommodates both by accepting Interest flags
+///
+/// ## Thread Safety
+///
+/// Implementations of this trait are intentionally `!Send` to ensure they are
+/// used only from a single thread. This allows for more efficient interior
+/// mutability without synchronization overhead.
 pub trait ReadinessPoll {
   /// The native event type used by this implementation
   type NativeEvent;
@@ -75,9 +80,6 @@ pub trait ReadinessPoll {
   fn event_key(event: &Self::NativeEvent) -> u64;
 
   /// Extract the interest from a native event
-  ///
-  /// For kqueue: returns either READ or WRITE (one event per filter)
-  /// For epoll: may return both READ and WRITE in a single event
   fn event_interest(event: &Self::NativeEvent) -> Interest;
 }
 
@@ -100,10 +102,6 @@ impl AsMut<[<sys::OsPoller as ReadinessPoll>::NativeEvent]> for Events {
     &mut self.events
   }
 }
-
-// SAFETY: The raw pointers in NativeEvent (e.g., kevent) are never dereferenced across threads
-unsafe impl Send for Events {}
-// unsafe impl Sync for Events {}
 
 impl Default for Events {
   fn default() -> Self {
@@ -197,118 +195,65 @@ impl<'a> Iterator for EventsIter<'a> {
   }
 }
 
-struct BlockingCompletion {
+/// Immediate completion for operations that don't need polling.
+struct ImmediateCompletion {
   id: u64,
   result: isize,
 }
 
-pub struct PollerState {
-  sys: sys::OsPoller,
-  fd_map: scc::HashMap<u64, RawFd>,
-}
-pub struct PollerHandle {
+/// Polling-based I/O backend for epoll (Linux) and kqueue (BSD/macOS).
+///
+/// This backend uses readiness-based polling to handle I/O operations.
+/// It's less efficient than io_uring but works on more platforms.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let mut backend = Poller::default();
+/// backend.init(1024)?;
+///
+/// backend.push(id, &op)?;
+/// backend.flush()?;
+///
+/// let completions = backend.wait(&mut store)?;
+/// ```
+#[derive(Default)]
+pub struct Poller {
+  /// The OS-specific polling mechanism (epoll/kqueue)
+  sys: Option<sys::OsPoller>,
+  /// Map of operation ID to file descriptor (for cleanup)
+  fd_map: Option<scc::HashMap<u64, RawFd>>,
+  /// Event buffer for polling
   events: Events,
-  blocking_sender: crossbeam_channel::Receiver<BlockingCompletion>,
-  state: Arc<PollerState>,
+  /// Immediate completions (operations that completed without polling)
+  immediate: Vec<ImmediateCompletion>,
+
+  /// Reusing the completed allocation.
+  completed: Vec<OpCompleted>,
 }
 
-impl PollerHandle {
-  fn tick_inner(
+impl Poller {
+  /// Create a new uninitialized poller.
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  #[inline]
+  fn sys(&self) -> &sys::OsPoller {
+    self.sys.as_ref().expect("Poller not initialized - call init() first")
+  }
+
+  #[inline]
+  fn fd_map(&self) -> &scc::HashMap<u64, RawFd> {
+    self.fd_map.as_ref().expect("Poller not initialized - call init() first")
+  }
+
+  /// Register an operation for polling
+  fn register_polling(
     &mut self,
-    store: &OpStore,
-    can_wait: bool,
-  ) -> io::Result<Vec<OpCompleted>> {
-    let state = &self.state;
-    let mut completed = Vec::new();
-
-    // First, collect all blocking completions from the channel
-    while let Ok(blocking) = self.blocking_sender.try_recv() {
-      completed.push(OpCompleted::new(blocking.id, blocking.result));
-    }
-
-    self.events.clear();
-    let items_written = state.sys.wait(
-      // SAFETY: as_raw_buf() provides mutable access to the entire capacity of the events buffer,
-      // which the OS will fill with events. The buffer is properly allocated and sized.
-      unsafe { self.events.as_raw_buf() },
-      if can_wait { None } else { Some(Duration::from_millis(0)) },
-    )?;
-
-    // Blocking calls may have run notify() to get values.
-    while let Ok(blocking) = self.blocking_sender.try_recv() {
-      completed.push(OpCompleted::new(blocking.id, blocking.result));
-    }
-
-    // SAFETY: The OS's wait() call filled items_written events into our buffer.
-    // set_len is safe because items_written <= capacity (guaranteed by wait implementation).
-    unsafe { self.events.set_len(items_written) };
-
-    for event in self.events.iter() {
-      let operation_id = event.key;
-
-      // Skip internal notification events - they're just used to wake up the poller
-      if operation_id == u64::MAX {
-        continue;
-      }
-
-      let result = store
-        .get_mut(operation_id, |entry| entry.run_blocking())
-        .expect("couldn't find entry");
-
-      // Look up fd from our internal map
-      let Some(entry_fd) = state.fd_map.get_sync(&operation_id).map(|fd| *fd)
-      else {
-        panic!("couldn't find fd for operation");
-      };
-
-      // Check for EAGAIN/EINPROGRESS (would block)
-      if result < 0 {
-        let errno = (-result) as i32;
-        if errno == libc::EAGAIN
-          || errno == libc::EWOULDBLOCK
-          || errno == libc::EINPROGRESS
-        {
-          state.sys.modify(entry_fd, operation_id, event.interest)?;
-          continue;
-        }
-      }
-
-      // Operation completed (success or error other than would-block)
-      {
-        // Clean up - use delete_timer for timer events, delete for fd-based events
-        if event.interest.is_timer() {
-          state.sys.delete_timer(operation_id)?;
-        } else {
-          state.sys.delete(entry_fd)?;
-        }
-        let was_deleted = state.fd_map.remove_sync(&operation_id).is_some();
-        assert!(was_deleted);
-
-        completed.push(OpCompleted::new(operation_id, result));
-      };
-    }
-
-    Ok(completed)
-  }
-}
-
-impl IoDriver for PollerHandle {
-  fn tick(&mut self, store: &OpStore) -> io::Result<Vec<OpCompleted>> {
-    self.tick_inner(store, true)
-  }
-
-  fn try_tick(&mut self, store: &OpStore) -> io::Result<Vec<OpCompleted>> {
-    self.tick_inner(store, false)
-  }
-}
-pub struct PollerSubmitter {
-  blocking_sender: crossbeam_channel::Sender<BlockingCompletion>,
-  state: Arc<PollerState>,
-}
-
-impl PollerSubmitter {
-  fn new_polling(&self, id: u64, op: &dyn Operation) -> Result<(), SubmitErr> {
-    let state = &self.state;
+    id: u64,
+    op: &dyn Operation,
+  ) -> io::Result<()> {
     let meta = op.meta();
     let interest = if meta.is_cap_fd() {
       if meta.is_fd_readable() && meta.is_fd_writable() {
@@ -318,86 +263,157 @@ impl PollerSubmitter {
       } else if meta.is_fd_writable() {
         Interest::WRITE
       } else {
-        panic!()
+        panic!("Operation has CAP_FD but no read/write interest")
       }
     } else if meta.is_cap_timer() {
       Interest::TIMER
     } else {
-      panic!()
+      panic!("Operation has no capability")
     };
 
-    state.fd_map.insert_sync(id, op.cap()).unwrap();
-    state.sys.add(op.cap(), id, interest).map_err(SubmitErr::Io)?;
+    self.fd_map().insert_sync(id, op.cap()).unwrap();
+    self.sys().add(op.cap(), id, interest)?;
 
     Ok(())
   }
 }
 
-impl IoSubmitter for PollerSubmitter {
-  fn submit(&mut self, id: u64, op: &dyn Operation) -> Result<(), SubmitErr> {
+impl IoBackend for Poller {
+  fn init(&mut self, cap: usize) -> io::Result<()> {
+    self.sys = Some(sys::OsPoller::new()?);
+    self.fd_map = Some(scc::HashMap::with_capacity(cap));
+    self.events = Events::with_capacity(cap.min(4096)); // Don't allocate huge event buffers
+    self.immediate = Vec::with_capacity(64); // Small buffer for immediate completions
+    self.completed = Vec::with_capacity(cap.min(256)); // Reusable completions buffer
+    Ok(())
+  }
+
+  fn push(&mut self, id: u64, op: &dyn Operation) -> io::Result<()> {
     let meta = op.meta();
 
+    // Operations with no capability (like NOP) complete immediately
     if meta.is_cap_none() {
       let result = op.run_blocking();
-      let _ = self.blocking_sender.send(BlockingCompletion { id, result });
-      dbg!(self.notify())?;
+      self.immediate.push(ImmediateCompletion { id, result });
       return Ok(());
-    };
-
-    if !meta.is_beh_run_before_noti() {
-      return self.new_polling(id, op);
     }
 
-    // CONNECT
+    // cap is either timer or fd.
+    // let cap = op.cap
+    //     if meta.is_cap_timer() || meta.is {
+    //       let milliseconds = op.cap();
+    //       self.sys.as_ref().unwrap().add(milliseconds, id, op.)
+    //     }
 
-    let result = op.run_blocking();
+    // Operations that need to run before polling (like CONNECT)
+    if meta.is_cap_fd() && meta.is_beh_run_before_noti() {
+      let result = op.run_blocking();
 
-    if result == -(libc::EINPROGRESS as isize) {
-      self.new_polling(id, op)
-    } else {
-      let _ = self.blocking_sender.send(BlockingCompletion { id, result });
-      dbg!(self.notify())?;
-      Ok(())
+      if result == -(libc::EINPROGRESS as isize) {
+        // Connection in progress - register for polling
+        return self.register_polling(id, op);
+      } else {
+        // Completed immediately (success or error)
+        self.immediate.push(ImmediateCompletion { id, result });
+        return Ok(());
+      }
     }
-  }
-  fn notify(&mut self) -> Result<(), SubmitErr> {
-    Ok(self.state.sys.notify()?)
-  }
-}
 
-/// Main polling structure
-pub struct Poller(());
-
-impl IoBackend for Poller {
-  type Driver = PollerHandle;
-  type Submitter = PollerSubmitter;
-  type State = PollerState;
-
-  fn new_state() -> io::Result<Self::State> {
-    Ok(PollerState {
-      sys: sys::OsPoller::new()?,
-      fd_map: scc::HashMap::default(),
-    })
+    // Regular operations - just register for polling
+    self.register_polling(id, op)
   }
 
-  fn new(
-    state: Arc<Self::State>,
-  ) -> io::Result<(Self::Submitter, Self::Driver)> {
-    let (blocking_sender, blocking_recv) = crossbeam_channel::unbounded();
+  fn flush(&mut self) -> io::Result<usize> {
+    // For epoll/kqueue, operations are registered immediately in push()
+    // since each registration is a separate syscall anyway.
+    // There's no batching opportunity like with io_uring.
+    Ok(0)
+  }
 
-    Ok((
-      PollerSubmitter {
-        blocking_sender: blocking_sender.clone(),
-        state: state.clone(),
-      },
-      PollerHandle {
-        events: Events::default(),
-        blocking_sender: blocking_recv,
-        state,
-      },
-    ))
+  /// Poll for completions with optional timeout
+  ///
+  /// - `timeout = None`: Block indefinitely
+  /// - `timeout = Some(Duration::ZERO)`: Non-blocking poll
+  /// - `timeout = Some(duration)`: Wait up to duration
+  fn wait_timeout(
+    &mut self,
+    store: &mut OpStore,
+    timeout: Option<Duration>,
+  ) -> io::Result<&[OpCompleted]> {
+    self.completed.clear();
+
+    // First, drain any immediate completions
+    for imm in self.immediate.drain(..) {
+      self.completed.push(OpCompleted::new(imm.id, imm.result));
+    }
+
+    // Poll for events
+    // Get reference to sys before mutating events to avoid borrow conflict
+    self.events.clear();
+    // SAFETY: as_raw_buf() provides mutable access to the entire capacity of the events buffer
+    let events = unsafe { self.events.as_raw_buf() };
+
+    let items_written = self.sys.as_ref().unwrap().wait(events, timeout)?;
+
+    // SAFETY: The OS's wait() call filled items_written events into our buffer
+    unsafe { self.events.set_len(items_written) };
+
+    for event in self.events.iter() {
+      let operation_id = event.key;
+
+      // Skip internal notification events
+      if operation_id == u64::MAX {
+        continue;
+      }
+
+      let entry = store
+        .get_mut(operation_id)
+        .expect("lio bookeeping error: couldn't find entry");
+      let result = entry.run_blocking();
+
+      // Look up fd from our internal map
+      let Some(entry_fd) = self.fd_map().get_sync(&operation_id).map(|fd| *fd)
+      else {
+        panic!("couldn't find fd for operation {}", operation_id);
+      };
+
+      // Check for EAGAIN/EINPROGRESS (would block)
+      if result < 0 {
+        let errno = (-result) as i32;
+        if errno == libc::EAGAIN
+          || errno == libc::EWOULDBLOCK
+          || errno == libc::EINPROGRESS
+        {
+          // Re-arm for more events
+          self.sys().modify(entry_fd, operation_id, event.interest)?;
+          continue;
+        }
+      }
+
+      // Operation completed (success or error other than would-block)
+      // Clean up - use delete_timer for timer events, delete for fd-based events
+      if event.interest.is_timer() {
+        self.sys().delete_timer(operation_id)?;
+      } else {
+        self.sys().delete(entry_fd)?;
+      }
+      let was_deleted = self.fd_map().remove_sync(&operation_id).is_some();
+      assert!(was_deleted);
+
+      self.completed.push(OpCompleted::new(operation_id, result));
+    }
+
+    Ok(self.completed.as_ref())
   }
 }
 
 #[cfg(test)]
-test_io_driver!(Poller);
+mod unit_tests {
+  use super::*;
+
+  #[test]
+  fn test_init() {
+    let mut backend = Poller::new();
+    backend.init(64).unwrap();
+  }
+}
