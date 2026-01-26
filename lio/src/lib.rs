@@ -74,6 +74,7 @@ pub mod fs;
 
 pub use buf::BufResult;
 
+pub mod op;
 pub mod operation;
 
 #[path = "registration/registration.rs"]

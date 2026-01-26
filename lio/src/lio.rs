@@ -132,7 +132,7 @@ impl Lio {
     match self.store.get_mut(key) {
       Some(entry) => {
         let result =
-          entry.try_extract::<T>().ok_or_else(|| Error::EntryNotCompleted)?;
+          entry.try_extract::<T>().ok_or(Error::EntryNotCompleted)?;
         self.store.remove(key);
         Ok(result)
       }

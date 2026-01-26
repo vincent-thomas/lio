@@ -1,26 +1,24 @@
 use std::task::Waker;
 
 use crate::{
+  op::Op,
   operation::{Operation, OperationExt},
   registration::notifier::Notifier,
 };
 
 pub struct StoredOp {
-  op: Box<dyn Operation>,
+  op: Op,
   notifier: Option<Notifier>,
 }
 
 impl StoredOp {
-  pub fn op_ref(&self) -> &dyn Operation {
-    self.op.as_ref()
+  pub fn op_ref(&self) -> &Op {
+    &self.op
   }
-  pub fn new_waker<O>(op: Box<O>, waker: Waker) -> Self
-  where
-    O: OperationExt + 'static,
-  {
+  pub fn new_waker(op: Op, waker: Waker) -> Self {
     Self { op, notifier: Some(Notifier::new_waker(waker)) }
   }
-  pub fn new_callback<O, F>(op: Box<O>, f: F) -> Self
+  pub fn new_callback<O, F>(op: Op, f: F) -> Self
   where
     O: OperationExt + 'static,
     F: FnOnce(O::Result) + Send,

@@ -21,12 +21,12 @@ use std::ptr;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-  CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, FALSE,
-  ERROR_IO_PENDING, WAIT_TIMEOUT,
+  CloseHandle, ERROR_IO_PENDING, FALSE, GetLastError, HANDLE,
+  INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::IO::{
-  CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus,
-  OVERLAPPED,
+  CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
+  PostQueuedCompletionStatus,
 };
 
 use crate::backends::{IoBackend, OpCompleted, OpStore};
@@ -271,9 +271,9 @@ impl IoBackend for Iocp {
     let port = unsafe {
       CreateIoCompletionPort(
         INVALID_HANDLE_VALUE,
-        0,  // No existing port
-        0,  // Completion key (unused for creation)
-        0,  // Concurrent threads (0 = system decides)
+        0, // No existing port
+        0, // Completion key (unused for creation)
+        0, // Concurrent threads (0 = system decides)
       )
     };
 
@@ -361,19 +361,10 @@ impl IoBackend for Iocp {
 impl Iocp {
   pub fn notify(&self) -> io::Result<()> {
     let success = unsafe {
-      PostQueuedCompletionStatus(
-        self.port(),
-        0,
-        NOTIFY_KEY,
-        ptr::null_mut(),
-      )
+      PostQueuedCompletionStatus(self.port(), 0, NOTIFY_KEY, ptr::null_mut())
     };
 
-    if success == FALSE {
-      Err(io::Error::last_os_error())
-    } else {
-      Ok(())
-    }
+    if success == FALSE { Err(io::Error::last_os_error()) } else { Ok(()) }
   }
 }
 

@@ -103,7 +103,8 @@ mod tests {
     backend.push(2, &Nop).unwrap();
 
     // Poll should return both completions
-    let completions = backend.wait_timeout(&mut store, Some(Duration::ZERO)).unwrap();
+    let completions =
+      backend.wait_timeout(&mut store, Some(Duration::ZERO)).unwrap();
     assert_eq!(completions.len(), 2);
   }
 }

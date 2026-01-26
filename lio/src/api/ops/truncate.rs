@@ -28,7 +28,8 @@ impl Operation for Truncate {
   // const OPCODE: u8 = 55;
   #[cfg(linux)]
   fn create_entry(&self) -> lio_uring::submission::Entry {
-    lio_uring::operation::Ftruncate::new(self.res.as_raw_fd(), self.size).build()
+    lio_uring::operation::Ftruncate::new(self.res.as_raw_fd(), self.size)
+      .build()
   }
 
   fn run_blocking(&self) -> isize {

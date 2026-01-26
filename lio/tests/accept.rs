@@ -1,5 +1,5 @@
-use lio::api;
 use lio::Lio;
+use lio::api;
 use std::{
   mem::MaybeUninit,
   net::SocketAddr,
@@ -41,14 +41,13 @@ fn test_accept_basic() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let server_sock = poll_until_recv(&mut lio, &receiver_sock).expect("socket syscall wasn't done");
+  let server_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("socket syscall wasn't done");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
   let (sender_bind, receiver_bind) = mpsc::channel();
-  api::bind(&server_sock, addr)
-    .with_lio(&mut lio)
-    .send_with(sender_bind);
+  api::bind(&server_sock, addr).with_lio(&mut lio).send_with(sender_bind);
 
   poll_until_recv(&mut lio, &receiver_bind).unwrap();
 
@@ -67,9 +66,7 @@ fn test_accept_basic() {
   };
 
   let (sender_listen, receiver_listen) = mpsc::channel();
-  api::listen(&server_sock, 128)
-    .with_lio(&mut lio)
-    .send_with(sender_listen);
+  api::listen(&server_sock, 128).with_lio(&mut lio).send_with(sender_listen);
 
   poll_until_recv(&mut lio, &receiver_listen).expect("listen syscall failed");
 
@@ -77,7 +74,8 @@ fn test_accept_basic() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let client_sock = poll_until_recv(&mut lio, &receiver_sock).expect("socket didn't finish after tick");
+  let client_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("socket didn't finish after tick");
 
   let (sender_connect, receiver_connect) = mpsc::channel();
   let (sender_accept, receiver_accept) = mpsc::channel();
@@ -85,9 +83,7 @@ fn test_accept_basic() {
   api::connect(&client_sock, bound_addr)
     .with_lio(&mut lio)
     .send_with(sender_connect);
-  api::accept(&server_sock)
-    .with_lio(&mut lio)
-    .send_with(sender_accept);
+  api::accept(&server_sock).with_lio(&mut lio).send_with(sender_accept);
 
   let (accepted_fd, _) = poll_until_recv(&mut lio, &receiver_accept).unwrap();
   poll_until_recv(&mut lio, &receiver_connect).expect("Failed to connect");
@@ -132,7 +128,8 @@ fn test_accept_multiple() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let server_sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create server socket");
+  let server_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create server socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -172,16 +169,13 @@ fn test_accept_multiple() {
     let (sender_c, receiver_c) = mpsc::channel();
 
     // Accept connection
-    api::accept(&server_sock)
-      .with_lio(&mut lio)
-      .send_with(sender_a);
+    api::accept(&server_sock).with_lio(&mut lio).send_with(sender_a);
 
     // Create client socket
-    lio::test_utils::tcp_socket()
-      .with_lio(&mut lio)
-      .send_with(sender_s);
+    lio::test_utils::tcp_socket().with_lio(&mut lio).send_with(sender_s);
 
-    let client_sock = poll_until_recv(&mut lio, &receiver_s).expect("Failed to create client socket");
+    let client_sock = poll_until_recv(&mut lio, &receiver_s)
+      .expect("Failed to create client socket");
 
     api::connect(&client_sock, bound_addr)
       .with_lio(&mut lio)
@@ -189,7 +183,8 @@ fn test_accept_multiple() {
 
     poll_until_recv(&mut lio, &receiver_c).expect("Failed to connect");
 
-    let (accepted_fd, _) = poll_until_recv(&mut lio, &receiver_a).expect("Failed to accept");
+    let (accepted_fd, _) =
+      poll_until_recv(&mut lio, &receiver_a).expect("Failed to accept");
 
     accepted_fds.push(accepted_fd);
     client_fds.push(client_sock);
@@ -222,7 +217,8 @@ fn test_accept_with_client_info() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let server_sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create server socket");
+  let server_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create server socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -256,23 +252,19 @@ fn test_accept_with_client_info() {
   let (sender_s, receiver_s) = mpsc::channel();
   let (sender_c, receiver_c) = mpsc::channel();
 
-  api::accept(&server_sock)
-    .with_lio(&mut lio)
-    .send_with(sender_a);
+  api::accept(&server_sock).with_lio(&mut lio).send_with(sender_a);
 
-  lio::test_utils::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_s);
+  lio::test_utils::tcp_socket().with_lio(&mut lio).send_with(sender_s);
 
-  let client_sock = poll_until_recv(&mut lio, &receiver_s).expect("Failed to create client socket");
+  let client_sock = poll_until_recv(&mut lio, &receiver_s)
+    .expect("Failed to create client socket");
 
-  api::connect(&client_sock, bound_addr)
-    .with_lio(&mut lio)
-    .send_with(sender_c);
+  api::connect(&client_sock, bound_addr).with_lio(&mut lio).send_with(sender_c);
 
   poll_until_recv(&mut lio, &receiver_c).expect("Failed to connect");
 
-  let (accepted_fd, _client_addr) = poll_until_recv(&mut lio, &receiver_a).expect("Failed to accept");
+  let (accepted_fd, _client_addr) =
+    poll_until_recv(&mut lio, &receiver_a).expect("Failed to accept");
 
   // Cleanup
   unsafe {
@@ -293,7 +285,8 @@ fn test_accept_ipv6() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let server_sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create IPv6 server socket");
+  let server_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create IPv6 server socket");
 
   let addr: SocketAddr = "[::1]:0".parse().unwrap();
 
@@ -325,24 +318,22 @@ fn test_accept_ipv6() {
 
   let (sender_a, receiver_a) = mpsc::channel();
 
-  api::accept(&server_sock)
-    .with_lio(&mut lio)
-    .send_with(sender_a);
+  api::accept(&server_sock).with_lio(&mut lio).send_with(sender_a);
 
   lio::test_utils::tcp6_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let client_sock = poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create IPv6 client socket");
+  let client_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create IPv6 client socket");
 
   let (sender_c, receiver_c) = mpsc::channel();
-  api::connect(&client_sock, bound_addr)
-    .with_lio(&mut lio)
-    .send_with(sender_c);
+  api::connect(&client_sock, bound_addr).with_lio(&mut lio).send_with(sender_c);
 
   poll_until_recv(&mut lio, &receiver_c).expect("connect error");
 
-  let (accepted_fd, _) = poll_until_recv(&mut lio, &receiver_a).expect("Failed to accept IPv6");
+  let (accepted_fd, _) =
+    poll_until_recv(&mut lio, &receiver_a).expect("Failed to accept IPv6");
 
   assert!(accepted_fd.as_fd().as_raw_fd() >= 0);
 

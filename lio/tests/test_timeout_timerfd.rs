@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use lio::{api, Lio};
+use lio::{Lio, api};
 
 #[test]
 fn test_timeout_basic() {

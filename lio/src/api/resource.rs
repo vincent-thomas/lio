@@ -221,7 +221,7 @@ pub trait AsResource {
 /// Direct implementation for [`Resource`] itself.
 ///
 /// This allows using a `Resource` directly where `AsResource` is expected.
-impl<'a> AsResource for &'a Resource {
+impl AsResource for &Resource {
   fn as_resource(&self) -> &Resource {
     self
   }

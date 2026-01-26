@@ -1,6 +1,6 @@
 use std::os::fd::AsRawFd;
 
-use crate::{BufResult, buf::BufLike, api::resource::Resource};
+use crate::{BufResult, api::resource::Resource, buf::BufLike};
 
 use crate::operation::{Operation, OperationExt};
 

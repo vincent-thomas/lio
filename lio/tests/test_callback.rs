@@ -28,11 +28,11 @@ fn test_callback_basic_lio() {
   let (tx, rx) = channel();
 
   let buf = vec![0u8; 100];
-  lio::read_with_buf(fd, buf, 0)
-    .with_lio(&mut lio)
-    .when_done(move |(bytes_read, buffer)| {
+  lio::read_with_buf(fd, buf, 0).with_lio(&mut lio).when_done(
+    move |(bytes_read, buffer)| {
       tx.send((bytes_read, buffer)).unwrap();
-    });
+    },
+  );
 
   lio.try_run().unwrap();
 
@@ -67,9 +67,8 @@ fn test_callback_basic_write() {
     )
   };
 
-  let recv = lio::write_with_buf(fd, test_data.to_vec(), 0)
-    .with_lio(&mut lio)
-    .send();
+  let recv =
+    lio::write_with_buf(fd, test_data.to_vec(), 0).with_lio(&mut lio).send();
   lio.try_run().unwrap();
 
   // Wait for callback to execute
@@ -102,11 +101,11 @@ fn test_callback_error_handling() {
   let (tx, rx) = channel();
 
   let buf = vec![0u8; 100];
-  lio::read_with_buf(invalid_fd, buf, 0)
-    .with_lio(&mut lio)
-    .when_done(move |(bytes_read, _buffer)| {
+  lio::read_with_buf(invalid_fd, buf, 0).with_lio(&mut lio).when_done(
+    move |(bytes_read, _buffer)| {
       tx.send(bytes_read).unwrap();
-    });
+    },
+  );
 
   lio.try_run().unwrap();
   // Wait for callback to execute
@@ -148,9 +147,8 @@ fn test_callback_concurrent() {
     let expected_data = data.clone();
     let path_clone = path.clone();
 
-    lio::read_with_buf(fd, buf, 0)
-      .with_lio(&mut lio)
-      .when_done(move |(bytes_read, buffer)| {
+    lio::read_with_buf(fd, buf, 0).with_lio(&mut lio).when_done(
+      move |(bytes_read, buffer)| {
         let bytes_read = bytes_read.expect("Read failed") as usize;
         assert_eq!(bytes_read, expected_data.len());
         assert_eq!(&buffer[..bytes_read], expected_data.as_bytes());
@@ -162,7 +160,8 @@ fn test_callback_concurrent() {
         }
 
         tx_clone.send(i).unwrap();
-      });
+      },
+    );
     lio.try_run().unwrap();
   }
 
@@ -243,12 +242,10 @@ fn test_callback_with_detach() {
   let (tx, rx) = sync_channel(1);
 
   let buf = vec![0u8; 100];
-  lio::read_with_buf(fd, buf, 0)
-    .with_lio(&mut lio)
-    .when_done(move |_result| {
-      // Just mark as invoked, don't care about result
-      tx.send(()).unwrap();
-    });
+  lio::read_with_buf(fd, buf, 0).with_lio(&mut lio).when_done(move |_result| {
+    // Just mark as invoked, don't care about result
+    tx.send(()).unwrap();
+  });
   lio.try_run().unwrap();
 
   // Wait for callback
@@ -281,16 +278,16 @@ fn test_callback_preserves_buffer_ownership() {
   let (tx, rx) = sync_channel(1);
 
   let buf = vec![0u8; 100];
-  lio::read_with_buf(fd, buf, 0)
-    .with_lio(&mut lio)
-    .when_done(move |(bytes_read, buffer)| {
+  lio::read_with_buf(fd, buf, 0).with_lio(&mut lio).when_done(
+    move |(bytes_read, buffer)| {
       // Verify we got ownership of the buffer
       let bytes_read = bytes_read.expect("Read failed") as usize;
       assert_eq!(&buffer[..bytes_read], test_data);
 
       // Send buffer to verify it lives beyond callback
       tx.send(buffer).unwrap();
-    });
+    },
+  );
 
   lio.try_run().unwrap();
   // Wait for callback
