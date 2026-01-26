@@ -93,9 +93,8 @@ impl OpStore {
     let capacity = cap.min(u32::MAX as usize) as u32;
 
     // Pre-allocate all slots
-    let slots = (0..capacity)
-      .map(|_| Slot { generation: 0, entry: None })
-      .collect();
+    let slots =
+      (0..capacity).map(|_| Slot { generation: 0, entry: None }).collect();
 
     Self {
       slots,

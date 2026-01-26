@@ -4,7 +4,6 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::time::Duration;
 use std::{io::Error, os::fd::RawFd};
 
-
 #[cfg(linux)]
 use crate::api::resource::Resource;
 use crate::operation::{Operation, OperationExt};
@@ -117,7 +116,8 @@ impl Operation for Timeout {
 
   #[cfg(linux)]
   fn create_entry(&self) -> lio_uring::submission::Entry {
-    lio_uring::operation::Timeout::new(&self.timespec as *const _ as *const _).build()
+    lio_uring::operation::Timeout::new(&self.timespec as *const _ as *const _)
+      .build()
   }
 
   /// Very special case here for kqueue.

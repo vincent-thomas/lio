@@ -86,9 +86,10 @@ impl IoUring {
         // Wait with timeout
         match cq.next_timeout(d)? {
           Some(first) => {
-            self
-              .completed
-              .push(OpCompleted::new(first.user_data(), first.result() as isize));
+            self.completed.push(OpCompleted::new(
+              first.user_data(),
+              first.result() as isize,
+            ));
           }
           None => return Ok(&[]), // Timeout expired
         }

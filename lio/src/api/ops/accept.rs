@@ -6,7 +6,6 @@ use std::{
   net::SocketAddr,
 };
 
-
 use crate::{
   api::resource::Resource,
   net_utils::libc_socketaddr_into_std,

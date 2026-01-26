@@ -1,7 +1,7 @@
 use std::{ffi::CString, os::fd::AsRawFd};
 
-use crate::operation::{Operation, OperationExt};
 use crate::api::resource::Resource;
+use crate::operation::{Operation, OperationExt};
 
 pub struct OpenAt {
   dir_res: Resource,

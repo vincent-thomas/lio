@@ -1,5 +1,5 @@
-use lio::api::*;
 use lio::Lio;
+use lio::api::*;
 use std::{
   mem::MaybeUninit,
   net::SocketAddr,
@@ -41,14 +41,12 @@ fn test_connect_basic() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let server_sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create server socket");
+  let server_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create server socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  bind(&server_sock, addr)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  bind(&server_sock, addr).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind");
 
@@ -66,9 +64,7 @@ fn test_connect_basic() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  listen(&server_sock, 128)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  listen(&server_sock, 128).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen");
 
@@ -77,8 +73,8 @@ fn test_connect_basic() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let client_sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create client socket");
+  let client_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create client socket");
 
   let (sender_c, receiver_c) = mpsc::channel();
 
@@ -116,14 +112,12 @@ fn test_connect_ipv6() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let server_sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create IPv6 server socket");
+  let server_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create IPv6 server socket");
 
   let addr: SocketAddr = "[::1]:0".parse().unwrap();
 
-  bind(&server_sock, addr)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  bind(&server_sock, addr).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind IPv6");
 
@@ -141,9 +135,7 @@ fn test_connect_ipv6() {
     format!("[::1]:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  listen(&server_sock, 128)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  listen(&server_sock, 128).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen");
 
@@ -151,8 +143,8 @@ fn test_connect_ipv6() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let client_sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create IPv6 client socket");
+  let client_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create IPv6 client socket");
 
   let (sender_c, receiver_c) = mpsc::channel();
 
@@ -184,21 +176,17 @@ fn test_connect_to_nonexistent() {
 
   let (sender, receiver) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender.clone());
+  lio::test_utils::tcp_socket().with_lio(&mut lio).send_with(sender.clone());
 
-  let client_sock =
-    poll_until_recv(&mut lio, &receiver).expect("Failed to create client socket");
+  let client_sock = poll_until_recv(&mut lio, &receiver)
+    .expect("Failed to create client socket");
 
   // Try to connect to a port that's (hopefully) not listening
   let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
   let (sender_c, receiver_c) = mpsc::channel();
 
-  connect(&client_sock, addr)
-    .with_lio(&mut lio)
-    .send_with(sender_c.clone());
+  connect(&client_sock, addr).with_lio(&mut lio).send_with(sender_c.clone());
 
   let result = poll_until_recv(&mut lio, &receiver_c);
 
@@ -221,14 +209,12 @@ fn test_connect_multiple_clients() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let server_sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create server socket");
+  let server_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create server socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  bind(&server_sock, addr)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  bind(&server_sock, addr).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind");
 
@@ -246,9 +232,7 @@ fn test_connect_multiple_clients() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  listen(&server_sock, 128)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  listen(&server_sock, 128).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen");
 
@@ -259,8 +243,8 @@ fn test_connect_multiple_clients() {
       .with_lio(&mut lio)
       .send_with(sender_sock.clone());
 
-    let client_sock =
-      poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create client socket");
+    let client_sock = poll_until_recv(&mut lio, &receiver_sock)
+      .expect("Failed to create client socket");
 
     let (sender_c, receiver_c) = mpsc::channel();
 
@@ -295,14 +279,12 @@ fn test_connect_already_connected() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let server_sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create server socket");
+  let server_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create server socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  bind(&server_sock, addr)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  bind(&server_sock, addr).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind");
 
@@ -320,9 +302,7 @@ fn test_connect_already_connected() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  listen(&server_sock, 128)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  listen(&server_sock, 128).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen");
 
@@ -330,8 +310,8 @@ fn test_connect_already_connected() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let client_sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create client socket");
+  let client_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create client socket");
 
   let (sender_c, receiver_c) = mpsc::channel();
 
@@ -372,14 +352,12 @@ fn test_connect_to_localhost() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let server_sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create server socket");
+  let server_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create server socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  bind(&server_sock, addr)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  bind(&server_sock, addr).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind");
 
@@ -397,9 +375,7 @@ fn test_connect_to_localhost() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  listen(&server_sock, 128)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  listen(&server_sock, 128).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen");
 
@@ -407,8 +383,8 @@ fn test_connect_to_localhost() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let client_sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create client socket");
+  let client_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create client socket");
 
   let (sender_c, receiver_c) = mpsc::channel();
 
@@ -416,7 +392,8 @@ fn test_connect_to_localhost() {
     .with_lio(&mut lio)
     .send_with(sender_c.clone());
 
-  poll_until_recv(&mut lio, &receiver_c).expect("Failed to connect to localhost");
+  poll_until_recv(&mut lio, &receiver_c)
+    .expect("Failed to connect to localhost");
 
   // Verify connected to localhost
   unsafe {
@@ -447,14 +424,12 @@ fn test_connect_concurrent() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let server_sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create server socket");
+  let server_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create server socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  bind(&server_sock, addr)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  bind(&server_sock, addr).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind");
 
@@ -472,9 +447,7 @@ fn test_connect_concurrent() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  listen(&server_sock, 128)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  listen(&server_sock, 128).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen");
 
@@ -485,8 +458,8 @@ fn test_connect_concurrent() {
       .with_lio(&mut lio)
       .send_with(sender_sock.clone());
 
-    let client_sock =
-      poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create client socket");
+    let client_sock = poll_until_recv(&mut lio, &receiver_sock)
+      .expect("Failed to create client socket");
 
     let (sender_c, receiver_c) = mpsc::channel();
 
@@ -521,14 +494,12 @@ fn test_connect_with_bind() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let server_sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create server socket");
+  let server_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create server socket");
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  bind(&server_sock, addr)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  bind(&server_sock, addr).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind server");
 
@@ -546,9 +517,7 @@ fn test_connect_with_bind() {
     format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
   };
 
-  listen(&server_sock, 128)
-    .with_lio(&mut lio)
-    .send_with(sender_unit.clone());
+  listen(&server_sock, 128).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen");
 
@@ -557,8 +526,8 @@ fn test_connect_with_bind() {
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
-  let client_sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create client socket");
+  let client_sock = poll_until_recv(&mut lio, &receiver_sock)
+    .expect("Failed to create client socket");
 
   let client_bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
