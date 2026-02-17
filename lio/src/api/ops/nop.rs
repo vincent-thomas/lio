@@ -1,46 +1,50 @@
-use crate::operation::{Operation, OperationExt};
+use crate::typed_op::TypedOp;
+use std::io;
 
 #[cfg(unix)]
 use crate::operation::OpMeta;
-
-#[cfg(windows)]
-use crate::operation::IocpStartResult;
 
 pub struct Nop;
 
 assert_op_max_size!(Nop);
 
-impl OperationExt for Nop {
-  type Result = ();
+impl Nop {
+  pub fn to_op(self) -> crate::op::Op {
+    crate::op::Op::Nop
+  }
 }
 
-impl Operation for Nop {
-  impl_result!(());
+impl TypedOp for Nop {
+  type Result = io::Result<()>;
 
-  #[cfg(unix)]
-  fn meta(&self) -> OpMeta {
-    OpMeta::CAP_NONE
+  fn into_op(&mut self) -> crate::op::Op {
+    crate::op::Op::Nop
   }
 
-  #[cfg(linux)]
-  fn create_entry(&self) -> lio_uring::submission::Entry {
-    lio_uring::operation::Nop::new().build()
+  fn extract_result(self, res: isize) -> Self::Result {
+    if res < 0 {
+      Err(io::Error::from_raw_os_error((-res) as i32))
+    } else {
+      Ok(())
+    }
   }
 
-  fn run_blocking(&self) -> isize {
-    0
-  }
+  // #[cfg(unix)]
+  // fn meta(&self) -> OpMeta {
+  //   OpMeta::CAP_NONE
+  // }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // Windows IOCP Support
-  // ═══════════════════════════════════════════════════════════════════════════
+  // #[cfg(unix)]
+  // fn cap(&self) -> i32 {
+  //   -1
+  // }
 
-  #[cfg(windows)]
-  fn start_iocp(
-    &self,
-    _overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
-  ) -> IocpStartResult {
-    // NOP completes immediately with result 0
-    IocpStartResult::Completed(0)
-  }
+  // #[cfg(linux)]
+  // fn create_entry(&self) -> lio_uring::submission::Entry {
+  //   lio_uring::operation::Nop::new().build()
+  // }
+
+  // fn run_blocking(&self) -> isize {
+  //   0
+  // }
 }

@@ -76,13 +76,13 @@ pub use buf::BufResult;
 
 pub mod op;
 pub mod operation;
+pub mod typed_op;
 
 #[path = "registration/registration.rs"]
 mod registration;
 
 #[path = "backends/backends.rs"]
 pub mod backends;
-mod worker;
 
 pub mod api;
 #[cfg_attr(docsrs, doc(hidden))]

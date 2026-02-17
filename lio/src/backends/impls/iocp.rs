@@ -126,7 +126,6 @@ impl Iocp {
   /// - `timeout = Some(duration)`: Wait up to duration
   fn poll_inner(
     &mut self,
-    _store: &mut OpStore,
     timeout_duration: Option<Duration>,
   ) -> io::Result<&[OpCompleted]> {
     self.completed.clear();
@@ -347,10 +346,9 @@ impl IoBackend for Iocp {
 
   fn wait_timeout(
     &mut self,
-    store: &mut OpStore,
     timeout: Option<Duration>,
   ) -> io::Result<&[OpCompleted]> {
-    self.poll_inner(store, timeout)
+    self.poll_inner(timeout)
   }
 }
 

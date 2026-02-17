@@ -76,7 +76,7 @@ pub use store::*;
 use std::io;
 use std::time::Duration;
 
-use crate::operation::Operation;
+use crate::op::Op;
 
 /// Error types that can occur when submitting operations to the backend.
 #[derive(Debug)]
@@ -165,7 +165,7 @@ pub trait IoBackend {
   /// # Errors
   ///
   /// - [`SubmitErr::Full`]: Submission queue is full (call flush first)
-  fn push(&mut self, id: u64, op: &dyn Operation) -> io::Result<()>;
+  fn push(&mut self, id: u64, op: Op) -> io::Result<()>;
 
   /// Flushes all queued operations to the kernel.
   ///
@@ -188,7 +188,6 @@ pub trait IoBackend {
   /// The returned slice is valid until the next call to `wait_timeout`, or `push`.
   fn wait_timeout(
     &mut self,
-    store: &mut OpStore,
     timeout: Option<Duration>,
   ) -> io::Result<&[OpCompleted]>;
 }

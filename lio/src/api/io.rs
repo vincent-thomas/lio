@@ -54,7 +54,13 @@
 //! threads than where operations were initiated. This is particularly useful for
 //! delegating I/O completion handling to dedicated threads.
 
-use crate::{lio::Lio, operation::OperationExt, registration::StoredOp};
+use crate::{
+  lio::Lio,
+  op::Op,
+  operation::OperationExt,
+  registration::{Registration, notifier::Notifier},
+  typed_op::TypedOp,
+};
 
 use std::{
   future::Future,
@@ -266,7 +272,7 @@ where
 
 impl<'a, T> Io<'a, T>
 where
-  T: OperationExt + 'static,
+  T: TypedOp, // T: OperationExt + 'static,
 {
   /// Block the current thread until the operation completes and return the result.
   ///
@@ -391,22 +397,24 @@ where
   where
     F: FnOnce(T::Result) + Send + 'static,
   {
-    let (lio, op) = self.into_lio();
-    let stored = StoredOp::new_callback(Box::new(op), f);
-    lio.schedule(stored).expect("lio error: lio should handle this");
+    let (lio, mut typed_op) = self.into_lio();
+    let op = typed_op.into_op();
+    lio
+      .schedule(op, Notifier::new_callback::<T, F>(f, typed_op))
+      .expect("lio error: lio should handle this");
   }
 }
 
 impl<'a, T> IntoFuture for Io<'a, T>
 where
-  T: OperationExt + Unpin + 'static,
+  T: TypedOp + Unpin + 'static,
 {
   type Output = T::Result;
   type IntoFuture = IoFuture<'a, T>;
 
   fn into_future(self) -> Self::IntoFuture {
     let (lio, op) = self.into_lio();
-    IoFuture { status: PFStatus::NeverPolled(Some(op)), lio }
+    IoFuture { status: PFStatus::NeverPolled, typed: Some(op), lio }
   }
 }
 
@@ -434,18 +442,19 @@ where
 /// //                                          IntoFuture creates IoFuture
 /// ```
 pub struct IoFuture<'a, T> {
-  status: PFStatus<T>,
+  status: PFStatus,
+  typed: Option<T>,
   lio: &'a mut Lio,
 }
 
-enum PFStatus<T> {
+enum PFStatus {
   HasPolled(u64),
-  NeverPolled(Option<T>),
+  NeverPolled,
 }
 
 impl<'a, T> Future for IoFuture<'a, T>
 where
-  T: OperationExt + Unpin + 'static,
+  T: TypedOp + Unpin, // T: OperationExt + Unpin + 'static,
 {
   type Output = T::Result;
 
@@ -458,8 +467,11 @@ where
 
     match &mut this.status {
       PFStatus::HasPolled(id) => {
-        match this.lio.check_done::<T>(*id) {
-          Ok(result) => Poll::Ready(result),
+        match this.lio.check_done(*id) {
+          Ok(result) => {
+            let typed = this.typed.take().expect("Assertion failed");
+            Poll::Ready(typed.extract_result(result))
+          }
           Err(crate::lio::Error::EntryNotCompleted) => {
             // Update waker in case it changed
             this.lio.set_waker(*id, cx.waker().clone());
@@ -470,19 +482,20 @@ where
           }
         }
       }
-      PFStatus::NeverPolled(op) => {
-        if let Some(taken_op) = op.take() {
-          let stored =
-            StoredOp::new_waker(Box::new(taken_op), cx.waker().clone());
-          let id = this
-            .lio
-            .schedule(stored)
-            .expect("lio error: lio should handle this");
-          this.status = PFStatus::HasPolled(id);
-          Poll::Pending
-        } else {
-          unreachable!()
-        }
+      PFStatus::NeverPolled => {
+        let op = this
+          .typed
+          .as_mut()
+          .expect("assertion failed: typed should exist when never polled.")
+          .into_op();
+
+        let id = this
+          .lio
+          .schedule(op, Notifier::new_waker(cx.waker().clone()))
+          .expect("lio error: lio should handle this");
+        this.status = PFStatus::HasPolled(id);
+
+        Poll::Pending
       }
     }
   }

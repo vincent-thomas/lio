@@ -1,7 +1,7 @@
 use crate::{
   backends::{IoBackend, OpStore},
-  operation::OperationExt,
-  registration::StoredOp,
+  op::Op,
+  registration::{Registration, notifier::Notifier},
 };
 
 use std::{io, task::Waker, time::Duration};
@@ -40,11 +40,15 @@ impl Lio {
       target_os = "openbsd",
       target_os = "netbsd"
     ))]
-    type Backend = crate::backends::pollingv2::Poller;
+    {
+      use crate::backends::pollingv2::Poller;
+      Self::new_with_backend(Poller::new(), cap)
+    }
     #[cfg(linux)]
-    type Backend = crate::backends::io_uring::IoUring;
-
-    Self::new_with_backend(Backend::new(), cap)
+    {
+      use crate::backends::io_uring::IoUring;
+      Self::new_with_backend(IoUring::new(), cap)
+    }
   }
 
   /// Creates a new Lio driver with the specified backend and capacity.
@@ -70,19 +74,18 @@ impl Lio {
     Ok(Self { io: Box::new(backend), store: OpStore::with_capacity(cap) })
   }
 
-  pub fn schedule(&mut self, stored: StoredOp) -> io::Result<u64> {
+  pub(crate) fn schedule(
+    &mut self,
+    op: Op,
+    notifier: Notifier,
+  ) -> io::Result<u64> {
     // Inserting first because of a stable pointer to push is required.
-    let id = self.store.insert(stored);
+    let id = self.store.insert(Registration::new(notifier));
 
-    let Some(registration) = self.store.get(id) else {
-      self.store.remove(id);
-      panic!("literally just inserted it");
-    };
-
-    match self.io.push(id, registration.op_ref()) {
+    match self.io.push(id, op) {
       Ok(()) => Ok(id),
       Err(err) => {
-        self.store.remove(id);
+        assert!(self.store.remove(id));
         Err(err)
       }
     }
@@ -111,7 +114,7 @@ impl Lio {
 
   fn run_inner(&mut self, timeout: Option<Duration>) -> io::Result<usize> {
     self.io.flush()?;
-    let completed = self.io.wait_timeout(&mut self.store, timeout)?;
+    let completed = self.io.wait_timeout(timeout)?;
 
     let len_completed = completed.len();
 
@@ -125,15 +128,12 @@ impl Lio {
     Ok(len_completed)
   }
 
-  pub fn check_done<T>(&mut self, key: u64) -> Result<T::Result, Error>
-  where
-    T: OperationExt,
-  {
+  pub(crate) fn check_done(&mut self, key: u64) -> Result<isize, Error> {
     match self.store.get_mut(key) {
       Some(entry) => {
         let result =
-          entry.try_extract::<T>().ok_or(Error::EntryNotCompleted)?;
-        self.store.remove(key);
+          entry.try_take_result().ok_or_else(|| Error::EntryNotCompleted)?;
+        assert!(self.store.remove(key));
         Ok(result)
       }
       None => Err(Error::EntryNotFound),

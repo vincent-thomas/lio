@@ -7,14 +7,13 @@ use std::io;
 use std::time::Duration;
 
 use crate::{
-  backends::{IoBackend, OpCompleted, OpStore},
-  operation::Operation,
+  backends::{IoBackend, OpCompleted},
+  op::Op,
 };
 
 /// A pending operation in the dummy backend
 struct PendingOp {
   id: u64,
-  result: i32,
 }
 
 /// Dummy backend for testing.
@@ -28,8 +27,8 @@ struct PendingOp {
 /// let mut backend = DummyBackend::default();
 /// backend.init(64)?;
 ///
-/// backend.push(id, &op)?;
-/// let completions = backend.poll(&mut store)?;
+/// backend.push(id, op)?;
+/// let completions = backend.poll()?;
 /// ```
 #[derive(Default)]
 pub struct DummyBackend {
@@ -48,32 +47,28 @@ impl DummyBackend {
 impl IoBackend for DummyBackend {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.pending = Vec::with_capacity(cap);
-    self.completed = Vec::with_capacity(cap.min(256)); // Reusable completions buffer
+    self.completed = Vec::with_capacity(cap.min(256));
     self.initialized = true;
     Ok(())
   }
 
-  fn push(&mut self, id: u64, _op: &dyn Operation) -> io::Result<()> {
+  fn push(&mut self, id: u64, _op: Op) -> io::Result<()> {
     assert!(self.initialized, "DummyBackend not initialized");
-    // For dummy backend, all operations succeed immediately with result 0
-    self.pending.push(PendingOp { id, result: 0 });
+    self.pending.push(PendingOp { id });
     Ok(())
   }
 
   fn flush(&mut self) -> io::Result<usize> {
-    // Dummy backend doesn't need flushing
     Ok(0)
   }
 
   fn wait_timeout(
     &mut self,
-    _store: &mut OpStore,
     _timeout: Option<Duration>,
   ) -> io::Result<&[OpCompleted]> {
     self.completed.clear();
-    // Return all pending operations immediately (dummy doesn't actually wait)
     for op in self.pending.drain(..) {
-      self.completed.push(OpCompleted::new(op.id, op.result as isize));
+      self.completed.push(OpCompleted::new(op.id, 0));
     }
     Ok(&self.completed)
   }
@@ -91,20 +86,13 @@ mod tests {
 
   #[test]
   fn test_push_and_poll() {
-    use crate::api::ops::Nop;
-
     let mut backend = DummyBackend::new();
     backend.init(64).unwrap();
 
-    let mut store = OpStore::with_capacity(64);
+    backend.push(1, Op::Nop).unwrap();
+    backend.push(2, Op::Nop).unwrap();
 
-    // Push a nop operation
-    backend.push(1, &Nop).unwrap();
-    backend.push(2, &Nop).unwrap();
-
-    // Poll should return both completions
-    let completions =
-      backend.wait_timeout(&mut store, Some(Duration::ZERO)).unwrap();
+    let completions = backend.wait_timeout(Some(Duration::ZERO)).unwrap();
     assert_eq!(completions.len(), 2);
   }
 }

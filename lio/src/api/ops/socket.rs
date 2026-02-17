@@ -2,7 +2,7 @@ use std::io;
 use std::os::fd::{FromRawFd, RawFd};
 
 use crate::api::resource::Resource;
-use crate::operation::{Operation, OperationExt};
+use crate::typed_op::TypedOp;
 
 // Not detach safe.
 pub struct Socket {
@@ -20,6 +20,14 @@ impl Socket {
     proto: libc::c_int,
   ) -> Self {
     Self { domain, ty, proto }
+  }
+
+  pub fn to_op(self) -> crate::op::Op {
+    crate::op::Op::Socket {
+      domain: self.domain,
+      ty: self.ty,
+      proto: self.proto,
+    }
   }
 
   /// Sets the close-on-exec flag on the socket file descriptor.
@@ -111,12 +119,18 @@ impl Socket {
   }
 }
 
-impl OperationExt for Socket {
+impl TypedOp for Socket {
   type Result = std::io::Result<Resource>;
-}
 
-impl Operation for Socket {
-  impl_result!(|_this, res: isize| -> io::Result<Resource> {
+  fn into_op(&mut self) -> crate::op::Op {
+    crate::op::Op::Socket {
+      domain: self.domain,
+      ty: self.ty,
+      proto: self.proto,
+    }
+  }
+
+  fn extract_result(self, res: isize) -> Self::Result {
     if res < 0 {
       Err(io::Error::from_raw_os_error((-res) as i32))
     } else {
@@ -124,97 +138,19 @@ impl Operation for Socket {
       let resource = unsafe { Resource::from_raw_fd(res as RawFd) };
       Ok(resource)
     }
-  });
-  impl_no_readyness!();
-
-  #[cfg(linux)]
-  // const OPCODE: u8 = 45;
-  #[cfg(linux)]
-  fn create_entry(&self) -> lio_uring::submission::Entry {
-    lio_uring::operation::Socket::new(self.domain, self.ty, self.proto).build()
   }
 
-  fn run_blocking(&self) -> isize {
-    eprintln!(
-      "[Socket::run_blocking] Starting socket creation: domain={}, type={}, proto={}",
-      self.domain, self.ty, self.proto
-    );
+  // #[cfg(unix)]
+  // fn meta(&self) -> crate::operation::OpMeta {
+  //   crate::operation::OpMeta::CAP_FD | crate::operation::OpMeta::FD_READ
+  // }
 
-    // Path 1: Platforms with SOCK_CLOEXEC support (atomic CLOEXEC flag)
-    #[cfg(any(
-      target_os = "android",
-      target_os = "dragonfly",
-      target_os = "freebsd",
-      target_os = "illumos",
-      target_os = "hurd",
-      target_os = "linux",
-      target_os = "netbsd",
-      target_os = "openbsd",
-      target_os = "cygwin",
-      target_os = "nto",
-      target_os = "solaris",
-    ))]
-    let fd = {
-      // Create socket with CLOEXEC set atomically (no race window)
-      let fd = syscall!(raw socket(
-        self.domain,
-        self.ty | libc::SOCK_CLOEXEC,
-        self.proto
-      )?);
+  // #[cfg(unix)]
+  // fn cap(&self) -> i32 {
+  //   -1
+  // }
 
-      // CRITICAL ERROR CLEANUP: If setup fails, close FD before returning error
-      let result = Self::setup_socket_options(fd as i32);
-
-      if result < 0 {
-        unsafe { libc::close(fd as i32) };
-        return result;
-      };
-      fd
-    };
-
-    // Path 2: Platforms without SOCK_CLOEXEC (macOS, etc.)
-    #[cfg(not(any(
-      target_os = "android",
-      target_os = "dragonfly",
-      target_os = "freebsd",
-      target_os = "illumos",
-      target_os = "hurd",
-      target_os = "linux",
-      target_os = "netbsd",
-      target_os = "openbsd",
-      target_os = "cygwin",
-      target_os = "nto",
-      target_os = "solaris",
-    )))]
-    let fd = {
-      let fd = syscall!(raw socket(self.domain, self.ty, self.proto)?);
-
-      // Set CLOEXEC if supported on this platform
-      #[cfg(not(any(
-        target_env = "newlib",
-        target_os = "emscripten",
-        target_os = "fuchsia",
-        target_os = "l4re",
-        target_os = "haiku",
-        target_os = "redox",
-        target_os = "vxworks",
-      )))]
-      {
-        let result = Self::set_cloexec(fd as i32);
-        if result < 0 {
-          let _ = syscall!(raw close(fd as i32));
-          return result;
-        }
-      }
-
-      let result = Self::setup_socket_options(fd as i32);
-      if result < 0 {
-        let _ = syscall!(raw close(fd as i32));
-        return result;
-      }
-      fd
-    };
-
-    fd
-  }
+  // fn run_blocking(&self) -> isize {
+  //   unsafe { libc::socket(self.domain, self.ty, self.proto) as isize }
+  // }
 }

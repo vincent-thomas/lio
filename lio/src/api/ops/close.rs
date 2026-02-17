@@ -1,40 +1,46 @@
 use std::io;
-use std::os::fd::AsRawFd;
 
-use crate::{
-  op::{Operation, OperationExt},
-  // resource::UniqueResource,
-};
+use crate::{api::resource::Resource, typed_op::TypedOp};
 
 pub struct Close {
-  res: UniqueResource,
+  res: Resource,
 }
 
 impl Close {
-  pub(crate) fn new(res: UniqueResource) -> Self {
+  pub(crate) fn new(res: Resource) -> Self {
     Self { res }
   }
 }
 
 assert_op_max_size!(Close);
 
-impl OperationExt for Close {
+impl TypedOp for Close {
   type Result = io::Result<()>;
-}
 
-impl Operation for Close {
-  impl_result!(());
-  impl_no_readyness!();
-
-  // #[cfg(linux)]
-  // const OPCODE: u8 = 19;
-
-  #[cfg(linux)]
-  fn create_entry(&self) -> lio_uring::submission::Entry {
-    lio_uring::operation::Close::new(self.res.as_raw_fd()).build()
+  fn into_op(&mut self) -> crate::op::Op {
+    crate::op::Op::Close { fd: self.res.clone() }
   }
 
-  fn run_blocking(&self) -> isize {
-    syscall!(raw close(self.res.as_raw_fd()))
+  fn extract_result(self, res: isize) -> Self::Result {
+    if res < 0 {
+      Err(io::Error::from_raw_os_error((-res) as i32))
+    } else {
+      Ok(())
+    }
   }
+
+  // #[cfg(unix)]
+  // fn meta(&self) -> crate::operation::OpMeta {
+  //   crate::op::Op::Close { fd: self.res.clone() }.meta()
+  // }
+
+  // #[cfg(unix)]
+  // fn cap(&self) -> i32 {
+  //   self.res.as_raw_fd()
+  // }
+
+  // fn run_blocking(&self) -> isize {
+  //   use std::os::fd::AsRawFd;
+  //   unsafe { libc::close(self.res.as_raw_fd()) as isize }
+  // }
 }
