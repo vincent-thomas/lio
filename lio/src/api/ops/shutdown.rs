@@ -1,8 +1,5 @@
-use std::os::fd::AsRawFd;
-
 use crate::api::resource::Resource;
-
-use crate::operation::{Operation, OperationExt};
+use crate::typed_op::TypedOp;
 
 pub struct Shutdown {
   res: Resource,
@@ -17,23 +14,33 @@ impl Shutdown {
   }
 }
 
-impl OperationExt for Shutdown {
+impl TypedOp for Shutdown {
   type Result = std::io::Result<()>;
-}
 
-impl Operation for Shutdown {
-  impl_result!(());
-  // NOTE: Not sure here, kqueue can prob be used with flags.
-  impl_no_readyness!();
-
-  #[cfg(linux)]
-  // const OPCODE: u8 = 34;
-  #[cfg(linux)]
-  fn create_entry(&self) -> lio_uring::submission::Entry {
-    lio_uring::operation::Shutdown::new(self.res.as_raw_fd(), self.how).build()
+  fn into_op(&mut self) -> crate::op::Op {
+    crate::op::Op::Shutdown { fd: self.res.clone(), how: self.how }
   }
 
-  fn run_blocking(&self) -> isize {
-    syscall!(raw shutdown(self.res.as_raw_fd(), self.how))
+  fn extract_result(self, res: isize) -> Self::Result {
+    if res < 0 {
+      Err(std::io::Error::from_raw_os_error((-res) as i32))
+    } else {
+      Ok(())
+    }
   }
+
+  // #[cfg(unix)]
+  // fn meta(&self) -> crate::operation::OpMeta {
+  //   crate::operation::OpMeta::CAP_FD
+  // }
+
+  // #[cfg(unix)]
+  // fn cap(&self) -> i32 {
+  //   self.res.as_raw_fd()
+  // }
+
+  // fn run_blocking(&self) -> isize {
+  //   use std::os::fd::AsRawFd;
+  //   unsafe { libc::shutdown(self.res.as_raw_fd(), self.how) as isize }
+  // }
 }

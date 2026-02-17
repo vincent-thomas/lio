@@ -1,13 +1,8 @@
 use std::os::fd::AsRawFd;
 
 use crate::{
-  BufResult,
-  api::resource::Resource,
-  buf::BufLike,
-  operation::{OpMeta, OperationExt},
+  BufResult, api::resource::Resource, buf::BufLike, typed_op::TypedOp,
 };
-
-use crate::operation::Operation;
 
 pub struct Recv<T>
 where
@@ -25,21 +20,37 @@ where
   pub(crate) fn new(res: Resource, buf: T, flags: Option<i32>) -> Self {
     Self { res, buf: Some(buf), flags: flags.unwrap_or(0) }
   }
+
+  pub fn to_op(mut self) -> crate::op::Op
+  where
+    T: BufLike + 'static,
+  {
+    let buffer = self.buf.take().expect("buffer already taken");
+    crate::op::Op::Recv {
+      fd: self.res,
+      flags: self.flags,
+      buffer: crate::op::ErasedBuffer::new(buffer),
+    }
+  }
 }
 
-impl<T> OperationExt for Recv<T>
+impl<T> TypedOp for Recv<T>
 where
-  T: BufLike + Send + Sync,
+  T: BufLike + Send + Sync + 'static,
 {
   type Result = BufResult<i32, T>;
-}
 
-impl<T> Operation for Recv<T>
-where
-  T: BufLike + Send + Sync,
-{
-  impl_result!(|this, res: isize| -> BufResult<i32, T> {
-    let buf = this.buf.take().expect("ran Recv::result more than once.");
+  fn into_op(&mut self) -> crate::op::Op {
+    let buffer = self.buf.take().expect("buffer already taken");
+    crate::op::Op::Recv {
+      fd: self.res.clone(),
+      flags: self.flags,
+      buffer: crate::op::ErasedBuffer::new(buffer),
+    }
+  }
+
+  fn extract_result(self, res: isize) -> Self::Result {
+    let buf = self.buf.expect("buffer already taken");
     let bytes = if res < 0 { 0 } else { res as usize };
     let out = buf.after(bytes);
     let result = if res < 0 {
@@ -48,38 +59,38 @@ where
       Ok(res as i32)
     };
     (result, out)
-  });
+  }
+
+  // #[cfg(unix)]
+  // fn meta(&self) -> crate::operation::OpMeta {
+  //   crate::operation::OpMeta::CAP_FD | crate::operation::OpMeta::FD_READ
+  // }
+
+  // #[cfg(unix)]
+  // fn cap(&self) -> i32 {
+  //   self.res.as_raw_fd()
+  // }
 
   // #[cfg(linux)]
-  // const OPCODE: u8 = 27;
+  // fn create_entry(&self) -> lio_uring::submission::Entry {
+  //   use std::os::fd::AsRawFd;
+  //   let buf_slice = self.buf.as_ref().unwrap().buf();
+  //   let ptr = buf_slice.as_ptr();
+  //   let len = buf_slice.len();
+  //   lio_uring::operation::Recv::new(
+  //     self.res.as_raw_fd(),
+  //     ptr.cast_mut(),
+  //     len as u32,
+  //   )
+  //   .flags(self.flags)
+  //   .build()
+  // }
 
-  #[cfg(linux)]
-  fn create_entry(&self) -> lio_uring::submission::Entry {
-    let buf_slice = self.buf.as_ref().unwrap().buf();
-    let ptr = buf_slice.as_ptr();
-    let len = buf_slice.len();
-    lio_uring::operation::Recv::new(
-      self.res.as_raw_fd(),
-      ptr.cast_mut(),
-      len as u32,
-    )
-    .flags(self.flags)
-    .build()
-  }
-
-  fn meta(&self) -> OpMeta {
-    OpMeta::CAP_FD | OpMeta::FD_READ
-  }
-
-  #[cfg(unix)]
-  fn cap(&self) -> i32 {
-    self.res.as_raw_fd()
-  }
-
-  fn run_blocking(&self) -> isize {
-    let buf_slice = self.buf.as_ref().unwrap().buf();
-    let ptr = buf_slice.as_ptr();
-    let len = buf_slice.len();
-    syscall!(raw recv(self.res.as_raw_fd(), ptr as *mut _, len, self.flags))
-  }
+  // fn run_blocking(&self) -> isize {
+  //   use std::os::fd::AsRawFd;
+  //   let buf_slice = self.buf.as_ref().unwrap().buf();
+  //   let ptr = buf_slice.as_ptr();
+  //   let len = buf_slice.len();
+  //   syscall!(raw recv(self.res.as_raw_fd(), ptr as *mut _, len, self.flags))
+  // }
 }

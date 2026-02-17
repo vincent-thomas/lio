@@ -1,12 +1,12 @@
 use crate::operation::OpMeta;
-#[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::io;
 use std::time::Duration;
-use std::{io::Error, os::fd::RawFd};
 
 #[cfg(linux)]
 use crate::api::resource::Resource;
-use crate::operation::{Operation, OperationExt};
+use crate::typed_op::TypedOp;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
 
 pub struct Timeout {
   duration: Duration,
@@ -86,73 +86,44 @@ impl Timeout {
   }
 }
 
-impl OperationExt for Timeout {
+impl TypedOp for Timeout {
   type Result = std::io::Result<()>;
-}
 
-impl Operation for Timeout {
-  impl_result!(|_this, res: isize| -> std::io::Result<()> {
+  fn into_op(&mut self) -> crate::op::Op {
+    crate::op::Op::Timeout {
+      duration: self.duration,
+      #[cfg(target_os = "linux")]
+      timer_fd: self.timer_res.clone(),
+      #[cfg(target_os = "linux")]
+      timespec: self.timespec,
+    }
+  }
+
+  fn extract_result(self, res: isize) -> Self::Result {
     if res == 0 {
       return Ok(());
     }
     match res.abs() as i32 {
       libc::ETIME => Ok(()),
-      _ => Err(Error::last_os_error()),
-    }
-  });
-
-  #[cfg(kqueue)]
-  fn meta(&self) -> OpMeta {
-    OpMeta::CAP_TIMER
-  }
-
-  #[cfg(not(kqueue))]
-  fn meta(&self) -> OpMeta {
-    OpMeta::CAP_FD | OpMeta::FD_READ
-  }
-
-  // #[cfg(linux)]
-  // const OPCODE: u8 = 11;
-
-  #[cfg(linux)]
-  fn create_entry(&self) -> lio_uring::submission::Entry {
-    lio_uring::operation::Timeout::new(&self.timespec as *const _ as *const _)
-      .build()
-  }
-
-  /// Very special case here for kqueue.
-  /// Return duration here.
-  #[cfg(unix)]
-  fn cap(&self) -> RawFd {
-    #[cfg(linux)]
-    {
-      self.timer_res.as_raw_fd()
-    }
-    #[cfg(kqueue)]
-    {
-      // For kqueue, encode duration as milliseconds in the "fd"
-      self.duration.as_millis() as RawFd
+      _ => Err(io::Error::last_os_error()),
     }
   }
 
-  fn run_blocking(&self) -> isize {
-    #[cfg(linux)]
-    {
-      // When the timer expires, read from the timerfd to clear it
-      let mut buf = [0u8; 8];
-      syscall!(raw read(
-        self.timer_res.as_raw_fd(),
-        buf.as_mut_ptr() as *mut libc::c_void,
-        8
-      ));
-      return 0;
-    }
+  // #[cfg(unix)]
+  // fn meta(&self) -> crate::operation::OpMeta {
+  //   crate::operation::OpMeta::CAP_TIMER
+  // }
 
-    #[cfg(kqueue)]
-    {
-      // For kqueue timers, run_blocking is called AFTER the timer fires
-      // from EVFILT_TIMER, so we just return success immediately
-      0
-    }
-  }
+  // #[cfg(unix)]
+  // fn cap(&self) -> i32 {
+  //   #[cfg(target_os = "linux")]
+  //   return self.timer_res.as_raw_fd();
+  //   #[cfg(not(target_os = "linux"))]
+  //   return -1;
+  // }
+
+  // fn run_blocking(&self) -> isize {
+  //   std::thread::sleep(self.duration);
+  //   0
+  // }
 }

@@ -223,6 +223,8 @@ pub struct Poller {
   sys: Option<sys::OsPoller>,
   /// Map of operation ID to file descriptor (for cleanup)
   fd_map: Option<scc::HashMap<u64, RawFd>>,
+  /// Map of operation ID to Op (for completion)
+  op_map: std::collections::HashMap<u64, crate::op::Op>,
   /// Event buffer for polling
   events: Events,
   /// Immediate completions (operations that completed without polling)
@@ -248,33 +250,129 @@ impl Poller {
     self.fd_map.as_ref().expect("Poller not initialized - call init() first")
   }
 
-  /// Register an operation for polling
-  fn register_polling(
-    &mut self,
-    id: u64,
-    op: &dyn Operation,
-  ) -> io::Result<()> {
-    let meta = op.meta();
-    let interest = if meta.is_cap_fd() {
-      if meta.is_fd_readable() && meta.is_fd_writable() {
-        Interest::READ_AND_WRITE
-      } else if meta.is_fd_readable() {
-        Interest::READ
-      } else if meta.is_fd_writable() {
-        Interest::WRITE
-      } else {
-        panic!("Operation has CAP_FD but no read/write interest")
+  fn run_op_blocking(op: crate::op::Op) -> isize {
+    use crate::buf::BufLike;
+    use crate::op::Op;
+    use std::os::fd::AsRawFd;
+
+    match op {
+      Op::Read { fd, buffer } => {
+        let fd = fd.as_raw_fd();
+        let buf = unsafe { buffer.take::<&mut [u8]>() };
+        let ptr = buf.as_mut_ptr();
+        let len = buf.len();
+        unsafe { libc::read(fd, ptr as *mut _, len) }
       }
-    } else if meta.is_cap_timer() {
-      Interest::TIMER
-    } else {
-      panic!("Operation has no capability")
-    };
-
-    self.fd_map().insert_sync(id, op.cap()).unwrap();
-    self.sys().add(op.cap(), id, interest)?;
-
-    Ok(())
+      Op::Write { fd, buffer } => {
+        let fd = fd.as_raw_fd();
+        let buf = unsafe { buffer.take::<&[u8]>() };
+        let ptr = buf.as_ptr() as *const libc::c_void;
+        let len = buf.len();
+        unsafe { libc::write(fd, ptr, len) }
+      }
+      Op::ReadAt { fd, offset, buffer } => {
+        let fd = fd.as_raw_fd();
+        let buf = unsafe { buffer.take::<&mut [u8]>() };
+        let ptr = buf.as_mut_ptr();
+        let len = buf.len();
+        unsafe { libc::pread(fd, ptr as *mut _, len, offset) }
+      }
+      Op::WriteAt { fd, offset, buffer } => {
+        let fd = fd.as_raw_fd();
+        let buf = unsafe { buffer.take::<&[u8]>() };
+        let ptr = buf.as_ptr() as *const libc::c_void;
+        let len = buf.len();
+        unsafe { libc::pwrite(fd, ptr, len, offset) }
+      }
+      Op::Send { fd, flags, buffer } => {
+        let fd = fd.as_raw_fd();
+        let buf = unsafe { buffer.take::<&[u8]>() };
+        let ptr = buf.as_ptr() as *const libc::c_void;
+        let len = buf.len();
+        unsafe { libc::send(fd, ptr, len, flags) }
+      }
+      Op::Recv { fd, flags, buffer } => {
+        let fd = fd.as_raw_fd();
+        let buf = unsafe { buffer.take::<&mut [u8]>() };
+        let ptr = buf.as_mut_ptr();
+        let len = buf.len();
+        unsafe { libc::recv(fd, ptr as *mut _, len, flags) }
+      }
+      Op::Accept { fd, addr, len } => unsafe {
+        let fd = fd.as_raw_fd();
+        libc::accept(fd, addr as *mut _, len) as isize
+      },
+      Op::Connect { fd, addr, len, connect_called: _ } => {
+        let fd = fd.as_raw_fd();
+        unsafe {
+          let ret = libc::connect(
+            fd,
+            std::mem::transmute::<&libc::sockaddr_storage, _>(&addr),
+            len,
+          );
+          if ret < 0 {
+            let err = *libc::__error();
+            if err == libc::EINPROGRESS || err == libc::EISCONN {
+              return if err == libc::EISCONN { 0 } else { -(err as isize) };
+            }
+          }
+          ret as isize
+        }
+      }
+      Op::Bind { fd, addr } => unsafe {
+        let fd = fd.as_raw_fd();
+        libc::bind(
+          fd,
+          std::mem::transmute::<&libc::sockaddr_storage, _>(&addr),
+          std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+        ) as isize
+      },
+      Op::Listen { fd, backlog } => unsafe {
+        let fd = fd.as_raw_fd();
+        libc::listen(fd, backlog) as isize
+      },
+      Op::Shutdown { fd, how } => unsafe {
+        let fd = fd.as_raw_fd();
+        libc::shutdown(fd, how) as isize
+      },
+      Op::Socket { domain, ty, proto } => unsafe {
+        libc::socket(domain, ty, proto) as isize
+      },
+      Op::OpenAt { dir_fd, path, flags } => unsafe {
+        libc::openat(dir_fd.as_raw_fd(), path, flags) as isize
+      },
+      Op::Close { fd } => unsafe { libc::close(fd.as_raw_fd()) as isize },
+      Op::Fsync { fd } => unsafe { libc::fsync(fd.as_raw_fd()) as isize },
+      Op::Truncate { fd, size } => unsafe {
+        libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) as isize
+      },
+      Op::LinkAt { old_dir_fd, old_path, new_dir_fd, new_path } => unsafe {
+        libc::linkat(
+          old_dir_fd.as_raw_fd(),
+          old_path,
+          new_dir_fd.as_raw_fd(),
+          new_path,
+          0,
+        ) as isize
+      },
+      Op::SymlinkAt { target, linkpath, dir_fd } => unsafe {
+        libc::symlinkat(target, dir_fd.as_raw_fd(), linkpath) as isize
+      },
+      #[cfg(target_os = "linux")]
+      Op::Tee { fd_in, fd_out, size } => unsafe {
+        libc::tee(
+          fd_in.as_raw_fd(),
+          fd_out.as_raw_fd(),
+          size as libc::size_t,
+          0,
+        ) as isize
+      },
+      Op::Timeout { duration, .. } => {
+        std::thread::sleep(duration);
+        0
+      }
+      Op::Nop => 0,
+    }
   }
 }
 
@@ -282,45 +380,83 @@ impl IoBackend for Poller {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.sys = Some(sys::OsPoller::new()?);
     self.fd_map = Some(scc::HashMap::with_capacity(cap));
-    self.events = Events::with_capacity(cap.min(4096)); // Don't allocate huge event buffers
-    self.immediate = Vec::with_capacity(64); // Small buffer for immediate completions
-    self.completed = Vec::with_capacity(cap.min(256)); // Reusable completions buffer
+    self.op_map = std::collections::HashMap::with_capacity(cap);
+    self.events = Events::with_capacity(cap.min(4096));
+    self.immediate = Vec::with_capacity(64);
+    self.completed = Vec::with_capacity(cap.min(256));
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: &dyn Operation) -> io::Result<()> {
-    let meta = op.meta();
+  fn push(&mut self, id: u64, op: crate::op::Op) -> io::Result<()> {
+    use crate::backends::pollingv2::interest::Interest;
+    use crate::op::Op;
+    use std::os::fd::AsRawFd;
 
-    // Operations with no capability (like NOP) complete immediately
-    if meta.is_cap_none() {
-      let result = op.run_blocking();
-      self.immediate.push(ImmediateCompletion { id, result });
-      return Ok(());
-    }
-
-    // cap is either timer or fd.
-    // let cap = op.cap
-    //     if meta.is_cap_timer() || meta.is {
-    //       let milliseconds = op.cap();
-    //       self.sys.as_ref().unwrap().add(milliseconds, id, op.)
-    //     }
-
-    // Operations that need to run before polling (like CONNECT)
-    if meta.is_cap_fd() && meta.is_beh_run_before_noti() {
-      let result = op.run_blocking();
-
-      if result == -(libc::EINPROGRESS as isize) {
-        // Connection in progress - register for polling
-        return self.register_polling(id, op);
-      } else {
-        // Completed immediately (success or error)
+    let fd_and_interest = match &op {
+      Op::Read { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
+      Op::Write { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
+      Op::ReadAt { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
+      Op::WriteAt { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
+      Op::Send { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
+      Op::Recv { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
+      Op::Accept { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
+      Op::Connect { .. } => None,
+      Op::Bind { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
+      Op::Listen { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
+      Op::Shutdown { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
+      Op::OpenAt { dir_fd, .. } => Some((dir_fd.as_raw_fd(), Interest::READ)),
+      Op::Close { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
+      Op::Fsync { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
+      Op::Truncate { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
+      #[cfg(target_os = "linux")]
+      Op::Tee { fd_in, .. } => {
+        Some((fd_in.as_raw_fd(), Interest::READ_AND_WRITE))
+      }
+      Op::Timeout { .. } => None,
+      Op::Nop => {
+        let result = Poller::run_op_blocking(op);
         self.immediate.push(ImmediateCompletion { id, result });
         return Ok(());
       }
+      Op::Socket { .. } => None,
+      Op::LinkAt { .. } | Op::SymlinkAt { .. } => {
+        let result = Poller::run_op_blocking(op);
+        self.immediate.push(ImmediateCompletion { id, result });
+        return Ok(());
+      }
+    };
+
+    self.op_map.insert(id, op);
+
+    if let Some((fd, interest)) = fd_and_interest {
+      self.fd_map().insert_sync(id, fd).unwrap();
+      self.sys().add(fd, id, interest)?;
+    } else {
+      match &self.op_map[&id] {
+        Op::Connect { fd, .. } => {
+          let fd = fd.as_raw_fd();
+          let result =
+            Poller::run_op_blocking(self.op_map.remove(&id).unwrap());
+          if result == -(libc::EINPROGRESS as isize) {
+            self.fd_map().insert_sync(id, fd).unwrap();
+            self.sys().add(fd, id, Interest::WRITE)?;
+          } else {
+            self.immediate.push(ImmediateCompletion { id, result });
+          }
+        }
+        Op::Timeout { .. } => {
+          self.immediate.push(ImmediateCompletion { id, result: 0 });
+        }
+        Op::Socket { .. } => {
+          let result =
+            Poller::run_op_blocking(self.op_map.remove(&id).unwrap());
+          self.immediate.push(ImmediateCompletion { id, result });
+        }
+        _ => {}
+      }
     }
 
-    // Regular operations - just register for polling
-    self.register_polling(id, op)
+    Ok(())
   }
 
   fn flush(&mut self) -> io::Result<usize> {
@@ -337,7 +473,6 @@ impl IoBackend for Poller {
   /// - `timeout = Some(duration)`: Wait up to duration
   fn wait_timeout(
     &mut self,
-    store: &mut OpStore,
     timeout: Option<Duration>,
   ) -> io::Result<&[OpCompleted]> {
     self.completed.clear();
@@ -358,7 +493,10 @@ impl IoBackend for Poller {
     // SAFETY: The OS's wait() call filled items_written events into our buffer
     unsafe { self.events.set_len(items_written) };
 
-    for event in self.events.iter() {
+    // Collect events first to avoid borrow conflicts
+    let events_to_process: Vec<_> = self.events.iter().collect();
+
+    for event in events_to_process {
       let operation_id = event.key;
 
       // Skip internal notification events
@@ -366,10 +504,14 @@ impl IoBackend for Poller {
         continue;
       }
 
-      let entry = store
-        .get_mut(operation_id)
-        .expect("lio bookeeping error: couldn't find entry");
-      let result = entry.run_blocking();
+      // Get the operation from our op_map and run it
+      let op = match self.op_map.remove(&operation_id) {
+        Some(op) => op,
+        None => {
+          panic!("couldn't find op for operation {}", operation_id);
+        }
+      };
+      let result = Poller::run_op_blocking(op);
 
       // Look up fd from our internal map
       let Some(entry_fd) = self.fd_map().get_sync(&operation_id).map(|fd| *fd)

@@ -16,7 +16,7 @@
 
 use std::collections::VecDeque;
 
-use crate::registration::{Registration, StoredOp};
+use crate::registration::Registration;
 
 /// A slot in the store containing generation and optional entry.
 struct Slot {
@@ -77,6 +77,17 @@ pub struct OpStore {
   capacity: u32,
 }
 
+#[derive(Debug)]
+pub struct StoreAtCapacity;
+
+impl std::fmt::Display for StoreAtCapacity {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("StoreAtCapacity")
+  }
+}
+
+impl std::error::Error for StoreAtCapacity {}
+
 impl OpStore {
   /// Creates a new OpStore with default capacity (1024).
   #[cfg(test)]
@@ -129,24 +140,32 @@ impl OpStore {
   /// # Panics
   ///
   /// Panics if the store is at capacity.
-  pub fn insert(&mut self, stored: StoredOp) -> u64 {
-    let index = self.next_id().expect("OpStore: out of capacity");
+  pub fn insert(&mut self, reg: Registration) -> u64 {
+    self.try_insert(reg).expect("at capacity")
+  }
+
+  /// Inserts an operation into the store and returns its ID.
+  pub fn try_insert(
+    &mut self,
+    reg: Registration,
+  ) -> Result<u64, StoreAtCapacity> {
+    let index = self.next_id().ok_or_else(|| StoreAtCapacity)?;
 
     let slot = &mut self.slots[index.slot() as usize];
-    debug_assert!(
+    assert!(
       slot.entry.is_none(),
       "OpStore: slot {} should be empty",
       index.slot()
     );
-    debug_assert_eq!(
+    assert_eq!(
       slot.generation,
       index.generation(),
       "OpStore: generation mismatch"
     );
 
-    slot.entry = Some(Registration::new(stored));
+    slot.entry = Some(reg);
 
-    index.as_u64()
+    Ok(index.as_u64())
   }
 
   /// Removes an operation from the store.
@@ -155,74 +174,55 @@ impl OpStore {
   /// was invalid (not found, already removed, or stale generation).
   pub fn remove(&mut self, id: u64) -> bool {
     let index = Index::from_u64(id);
+    let slot = match self.raw_get_mut_slot(index) {
+      Some(slot) => slot,
+      None => return false,
+    };
 
-    if index.slot() >= self.capacity {
-      return false;
-    }
+    // Remove the entry
+    slot.entry = None;
+    // Increment generation for next use (ABA protection)
+    slot.generation = slot.generation.strict_add(1);
+    // Return slot to free list
+    self.free_list.push_back(index.slot());
 
-    let slot = &mut self.slots[index.slot() as usize];
-
-    // Check generation matches and slot is occupied
-    if slot.generation == index.generation() && slot.entry.is_some() {
-      // Remove the entry
-      slot.entry = None;
-      // Increment generation for next use (ABA protection)
-      slot.generation = slot.generation.wrapping_add(1);
-      // Return slot to free list
-      self.free_list.push_back(index.slot());
-      true
-    } else {
-      false
-    }
+    true
   }
 
   /// Gets mutable access to an operation's registration.
   ///
   /// Returns `None` if the ID is invalid or refers to a stale generation.
   pub fn get_mut(&mut self, id: u64) -> Option<&mut Registration> {
-    let index = Index::from_u64(id);
-
-    if index.slot() >= self.capacity {
-      return None;
-    }
-
-    let slot = &mut self.slots[index.slot() as usize];
-
-    if slot.generation == index.generation() {
-      slot.entry.as_mut()
-    } else {
-      None
-    }
+    self.raw_get_mut_slot(Index::from_u64(id))?.entry.as_mut()
   }
 
   /// Gets read-only access to an operation's registration.
   ///
-  /// Returns `None` if the ID is invalid or refers to a stale generation.
+  /// Returns `None` if the ID is invalid or not found.
   pub fn get(&self, id: u64) -> Option<&Registration> {
-    let index = Index::from_u64(id);
+    self.raw_get_slot(Index::from_u64(id))?.entry.as_ref()
+  }
 
-    if index.slot() >= self.capacity {
-      return None;
-    }
+  fn raw_get_slot(&self, index: Index) -> Option<&Slot> {
+    let slot = self.slots.get(index.slot() as usize)?;
+    if slot.generation == index.generation() { Some(slot) } else { None }
+  }
 
-    let slot = &self.slots[index.slot() as usize];
-
-    if slot.generation == index.generation() {
-      slot.entry.as_ref()
-    } else {
-      None
-    }
+  fn raw_get_mut_slot(&mut self, index: Index) -> Option<&mut Slot> {
+    let slot = self.slots.get_mut(index.slot() as usize)?;
+    if slot.generation == index.generation() { Some(slot) } else { None }
   }
 }
 
 #[cfg(test)]
 mod tests {
+  use crate::registration::notifier::Notifier;
+
   use super::*;
   use std::collections::HashSet;
 
   // Helper to create a dummy StoredOp
-  fn dummy_stored_op() -> StoredOp {
-    use crate::api::ops::Nop;
+  fn dummy_stored_op() -> Registration {
     use std::task::{RawWaker, RawWakerVTable, Waker};
 
     unsafe fn clone(_: *const ()) -> RawWaker {
@@ -237,7 +237,7 @@ mod tests {
     let raw_waker = RawWaker::new(std::ptr::null(), &VTABLE);
     let waker = unsafe { Waker::from_raw(raw_waker) };
 
-    StoredOp::new_waker(Box::new(Nop), waker)
+    Registration::new(Notifier::new_waker(waker))
   }
 
   #[test]

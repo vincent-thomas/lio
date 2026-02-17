@@ -126,7 +126,7 @@ impl Socket {
     ty: libc::c_int,
     proto: libc::c_int,
   ) -> Io<'static, SocketNew> {
-    let socket_accept_op = SocketNew(ops::Socket::new(domain, ty, proto));
+    let socket_accept_op = SocketNew::new(domain, ty, proto);
     Io::from_op(socket_accept_op)
   }
 
@@ -217,8 +217,7 @@ impl Socket {
   /// # lio::exit();
   /// ```
   pub fn accept(&self) -> Io<'_, SocketAccept> {
-    // Create Accept operation and wrap it in SocketAccept
-    let socket_accept_op = SocketAccept(Accept::new(self.0.clone()));
+    let socket_accept_op = SocketAccept::new(self.0.clone());
     Io::from_op(socket_accept_op)
   }
 

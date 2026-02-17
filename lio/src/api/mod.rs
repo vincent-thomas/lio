@@ -74,11 +74,16 @@ use crate::{api::resource::AsResource, buf::BufLike};
 use io::Io;
 use std::{ffi::CString, net::SocketAddr, time::Duration};
 
+// Import the TypedOp operations we've migrated
+use ops::{
+  Accept, Close, Connect, Nop, Read, Shutdown, Socket, Timeout, Write,
+};
+
 doc_op! {
     short: "does nothing. maybe useful for testing?",
 
     pub fn nop() -> Io<'static, ops::Nop> {
-        Io::from_op(ops::Nop)
+        Io::from_op(Nop)
     }
 }
 
@@ -90,7 +95,7 @@ doc_op! {
     ///
     /// Shuts down the read, write, or both halves of this connection.
     pub fn shutdown(res: &impl AsResource, how: i32) -> Io<'static, ops::Shutdown> {
-        Io::from_op(ops::Shutdown::new(res.as_resource().clone(), how))
+        Io::from_op(Shutdown::new(res.as_resource().clone(), how))
     }
 }
 
@@ -158,11 +163,11 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn write<B>(res: &impl AsResource, buf: B) -> Io<'static, ops::Write<B>>
+    pub fn write<B>(res: &impl AsResource, buf: B) -> Io<'static, Write<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
-        Io::from_op(ops::Write::new(res.as_resource().clone(), buf))
+        Io::from_op(Write::new(res.as_resource().clone(), buf))
     }
 }
 

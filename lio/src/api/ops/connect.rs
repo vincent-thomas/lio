@@ -1,19 +1,19 @@
 use std::{
-  io, mem,
+  io,
   net::SocketAddr,
   os::fd::AsRawFd,
   sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::{
-  api::resource::Resource,
-  net_utils::std_socketaddr_into_libc,
-  operation::{OpMeta, Operation, OperationExt},
+  api::resource::Resource, net_utils::std_socketaddr_into_libc,
+  typed_op::TypedOp,
 };
 
 pub struct Connect {
   res: Resource,
   addr: libc::sockaddr_storage,
+  len: libc::socklen_t,
   connect_called: AtomicBool,
 }
 
@@ -21,72 +21,75 @@ assert_op_max_size!(Connect);
 
 impl Connect {
   pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {
-    Self {
-      res,
-      addr: std_socketaddr_into_libc(addr),
-      connect_called: AtomicBool::new(false),
-    }
+    let addr = std_socketaddr_into_libc(addr);
+    let len = if addr.ss_family == libc::AF_INET as libc::sa_family_t {
+      std::mem::size_of::<libc::sockaddr_in>()
+    } else if addr.ss_family == libc::AF_INET6 as libc::sa_family_t {
+      std::mem::size_of::<libc::sockaddr_in6>()
+    } else {
+      std::mem::size_of::<libc::sockaddr_storage>()
+    } as libc::socklen_t;
+    Self { res, addr, len, connect_called: AtomicBool::new(false) }
   }
 
-  fn get_addrlen(&self) -> libc::socklen_t {
-    let addrlen = if self.addr.ss_family == libc::AF_INET as libc::sa_family_t {
-      mem::size_of::<libc::sockaddr_in>()
-    } else if self.addr.ss_family == libc::AF_INET6 as libc::sa_family_t {
-      mem::size_of::<libc::sockaddr_in6>()
-    } else {
-      mem::size_of::<libc::sockaddr_storage>()
-    };
-
-    addrlen as libc::socklen_t
+  /// Convert this operation into an Op enum variant.
+  pub fn to_op(self) -> crate::op::Op {
+    let connect_called = self.connect_called.load(Ordering::Relaxed);
+    crate::op::Op::Connect {
+      fd: self.res,
+      addr: self.addr,
+      len: self.len,
+      connect_called,
+    }
   }
 }
 
-impl OperationExt for Connect {
+impl TypedOp for Connect {
   type Result = io::Result<()>;
-}
 
-impl Operation for Connect {
-  impl_result!(());
-
-  // #[cfg(linux)]
-  // const OPCODE: u8 = 16;
-
-  #[cfg(linux)]
-  fn create_entry(&self) -> lio_uring::submission::Entry {
-    lio_uring::operation::Connect::new(
-      self.res.as_raw_fd(),
-      (&self.addr as *const libc::sockaddr_storage).cast(),
-      self.get_addrlen(),
-    )
-    .build()
-  }
-
-  fn meta(&self) -> OpMeta {
-    OpMeta::CAP_FD | OpMeta::FD_WRITE | OpMeta::BEH_NEEDS_RUN
-  }
-
-  fn cap(&self) -> i32 {
-    self.res.as_raw_fd()
-  }
-
-  fn run_blocking(&self) -> isize {
-    let result = syscall!(raw connect(
-      self.res.as_raw_fd(),
-      (&self.addr as *const libc::sockaddr_storage).cast(),
-      self.get_addrlen(),
-    ));
-
-    // Track if this is the first connect() call for this operation
-    let is_first_call = !self.connect_called.swap(true, Ordering::SeqCst);
-
-    // - If this is a subsequent call: connection just completed (success)
-    // - If this is the first connect() call: socket was already connected (error)
-    // if result < 0 {
-    if !is_first_call && result == -libc::EISCONN as isize {
-      //   // First connect() returned EISCONN = socket was already connected
-      0
-    } else {
-      result
+  fn into_op(&mut self) -> crate::op::Op {
+    let connect_called = self.connect_called.load(Ordering::Relaxed);
+    crate::op::Op::Connect {
+      fd: self.res.clone(),
+      addr: self.addr,
+      len: self.len,
+      connect_called,
     }
   }
+
+  fn extract_result(self, res: isize) -> Self::Result {
+    if res < 0 {
+      Err(io::Error::from_raw_os_error((-res) as i32))
+    } else {
+      Ok(())
+    }
+  }
+
+  // #[cfg(unix)]
+  // fn meta(&self) -> crate::operation::OpMeta {
+  //   crate::operation::OpMeta::CAP_FD | crate::operation::OpMeta::FD_WRITE
+  // }
+
+  // #[cfg(unix)]
+  // fn cap(&self) -> i32 {
+  //   self.res.as_raw_fd()
+  // }
+
+  // fn run_blocking(&self) -> isize {
+  //   use std::os::fd::AsRawFd;
+  //   let ret = unsafe {
+  //     libc::connect(
+  //       self.res.as_raw_fd(),
+  //       &self.addr as *const _ as *const _,
+  //       self.len,
+  //     )
+  //   };
+  //   if ret < 0 {
+  //     let err = unsafe { *libc::__error() };
+  //     if err == libc::EINPROGRESS || err == libc::EISCONN {
+  //       return if err == libc::EISCONN { 0 } else { -err as isize };
+  //     }
+  //   }
+  //   ret as isize
+  // }
 }

@@ -1,9 +1,8 @@
 use std::{io, mem, net::SocketAddr, os::fd::AsRawFd};
 
 use crate::{
-  api::resource::Resource,
-  net_utils::std_socketaddr_into_libc,
-  operation::{Operation, OperationExt},
+  api::resource::Resource, net_utils::std_socketaddr_into_libc,
+  typed_op::TypedOp,
 };
 
 pub struct Bind {
@@ -15,45 +14,63 @@ impl Bind {
   pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {
     Self { res, addr: std_socketaddr_into_libc(addr) }
   }
+
+  pub fn to_op(self) -> crate::op::Op {
+    crate::op::Op::Bind { fd: self.res, addr: self.addr }
+  }
 }
 
 assert_op_max_size!(Bind);
 
-impl OperationExt for Bind {
+impl TypedOp for Bind {
   type Result = io::Result<()>;
-}
 
-impl Operation for Bind {
-  impl_no_readyness!();
-  impl_result!(());
+  fn into_op(&mut self) -> crate::op::Op {
+    crate::op::Op::Bind { fd: self.res.clone(), addr: self.addr }
+  }
+
+  fn extract_result(self, res: isize) -> Self::Result {
+    if res < 0 {
+      Err(io::Error::from_raw_os_error((-res) as i32))
+    } else {
+      Ok(())
+    }
+  }
+
+  // #[cfg(unix)]
+  // fn meta(&self) -> crate::operation::OpMeta {
+  //   crate::operation::OpMeta::CAP_FD
+  // }
+
+  // #[cfg(unix)]
+  // fn cap(&self) -> i32 {
+  //   self.res.as_raw_fd()
+  // }
 
   // #[cfg(linux)]
-  // const OPCODE: u8 = 56;
+  // fn create_entry(&self) -> lio_uring::submission::Entry {
+  //   lio_uring::operation::Bind::new(
+  //     self.res.as_raw_fd(),
+  //     (&self.addr as *const libc::sockaddr_storage).cast(),
+  //     mem::size_of_val(&self.addr) as libc::socklen_t,
+  //   )
+  //   .build()
+  // }
 
-  #[cfg(linux)]
-  fn create_entry(&self) -> lio_uring::submission::Entry {
-    lio_uring::operation::Bind::new(
-      self.res.as_raw_fd(),
-      (&self.addr as *const libc::sockaddr_storage).cast(),
-      mem::size_of_val(&self.addr) as libc::socklen_t,
-    )
-    .build()
-  }
+  // fn run_blocking(&self) -> isize {
+  //   let storage = self.addr;
+  //   let addrlen = if storage.ss_family == libc::AF_INET as libc::sa_family_t {
+  //     mem::size_of::<libc::sockaddr_in>()
+  //   } else if storage.ss_family == libc::AF_INET6 as libc::sa_family_t {
+  //     mem::size_of::<libc::sockaddr_in6>()
+  //   } else {
+  //     mem::size_of::<libc::sockaddr_storage>()
+  //   };
 
-  fn run_blocking(&self) -> isize {
-    let storage = self.addr;
-    let addrlen = if storage.ss_family == libc::AF_INET as libc::sa_family_t {
-      mem::size_of::<libc::sockaddr_in>()
-    } else if storage.ss_family == libc::AF_INET6 as libc::sa_family_t {
-      mem::size_of::<libc::sockaddr_in6>()
-    } else {
-      mem::size_of::<libc::sockaddr_storage>()
-    };
-
-    syscall!(raw bind(
-      self.res.as_raw_fd(),
-      (&self.addr as *const libc::sockaddr_storage).cast(),
-      addrlen as libc::socklen_t,
-    ))
-  }
+  //   syscall!(raw bind(
+  //     self.res.as_raw_fd(),
+  //     (&self.addr as *const libc::sockaddr_storage).cast(),
+  //     addrlen as libc::socklen_t,
+  //   ))
+  // }
 }

@@ -174,8 +174,7 @@ impl TcpListener {
   /// # lio::exit();
   /// ```
   pub fn accept(&self) -> Io<'_, TcpAccept> {
-    // Create Accept operation and wrap it in SocketAccept
-    let socket_accept_op = TcpAccept(Accept::new(self.0.as_resource().clone()));
+    let socket_accept_op = TcpAccept::new(self.0.as_resource().clone());
     Io::from_op(socket_accept_op)
   }
 }

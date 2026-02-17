@@ -1,18 +1,17 @@
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+// #[cfg(unix)]
 use std::{
   io::{self, Error},
-  mem::{self},
+  mem::{self, MaybeUninit},
   net::SocketAddr,
+  os::fd::{AsRawFd, FromRawFd, RawFd},
 };
 
 use crate::{
   api::resource::Resource,
   net_utils::libc_socketaddr_into_std,
-  operation::{OpMeta, OperationExt},
+  op::Op,
+  typed_op::{ResultNotMatching, TypedOp},
 };
-
-use crate::operation::Operation;
 
 // Not detach safe.
 pub struct Accept {
@@ -35,14 +34,27 @@ impl Accept {
     let addr: libc::sockaddr_storage = unsafe { mem::zeroed() };
     Self { res, addr, len: mem::size_of_val(&addr) as libc::socklen_t }
   }
+
+  pub fn to_op(self) -> crate::op::Op {
+    crate::op::Op::Accept {
+      fd: self.res,
+      addr: Box::into_raw(Box::new(self.addr)),
+      len: Box::into_raw(Box::new(self.len)),
+    }
+  }
 }
 
-impl OperationExt for Accept {
+impl TypedOp for Accept {
   type Result = io::Result<(Resource, SocketAddr)>;
-}
 
-impl Operation for Accept {
-  impl_result!(|this, res: isize| -> io::Result<(Resource, SocketAddr)> {
+  fn into_op(&mut self) -> crate::op::Op {
+    Op::Accept {
+      fd: self.res.clone(),
+      addr: &mut self.addr as *mut _,
+      len: &mut self.len as *mut _,
+    }
+  }
+  fn extract_result(self, res: isize) -> Self::Result {
     let result = if res < 0 {
       return Err(Error::from_raw_os_error(-res as i32));
     } else {
@@ -52,102 +64,132 @@ impl Operation for Accept {
     // SAFETY: result is valid fd.
     let res = unsafe { Resource::from_raw_fd(result) };
     // SAFETY: valid pointer.
-    let addr = unsafe { libc_socketaddr_into_std(&this.addr as *const _) }?;
-
+    let addr = unsafe { libc_socketaddr_into_std(&self.addr as *const _) }?;
     Ok((res, addr))
-  });
-
-  // #[cfg(linux)]
-  // const OPCODE: u8 = 13;
-
-  #[cfg(linux)]
-  fn create_entry(&self) -> lio_uring::submission::Entry {
-    lio_uring::operation::Accept::new(
-      self.res.as_raw_fd(),
-      &self.addr as *const _ as *mut libc::sockaddr,
-      (&self.len as *const libc::socklen_t).cast_mut(),
-    )
-    .build()
   }
 
-  fn meta(&self) -> OpMeta {
-    OpMeta::CAP_FD | OpMeta::FD_READ
-  }
+  // #[cfg(unix)]
+  // fn meta(&self) -> crate::operation::OpMeta {
+  //   crate::operation::OpMeta::CAP_FD | crate::operation::OpMeta::FD_READ
+  // }
 
-  #[cfg(unix)]
-  fn cap(&self) -> i32 {
-    self.res.as_raw_fd()
-  }
+  // #[cfg(unix)]
+  // fn cap(&self) -> i32 {
+  //   self.res.as_raw_fd()
+  // }
 
-  fn run_blocking(&self) -> isize {
-    #[cfg(any(
-      target_os = "android",
-      target_os = "dragonfly",
-      target_os = "freebsd",
-      target_os = "illumos",
-      target_os = "linux",
-      target_os = "hurd",
-      target_os = "netbsd",
-      target_os = "openbsd",
-      target_os = "cygwin",
-    ))]
-    let fd = {
-      syscall!(raw accept4(
-        self.res.as_raw_fd(),
-        &self.addr as *const _ as *mut libc::sockaddr,
-        (&self.len as *const libc::socklen_t).cast_mut(),
-        libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK
-      ))
-    };
-
-    #[cfg(not(any(
-      target_os = "android",
-      target_os = "dragonfly",
-      target_os = "freebsd",
-      target_os = "illumos",
-      target_os = "linux",
-      target_os = "hurd",
-      target_os = "netbsd",
-      target_os = "openbsd",
-      target_os = "cygwin",
-    )))]
-    let fd = {
-      let socket = syscall!(raw accept(
-        self.res.as_raw_fd(),
-        &self.addr as *const _ as *mut libc::sockaddr,
-        (&self.len as *const libc::socklen_t).cast_mut()
-      )?);
-
-      if socket < 0 {
-        return socket;
-      }
-
-      // Ensure the socket is closed if either of the `fcntl` calls error below
-      #[cfg(not(any(target_os = "espidf", target_os = "vita")))]
-      {
-        let res =
-          syscall!(raw fcntl(socket as i32, libc::F_SETFD, libc::FD_CLOEXEC));
-        if res < 0 {
-          syscall!(raw close(socket as i32));
-          return res;
-        }
-      }
-
-      // See https://github.com/tokio-rs/mio/issues/1450
-      #[cfg(not(any(target_os = "espidf", target_os = "vita")))]
-      {
-        let res =
-          syscall!(raw fcntl(socket as i32, libc::F_SETFL, libc::O_NONBLOCK));
-        if res < 0 {
-          let _ = syscall!(raw close(socket as i32));
-          return res;
-        }
-      }
-
-      socket
-    };
-
-    fd
-  }
+  // fn run_blocking(&self) -> isize {
+  //   use std::os::fd::AsRawFd;
+  //   let res = self.res.as_raw_fd();
+  //   let mut addr = MaybeUninit::<libc::sockaddr_storage>::uninit();
+  //   let mut len =
+  //     std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+  //   unsafe {
+  //     libc::accept(res, addr.as_mut_ptr() as *mut libc::sockaddr, &mut len)
+  //       as isize
+  //   }
+  // }
 }
-assert_op_max_size!(Accept);
+
+// impl OperationExt for Accept {
+//   type Result = io::Result<(Resource, SocketAddr)>;
+// }
+//
+// impl Operation for Accept {
+//   impl_result!(|this, res: isize| -> io::Result<(Resource, SocketAddr)> {
+//   });
+//
+//   // #[cfg(linux)]
+//   // const OPCODE: u8 = 13;
+//
+//   #[cfg(linux)]
+//   fn create_entry(&self) -> lio_uring::submission::Entry {
+//     lio_uring::operation::Accept::new(
+//       self.res.as_raw_fd(),
+//       &self.addr as *const _ as *mut libc::sockaddr,
+//       (&self.len as *const libc::socklen_t).cast_mut(),
+//     )
+//     .build()
+//   }
+//
+//   fn meta(&self) -> OpMeta {
+//     OpMeta::CAP_FD | OpMeta::FD_READ
+//   }
+//
+//   #[cfg(unix)]
+//   fn cap(&self) -> i32 {
+//     self.res.as_raw_fd()
+//   }
+//
+//   fn run_blocking(&self) -> isize {
+//     #[cfg(any(
+//       target_os = "android",
+//       target_os = "dragonfly",
+//       target_os = "freebsd",
+//       target_os = "illumos",
+//       target_os = "linux",
+//       target_os = "hurd",
+//       target_os = "netbsd",
+//       target_os = "openbsd",
+//       target_os = "cygwin",
+//     ))]
+//     let fd = {
+//       syscall!(raw accept4(
+//         self.res.as_raw_fd(),
+//         &self.addr as *const _ as *mut libc::sockaddr,
+//         (&self.len as *const libc::socklen_t).cast_mut(),
+//         libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK
+//       ))
+//     };
+//
+//     #[cfg(not(any(
+//       target_os = "android",
+//       target_os = "dragonfly",
+//       target_os = "freebsd",
+//       target_os = "illumos",
+//       target_os = "linux",
+//       target_os = "hurd",
+//       target_os = "netbsd",
+//       target_os = "openbsd",
+//       target_os = "cygwin",
+//     )))]
+//     let fd = {
+//       let socket = syscall!(raw accept(
+//         self.res.as_raw_fd(),
+//         &self.addr as *const _ as *mut libc::sockaddr,
+//         (&self.len as *const libc::socklen_t).cast_mut()
+//       )?);
+//
+//       if socket < 0 {
+//         return socket;
+//       }
+//
+//       // Ensure the socket is closed if either of the `fcntl` calls error below
+//       #[cfg(not(any(target_os = "espidf", target_os = "vita")))]
+//       {
+//         let res =
+//           syscall!(raw fcntl(socket as i32, libc::F_SETFD, libc::FD_CLOEXEC));
+//         if res < 0 {
+//           syscall!(raw close(socket as i32));
+//           return res;
+//         }
+//       }
+//
+//       // See https://github.com/tokio-rs/mio/issues/1450
+//       #[cfg(not(any(target_os = "espidf", target_os = "vita")))]
+//       {
+//         let res =
+//           syscall!(raw fcntl(socket as i32, libc::F_SETFL, libc::O_NONBLOCK));
+//         if res < 0 {
+//           let _ = syscall!(raw close(socket as i32));
+//           return res;
+//         }
+//       }
+//
+//       socket
+//     };
+//
+//     fd
+//   }
+// }
+// assert_op_max_size!(Accept);

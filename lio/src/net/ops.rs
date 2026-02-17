@@ -2,23 +2,23 @@
 //!
 //! This module contains specialized operation types that adapt low-level I/O operations
 //! to work with the high-level [`Socket`] type. These types implement
-//! the [`Operation`] trait and are used internally by the networking API.
+//! the [`TypedOp`] trait and are used internally by the networking API.
 //!
 //! Most users will not need to use these types directly, as they are returned by methods
 //! on [`Socket`], [`TcpListener`](crate::net::TcpListener), and
-//! [`TcpSocket`].
+//! [`TcpSocket`](crate::net::TcpSocket).
 //!
 //! # Available Operations
 //!
 //! - [`SocketAccept`]: Accept operation that returns a [`Socket`]
 //! - [`SocketNew`]: Socket creation operation that returns a [`Socket`]
 
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, os::fd::FromRawFd};
 
 use crate::{
   api::{ops, resource::FromResource},
   net::{Socket, TcpSocket},
-  operation::{OpMeta, Operation, OperationExt},
+  typed_op::TypedOp,
 };
 
 /// Accept operation specialized for [`Socket`].
@@ -27,39 +27,26 @@ use crate::{
 /// its result to return a [`Socket`] instead of a raw [`Resource`](crate::api::resource::Resource).
 ///
 /// You typically won't create this directly; it's returned by [`Socket::accept()`](crate::net::Socket::accept).
-pub struct SocketAccept(pub(crate) ops::Accept);
-
-impl OperationExt for SocketAccept {
-  type Result = io::Result<(Socket, SocketAddr)>;
+pub struct SocketAccept {
+  inner: ops::Accept,
 }
 
-impl Operation for SocketAccept {
-  fn run_blocking(&self) -> isize {
-    self.0.run_blocking()
+impl SocketAccept {
+  pub(crate) fn new(res: crate::api::resource::Resource) -> Self {
+    Self { inner: ops::Accept::new(res) }
   }
-  fn meta(&self) -> OpMeta {
-    self.0.meta()
-  }
-  fn result(&mut self, ret: isize) -> *const () {
-    let ptr =
-      self.0.result(ret) as *const <ops::Accept as OperationExt>::Result;
+}
 
-    // SAFETY: The pointer was just created by Accept::result and points to valid Accept::Result
-    let accept_result = unsafe { ptr.read() };
+impl TypedOp for SocketAccept {
+  type Result = io::Result<(Socket, SocketAddr)>;
 
-    let socket_result = accept_result
-      .map(|(resource, addr)| (Socket::from_resource(resource), addr));
-
-    // Box the result and return pointer
-    Box::into_raw(Box::new(socket_result)) as *const ()
-  }
-  fn cap(&self) -> i32 {
-    self.0.cap()
+  fn into_op(&mut self) -> crate::op::Op {
+    self.inner.into_op()
   }
 
-  #[cfg(linux)]
-  fn create_entry(&self) -> lio_uring::submission::Entry {
-    self.0.create_entry()
+  fn extract_result(mut self, res: isize) -> Self::Result {
+    let (resource, addr) = self.inner.extract_result(res)?;
+    Ok((Socket::from_resource(resource), addr))
   }
 }
 
@@ -69,73 +56,60 @@ impl Operation for SocketAccept {
 /// return a [`Socket`] instead of a raw [`Resource`](crate::api::resource::Resource).
 ///
 /// You typically won't create this directly; it's returned by [`Socket::new()`](crate::net::Socket::new).
-pub struct SocketNew(pub(crate) ops::Socket);
+pub struct SocketNew {
+  domain: i32,
+  ty: i32,
+  proto: i32,
+}
 
-impl OperationExt for SocketNew {
+impl SocketNew {
+  pub(crate) fn new(domain: i32, ty: i32, proto: i32) -> Self {
+    Self { domain, ty, proto }
+  }
+}
+
+impl TypedOp for SocketNew {
   type Result = io::Result<Socket>;
-}
 
-impl Operation for SocketNew {
-  fn run_blocking(&self) -> isize {
-    self.0.run_blocking()
-  }
-  fn meta(&self) -> OpMeta {
-    self.0.meta()
-  }
-  fn result(&mut self, ret: isize) -> *const () {
-    let ptr =
-      self.0.result(ret) as *const <ops::Socket as OperationExt>::Result;
-
-    // SAFETY: The pointer was just created by Accept::result and points to valid Accept::Result
-    let accept_result = unsafe { ptr.read() };
-
-    let socket_result = accept_result.map(Socket::from_resource);
-
-    // Box the result and return pointer
-    Box::into_raw(Box::new(socket_result)) as *const ()
-  }
-  fn cap(&self) -> i32 {
-    self.0.cap()
+  fn into_op(&mut self) -> crate::op::Op {
+    crate::op::Op::Socket {
+      domain: self.domain,
+      ty: self.ty,
+      proto: self.proto,
+    }
   }
 
-  #[cfg(linux)]
-  fn create_entry(&self) -> lio_uring::submission::Entry {
-    self.0.create_entry()
+  fn extract_result(self, res: isize) -> Self::Result {
+    let result = if res < 0 {
+      return Err(io::Error::from_raw_os_error(-res as i32));
+    } else {
+      res as std::os::fd::RawFd
+    };
+    // SAFETY: result is valid fd.
+    let res = unsafe { crate::api::resource::Resource::from_raw_fd(result) };
+    Ok(Socket::from_resource(res))
   }
 }
 
-pub struct TcpAccept(pub(crate) ops::Accept);
+pub struct TcpAccept {
+  inner: ops::Accept,
+}
 
-impl OperationExt for TcpAccept {
+impl TcpAccept {
+  pub(crate) fn new(res: crate::api::resource::Resource) -> Self {
+    Self { inner: ops::Accept::new(res) }
+  }
+}
+
+impl TypedOp for TcpAccept {
   type Result = io::Result<(TcpSocket, SocketAddr)>;
-}
 
-impl Operation for TcpAccept {
-  fn run_blocking(&self) -> isize {
-    self.0.run_blocking()
-  }
-  fn meta(&self) -> OpMeta {
-    self.0.meta()
-  }
-  fn result(&mut self, ret: isize) -> *const () {
-    let ptr =
-      self.0.result(ret) as *const <ops::Accept as OperationExt>::Result;
-
-    // SAFETY: The pointer was just created by Accept::result and points to valid Accept::Result
-    let accept_result = unsafe { ptr.read() };
-
-    let socket_result = accept_result
-      .map(|(resource, addr)| (TcpSocket::from_resource(resource), addr));
-
-    // Box the result and return pointer
-    Box::into_raw(Box::new(socket_result)) as *const ()
-  }
-  fn cap(&self) -> i32 {
-    self.0.cap()
+  fn into_op(&mut self) -> crate::op::Op {
+    self.inner.into_op()
   }
 
-  #[cfg(linux)]
-  fn create_entry(&self) -> lio_uring::submission::Entry {
-    self.0.create_entry()
+  fn extract_result(mut self, res: isize) -> Self::Result {
+    let (resource, addr) = self.inner.extract_result(res)?;
+    Ok((TcpSocket::from_resource(resource), addr))
   }
 }
