@@ -29,8 +29,8 @@ jobs:
       - name: Lint
         run: make lint
 
-  lio-cbuild:
-    name: Check lio C build
+  lio-build-n-test:
+    name: Build n Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -48,6 +48,9 @@ jobs:
 
       - name: Run make lio-cbuild
         run: make cbuild
+
+      - name: Run test
+        run: make test
 
   nix-flake-check:
     runs-on: ubuntu-latest
