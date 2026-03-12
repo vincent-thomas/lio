@@ -130,7 +130,7 @@ impl OpenOptions {
   /// This function will return an error if the file does not exist, the user lacks
   /// permission to access the file, or if any of the options specified are invalid
   /// for the given file.
-  pub fn open<P: AsRef<Path>>(&self, path: P) -> Io<'_, OpenatFile> {
+  pub fn open<P: AsRef<Path>>(&self, path: P) -> Io<OpenatFile> {
     let flags = self.make_flags()?;
 
     // let path_bytes = path.as_ref().as_os_str().as_bytes();
@@ -174,7 +174,7 @@ impl OpenOptions {
   }
 
   // #[cfg(unix)]
-  fn open_inner(&self, flags: libc::c_int, path: &Path) -> Io<'_, OpenatFile> {
+  fn open_inner(&self, flags: libc::c_int, path: &Path) -> Io<OpenatFile> {
     todo!();
     // TODO: Implement for Windows using NtCreateFile or similar
     // Err(std::io::Error::new(

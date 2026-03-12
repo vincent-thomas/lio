@@ -1,4 +1,4 @@
-#![cfg(linux)]
+#![cfg(target_os = "linux")]
 
 use lio::Lio;
 use lio::api::{self, resource::Resource};
@@ -16,10 +16,10 @@ fn poll_until_recv<T>(lio: &mut Lio, receiver: &mpsc::Receiver<T>) -> T {
       Ok(result) => return result,
       Err(mpsc::TryRecvError::Empty) => {
         attempts += 1;
-        if attempts > 10 {
-          panic!("Operation did not complete after 10 attempts");
+        if attempts > 100 {
+          panic!("Operation did not complete after 100 attempts");
         }
-        thread::sleep(Duration::from_micros(100));
+        thread::sleep(Duration::from_millis(10));
       }
       Err(mpsc::TryRecvError::Disconnected) => {
         panic!("Channel disconnected");
@@ -29,7 +29,6 @@ fn poll_until_recv<T>(lio: &mut Lio, receiver: &mpsc::Receiver<T>) -> T {
 }
 
 #[test]
-#[ignore]
 fn test_tee_basic() {
   let mut lio = Lio::new(64).unwrap();
 
@@ -42,10 +41,13 @@ fn test_tee_basic() {
     assert_eq!(libc::pipe(pipe2_fds.as_mut_ptr()), 0);
   }
 
-  let pipe1_read = pipe1_fds[0];
   let pipe1_write = pipe1_fds[1];
-  let pipe2_write = pipe2_fds[1];
   let pipe2_read = pipe2_fds[0];
+
+  // Create Resources and keep them alive until after we read from the pipes.
+  // Resources take ownership of fds, so they'll be closed when dropped.
+  let pipe1_read_res = unsafe { Resource::from_raw_fd(pipe1_fds[0]) };
+  let pipe2_write_res = unsafe { Resource::from_raw_fd(pipe2_fds[1]) };
 
   // Write data to pipe1
   let test_data = b"Hello, tee!";
@@ -61,13 +63,9 @@ fn test_tee_basic() {
   let (sender, receiver) = mpsc::channel();
 
   // Use tee to copy data from pipe1 to pipe2
-  api::tee(
-    &unsafe { Resource::from_raw_fd(pipe1_read) },
-    &unsafe { Resource::from_raw_fd(pipe2_write) },
-    test_data.len() as u32,
-  )
-  .with_lio(&mut lio)
-  .send_with(sender.clone());
+  api::tee(&pipe1_read_res, &pipe2_write_res, test_data.len() as u32)
+    .with_lio(&mut lio)
+    .send_with(sender.clone());
 
   let bytes_copied =
     poll_until_recv(&mut lio, &receiver).expect("Failed to tee data");
@@ -85,11 +83,12 @@ fn test_tee_basic() {
   }
   assert_eq!(&buf2, test_data);
 
-  // Data should still be in pipe1
+  // Data should still be in pipe1 (tee copies without consuming)
+  use std::os::fd::AsRawFd;
   let mut buf1 = vec![0u8; test_data.len()];
   unsafe {
     let read_bytes = libc::read(
-      pipe1_read,
+      pipe1_read_res.as_raw_fd(),
       buf1.as_mut_ptr() as *mut libc::c_void,
       buf1.len(),
     );
@@ -97,17 +96,15 @@ fn test_tee_basic() {
   }
   assert_eq!(&buf1, test_data);
 
-  // Cleanup
+  // Cleanup - only close fds not owned by Resources
   unsafe {
-    libc::close(pipe1_fds[0]);
-    libc::close(pipe1_fds[1]);
-    libc::close(pipe2_fds[0]);
-    libc::close(pipe2_fds[1]);
+    libc::close(pipe1_write);
+    libc::close(pipe2_read);
   }
+  // pipe1_read and pipe2_write are closed when Resources are dropped
 }
 
 #[test]
-#[ignore]
 fn test_tee_large_data() {
   let mut lio = Lio::new(64).unwrap();
 
@@ -119,10 +116,12 @@ fn test_tee_large_data() {
     assert_eq!(libc::pipe(pipe2_fds.as_mut_ptr()), 0);
   }
 
-  let pipe1_read = pipe1_fds[0];
   let pipe1_write = pipe1_fds[1];
-  let pipe2_write = pipe2_fds[1];
   let pipe2_read = pipe2_fds[0];
+
+  // Create Resources and keep them alive until after we read from the pipes
+  let pipe1_read_res = unsafe { Resource::from_raw_fd(pipe1_fds[0]) };
+  let pipe2_write_res = unsafe { Resource::from_raw_fd(pipe2_fds[1]) };
 
   // Write larger data
   let test_data: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
@@ -138,13 +137,9 @@ fn test_tee_large_data() {
   let (sender, receiver) = mpsc::channel();
 
   // Tee the data
-  api::tee(
-    &unsafe { Resource::from_raw_fd(pipe1_read) },
-    &unsafe { Resource::from_raw_fd(pipe2_write) },
-    test_data.len() as u32,
-  )
-  .with_lio(&mut lio)
-  .send_with(sender);
+  api::tee(&pipe1_read_res, &pipe2_write_res, test_data.len() as u32)
+    .with_lio(&mut lio)
+    .send_with(sender);
 
   let bytes_copied =
     poll_until_recv(&mut lio, &receiver).expect("Failed to tee large data");
@@ -164,17 +159,15 @@ fn test_tee_large_data() {
   }
   assert_eq!(&buf2, &test_data[..bytes_copied as usize]);
 
-  // Cleanup
+  // Cleanup - only close fds not owned by Resources
   unsafe {
-    libc::close(pipe1_fds[0]);
-    libc::close(pipe1_fds[1]);
-    libc::close(pipe2_fds[0]);
-    libc::close(pipe2_fds[1]);
+    libc::close(pipe1_write);
+    libc::close(pipe2_read);
   }
+  // pipe1_read and pipe2_write are closed when Resources are dropped
 }
 
 #[test]
-#[ignore]
 fn test_tee_partial() {
   let mut lio = Lio::new(64).unwrap();
 
@@ -186,10 +179,12 @@ fn test_tee_partial() {
     assert_eq!(libc::pipe(pipe2_fds.as_mut_ptr()), 0);
   }
 
-  let pipe1_read = pipe1_fds[0];
   let pipe1_write = pipe1_fds[1];
-  let pipe2_write = pipe2_fds[1];
   let pipe2_read = pipe2_fds[0];
+
+  // Create Resources and keep them alive
+  let pipe1_read_res = unsafe { Resource::from_raw_fd(pipe1_fds[0]) };
+  let pipe2_write_res = unsafe { Resource::from_raw_fd(pipe2_fds[1]) };
 
   let test_data = b"0123456789ABCDEF";
   unsafe {
@@ -204,13 +199,9 @@ fn test_tee_partial() {
 
   // Tee only part of the data
   let bytes_to_tee = 8;
-  api::tee(
-    &unsafe { Resource::from_raw_fd(pipe1_read) },
-    &unsafe { Resource::from_raw_fd(pipe2_write) },
-    bytes_to_tee,
-  )
-  .with_lio(&mut lio)
-  .send_with(sender);
+  api::tee(&pipe1_read_res, &pipe2_write_res, bytes_to_tee)
+    .with_lio(&mut lio)
+    .send_with(sender);
 
   let bytes_copied =
     poll_until_recv(&mut lio, &receiver).expect("Failed to tee partial data");
@@ -229,10 +220,11 @@ fn test_tee_partial() {
   assert_eq!(&buf2, &test_data[..bytes_to_tee as usize]);
 
   // All data should still be in pipe1
+  use std::os::fd::AsRawFd;
   let mut buf1 = vec![0u8; test_data.len()];
   unsafe {
     let read_bytes = libc::read(
-      pipe1_read,
+      pipe1_read_res.as_raw_fd(),
       buf1.as_mut_ptr() as *mut libc::c_void,
       buf1.len(),
     );
@@ -240,17 +232,16 @@ fn test_tee_partial() {
   }
   assert_eq!(&buf1, test_data);
 
-  // Cleanup
+  // Cleanup - only close fds not owned by Resources
   unsafe {
-    libc::close(pipe1_fds[1]);
-    libc::close(pipe2_fds[0]);
-    libc::close(pipe2_fds[1]);
+    libc::close(pipe1_write);
+    libc::close(pipe2_read);
   }
 }
 
 #[test]
-#[ignore]
 fn test_tee_empty_pipe() {
+  use std::os::fd::AsRawFd;
   let mut lio = Lio::new(64).unwrap();
 
   let mut pipe1_fds = [0i32; 2];
@@ -261,42 +252,40 @@ fn test_tee_empty_pipe() {
     assert_eq!(libc::pipe(pipe2_fds.as_mut_ptr()), 0);
   }
 
-  let pipe1_read = pipe1_fds[0];
-  let pipe2_write = pipe2_fds[1];
+  // Create Resources and keep them alive
+  let pipe1_read_res = unsafe { Resource::from_raw_fd(pipe1_fds[0]) };
+  let pipe2_write_res = unsafe { Resource::from_raw_fd(pipe2_fds[1]) };
 
   // Set pipes to non-blocking
   unsafe {
-    let flags = libc::fcntl(pipe1_read, libc::F_GETFL, 0);
-    libc::fcntl(pipe1_read, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    let flags = libc::fcntl(pipe1_read_res.as_raw_fd(), libc::F_GETFL, 0);
+    libc::fcntl(
+      pipe1_read_res.as_raw_fd(),
+      libc::F_SETFL,
+      flags | libc::O_NONBLOCK,
+    );
   }
 
   let (sender, receiver) = mpsc::channel();
 
   // Try to tee from empty pipe
-  api::tee(
-    &unsafe { Resource::from_raw_fd(pipe1_read) },
-    &unsafe { Resource::from_raw_fd(pipe2_write) },
-    100,
-  )
-  .with_lio(&mut lio)
-  .send_with(sender);
+  api::tee(&pipe1_read_res, &pipe2_write_res, 100)
+    .with_lio(&mut lio)
+    .send_with(sender);
 
   let result = poll_until_recv(&mut lio, &receiver);
 
   // Should fail with EAGAIN or similar
   assert!(result.is_err(), "Tee from empty pipe should fail");
 
-  // Cleanup
+  // Cleanup - only close fds not owned by Resources
   unsafe {
-    libc::close(pipe1_fds[0]);
     libc::close(pipe1_fds[1]);
     libc::close(pipe2_fds[0]);
-    libc::close(pipe2_fds[1]);
   }
 }
 
 #[test]
-#[ignore]
 fn test_tee_zero_size() {
   let mut lio = Lio::new(64).unwrap();
 
@@ -308,9 +297,11 @@ fn test_tee_zero_size() {
     assert_eq!(libc::pipe(pipe2_fds.as_mut_ptr()), 0);
   }
 
-  let pipe1_read = pipe1_fds[0];
   let pipe1_write = pipe1_fds[1];
-  let pipe2_write = pipe2_fds[1];
+
+  // Create Resources and keep them alive
+  let pipe1_read_res = unsafe { Resource::from_raw_fd(pipe1_fds[0]) };
+  let pipe2_write_res = unsafe { Resource::from_raw_fd(pipe2_fds[1]) };
 
   let test_data = b"Some data";
   unsafe {
@@ -324,29 +315,22 @@ fn test_tee_zero_size() {
   let (sender, receiver) = mpsc::channel();
 
   // Tee with size 0
-  api::tee(
-    &unsafe { Resource::from_raw_fd(pipe1_read) },
-    &unsafe { Resource::from_raw_fd(pipe2_write) },
-    0,
-  )
-  .with_lio(&mut lio)
-  .send_with(sender);
+  api::tee(&pipe1_read_res, &pipe2_write_res, 0)
+    .with_lio(&mut lio)
+    .send_with(sender);
 
   let bytes_copied = poll_until_recv(&mut lio, &receiver)
     .expect("Tee with size 0 should succeed");
   assert_eq!(bytes_copied, 0);
 
-  // Cleanup
+  // Cleanup - only close fds not owned by Resources
   unsafe {
-    libc::close(pipe1_fds[0]);
-    libc::close(pipe1_fds[1]);
+    libc::close(pipe1_write);
     libc::close(pipe2_fds[0]);
-    libc::close(pipe2_fds[1]);
   }
 }
 
 #[cfg(target_os = "linux")]
-#[ignore]
 #[test]
 fn test_tee_multiple() {
   let mut lio = Lio::new(64).unwrap();
@@ -361,12 +345,14 @@ fn test_tee_multiple() {
     assert_eq!(libc::pipe(pipe3_fds.as_mut_ptr()), 0);
   }
 
-  let pipe1_read = pipe1_fds[0];
   let pipe1_write = pipe1_fds[1];
-  let pipe2_write = pipe2_fds[1];
   let pipe2_read = pipe2_fds[0];
-  let pipe3_write = pipe3_fds[1];
   let pipe3_read = pipe3_fds[0];
+
+  // Create Resources and keep them alive for multiple tee operations
+  let pipe1_read_res = unsafe { Resource::from_raw_fd(pipe1_fds[0]) };
+  let pipe2_write_res = unsafe { Resource::from_raw_fd(pipe2_fds[1]) };
+  let pipe3_write_res = unsafe { Resource::from_raw_fd(pipe3_fds[1]) };
 
   let test_data = b"Tee multiple times";
   unsafe {
@@ -380,13 +366,9 @@ fn test_tee_multiple() {
   let (sender, receiver) = mpsc::channel();
 
   // Tee to pipe2
-  api::tee(
-    &unsafe { Resource::from_raw_fd(pipe1_read) },
-    &unsafe { Resource::from_raw_fd(pipe2_write) },
-    test_data.len() as u32,
-  )
-  .with_lio(&mut lio)
-  .send_with(sender.clone());
+  api::tee(&pipe1_read_res, &pipe2_write_res, test_data.len() as u32)
+    .with_lio(&mut lio)
+    .send_with(sender.clone());
 
   let bytes1 = poll_until_recv(&mut lio, &receiver).expect("First tee failed");
   assert_eq!(bytes1 as usize, test_data.len());
@@ -394,13 +376,9 @@ fn test_tee_multiple() {
   let (sender2, receiver2) = mpsc::channel();
 
   // Tee to pipe3 (data still in pipe1)
-  api::tee(
-    &unsafe { Resource::from_raw_fd(pipe1_read) },
-    &unsafe { Resource::from_raw_fd(pipe3_write) },
-    test_data.len() as u32,
-  )
-  .with_lio(&mut lio)
-  .send_with(sender2);
+  api::tee(&pipe1_read_res, &pipe3_write_res, test_data.len() as u32)
+    .with_lio(&mut lio)
+    .send_with(sender2);
 
   let bytes2 =
     poll_until_recv(&mut lio, &receiver2).expect("Second tee failed");
@@ -420,23 +398,21 @@ fn test_tee_multiple() {
   }
   assert_eq!(&buf3, test_data);
 
-  // Cleanup
+  // Cleanup - only close fds not owned by Resources
   unsafe {
-    libc::close(pipe1_fds[0]);
-    libc::close(pipe1_fds[1]);
-    libc::close(pipe2_fds[0]);
-    libc::close(pipe2_fds[1]);
-    libc::close(pipe3_fds[0]);
-    libc::close(pipe3_fds[1]);
+    libc::close(pipe1_write);
+    libc::close(pipe2_read);
+    libc::close(pipe3_read);
   }
+  // pipe1_read, pipe2_write, pipe3_write are closed when Resources are dropped
 }
 
 #[test]
-#[ignore]
 fn test_tee_concurrent() {
   let mut lio = Lio::new(64).unwrap();
 
   // Test multiple concurrent tee operations
+  // Create pipes and Resources, keeping Resources alive until after results are received
   let tasks: Vec<_> = (0..5)
     .map(|i| {
       let mut pipe1_fds = [0i32; 2];
@@ -456,36 +432,35 @@ fn test_tee_concurrent() {
         );
       }
 
-      (pipe1_fds, pipe2_fds, data)
+      // Create Resources that will be kept alive
+      let pipe1_read_res = unsafe { Resource::from_raw_fd(pipe1_fds[0]) };
+      let pipe2_write_res = unsafe { Resource::from_raw_fd(pipe2_fds[1]) };
+
+      (pipe1_fds[1], pipe2_fds[0], pipe1_read_res, pipe2_write_res, data)
     })
     .collect();
 
   let (sender, receiver) = mpsc::channel();
 
-  for (pipe1_fds, pipe2_fds, data) in &tasks {
+  for (_, _, pipe1_read_res, pipe2_write_res, data) in &tasks {
     let data_len = data.len();
-    api::tee(
-      &unsafe { Resource::from_raw_fd(pipe1_fds[0]) },
-      &unsafe { Resource::from_raw_fd(pipe2_fds[1]) },
-      data_len as u32,
-    )
-    .with_lio(&mut lio)
-    .send_with(sender.clone());
+    api::tee(pipe1_read_res, pipe2_write_res, data_len as u32)
+      .with_lio(&mut lio)
+      .send_with(sender.clone());
   }
 
-  for (_, _, data) in &tasks {
+  for (_, _, _, _, data) in &tasks {
     let bytes_copied =
       poll_until_recv(&mut lio, &receiver).expect("Concurrent tee failed");
     assert_eq!(bytes_copied as usize, data.len());
   }
 
-  // Cleanup
-  for (pipe1_fds, pipe2_fds, _) in &tasks {
+  // Cleanup - only close fds not owned by Resources
+  for (pipe1_write, pipe2_read, _, _, _) in &tasks {
     unsafe {
-      libc::close(pipe1_fds[0]);
-      libc::close(pipe1_fds[1]);
-      libc::close(pipe2_fds[0]);
-      libc::close(pipe2_fds[1]);
+      libc::close(*pipe1_write);
+      libc::close(*pipe2_read);
     }
   }
+  // pipe1_read and pipe2_write are closed when Resources are dropped
 }

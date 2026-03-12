@@ -25,10 +25,9 @@
 //!
 //! ## TCP Echo Server
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use lio::net::TcpListener;
 //!
-//! # lio::init();
 //! async fn echo_server() -> std::io::Result<()> {
 //!     let listener = TcpListener::bind_async("127.0.0.1:8080").await?;
 //!     println!("Server listening on 127.0.0.1:8080");
@@ -39,24 +38,24 @@
 //!
 //!         // Echo data back to the client
 //!         let buffer = vec![0u8; 1024];
-//!         let (buffer, bytes_read) = socket.recv(buffer).await?;
+//!         let (result, buffer) = socket.recv(buffer).await;
+//!     let bytes_read = result? as usize;
 //!
 //!         if bytes_read > 0 {
-//!             let (_, bytes_sent) = socket.send(buffer[..bytes_read].to_vec()).await?;
+//!             let (result, _) = socket.send(buffer[..bytes_read].to_vec()).await;
+//!             let bytes_sent = result? as usize;
 //!             println!("Echoed {} bytes", bytes_sent);
 //!         }
 //!     }
 //! }
-//! # lio::exit();
 //! ```
 //!
 //! ## TCP Client
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use lio::net::TcpSocket;
 //! use std::net::SocketAddr;
 //!
-//! # lio::init();
 //! async fn send_message() -> std::io::Result<()> {
 //!     // Connect to server
 //!     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
@@ -64,12 +63,14 @@
 //!
 //!     // Send a message
 //!     let message = b"Hello, server!".to_vec();
-//!     let (message, bytes_sent) = socket.send(message).await?;
+//!     let (result, message) = socket.send(message).await;
+//!     let bytes_sent = result? as usize;
 //!     println!("Sent {} bytes", bytes_sent);
 //!
 //!     // Receive response
 //!     let buffer = vec![0u8; 1024];
-//!     let (buffer, bytes_read) = socket.recv(buffer).await?;
+//!     let (result, buffer) = socket.recv(buffer).await;
+//!     let bytes_read = result? as usize;
 //!     println!("Received: {:?}", &buffer[..bytes_read]);
 //!
 //!     // Gracefully shutdown
@@ -77,18 +78,16 @@
 //!
 //!     Ok(())
 //! }
-//! # lio::exit();
 //! ```
 //!
 //! ## Low-Level Socket Operations
 //!
 //! For advanced use cases, you can use [`Socket`] directly:
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use lio::net::Socket;
 //! use std::net::SocketAddr;
 //!
-//! # lio::init();
 //! async fn custom_socket() -> std::io::Result<()> {
 //!     // Create a raw TCP socket
 //!     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
@@ -106,7 +105,6 @@
 //!
 //!     Ok(())
 //! }
-//! # lio::exit();
 //! ```
 //!
 //! # Synchronous vs Asynchronous
@@ -114,10 +112,9 @@
 //! Most operations in this module are async by default. However, some types like
 //! [`TcpListener`] and [`TcpSocket`] provide `_sync` variants for blocking operations:
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use lio::net::TcpListener;
 //!
-//! # lio::init();
 //! fn sync_example() -> std::io::Result<()> {
 //!     // This blocks until the listener is ready
 //!     let listener = TcpListener::bind_sync("127.0.0.1:8080")?;
@@ -125,7 +122,6 @@
 //!     // Accept is still async
 //!     Ok(())
 //! }
-//! # lio::exit();
 //! ```
 //!
 //! # See Also

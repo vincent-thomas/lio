@@ -1,5 +1,3 @@
-use std::os::fd::AsRawFd;
-
 use crate::api::resource::Resource;
 use crate::typed_op::TypedOp;
 

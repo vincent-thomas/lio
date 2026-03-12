@@ -1,0 +1,35 @@
+#cloud-config
+
+users:
+  - name: lio
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    groups: [sudo]
+    lock_passwd: false
+    # Password: lio (for emergency console access)
+    passwd: $6$rounds=4096$salt$xDxBz7R5vqzQbPwfqJvYTvQVqVvXqVvYTvQVqVvXqVvYTvQVqVvXqVvYTvQVqVvX
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - build-essential
+  - curl
+  - git
+  - pkg-config
+  - libssl-dev
+
+runcmd:
+  # Install Rust
+  - su - lio -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+  - su - lio -c 'source ~/.cargo/env && cargo install cargo-nextest'
+  # Signal that provisioning is complete
+  - touch /tmp/cloud-init-done
+
+write_files:
+  - path: /etc/profile.d/rust.sh
+    content: |
+      export PATH="$HOME/.cargo/bin:$PATH"
+    permissions: '0644'
+
+final_message: "Cloud-init provisioning complete after $UPTIME seconds"

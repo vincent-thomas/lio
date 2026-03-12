@@ -1,23 +1,21 @@
 // #[cfg(unix)]
 use std::{
   io::{self, Error},
-  mem::{self, MaybeUninit},
+  mem::{self},
   net::SocketAddr,
-  os::fd::{AsRawFd, FromRawFd, RawFd},
+  os::fd::{FromRawFd, RawFd},
 };
 
 use crate::{
-  api::resource::Resource,
-  net_utils::libc_socketaddr_into_std,
-  op::Op,
-  typed_op::{ResultNotMatching, TypedOp},
+  api::resource::Resource, net_utils::libc_socketaddr_into_std, op::Op,
+  typed_op::TypedOp,
 };
 
 // Not detach safe.
 pub struct Accept {
   res: Resource,
-  addr: libc::sockaddr_storage,
-  len: libc::socklen_t,
+  addr: Box<libc::sockaddr_storage>,
+  len: Box<libc::socklen_t>,
 }
 
 // SAFETY: The UnsafeCells are only written during construction and by the kernel
@@ -31,15 +29,17 @@ impl Accept {
     // SAFETY: libc::sockaddr_storage is a C struct that is safe to zero-initialize.
     // It consists of primitive integer fields where zero is a valid value. The kernel
     // will fill this structure via the accept syscall's output parameter.
-    let addr: libc::sockaddr_storage = unsafe { mem::zeroed() };
-    Self { res, addr, len: mem::size_of_val(&addr) as libc::socklen_t }
+    let addr: Box<libc::sockaddr_storage> = Box::new(unsafe { mem::zeroed() });
+    let len =
+      Box::new(mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t);
+    Self { res, addr, len }
   }
 
   pub fn to_op(self) -> crate::op::Op {
     crate::op::Op::Accept {
       fd: self.res,
-      addr: Box::into_raw(Box::new(self.addr)),
-      len: Box::into_raw(Box::new(self.len)),
+      addr: Box::into_raw(self.addr),
+      len: Box::into_raw(self.len),
     }
   }
 }
@@ -50,8 +50,10 @@ impl TypedOp for Accept {
   fn into_op(&mut self) -> crate::op::Op {
     Op::Accept {
       fd: self.res.clone(),
-      addr: &mut self.addr as *mut _,
-      len: &mut self.len as *mut _,
+      // SAFETY: self.addr is a Box, so the pointer remains valid even if
+      // `self` (the Accept struct) is later moved to the heap by OpCallback.
+      addr: &mut *self.addr as *mut _,
+      len: &mut *self.len as *mut _,
     }
   }
   fn extract_result(self, res: isize) -> Self::Result {
@@ -63,8 +65,8 @@ impl TypedOp for Accept {
 
     // SAFETY: result is valid fd.
     let res = unsafe { Resource::from_raw_fd(result) };
-    // SAFETY: valid pointer.
-    let addr = unsafe { libc_socketaddr_into_std(&self.addr as *const _) }?;
+    // SAFETY: self.addr was filled by the kernel via the accept syscall.
+    let addr = unsafe { libc_socketaddr_into_std(&*self.addr as *const _) }?;
     Ok((res, addr))
   }
 

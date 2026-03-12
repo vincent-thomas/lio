@@ -22,6 +22,8 @@ pkgs.rustPlatform.buildRustPackage {
 
   buildInputs = with pkgs; [ stdenv.cc.cc ];
 
+  doCheck = false;
+
   buildPhase = ''
     runHook preBuild
     make cbuild

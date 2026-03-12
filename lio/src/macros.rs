@@ -201,47 +201,47 @@ macro_rules! syscall {
   }};
 }
 
-macro_rules! impl_result {
-  (()) => {
-      impl_result!(|_this, res: isize| -> std::io::Result<()> {
-        if res < 0 {
-          Err(std::io::Error::from_raw_os_error((-res) as i32))
-        } else {
-          Ok(())
-        }
-      });
-  };
-
-  (res) => {
-    impl_result!(|_this, res: isize| -> std::io::Result<crate::api::resource::Resource> {
-      if res < 0 {
-        Err(std::io::Error::from_raw_os_error((-res) as i32))
-      } else {
-        // SAFETY: Caller guarrantees this is valid fd.
-        let resource = unsafe {
-          std::os::fd::FromRawFd::from_raw_fd(res as i32)
-        };
-        Ok(resource)
-      }
-    });
-  };
-
-  (|$this:ident, $res:ident: $res_ty:ty| -> $ret_ty:ty { $($body:tt)* }) => {
-    fn result(&mut self, res: isize) -> *const () {
-      let __impl_result = |$this: &mut Self, $res: $res_ty| -> $ret_ty { $($body)* };
-      Box::into_raw(Box::new(__impl_result(self, res))) as *const ()
-    }
-  };
-}
-
-macro_rules! impl_no_readyness {
-  () => {
-    #[cfg(unix)]
-    fn meta(&self) -> crate::operation::OpMeta {
-      crate::operation::OpMeta::CAP_NONE
-    }
-  };
-}
+// macro_rules! impl_result {
+//   (()) => {
+//       impl_result!(|_this, res: isize| -> std::io::Result<()> {
+//         if res < 0 {
+//           Err(std::io::Error::from_raw_os_error((-res) as i32))
+//         } else {
+//           Ok(())
+//         }
+//       });
+//   };
+//
+//   (res) => {
+//     impl_result!(|_this, res: isize| -> std::io::Result<crate::api::resource::Resource> {
+//       if res < 0 {
+//         Err(std::io::Error::from_raw_os_error((-res) as i32))
+//       } else {
+//         // SAFETY: Caller guarrantees this is valid fd.
+//         let resource = unsafe {
+//           std::os::fd::FromRawFd::from_raw_fd(res as i32)
+//         };
+//         Ok(resource)
+//       }
+//     });
+//   };
+//
+//   (|$this:ident, $res:ident: $res_ty:ty| -> $ret_ty:ty { $($body:tt)* }) => {
+//     fn result(&mut self, res: isize) -> *const () {
+//       let __impl_result = |$this: &mut Self, $res: $res_ty| -> $ret_ty { $($body)* };
+//       Box::into_raw(Box::new(__impl_result(self, res))) as *const ()
+//     }
+//   };
+// }
+//
+// macro_rules! impl_no_readyness {
+//   () => {
+//     #[cfg(unix)]
+//     fn meta(&self) -> crate::operation::OpMeta {
+//       crate::operation::OpMeta::CAP_NONE
+//     }
+//   };
+// }
 
 #[cfg(test)]
 pub(crate) mod __internal {

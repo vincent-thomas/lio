@@ -1,4 +1,3 @@
-use crate::operation::OpMeta;
 use std::io;
 use std::time::Duration;
 
@@ -6,7 +5,7 @@ use std::time::Duration;
 use crate::api::resource::Resource;
 use crate::typed_op::TypedOp;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
 pub struct Timeout {
   duration: Duration,
@@ -95,17 +94,21 @@ impl TypedOp for Timeout {
       #[cfg(target_os = "linux")]
       timer_fd: self.timer_res.clone(),
       #[cfg(target_os = "linux")]
-      timespec: self.timespec,
+      timespec: &self.timespec as *const libc::timespec,
     }
   }
 
   fn extract_result(self, res: isize) -> Self::Result {
     if res == 0 {
-      return Ok(());
-    }
-    match res.abs() as i32 {
-      libc::ETIME => Ok(()),
-      _ => Err(io::Error::last_os_error()),
+      Ok(())
+    } else {
+      match res.abs() as i32 {
+        #[cfg(target_os = "linux")]
+        libc::ETIME => Ok(()),
+        #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+        libc::ETIMEDOUT => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+      }
     }
   }
 

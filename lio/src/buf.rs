@@ -9,7 +9,9 @@
 //! The [`BufStore`] (requires `buf` feature) provides a pool of reusable 4096-byte buffers
 //! to avoid heap allocations. Each buffer is protected by a mutex for concurrent access.
 //!
-//! ```ignore
+//! ```
+//! use lio::buf::BufStore;
+//!
 //! let pool = BufStore::default(); // 128 buffers
 //!
 //! if let Some(buf) = pool.try_get() {
@@ -32,14 +34,21 @@
 /// Result type for operations that return both a result and a buffer.
 ///
 /// This is commonly used for read/write operations where the buffer
-/// is returned along with the operation result.
+/// is returned along with the operation result. The buffer is always
+/// returned regardless of success or failure.
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use lio::BufResult;
+///
+/// // Simulating an I/O result that returns the buffer
 /// let buf = vec![0u8; 1024];
-/// let (result, buf) = lio::recv(socket, buf, None).await;
-/// // buffer is returned and can be reused
+/// let result: BufResult<usize, Vec<u8>> = (Ok(512), buf);
+///
+/// let (io_result, returned_buf) = result;
+/// assert_eq!(io_result.unwrap(), 512);
+/// assert_eq!(returned_buf.len(), 1024);
 /// ```
 pub type BufResult<T, B> = (std::io::Result<T>, B);
 
@@ -360,7 +369,9 @@ impl BufCell {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use lio::buf::BufStore;
+///
 /// let buf_store = BufStore::with_capacity(64); // 64 * 4KB allocated once
 ///
 /// if let Some(buf) = buf_store.try_get() {

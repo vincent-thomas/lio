@@ -13,28 +13,23 @@
 //!
 //! # Examples
 //!
-//! ```rust,no_run
-//! use lio_uring::{IoUring, operation::Write};
+//! ```rust
+//! use lio_uring::{LioUring, operation::Write};
 //! use std::os::fd::AsRawFd;
 //!
 //! # fn main() -> std::io::Result<()> {
-//! let (mut cq, mut sq) = IoUring::with_capacity(32)?;
+//! let mut ring = LioUring::new(32)?;
 //!
 //! let data = b"Hello, io_uring!";
 //! let file = std::fs::File::create("/tmp/test")?;
 //!
-//! let op = Write {
-//!     fd: file.as_raw_fd(),
-//!     ptr: data.as_ptr() as *mut _,
-//!     len: data.len() as u32,
-//!     offset: 0,
-//! };
+//! let op = Write::new(file.as_raw_fd(), data.as_ptr(), data.len() as u32);
 //!
-//! unsafe { sq.push(&op, 1) }?;
-//! sq.submit()?;
+//! unsafe { ring.push(op.build(), 1) }?;
+//! ring.submit()?;
 //!
-//! let completion = cq.next()?;
-//! assert_eq!(completion.result()?, data.len() as i32);
+//! let completion = ring.wait()?;
+//! assert_eq!(completion.result(), data.len() as i32);
 //! # Ok(())
 //! # }
 //! ```
@@ -42,7 +37,7 @@
 use core::mem;
 use std::os::fd::RawFd;
 
-use crate::{bindings, completion::SqeFlags, submission::Entry};
+use crate::{Entry, SqeFlags, bindings};
 
 macro_rules! opcode {
     (@type $name:ty ) => {
@@ -2882,9 +2877,9 @@ mod smoke_tests {
       pastey::paste! {
         #[test]
         fn [<smoke_ $name:snake>]() {
-          let (_cq, mut sq) = crate::with_capacity(2).unwrap();
+          let mut ring = crate::LioUring::new(2).unwrap();
           let op = $op;
-          unsafe { sq.push(&op, 0x1234) };
+          unsafe { ring.push(op.build(), 0x1234) }.unwrap();
         }
       }
     };
@@ -2892,99 +2887,87 @@ mod smoke_tests {
 
   #[test]
   fn smoke_nop() {
-    let (mut cq, mut sq) = crate::with_capacity(2);
-    let op = Nop;
-    unsafe { sq.push(&op, 0x1234) };
-    sq.submit();
-    let completion = cq.next();
-    assert_eq!(completion.user_data, 0x1234);
-    assert_eq!(completion.res, 0);
+    let mut ring = crate::LioUring::new(2).unwrap();
+    let op = Nop::new();
+    unsafe { ring.push(op.build(), 0x1234) }.unwrap();
+    ring.submit().unwrap();
+    let completion = ring.wait().unwrap();
+    assert_eq!(completion.user_data(), 0x1234);
+    assert_eq!(completion.result(), 0);
   }
 
   #[test]
   fn smoke_read() {
-    let (mut cq, mut sq) = crate::with_capacity(2);
+    let mut ring = crate::LioUring::new(2).unwrap();
     let mut buf = vec![0u8; 1024];
     let file = File::open("/dev/null").unwrap();
-    let op = Read {
-      fd: file.as_raw_fd(),
-      ptr: buf.as_mut_ptr().cast(),
-      len: buf.len() as u32,
-      offset: 0,
-    };
-    unsafe { sq.push(&op, 0x1234) };
-    sq.submit();
-    let completion = cq.next();
-    assert_eq!(completion.user_data, 0x1234);
-    assert_eq!(completion.res, 0); // /dev/null returns 0 bytes read
+    let op =
+      Read::new(file.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len() as u32);
+    unsafe { ring.push(op.build(), 0x1234) }.unwrap();
+    ring.submit().unwrap();
+    let completion = ring.wait().unwrap();
+    assert_eq!(completion.user_data(), 0x1234);
+    assert_eq!(completion.result(), 0); // /dev/null returns 0 bytes read
   }
 
   #[test]
   fn smoke_write() {
-    let (mut cq, mut sq) = crate::with_capacity(2);
+    let mut ring = crate::LioUring::new(2).unwrap();
     let buf = b"Hello, io_uring!";
     let file = File::create("/tmp/lio_uring_test_write").unwrap();
-    let op = Write {
-      fd: file.as_raw_fd(),
-      ptr: buf.as_ptr() as *mut _,
-      len: buf.len() as u32,
-      offset: 0,
-    };
-    unsafe { sq.push(&op, 0x1234) };
-    sq.submit();
-    let completion = cq.next();
-    assert_eq!(completion.user_data, 0x1234);
-    assert_eq!(completion.res, buf.len() as i32);
+    let op = Write::new(file.as_raw_fd(), buf.as_ptr(), buf.len() as u32);
+    unsafe { ring.push(op.build(), 0x1234) }.unwrap();
+    ring.submit().unwrap();
+    let completion = ring.wait().unwrap();
+    assert_eq!(completion.user_data(), 0x1234);
+    assert_eq!(completion.result(), buf.len() as i32);
   }
 
   #[test]
   fn smoke_fsync() {
-    let (mut cq, mut sq) = crate::with_capacity(2);
+    let mut ring = crate::LioUring::new(2).unwrap();
     let file = File::create("/tmp/lio_uring_test_fsync").unwrap();
-    let op = Fsync { fd: file.as_raw_fd(), flags: 0 };
-    unsafe { sq.push(&op, 0x1234) };
-    sq.submit();
-    let completion = cq.next();
-    assert_eq!(completion.user_data, 0x1234);
-    assert_eq!(completion.res, 0); // fsync returns 0 on success
+    let op = Fsync::new(file.as_raw_fd());
+    unsafe { ring.push(op.build(), 0x1234) }.unwrap();
+    ring.submit().unwrap();
+    let completion = ring.wait().unwrap();
+    assert_eq!(completion.user_data(), 0x1234);
+    assert_eq!(completion.result(), 0); // fsync returns 0 on success
   }
 
   #[test]
   fn smoke_close() {
-    let (mut cq, mut sq) = crate::with_capacity(2);
+    let mut ring = crate::LioUring::new(2).unwrap();
     let file = File::create("/tmp/lio_uring_test_close").unwrap();
     let fd = file.as_raw_fd();
     core::mem::forget(file); // Don't close it normally
-    let op = Close { fd };
-    unsafe { sq.push(&op, 0x1234) };
-    sq.submit();
-    let completion = cq.next();
-    assert_eq!(completion.user_data, 0x1234);
-    assert_eq!(completion.res, 0); // close returns 0 on success
+    let op = Close::new(fd);
+    unsafe { ring.push(op.build(), 0x1234) }.unwrap();
+    ring.submit().unwrap();
+    let completion = ring.wait().unwrap();
+    assert_eq!(completion.user_data(), 0x1234);
+    assert_eq!(completion.result(), 0); // close returns 0 on success
   }
 
   #[test]
   fn smoke_openat() {
-    let (mut cq, mut sq) = crate::with_capacity(2);
+    let mut ring = crate::LioUring::new(2).unwrap();
     let path = b"/tmp/lio_uring_test_open\0";
-    let op = Openat {
-      dfd: -100, // AT_FDCWD
-      path: path.as_ptr().cast(),
-      flags: libc::O_CREAT | libc::O_WRONLY,
-      mode: 0o644,
-    };
-    unsafe { sq.push(&op, 0x1234) };
-    sq.submit();
-    let completion = cq.next();
-    assert_eq!(completion.user_data, 0x1234);
-    assert!(completion.res >= 0); // openat returns fd >= 0 on success
+    let op = Openat::new(-100, path.as_ptr().cast()) // AT_FDCWD
+      .flags(libc::O_CREAT | libc::O_WRONLY)
+      .mode(0o644);
+    unsafe { ring.push(op.build(), 0x1234) }.unwrap();
+    ring.submit().unwrap();
+    let completion = ring.wait().unwrap();
+    assert_eq!(completion.user_data(), 0x1234);
+    assert!(completion.result() >= 0); // openat returns fd >= 0 on success
     // Close the fd returned by openat
-    unsafe { libc::close(completion.res) };
+    unsafe { libc::close(completion.result()) };
   }
 
   #[test]
   fn smoke_readv() {
-    let (mut cq, mut sq) = crate::with_capacity(2);
+    let mut ring = crate::LioUring::new(2).unwrap();
     let mut buf1 = vec![0u8; 512];
     let mut buf2 = vec![0u8; 512];
     let iovecs = [
@@ -2992,22 +2975,17 @@ mod smoke_tests {
       libc::iovec { iov_base: buf2.as_mut_ptr().cast(), iov_len: buf2.len() },
     ];
     let file = File::open("/dev/zero").unwrap();
-    let op = Readv {
-      fd: file.as_raw_fd(),
-      iovecs: iovecs.as_ptr().cast(),
-      nr_vecs: 2,
-      offset: 0,
-    };
-    unsafe { sq.push(&op, 0x1234) };
-    sq.submit();
-    let completion = cq.next();
-    assert_eq!(completion.user_data, 0x1234);
-    assert_eq!(completion.res, 1024); // Should read 1024 bytes from /dev/zero
+    let op = Readv::new(file.as_raw_fd(), iovecs.as_ptr().cast(), 2);
+    unsafe { ring.push(op.build(), 0x1234) }.unwrap();
+    ring.submit().unwrap();
+    let completion = ring.wait().unwrap();
+    assert_eq!(completion.user_data(), 0x1234);
+    assert_eq!(completion.result(), 1024); // Should read 1024 bytes from /dev/zero
   }
 
   #[test]
   fn smoke_writev() {
-    let (mut cq, mut sq) = crate::with_capacity(2);
+    let mut ring = crate::LioUring::new(2).unwrap();
     let buf1 = b"Hello, ";
     let buf2 = b"io_uring!";
     let iovecs = [
@@ -3015,307 +2993,159 @@ mod smoke_tests {
       libc::iovec { iov_base: buf2.as_ptr() as *mut _, iov_len: buf2.len() },
     ];
     let file = File::create("/tmp/lio_uring_test_writev").unwrap();
-    let op = Writev {
-      fd: file.as_raw_fd(),
-      iovecs: iovecs.as_ptr().cast(),
-      nr_vecs: 2,
-      offset: 0,
-    };
-    unsafe { sq.push(&op, 0x1234) };
-    sq.submit();
-    let completion = cq.next();
-    assert_eq!(completion.user_data, 0x1234);
-    assert_eq!(completion.res, 16); // "Hello, " + "io_uring!" = 16 bytes
+    let op = Writev::new(file.as_raw_fd(), iovecs.as_ptr().cast(), 2);
+    unsafe { ring.push(op.build(), 0x1234) }.unwrap();
+    ring.submit().unwrap();
+    let completion = ring.wait().unwrap();
+    assert_eq!(completion.user_data(), 0x1234);
+    assert_eq!(completion.result(), 16); // "Hello, " + "io_uring!" = 16 bytes
   }
 
   #[test]
   fn smoke_poll_add() {
-    let (mut cq, mut sq) = crate::with_capacity(2);
+    let mut ring = crate::LioUring::new(2).unwrap();
     let file = File::open("/dev/null").unwrap();
-    let op = PollAdd { fd: file.as_raw_fd(), poll_mask: libc::POLLIN as u32 };
-    unsafe { sq.push(&op, 0x1234) };
-    sq.submit();
-    let completion = cq.next();
-    assert_eq!(completion.user_data, 0x1234);
+    let op = PollAdd::new(file.as_raw_fd(), libc::POLLIN as u32);
+    unsafe { ring.push(op.build(), 0x1234) }.unwrap();
+    ring.submit().unwrap();
+    let completion = ring.wait().unwrap();
+    assert_eq!(completion.user_data(), 0x1234);
     // Poll on /dev/null should return immediately with POLLIN set
-    assert!(completion.res >= 0);
+    assert!(completion.result() >= 0);
   }
 
   #[test]
   fn smoke_fallocate() {
-    let (mut cq, mut sq) = crate::with_capacity(2);
+    let mut ring = crate::LioUring::new(2).unwrap();
     let file = File::create("/tmp/lio_uring_test_fallocate").unwrap();
-    let op = Fallocate { fd: file.as_raw_fd(), mode: 0, offset: 0, len: 4096 };
-    unsafe { sq.push(&op, 0x1234) };
-    sq.submit();
-    let completion = cq.next();
-    assert_eq!(completion.user_data, 0x1234);
-    assert_eq!(completion.res, 0); // fallocate returns 0 on success
+    let op = Fallocate::new(file.as_raw_fd(), 4096);
+    unsafe { ring.push(op.build(), 0x1234) }.unwrap();
+    ring.submit().unwrap();
+    let completion = ring.wait().unwrap();
+    assert_eq!(completion.user_data(), 0x1234);
+    assert_eq!(completion.result(), 0); // fallocate returns 0 on success
   }
 
   #[test]
   fn smoke_fadvise() {
-    let (mut cq, mut sq) = crate::with_capacity(2);
+    let mut ring = crate::LioUring::new(2).unwrap();
     let file = File::open("/dev/null").unwrap();
-    let op = Fadvise {
-      fd: file.as_raw_fd(),
-      offset: 0,
-      len: 1024,
-      advice: libc::POSIX_FADV_SEQUENTIAL,
-    };
-    unsafe { sq.push(&op, 0x1234) };
-    sq.submit();
-    let completion = cq.next();
-    assert_eq!(completion.user_data, 0x1234);
-    assert_eq!(completion.res, 0); // fadvise returns 0 on success
+    let op =
+      Fadvise::new(file.as_raw_fd(), 0, 1024, libc::POSIX_FADV_SEQUENTIAL);
+    unsafe { ring.push(op.build(), 0x1234) }.unwrap();
+    ring.submit().unwrap();
+    let completion = ring.wait().unwrap();
+    assert_eq!(completion.user_data(), 0x1234);
+    assert_eq!(completion.result(), 0); // fadvise returns 0 on success
   }
 
   #[test]
   fn smoke_ftruncate() {
     use std::io::Write;
-    let (mut cq, mut sq) = crate::with_capacity(2);
+    let mut ring = crate::LioUring::new(2).unwrap();
     let mut file = File::create("/tmp/lio_uring_test_ftruncate").unwrap();
     // Write some data first so we have something to truncate
     file.write_all(&[0u8; 2048]).unwrap();
     file.flush().unwrap();
-    let op = Ftruncate { fd: file.as_raw_fd(), len: 1024 };
-    unsafe { sq.push(&op, 0x1234) };
-    sq.submit();
-    let completion = cq.next();
-    assert_eq!(completion.user_data, 0x1234);
+    let op = Ftruncate::new(file.as_raw_fd(), 1024);
+    unsafe { ring.push(op.build(), 0x1234) }.unwrap();
+    ring.submit().unwrap();
+    let completion = ring.wait().unwrap();
+    assert_eq!(completion.user_data(), 0x1234);
     // ftruncate returns 0 on success, or negative errno
     // EINVAL (-22) can occur on some kernel versions, so we just verify we got a completion
-    println!("ftruncate result: {}", completion.res);
+    println!("ftruncate result: {}", completion.result());
   }
 
-  smoke_test!(PollRemove, PollRemove { user_data: 0x5678 });
-  smoke_test!(TimeoutRemove, TimeoutRemove { user_data: 0x5678, flags: 0 });
-  smoke_test!(Cancel, Cancel { user_data: 0x5678, flags: 0 });
-  smoke_test!(Recvmsg, unsafe {
-    Recvmsg { fd: 0, msg: core::ptr::null_mut(), flags: 0 }
-  });
-  smoke_test!(Sendmsg, unsafe {
-    Sendmsg { fd: 1, msg: core::ptr::null(), flags: 0 }
-  });
-  smoke_test!(Madvise, unsafe {
-    Madvise { addr: core::ptr::null_mut(), length: 0, advice: 0 }
-  });
+  smoke_test!(PollRemove, PollRemove::new(0x5678));
+  smoke_test!(TimeoutRemove, TimeoutRemove::new(0x5678));
+  smoke_test!(Cancel, Cancel::new(0x5678));
+  smoke_test!(Recvmsg, Recvmsg::new(0, core::ptr::null_mut()));
+  smoke_test!(Sendmsg, Sendmsg::new(1, core::ptr::null()));
+  smoke_test!(Madvise, Madvise::new(core::ptr::null_mut(), 0, 0));
+  smoke_test!(Splice, Splice::new(0, 1, 0));
+  smoke_test!(Tee, Tee::new(0, 1, 0));
+  smoke_test!(Shutdown, Shutdown::new(0, 0));
   smoke_test!(
-    Splice,
-    Splice {
-      fd_in: 0,
-      off_in: 0,
-      fd_out: 1,
-      off_out: 0,
-      nbytes: 0,
-      splice_flags: 0
-    }
+    Renameat,
+    Renameat::new(-100, core::ptr::null(), -100, core::ptr::null())
   );
-  smoke_test!(Tee, Tee { fd_in: 0, fd_out: 1, nbytes: 0, splice_flags: 0 });
-  smoke_test!(Shutdown, Shutdown { fd: 0, how: 0 });
-  smoke_test!(Renameat, unsafe {
-    Renameat {
-      olddfd: -100,
-      oldpath: core::ptr::null(),
-      newdfd: -100,
-      newpath: core::ptr::null(),
-      flags: 0,
-    }
-  });
-  smoke_test!(Unlinkat, unsafe {
-    Unlinkat { dfd: -100, path: core::ptr::null(), flags: 0 }
-  });
-  smoke_test!(Mkdirat, unsafe {
-    Mkdirat { dfd: -100, path: core::ptr::null(), mode: 0 }
-  });
-  smoke_test!(Symlinkat, unsafe {
-    Symlinkat {
-      target: core::ptr::null(),
-      newdirfd: -100,
-      linkpath: core::ptr::null(),
-    }
-  });
-  smoke_test!(Linkat, unsafe {
-    Linkat {
-      olddfd: -100,
-      oldpath: core::ptr::null(),
-      newdfd: -100,
-      newpath: core::ptr::null(),
-      flags: 0,
-    }
-  });
-  smoke_test!(Statx, unsafe {
-    Statx {
-      dfd: -100,
-      path: core::ptr::null(),
-      flags: 0,
-      mask: 0,
-      statxbuf: core::ptr::null_mut(),
-    }
-  });
-  smoke_test!(Fgetxattr, unsafe {
-    Fgetxattr {
-      fd: 0,
-      name: core::ptr::null(),
-      value: core::ptr::null_mut(),
-      len: 0,
-    }
-  });
-  smoke_test!(Fsetxattr, unsafe {
-    Fsetxattr {
-      fd: 0,
-      name: core::ptr::null(),
-      value: core::ptr::null(),
-      flags: 0,
-      len: 0,
-    }
-  });
+  smoke_test!(Unlinkat, Unlinkat::new(-100, core::ptr::null()));
+  smoke_test!(Mkdirat, Mkdirat::new(-100, core::ptr::null(), 0));
   smoke_test!(
-    Socket,
-    Socket { domain: 2, sock_type: 1, protocol: 0, flags: 0 }
+    Symlinkat,
+    Symlinkat::new(core::ptr::null(), -100, core::ptr::null())
   );
   smoke_test!(
-    SocketDirect,
-    SocketDirect {
-      domain: 2,
-      sock_type: 1,
-      protocol: 0,
-      file_index: 0,
-      flags: 0
-    }
+    Linkat,
+    Linkat::new(-100, core::ptr::null(), -100, core::ptr::null())
   );
-  smoke_test!(RecvMulti, unsafe {
-    RecvMulti { fd: 0, buf: core::ptr::null_mut(), len: 0, flags: 0 }
-  });
-  smoke_test!(AcceptMulti, unsafe {
-    AcceptMulti {
-      fd: 0,
-      addr: core::ptr::null_mut(),
-      addrlen: core::ptr::null_mut(),
-      flags: 0,
-    }
-  });
-  smoke_test!(FilesUpdate, unsafe {
-    FilesUpdate { fds: core::ptr::null_mut(), nr_fds: 0, offset: 0 }
-  });
-  smoke_test!(Waitid, unsafe {
-    Waitid {
-      idtype: 0,
-      id: 0,
-      infop: core::ptr::null_mut(),
-      options: 0,
-      flags: 0,
-    }
-  });
-  smoke_test!(Getxattr, unsafe {
-    Getxattr {
-      name: core::ptr::null(),
-      value: core::ptr::null_mut(),
-      path: core::ptr::null(),
-      len: 0,
-    }
-  });
-  smoke_test!(Setxattr, unsafe {
-    Setxattr {
-      name: core::ptr::null(),
-      path: core::ptr::null(),
-      value: core::ptr::null(),
-      flags: 0,
-      len: 0,
-    }
-  });
   smoke_test!(
-    SyncFileRange,
-    SyncFileRange { fd: 0, len: 0, offset: 0, flags: 0 }
+    Statx,
+    Statx::new(-100, core::ptr::null(), 0, 0, core::ptr::null_mut())
   );
-  smoke_test!(Epoll, unsafe {
-    Epoll { epfd: 0, fd: 1, op: 0, ev: core::ptr::null_mut() }
-  });
-  smoke_test!(ProvideBuffers, unsafe {
-    ProvideBuffers {
-      addr: core::ptr::null_mut(),
-      len: 0,
-      nr: 0,
-      bgid: 0,
-      bid: 0,
-    }
-  });
-  smoke_test!(RemoveBuffers, RemoveBuffers { nr: 0, bgid: 0 });
-  smoke_test!(MsgRing, MsgRing { fd: 0, len: 0, data: 0, flags: 0 });
-  smoke_test!(SendZc, unsafe {
-    SendZc { sockfd: 1, buf: core::ptr::null(), len: 0, flags: 0, zc_flags: 0 }
-  });
-  smoke_test!(SendmsgZc, unsafe {
-    SendmsgZc { fd: 1, msg: core::ptr::null(), flags: 0 }
-  });
   smoke_test!(
-    PollUpdate,
-    PollUpdate { old_user_data: 0, new_user_data: 0, poll_mask: 0, flags: 0 }
+    Fgetxattr,
+    Fgetxattr::new(0, core::ptr::null(), core::ptr::null_mut(), 0)
   );
-  smoke_test!(LinkTimeout, unsafe {
-    LinkTimeout { ts: core::ptr::null_mut(), flags: 0 }
-  });
-  smoke_test!(Bind, unsafe {
-    Bind { sockfd: 0, addr: core::ptr::null(), addrlen: 0 }
-  });
-  smoke_test!(Listen, Listen { sockfd: 0, backlog: 0 });
-  smoke_test!(FixedFdInstall, FixedFdInstall { fd: 0, flags: 0 });
-  smoke_test!(SendZcFixed, unsafe {
-    SendZcFixed {
-      sockfd: 1,
-      buf: core::ptr::null(),
-      len: 0,
-      flags: 0,
-      zc_flags: 0,
-      buf_index: 0,
-    }
-  });
-  smoke_test!(Openat2, unsafe {
-    Openat2 { dfd: -100, path: core::ptr::null(), how: core::ptr::null_mut() }
-  });
   smoke_test!(
-    MsgRingCqeFlags,
-    MsgRingCqeFlags { fd: 0, len: 0, data: 0, flags: 0, cqe_flags: 0 }
+    Fsetxattr,
+    Fsetxattr::new(0, core::ptr::null(), core::ptr::null(), 0, 0)
   );
-  smoke_test!(CloseFixed, CloseFixed { file_index: 0 });
-  smoke_test!(ReadFixed2, unsafe {
-    ReadFixed2 {
-      fd: 0,
-      buf: core::ptr::null_mut(),
-      nbytes: 0,
-      offset: 0,
-      buf_index: 0,
-    }
-  });
-  smoke_test!(WriteFixed2, unsafe {
-    WriteFixed2 {
-      fd: 1,
-      buf: core::ptr::null(),
-      nbytes: 0,
-      offset: 0,
-      buf_index: 0,
-    }
-  });
-  smoke_test!(UringCmd, UringCmd { op: 0, fd: 0 });
-  smoke_test!(FutexWait, unsafe {
-    FutexWait {
-      futex: core::ptr::null_mut(),
-      val: 0,
-      mask: 0,
-      futex_flags: 0,
-      flags: 0,
-    }
-  });
-  smoke_test!(FutexWake, unsafe {
-    FutexWake {
-      futex: core::ptr::null_mut(),
-      val: 0,
-      mask: 0,
-      futex_flags: 0,
-      flags: 0,
-    }
-  });
-  smoke_test!(FutexWaitv, unsafe {
-    FutexWaitv { futex: core::ptr::null_mut(), nr_futex: 0, flags: 0 }
-  });
+  smoke_test!(Socket, Socket::new(2, 1, 0));
+  smoke_test!(SocketDirect, SocketDirect::new(2, 1, 0, 0));
+  smoke_test!(RecvMulti, RecvMulti::new(0, core::ptr::null_mut(), 0));
+  smoke_test!(
+    AcceptMulti,
+    AcceptMulti::new(0, core::ptr::null_mut(), core::ptr::null_mut())
+  );
+  smoke_test!(FilesUpdate, FilesUpdate::new(core::ptr::null_mut(), 0, 0));
+  smoke_test!(Waitid, Waitid::new(0, 0, core::ptr::null_mut(), 0));
+  smoke_test!(
+    Getxattr,
+    Getxattr::new(
+      core::ptr::null(),
+      core::ptr::null(),
+      core::ptr::null_mut(),
+      0
+    )
+  );
+  smoke_test!(
+    Setxattr,
+    Setxattr::new(
+      core::ptr::null(),
+      core::ptr::null(),
+      core::ptr::null(),
+      0,
+      0
+    )
+  );
+  smoke_test!(SyncFileRange, SyncFileRange::new(0, 0, 0));
+  smoke_test!(Epoll, Epoll::new(0, 1, 0, core::ptr::null_mut()));
+  smoke_test!(
+    ProvideBuffers,
+    ProvideBuffers::new(core::ptr::null_mut(), 0, 0, 0, 0)
+  );
+  smoke_test!(RemoveBuffers, RemoveBuffers::new(0, 0));
+  smoke_test!(MsgRing, MsgRing::new(0, 0, 0));
+  smoke_test!(SendZc, SendZc::new(1, core::ptr::null(), 0));
+  smoke_test!(SendmsgZc, SendmsgZc::new(1, core::ptr::null()));
+  smoke_test!(PollUpdate, PollUpdate::new(0, 0, 0));
+  smoke_test!(LinkTimeout, LinkTimeout::new(core::ptr::null_mut()));
+  smoke_test!(Bind, Bind::new(0, core::ptr::null(), 0));
+  smoke_test!(Listen, Listen::new(0, 0));
+  smoke_test!(FixedFdInstall, FixedFdInstall::new(0));
+  smoke_test!(SendZcFixed, SendZcFixed::new(1, core::ptr::null(), 0, 0));
+  smoke_test!(
+    Openat2,
+    Openat2::new(-100, core::ptr::null(), core::ptr::null_mut())
+  );
+  smoke_test!(MsgRingCqeFlags, MsgRingCqeFlags::new(0, 0, 0, 0));
+  smoke_test!(CloseFixed, CloseFixed::new(0));
+  smoke_test!(ReadFixed2, ReadFixed2::new(0, core::ptr::null_mut(), 0, 0, 0));
+  smoke_test!(WriteFixed2, WriteFixed2::new(1, core::ptr::null(), 0, 0, 0));
+  smoke_test!(UringCmd, UringCmd::new(0, 0));
+  smoke_test!(FutexWait, FutexWait::new(core::ptr::null_mut(), 0, 0, 0));
+  smoke_test!(FutexWake, FutexWake::new(core::ptr::null_mut(), 0, 0, 0));
+  smoke_test!(FutexWaitv, FutexWaitv::new(core::ptr::null_mut(), 0));
 }

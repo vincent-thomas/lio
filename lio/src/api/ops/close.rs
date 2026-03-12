@@ -1,14 +1,30 @@
 use std::io;
 
-use crate::{api::resource::Resource, typed_op::TypedOp};
+#[cfg(unix)]
+use std::os::fd::RawFd;
+#[cfg(windows)]
+use std::os::windows::io::RawHandle;
+
+use crate::typed_op::TypedOp;
 
 pub struct Close {
-  res: Resource,
+  #[cfg(unix)]
+  fd: RawFd,
+  #[cfg(windows)]
+  handle: RawHandle,
+  #[cfg(windows)]
+  is_socket: bool,
 }
 
 impl Close {
-  pub(crate) fn new(res: Resource) -> Self {
-    Self { res }
+  #[cfg(unix)]
+  pub(crate) fn new(fd: RawFd) -> Self {
+    Self { fd }
+  }
+
+  #[cfg(windows)]
+  pub(crate) fn new(handle: RawHandle, is_socket: bool) -> Self {
+    Self { handle, is_socket }
   }
 }
 
@@ -18,7 +34,14 @@ impl TypedOp for Close {
   type Result = io::Result<()>;
 
   fn into_op(&mut self) -> crate::op::Op {
-    crate::op::Op::Close { fd: self.res.clone() }
+    #[cfg(unix)]
+    {
+      crate::op::Op::Close { fd: self.fd }
+    }
+    #[cfg(windows)]
+    {
+      crate::op::Op::Close { handle: self.handle, is_socket: self.is_socket }
+    }
   }
 
   fn extract_result(self, res: isize) -> Self::Result {
@@ -28,19 +51,4 @@ impl TypedOp for Close {
       Ok(())
     }
   }
-
-  // #[cfg(unix)]
-  // fn meta(&self) -> crate::operation::OpMeta {
-  //   crate::op::Op::Close { fd: self.res.clone() }.meta()
-  // }
-
-  // #[cfg(unix)]
-  // fn cap(&self) -> i32 {
-  //   self.res.as_raw_fd()
-  // }
-
-  // fn run_blocking(&self) -> isize {
-  //   use std::os::fd::AsRawFd;
-  //   unsafe { libc::close(self.res.as_raw_fd()) as isize }
-  // }
 }

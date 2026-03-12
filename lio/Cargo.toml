@@ -20,13 +20,11 @@ default = []
 unstable_ffi = []
 bytes = ["dep:bytes"]
 zeroize = ["dep:zeroize"]
-high = []
 
 [dependencies]
 
 # Required
 libc.workspace = true
-scc = { version = "3.4.8", default-features = false }
 crossbeam-channel = { version = "0.5", default-features = false, features = ["std"] }
 
 # Optional
@@ -40,6 +38,7 @@ lio-uring.path = "../lio-uring"
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_System_IO",
+  "Win32_System_Threading",      # CreateTimerQueueTimer, DeleteTimerQueueTimer
   "Win32_Storage_FileSystem",    # ReadFile, WriteFile, CreateFileW
   "Win32_Networking_WinSock",    # WSARecv, WSASend, AcceptEx, ConnectEx
   "Win32_Security",              # Security attributes for file operations
@@ -47,7 +46,9 @@ windows-sys = { version = "0.59", features = [
 
 [build-dependencies]
 cfg_aliases = "0.2.1"
+cbindgen = { version = "0.29", default-features = false }
 
 [dev-dependencies]
 fastrand = "2.3.0"
+pastey = "0.1"
 proptest = "1.4"

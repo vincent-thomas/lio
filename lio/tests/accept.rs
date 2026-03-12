@@ -1,3 +1,6 @@
+mod common;
+
+use common::poll_until_recv;
 use lio::Lio;
 use lio::api;
 use std::{
@@ -5,30 +8,7 @@ use std::{
   net::SocketAddr,
   os::fd::{AsFd, AsRawFd},
   sync::mpsc,
-  thread,
-  time::Duration,
 };
-
-/// Helper to poll until we receive a result
-fn poll_until_recv<T>(lio: &mut Lio, receiver: &mpsc::Receiver<T>) -> T {
-  let mut attempts = 0;
-  loop {
-    lio.try_run().unwrap();
-    match receiver.try_recv() {
-      Ok(result) => return result,
-      Err(mpsc::TryRecvError::Empty) => {
-        attempts += 1;
-        if attempts > 10 {
-          panic!("Operation did not complete after 10 attempts");
-        }
-        thread::sleep(Duration::from_micros(100));
-      }
-      Err(mpsc::TryRecvError::Disconnected) => {
-        panic!("Channel disconnected");
-      }
-    }
-  }
-}
 
 #[test]
 fn test_accept_basic() {
@@ -107,13 +87,6 @@ fn test_accept_basic() {
   let (res, buf) = poll_until_recv(&mut lio, &receiver_recv);
   res.unwrap();
   assert!(buf == _buf);
-
-  // Cleanup
-  unsafe {
-    libc::close(accepted_fd.as_fd().as_raw_fd());
-    libc::close(server_sock.as_fd().as_raw_fd());
-    libc::close(client_sock.as_fd().as_raw_fd());
-  }
 }
 
 #[test]
@@ -193,17 +166,6 @@ fn test_accept_multiple() {
   // Verify all connections
   assert_eq!(accepted_fds.len(), num_clients);
   assert_eq!(client_fds.len(), num_clients);
-
-  // Cleanup
-  unsafe {
-    for fd in accepted_fds {
-      libc::close(fd.as_fd().as_raw_fd());
-    }
-    for fd in client_fds {
-      libc::close(fd.as_fd().as_raw_fd());
-    }
-    libc::close(server_sock.as_fd().as_raw_fd());
-  }
 }
 
 #[test]
@@ -265,13 +227,7 @@ fn test_accept_with_client_info() {
 
   let (accepted_fd, _client_addr) =
     poll_until_recv(&mut lio, &receiver_a).expect("Failed to accept");
-
-  // Cleanup
-  unsafe {
-    libc::close(client_sock.as_fd().as_raw_fd());
-    libc::close(accepted_fd.as_fd().as_raw_fd());
-    libc::close(server_sock.as_fd().as_raw_fd());
-  }
+  let _ = accepted_fd;
 }
 
 #[test]
@@ -336,11 +292,4 @@ fn test_accept_ipv6() {
     poll_until_recv(&mut lio, &receiver_a).expect("Failed to accept IPv6");
 
   assert!(accepted_fd.as_fd().as_raw_fd() >= 0);
-
-  // Cleanup
-  unsafe {
-    libc::close(client_sock.as_fd().as_raw_fd());
-    libc::close(accepted_fd.as_fd().as_raw_fd());
-    libc::close(server_sock.as_fd().as_raw_fd());
-  }
 }

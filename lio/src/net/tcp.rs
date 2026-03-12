@@ -7,11 +7,10 @@ use crate::{
   api::{
     self,
     io::Io,
-    ops::{self, Accept, Recv, Shutdown},
+    ops::{self, Recv, Shutdown},
     resource::{AsResource, FromResource, IntoResource, Resource},
   },
   net::ops::TcpAccept,
-  operation::{OpMeta, Operation, OperationExt},
 };
 
 use super::socket::Socket;
@@ -29,7 +28,6 @@ use super::socket::Socket;
 /// ```rust,no_run
 /// use lio::net::TcpListener;
 ///
-/// # lio::init();
 /// async fn example() -> std::io::Result<()> {
 ///     // Bind to an address and start listening
 ///     let listener = TcpListener::bind_async("127.0.0.1:8080").await?;
@@ -42,7 +40,6 @@ use super::socket::Socket;
 ///         // Handle the connection...
 ///     }
 /// }
-/// # lio::exit();
 /// ```
 ///
 /// ## Synchronous binding
@@ -50,7 +47,6 @@ use super::socket::Socket;
 /// ```rust,no_run
 /// use lio::net::TcpListener;
 ///
-/// # lio::init();
 /// fn example() -> std::io::Result<()> {
 ///     // Bind synchronously (blocks until ready)
 ///     let listener = TcpListener::bind_sync("127.0.0.1:8080")?;
@@ -58,7 +54,6 @@ use super::socket::Socket;
 ///     // Accept connections asynchronously
 ///     Ok(())
 /// }
-/// # lio::exit();
 /// ```
 pub struct TcpListener(Socket);
 
@@ -91,8 +86,7 @@ impl TcpListener {
   /// ```rust,no_run
   /// use lio::net::TcpListener;
   ///
-  /// # lio::init();
-  /// async fn example() -> std::io::Result<()> {
+    /// async fn example() -> std::io::Result<()> {
   ///     // Bind using a string
   ///     let listener = TcpListener::bind_async("127.0.0.1:8080").await?;
   ///
@@ -101,17 +95,16 @@ impl TcpListener {
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
+    /// ```
   // TODO: AsyncToSocketAddrs
   pub async fn bind_async(addr: impl ToSocketAddrs) -> io::Result<Self> {
     let mut addrs = addr.to_socket_addrs()?;
 
-    let socket = Socket::new(libc::SOCK_STREAM, libc::AF_INET, 0).await?;
+    let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
     let addr = addrs.next().unwrap();
     socket.bind(addr).await?;
     socket.listen().await?;
-    return Ok(TcpListener(socket));
+    Ok(TcpListener(socket))
   }
 
   /// Creates a new `TcpListener` which will be bound to the specified address synchronously.
@@ -124,23 +117,22 @@ impl TcpListener {
   /// ```rust,no_run
   /// use lio::net::TcpListener;
   ///
-  /// # lio::init();
-  /// fn example() -> std::io::Result<()> {
+    /// fn example() -> std::io::Result<()> {
   ///     // This will block until the listener is ready
   ///     let listener = TcpListener::bind_sync("127.0.0.1:8080")?;
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
+    /// ```
+  #[allow(deprecated)]
   pub fn bind_sync(addr: impl ToSocketAddrs) -> io::Result<Self> {
     let mut addrs = addr.to_socket_addrs()?;
 
-    let socket = Socket::new(libc::SOCK_STREAM, libc::AF_INET, 0).wait()?;
+    let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).wait()?;
     let addr = addrs.next().unwrap();
     socket.bind(addr).wait()?;
     socket.listen().wait()?;
-    return Ok(TcpListener(socket));
+    Ok(TcpListener(socket))
   }
 
   /// Accepts a new incoming connection from this listener.
@@ -160,8 +152,7 @@ impl TcpListener {
   /// ```rust,no_run
   /// use lio::net::TcpListener;
   ///
-  /// # lio::init();
-  /// async fn example() -> std::io::Result<()> {
+    /// async fn example() -> std::io::Result<()> {
   ///     let listener = TcpListener::bind_async("127.0.0.1:8080").await?;
   ///
   ///     loop {
@@ -171,11 +162,15 @@ impl TcpListener {
   ///         // Handle the socket...
   ///     }
   /// }
-  /// # lio::exit();
-  /// ```
-  pub fn accept(&self) -> Io<'_, TcpAccept> {
+    /// ```
+  pub fn accept(&self) -> Io<TcpAccept> {
     let socket_accept_op = TcpAccept::new(self.0.as_resource().clone());
     Io::from_op(socket_accept_op)
+  }
+
+  /// Returns the local address this listener is bound to.
+  pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    self.0.local_addr()
   }
 }
 
@@ -196,7 +191,6 @@ impl TcpListener {
 /// use std::net::SocketAddr;
 /// use lio::net::TcpSocket;
 ///
-/// # lio::init();
 /// async fn example() -> std::io::Result<()> {
 ///     // Connect to a server
 ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
@@ -204,15 +198,16 @@ impl TcpListener {
 ///
 ///     // Send data
 ///     let data = b"Hello, server!".to_vec();
-///     let (data, bytes_sent) = socket.send(data).await?;
+///     let (result, data) = socket.send(data).await;
+///     let bytes_sent = result? as usize;
 ///
 ///     // Receive response
 ///     let buffer = vec![0u8; 1024];
-///     let (buffer, bytes_read) = socket.recv(buffer).await?;
+///     let (result, buffer) = socket.recv(buffer).await;
+///     let bytes_read = result? as usize;
 ///
 ///     Ok(())
 /// }
-/// # lio::exit();
 /// ```
 ///
 /// ## Handling an accepted connection
@@ -220,7 +215,6 @@ impl TcpListener {
 /// ```rust,no_run
 /// use lio::net::TcpListener;
 ///
-/// # lio::init();
 /// async fn example() -> std::io::Result<()> {
 ///     let listener = TcpListener::bind_async("127.0.0.1:8080").await?;
 ///
@@ -229,11 +223,11 @@ impl TcpListener {
 ///
 ///     // Use the socket...
 ///     let buffer = vec![0u8; 1024];
-///     let (buffer, bytes_read) = socket.recv(buffer).await?;
+///     let (result, buffer) = socket.recv(buffer).await;
+///     let bytes_read = result? as usize;
 ///
 ///     Ok(())
 /// }
-/// # lio::exit();
 /// ```
 pub struct TcpSocket(Socket);
 
@@ -268,8 +262,7 @@ impl TcpSocket {
   /// use std::net::SocketAddr;
   /// use lio::net::TcpSocket;
   ///
-  /// # lio::init();
-  /// async fn example() -> std::io::Result<()> {
+    /// async fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
   ///     let socket = TcpSocket::connect_async(addr).await?;
   ///
@@ -277,10 +270,9 @@ impl TcpSocket {
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
+    /// ```
   pub async fn connect_async(addr: SocketAddr) -> io::Result<Self> {
-    let socket = Socket::new(libc::SOCK_STREAM, libc::AF_INET, 0).await?;
+    let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
     api::connect(&socket, addr).await?;
     Ok(TcpSocket(socket))
   }
@@ -296,18 +288,17 @@ impl TcpSocket {
   /// use std::net::SocketAddr;
   /// use lio::net::TcpSocket;
   ///
-  /// # lio::init();
-  /// fn example() -> std::io::Result<()> {
+    /// fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
   ///     // This will block until connected
   ///     let socket = TcpSocket::connect_sync(addr)?;
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
+    /// ```
+  #[allow(deprecated)]
   pub fn connect_sync(addr: SocketAddr) -> io::Result<Self> {
-    let socket = Socket::new(libc::SOCK_STREAM, libc::AF_INET, 0).wait()?;
+    let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).wait()?;
     api::connect(&socket, addr).wait()?;
     Ok(TcpSocket(socket))
   }
@@ -330,22 +321,21 @@ impl TcpSocket {
   /// use lio::net::TcpSocket;
   /// use std::net::SocketAddr;
   ///
-  /// # lio::init();
-  /// async fn example() -> std::io::Result<()> {
+    /// async fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
   ///     let socket = TcpSocket::connect_async(addr).await?;
   ///
   ///     let buffer = vec![0u8; 1024];
-  ///     let (buffer, bytes_read) = socket.recv(buffer).await?;
+  ///     let (result, buffer) = socket.recv(buffer).await;
+///     let bytes_read = result? as usize;
   ///
   ///     println!("Received {} bytes", bytes_read);
   ///     println!("Data: {:?}", &buffer[..bytes_read]);
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
-  pub fn recv(&self, vec: Vec<u8>) -> Io<'_, Recv<Vec<u8>>> {
+    /// ```
+  pub fn recv(&self, vec: Vec<u8>) -> Io<Recv<Vec<u8>>> {
     self.0.recv(vec)
   }
 
@@ -367,21 +357,20 @@ impl TcpSocket {
   /// use lio::net::TcpSocket;
   /// use std::net::SocketAddr;
   ///
-  /// # lio::init();
-  /// async fn example() -> std::io::Result<()> {
+    /// async fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
   ///     let socket = TcpSocket::connect_async(addr).await?;
   ///
   ///     let data = b"Hello, server!".to_vec();
-  ///     let (data, bytes_sent) = socket.send(data).await?;
+  ///     let (result, data) = socket.send(data).await;
+///     let bytes_sent = result? as usize;
   ///
   ///     println!("Sent {} bytes", bytes_sent);
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
-  pub fn send(&self, vec: Vec<u8>) -> Io<'_, ops::Send<Vec<u8>>> {
+    /// ```
+  pub fn send(&self, vec: Vec<u8>) -> Io<ops::Send<Vec<u8>>> {
     self.0.send(vec)
   }
 
@@ -404,27 +393,27 @@ impl TcpSocket {
   /// use lio::net::TcpSocket;
   /// use std::net::SocketAddr;
   ///
-  /// # lio::init();
-  /// async fn example() -> std::io::Result<()> {
+    /// async fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
   ///     let socket = TcpSocket::connect_async(addr).await?;
   ///
   ///     // Send request
   ///     let data = b"GET / HTTP/1.1\r\n\r\n".to_vec();
-  ///     socket.send(data).await?;
+  ///     let (result, _) = socket.send(data).await;
+  ///     result?;
   ///
   ///     // Shutdown write side to signal end of request
   ///     socket.shutdown(libc::SHUT_WR).await?;
   ///
   ///     // Can still receive the response
   ///     let buffer = vec![0u8; 4096];
-  ///     let (buffer, bytes_read) = socket.recv(buffer).await?;
+  ///     let (result, buffer) = socket.recv(buffer).await;
+///     let bytes_read = result? as usize;
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
-  pub fn shutdown(&self, how: i32) -> Io<'_, Shutdown> {
+    /// ```
+  pub fn shutdown(&self, how: i32) -> Io<Shutdown> {
     self.0.shutdown(how)
   }
 }

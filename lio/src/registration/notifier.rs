@@ -11,9 +11,11 @@ pub(crate) enum Notifier {
 }
 
 impl Notifier {
+  #[allow(dead_code)]
   pub fn new_waker(waker: Waker) -> Self {
     Self::Waker(Some(waker))
   }
+  #[allow(dead_code)]
   pub fn new_callback<T, F>(callback: F, typed_op: T) -> Self
   where
     T: TypedOp,
@@ -74,7 +76,7 @@ unsafe impl Send for OpCallback {}
 unsafe impl Sync for OpCallback {}
 
 impl OpCallback {
-  fn new<T, F>(callback: F, typed_op: T) -> Self
+  pub(crate) fn new<T, F>(callback: F, typed_op: T) -> Self
   where
     T: TypedOp,
     F: FnOnce(T::Result) + Send,
@@ -82,6 +84,22 @@ impl OpCallback {
     OpCallback {
       callback: Box::into_raw(Box::new(callback)) as *const (),
       typed_op: Box::into_raw(Box::new(typed_op)) as *const (),
+      call_callback_fn: Self::call_callback::<T, F>,
+    }
+  }
+
+  /// Create an OpCallback from an already-boxed TypedOp.
+  ///
+  /// This is used when the TypedOp has been pre-boxed to ensure pointer
+  /// stability before calling `into_op()`.
+  pub(crate) fn new_boxed<T, F>(callback: F, typed_op: Box<T>) -> Self
+  where
+    T: TypedOp,
+    F: FnOnce(T::Result) + Send,
+  {
+    OpCallback {
+      callback: Box::into_raw(Box::new(callback)) as *const (),
+      typed_op: Box::into_raw(typed_op) as *const (),
       call_callback_fn: Self::call_callback::<T, F>,
     }
   }

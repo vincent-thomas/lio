@@ -21,13 +21,42 @@ use os::kqueue as sys;
 pub(crate) mod tests;
 
 use core::slice;
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::RawFd;
 use std::time::Duration;
 
+/// Get the current errno value.
+#[inline]
+fn get_errno() -> libc::c_int {
+  #[cfg(target_os = "linux")]
+  // SAFETY: errno is thread-local and always valid to read after a failed syscall
+  unsafe {
+    *libc::__errno_location()
+  }
+  #[cfg(not(target_os = "linux"))]
+  // SAFETY: errno is thread-local and always valid to read after a failed syscall
+  unsafe {
+    *libc::__error()
+  }
+}
+
+/// Convert a libc syscall result to lio convention.
+/// Libc returns -1 on error and sets errno; we return -errno.
+#[inline]
+fn syscall_result(ret: libc::c_int) -> isize {
+  if ret < 0 { -(get_errno() as isize) } else { ret as isize }
+}
+
+/// Convert a libc syscall result (ssize_t) to lio convention.
+#[inline]
+fn syscall_result_ssize(ret: libc::ssize_t) -> isize {
+  if ret < 0 { -(get_errno() as isize) } else { ret }
+}
+
 use crate::backends::pollingv2::interest::Interest;
-use crate::backends::{IoBackend, OpCompleted, OpStore};
-use crate::operation::Operation;
+use crate::backends::{IoBackend, OpCompleted};
+// use crate::operation::Operation;
 mod interest;
 
 /// Trait for OS-specific readiness polling implementations
@@ -208,21 +237,24 @@ struct ImmediateCompletion {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```
+/// use lio::backends::{IoBackend, pollingv2::Poller};
+/// use std::time::Duration;
+///
 /// let mut backend = Poller::default();
-/// backend.init(1024)?;
+/// backend.init(1024).unwrap();
 ///
-/// backend.push(id, &op)?;
-/// backend.flush()?;
+/// backend.push(1, lio::op::Op::Nop).unwrap();
+/// backend.flush().unwrap();
 ///
-/// let completions = backend.wait(&mut store)?;
+/// let completions = backend.wait_timeout(Some(Duration::ZERO)).unwrap();
 /// ```
 #[derive(Default)]
 pub struct Poller {
   /// The OS-specific polling mechanism (epoll/kqueue)
   sys: Option<sys::OsPoller>,
   /// Map of operation ID to file descriptor (for cleanup)
-  fd_map: Option<scc::HashMap<u64, RawFd>>,
+  fd_map: Option<HashMap<u64, RawFd>>,
   /// Map of operation ID to Op (for completion)
   op_map: std::collections::HashMap<u64, crate::op::Op>,
   /// Event buffer for polling
@@ -246,126 +278,230 @@ impl Poller {
   }
 
   #[inline]
-  fn fd_map(&self) -> &scc::HashMap<u64, RawFd> {
-    self.fd_map.as_ref().expect("Poller not initialized - call init() first")
+  fn fd_map(&mut self) -> &mut HashMap<u64, RawFd> {
+    self.fd_map.as_mut().expect("Poller not initialized - call init() first")
   }
 
-  fn run_op_blocking(op: crate::op::Op) -> isize {
-    use crate::buf::BufLike;
+  /// Run an op by reference using peek (no ownership transfer of buffers).
+  /// Used in wait_timeout so the op can be put back in op_map on EAGAIN.
+  fn run_op_on_event(op: &crate::op::Op) -> isize {
     use crate::op::Op;
     use std::os::fd::AsRawFd;
 
     match op {
       Op::Read { fd, buffer } => {
         let fd = fd.as_raw_fd();
-        let buf = unsafe { buffer.take::<&mut [u8]>() };
-        let ptr = buf.as_mut_ptr();
-        let len = buf.len();
-        unsafe { libc::read(fd, ptr as *mut _, len) }
+        // SAFETY: ErasedBuffer stores RawBuf set by into_op
+        let crate::op::RawBuf { ptr, len } =
+          unsafe { buffer.peek::<crate::op::RawBuf>() };
+        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
+        syscall_result_ssize(unsafe { libc::read(fd, ptr as *mut _, len) })
       }
       Op::Write { fd, buffer } => {
         let fd = fd.as_raw_fd();
-        let buf = unsafe { buffer.take::<&[u8]>() };
-        let ptr = buf.as_ptr() as *const libc::c_void;
-        let len = buf.len();
-        unsafe { libc::write(fd, ptr, len) }
+        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
+        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
+        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
+        syscall_result_ssize(unsafe { libc::write(fd, ptr as *const _, len) })
       }
       Op::ReadAt { fd, offset, buffer } => {
         let fd = fd.as_raw_fd();
-        let buf = unsafe { buffer.take::<&mut [u8]>() };
-        let ptr = buf.as_mut_ptr();
-        let len = buf.len();
-        unsafe { libc::pread(fd, ptr as *mut _, len, offset) }
+        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
+        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
+        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
+        syscall_result_ssize(unsafe {
+          libc::pread(fd, ptr as *mut _, len, *offset)
+        })
       }
       Op::WriteAt { fd, offset, buffer } => {
         let fd = fd.as_raw_fd();
-        let buf = unsafe { buffer.take::<&[u8]>() };
-        let ptr = buf.as_ptr() as *const libc::c_void;
-        let len = buf.len();
-        unsafe { libc::pwrite(fd, ptr, len, offset) }
+        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
+        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
+        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
+        syscall_result_ssize(unsafe {
+          libc::pwrite(fd, ptr as *const _, len, *offset)
+        })
       }
       Op::Send { fd, flags, buffer } => {
         let fd = fd.as_raw_fd();
-        let buf = unsafe { buffer.take::<&[u8]>() };
-        let ptr = buf.as_ptr() as *const libc::c_void;
-        let len = buf.len();
-        unsafe { libc::send(fd, ptr, len, flags) }
+        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
+        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
+        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
+        syscall_result_ssize(unsafe {
+          libc::send(fd, ptr as *const _, len, *flags)
+        })
       }
       Op::Recv { fd, flags, buffer } => {
         let fd = fd.as_raw_fd();
-        let buf = unsafe { buffer.take::<&mut [u8]>() };
-        let ptr = buf.as_mut_ptr();
-        let len = buf.len();
-        unsafe { libc::recv(fd, ptr as *mut _, len, flags) }
+        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
+        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
+        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
+        syscall_result_ssize(unsafe {
+          libc::recv(fd, ptr as *mut _, len, *flags)
+        })
       }
+      // SAFETY: fd is valid (from AsRawFd), addr/len are valid pointers from Op.
       Op::Accept { fd, addr, len } => unsafe {
-        let fd = fd.as_raw_fd();
-        libc::accept(fd, addr as *mut _, len) as isize
+        syscall_result(libc::accept(fd.as_raw_fd(), *addr as *mut _, *len))
       },
-      Op::Connect { fd, addr, len, connect_called: _ } => {
+      Op::Timeout { .. } => 0,
+      Op::Connect { fd, addr, len, connect_called } => {
         let fd = fd.as_raw_fd();
+        // SAFETY: fd is valid (from AsRawFd), addr is valid pointer from TypedOp.
         unsafe {
-          let ret = libc::connect(
-            fd,
-            std::mem::transmute::<&libc::sockaddr_storage, _>(&addr),
-            len,
-          );
+          let ret = libc::connect(fd, *addr as *const libc::sockaddr, *len);
           if ret < 0 {
-            let err = *libc::__error();
-            if err == libc::EINPROGRESS || err == libc::EISCONN {
-              return if err == libc::EISCONN { 0 } else { -(err as isize) };
+            let err = get_errno();
+            if err == libc::EINPROGRESS {
+              return -(err as isize);
             }
+            // EISCONN means success only when already in the EINPROGRESS flow
+            if err == libc::EISCONN && *connect_called {
+              return 0;
+            }
+            return -(err as isize);
           }
           ret as isize
         }
       }
-      Op::Bind { fd, addr } => unsafe {
+      _ => panic!("run_op_on_event called for non-event op"),
+    }
+  }
+
+  fn run_op_blocking(op: crate::op::Op) -> isize {
+    use crate::op::Op;
+    use std::os::fd::AsRawFd;
+
+    match op {
+      Op::Read { fd, buffer } => {
         let fd = fd.as_raw_fd();
-        libc::bind(
-          fd,
-          std::mem::transmute::<&libc::sockaddr_storage, _>(&addr),
-          std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
-        ) as isize
+        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
+        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
+        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
+        syscall_result_ssize(unsafe { libc::read(fd, ptr as *mut _, len) })
+      }
+      Op::Write { fd, buffer } => {
+        let fd = fd.as_raw_fd();
+        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
+        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
+        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
+        syscall_result_ssize(unsafe { libc::write(fd, ptr as *const _, len) })
+      }
+      Op::ReadAt { fd, offset, buffer } => {
+        let fd = fd.as_raw_fd();
+        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
+        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
+        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
+        syscall_result_ssize(unsafe {
+          libc::pread(fd, ptr as *mut _, len, offset)
+        })
+      }
+      Op::WriteAt { fd, offset, buffer } => {
+        let fd = fd.as_raw_fd();
+        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
+        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
+        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
+        syscall_result_ssize(unsafe {
+          libc::pwrite(fd, ptr as *const _, len, offset)
+        })
+      }
+      Op::Send { fd, flags, buffer } => {
+        let fd = fd.as_raw_fd();
+        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
+        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
+        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
+        syscall_result_ssize(unsafe {
+          libc::send(fd, ptr as *const _, len, flags)
+        })
+      }
+      Op::Recv { fd, flags, buffer } => {
+        let fd = fd.as_raw_fd();
+        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
+        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
+        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
+        syscall_result_ssize(unsafe {
+          libc::recv(fd, ptr as *mut _, len, flags)
+        })
+      }
+      // SAFETY: fd is valid (from AsRawFd), addr/len are valid pointers from Op.
+      Op::Accept { fd, addr, len } => unsafe {
+        syscall_result(libc::accept(fd.as_raw_fd(), addr as *mut _, len))
       },
+      Op::Connect { fd, addr, len, connect_called } => {
+        let fd = fd.as_raw_fd();
+        // SAFETY: fd is valid (from AsRawFd), addr is valid pointer from TypedOp.
+        unsafe {
+          let ret = libc::connect(fd, addr as *const libc::sockaddr, len);
+          if ret < 0 {
+            let err = get_errno();
+            if err == libc::EINPROGRESS {
+              return -(err as isize);
+            }
+            if err == libc::EISCONN && connect_called {
+              return 0;
+            }
+            return -(err as isize);
+          }
+          ret as isize
+        }
+      }
+      // SAFETY: fd is valid (from AsRawFd), addr is valid pointer from TypedOp.
+      Op::Bind { fd, addr, addrlen } => unsafe {
+        syscall_result(libc::bind(
+          fd.as_raw_fd(),
+          addr as *const libc::sockaddr,
+          addrlen,
+        ))
+      },
+      // SAFETY: fd is valid (from AsRawFd), backlog is a valid i32.
       Op::Listen { fd, backlog } => unsafe {
-        let fd = fd.as_raw_fd();
-        libc::listen(fd, backlog) as isize
+        syscall_result(libc::listen(fd.as_raw_fd(), backlog))
       },
+      // SAFETY: fd is valid (from AsRawFd), how is a valid shutdown flag.
       Op::Shutdown { fd, how } => unsafe {
-        let fd = fd.as_raw_fd();
-        libc::shutdown(fd, how) as isize
+        syscall_result(libc::shutdown(fd.as_raw_fd(), how))
       },
+      // SAFETY: domain, ty, proto are valid socket parameters from Op.
       Op::Socket { domain, ty, proto } => unsafe {
-        libc::socket(domain, ty, proto) as isize
+        syscall_result(libc::socket(domain, ty, proto))
       },
+      // SAFETY: dir_fd is valid (from AsRawFd), path is a valid C string from Op.
       Op::OpenAt { dir_fd, path, flags } => unsafe {
-        libc::openat(dir_fd.as_raw_fd(), path, flags) as isize
+        syscall_result(libc::openat(dir_fd.as_raw_fd(), path, flags))
       },
-      Op::Close { fd } => unsafe { libc::close(fd.as_raw_fd()) as isize },
-      Op::Fsync { fd } => unsafe { libc::fsync(fd.as_raw_fd()) as isize },
+      // SAFETY: fd is a valid raw fd from Op (ownership transferred to close).
+      Op::Close { fd } => unsafe { syscall_result(libc::close(fd)) },
+      // SAFETY: fd is valid (from AsRawFd).
+      Op::Fsync { fd } => unsafe {
+        syscall_result(libc::fsync(fd.as_raw_fd()))
+      },
+      // SAFETY: fd is valid (from AsRawFd), size is a valid length.
       Op::Truncate { fd, size } => unsafe {
-        libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) as isize
+        syscall_result(libc::ftruncate(fd.as_raw_fd(), size as libc::off_t))
       },
+      // SAFETY: dir_fds are valid (from AsRawFd), paths are valid C strings from Op.
       Op::LinkAt { old_dir_fd, old_path, new_dir_fd, new_path } => unsafe {
-        libc::linkat(
+        syscall_result(libc::linkat(
           old_dir_fd.as_raw_fd(),
           old_path,
           new_dir_fd.as_raw_fd(),
           new_path,
           0,
-        ) as isize
+        ))
       },
+      // SAFETY: dir_fd is valid (from AsRawFd), target/linkpath are valid C strings from Op.
       Op::SymlinkAt { target, linkpath, dir_fd } => unsafe {
-        libc::symlinkat(target, dir_fd.as_raw_fd(), linkpath) as isize
+        syscall_result(libc::symlinkat(target, dir_fd.as_raw_fd(), linkpath))
       },
       #[cfg(target_os = "linux")]
+      // SAFETY: fd_in/fd_out are valid (from AsRawFd), size is a valid length.
       Op::Tee { fd_in, fd_out, size } => unsafe {
-        libc::tee(
+        syscall_result_ssize(libc::tee(
           fd_in.as_raw_fd(),
           fd_out.as_raw_fd(),
           size as libc::size_t,
           0,
-        ) as isize
+        ))
       },
       Op::Timeout { duration, .. } => {
         std::thread::sleep(duration);
@@ -379,7 +515,7 @@ impl Poller {
 impl IoBackend for Poller {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.sys = Some(sys::OsPoller::new()?);
-    self.fd_map = Some(scc::HashMap::with_capacity(cap));
+    self.fd_map = Some(HashMap::with_capacity(cap));
     self.op_map = std::collections::HashMap::with_capacity(cap);
     self.events = Events::with_capacity(cap.min(4096));
     self.immediate = Vec::with_capacity(64);
@@ -393,21 +529,29 @@ impl IoBackend for Poller {
     use std::os::fd::AsRawFd;
 
     let fd_and_interest = match &op {
-      Op::Read { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
-      Op::Write { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
-      Op::ReadAt { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
-      Op::WriteAt { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
+      Op::ReadAt { .. }
+      | Op::WriteAt { .. }
+      | Op::Read { .. }
+      | Op::Write { .. } => {
+        let result = Poller::run_op_blocking(op);
+        self.immediate.push(ImmediateCompletion { id, result });
+        return Ok(());
+      }
       Op::Send { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
       Op::Recv { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
       Op::Accept { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
       Op::Connect { .. } => None,
-      Op::Bind { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
-      Op::Listen { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
-      Op::Shutdown { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
-      Op::OpenAt { dir_fd, .. } => Some((dir_fd.as_raw_fd(), Interest::READ)),
-      Op::Close { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
-      Op::Fsync { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
-      Op::Truncate { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
+      Op::Bind { .. }
+      | Op::Listen { .. }
+      | Op::Shutdown { .. }
+      | Op::OpenAt { .. }
+      | Op::Close { .. }
+      | Op::Fsync { .. }
+      | Op::Truncate { .. } => {
+        let result = Poller::run_op_blocking(op);
+        self.immediate.push(ImmediateCompletion { id, result });
+        return Ok(());
+      }
       #[cfg(target_os = "linux")]
       Op::Tee { fd_in, .. } => {
         Some((fd_in.as_raw_fd(), Interest::READ_AND_WRITE))
@@ -429,8 +573,19 @@ impl IoBackend for Poller {
     self.op_map.insert(id, op);
 
     if let Some((fd, interest)) = fd_and_interest {
-      self.fd_map().insert_sync(id, fd).unwrap();
-      self.sys().add(fd, id, interest)?;
+      self.fd_map().insert(id, fd);
+      if let Err(e) = self.sys().add(fd, id, interest) {
+        // Registration failed (e.g., EBADF for invalid fd).
+        // Return as immediate completion with error instead of propagating.
+        self.fd_map().remove(&id);
+        let op = self.op_map.remove(&id).unwrap();
+        let errno = e.raw_os_error().unwrap_or(libc::EIO);
+        // Try the operation anyway - it will fail with a proper error
+        let result = Poller::run_op_blocking(op);
+        let final_result = if result < 0 { result } else { -(errno as isize) };
+        self.immediate.push(ImmediateCompletion { id, result: final_result });
+        return Ok(());
+      }
     } else {
       match &self.op_map[&id] {
         Op::Connect { fd, .. } => {
@@ -438,14 +593,17 @@ impl IoBackend for Poller {
           let result =
             Poller::run_op_blocking(self.op_map.remove(&id).unwrap());
           if result == -(libc::EINPROGRESS as isize) {
-            self.fd_map().insert_sync(id, fd).unwrap();
+            self.fd_map().insert(id, fd);
             self.sys().add(fd, id, Interest::WRITE)?;
           } else {
             self.immediate.push(ImmediateCompletion { id, result });
           }
         }
-        Op::Timeout { .. } => {
-          self.immediate.push(ImmediateCompletion { id, result: 0 });
+        Op::Timeout { duration, .. } => {
+          let duration_ms = duration.as_millis() as RawFd;
+          self.fd_map().insert(id, duration_ms);
+          self.sys().add(duration_ms, id, Interest::TIMER)?;
+          // op stays in op_map; kqueue fires when duration elapses
         }
         Op::Socket { .. } => {
           let result =
@@ -488,7 +646,16 @@ impl IoBackend for Poller {
     // SAFETY: as_raw_buf() provides mutable access to the entire capacity of the events buffer
     let events = unsafe { self.events.as_raw_buf() };
 
-    let items_written = self.sys.as_ref().unwrap().wait(events, timeout)?;
+    let items_written = match self.sys.as_ref().unwrap().wait(events, timeout) {
+      Ok(n) => n,
+      Err(e) => {
+        // If we already have completions, return them instead of propagating the error
+        if !self.completed.is_empty() {
+          return Ok(self.completed.as_ref());
+        }
+        return Err(e);
+      }
+    };
 
     // SAFETY: The OS's wait() call filled items_written events into our buffer
     unsafe { self.events.set_len(items_written) };
@@ -504,20 +671,19 @@ impl IoBackend for Poller {
         continue;
       }
 
-      // Get the operation from our op_map and run it
+      // Look up fd from our internal map
+      let Some(entry_fd) = self.fd_map().get(&operation_id).copied() else {
+        panic!("couldn't find fd for operation {}", operation_id);
+      };
+
+      // Remove op temporarily; put it back on EAGAIN
       let op = match self.op_map.remove(&operation_id) {
         Some(op) => op,
         None => {
           panic!("couldn't find op for operation {}", operation_id);
         }
       };
-      let result = Poller::run_op_blocking(op);
-
-      // Look up fd from our internal map
-      let Some(entry_fd) = self.fd_map().get_sync(&operation_id).map(|fd| *fd)
-      else {
-        panic!("couldn't find fd for operation {}", operation_id);
-      };
+      let result = Poller::run_op_on_event(&op);
 
       // Check for EAGAIN/EINPROGRESS (would block)
       if result < 0 {
@@ -526,7 +692,8 @@ impl IoBackend for Poller {
           || errno == libc::EWOULDBLOCK
           || errno == libc::EINPROGRESS
         {
-          // Re-arm for more events
+          // Put op back and re-arm for more events
+          self.op_map.insert(operation_id, op);
           self.sys().modify(entry_fd, operation_id, event.interest)?;
           continue;
         }
@@ -539,7 +706,7 @@ impl IoBackend for Poller {
       } else {
         self.sys().delete(entry_fd)?;
       }
-      let was_deleted = self.fd_map().remove_sync(&operation_id).is_some();
+      let was_deleted = self.fd_map().remove(&operation_id).is_some();
       assert!(was_deleted);
 
       self.completed.push(OpCompleted::new(operation_id, result));

@@ -1,7 +1,7 @@
-#![cfg(feature = "high")]
 #![cfg(linux)]
 
-use lio::Lio;
+use lio::{Lio, api, api::resource::Resource};
+use std::os::fd::FromRawFd;
 use std::time::Instant;
 
 #[test]
@@ -17,6 +17,10 @@ fn test_close_timing() {
     assert_eq!(libc::pipe(pipe2_fds.as_mut_ptr()), 0);
   }
 
+  // Wrap raw fds in Resource for tee (which requires AsResource)
+  let pipe1_read = unsafe { Resource::from_raw_fd(pipe1_fds[0]) };
+  let pipe2_write = unsafe { Resource::from_raw_fd(pipe2_fds[1]) };
+
   // Write some data
   let test_data = b"Hello!";
   unsafe {
@@ -30,9 +34,13 @@ fn test_close_timing() {
   // Do a tee operation
   let tee_start = Instant::now();
   let mut tee_recv =
-    lio::tee(pipe1_fds[0], pipe2_fds[1], test_data.len() as u32)
+    api::tee(&pipe1_read, &pipe2_write, test_data.len() as u32)
       .with_lio(&mut lio)
       .send();
+
+  // Forget the Resources so they don't close fds on drop (we close them manually below)
+  std::mem::forget(pipe1_read);
+  std::mem::forget(pipe2_write);
 
   // Try multiple ticks - some operations need more than one
   for i in 0..10 {
@@ -49,11 +57,11 @@ fn test_close_timing() {
   }
   println!("Tee took: {:?}", tee_start.elapsed());
 
-  // Close all file descriptors
-  let mut close1_recv = lio::close(pipe1_fds[0]).with_lio(&mut lio).send();
-  let mut close2_recv = lio::close(pipe1_fds[1]).with_lio(&mut lio).send();
-  let mut close3_recv = lio::close(pipe2_fds[0]).with_lio(&mut lio).send();
-  let mut close4_recv = lio::close(pipe2_fds[1]).with_lio(&mut lio).send();
+  // Close all file descriptors (close takes RawFd)
+  let mut close1_recv = api::close(pipe1_fds[0]).with_lio(&mut lio).send();
+  let mut close2_recv = api::close(pipe1_fds[1]).with_lio(&mut lio).send();
+  let mut close3_recv = api::close(pipe2_fds[0]).with_lio(&mut lio).send();
+  let mut close4_recv = api::close(pipe2_fds[1]).with_lio(&mut lio).send();
 
   // Try multiple ticks for close operations too
   for i in 0..10 {

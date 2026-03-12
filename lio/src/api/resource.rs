@@ -3,22 +3,20 @@
 //! This module provides the [`Resource`] type, which is lio's abstraction around
 //! platform-specific I/O resources (file descriptors on Unix and some other platforms, handles on Windows).
 //!
-//! ```rust
+//! ```rust,no_run
 //! use std::ffi::CString;
 //! use lio::api::resource::Resource;
+//! use std::os::fd::FromRawFd;
 //!
-//! # lio::init();
 //! async fn example() -> std::io::Result<()> {
+//!     # let dir = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
 //!     let path = CString::new("/tmp/test").unwrap();
-//!     let fd: Resource = lio::openat(libc::AT_FDCWD, path, libc::O_RDONLY).await?;
+//!     let fd: Resource = lio::api::openat(&dir, path, libc::O_RDONLY).await?;
 //!
 //!     // Use the resource...
-//!
-//!     // IMPORTANT: Close when done
-//!     fd.close();
+//!     // Resource is automatically closed when dropped.
 //!     Ok(())
 //! }
-//! # lio::exit();
 //! ```
 //!
 //! # Cloning and Sharing
@@ -29,36 +27,34 @@
 //! ```rust
 //! use lio::api::resource::Resource;
 //!
-//! # lio::init();
 //! async fn share_resource(fd: Resource) {
 //!     let fd_clone = fd.clone(); // Points to the same file descriptor
 //!
-//!     // Both fd and fd_clone refer to the same resource
-//!     // Only one close call is needed (the resource will be closed when all clones are dropped)
+//!     // Both fd and fd_clone refer to the same resource.
+//!     // The resource is closed when all clones are dropped.
 //! }
-//! # lio::exit();
 //! ```
 //!
 //! # Creating Resources
 //!
 //! Resources are typically obtained from lio I/O operations:
 //!
-//! ```rust
+//! ```rust,no_run
 //! use std::ffi::CString;
 //! use lio::api::resource::Resource;
+//! use std::os::fd::FromRawFd;
 //!
-//! # lio::init();
 //! async fn open_file() -> std::io::Result<Resource> {
+//!     # let dir = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
 //!     let path = CString::new("/tmp/test").unwrap();
-//!     let resource: Resource = lio::openat(libc::AT_FDCWD, path, libc::O_RDONLY).await?;
+//!     let resource: Resource = lio::api::openat(&dir, path, libc::O_RDONLY).await?;
 //!     Ok(resource)
 //! }
 //!
 //! async fn create_socket() -> std::io::Result<Resource> {
-//!     let sock: Resource = lio::socket(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+//!     let sock: Resource = lio::api::socket(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
 //!     Ok(sock)
 //! }
-//! # lio::exit();
 //! ```
 //!
 //! Or from raw file descriptors (Unix):
@@ -67,12 +63,10 @@
 //! use std::os::fd::{FromRawFd, RawFd};
 //! use lio::api::resource::Resource;
 //!
-//! # lio::init();
 //! fn from_raw(raw_fd: RawFd) -> Resource {
 //!     // Safe if raw_fd is a valid, open file descriptor
 //!     unsafe { Resource::from_raw_fd(raw_fd) }
 //! }
-//! # lio::exit();
 //! ```
 
 use std::sync::Arc;
@@ -166,9 +160,9 @@ pub struct Resource(Arc<Owned>);
 
 /// Trait for types that can be converted into a [`Resource`].
 ///
-/// This trait is implemented by high-level types like [`Socket`](crate::net::Socket),
-/// [`TcpSocket`](crate::net::TcpSocket), and [`TcpListener`](crate::net::TcpListener)
-/// to allow conversion to the underlying resource.
+/// This trait is implemented by high-level types like `Socket`, `TcpSocket`, and
+/// `TcpListener` (in the `net` module, requires `high` feature) to allow conversion
+/// to the underlying resource.
 ///
 /// # Examples
 ///
@@ -235,15 +229,15 @@ impl AsResource for Resource {
 
 /// Trait for types that can be constructed from a [`Resource`].
 ///
-/// This trait is implemented by high-level types like [`Socket`](crate::net::Socket),
-/// [`TcpSocket`](crate::net::TcpSocket), and [`TcpListener`](crate::net::TcpListener)
-/// to allow wrapping a raw [`Resource`] in a typed interface.
+/// This trait is implemented by high-level types like `Socket`, `TcpSocket`, and
+/// `TcpListener` (in the `net` module, requires `high` feature) to allow wrapping
+/// a raw [`Resource`] in a typed interface.
 ///
 /// # Safety Contract
 ///
 /// Implementors guarantee that the [`Resource`] is compatible with the type being
-/// constructed. For example, constructing a [`TcpSocket`](crate::net::TcpSocket)
-/// from a resource requires that the resource is actually a TCP socket file descriptor.
+/// constructed. For example, constructing a `TcpSocket` from a resource requires
+/// that the resource is actually a TCP socket file descriptor.
 ///
 /// # Examples
 ///
@@ -300,10 +294,12 @@ impl Resource {
   ///
   /// # Examples
   ///
-  /// ```rust,ignore
+  /// ```
   /// use lio::api::resource::Resource;
+  /// use std::os::fd::FromRawFd;
   ///
-  /// let resource: Resource = /* ... */;
+  /// // Create a resource (using stdout as an example)
+  /// let resource: Resource = unsafe { Resource::from_raw_fd(1) };
   /// assert_eq!(resource.count(), 1);
   ///
   /// let clone = resource.clone();
@@ -312,6 +308,7 @@ impl Resource {
   ///
   /// drop(clone);
   /// assert_eq!(resource.count(), 1);
+  /// # std::mem::forget(resource); // Don't close stdout
   /// ```
   pub fn count(&self) -> usize {
     Arc::strong_count(&self.0)
@@ -330,10 +327,11 @@ impl Resource {
   ///
   /// # Examples
   ///
-  /// ```rust,ignore
+  /// ```
   /// use lio::api::resource::Resource;
+  /// use std::os::fd::FromRawFd;
   ///
-  /// let resource: Resource = /* ... */;
+  /// let resource: Resource = unsafe { Resource::from_raw_fd(1) };
   /// assert!(resource.will_close()); // Only reference
   ///
   /// let clone = resource.clone();
@@ -342,6 +340,7 @@ impl Resource {
   ///
   /// drop(clone);
   /// assert!(resource.will_close()); // Last reference again
+  /// # std::mem::forget(resource); // Don't close stdout
   /// ```
   pub fn will_close(&self) -> bool {
     self.count() == 1

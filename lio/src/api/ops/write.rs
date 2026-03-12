@@ -1,5 +1,3 @@
-use std::os::fd::AsRawFd;
-
 use crate::{
   BufResult, api::resource::Resource, buf::BufLike, typed_op::TypedOp,
 };
@@ -25,10 +23,7 @@ where
     B: BufLike + 'static,
   {
     let buffer = self.buf.take().expect("buffer already taken");
-    crate::op::Op::Write {
-      fd: self.res,
-      buffer: crate::op::ErasedBuffer::new(buffer),
-    }
+    crate::op::Op::Write { fd: self.res, buffer: crate::op::OpBuf::new(buffer) }
   }
 }
 
@@ -39,23 +34,24 @@ where
   type Result = BufResult<i32, B>;
 
   fn into_op(&mut self) -> crate::op::Op {
-    let buffer = self.buf.take().expect("buffer already taken");
+    let slice = self.buf.as_ref().expect("buffer not available").buf();
+    let ptr = slice.as_ptr() as *mut u8;
+    let len = slice.len();
     crate::op::Op::Write {
       fd: self.res.clone(),
-      buffer: crate::op::ErasedBuffer::new(buffer),
+      buffer: crate::op::OpBuf::new(crate::op::RawBuf { ptr, len }),
     }
   }
 
   fn extract_result(self, res: isize) -> Self::Result {
-    let buf = self.buf.expect("buffer already taken");
-    let bytes = if res < 0 { 0 } else { res as usize };
-    let out = buf.after(bytes);
-    let result = if res < 0 {
-      Err(std::io::Error::from_raw_os_error((-res) as i32))
+    let buf = self.buf.expect("buffer not available");
+    if res < 0 {
+      // On error, return buffer unchanged
+      (Err(std::io::Error::from_raw_os_error((-res) as i32)), buf)
     } else {
-      Ok(res as i32)
-    };
-    (result, out)
+      // On success, advance buffer past written bytes
+      (Ok(res as i32), buf.after(res as usize))
+    }
   }
 
   // #[cfg(unix)]

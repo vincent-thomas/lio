@@ -25,39 +25,45 @@
 //! ownership of the buffer and return it along with the result. This enables
 //! zero-copy I/O while ensuring memory safety:
 //!
-//! ```ignore
+//! ```no_run
+//! use lio::{Lio, api};
+//! use std::os::fd::FromRawFd;
+//!
+//! let mut lio = Lio::new(64).unwrap();
+//! let fd = unsafe { api::resource::Resource::from_raw_fd(0) };
 //! let buf = vec![0u8; 1024];
-//! let (result, buf) = lio::read(fd, buf).await;
+//! let (result, buf) = api::read(&fd, buf).with_lio(&mut lio).wait();
 //! // buf is returned and can be reused
 //! ```
 //!
-//! # Example: Echo Server
+//! # Example: Echo Server (Conceptual)
 //!
-//! ```ignore
-//! use lio::api::resource::Resource;
+//! This shows the general pattern for building a server with lio. Note that
+//! in practice you'd use the higher-level `net` module (requires `high` feature).
 //!
-//! async fn echo_server() -> std::io::Result<()> {
+//! ```no_run
+//! use lio::{Lio, api};
+//! use std::os::fd::FromRawFd;
+//!
+//! fn echo_server(lio: &mut Lio) -> std::io::Result<()> {
 //!     // Create and bind socket
-//!     let sock = lio::socket(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+//!     let sock = api::socket(libc::AF_INET, libc::SOCK_STREAM, 0)
+//!         .with_lio(lio).wait()?;
 //!     let addr = "127.0.0.1:8080".parse().unwrap();
-//!     lio::bind(&sock, addr).await?;
-//!     lio::listen(&sock, 128).await?;
+//!     api::bind(&sock, addr).with_lio(lio).wait()?;
+//!     api::listen(&sock, 128).with_lio(lio).wait()?;
 //!
-//!     loop {
-//!         // Accept connection
-//!         let (client, _addr) = lio::accept(&sock).await?;
+//!     // Accept one connection for this example
+//!     let (client, _addr) = api::accept(&sock).with_lio(lio).wait()?;
 //!
-//!         // Echo loop
-//!         let mut buf = vec![0u8; 1024];
-//!         loop {
-//!             let (n, buf_back) = lio::recv(&client, buf, None).await;
-//!             let n = n?;
-//!             if n == 0 { break; }
-//!
-//!             let (_, buf_back) = lio::send(&client, buf_back, None).await;
-//!             buf = buf_back.0?;
-//!         }
+//!     // Echo once
+//!     let buf = vec![0u8; 1024];
+//!     let (result, buf) = api::recv(&client, buf, None).with_lio(lio).wait();
+//!     let n = result? as usize;
+//!     if n > 0 {
+//!         let _ = api::send(&client, buf[..n].to_vec(), None).with_lio(lio).wait();
 //!     }
+//!     Ok(())
 //! }
 //! ```
 //!
@@ -74,55 +80,95 @@ use crate::{api::resource::AsResource, buf::BufLike};
 use io::Io;
 use std::{ffi::CString, net::SocketAddr, time::Duration};
 
-// Import the TypedOp operations we've migrated
-use ops::{
-  Accept, Close, Connect, Nop, Read, Shutdown, Socket, Timeout, Write,
-};
+#[cfg(unix)]
+use std::os::fd::RawFd;
+#[cfg(windows)]
+use std::os::windows::io::RawHandle;
 
 doc_op! {
-    short: "does nothing. maybe useful for testing?",
+    short: "A no-op that completes immediately. Useful for waking up the event loop or testing.",
 
-    pub fn nop() -> Io<'static, ops::Nop> {
-        Io::from_op(Nop)
+    pub fn nop() -> Io<ops::Nop> {
+        Io::from_op(ops::Nop)
     }
 }
 
 doc_op! {
-    short: "very nice",
+    short: "Closes a raw file descriptor.",
+    syscall: "close(2)",
+
+    #[cfg(unix)]
+    pub fn close(fd: RawFd) -> Io<ops::Close> {
+        Io::from_op(ops::Close::new(fd))
+    }
+}
+
+/// Closes a raw handle.
+///
+/// # Parameters
+/// - `handle`: The raw handle to close
+/// - `is_socket`: Whether this handle is a socket (uses closesocket()) or a file (uses CloseHandle())
+#[cfg(windows)]
+pub fn close(handle: RawHandle, is_socket: bool) -> Io<ops::Close> {
+  Io::from_op(ops::Close::new(handle, is_socket))
+}
+
+doc_op! {
+    short: "Shuts down the read, write, or both halves of a socket connection.",
     syscall: "shutdown(2)",
     doc_link: "https://man7.org/linux/man-pages/man2/shutdown.2.html",
 
     ///
-    /// Shuts down the read, write, or both halves of this connection.
-    pub fn shutdown(res: &impl AsResource, how: i32) -> Io<'static, ops::Shutdown> {
-        Io::from_op(Shutdown::new(res.as_resource().clone(), how))
+    /// # Parameters
+    ///
+    /// - `res`: The socket resource to shut down
+    /// - `how`: Specifies what to shut down:
+    ///   - `libc::SHUT_RD` (0): Stop receiving data
+    ///   - `libc::SHUT_WR` (1): Stop sending data
+    ///   - `libc::SHUT_RDWR` (2): Stop both receiving and sending
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use std::os::fd::FromRawFd;
+    /// use lio::api::resource::Resource;
+    ///
+    /// async fn shutdown_example() -> std::io::Result<()> {
+    ///     # let socket = unsafe { Resource::from_raw_fd(0) };
+    ///     // Stop sending data on this socket
+    ///     lio::api::shutdown(&socket, libc::SHUT_WR).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn shutdown(res: &impl AsResource, how: i32) -> Io<ops::Shutdown> {
+        Io::from_op(ops::Shutdown::new(res.as_resource().clone(), how))
     }
 }
 
 doc_op! {
     short: "Issues a timeout that returns after duration seconds.",
 
-    pub fn timeout(duration: Duration) -> Io<'static, ops::Timeout> {
+    pub fn timeout(duration: Duration) -> Io<ops::Timeout> {
         Io::from_op(ops::Timeout::new(duration))
     }
 }
 
 doc_op!(
-  short: "Create a soft-link.",
+  short: "Create a symlink.",
   syscall: "symlinkat(2)",
   doc_link: "https://man7.org/linux/man-pages/man2/symlink.2.html",
 
-  pub fn symlinkat(dir_res: &impl AsResource, target: CString, linkpath: CString) -> Io<'static, ops::SymlinkAt> {
+  pub fn symlinkat(dir_res: &impl AsResource, target: CString, linkpath: CString) -> Io<ops::SymlinkAt> {
     Io::from_op(ops::SymlinkAt::new(dir_res.as_resource().clone(), target, linkpath))
   }
 );
 
 doc_op!(
-  short: "Create a hard-link",
+  short: "Create a hard-link.",
   syscall: "linkat(2)",
   doc_link: "https://man7.org/linux/man-pages/man2/linkat.2.html",
 
-  pub fn linkat(old_dir_res: &impl AsResource, old_path: CString, new_dir_res: impl AsResource, linkpath: CString) -> Io<'static, ops::LinkAt> {
+  pub fn linkat(old_dir_res: &impl AsResource, old_path: CString, new_dir_res: impl AsResource, linkpath: CString) -> Io<ops::LinkAt> {
     Io::from_op(ops::LinkAt::new(old_dir_res.as_resource().clone(), old_path, new_dir_res.as_resource().clone(), linkpath))
   }
 );
@@ -134,14 +180,16 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// async fn write_example() -> std::io::Result<()> {
-    ///     # let fd = 0;
-    ///     lio::fsync(fd).await?;
+    ///     # use std::os::fd::FromRawFd;
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     lio::api::fsync(&fd).await?;
     ///     Ok(())
     /// }
     /// ```
-    pub fn fsync(res: &impl AsResource) -> Io<'static, ops::Fsync> {
+    pub fn fsync(res: &impl AsResource) -> Io<ops::Fsync> {
         Io::from_op(ops::Fsync::new(res.as_resource().clone()))
     }
 }
@@ -154,25 +202,27 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// async fn write_example() -> std::io::Result<()> {
-    ///     # let fd = 0;
+    ///     # use std::os::fd::FromRawFd;
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
     ///     let data = b"Hello, World!".to_vec();
-    ///     let (result_bytes_written, _buf) = lio::write_with_buf(fd, data, 0).await;
+    ///     let (result_bytes_written, _buf) = lio::api::write(&fd, data).await;
     ///     println!("Wrote {} bytes", result_bytes_written?);
     ///     Ok(())
     /// }
     /// ```
-    pub fn write<B>(res: &impl AsResource, buf: B) -> Io<'static, Write<B>>
+    pub fn write<B>(res: &impl AsResource, buf: B) -> Io<ops::Write<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
-        Io::from_op(Write::new(res.as_resource().clone(), buf))
+        Io::from_op(ops::Write::new(res.as_resource().clone(), buf))
     }
 }
 
 doc_op! {
-    short: "Writes data from buffer to file descriptor. file descriptor cannot be non-seeakble.",
+    short: "Writes data from buffer to file descriptor at a specific offset.",
     syscall: "pwrite(2)",
     doc_link: "https://man7.org/linux/man-pages/man2/pwrite.2.html",
 
@@ -183,16 +233,18 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// async fn write_example() -> std::io::Result<()> {
-    ///     # let fd = 0;
+    ///     # use std::os::fd::FromRawFd;
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
     ///     let data = b"Hello, World!".to_vec();
-    ///     let (result_bytes_written, _buf) = lio::write_with_buf(fd, data, 0).await;
+    ///     let (result_bytes_written, _buf) = lio::api::write_at(&fd, data, 0).await;
     ///     println!("Wrote {} bytes", result_bytes_written?);
     ///     Ok(())
     /// }
     /// ```
-    pub fn write_at<B>(res: &impl AsResource, buf: B, offset: i64) -> Io<'static, ops::WriteAt<B>>
+    pub fn write_at<B>(res: &impl AsResource, buf: B, offset: i64) -> Io<ops::WriteAt<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
@@ -205,7 +257,7 @@ doc_op! {
     syscall: "read(2)",
     doc_link: "https://man7.org/linux/man-pages/man2/read.2.html",
 
-    pub fn read<B>(res: &impl AsResource, mem: B) -> Io<'static, ops::Read<B>>
+    pub fn read<B>(res: &impl AsResource, mem: B) -> Io<ops::Read<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
@@ -218,7 +270,7 @@ doc_op! {
   syscall: "pread(2)",
   doc_link: "https://man7.org/linux/man-pages/man2/pwrite.2.html",
 
-  pub fn read_at<B>(res: &impl AsResource, mem: B, offset: i64) -> Io<'static, ops::ReadAt<B>>
+  pub fn read_at<B>(res: &impl AsResource, mem: B, offset: i64) -> Io<ops::ReadAt<B>>
   where
       B: BufLike + std::marker::Send + Sync
   {
@@ -233,14 +285,16 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// async fn truncate_example() -> std::io::Result<()> {
-    ///     # let fd = 0;
-    ///     lio::truncate(fd, 1024).await?; // Truncate to 1KB
+    ///     # use std::os::fd::FromRawFd;
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     lio::api::truncate(&fd, 1024).await?; // Truncate to 1KB
     ///     Ok(())
     /// }
     /// ```
-    pub fn truncate(res: &impl AsResource, len: u64) -> Io<'static, ops::Truncate> {
+    pub fn truncate(res: &impl AsResource, len: u64) -> Io<ops::Truncate> {
         Io::from_op(ops::Truncate::new(res.as_resource().clone(), len))
     }
 }
@@ -252,15 +306,15 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// async fn socket_example() -> std::io::Result<()> {
     ///     // AF_INET (IPv4), SOCK_STREAM (TCP), protocol 0 (default)
-    ///     let sock = lio::socket(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
-    ///     println!("Created socket with fd: {}", sock);
+    ///     let sock = lio::api::socket(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+    ///     println!("Created socket: {:?}", sock);
     ///     Ok(())
     /// }
     /// ```
-    pub fn socket(domain: libc::c_int, ty: libc::c_int, proto: libc::c_int) -> Io<'static, ops::Socket> {
+    pub fn socket(domain: libc::c_int, ty: libc::c_int, proto: libc::c_int) -> Io<ops::Socket> {
         Io::from_op(ops::Socket::new(domain, ty, proto))
     }
 }
@@ -272,17 +326,17 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust
-    /// use socket2::SockAddr;
-    ///
+    /// ```rust,no_run
     /// async fn bind_example() -> std::io::Result<()> {
-    ///     # let fd = 0;
+    ///     # use std::os::fd::FromRawFd;
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
     ///     let addr = "127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap();
-    ///     lio::bind(fd, addr).await?;
+    ///     lio::api::bind(&fd, addr).await?;
     ///     Ok(())
     /// }
     /// ```
-    pub fn bind(resource: &impl AsResource, addr: SocketAddr) -> Io<'static, ops::Bind> {
+    pub fn bind(resource: &impl AsResource, addr: SocketAddr) -> Io<ops::Bind> {
         Io::from_op(ops::Bind::new(resource.as_resource().clone(), addr))
     }
 }
@@ -294,19 +348,43 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust
-    /// use std::mem::MaybeUninit;
-    ///
+    /// ```rust,no_run
     /// async fn accept_example() -> std::io::Result<()> {
-    ///     # let fd = 0;
-    ///
-    ///     let (client_fd, addr) = lio::accept(fd).await?;
-    ///     println!("Accepted connection on fd: {}", client_fd);
+    ///     # use std::os::fd::FromRawFd;
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     let (client_fd, addr) = lio::api::accept(&fd).await?;
+    ///     println!("Accepted connection: {:?}", client_fd);
     ///     Ok(())
     /// }
     /// ```
-    pub fn accept(res: &impl AsResource) -> Io<'static, ops::Accept> {
+    pub fn accept(res: &impl AsResource) -> Io<ops::Accept> {
         Io::from_op(ops::Accept::new(res.as_resource().clone()))
+    }
+}
+
+doc_op! {
+    short: "Accepts a connection on a Unix domain socket.",
+    syscall: "accept(2)",
+
+    ///
+    /// Unlike [`accept`], this function does not attempt to parse the peer address
+    /// into a `SocketAddr`, making it suitable for Unix domain sockets.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// async fn accept_unix_example() -> std::io::Result<()> {
+    ///     # use std::os::fd::FromRawFd;
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     let client_fd = lio::api::accept_unix(&fd).await?;
+    ///     println!("Accepted Unix connection: {:?}", client_fd);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn accept_unix(res: &impl AsResource) -> Io<ops::AcceptUnix> {
+        Io::from_op(ops::AcceptUnix::new(res.as_resource().clone()))
     }
 }
 
@@ -317,17 +395,17 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust
-    /// use std::os::fd::RawFd;
-    ///
+    /// ```rust,no_run
     /// async fn listen_example() -> std::io::Result<()> {
-    ///     # let fd = 0;
-    ///     lio::listen(fd, 128).await?;
+    ///     # use std::os::fd::FromRawFd;
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     lio::api::listen(&fd, 128).await?;
     ///     println!("Socket is now listening for connections");
     ///     Ok(())
     /// }
     /// ```
-    pub fn listen(res: &impl AsResource, backlog: i32) -> Io<'static, ops::Listen> {
+    pub fn listen(res: &impl AsResource, backlog: i32) -> Io<ops::Listen> {
         Io::from_op(ops::Listen::new(res.as_resource().clone(), backlog))
     }
 }
@@ -339,18 +417,20 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// use std::net::SocketAddr;
     ///
     /// async fn connect_example() -> std::io::Result<()> {
-    ///     # let fd = 0;
+    ///     # use std::os::fd::FromRawFd;
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
     ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-    ///     lio::connect(fd, addr).await?;
+    ///     lio::api::connect(&fd, addr).await?;
     ///     println!("Connected to remote address");
     ///     Ok(())
     /// }
     /// ```
-    pub fn connect(res: &impl AsResource, addr: SocketAddr) -> Io<'static, ops::Connect> {
+    pub fn connect(res: &impl AsResource, addr: SocketAddr) -> Io<ops::Connect> {
         Io::from_op(ops::Connect::new(res.as_resource().clone(), addr))
     }
 }
@@ -362,16 +442,18 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// async fn send_example() -> std::io::Result<()> {
-    ///     # let fd = 0;
+    ///     # use std::os::fd::FromRawFd;
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
     ///     let data = b"Hello, server!".to_vec();
-    ///     let (bytes_sent, _buf) = lio::send_with_buf(fd, data, None).await;
+    ///     let (bytes_sent, _buf) = lio::api::send(&fd, data, None).await;
     ///     println!("Sent {} bytes", bytes_sent?);
     ///     Ok(())
     /// }
     /// ```
-    pub fn send<B>(res: &impl AsResource, buf: B, flags: Option<i32>) -> Io<'static, ops::Send<B>>
+    pub fn send<B>(res: &impl AsResource, buf: B, flags: Option<i32>) -> Io<ops::Send<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
@@ -387,17 +469,19 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// async fn recv_example() -> std::io::Result<()> {
-    ///     # let fd = 0;
-    ///     let mut buffer = vec![0u8; 1024];
-    ///     let (res_bytes_received, buf) = lio::recv_with_buf(fd, buffer, None).await;
-    ///     let bytes_received = res_bytes_received?;
-    ///     println!("Received {} bytes: {:?}", bytes_received, &buf[..bytes_received as usize]);
+    ///     # use std::os::fd::FromRawFd;
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     let buffer = vec![0u8; 1024];
+    ///     let (res_bytes_received, buf) = lio::api::recv(&fd, buffer, None).await;
+    ///     let bytes_received = res_bytes_received? as usize;
+    ///     println!("Received {} bytes: {:?}", bytes_received, &buf[..bytes_received]);
     ///     Ok(())
     /// }
     /// ```
-    pub fn recv<B>(res: &impl AsResource, buf: B, flags: Option<i32>) -> Io<'static, ops::Recv<B>>
+    pub fn recv<B>(res: &impl AsResource, buf: B, flags: Option<i32>) -> Io<ops::Recv<B>>
     where
         B: BufLike + std::marker::Send + Sync
     {
@@ -412,17 +496,20 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// use std::ffi::CString;
     ///
     /// async fn openat_example() -> std::io::Result<()> {
+    ///     # use std::os::fd::FromRawFd;
+    ///     # use lio::api::resource::Resource;
+    ///     # let dir = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
     ///     let path = CString::new("/tmp/test.txt").unwrap();
-    ///     let fd = lio::openat(libc::AT_FDCWD, path, libc::O_RDONLY).await?;
-    ///     println!("Opened file with fd: {}", fd);
+    ///     let fd = lio::api::openat(&dir, path, libc::O_RDONLY).await?;
+    ///     println!("Opened file: {:?}", fd);
     ///     Ok(())
     /// }
     /// ```
-    pub fn openat(dir_res: &impl AsResource, path: CString, flags: i32) -> Io<'static, ops::OpenAt> {
+    pub fn openat(dir_res: &impl AsResource, path: CString, flags: i32) -> Io<ops::OpenAt> {
         Io::from_op(ops::OpenAt::new(dir_res.as_resource().clone(), path, flags))
     }
 }
@@ -448,7 +535,7 @@ doc_op! {
     /// ```
     #[cfg(linux)]
     #[cfg_attr(docsrs, doc(cfg(linux)))]
-    pub fn tee(res_in: &impl AsResource, res_out: impl AsResource, size: u32) -> Io<'static, ops::Tee> {
+    pub fn tee(res_in: &impl AsResource, res_out: impl AsResource, size: u32) -> Io<ops::Tee> {
         Io::from_op(ops::Tee::new(res_in.as_resource().clone(), res_out.as_resource().clone(), size))
     }
 }

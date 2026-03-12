@@ -1,33 +1,13 @@
+mod common;
+
+use common::poll_until_recv;
 use lio::Lio;
-use lio::api::{self, bind, listen};
+use lio::api;
 use std::{
   net::SocketAddr,
-  os::fd::{AsFd, AsRawFd},
+  os::fd::{AsFd, AsRawFd, FromRawFd},
   sync::mpsc,
-  thread,
-  time::Duration,
 };
-
-/// Helper to poll until we receive a result
-fn poll_until_recv<T>(lio: &mut Lio, receiver: &mpsc::Receiver<T>) -> T {
-  let mut attempts = 0;
-  loop {
-    lio.try_run().unwrap();
-    match receiver.try_recv() {
-      Ok(result) => return result,
-      Err(mpsc::TryRecvError::Empty) => {
-        attempts += 1;
-        if attempts > 10 {
-          panic!("Operation did not complete after 10 attempts");
-        }
-        thread::sleep(Duration::from_micros(100));
-      }
-      Err(mpsc::TryRecvError::Disconnected) => {
-        panic!("Channel disconnected");
-      }
-    }
-  }
-}
 
 #[cfg(linux)]
 #[test]
@@ -73,7 +53,6 @@ fn test_listen_basic() {
       "Socket should be in listening state {:?}",
       std::io::Error::last_os_error()
     );
-    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -94,12 +73,12 @@ fn test_listen_with_backlog() {
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  bind(&sock, addr).with_lio(&mut lio).send_with(sender_unit.clone());
+  api::bind(&sock, addr).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind socket");
 
   // Listen with custom backlog
-  listen(&sock, 10).with_lio(&mut lio).send_with(sender_unit.clone());
+  api::listen(&sock, 10).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit)
     .expect("Failed to listen with backlog 10");
@@ -116,7 +95,6 @@ fn test_listen_with_backlog() {
       &mut len,
     );
     assert_eq!(accept_val, 1);
-    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -137,12 +115,12 @@ fn test_listen_large_backlog() {
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-  bind(&sock, addr).with_lio(&mut lio).send_with(sender_unit.clone());
+  api::bind(&sock, addr).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to bind socket");
 
   // Listen with large backlog
-  listen(&sock, 1024).with_lio(&mut lio).send_with(sender_unit.clone());
+  api::listen(&sock, 1024).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit)
     .expect("Failed to listen with large backlog");
@@ -159,7 +137,6 @@ fn test_listen_large_backlog() {
       &mut len,
     );
     assert_eq!(accept_val, 1);
-    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -185,9 +162,6 @@ fn test_listen_without_bind() {
 
   // On most systems this will succeed (bind to INADDR_ANY:0)
   // but behavior may vary by platform
-  unsafe {
-    libc::close(sock.as_fd().as_raw_fd());
-  }
 }
 
 #[cfg(linux)]
@@ -207,12 +181,12 @@ fn test_listen_ipv6() {
 
   let addr: SocketAddr = "[::1]:0".parse().unwrap();
 
-  bind(&sock, addr).with_lio(&mut lio).send_with(sender_unit.clone());
+  api::bind(&sock, addr).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit)
     .expect("Failed to bind IPv6 socket");
 
-  listen(&sock, 128).with_lio(&mut lio).send_with(sender_unit.clone());
+  api::listen(&sock, 128).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit)
     .expect("Failed to listen on IPv6 socket");
@@ -229,7 +203,6 @@ fn test_listen_ipv6() {
       &mut len,
     );
     assert_eq!(accept_val, 1);
-    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -261,11 +234,6 @@ fn test_listen_on_udp() {
   let result = poll_until_recv(&mut lio, &receiver_l);
 
   assert!(result.is_err(), "Listen should fail on UDP socket");
-
-  // Cleanup
-  unsafe {
-    libc::close(sock.as_fd().as_raw_fd());
-  }
 }
 
 #[test]
@@ -301,9 +269,6 @@ fn test_listen_twice() {
   let _ = poll_until_recv(&mut lio, &receiver_l2);
 
   // Behavior may vary - some systems allow it, some don't
-  unsafe {
-    libc::close(sock.as_fd().as_raw_fd());
-  }
 }
 
 #[cfg(linux)]
@@ -345,7 +310,6 @@ fn test_listen_zero_backlog() {
       &mut len,
     );
     assert_eq!(accept_val, 1);
-    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -369,13 +333,17 @@ fn test_listen_after_close() {
 
   poll_until_recv(&mut lio, &receiver_bind).expect("Failed to bind socket");
 
+  // Close the socket manually and forget to prevent double-close
   unsafe {
     libc::close(sock.as_fd().as_raw_fd());
   }
+  std::mem::forget(sock);
 
-  // Try to listen on closed socket
+  // Try to listen on closed socket using invalid fd
   let (sender_l, receiver_l) = mpsc::channel();
-  api::listen(&sock, 128).with_lio(&mut lio).send_with(sender_l);
+  api::listen(&unsafe { lio::api::resource::Resource::from_raw_fd(-1) }, 128)
+    .with_lio(&mut lio)
+    .send_with(sender_l);
 
   let result = poll_until_recv(&mut lio, &receiver_l);
 
@@ -434,7 +402,6 @@ fn test_listen_concurrent() {
         &mut len,
       );
       assert_eq!(accept_val, 1);
-      libc::close(sock.as_fd().as_raw_fd());
     }
   }
 }
@@ -462,7 +429,7 @@ fn test_listen_on_all_interfaces() {
   poll_until_recv(&mut lio, &receiver_unit)
     .expect("Failed to bind to all interfaces");
 
-  listen(&sock, 128).with_lio(&mut lio).send_with(sender_unit.clone());
+  api::listen(&sock, 128).with_lio(&mut lio).send_with(sender_unit.clone());
 
   poll_until_recv(&mut lio, &receiver_unit)
     .expect("Failed to listen on all interfaces");
@@ -479,6 +446,5 @@ fn test_listen_on_all_interfaces() {
       &mut len,
     );
     assert_eq!(accept_val, 1);
-    libc::close(sock.as_fd().as_raw_fd());
   }
 }

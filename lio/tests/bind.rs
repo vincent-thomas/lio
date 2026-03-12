@@ -1,33 +1,13 @@
+mod common;
+
+use common::poll_until_recv;
 use lio::Lio;
 use lio::api::bind;
 use std::{
   net::SocketAddr,
   os::fd::{AsFd, AsRawFd},
   sync::mpsc,
-  thread,
-  time::Duration,
 };
-
-/// Helper to poll until we receive a result
-fn poll_until_recv<T>(lio: &mut Lio, receiver: &mpsc::Receiver<T>) -> T {
-  let mut attempts = 0;
-  loop {
-    lio.try_run().unwrap();
-    match receiver.try_recv() {
-      Ok(result) => return result,
-      Err(mpsc::TryRecvError::Empty) => {
-        attempts += 1;
-        if attempts > 10 {
-          panic!("Operation did not complete after 10 attempts");
-        }
-        thread::sleep(Duration::from_micros(100));
-      }
-      Err(mpsc::TryRecvError::Disconnected) => {
-        panic!("Channel disconnected");
-      }
-    }
-  }
-}
 
 #[test]
 fn test_bind_ipv4_any_port() {
@@ -62,7 +42,6 @@ fn test_bind_ipv4_any_port() {
       &mut addr_len,
     );
     assert_eq!(result, 0, "getsockname should succeed");
-    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -100,7 +79,6 @@ fn test_bind_ipv4_specific_port() {
     );
     let sockaddr_in = addr_storage.assume_init();
     assert_eq!(u16::from_be(sockaddr_in.sin_port), 19999);
-    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -138,7 +116,6 @@ fn test_bind_ipv6() {
       &mut addr_len,
     );
     assert_eq!(result, 0);
-    libc::close(sock.as_fd().as_raw_fd());
   }
 }
 
@@ -174,11 +151,14 @@ fn test_bind_udp() {
       &mut addr_len,
     );
     assert_eq!(result, 0);
-    libc::close(sock.as_raw_fd());
   }
 }
 
 #[test]
+#[cfg_attr(
+  any(target_os = "freebsd", target_os = "macos"),
+  ignore = "FreeBSD/macOS allows duplicate binds"
+)]
 fn test_bind_already_bound() {
   let mut lio = Lio::new(64).unwrap();
 
@@ -198,6 +178,11 @@ fn test_bind_already_bound() {
 
   poll_until_recv(&mut lio, &receiver_bind)
     .expect("Failed to bind first socket");
+
+  // Put socket in listening state to actually claim the port
+  unsafe {
+    libc::listen(sock1.as_raw_fd(), 1);
+  }
 
   // Get the actual bound address
   let bound_addr = unsafe {
@@ -230,12 +215,6 @@ fn test_bind_already_bound() {
 
   // Should fail with address in use
   assert!(result.is_err(), "Binding to already-used address should fail");
-
-  // Cleanup
-  unsafe {
-    libc::close(sock1.as_raw_fd());
-    libc::close(sock2.as_raw_fd());
-  }
 }
 
 #[test]
@@ -266,11 +245,6 @@ fn test_bind_double_bind() {
 
   // Should fail
   assert!(result.is_err(), "Double bind should fail");
-
-  // Cleanup
-  unsafe {
-    libc::close(sock.as_raw_fd());
-  }
 }
 
 #[test]
@@ -306,10 +280,8 @@ fn test_bind_with_reuseaddr() {
   poll_until_recv(&mut lio, &receiver_bind)
     .expect("Failed to bind first socket");
 
-  // Close first socket
-  unsafe {
-    libc::close(sock1.as_raw_fd());
-  }
+  // Close first socket (drop through Resource to avoid double-close)
+  drop(sock1);
 
   // Immediately bind another socket to the same address with SO_REUSEADDR
   lio::test_utils::tcp_socket()
@@ -336,11 +308,6 @@ fn test_bind_with_reuseaddr() {
   poll_until_recv(&mut lio, &receiver_bind2).expect(
     "Should be able to bind with SO_REUSEADDR after closing previous socket",
   );
-
-  // Cleanup
-  unsafe {
-    libc::close(sock2.as_raw_fd());
-  }
 }
 
 #[test]
@@ -377,7 +344,6 @@ fn test_bind_localhost() {
     let sockaddr_in = addr_storage.assume_init();
     // 127.0.0.1 in network byte order
     assert_eq!(u32::from_be(sockaddr_in.sin_addr.s_addr), 0x7f000001);
-    libc::close(sock.as_raw_fd());
   }
 }
 
@@ -411,12 +377,5 @@ fn test_bind_concurrent() {
 
   for _ in 0..10 {
     poll_until_recv(&mut lio, &receiver_bind).expect("Failed to bind socket");
-  }
-
-  // Cleanup
-  for sock in socks {
-    unsafe {
-      libc::close(sock.as_raw_fd());
-    }
   }
 }

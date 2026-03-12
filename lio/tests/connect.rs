@@ -1,3 +1,6 @@
+mod common;
+
+use common::poll_until_recv;
 use lio::Lio;
 use lio::api::*;
 use std::{
@@ -5,30 +8,7 @@ use std::{
   net::SocketAddr,
   os::fd::{AsFd, AsRawFd},
   sync::mpsc::{self},
-  thread,
-  time::Duration,
 };
-
-/// Helper to poll until we receive a result
-fn poll_until_recv<T>(lio: &mut Lio, receiver: &mpsc::Receiver<T>) -> T {
-  let mut attempts = 0;
-  loop {
-    lio.try_run().unwrap();
-    match receiver.try_recv() {
-      Ok(result) => return result,
-      Err(mpsc::TryRecvError::Empty) => {
-        attempts += 1;
-        if attempts > 10 {
-          panic!("Operation did not complete after 10 attempts");
-        }
-        thread::sleep(Duration::from_micros(100));
-      }
-      Err(mpsc::TryRecvError::Disconnected) => {
-        panic!("Channel disconnected");
-      }
-    }
-  }
-}
 
 #[test]
 fn test_connect_basic() {
@@ -95,9 +75,6 @@ fn test_connect_basic() {
       &mut peer_len,
     );
     assert_eq!(result, 0, "Should be able to get peer name after connect");
-
-    libc::close(client_sock.as_fd().as_raw_fd());
-    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -164,9 +141,6 @@ fn test_connect_ipv6() {
       &mut peer_len,
     );
     assert_eq!(result, 0);
-
-    libc::close(client_sock.as_fd().as_raw_fd());
-    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -192,10 +166,6 @@ fn test_connect_to_nonexistent() {
 
   // Should fail with connection refused
   assert!(result.is_err(), "Connect to non-listening port should fail");
-
-  unsafe {
-    libc::close(client_sock.as_fd().as_raw_fd());
-  }
 }
 
 #[test]
@@ -258,14 +228,6 @@ fn test_connect_multiple_clients() {
   }
 
   assert_eq!(client_socks.len(), 5);
-
-  // Cleanup
-  unsafe {
-    for sock in client_socks {
-      libc::close(sock.as_fd().as_raw_fd());
-    }
-    libc::close(server_sock.as_fd().as_raw_fd());
-  }
 }
 
 #[test]
@@ -330,15 +292,8 @@ fn test_connect_already_connected() {
 
   let result = poll_until_recv(&mut lio, &receiver_c2);
 
-  dbg!(&result);
-
   // Should fail with already connected
   assert!(result.is_err(), "Second connect should fail: err {result:#?}");
-
-  unsafe {
-    libc::close(client_sock.as_fd().as_raw_fd());
-    libc::close(server_sock.as_fd().as_raw_fd());
-  }
 }
 
 #[test]
@@ -407,9 +362,6 @@ fn test_connect_to_localhost() {
     );
     let sockaddr_in = peer_addr.assume_init();
     assert_eq!(u32::from_be(sockaddr_in.sin_addr.s_addr), 0x7f000001);
-
-    libc::close(client_sock.as_fd().as_raw_fd());
-    libc::close(server_sock.as_fd().as_raw_fd());
   }
 }
 
@@ -473,14 +425,6 @@ fn test_connect_concurrent() {
   }
 
   assert_eq!(client_socks.len(), 10);
-
-  // Cleanup
-  unsafe {
-    for sock in client_socks {
-      libc::close(sock.as_fd().as_raw_fd());
-    }
-    libc::close(server_sock.as_fd().as_raw_fd());
-  }
 }
 
 #[test]
@@ -545,9 +489,4 @@ fn test_connect_with_bind() {
     .send_with(sender_c.clone());
 
   poll_until_recv(&mut lio, &receiver_c).expect("Failed to connect");
-
-  unsafe {
-    libc::close(client_sock.as_fd().as_raw_fd());
-    libc::close(server_sock.as_fd().as_raw_fd());
-  }
 }
