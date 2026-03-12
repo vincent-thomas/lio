@@ -8,7 +8,7 @@ OUT_DIR="$PROJECT_ROOT/target/nix-test"
 mkdir -p "$OUT_DIR"
 
 echo "==> Building nix package..."
-nix build -L
+nix build -L '.?submodules=1'
 
 RESULT_DIR="$(readlink -f "$PROJECT_ROOT/result")"
 export PKG_CONFIG_PATH="$RESULT_DIR/lib/pkgconfig"
