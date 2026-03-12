@@ -182,13 +182,10 @@ fn prop_test_write_arbitrary_data_and_offsets_run(
   // Perform the write operation with channel pattern
   let test_data_clone = test_data.clone();
 
-  let mut receiver = api::write_at(
-    &unsafe { Resource::from_raw_fd(fd) },
-    test_data,
-    write_offset,
-  )
-  .with_lio(&mut lio)
-  .send();
+  // Keep resource alive until after pread (Resource closes fd on last drop)
+  let resource = unsafe { Resource::from_raw_fd(fd) };
+  let mut receiver =
+    api::write_at(&resource, test_data, write_offset).with_lio(&mut lio).send();
 
   // Poll until the write completes (may take multiple ticks on some backends)
   let (write_result, returned_buf) = {
@@ -261,11 +258,11 @@ fn prop_test_write_arbitrary_data_and_offsets_run(
     }
   }
 
-  // Cleanup
+  // Cleanup - resource closes fd on drop
   unsafe {
-    libc::close(fd);
     libc::unlink(path.as_ptr());
   }
+  drop(resource);
 
   Ok(())
 }

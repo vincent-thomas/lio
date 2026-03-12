@@ -1,87 +1,42 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-# Determine project root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-TARGET_DIR="$PROJECT_ROOT/target/release"
+OUT_DIR="$PROJECT_ROOT/target/nix-test"
 
-echo $TARGET_DIR
+mkdir -p "$OUT_DIR"
 
-echo "Building the Nix package..."
+echo "==> Building nix package..."
 nix build -L
 
-echo ""
-echo "Setting PKG_CONFIG_PATH..."
-PKGCONFIG_DIR="$(readlink -f $PROJECT_ROOT/result)/lib/pkgconfig"
+RESULT_DIR="$(readlink -f "$PROJECT_ROOT/result")"
+export PKG_CONFIG_PATH="$RESULT_DIR/lib/pkgconfig"
 
-which pkg-config
+echo "==> Verifying pkg-config..."
+pkg-config --exists lio
+echo "    version: $(pkg-config --modversion lio)"
 
-echo "Falling back, no nix env"
-export PKG_CONFIG_PATH="$PKGCONFIG_DIR"
-echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
+echo "==> Compiling test (dynamic)..."
+gcc "$SCRIPT_DIR/test_pkgconfig.c" $(pkg-config --cflags --libs lio) -o "$OUT_DIR/test_dynamic"
 
-echo ""
-echo "Testing pkg-config queries..."
-echo "1. Check if lio.pc is found:"
-pkg-config --libs lio
-pkg-config --exists lio && echo "   ✓ lio.pc found" || echo "   ✗ lio.pc not found"
+echo "==> Running test (dynamic)..."
+"$OUT_DIR/test_dynamic"
 
-echo ""
-echo "2. Package version:"
-pkg-config --modversion lio
-
-echo ""
-echo "3. Compiler flags:"
-pkg-config --cflags lio
-
-echo ""
-echo "4. Linker flags:"
-pkg-config --libs lio
-
-echo ""
-echo "5. Static linker flags:"
-pkg-config --libs --static lio
-
-echo ""
-echo "6. All variables:"
-pkg-config --print-variables lio
-
-echo ""
-echo "Compiling test program with pkg-config (dynamic linking)..."
-gcc $SCRIPT_DIR/test_pkgconfig.c $(pkg-config --cflags --libs lio) -o $TARGET_DIR/test_pkgconfig
-
-echo ""
-echo "Running test program (dynamic)..."
-
-$TARGET_DIR/test_pkgconfig
-
-echo ""
-echo "Compiling test program with static lio library..."
-# On macOS, we can't fully statically link, but we can statically link our library
-# We need to extract the library path and link directly to the .a file
+echo "==> Compiling test (static)..."
 LIO_LIBDIR=$(pkg-config --variable=libdir lio)
-gcc $SCRIPT_DIR/test_pkgconfig.c $(pkg-config --cflags lio) $LIO_LIBDIR/liblio.a -lpthread -o $TARGET_DIR/test_pkgconfig_static
+gcc "$SCRIPT_DIR/test_pkgconfig.c" $(pkg-config --cflags lio) "$LIO_LIBDIR/liblio.a" -lpthread -o "$OUT_DIR/test_static"
 
-echo ""
-echo "Verifying static linking of lio library..."
-# Check that lio is not in the dynamic dependencies
-if otool -L $TARGET_DIR/test_pkgconfig_static 2>/dev/null | grep -q liblio.dylib; then
-    echo "   ✗ Binary is dynamically linking liblio.dylib"
-    otool -L $TARGET_DIR/test_pkgconfig_static
+echo "==> Verifying static link..."
+if otool -L "$OUT_DIR/test_static" 2>/dev/null | grep -q liblio.dylib; then
+    echo "FAIL: liblio.dylib found in dynamic deps"
     exit 1
-elif ldd $TARGET_DIR/test_pkgconfig_static 2>/dev/null | grep -q liblio; then
-    echo "   ✗ Binary is dynamically linking liblio"
-    ldd $TARGET_DIR/test_pkgconfig_static
+elif ldd "$OUT_DIR/test_static" 2>/dev/null | grep -q liblio; then
+    echo "FAIL: liblio found in dynamic deps"
     exit 1
-else
-    echo "   ✓ lio library is statically linked"
 fi
 
-echo ""
-echo "Running test program (static)..."
+echo "==> Running test (static)..."
+"$OUT_DIR/test_static"
 
-$TARGET_DIR/test_pkgconfig_static
-
-echo ""
-echo "✓ All tests passed!"
+echo "==> All tests passed"

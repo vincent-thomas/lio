@@ -149,7 +149,7 @@ impl OpStore {
     &mut self,
     reg: Registration,
   ) -> Result<u64, StoreAtCapacity> {
-    let index = self.next_id().ok_or_else(|| StoreAtCapacity)?;
+    let index = self.next_id().ok_or(StoreAtCapacity)?;
 
     let slot = &mut self.slots[index.slot() as usize];
     assert!(
@@ -216,7 +216,6 @@ impl OpStore {
 
 #[cfg(test)]
 mod tests {
-  use crate::registration::notifier::Notifier;
 
   use super::*;
   use std::collections::HashSet;
@@ -237,7 +236,7 @@ mod tests {
     let raw_waker = RawWaker::new(std::ptr::null(), &VTABLE);
     let waker = unsafe { Waker::from_raw(raw_waker) };
 
-    Registration::new(Notifier::new_waker(waker))
+    Registration::new_waker(waker)
   }
 
   #[test]

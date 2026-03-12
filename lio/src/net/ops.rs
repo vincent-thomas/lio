@@ -5,8 +5,7 @@
 //! the [`TypedOp`] trait and are used internally by the networking API.
 //!
 //! Most users will not need to use these types directly, as they are returned by methods
-//! on [`Socket`], [`TcpListener`](crate::net::TcpListener), and
-//! [`TcpSocket`](crate::net::TcpSocket).
+//! on [`Socket`], [`TcpListener`], and [`TcpSocket`].
 //!
 //! # Available Operations
 //!
@@ -15,9 +14,10 @@
 
 use std::{io, net::SocketAddr, os::fd::FromRawFd};
 
+#[allow(unused_imports)] // TcpListener used in doc links
 use crate::{
   api::{ops, resource::FromResource},
-  net::{Socket, TcpSocket},
+  net::{Socket, TcpListener, TcpSocket},
   typed_op::TypedOp,
 };
 
@@ -44,7 +44,7 @@ impl TypedOp for SocketAccept {
     self.inner.into_op()
   }
 
-  fn extract_result(mut self, res: isize) -> Self::Result {
+  fn extract_result(self, res: isize) -> Self::Result {
     let (resource, addr) = self.inner.extract_result(res)?;
     Ok((Socket::from_resource(resource), addr))
   }
@@ -108,7 +108,7 @@ impl TypedOp for TcpAccept {
     self.inner.into_op()
   }
 
-  fn extract_result(mut self, res: isize) -> Self::Result {
+  fn extract_result(self, res: isize) -> Self::Result {
     let (resource, addr) = self.inner.extract_result(res)?;
     Ok((TcpSocket::from_resource(resource), addr))
   }

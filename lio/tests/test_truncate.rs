@@ -1,3 +1,6 @@
+mod common;
+
+use common::poll_until_recv;
 use lio::{
   Lio,
   api::{resource::Resource, truncate},
@@ -21,18 +24,16 @@ fn test_truncate_shrink_file() {
     fd
   };
 
+  // Keep resource alive until after fstat (Resource closes fd on last drop)
+  let resource = unsafe { Resource::from_raw_fd(fd) };
+
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
   // Truncate to 5 bytes
-  truncate(&unsafe { Resource::from_raw_fd(fd) }, 5)
-    .with_lio(&mut lio)
-    .send_with(sender1);
+  truncate(&resource, 5).with_lio(&mut lio).send_with(sender1);
 
-  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio.try_run().unwrap();
-
-  receiver.recv().unwrap().expect("Failed to truncate file");
+  poll_until_recv(&mut lio, &receiver).expect("Failed to truncate file");
 
   // Verify size
   unsafe {
@@ -47,9 +48,10 @@ fn test_truncate_shrink_file() {
     assert_eq!(read_bytes, 5);
     assert_eq!(&buf[..5], b"01234");
 
-    libc::close(fd);
     libc::unlink(path.as_ptr());
   }
+  // resource dropped here, closing fd
+  drop(resource);
 }
 
 #[test]
@@ -69,19 +71,15 @@ fn test_truncate_extend_file() {
     fd
   };
 
+  let resource = unsafe { Resource::from_raw_fd(fd) };
+
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
   // Extend to 20 bytes
-  truncate(&unsafe { Resource::from_raw_fd(fd) }, 20)
-    .with_lio(&mut lio)
-    .send_with(sender1);
+  truncate(&resource, 20).with_lio(&mut lio).send_with(sender1);
 
-  lio.try_run().unwrap();
-
-  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-
-  receiver.try_recv().unwrap().expect("Failed to truncate file");
+  poll_until_recv(&mut lio, &receiver).expect("Failed to truncate file");
 
   // Verify size
   unsafe {
@@ -97,9 +95,9 @@ fn test_truncate_extend_file() {
     assert_eq!(&buf[..5], b"Hello");
     assert_eq!(&buf[5..20], &[0u8; 15]);
 
-    libc::close(fd);
     libc::unlink(path.as_ptr());
   }
+  drop(resource);
 }
 
 #[test]
@@ -119,18 +117,16 @@ fn test_truncate_to_zero() {
     fd
   };
 
+  let resource = unsafe { Resource::from_raw_fd(fd) };
+
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
   // Truncate to 0 bytes
-  truncate(&unsafe { Resource::from_raw_fd(fd) }, 0)
-    .with_lio(&mut lio)
-    .send_with(sender1);
+  truncate(&resource, 0).with_lio(&mut lio).send_with(sender1);
 
-  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio.try_run().unwrap();
-
-  receiver.try_recv().unwrap().expect("Failed to truncate file to zero");
+  poll_until_recv(&mut lio, &receiver)
+    .expect("Failed to truncate file to zero");
 
   // Verify size
   unsafe {
@@ -144,9 +140,9 @@ fn test_truncate_to_zero() {
     let read_bytes = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 10);
     assert_eq!(read_bytes, 0);
 
-    libc::close(fd);
     libc::unlink(path.as_ptr());
   }
+  drop(resource);
 }
 
 #[test]
@@ -168,18 +164,17 @@ fn test_truncate_same_size() {
     fd
   };
 
+  let resource = unsafe { Resource::from_raw_fd(fd) };
+
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
   // Truncate to same size
-  truncate(&unsafe { Resource::from_raw_fd(fd) }, test_data.len() as u64)
+  truncate(&resource, test_data.len() as u64)
     .with_lio(&mut lio)
     .send_with(sender1);
 
-  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio.try_run().unwrap();
-
-  receiver.try_recv().unwrap().expect("Failed to truncate file");
+  poll_until_recv(&mut lio, &receiver).expect("Failed to truncate file");
 
   // Verify size and content unchanged
   unsafe {
@@ -194,9 +189,9 @@ fn test_truncate_same_size() {
     assert_eq!(read_bytes as usize, test_data.len());
     assert_eq!(&buf, test_data);
 
-    libc::close(fd);
     libc::unlink(path.as_ptr());
   }
+  drop(resource);
 }
 
 #[test]
@@ -216,18 +211,15 @@ fn test_truncate_then_write() {
     fd
   };
 
+  let resource = unsafe { Resource::from_raw_fd(fd) };
+
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
   // Truncate to 5 bytes
-  truncate(&unsafe { Resource::from_raw_fd(fd) }, 5)
-    .with_lio(&mut lio)
-    .send_with(sender1);
+  truncate(&resource, 5).with_lio(&mut lio).send_with(sender1);
 
-  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio.try_run().unwrap();
-
-  receiver.try_recv().unwrap().expect("Failed to truncate file");
+  poll_until_recv(&mut lio, &receiver).expect("Failed to truncate file");
 
   // Write new data
   unsafe {
@@ -243,9 +235,9 @@ fn test_truncate_then_write() {
     assert_eq!(read_bytes, 8);
     assert_eq!(&buf[..8], b"Old dNew");
 
-    libc::close(fd);
     libc::unlink(path.as_ptr());
   }
+  drop(resource);
 }
 
 #[test]
@@ -270,18 +262,15 @@ fn test_truncate_large_file() {
     fd
   };
 
+  let resource = unsafe { Resource::from_raw_fd(fd) };
+
   let (sender, receiver) = mpsc::channel();
   let sender1 = sender.clone();
 
   // Truncate to 1KB
-  truncate(&unsafe { Resource::from_raw_fd(fd) }, 1024)
-    .with_lio(&mut lio)
-    .send_with(sender1);
+  truncate(&resource, 1024).with_lio(&mut lio).send_with(sender1);
 
-  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio.try_run().unwrap();
-
-  receiver.try_recv().unwrap().expect("Failed to truncate large file");
+  poll_until_recv(&mut lio, &receiver).expect("Failed to truncate large file");
 
   // Verify size
   unsafe {
@@ -297,9 +286,9 @@ fn test_truncate_large_file() {
     assert_eq!(read_bytes, 1024);
     assert_eq!(&buf, &large_data[..1024]);
 
-    libc::close(fd);
     libc::unlink(path.as_ptr());
   }
+  drop(resource);
 }
 
 #[test]
@@ -319,46 +308,26 @@ fn test_truncate_multiple_times() {
     fd
   };
 
+  let resource = unsafe { Resource::from_raw_fd(fd) };
+
   let (sender, receiver) = mpsc::channel();
 
   // Truncate multiple times
   let sender1 = sender.clone();
-  truncate(&unsafe { Resource::from_raw_fd(fd) }, 8)
-    .with_lio(&mut lio)
-    .send_with(sender1);
-  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio.try_run().unwrap();
-  receiver.try_recv().unwrap().expect("First truncate failed");
+  truncate(&resource, 8).with_lio(&mut lio).send_with(sender1);
+  poll_until_recv(&mut lio, &receiver).expect("First truncate failed");
 
   let sender2 = sender.clone();
-  truncate(&unsafe { Resource::from_raw_fd(fd) }, 5)
-    .with_lio(&mut lio)
-    .when_done(move |res| {
-      sender2.send(res).unwrap();
-    });
-  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio.try_run().unwrap();
-  receiver.recv().unwrap().expect("Second truncate failed");
+  truncate(&resource, 5).with_lio(&mut lio).send_with(sender2);
+  poll_until_recv(&mut lio, &receiver).expect("Second truncate failed");
 
   let sender3 = sender.clone();
-  truncate(&unsafe { Resource::from_raw_fd(fd) }, 10)
-    .with_lio(&mut lio)
-    .when_done(move |res| {
-      sender3.send(res).unwrap();
-    });
-  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio.try_run().unwrap();
-  receiver.recv().unwrap().expect("Third truncate failed");
+  truncate(&resource, 10).with_lio(&mut lio).send_with(sender3);
+  poll_until_recv(&mut lio, &receiver).expect("Third truncate failed");
 
   let sender4 = sender.clone();
-  truncate(&unsafe { Resource::from_raw_fd(fd) }, 3)
-    .with_lio(&mut lio)
-    .when_done(move |res| {
-      sender4.send(res).unwrap();
-    });
-  // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-  lio.try_run().unwrap();
-  receiver.recv().unwrap().expect("Fourth truncate failed");
+  truncate(&resource, 3).with_lio(&mut lio).send_with(sender4);
+  poll_until_recv(&mut lio, &receiver).expect("Fourth truncate failed");
 
   // Verify final size
   unsafe {
@@ -372,9 +341,9 @@ fn test_truncate_multiple_times() {
     assert_eq!(read_bytes, 3);
     assert_eq!(&buf[..3], b"012");
 
-    libc::close(fd);
     libc::unlink(path.as_ptr());
   }
+  drop(resource);
 }
 
 #[test]
@@ -397,25 +366,21 @@ fn test_truncate_concurrent() {
       fd
     };
 
+    let resource = unsafe { Resource::from_raw_fd(fd) };
+
     let (sender, receiver) = mpsc::channel();
 
-    truncate(&unsafe { Resource::from_raw_fd(fd) }, 5)
-      .with_lio(&mut lio)
-      .send_with(sender.clone());
+    truncate(&resource, 5).with_lio(&mut lio).send_with(sender.clone());
 
-    // assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
-    // lio::tick();
-    lio.try_run().unwrap();
-
-    receiver.try_recv().unwrap().expect("Failed to truncate");
+    poll_until_recv(&mut lio, &receiver).expect("Failed to truncate");
 
     unsafe {
       let mut stat: libc::stat = std::mem::zeroed();
       libc::fstat(fd, &mut stat);
       assert_eq!(stat.st_size, 5);
 
-      libc::close(fd);
       libc::unlink(path.as_ptr());
     }
+    drop(resource);
   }
 }

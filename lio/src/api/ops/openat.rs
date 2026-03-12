@@ -1,7 +1,4 @@
-use std::{
-  ffi::CString,
-  os::fd::{AsRawFd, FromRawFd},
-};
+use std::{ffi::CString, os::fd::FromRawFd};
 
 use crate::api::resource::Resource;
 use crate::typed_op::TypedOp;

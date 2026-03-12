@@ -21,21 +21,20 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use lio::backends::{IoBackend, OpStore};
+//! ```
+//! use lio::backends::{IoBackend, pollingv2::Poller};
+//! use std::time::Duration;
 //!
 //! // Create and initialize backend
-//! let mut backend = IoUring::default();
-//! backend.init(1024)?;  // Pre-allocate for 1024 concurrent ops
+//! let mut backend = Poller::default();
+//! backend.init(1024).unwrap();  // Pre-allocate for 1024 concurrent ops
 //!
-//! let mut store = OpStore::with_capacity(1024);
+//! // Submit a nop operation
+//! backend.push(1, lio::op::Op::Nop).unwrap();
+//! backend.flush().unwrap();
 //!
-//! // Submit operations
-//! backend.push(id, &op)?;
-//! backend.flush()?;
-//!
-//! // Poll for completions
-//! let completions = backend.poll(&mut store)?;
+//! // Poll for completions (non-blocking)
+//! let completions = backend.wait_timeout(Some(Duration::ZERO)).unwrap();
 //! ```
 
 #[cfg(test)]
@@ -131,7 +130,7 @@ impl OpCompleted {
 /// 1. Create backend with `Default::default()` or backend-specific constructor
 /// 2. Call [`init`](Self::init) to pre-allocate resources (zero runtime allocation)
 /// 3. Use [`push`](Self::push) + [`flush`](Self::flush) to submit operations
-/// 4. Use [`poll`](Self::poll) or [`wait`](Self::wait) to retrieve completions
+/// 4. Use [`wait_timeout`](Self::wait_timeout) to retrieve completions
 ///
 /// # Thread Safety
 ///

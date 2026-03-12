@@ -503,6 +503,7 @@ mod utils {
   target_os = "dragonfly",
   target_vendor = "apple",
 ))]
+#[allow(dead_code)]
 mod notify {
   use super::*;
   use crate::backends::pollingv2::os::NOTIFY_KEY;

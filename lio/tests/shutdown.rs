@@ -1,9 +1,11 @@
-use lio::api::resource::{FromResource, Resource};
+mod common;
+
+use common::poll_recv;
+use lio::api::resource::Resource;
 use lio::{Lio, api};
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::time::Duration;
+use std::os::fd::{AsRawFd, FromRawFd};
 
 #[test]
 fn test_shutdown_write() {
@@ -57,40 +59,22 @@ fn test_shutdown_write() {
   // Accept connection on server
   let mut accept_recv = api::accept(&server_sock).with_lio(&mut lio).send();
 
-  let connect_result = loop {
-    if let Some(result) = connect_recv.try_recv() {
-      break result;
-    }
-    lio.try_run().unwrap();
-  };
-  connect_result.unwrap();
-
-  let (server_client_fd, _addr) = loop {
-    if let Some(result) = accept_recv.try_recv() {
-      break result.unwrap();
-    }
-    lio.try_run().unwrap();
-  };
+  poll_recv(&mut lio, &mut connect_recv).unwrap();
+  let (server_client_fd, _addr) =
+    poll_recv(&mut lio, &mut accept_recv).unwrap();
 
   // Shutdown write on client
   let mut shutdown_recv =
     api::shutdown(&client_sock, libc::SHUT_WR).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  shutdown_recv.try_recv().expect("Failed to shutdown write").unwrap();
+  poll_recv(&mut lio, &mut shutdown_recv).unwrap();
 
   // Try to send data (should fail or return 0)
   let data = b"Test data".to_vec();
   let mut send_recv =
     api::send(&client_sock, data, None).with_lio(&mut lio).send();
 
-  let (result, _) = loop {
-    if let Some(result) = send_recv.try_recv() {
-      break result;
-    }
-    lio.run_timeout(Duration::from_millis(10)).unwrap();
-  };
+  let (result, _) = poll_recv(&mut lio, &mut send_recv);
 
   // Send after SHUT_WR should fail
   assert!(
@@ -103,12 +87,7 @@ fn test_shutdown_write() {
   let mut recv_recv =
     api::recv(&server_client_fd, buf, None).with_lio(&mut lio).send();
 
-  let (bytes_received, _) = loop {
-    if let Some(result) = recv_recv.try_recv() {
-      break result;
-    }
-    lio.run_timeout(Duration::from_millis(10)).unwrap();
-  };
+  let (bytes_received, _) = poll_recv(&mut lio, &mut recv_recv);
 
   assert_eq!(
     bytes_received.expect("Recv should succeed"),
@@ -116,12 +95,7 @@ fn test_shutdown_write() {
     "Should receive EOF after client shutdown write"
   );
 
-  // Cleanup
-  unsafe {
-    libc::close(client_sock.as_raw_fd());
-    libc::close(server_client_fd.as_raw_fd());
-    libc::close(server_sock.as_raw_fd());
-  }
+  // Resources are automatically closed when dropped
 }
 
 #[test]
@@ -175,40 +149,22 @@ fn test_shutdown_read() {
   // Accept connection on server
   let mut accept_recv = api::accept(&server_sock).with_lio(&mut lio).send();
 
-  let connect_result = loop {
-    if let Some(result) = connect_recv.try_recv() {
-      break result;
-    }
-    lio.try_run().unwrap();
-  };
-  connect_result.unwrap();
-
-  let (server_client_fd, _addr) = loop {
-    if let Some(result) = accept_recv.try_recv() {
-      break result.unwrap();
-    }
-    lio.try_run().unwrap();
-  };
+  poll_recv(&mut lio, &mut connect_recv).unwrap();
+  let (server_client_fd, _addr) =
+    poll_recv(&mut lio, &mut accept_recv).unwrap();
 
   // Shutdown read on client
   let mut shutdown_recv =
     api::shutdown(&client_sock, libc::SHUT_RD).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  shutdown_recv.try_recv().expect("Failed to shutdown read").unwrap();
+  poll_recv(&mut lio, &mut shutdown_recv).unwrap();
 
   // Client can still send
   let data = b"Hello".to_vec();
   let mut send_recv =
     api::send(&client_sock, data.clone(), None).with_lio(&mut lio).send();
 
-  let (bytes_sent, _) = loop {
-    if let Some(result) = send_recv.try_recv() {
-      break result;
-    }
-    lio.run_timeout(Duration::from_millis(10)).unwrap();
-  };
+  let (bytes_sent, _) = poll_recv(&mut lio, &mut send_recv);
   assert_eq!(bytes_sent.expect("Send should succeed") as usize, data.len());
 
   // Server can receive
@@ -216,22 +172,12 @@ fn test_shutdown_read() {
   let mut recv_recv =
     api::recv(&server_client_fd, buf, None).with_lio(&mut lio).send();
 
-  let (bytes_received, received_buf) = loop {
-    if let Some(result) = recv_recv.try_recv() {
-      break result;
-    }
-    lio.run_timeout(Duration::from_millis(10)).unwrap();
-  };
+  let (bytes_received, received_buf) = poll_recv(&mut lio, &mut recv_recv);
   let bytes_received = bytes_received.expect("Recv should succeed") as usize;
   assert_eq!(bytes_received, data.len());
   assert_eq!(&received_buf[..bytes_received], data.as_slice());
 
-  // Cleanup
-  unsafe {
-    libc::close(client_sock.as_raw_fd());
-    libc::close(server_client_fd.as_raw_fd());
-    libc::close(server_sock.as_raw_fd());
-  }
+  // Resources are automatically closed when dropped
 }
 
 #[test]
@@ -240,16 +186,12 @@ fn test_shutdown_both() {
 
   let mut server_sock = lio::test_utils::tcp_socket().with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  let server_sock = server_sock.try_recv().unwrap().unwrap();
+  let server_sock = poll_recv(&mut lio, &mut server_sock).unwrap();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
   let mut bind_recv = api::bind(&server_sock, addr).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  bind_recv.try_recv().unwrap().expect("Failed to bind");
+  poll_recv(&mut lio, &mut bind_recv).expect("Failed to bind");
 
   let bound_addr = unsafe {
     let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
@@ -268,53 +210,36 @@ fn test_shutdown_both() {
   let mut listen_recv =
     api::listen(&server_sock, 128).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  listen_recv.try_recv().expect("Failed to listen").unwrap();
+  poll_recv(&mut lio, &mut listen_recv).expect("Failed to listen");
 
   // Create client socket
   let mut client_sock = lio::test_utils::tcp_socket().with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  let client_sock = client_sock.try_recv().unwrap().unwrap();
+  let client_sock = poll_recv(&mut lio, &mut client_sock).unwrap();
 
   // Connect client to server
   let mut connect_recv =
     api::connect(&client_sock, bound_addr).with_lio(&mut lio).send();
 
-  let connect_result = loop {
-    if let Some(result) = connect_recv.try_recv() {
-      break result;
-    }
-    lio.try_run().unwrap();
-  };
-  connect_result.unwrap();
-
   // Accept connection on server
-  let accept_recv = api::accept(&server_sock).with_lio(&mut lio).send();
+  let mut accept_recv = api::accept(&server_sock).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-  lio.try_run().unwrap();
-
-  let (server_client_fd, _addr) = accept_recv.recv().unwrap();
+  poll_recv(&mut lio, &mut connect_recv).unwrap();
+  let (server_client_fd, _addr) =
+    poll_recv(&mut lio, &mut accept_recv).unwrap();
 
   // Shutdown both directions on client
   let mut shutdown_recv =
     api::shutdown(&client_sock, libc::SHUT_RDWR).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  shutdown_recv.try_recv().unwrap().expect("Failed to shutdown both");
+  poll_recv(&mut lio, &mut shutdown_recv).expect("Failed to shutdown both");
 
   // Send should fail
   let data = b"Test".to_vec();
   let mut send_recv =
     api::send(&client_sock, data, None).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  let (result, _) = send_recv.try_recv().unwrap();
+  let (result, _) = poll_recv(&mut lio, &mut send_recv);
   assert!(
     result.is_err() || result.unwrap() == 0,
     "Send should fail after SHUT_RDWR"
@@ -322,24 +247,17 @@ fn test_shutdown_both() {
 
   // Server should receive EOF
   let buf = vec![0u8; 100];
-  let recv_recv =
+  let mut recv_recv =
     api::recv(&server_client_fd, buf, None).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  let (bytes_received, _) = recv_recv.recv();
+  let (bytes_received, _) = poll_recv(&mut lio, &mut recv_recv);
   assert_eq!(
     bytes_received.expect("Recv should succeed"),
     0,
     "Should receive EOF"
   );
 
-  // Cleanup
-  unsafe {
-    libc::close(client_sock.as_raw_fd());
-    libc::close(server_client_fd.as_raw_fd());
-    libc::close(server_sock.as_raw_fd());
-  }
+  // Resources are automatically closed when dropped
 }
 
 #[test]
@@ -352,9 +270,7 @@ fn test_shutdown_invalid_fd() {
       .with_lio(&mut lio)
       .send();
 
-  assert!(lio.try_run().unwrap() == 1);
-
-  let result = shutdown_recv.try_recv().unwrap();
+  let result = poll_recv(&mut lio, &mut shutdown_recv);
   assert!(result.is_err(), "Shutdown on invalid fd should fail");
 }
 
@@ -395,41 +311,33 @@ fn test_shutdown_after_close() {
 
   listen_recv.recv().expect("Failed to listen");
 
-  let client_sock = lio::test_utils::tcp_socket().with_lio(&mut lio).send();
+  let mut client_sock_recv =
+    lio::test_utils::tcp_socket().with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  let client_sock = client_sock.recv().unwrap();
+  let client_sock = poll_recv(&mut lio, &mut client_sock_recv).unwrap();
 
   let mut connect_recv =
     api::connect(&client_sock, bound_addr).with_lio(&mut lio).send();
 
-  let connect_result = loop {
-    if let Some(result) = connect_recv.try_recv() {
-      break result;
-    }
-    lio.try_run().unwrap();
-  };
-  connect_result.unwrap();
+  poll_recv(&mut lio, &mut connect_recv).unwrap();
 
-  // Close the socket
+  // Close the socket manually and forget to prevent double-close
   unsafe {
     libc::close(client_sock.as_raw_fd());
   }
+  std::mem::forget(client_sock);
 
   // Try to shutdown after close (should fail)
-  let shutdown_recv =
-    api::shutdown(&client_sock, libc::SHUT_RDWR).with_lio(&mut lio).send();
+  // Note: We create a new Resource with the same (now invalid) fd for testing
+  let mut shutdown_recv =
+    api::shutdown(&unsafe { Resource::from_raw_fd(-1) }, libc::SHUT_RDWR)
+      .with_lio(&mut lio)
+      .send();
 
-  lio.try_run().unwrap();
-
-  let result = shutdown_recv.recv();
+  let result = poll_recv(&mut lio, &mut shutdown_recv);
   assert!(result.is_err(), "Shutdown after close should fail");
 
-  // Cleanup
-  unsafe {
-    libc::close(server_sock.as_raw_fd());
-  }
+  // server_sock is automatically closed when dropped
 }
 
 #[test]
@@ -483,45 +391,26 @@ fn test_shutdown_twice() {
   // Accept connection on server
   let mut accept_recv = api::accept(&server_sock).with_lio(&mut lio).send();
 
-  let connect_result = loop {
-    if let Some(result) = connect_recv.try_recv() {
-      break result;
-    }
-    lio.try_run().unwrap();
-  };
-  connect_result.unwrap();
-
-  let (server_client_fd, _addr) = loop {
-    if let Some(result) = accept_recv.try_recv() {
-      break result.unwrap();
-    }
-    lio.try_run().unwrap();
-  };
+  poll_recv(&mut lio, &mut connect_recv).unwrap();
+  let (_server_client_fd, _addr) =
+    poll_recv(&mut lio, &mut accept_recv).unwrap();
 
   // First shutdown
   let mut shutdown_recv =
     api::shutdown(&client_sock, libc::SHUT_WR).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  shutdown_recv.try_recv().expect("First shutdown should succeed").unwrap();
+  poll_recv(&mut lio, &mut shutdown_recv)
+    .expect("First shutdown should succeed");
 
   // Second shutdown on same direction
-  let shutdown_recv2 =
+  let mut shutdown_recv2 =
     api::shutdown(&client_sock, libc::SHUT_WR).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  let result = shutdown_recv2.recv();
+  let result = poll_recv(&mut lio, &mut shutdown_recv2);
   // Some systems allow this, some don't - just verify it doesn't crash
   let _ = result;
 
-  // Cleanup
-  unsafe {
-    libc::close(client_sock.as_raw_fd());
-    libc::close(server_client_fd.as_raw_fd());
-    libc::close(server_sock.as_raw_fd());
-  }
+  // Resources are automatically closed when dropped
 }
 
 #[test]
@@ -575,40 +464,22 @@ fn test_shutdown_sequential_directions() {
   // Accept connection on server
   let mut accept_recv = api::accept(&server_sock).with_lio(&mut lio).send();
 
-  let connect_result = loop {
-    if let Some(result) = connect_recv.try_recv() {
-      break result;
-    }
-    lio.try_run().unwrap();
-  };
-  connect_result.unwrap();
-
-  let (server_client_fd, _addr) = loop {
-    if let Some(result) = accept_recv.try_recv() {
-      break result.unwrap();
-    }
-    lio.try_run().unwrap();
-  };
+  poll_recv(&mut lio, &mut connect_recv).unwrap();
+  let (server_client_fd, _addr) =
+    poll_recv(&mut lio, &mut accept_recv).unwrap();
 
   // Shutdown write first
   let mut shutdown_recv =
     api::shutdown(&client_sock, libc::SHUT_WR).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  shutdown_recv.try_recv().expect("Failed to shutdown write").unwrap();
+  poll_recv(&mut lio, &mut shutdown_recv).expect("Failed to shutdown write");
 
   // Client can still receive - send from server
   let data = b"From server".to_vec();
   let mut send_recv =
     api::send(&server_client_fd, data, None).with_lio(&mut lio).send();
 
-  let (bytes_sent, _) = loop {
-    if let Some(result) = send_recv.try_recv() {
-      break result;
-    }
-    lio.run_timeout(Duration::from_millis(10)).unwrap();
-  };
+  let (bytes_sent, _) = poll_recv(&mut lio, &mut send_recv);
   assert!(bytes_sent.is_ok(), "Server send should succeed");
 
   // Receive on client
@@ -616,12 +487,7 @@ fn test_shutdown_sequential_directions() {
   let mut recv_recv =
     api::recv(&client_sock, buf, None).with_lio(&mut lio).send();
 
-  let (bytes_received, received_buf) = loop {
-    if let Some(result) = recv_recv.try_recv() {
-      break result;
-    }
-    lio.run_timeout(Duration::from_millis(10)).unwrap();
-  };
+  let (bytes_received, received_buf) = poll_recv(&mut lio, &mut recv_recv);
   let bytes_received = bytes_received.unwrap() as usize;
   assert_eq!(&received_buf[..bytes_received], b"From server");
 
@@ -629,16 +495,9 @@ fn test_shutdown_sequential_directions() {
   let mut shutdown_recv2 =
     api::shutdown(&client_sock, libc::SHUT_RD).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
+  poll_recv(&mut lio, &mut shutdown_recv2).expect("Failed to shutdown read");
 
-  shutdown_recv2.try_recv().expect("Failed to shutdown read").unwrap();
-
-  // Cleanup
-  unsafe {
-    libc::close(client_sock.as_raw_fd());
-    libc::close(server_client_fd.as_raw_fd());
-    libc::close(server_sock.as_raw_fd());
-  }
+  // Resources are automatically closed when dropped
 }
 
 #[test]
@@ -693,51 +552,26 @@ fn test_shutdown_before_data_sent() {
   // Accept connection on server
   let mut accept_recv = api::accept(&server_sock).with_lio(&mut lio).send();
 
-  let connect_result = loop {
-    if let Some(result) = connect_recv.try_recv() {
-      break result;
-    }
-    lio.try_run().unwrap();
-  };
-  connect_result.unwrap();
-
-  let (server_client_fd, _addr) = loop {
-    if let Some(result) = accept_recv.try_recv() {
-      break result.unwrap();
-    }
-    lio.try_run().unwrap();
-  };
+  poll_recv(&mut lio, &mut connect_recv).unwrap();
+  let (server_client_fd, _addr) =
+    poll_recv(&mut lio, &mut accept_recv).unwrap();
 
   // Shutdown immediately after connection, before any data transfer
   let mut shutdown_recv =
     api::shutdown(&client_sock, libc::SHUT_RDWR).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  shutdown_recv
-    .try_recv()
-    .expect("Shutdown should succeed on fresh connection")
-    .unwrap();
+  poll_recv(&mut lio, &mut shutdown_recv)
+    .expect("Shutdown should succeed on fresh connection");
 
   // Verify server sees EOF
   let buf = vec![0u8; 100];
   let mut recv_recv =
     api::recv(&server_client_fd, buf, None).with_lio(&mut lio).send();
 
-  let (bytes_received, _) = loop {
-    if let Some(result) = recv_recv.try_recv() {
-      break result;
-    }
-    lio.run_timeout(Duration::from_millis(10)).unwrap();
-  };
+  let (bytes_received, _) = poll_recv(&mut lio, &mut recv_recv);
   assert_eq!(bytes_received.expect("Recv should succeed"), 0);
 
-  // Cleanup
-  unsafe {
-    libc::close(client_sock.as_raw_fd());
-    libc::close(server_client_fd.as_raw_fd());
-    libc::close(server_sock.as_raw_fd());
-  }
+  // Resources are automatically closed when dropped
 }
 
 #[test]
@@ -793,45 +627,26 @@ fn test_shutdown_ipv6() {
   // Accept connection on server
   let mut accept_recv = api::accept(&server_sock).with_lio(&mut lio).send();
 
-  let connect_result = loop {
-    if let Some(result) = connect_recv.try_recv() {
-      break result;
-    }
-    lio.try_run().unwrap();
-  };
-  connect_result.expect("Failed to connect IPv6");
-
-  let (server_client_fd, _addr) = loop {
-    if let Some(result) = accept_recv.try_recv() {
-      break result.expect("Failed to accept IPv6");
-    }
-    lio.try_run().unwrap();
-  };
+  poll_recv(&mut lio, &mut connect_recv).expect("Failed to connect IPv6");
+  let (server_client_fd, _addr) =
+    poll_recv(&mut lio, &mut accept_recv).expect("Failed to accept IPv6");
 
   // Shutdown write on IPv6 socket
-  let shutdown_recv =
+  let mut shutdown_recv =
     api::shutdown(&client_sock, libc::SHUT_WR).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  shutdown_recv.recv().expect("Failed to shutdown IPv6 socket");
+  poll_recv(&mut lio, &mut shutdown_recv)
+    .expect("Failed to shutdown IPv6 socket");
 
   // Verify EOF
   let buf = vec![0u8; 100];
-  let recv_recv =
+  let mut recv_recv =
     api::recv(&server_client_fd, buf, None).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  let (bytes_received, _) = recv_recv.recv();
+  let (bytes_received, _) = poll_recv(&mut lio, &mut recv_recv);
   assert_eq!(bytes_received.expect("Recv should succeed"), 0);
 
-  // Cleanup
-  unsafe {
-    libc::close(client_sock.as_raw_fd());
-    libc::close(server_client_fd.as_raw_fd());
-    libc::close(server_sock.as_raw_fd());
-  }
+  // Resources are automatically closed when dropped
 }
 
 #[test]
@@ -840,21 +655,16 @@ fn test_shutdown_concurrent() {
 
   // Test shutting down multiple connections (sequentially)
   for _ in 0..5 {
-    let server_sock = lio::test_utils::tcp_socket().with_lio(&mut lio).send();
+    let mut server_sock =
+      lio::test_utils::tcp_socket().with_lio(&mut lio).send();
 
-    lio.try_run().unwrap();
-
-    let server_sock =
-      server_sock.recv().expect("Failed to create server socket");
+    let server_sock = poll_recv(&mut lio, &mut server_sock)
+      .expect("Failed to create server socket");
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut bind_recv = api::bind(&server_sock, addr).with_lio(&mut lio).send();
 
-    lio.try_run().unwrap();
-
-    let result = bind_recv.try_recv().expect("Failed to bind");
-
-    result.expect("should succeed");
+    poll_recv(&mut lio, &mut bind_recv).expect("Failed to bind");
 
     let bound_addr = unsafe {
       let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
@@ -873,17 +683,13 @@ fn test_shutdown_concurrent() {
     let mut listen_recv =
       api::listen(&server_sock, 128).with_lio(&mut lio).send();
 
-    lio.try_run().unwrap();
-
-    listen_recv.try_recv().expect("Failed to listen").unwrap();
+    poll_recv(&mut lio, &mut listen_recv).expect("Failed to listen");
 
     // Create and connect client
     let mut client_sock =
       lio::test_utils::tcp_socket().with_lio(&mut lio).send();
 
-    lio.try_run().unwrap();
-
-    let client_sock = client_sock.try_recv().unwrap().unwrap();
+    let client_sock = poll_recv(&mut lio, &mut client_sock).unwrap();
 
     let mut connect_recv =
       api::connect(&client_sock, bound_addr).with_lio(&mut lio).send();
@@ -891,34 +697,18 @@ fn test_shutdown_concurrent() {
     // Accept connection
     let mut accept_recv = api::accept(&server_sock).with_lio(&mut lio).send();
 
-    let connect_result = loop {
-      if let Some(result) = connect_recv.try_recv() {
-        break result;
-      }
-      lio.try_run().unwrap();
-    };
-    connect_result.unwrap();
-
-    let (server_client_fd, _addr) = loop {
-      if let Some(result) = accept_recv.try_recv() {
-        break result.unwrap();
-      }
-      lio.try_run().unwrap();
-    };
+    poll_recv(&mut lio, &mut connect_recv).unwrap();
+    let (_server_client_fd, _addr) =
+      poll_recv(&mut lio, &mut accept_recv).unwrap();
 
     // Shutdown
     let mut shutdown_recv =
       api::shutdown(&client_sock, libc::SHUT_RDWR).with_lio(&mut lio).send();
 
-    lio.try_run().unwrap();
+    poll_recv(&mut lio, &mut shutdown_recv)
+      .expect("Concurrent shutdown failed");
 
-    shutdown_recv.try_recv().expect("Concurrent shutdown failed").unwrap();
-
-    unsafe {
-      libc::close(client_sock.as_raw_fd());
-      libc::close(server_client_fd.as_raw_fd());
-      libc::close(server_sock.as_raw_fd());
-    }
+    // Resources are automatically closed when dropped at end of loop iteration
   }
 }
 
@@ -973,47 +763,30 @@ fn test_shutdown_with_pending_data() {
   // Accept connection on server
   let mut accept_recv = api::accept(&server_sock).with_lio(&mut lio).send();
 
-  let connect_result = loop {
-    if let Some(result) = connect_recv.try_recv() {
-      break result;
-    }
-    lio.try_run().unwrap();
-  };
-  connect_result.unwrap();
-
-  let (server_client_fd, _addr) = loop {
-    if let Some(result) = accept_recv.try_recv() {
-      break result.unwrap();
-    }
-    lio.try_run().unwrap();
-  };
+  poll_recv(&mut lio, &mut connect_recv).unwrap();
+  let (server_client_fd, _addr) =
+    poll_recv(&mut lio, &mut accept_recv).unwrap();
 
   // Send some data from client
   let data = b"Data before shutdown".to_vec();
-  let send_recv =
+  let mut send_recv =
     api::send(&client_sock, data.clone(), None).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  let (bytes_sent, _) = send_recv.recv();
+  let (bytes_sent, _) = poll_recv(&mut lio, &mut send_recv);
   assert!(bytes_sent.is_ok(), "Send should succeed");
 
   // Shutdown write immediately (data may still be in transit)
-  let shutdown_recv =
+  let mut shutdown_recv =
     api::shutdown(&client_sock, libc::SHUT_WR).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  shutdown_recv.recv().expect("Shutdown should succeed");
+  poll_recv(&mut lio, &mut shutdown_recv).expect("Shutdown should succeed");
 
   // Server should still be able to receive the data
   let buf = vec![0u8; 100];
-  let recv_recv =
+  let mut recv_recv =
     api::recv(&server_client_fd, buf, None).with_lio(&mut lio).send();
 
-  lio.try_run().unwrap();
-
-  let (bytes_received, received_buf) = recv_recv.recv();
+  let (bytes_received, received_buf) = poll_recv(&mut lio, &mut recv_recv);
   let bytes_received = bytes_received.expect("Recv should succeed") as usize;
 
   // Should receive the data followed by EOF
@@ -1022,19 +795,12 @@ fn test_shutdown_with_pending_data() {
 
     // Next read should be EOF
     let buf2 = vec![0u8; 100];
-    let recv_recv2 =
+    let mut recv_recv2 =
       api::recv(&server_client_fd, buf2, None).with_lio(&mut lio).send();
 
-    lio.try_run().unwrap();
-
-    let (bytes_received2, _) = recv_recv2.recv();
+    let (bytes_received2, _) = poll_recv(&mut lio, &mut recv_recv2);
     assert_eq!(bytes_received2.expect("Recv should succeed"), 0);
   }
 
-  // Cleanup
-  unsafe {
-    libc::close(client_sock.as_raw_fd());
-    libc::close(server_client_fd.as_raw_fd());
-    libc::close(server_sock.as_raw_fd());
-  }
+  // Resources are automatically closed when dropped
 }

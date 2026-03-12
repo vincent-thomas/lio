@@ -1,7 +1,6 @@
 use std::{
   io,
   net::SocketAddr,
-  os::fd::AsRawFd,
   sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -31,17 +30,6 @@ impl Connect {
     } as libc::socklen_t;
     Self { res, addr, len, connect_called: AtomicBool::new(false) }
   }
-
-  /// Convert this operation into an Op enum variant.
-  pub fn to_op(self) -> crate::op::Op {
-    let connect_called = self.connect_called.load(Ordering::Relaxed);
-    crate::op::Op::Connect {
-      fd: self.res,
-      addr: self.addr,
-      len: self.len,
-      connect_called,
-    }
-  }
 }
 
 impl TypedOp for Connect {
@@ -51,7 +39,7 @@ impl TypedOp for Connect {
     let connect_called = self.connect_called.load(Ordering::Relaxed);
     crate::op::Op::Connect {
       fd: self.res.clone(),
-      addr: self.addr,
+      addr: &self.addr as *const _,
       len: self.len,
       connect_called,
     }

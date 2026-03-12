@@ -4,7 +4,7 @@ use crate::{
   api::{
     self,
     io::Io,
-    ops::{self, Accept, Bind, Connect, Listen, Recv, Send, Shutdown},
+    ops::{Bind, Connect, Listen, Recv, Send, Shutdown},
     resource::{AsResource, FromResource, IntoResource, Resource},
   },
   net::ops::{SocketAccept, SocketNew},
@@ -23,7 +23,6 @@ use crate::{
 /// use std::net::SocketAddr;
 /// use lio::net::Socket;
 ///
-/// # lio::init();
 /// async fn run_server() -> std::io::Result<()> {
 ///     // Create a new socket
 ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
@@ -40,11 +39,11 @@ use crate::{
 ///
 ///     // Receive data from the client
 ///     let buffer = vec![0u8; 1024];
-///     let (buffer, bytes_read) = client_socket.recv(buffer).await?;
+///     let (result, buffer) = client_socket.recv(buffer).await;
+///     let bytes_read = result? as usize;
 ///
 ///     Ok(())
 /// }
-/// # lio::exit();
 /// ```
 ///
 /// ## Creating a TCP client
@@ -53,7 +52,6 @@ use crate::{
 /// use std::net::SocketAddr;
 /// use lio::net::Socket;
 ///
-/// # lio::init();
 /// async fn connect_to_server() -> std::io::Result<()> {
 ///     // Create a new socket
 ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
@@ -64,14 +62,14 @@ use crate::{
 ///
 ///     // Send data
 ///     let data = b"Hello, server!".to_vec();
-///     let (data, bytes_sent) = socket.send(data).await?;
+///     let (result, data) = socket.send(data).await;
+///     let bytes_sent = result? as usize;
 ///
 ///     // Shutdown the write side
 ///     socket.shutdown(libc::SHUT_WR).await?;
 ///
 ///     Ok(())
 /// }
-/// # lio::exit();
 /// ```
 pub struct Socket(Resource);
 
@@ -109,8 +107,7 @@ impl Socket {
   /// ```rust,no_run
   /// use lio::net::Socket;
   ///
-  /// # lio::init();
-  /// async fn example() -> std::io::Result<()> {
+    /// async fn example() -> std::io::Result<()> {
   ///     // Create a TCP socket for IPv4
   ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
   ///
@@ -119,13 +116,13 @@ impl Socket {
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
+    /// ```
+  #[allow(clippy::new_ret_no_self)]
   pub fn new(
     domain: libc::c_int,
     ty: libc::c_int,
     proto: libc::c_int,
-  ) -> Io<'static, SocketNew> {
+  ) -> Io<SocketNew> {
     let socket_accept_op = SocketNew::new(domain, ty, proto);
     Io::from_op(socket_accept_op)
   }
@@ -141,8 +138,7 @@ impl Socket {
   /// use std::net::SocketAddr;
   /// use lio::net::Socket;
   ///
-  /// # lio::init();
-  /// async fn example() -> std::io::Result<()> {
+    /// async fn example() -> std::io::Result<()> {
   ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
   ///
   ///     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
@@ -150,9 +146,8 @@ impl Socket {
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
-  pub fn bind(&self, addr: SocketAddr) -> Io<'_, Bind> {
+    /// ```
+  pub fn bind(&self, addr: SocketAddr) -> Io<Bind> {
     api::bind(&self.0, addr)
   }
 
@@ -167,8 +162,7 @@ impl Socket {
   /// use std::net::SocketAddr;
   /// use lio::net::Socket;
   ///
-  /// # lio::init();
-  /// async fn example() -> std::io::Result<()> {
+    /// async fn example() -> std::io::Result<()> {
   ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
   ///
   ///     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
@@ -177,9 +171,8 @@ impl Socket {
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
-  pub fn listen(&self) -> Io<'_, Listen> {
+    /// ```
+  pub fn listen(&self) -> Io<Listen> {
     api::listen(&self.0, 128)
   }
 
@@ -201,8 +194,7 @@ impl Socket {
   /// use std::net::SocketAddr;
   /// use lio::net::Socket;
   ///
-  /// # lio::init();
-  /// async fn example() -> std::io::Result<()> {
+    /// async fn example() -> std::io::Result<()> {
   ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
   ///
   ///     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
@@ -214,9 +206,8 @@ impl Socket {
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
-  pub fn accept(&self) -> Io<'_, SocketAccept> {
+    /// ```
+  pub fn accept(&self) -> Io<SocketAccept> {
     let socket_accept_op = SocketAccept::new(self.0.clone());
     Io::from_op(socket_accept_op)
   }
@@ -232,8 +223,7 @@ impl Socket {
   /// use std::net::SocketAddr;
   /// use lio::net::Socket;
   ///
-  /// # lio::init();
-  /// async fn example() -> std::io::Result<()> {
+    /// async fn example() -> std::io::Result<()> {
   ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
   ///
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
@@ -243,9 +233,8 @@ impl Socket {
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
-  pub fn connect(&self, addr: SocketAddr) -> Io<'_, Connect> {
+    /// ```
+  pub fn connect(&self, addr: SocketAddr) -> Io<Connect> {
     api::connect(&self.0, addr)
   }
 
@@ -266,19 +255,18 @@ impl Socket {
   /// ```rust,no_run
   /// use lio::net::Socket;
   ///
-  /// # lio::init();
-  /// async fn example(socket: Socket) -> std::io::Result<()> {
+    /// async fn example(socket: Socket) -> std::io::Result<()> {
   ///     let buffer = vec![0u8; 1024];
-  ///     let (buffer, bytes_read) = socket.recv(buffer).await?;
+  ///     let (result, buffer) = socket.recv(buffer).await;
+  ///     let bytes_read = result? as usize;
   ///
   ///     println!("Received {} bytes", bytes_read);
   ///     println!("Data: {:?}", &buffer[..bytes_read]);
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
-  pub fn recv(&self, vec: Vec<u8>) -> Io<'_, Recv<Vec<u8>>> {
+    /// ```
+  pub fn recv(&self, vec: Vec<u8>) -> Io<Recv<Vec<u8>>> {
     api::recv(&self.0, vec, None)
   }
 
@@ -299,18 +287,17 @@ impl Socket {
   /// ```rust,no_run
   /// use lio::net::Socket;
   ///
-  /// # lio::init();
-  /// async fn example(socket: Socket) -> std::io::Result<()> {
+    /// async fn example(socket: Socket) -> std::io::Result<()> {
   ///     let data = b"Hello, world!".to_vec();
-  ///     let (data, bytes_sent) = socket.send(data).await?;
+  ///     let (result, data) = socket.send(data).await;
+///     let bytes_sent = result? as usize;
   ///
   ///     println!("Sent {} bytes", bytes_sent);
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
-  pub fn send(&self, vec: Vec<u8>) -> Io<'_, Send<Vec<u8>>> {
+    /// ```
+  pub fn send(&self, vec: Vec<u8>) -> Io<Send<Vec<u8>>> {
     api::send(&self.0, vec, None)
   }
 
@@ -330,8 +317,7 @@ impl Socket {
   /// ```rust,no_run
   /// use lio::net::Socket;
   ///
-  /// # lio::init();
-  /// async fn example(socket: Socket) -> std::io::Result<()> {
+    /// async fn example(socket: Socket) -> std::io::Result<()> {
   ///     // Send all data...
   ///
   ///     // Shutdown the write side to signal EOF to the peer
@@ -341,9 +327,56 @@ impl Socket {
   ///
   ///     Ok(())
   /// }
-  /// # lio::exit();
-  /// ```
-  pub fn shutdown(&self, how: i32) -> Io<'_, Shutdown> {
+    /// ```
+  pub fn shutdown(&self, how: i32) -> Io<Shutdown> {
     api::shutdown(&self.0, how)
+  }
+
+  /// Returns the local address this socket is bound to.
+  pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+    use std::os::fd::AsRawFd;
+
+    let fd = self.0.as_raw_fd();
+    // SAFETY: sockaddr_storage is a C struct safe to zero-initialize
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len =
+      std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+
+    // SAFETY: fd is valid, storage/len are valid pointers with correct size
+    let ret = unsafe {
+      libc::getsockname(
+        fd,
+        &mut storage as *mut _ as *mut libc::sockaddr,
+        &mut len,
+      )
+    };
+
+    if ret < 0 {
+      return Err(std::io::Error::last_os_error());
+    }
+
+    // Convert sockaddr_storage to SocketAddr
+    match storage.ss_family as libc::c_int {
+      libc::AF_INET => {
+        // SAFETY: ss_family == AF_INET guarantees storage contains sockaddr_in
+        let addr: &libc::sockaddr_in =
+          unsafe { &*(&storage as *const _ as *const _) };
+        let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+        let port = u16::from_be(addr.sin_port);
+        Ok(SocketAddr::from((ip, port)))
+      }
+      libc::AF_INET6 => {
+        // SAFETY: ss_family == AF_INET6 guarantees storage contains sockaddr_in6
+        let addr: &libc::sockaddr_in6 =
+          unsafe { &*(&storage as *const _ as *const _) };
+        let ip = std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
+        let port = u16::from_be(addr.sin6_port);
+        Ok(SocketAddr::from((ip, port)))
+      }
+      _ => Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "unsupported address family",
+      )),
+    }
   }
 }

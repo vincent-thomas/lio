@@ -282,7 +282,7 @@ where
 
   assert!(result.is_err(), "Deleting non-existent fd should return error");
   assert_eq!(
-    dbg!(result).unwrap_err().raw_os_error(),
+    result.unwrap_err().raw_os_error(),
     Some(libc::ENOENT),
     "Error should be ENOENT"
   );

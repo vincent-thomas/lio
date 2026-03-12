@@ -1,9 +1,6 @@
 use crate::typed_op::TypedOp;
 use std::io;
 
-#[cfg(unix)]
-use crate::operation::OpMeta;
-
 pub struct Nop;
 
 assert_op_max_size!(Nop);

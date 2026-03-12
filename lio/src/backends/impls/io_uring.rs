@@ -1,111 +1,98 @@
 //! `lio`-provided [`IoBackend`] impl for `io_uring`.
 
 use lio_uring::{
-  completion::CompletionQueue,
+  Entry, LioUring,
   operation::{
-    self, Accept, Close, Connect, Fallocate, Fsync, LinkAt, MkDirAt, OpenAt,
-    Read, Readv, Recv, RenameAt, Send, Shutdown, Statx, SymlinkAt, Tee,
-    Timeout, UnlinkAt, Write, Writev,
+    self, Accept, Bind, Close, Connect, Fsync, Ftruncate, LinkAt, Listen,
+    OpenAt, Read, Recv, Send, Shutdown, Socket, SymlinkAt, Tee, Timeout, Write,
   },
-  submission::{Entry, SubmissionQueue},
 };
 
 use crate::{
   backends::{IoBackend, OpCompleted},
-  op::Op,
+  op::{Op, RawBuf},
 };
 use std::io;
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
-fn create_io_uring_entry(op: &mut Op) -> Entry {
-  use crate::buf::BufLike;
-  use std::os::fd::AsRawFd;
-
+fn create_io_uring_entry(op: &Op) -> Entry {
   match op {
     Op::Nop => operation::Nop::new().build(),
     Op::Read { fd, buffer } => {
-      let buf = unsafe { buffer.take::<&mut [u8]>() };
-      let ptr = buf.as_mut_ptr();
-      let len = buf.len() as u32;
-      // Store buffer back for later use
-      let _ = buffer.replace(buf);
-      Read::new(fd.as_raw_fd(), ptr, len).build()
+      // SAFETY: OpBuf stores RawBuf set by into_op
+      let RawBuf { ptr, len } = unsafe { buffer.peek::<RawBuf>() };
+      Read::new(fd.as_raw_fd(), ptr, len as u32).build()
     }
     Op::Write { fd, buffer } => {
-      let buf = unsafe { buffer.take::<&[u8]>() };
-      let ptr = buf.as_ptr();
-      let len = buf.len() as u32;
-      let _ = buffer.replace(buf);
-      Write::new(fd.as_raw_fd(), ptr, len).build()
+      // SAFETY: OpBuf stores (ptr, len) tuple set by into_op
+      let (ptr, len) = unsafe { buffer.peek::<(*const u8, usize)>() };
+      Write::new(fd.as_raw_fd(), ptr, len as u32).build()
     }
     Op::ReadAt { fd, offset, buffer } => {
-      let buf = unsafe { buffer.take::<&mut [u8]>() };
-      let ptr = buf.as_mut_ptr();
-      let len = buf.len() as u32;
-      let _ = buffer.replace(buf);
-      Read::new(fd.as_raw_fd(), ptr, len).offset(*offset).build()
+      // SAFETY: OpBuf stores RawBuf set by into_op
+      let RawBuf { ptr, len } = unsafe { buffer.peek::<RawBuf>() };
+      Read::new(fd.as_raw_fd(), ptr, len as u32).offset(*offset as u64).build()
     }
     Op::WriteAt { fd, offset, buffer } => {
-      let buf = unsafe { buffer.take::<&[u8]>() };
-      let ptr = buf.as_ptr();
-      let len = buf.len() as u32;
-      let _ = buffer.replace(buf);
-      Write::new(fd.as_raw_fd(), ptr, len).offset(*offset).build()
+      // SAFETY: OpBuf stores (ptr, len) tuple set by into_op
+      let (ptr, len) = unsafe { buffer.peek::<(*const u8, usize)>() };
+      Write::new(fd.as_raw_fd(), ptr, len as u32).offset(*offset as u64).build()
     }
     Op::Send { fd, flags, buffer } => {
-      let buf = unsafe { buffer.take::<&[u8]>() };
-      let ptr = buf.as_ptr();
-      let len = buf.len() as u32;
-      let _ = buffer.replace(buf);
-      Send::new(fd.as_raw_fd(), ptr, len).flags(*flags).build()
+      // SAFETY: OpBuf stores (ptr, len) tuple set by into_op
+      let (ptr, len) = unsafe { buffer.peek::<(*const u8, usize)>() };
+      Send::new(fd.as_raw_fd(), ptr, len as u32).flags(*flags).build()
     }
     Op::Recv { fd, flags, buffer } => {
-      let buf = unsafe { buffer.take::<&mut [u8]>() };
-      let ptr = buf.as_mut_ptr();
-      let len = buf.len() as u32;
-      let _ = buffer.replace(buf);
-      Recv::new(fd.as_raw_fd(), ptr, len).flags(*flags).build()
+      // SAFETY: OpBuf stores RawBuf set by into_op
+      let RawBuf { ptr, len } = unsafe { buffer.peek::<RawBuf>() };
+      Recv::new(fd.as_raw_fd(), ptr, len as u32).flags(*flags).build()
     }
     Op::Accept { fd, addr, len } => {
-      Accept::new(fd.as_raw_fd(), *addr, *len).build()
+      // Cast sockaddr_storage* to sockaddr*
+      Accept::new(fd.as_raw_fd(), (*addr) as *mut libc::sockaddr, *len).build()
     }
     Op::Connect { fd, addr, len, .. } => {
-      Connect::new(fd.as_raw_fd(), *addr as *const _, *len).build()
+      Connect::new(fd.as_raw_fd(), (*addr) as *const libc::sockaddr, *len)
+        .build()
     }
-    Op::Bind { fd, addr } => {
-      // For bind, we need to convert to the right format
-      // Use socket directly in blocking mode for now
-      // This is a limitation - io_uring doesn't have a native bind opcode
-      // We'll fall back to blocking
-      operation::Nop::new().build()
+    Op::Bind { fd, addr, addrlen } => {
+      Bind::new(fd.as_raw_fd(), (*addr) as *const libc::sockaddr, *addrlen)
+        .build()
     }
-    Op::Listen { fd, backlog } => operation::Nop::new().build(),
+    Op::Listen { fd, backlog } => Listen::new(fd.as_raw_fd(), *backlog).build(),
     Op::Shutdown { fd, how } => Shutdown::new(fd.as_raw_fd(), *how).build(),
-    Op::Socket { domain, ty, proto } => operation::Nop::new().build(),
+    Op::Socket { domain, ty, proto } => {
+      Socket::new(*domain, *ty, *proto).build()
+    }
     Op::OpenAt { dir_fd, path, flags } => {
-      OpenAt::new(dir_fd.as_raw_fd(), *path, *flags, 0).build()
+      OpenAt::new(dir_fd.as_raw_fd(), *path).flags(*flags).build()
     }
-    Op::Close { fd } => Close::new(fd.as_raw_fd()).build(),
+    Op::Close { fd } => Close::new(*fd).build(),
     Op::Fsync { fd } => Fsync::new(fd.as_raw_fd()).build(),
-    Op::Truncate { fd, size } => {
-      Fallocate::new(fd.as_raw_fd(), *size as u64).build()
-    }
-    Op::LinkAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
-      LinkAt::new(*old_dir_fd, *old_path, *new_dir_fd, *new_path).build()
-    }
+    // TODO: IORING_OP_FTRUNCATE (kernel 6.9+) returns success but doesn't
+    // actually truncate in some tests. Needs investigation - might be SQE
+    // setup issue or kernel-specific behavior.
+    Op::Truncate { fd, size } => Ftruncate::new(fd.as_raw_fd(), *size).build(),
+    Op::LinkAt { old_dir_fd, old_path, new_dir_fd, new_path } => LinkAt::new(
+      old_dir_fd.as_raw_fd(),
+      *old_path,
+      new_dir_fd.as_raw_fd(),
+      *new_path,
+    )
+    .build(),
     Op::SymlinkAt { target, linkpath, dir_fd } => {
-      SymlinkAt::new(*dir_fd, *target, *linkpath).build()
+      SymlinkAt::new(dir_fd.as_raw_fd(), *target, *linkpath).build()
     }
     #[cfg(target_os = "linux")]
     Op::Tee { fd_in, fd_out, size } => {
-      Tee::new(fd_in.as_raw_fd(), fd_out.as_raw_fd(), *size as u32).build()
+      Tee::new(fd_in.as_raw_fd(), fd_out.as_raw_fd(), *size).build()
     }
-    Op::Timeout { duration, .. } => {
-      let ts = libc::timespec {
-        tv_sec: duration.as_secs() as i64,
-        tv_nsec: duration.subsec_nanos() as i64,
-      };
-      Timeout::new(&ts, 1, Default::default()).build()
+    Op::Timeout { timespec, .. } => {
+      // __kernel_timespec has same layout as libc::timespec
+      // timespec is already a pointer to data in the boxed TypedOp
+      Timeout::new(*timespec as *const _).build()
     }
   }
 }
@@ -128,8 +115,7 @@ fn create_io_uring_entry(op: &mut Op) -> Entry {
 /// ```
 #[derive(Default)]
 pub struct IoUring {
-  sq: Option<SubmissionQueue>,
-  cq: Option<CompletionQueue>,
+  ring: Option<LioUring>,
   /// Reusable buffer for completed operations (avoids allocation per poll/wait).
   completed: Vec<OpCompleted>,
 }
@@ -143,13 +129,8 @@ impl IoUring {
   }
 
   #[inline]
-  fn sq(&mut self) -> &mut SubmissionQueue {
-    self.sq.as_mut().expect("IoUring not initialized - call init() first")
-  }
-
-  #[inline]
-  fn cq(&mut self) -> &mut CompletionQueue {
-    self.cq.as_mut().expect("IoUring not initialized - call init() first")
+  fn ring(&mut self) -> &mut LioUring {
+    self.ring.as_mut().expect("IoUring not initialized - call init() first")
   }
 
   /// Poll for completions with optional timeout.
@@ -162,19 +143,20 @@ impl IoUring {
     timeout: Option<Duration>,
   ) -> io::Result<&[OpCompleted]> {
     self.completed.clear();
-    let cq = self.cq();
+
+    let ring = self.ring.as_mut().expect("IoUring not initialized");
 
     match timeout {
       None => {
         // Block indefinitely for first completion
-        let first = cq.next()?;
+        let first = ring.wait()?;
         self
           .completed
           .push(OpCompleted::new(first.user_data(), first.result() as isize));
       }
       Some(d) if d.is_zero() => {
         // Non-blocking: check if anything is ready
-        match cq.try_next()? {
+        match ring.try_wait()? {
           Some(op) => {
             self
               .completed
@@ -185,7 +167,7 @@ impl IoUring {
       }
       Some(d) => {
         // Wait with timeout
-        match cq.next_timeout(d)? {
+        match ring.wait_timeout(d)? {
           Some(first) => {
             self.completed.push(OpCompleted::new(
               first.user_data(),
@@ -198,7 +180,8 @@ impl IoUring {
     }
 
     // Drain any additional completions (non-blocking)
-    while let Ok(Some(op)) = cq.try_next() {
+    let ring = self.ring.as_mut().expect("IoUring not initialized");
+    while let Ok(Some(op)) = ring.try_wait() {
       self
         .completed
         .push(OpCompleted::new(op.user_data(), op.result() as isize));
@@ -210,19 +193,18 @@ impl IoUring {
 
 impl IoBackend for IoUring {
   fn init(&mut self, cap: usize) -> io::Result<()> {
-    let (sq, cq) = lio_uring::with_capacity(cap as u32)?;
-    self.sq = Some(sq);
-    self.cq = Some(cq);
+    let ring = LioUring::new(cap as u32)?;
+    self.ring = Some(ring);
     // Pre-allocate completions buffer (reasonable batch size)
     self.completed = Vec::with_capacity(cap.min(256));
     Ok(())
   }
 
-  fn push(&mut self, id: u64, mut op: Op) -> io::Result<()> {
-    let entry = create_io_uring_entry(&mut op);
+  fn push(&mut self, id: u64, op: Op) -> io::Result<()> {
+    let entry = create_io_uring_entry(&op);
 
     // Push to submission queue without syscall
-    unsafe { self.sq().push(entry, id) }.map_err(|_| {
+    unsafe { self.ring().push(entry, id) }.map_err(|_| {
       io::Error::new(io::ErrorKind::WouldBlock, "submission queue full")
     })?;
 
@@ -231,7 +213,7 @@ impl IoBackend for IoUring {
 
   fn flush(&mut self) -> io::Result<usize> {
     // Submit all queued operations with a single syscall
-    let submitted = self.sq().submit()?;
+    let submitted = self.ring().submit()?;
     Ok(submitted)
   }
 

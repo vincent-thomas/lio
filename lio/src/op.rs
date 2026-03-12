@@ -7,22 +7,41 @@ use std::ffi::c_char;
 use std::ptr::NonNull;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::fd::RawFd;
+
 use crate::api::resource::Resource;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ErasedBuffer - Type-erased buffer storage
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Non-owning raw buffer pointer for use in [`OpBuf`] by the polling backend.
+///
+/// The actual buffer is owned by the typed op (e.g., `Send<Vec<u8>>`). This struct
+/// holds only a pointer + length so the backend can call the syscall without taking
+/// ownership, leaving the buffer available for `extract_result`.
+#[derive(Clone, Copy)]
+pub struct RawBuf {
+  pub ptr: *mut u8,
+  pub len: usize,
+}
+// SAFETY: The pointed-to data is owned by a TypedOp which is Send + Sync.
+// We only use this pointer from the thread that scheduled the operation.
+unsafe impl Send for RawBuf {}
+// SAFETY: Same as Send - we only access through the owning TypedOp.
+unsafe impl Sync for RawBuf {}
+
 /// Type-erased buffer storage with proper cleanup.
 ///
 /// This allows storing buffers of any type without boxing the entire operation.
 /// The buffer is boxed once, but we avoid the `Box<dyn Operation>` indirection.
-pub struct ErasedBuffer {
+pub struct OpBuf {
   ptr: Option<NonNull<()>>,
   drop_fn: unsafe fn(*mut ()),
 }
 
-impl ErasedBuffer {
+impl OpBuf {
   /// Creates a new erased buffer from a value.
   pub fn new<T: Send + 'static>(value: T) -> Self {
     let boxed = Box::new(value);
@@ -34,7 +53,23 @@ impl ErasedBuffer {
 
   /// Used in [Self::new].
   unsafe fn drop_erased<T>(ptr: *mut ()) {
+    // SAFETY: ptr was created from Box::into_raw in new(), and T matches the original type.
     drop(unsafe { Box::from_raw(ptr as *mut T) });
+  }
+
+  /// Peeks at the contained value by copying it (without consuming/dropping).
+  ///
+  /// # Safety
+  /// Caller must ensure T matches the original type and T: Copy.
+  pub unsafe fn peek<T: Copy>(&self) -> T {
+    let ptr = self
+      .ptr
+      .as_ref()
+      .expect("ErasedBuffer already taken")
+      .as_ptr()
+      .cast::<T>();
+    // SAFETY: Caller guarantees type matches and T is Copy
+    unsafe { *ptr }
   }
 
   /// Takes the buffer out, consuming self.
@@ -50,7 +85,7 @@ impl ErasedBuffer {
   }
 }
 
-impl Drop for ErasedBuffer {
+impl Drop for OpBuf {
   fn drop(&mut self) {
     if let Some(ptr) = self.ptr.take() {
       // SAFETY: drop_fn matches the original type
@@ -60,9 +95,9 @@ impl Drop for ErasedBuffer {
 }
 
 // SAFETY: The buffer contents are Send (enforced by new())
-unsafe impl Send for ErasedBuffer {}
+unsafe impl Send for OpBuf {}
 // SAFETY: We only access through &mut self or by consuming
-unsafe impl Sync for ErasedBuffer {}
+unsafe impl Sync for OpBuf {}
 
 /// All I/O operations as pure data.
 ///
@@ -74,31 +109,31 @@ pub enum Op {
   // ═══════════════════════════════════════════════════════════════════════════════
   Read {
     fd: Resource,
-    buffer: ErasedBuffer,
+    buffer: OpBuf,
   },
   Write {
     fd: Resource,
-    buffer: ErasedBuffer,
+    buffer: OpBuf,
   },
   ReadAt {
     fd: Resource,
     offset: i64,
-    buffer: ErasedBuffer,
+    buffer: OpBuf,
   },
   WriteAt {
     fd: Resource,
     offset: i64,
-    buffer: ErasedBuffer,
+    buffer: OpBuf,
   },
   Send {
     fd: Resource,
     flags: i32,
-    buffer: ErasedBuffer,
+    buffer: OpBuf,
   },
   Recv {
     fd: Resource,
     flags: i32,
-    buffer: ErasedBuffer,
+    buffer: OpBuf,
   },
 
   // ═══════════════════════════════════════════════════════════════════════════════
@@ -111,14 +146,15 @@ pub enum Op {
   },
   Connect {
     fd: Resource,
-    addr: libc::sockaddr_storage,
+    addr: *const libc::sockaddr_storage,
     len: libc::socklen_t,
     /// Tracks whether connect() has been called (for EISCONN handling)
     connect_called: bool,
   },
   Bind {
     fd: Resource,
-    addr: libc::sockaddr_storage,
+    addr: *const libc::sockaddr_storage,
+    addrlen: libc::socklen_t,
   },
   Listen {
     fd: Resource,
@@ -143,7 +179,15 @@ pub enum Op {
     flags: i32,
   },
   Close {
-    fd: Resource,
+    /// Raw file descriptor - we do not hold a Resource here to avoid
+    /// double-close (the op itself performs the close syscall).
+    #[cfg(unix)]
+    fd: RawFd,
+    #[cfg(windows)]
+    handle: std::os::windows::io::RawHandle,
+    /// Whether this is a socket (use closesocket()) or a file handle (use CloseHandle())
+    #[cfg(windows)]
+    is_socket: bool,
   },
   Fsync {
     fd: Resource,
@@ -182,7 +226,7 @@ pub enum Op {
     #[cfg(target_os = "linux")]
     timer_fd: Resource,
     #[cfg(target_os = "linux")]
-    timespec: libc::timespec,
+    timespec: *const libc::timespec,
   },
   Nop,
 }
@@ -191,4 +235,5 @@ pub enum Op {
 // which is stored alongside Op in StoredOp. The pointers are valid for the
 // lifetime of the operation.
 unsafe impl Send for Op {}
+// SAFETY: Same as Send - pointers are valid for the operation's lifetime.
 unsafe impl Sync for Op {}

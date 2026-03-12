@@ -28,54 +28,38 @@
 //! on the last reference's drop.
 //!
 //! ### Example
-//! All operations return a [`Io<'a, T>`](crate::api::io::Io) which represents an in-flight I/O operation:
+//! All operations return a [`Io<T>`](crate::api::io::Io) which represents an in-flight I/O operation:
 //!
-//! ```rust
-//! use lio::api::{self, resource::Resource};
+//! ```
+//! use lio::{Lio, api};
+//! use std::os::fd::FromRawFd;
 //!
-//! lio::init();
-//!
-//! let resource: Resource = 1;
+//! let mut lio = Lio::new(64).unwrap();
+//! // stdout (fd 1) is always valid
+//! let resource = unsafe { lio::api::resource::Resource::from_raw_fd(1) };
 //! let data = b"Hello\n".to_vec();
 //!
-//! // 1. Async/await (requires async runtime, lio is runtime-independent)
-//! async fn async_example(res: Resource, data: Vec<u8>) {
-//!     let (result, buf) = api::write(res, data, 0).await;
-//!     println!("Wrote {} bytes", result.unwrap());
-//! }
-//!
-//! // 2. Blocking call
-//! let (result, buf) = api::write(resource, data.clone(), 0).wait();
-//!
-//! // 3. Channel-based
-//! let receiver = api::write(resource, data.clone(), 0).send();
-//! let (result, buf) = receiver.recv();
-//!
-//! // 4. Callback-based
-//! api::write(resource, data, 0).when_done(|(result, buf)| {
-//!     println!("Operation completed: {:?}", result);
+//! // Callback-based
+//! api::write(&resource, data).with_lio(&mut lio).when_done(|(result, buf)| {
+//!     // result: io::Result<i32>, buf: the original Vec
 //! });
-//!
-//! lio::exit();
+//! lio.try_run().unwrap();
 //! ```
 
 #[macro_use]
 mod macros;
 pub mod buf;
-// #[cfg(feature = "unstable_ffi")]
-// pub mod ffi;
+#[cfg(feature = "unstable_ffi")]
+pub mod ffi;
 mod net_utils;
 
-#[cfg(feature = "high")]
 pub mod net;
 
-#[cfg(feature = "high")]
 pub mod fs;
 
 pub use buf::BufResult;
 
 pub mod op;
-pub mod operation;
 pub mod typed_op;
 
 #[path = "registration/registration.rs"]
@@ -90,4 +74,4 @@ pub mod test_utils;
 
 // Re-export core types
 mod lio;
-pub use lio::Lio;
+pub use lio::{Lio, install_global, uninstall_global};

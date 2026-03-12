@@ -35,13 +35,14 @@ use crate::op::Op;
 ///     }
 /// }
 /// ```
+#[allow(clippy::wrong_self_convention)]
 pub trait TypedOp: Send + Sync + 'static {
   /// The typed result produced by this operation.
   type Result: Send + Sync;
 
   /// Convert this operation into the type-erased Op enum.
   ///
-  /// This method consumes the operation and converts it to the unified
+  /// This method converts the operation to the unified
   /// representation used by backends for execution.
   fn into_op(&mut self) -> Op;
 

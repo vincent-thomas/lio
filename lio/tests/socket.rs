@@ -84,7 +84,7 @@ fn test_socket_tcp_ipv4() {
       &mut len,
     );
     assert_eq!(sock_type, libc::SOCK_STREAM);
-    libc::close(sock.as_fd().as_raw_fd());
+    // sock is automatically closed when dropped
   }
 }
 
@@ -112,7 +112,7 @@ fn test_socket_tcp_ipv6() {
       &mut len,
     );
     assert_eq!(sock_type, libc::SOCK_STREAM);
-    libc::close(sock.as_fd().as_raw_fd());
+    // sock is automatically closed when dropped
   }
 }
 
@@ -140,7 +140,7 @@ fn test_socket_udp_ipv4() {
       &mut len,
     );
     assert_eq!(sock_type, libc::SOCK_DGRAM);
-    libc::close(sock.as_fd().as_raw_fd());
+    // sock is automatically closed when dropped
   }
 }
 
@@ -167,7 +167,7 @@ fn test_socket_udp_ipv6() {
       &mut len,
     );
     assert_eq!(sock_type, libc::SOCK_DGRAM);
-    libc::close(sock.as_fd().as_raw_fd());
+    // sock is automatically closed when dropped
   }
 }
 
@@ -182,10 +182,7 @@ fn test_socket_without_protocol() {
   let sock = poll_until_recv(&mut lio, &receiver)
     .expect("Failed to create socket without explicit protocol");
   assert!(sock.as_fd().as_raw_fd() >= 0, "Socket fd should be valid");
-
-  unsafe {
-    libc::close(sock.as_fd().as_raw_fd());
-  }
+  // sock is automatically closed when dropped
 }
 
 #[test]
@@ -210,7 +207,7 @@ fn test_socket_unix_stream() {
       &mut len,
     );
     assert_eq!(sock_type, libc::SOCK_STREAM);
-    libc::close(socket.as_fd().as_raw_fd());
+    // socket is automatically closed when dropped
   }
 }
 
@@ -236,7 +233,7 @@ fn test_socket_unix_dgram() {
       &mut len,
     );
     assert_eq!(sock_type, libc::SOCK_DGRAM);
-    libc::close(sock.as_fd().as_raw_fd());
+    // sock is automatically closed when dropped
   }
 }
 
@@ -266,13 +263,7 @@ fn test_socket_multiple() {
   assert_ne!(sock1.as_fd().as_raw_fd(), sock2.as_fd().as_raw_fd());
   assert_ne!(sock1.as_fd().as_raw_fd(), sock3.as_fd().as_raw_fd());
   assert_ne!(sock2.as_fd().as_raw_fd(), sock3.as_fd().as_raw_fd());
-
-  // Cleanup
-  unsafe {
-    libc::close(sock1.as_fd().as_raw_fd());
-    libc::close(sock2.as_fd().as_raw_fd());
-    libc::close(sock3.as_fd().as_raw_fd());
-  }
+  // sockets are automatically closed when dropped
 }
 
 #[test]
@@ -304,9 +295,7 @@ fn test_socket_concurrent() {
     let sock =
       poll_until_recv(&mut lio, &receiver).expect("Failed to create socket");
     assert!(sock.as_fd().as_raw_fd() >= 0);
-    unsafe {
-      libc::close(sock.as_fd().as_raw_fd());
-    }
+    // sock is automatically closed when dropped at end of loop iteration
   }
 }
 
@@ -344,8 +333,7 @@ fn test_socket_options_after_creation() {
       &mut len,
     );
     assert_ne!(get_val, 0);
-
-    libc::close(sock.as_fd().as_raw_fd());
+    // sock is automatically closed when dropped
   }
 }
 
@@ -370,7 +358,6 @@ fn test_socket_nonblocking() {
     // Verify non-blocking mode is set
     let new_flags = libc::fcntl(raw_fd, libc::F_GETFL, 0);
     assert!(new_flags & libc::O_NONBLOCK != 0);
-
-    libc::close(raw_fd);
+    // sock is automatically closed when dropped
   }
 }

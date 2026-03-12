@@ -1,14 +1,55 @@
 use crate::{
   backends::{IoBackend, OpStore},
   op::Op,
-  registration::{Registration, notifier::Notifier},
+  registration::Registration,
 };
 
-use std::{io, task::Waker, time::Duration};
+use std::{cell::RefCell, io, rc::Rc, task::Waker, time::Duration};
 
-pub struct Lio {
+thread_local! {
+  static GLOBAL_LIO: RefCell<Option<Lio>> = const { RefCell::new(None) };
+}
+
+/// Installs a global Lio instance for the current thread.
+///
+/// After calling this, operations can be used without explicitly calling `.with_lio()`.
+/// This is useful for thread-per-core designs where each thread has its own Lio instance.
+///
+/// # Panics
+///
+/// Panics if a global Lio is already installed on this thread.
+pub fn install_global(lio: Lio) {
+  GLOBAL_LIO.with(|global| {
+    let mut global = global.borrow_mut();
+    if global.is_some() {
+      panic!("Global Lio already installed on this thread. Call uninstall_global() first.");
+    }
+    *global = Some(lio);
+  });
+}
+
+/// Uninstalls the global Lio instance for the current thread.
+///
+/// Returns the previously installed Lio, or `None` if no global was installed.
+pub fn uninstall_global() -> Option<Lio> {
+  GLOBAL_LIO.with(|global| global.borrow_mut().take())
+}
+
+/// Returns a clone of the global Lio instance for the current thread.
+///
+/// Returns `None` if no global Lio has been installed.
+pub(crate) fn get_global() -> Option<Lio> {
+  GLOBAL_LIO.with(|global| global.borrow().clone())
+}
+
+struct LioInner {
   store: OpStore,
   io: Box<dyn IoBackend>,
+}
+
+#[derive(Clone)]
+pub struct Lio {
+  inner: Rc<RefCell<LioInner>>,
 }
 
 #[non_exhaustive]
@@ -26,8 +67,10 @@ impl Lio {
   ///
   /// # Example
   ///
-  /// ```ignore
-  /// let mut lio = Lio::new(1024)?;
+  /// ```
+  /// use lio::Lio;
+  ///
+  /// let mut lio = Lio::new(1024).unwrap();
   /// ```
   pub fn new(cap: usize) -> io::Result<Self> {
     #[cfg(any(
@@ -60,10 +103,11 @@ impl Lio {
   ///
   /// # Example
   ///
-  /// ```ignore
-  /// use lio::backends::impls::pollingv2::Poller;
+  /// ```
+  /// use lio::Lio;
+  /// use lio::backends::pollingv2::Poller;
   ///
-  /// let mut lio = Lio::new_with_backend(Poller::new(), 1024)?;
+  /// let mut lio = Lio::new_with_backend(Poller::new(), 1024).unwrap();
   /// ```
   pub fn new_with_backend<D>(mut backend: D, cap: usize) -> io::Result<Self>
   where
@@ -71,21 +115,24 @@ impl Lio {
   {
     backend.init(cap)?;
 
-    Ok(Self { io: Box::new(backend), store: OpStore::with_capacity(cap) })
+    let inner =
+      LioInner { io: Box::new(backend), store: OpStore::with_capacity(cap) };
+    Ok(Self { inner: Rc::new(RefCell::new(inner)) })
   }
 
   pub(crate) fn schedule(
-    &mut self,
+    &self,
     op: Op,
-    notifier: Notifier,
+    notifier: Registration,
   ) -> io::Result<u64> {
+    let mut inner = self.inner.borrow_mut();
     // Inserting first because of a stable pointer to push is required.
-    let id = self.store.insert(Registration::new(notifier));
+    let id = inner.store.insert(notifier);
 
-    match self.io.push(id, op) {
+    match inner.io.push(id, op) {
       Ok(()) => Ok(id),
       Err(err) => {
-        assert!(self.store.remove(id));
+        assert!(inner.store.remove(id));
         Err(err)
       }
     }
@@ -94,12 +141,12 @@ impl Lio {
   /// Non-blocking poll for completed operations.
   ///
   /// Returns immediately, processing any completions that are ready.
-  pub fn try_run(&mut self) -> io::Result<usize> {
+  pub fn try_run(&self) -> io::Result<usize> {
     self.run_inner(Some(Duration::ZERO))
   }
 
   /// Block until at least one operation completes.
-  pub fn run(&mut self) -> io::Result<usize> {
+  pub fn run(&self) -> io::Result<usize> {
     self.run_inner(None)
   }
 
@@ -108,41 +155,62 @@ impl Lio {
   /// Waits for at least one operation to complete or until the timeout expires,
   /// whichever comes first. Returns `Ok(true)` if completions were processed,
   /// `Ok(false)` if the timeout expired with no completions.
-  pub fn run_timeout(&mut self, timeout: Duration) -> io::Result<usize> {
+  pub fn run_timeout(&self, timeout: Duration) -> io::Result<usize> {
     self.run_inner(Some(timeout))
   }
 
-  fn run_inner(&mut self, timeout: Option<Duration>) -> io::Result<usize> {
-    self.io.flush()?;
-    let completed = self.io.wait_timeout(timeout)?;
+  fn run_inner(&self, timeout: Option<Duration>) -> io::Result<usize> {
+    let mut inner = self.inner.borrow_mut();
+    inner.io.flush()?;
 
-    let len_completed = completed.len();
+    // Copy completion data to release borrow on inner.io
+    let completed: Vec<_> = inner
+      .io
+      .wait_timeout(timeout)?
+      .iter()
+      .map(|c| (c.op_id, c.result))
+      .collect();
 
-    for completed_op in completed {
-      let Some(op) = self.store.get_mut(completed_op.op_id) else {
+    // Collect IDs to remove (callbacks consume the result, wakers don't)
+    let mut to_remove = Vec::new();
+
+    for (op_id, result) in &completed {
+      let Some(op) = inner.store.get_mut(*op_id) else {
         panic!("lio bookkeeping bug: completed op doesn't exist in store.");
       };
-      op.set_done(completed_op.result);
+      op.set_done(*result);
+
+      // If the result was consumed (callback path), mark for removal.
+      // Waker path leaves result in place for check_done to consume.
+      if op.result_consumed() {
+        to_remove.push(*op_id);
+      }
     }
 
-    Ok(len_completed)
+    // Remove consumed entries
+    for id in to_remove {
+      inner.store.remove(id);
+    }
+
+    Ok(completed.len())
   }
 
-  pub(crate) fn check_done(&mut self, key: u64) -> Result<isize, Error> {
-    match self.store.get_mut(key) {
+  pub(crate) fn check_done(&self, key: u64) -> Result<isize, Error> {
+    let mut inner = self.inner.borrow_mut();
+    match inner.store.get_mut(key) {
       Some(entry) => {
-        let result =
-          entry.try_take_result().ok_or_else(|| Error::EntryNotCompleted)?;
-        assert!(self.store.remove(key));
+        let result = entry.try_take_result().ok_or(Error::EntryNotCompleted)?;
+        assert!(inner.store.remove(key));
         Ok(result)
       }
       None => Err(Error::EntryNotFound),
     }
   }
 
-  pub fn set_waker(&mut self, id: u64, waker: Waker) -> Option<()> {
-    let entry = self.store.get_mut(id)?;
-    entry.set_waker(waker);
-    Some(())
+  pub(crate) fn set_waker(&self, id: u64, waker: Waker) {
+    let mut inner = self.inner.borrow_mut();
+    if let Some(entry) = inner.store.get_mut(id) {
+      entry.set_waker(waker);
+    }
   }
 }

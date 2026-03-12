@@ -18,7 +18,7 @@ fn test_worker_start_stop() {
   loop {
     lio.try_run().unwrap();
     if let Ok((res, _buf)) = receiver.try_recv() {
-      dbg!(res);
+      res.unwrap();
       break;
     }
     std::thread::sleep(std::time::Duration::from_micros(100));

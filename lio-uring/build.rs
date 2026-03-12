@@ -1,6 +1,15 @@
-use std::{env, fs, path::PathBuf, process::Command};
-
 fn main() {
+  let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+  if target_os != "linux" {
+    // Skip build on non-Linux - the crate won't be usable but won't break workspace commands
+    return;
+  }
+
+  build_linux();
+}
+
+fn build_linux() {
+  use std::{env, fs, path::PathBuf, process::Command};
   // This is the directory where the `c` library is located.
   let libdir_path = PathBuf::from("liburing")
     // `rustc-link-search` requires an absolute path.
