@@ -622,3 +622,177 @@ impl LioUring {
     Ok(())
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // ==========================================================================
+  // Completion Tests (unit tests - no kernel needed)
+  // ==========================================================================
+
+  #[test]
+  fn test_completion_is_ok_positive() {
+    let c = Completion { user_data: 1, res: 0, flags: 0 };
+    assert!(c.is_ok());
+
+    let c = Completion { user_data: 1, res: 100, flags: 0 };
+    assert!(c.is_ok());
+  }
+
+  #[test]
+  fn test_completion_is_ok_negative() {
+    let c = Completion { user_data: 1, res: -1, flags: 0 };
+    assert!(!c.is_ok());
+
+    let c = Completion { user_data: 1, res: -libc::EBADF, flags: 0 };
+    assert!(!c.is_ok());
+  }
+
+  #[test]
+  fn test_completion_result() {
+    let c = Completion { user_data: 1, res: 42, flags: 0 };
+    assert_eq!(c.result(), 42);
+
+    let c = Completion { user_data: 1, res: -libc::EINVAL, flags: 0 };
+    assert_eq!(c.result(), -libc::EINVAL);
+  }
+
+  #[test]
+  fn test_completion_user_data() {
+    let c = Completion { user_data: 0xDEADBEEF, res: 0, flags: 0 };
+    assert_eq!(c.user_data(), 0xDEADBEEF);
+
+    let c = Completion { user_data: u64::MAX, res: 0, flags: 0 };
+    assert_eq!(c.user_data(), u64::MAX);
+  }
+
+  #[test]
+  fn test_completion_has_more() {
+    let c = Completion { user_data: 1, res: 0, flags: 0 };
+    assert!(!c.has_more());
+
+    let c =
+      Completion { user_data: 1, res: 0, flags: bindings::IORING_CQE_F_MORE };
+    assert!(c.has_more());
+  }
+
+  #[test]
+  fn test_completion_buffer_id_none() {
+    let c = Completion { user_data: 1, res: 0, flags: 0 };
+    assert_eq!(c.buffer_id(), None);
+  }
+
+  #[test]
+  fn test_completion_buffer_id_some() {
+    let buffer_id: u16 = 42;
+    let flags = bindings::IORING_CQE_F_BUFFER
+      | ((buffer_id as u32) << bindings::IORING_CQE_BUFFER_SHIFT);
+    let c = Completion { user_data: 1, res: 0, flags };
+    assert_eq!(c.buffer_id(), Some(42));
+  }
+
+  // ==========================================================================
+  // SqeFlags Tests (unit tests - no kernel needed)
+  // ==========================================================================
+
+  #[test]
+  fn test_sqe_flags_none_is_zero() {
+    assert_eq!(SqeFlags::NONE.bits(), 0);
+  }
+
+  #[test]
+  fn test_sqe_flags_individual_values() {
+    assert_ne!(SqeFlags::FIXED_FILE.bits(), 0);
+    assert_ne!(SqeFlags::ASYNC.bits(), 0);
+    assert_ne!(SqeFlags::IO_LINK.bits(), 0);
+    assert_ne!(SqeFlags::IO_DRAIN.bits(), 0);
+    assert_ne!(SqeFlags::IO_HARDLINK.bits(), 0);
+    assert_ne!(SqeFlags::BUFFER_SELECT.bits(), 0);
+    assert_ne!(SqeFlags::CQE_SKIP_SUCCESS.bits(), 0);
+  }
+
+  #[test]
+  fn test_sqe_flags_or_combines() {
+    let combined = SqeFlags::ASYNC.or(SqeFlags::IO_LINK);
+    assert_eq!(
+      combined.bits(),
+      SqeFlags::ASYNC.bits() | SqeFlags::IO_LINK.bits()
+    );
+  }
+
+  #[test]
+  fn test_sqe_flags_bitor_operator() {
+    let combined = SqeFlags::ASYNC | SqeFlags::IO_DRAIN;
+    assert_eq!(
+      combined.bits(),
+      SqeFlags::ASYNC.bits() | SqeFlags::IO_DRAIN.bits()
+    );
+  }
+
+  #[test]
+  fn test_sqe_flags_contains_true() {
+    let flags = SqeFlags::ASYNC | SqeFlags::IO_LINK;
+    assert!(flags.contains(SqeFlags::ASYNC));
+    assert!(flags.contains(SqeFlags::IO_LINK));
+  }
+
+  #[test]
+  fn test_sqe_flags_contains_false() {
+    let flags = SqeFlags::ASYNC | SqeFlags::IO_LINK;
+    assert!(!flags.contains(SqeFlags::FIXED_FILE));
+    assert!(!flags.contains(SqeFlags::IO_DRAIN));
+  }
+
+  #[test]
+  fn test_sqe_flags_contains_none() {
+    let flags = SqeFlags::ASYNC;
+    assert!(flags.contains(SqeFlags::NONE)); // NONE (0) is always contained
+  }
+
+  #[test]
+  fn test_sqe_flags_multiple_or() {
+    let flags = SqeFlags::ASYNC
+      | SqeFlags::IO_LINK
+      | SqeFlags::FIXED_FILE
+      | SqeFlags::IO_DRAIN;
+    assert!(flags.contains(SqeFlags::ASYNC));
+    assert!(flags.contains(SqeFlags::IO_LINK));
+    assert!(flags.contains(SqeFlags::FIXED_FILE));
+    assert!(flags.contains(SqeFlags::IO_DRAIN));
+  }
+
+  // ==========================================================================
+  // Params Tests (unit tests - no kernel needed)
+  // ==========================================================================
+
+  #[test]
+  fn test_params_default() {
+    let params = Params::default();
+    assert_eq!(params.sq_entries, 128);
+    assert_eq!(params.flags, 0);
+    assert_eq!(params.sq_thread_cpu, 0);
+    assert_eq!(params.sq_thread_idle, 0);
+  }
+
+  #[test]
+  fn test_params_sqpoll() {
+    let params = Params::default().sqpoll(1000);
+    assert!((params.flags & bindings::IORING_SETUP_SQPOLL) != 0);
+    assert_eq!(params.sq_thread_idle, 1000);
+  }
+
+  #[test]
+  fn test_params_iopoll() {
+    let params = Params::default().iopoll();
+    assert!((params.flags & bindings::IORING_SETUP_IOPOLL) != 0);
+  }
+
+  #[test]
+  fn test_params_chained() {
+    let params = Params::default().sqpoll(500).iopoll();
+    assert!((params.flags & bindings::IORING_SETUP_SQPOLL) != 0);
+    assert!((params.flags & bindings::IORING_SETUP_IOPOLL) != 0);
+    assert_eq!(params.sq_thread_idle, 500);
+  }
+}
