@@ -282,6 +282,198 @@ impl std::os::windows::io::FromRawHandle for Resource {
 }
 
 impl Resource {
+  /// Returns a `Resource` for standard output (stdout).
+  ///
+  /// This creates a duplicate of the stdout file descriptor, so the returned
+  /// `Resource` can be safely dropped without affecting the actual stdout.
+  ///
+  /// # Panics
+  ///
+  /// Panics if duplicating the file descriptor fails.
+  ///
+  /// # Examples
+  ///
+  /// ```rust,no_run
+  /// use lio::api::resource::Resource;
+  ///
+  /// let stdout = Resource::stdout();
+  /// // Use stdout for async I/O...
+  /// ```
+  #[cfg(unix)]
+  pub fn stdout() -> Self {
+    // SAFETY: dup returns a new valid fd if successful
+    let fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    assert!(fd >= 0, "Failed to dup stdout");
+    // SAFETY: fd is valid, just returned from dup
+    unsafe { <Self as std::os::fd::FromRawFd>::from_raw_fd(fd) }
+  }
+
+  /// Returns a `Resource` for standard output (stdout).
+  #[cfg(windows)]
+  pub fn stdout() -> Self {
+    use windows_sys::Win32::Foundation::{
+      DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // SAFETY: GetStdHandle is safe to call with valid constants
+    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    assert!(handle != INVALID_HANDLE_VALUE, "Failed to get stdout handle");
+
+    let mut dup_handle: HANDLE = 0;
+    let current_process = unsafe { GetCurrentProcess() };
+
+    // SAFETY: All handles are valid, dup_handle is a valid out pointer
+    let result = unsafe {
+      DuplicateHandle(
+        current_process,
+        handle,
+        current_process,
+        &mut dup_handle,
+        0,
+        0, // bInheritHandle = FALSE
+        DUPLICATE_SAME_ACCESS,
+      )
+    };
+    assert!(result != 0, "Failed to duplicate stdout handle");
+
+    // SAFETY: dup_handle is valid, just returned from DuplicateHandle
+    unsafe {
+      <Self as std::os::windows::io::FromRawHandle>::from_raw_handle(
+        dup_handle as *mut std::ffi::c_void,
+      )
+    }
+  }
+
+  /// Returns a `Resource` for standard error (stderr).
+  ///
+  /// This creates a duplicate of the stderr file descriptor, so the returned
+  /// `Resource` can be safely dropped without affecting the actual stderr.
+  ///
+  /// # Panics
+  ///
+  /// Panics if duplicating the file descriptor fails.
+  ///
+  /// # Examples
+  ///
+  /// ```rust,no_run
+  /// use lio::api::resource::Resource;
+  ///
+  /// let stderr = Resource::stderr();
+  /// // Use stderr for async I/O...
+  /// ```
+  #[cfg(unix)]
+  pub fn stderr() -> Self {
+    // SAFETY: dup returns a new valid fd if successful
+    let fd = unsafe { libc::dup(libc::STDERR_FILENO) };
+    assert!(fd >= 0, "Failed to dup stderr");
+    // SAFETY: fd is valid, just returned from dup
+    unsafe { <Self as std::os::fd::FromRawFd>::from_raw_fd(fd) }
+  }
+
+  /// Returns a `Resource` for standard error (stderr).
+  #[cfg(windows)]
+  pub fn stderr() -> Self {
+    use windows_sys::Win32::Foundation::{
+      DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // SAFETY: GetStdHandle is safe to call with valid constants
+    let handle = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    assert!(handle != INVALID_HANDLE_VALUE, "Failed to get stderr handle");
+
+    let mut dup_handle: HANDLE = 0;
+    let current_process = unsafe { GetCurrentProcess() };
+
+    // SAFETY: All handles are valid, dup_handle is a valid out pointer
+    let result = unsafe {
+      DuplicateHandle(
+        current_process,
+        handle,
+        current_process,
+        &mut dup_handle,
+        0,
+        0, // bInheritHandle = FALSE
+        DUPLICATE_SAME_ACCESS,
+      )
+    };
+    assert!(result != 0, "Failed to duplicate stderr handle");
+
+    // SAFETY: dup_handle is valid, just returned from DuplicateHandle
+    unsafe {
+      <Self as std::os::windows::io::FromRawHandle>::from_raw_handle(
+        dup_handle as *mut std::ffi::c_void,
+      )
+    }
+  }
+
+  /// Returns a `Resource` for standard input (stdin).
+  ///
+  /// This creates a duplicate of the stdin file descriptor, so the returned
+  /// `Resource` can be safely dropped without affecting the actual stdin.
+  ///
+  /// # Panics
+  ///
+  /// Panics if duplicating the file descriptor fails.
+  ///
+  /// # Examples
+  ///
+  /// ```rust,no_run
+  /// use lio::api::resource::Resource;
+  ///
+  /// let stdin = Resource::stdin();
+  /// // Use stdin for async I/O...
+  /// ```
+  #[cfg(unix)]
+  pub fn stdin() -> Self {
+    // SAFETY: dup returns a new valid fd if successful
+    let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
+    assert!(fd >= 0, "Failed to dup stdin");
+    // SAFETY: fd is valid, just returned from dup
+    unsafe { <Self as std::os::fd::FromRawFd>::from_raw_fd(fd) }
+  }
+
+  /// Returns a `Resource` for standard input (stdin).
+  #[cfg(windows)]
+  pub fn stdin() -> Self {
+    use windows_sys::Win32::Foundation::{
+      DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // SAFETY: GetStdHandle is safe to call with valid constants
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    assert!(handle != INVALID_HANDLE_VALUE, "Failed to get stdin handle");
+
+    let mut dup_handle: HANDLE = 0;
+    let current_process = unsafe { GetCurrentProcess() };
+
+    // SAFETY: All handles are valid, dup_handle is a valid out pointer
+    let result = unsafe {
+      DuplicateHandle(
+        current_process,
+        handle,
+        current_process,
+        &mut dup_handle,
+        0,
+        0, // bInheritHandle = FALSE
+        DUPLICATE_SAME_ACCESS,
+      )
+    };
+    assert!(result != 0, "Failed to duplicate stdin handle");
+
+    // SAFETY: dup_handle is valid, just returned from DuplicateHandle
+    unsafe {
+      <Self as std::os::windows::io::FromRawHandle>::from_raw_handle(
+        dup_handle as *mut std::ffi::c_void,
+      )
+    }
+  }
+
   /// Returns the number of strong references to this resource.
   ///
   /// This counts how many `Resource` instances point to the same underlying
@@ -296,10 +488,9 @@ impl Resource {
   ///
   /// ```
   /// use lio::api::resource::Resource;
-  /// use std::os::fd::FromRawFd;
   ///
   /// // Create a resource (using stdout as an example)
-  /// let resource: Resource = unsafe { Resource::from_raw_fd(1) };
+  /// let resource = Resource::stdout();
   /// assert_eq!(resource.count(), 1);
   ///
   /// let clone = resource.clone();
@@ -308,7 +499,6 @@ impl Resource {
   ///
   /// drop(clone);
   /// assert_eq!(resource.count(), 1);
-  /// # std::mem::forget(resource); // Don't close stdout
   /// ```
   pub fn count(&self) -> usize {
     Arc::strong_count(&self.0)
@@ -329,9 +519,8 @@ impl Resource {
   ///
   /// ```
   /// use lio::api::resource::Resource;
-  /// use std::os::fd::FromRawFd;
   ///
-  /// let resource: Resource = unsafe { Resource::from_raw_fd(1) };
+  /// let resource = Resource::stdout();
   /// assert!(resource.will_close()); // Only reference
   ///
   /// let clone = resource.clone();
@@ -340,7 +529,6 @@ impl Resource {
   ///
   /// drop(clone);
   /// assert!(resource.will_close()); // Last reference again
-  /// # std::mem::forget(resource); // Don't close stdout
   /// ```
   pub fn will_close(&self) -> bool {
     self.count() == 1
@@ -350,5 +538,71 @@ impl Resource {
 impl std::fmt::Debug for Resource {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.write_str("Resource")
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_stdout() {
+    let stdout = Resource::stdout();
+    assert_eq!(stdout.count(), 1);
+
+    // Cloning should increase count
+    let clone = stdout.clone();
+    assert_eq!(stdout.count(), 2);
+    assert_eq!(clone.count(), 2);
+
+    // Dropping clone should decrease count
+    drop(clone);
+    assert_eq!(stdout.count(), 1);
+
+    // Should be safe to drop (it's a dup'd handle)
+    drop(stdout);
+  }
+
+  #[test]
+  fn test_stderr() {
+    let stderr = Resource::stderr();
+    assert_eq!(stderr.count(), 1);
+
+    let clone = stderr.clone();
+    assert_eq!(stderr.count(), 2);
+
+    drop(clone);
+    assert_eq!(stderr.count(), 1);
+
+    drop(stderr);
+  }
+
+  #[test]
+  fn test_stdin() {
+    let stdin = Resource::stdin();
+    assert_eq!(stdin.count(), 1);
+
+    let clone = stdin.clone();
+    assert_eq!(stdin.count(), 2);
+
+    drop(clone);
+    assert_eq!(stdin.count(), 1);
+
+    drop(stdin);
+  }
+
+  #[test]
+  fn test_std_streams_are_independent() {
+    // Each call should return an independent resource
+    let stdout1 = Resource::stdout();
+    let stdout2 = Resource::stdout();
+
+    // They should be separate resources (different Arc instances)
+    assert_eq!(stdout1.count(), 1);
+    assert_eq!(stdout2.count(), 1);
+
+    drop(stdout1);
+    // stdout2 should still be valid
+    assert_eq!(stdout2.count(), 1);
   }
 }

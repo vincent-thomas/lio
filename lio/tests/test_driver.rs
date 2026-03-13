@@ -1,6 +1,5 @@
 use lio::Lio;
 use lio::api::resource::Resource;
-use std::os::fd::FromRawFd;
 
 #[test]
 fn test_worker_start_stop() {
@@ -8,7 +7,7 @@ fn test_worker_start_stop() {
 
   let thing = "hello".as_bytes().to_vec();
 
-  let fd = unsafe { Resource::from_raw_fd(1) };
+  let fd = Resource::stdout();
 
   let (sender, receiver) = std::sync::mpsc::channel();
 
