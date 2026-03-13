@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.1 - 2026-03-13
+
+- try ([65b2e02](https://github.com/vincent-thomas/lio/commit/65b2e0246b3b62cc1ae3820b92021a271c614fb7))
+- nice ([a47197c](https://github.com/vincent-thomas/lio/commit/a47197c2174de7f920bdb7af7d09388e714b543e))
+- nice ([46d653d](https://github.com/vincent-thomas/lio/commit/46d653df018de252666fcf4804bf5bde398b88f2))
+
 ## v0.4.0 - 2026-03-13
 
 - nice ([fe878ec](https://github.com/vincent-thomas/lio/commit/fe878ecb0dfde7b796b3328efae20e42c270e4e6))
