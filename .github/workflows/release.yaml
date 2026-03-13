@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        continue-on-error: false
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: cargo-release-cache
+
+      - name: Install cargo-edit
+        run: nix develop -c cargo install cargo-edit
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Run tests before release
+        run: make test
+
+      - name: Bump version
+        run: |
+          nix develop -c cargo set-version -p lio --bump ${{ github.event.inputs.bump }}
+
+      - name: Get new version
+        id: version
+        run: |
+          VERSION=$(nix develop -c cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "lio") | .version')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Generate CHANGELOG
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          # Build new version section
+          {
+            echo "## v${{ steps.version.outputs.version }} - $(date +%Y-%m-%d)"
+            echo ""
+            if [ -n "$PREV_TAG" ]; then
+              git log --pretty=format:"- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" "$PREV_TAG"..HEAD
+            else
+              git log --pretty=format:"- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))"
+            fi
+            echo ""
+            echo ""
+          } > new_section.md
+
+          # Prepend to existing changelog or create new one
+          if [ -f CHANGELOG.md ]; then
+            # Remove header, prepend new section, add header back
+            tail -n +3 CHANGELOG.md > old_content.md
+            echo "# Changelog" > CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            cat new_section.md >> CHANGELOG.md
+            cat old_content.md >> CHANGELOG.md
+            rm old_content.md
+          else
+            echo "# Changelog" > CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            cat new_section.md >> CHANGELOG.md
+          fi
+
+          rm new_section.md
+          git add CHANGELOG.md
+
+      - name: Commit release
+        run: |
+          git add lio/Cargo.toml Cargo.lock
+          git commit -m "release: v${{ steps.version.outputs.version }}"
+
+      - name: Create tag
+        run: |
+          git tag "v${{ steps.version.outputs.version }}"
+
+      - name: Push
+        run: |
+          git push origin main --follow-tags
+
+      - name: Create GitHub Release
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" \
+            --generate-notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to crates.io
+        run: |
+          nix develop -c cargo publish -p lio
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
