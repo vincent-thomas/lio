@@ -32,6 +32,7 @@ impl OsPoller {
     // Create epoll instance with CLOEXEC
     let epoll_fd = {
       let fd = syscall!(epoll_create1(libc::EPOLL_CLOEXEC))?;
+      // SAFETY: fd is valid, just returned successfully from epoll_create1
       unsafe { OwnedFd::from_raw_fd(fd) }
     };
 
@@ -42,6 +43,7 @@ impl OsPoller {
     let timer_fd = {
       let fd: RawFd =
         syscall!(timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC))?;
+      // SAFETY: fd is valid, just returned successfully from timerfd_create
       unsafe { OwnedFd::from_raw_fd(fd) }
     };
 
@@ -166,9 +168,12 @@ impl ReadinessPoll for OsPoller {
   ) -> io::Result<usize> {
     /// `timespec` value that equals zero.
     #[cfg(not(target_os = "redox"))]
+    // SAFETY: All-zeros is a valid representation of timespec (all integer fields)
     const TS_ZERO: libc::timespec = unsafe {
       std::mem::transmute([0u8; std::mem::size_of::<libc::timespec>()])
     };
+    // SAFETY: All-zeros is a valid representation of itimerspec (contains timespec fields)
+    #[allow(dead_code)]
     const ITS_ZERO: libc::itimerspec = unsafe {
       std::mem::transmute([0u8; std::mem::size_of::<libc::itimerspec>()])
     };
@@ -187,7 +192,6 @@ impl ReadinessPoll for OsPoller {
             ts
           }
         },
-        ..unsafe { std::mem::zeroed() }
       };
 
       let mut result = MaybeUninit::<libc::itimerspec>::uninit();
@@ -310,12 +314,14 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
   let mut result = MaybeUninit::<[OwnedFd; 2]>::uninit();
   match syscall!(pipe2(result.as_mut_ptr().cast::<_>(), libc::O_CLOEXEC)) {
     Ok(_) => {
+      // SAFETY: pipe2 succeeded, so result is now initialized with two valid fds
       let [read, write] = unsafe { result.assume_init() };
       Ok((read, write))
     }
     Err(_) => {
-      use libc::{F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC, O_NONBLOCK};
+      use libc::{F_GETFD, F_SETFD, FD_CLOEXEC};
       syscall!(pipe(result.as_mut_ptr().cast::<_>()))?;
+      // SAFETY: pipe succeeded, so result is now initialized with two valid fds
       let [read, write] = unsafe { result.assume_init() };
 
       let flags = syscall!(fcntl(read.as_raw_fd(), F_GETFD))?;
@@ -337,6 +343,7 @@ impl Notifier {
       // Try to create an eventfd.
       match syscall!(eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) {
         Ok(fd) => {
+          // SAFETY: fd is valid, just returned successfully from eventfd
           let owned = unsafe { OwnedFd::from_raw_fd(fd) };
           return Ok(Notifier::EventFd(owned));
         }

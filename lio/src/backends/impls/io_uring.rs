@@ -204,6 +204,7 @@ impl IoBackend for IoUring {
     let entry = create_io_uring_entry(&op);
 
     // Push to submission queue without syscall
+    // SAFETY: entry is a valid SQE created from op, id is used as user_data
     unsafe { self.ring().push(entry, id) }.map_err(|_| {
       io::Error::new(io::ErrorKind::WouldBlock, "submission queue full")
     })?;

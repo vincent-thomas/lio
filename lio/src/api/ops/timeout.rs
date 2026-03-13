@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::api::resource::Resource;
 use crate::typed_op::TypedOp;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{FromRawFd, RawFd};
 
 pub struct Timeout {
   duration: Duration,
@@ -42,6 +42,7 @@ impl Timeout {
         tv_nsec: duration.subsec_nanos() as libc::c_long,
       },
       #[cfg(target_os = "linux")]
+      // SAFETY: timer_fd is valid, just created by create_timer_fd above
       timer_res: unsafe { Resource::from_raw_fd(timer_fd) },
       #[cfg(kqueue)]
       timer_id: id,
@@ -59,6 +60,7 @@ impl Timeout {
     ))?;
 
     // Set the timeout
+    // SAFETY: itimerspec is a C struct where all-zeros is a valid representation
     let mut new_value: libc::itimerspec =
       unsafe { MaybeUninit::zeroed().assume_init() };
     new_value.it_value.tv_sec = duration.as_secs() as libc::time_t;

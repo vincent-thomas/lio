@@ -19,9 +19,12 @@ pkgs.rustPlatform.buildRustPackage {
     (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
     gnumake
     clang
+    llvmPackages.libclang
   ];
 
   buildInputs = with pkgs; [ stdenv.cc.cc ];
+
+  LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
   doCheck = false;
 

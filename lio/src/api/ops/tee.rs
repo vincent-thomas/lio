@@ -1,6 +1,6 @@
 #[cfg(not(linux))]
 use crate::operation::EventType;
-use std::{io, os::fd::AsRawFd};
+use std::io;
 
 use crate::api::resource::Resource;
 use crate::typed_op::TypedOp;
