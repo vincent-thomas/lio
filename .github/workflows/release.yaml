@@ -106,9 +106,13 @@ jobs:
         run: |
           git tag "v${{ steps.version.outputs.version }}"
 
-      - name: Push
+      - name: Push commit
         run: |
-          git push origin main --follow-tags
+          git push origin main
+
+      - name: Push tag
+        run: |
+          git push origin "v${{ steps.version.outputs.version }}"
 
       - name: Create GitHub Release
         run: |
