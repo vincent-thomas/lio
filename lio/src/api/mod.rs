@@ -510,11 +510,13 @@ doc_op! {
     /// # Examples
     ///
     /// ```rust
+    ///
+    /// use lio::api;
     /// #[cfg(linux)]
     /// async fn tee_example() -> std::io::Result<()> {
     ///     # let fd_in = 0;
     ///     # let fd_out = 0;
-    ///     let bytes_copied = lio::tee(fd_in, fd_out, 1024).await?;
+    ///     let bytes_copied = api::tee(fd_in, fd_out, 1024).await?;
     ///     println!("Copied {} bytes", bytes_copied);
     ///     Ok(())
     /// }
