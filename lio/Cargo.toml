@@ -38,7 +38,8 @@ lio-uring.path = "../lio-uring"
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_System_IO",
-  "Win32_System_Threading",      # CreateTimerQueueTimer, DeleteTimerQueueTimer
+  "Win32_System_Threading",      # CreateTimerQueueTimer, DeleteTimerQueueTimer, GetCurrentProcess, DuplicateHandle
+  "Win32_System_Console",        # GetStdHandle, STD_*_HANDLE
   "Win32_Storage_FileSystem",    # ReadFile, WriteFile, CreateFileW
   "Win32_Networking_WinSock",    # WSARecv, WSASend, AcceptEx, ConnectEx
   "Win32_Security",              # Security attributes for file operations

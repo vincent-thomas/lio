@@ -27,10 +27,9 @@
 //!
 //! ```no_run
 //! use lio::{Lio, api};
-//! use std::os::fd::FromRawFd;
 //!
 //! let mut lio = Lio::new(64).unwrap();
-//! let fd = unsafe { api::resource::Resource::from_raw_fd(0) };
+//! let fd = api::resource::Resource::stdin();
 //! let buf = vec![0u8; 1024];
 //! let (result, buf) = api::read(&fd, buf).with_lio(&mut lio).wait();
 //! // buf is returned and can be reused
@@ -43,7 +42,6 @@
 //!
 //! ```no_run
 //! use lio::{Lio, api};
-//! use std::os::fd::FromRawFd;
 //!
 //! fn echo_server(lio: &mut Lio) -> std::io::Result<()> {
 //!     // Create and bind socket
@@ -130,11 +128,10 @@ doc_op! {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use std::os::fd::FromRawFd;
     /// use lio::api::resource::Resource;
     ///
     /// async fn shutdown_example() -> std::io::Result<()> {
-    ///     # let socket = unsafe { Resource::from_raw_fd(0) };
+    ///     # let socket = Resource::stdin(); // Placeholder for a real socket
     ///     // Stop sending data on this socket
     ///     lio::api::shutdown(&socket, libc::SHUT_WR).await?;
     ///     Ok(())
@@ -182,9 +179,8 @@ doc_op! {
     ///
     /// ```rust,no_run
     /// async fn write_example() -> std::io::Result<()> {
-    ///     # use std::os::fd::FromRawFd;
     ///     # use lio::api::resource::Resource;
-    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     # let fd = Resource::stdin();
     ///     lio::api::fsync(&fd).await?;
     ///     Ok(())
     /// }
@@ -204,9 +200,8 @@ doc_op! {
     ///
     /// ```rust,no_run
     /// async fn write_example() -> std::io::Result<()> {
-    ///     # use std::os::fd::FromRawFd;
     ///     # use lio::api::resource::Resource;
-    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     # let fd = Resource::stdin();
     ///     let data = b"Hello, World!".to_vec();
     ///     let (result_bytes_written, _buf) = lio::api::write(&fd, data).await;
     ///     println!("Wrote {} bytes", result_bytes_written?);
@@ -235,9 +230,8 @@ doc_op! {
     ///
     /// ```rust,no_run
     /// async fn write_example() -> std::io::Result<()> {
-    ///     # use std::os::fd::FromRawFd;
     ///     # use lio::api::resource::Resource;
-    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     # let fd = Resource::stdin();
     ///     let data = b"Hello, World!".to_vec();
     ///     let (result_bytes_written, _buf) = lio::api::write_at(&fd, data, 0).await;
     ///     println!("Wrote {} bytes", result_bytes_written?);
@@ -287,9 +281,8 @@ doc_op! {
     ///
     /// ```rust,no_run
     /// async fn truncate_example() -> std::io::Result<()> {
-    ///     # use std::os::fd::FromRawFd;
     ///     # use lio::api::resource::Resource;
-    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     # let fd = Resource::stdin();
     ///     lio::api::truncate(&fd, 1024).await?; // Truncate to 1KB
     ///     Ok(())
     /// }
@@ -328,9 +321,8 @@ doc_op! {
     ///
     /// ```rust,no_run
     /// async fn bind_example() -> std::io::Result<()> {
-    ///     # use std::os::fd::FromRawFd;
     ///     # use lio::api::resource::Resource;
-    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     # let fd = Resource::stdin();
     ///     let addr = "127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap();
     ///     lio::api::bind(&fd, addr).await?;
     ///     Ok(())
@@ -350,9 +342,8 @@ doc_op! {
     ///
     /// ```rust,no_run
     /// async fn accept_example() -> std::io::Result<()> {
-    ///     # use std::os::fd::FromRawFd;
     ///     # use lio::api::resource::Resource;
-    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     # let fd = Resource::stdin();
     ///     let (client_fd, addr) = lio::api::accept(&fd).await?;
     ///     println!("Accepted connection: {:?}", client_fd);
     ///     Ok(())
@@ -375,9 +366,8 @@ doc_op! {
     ///
     /// ```rust,no_run
     /// async fn accept_unix_example() -> std::io::Result<()> {
-    ///     # use std::os::fd::FromRawFd;
     ///     # use lio::api::resource::Resource;
-    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     # let fd = Resource::stdin();
     ///     let client_fd = lio::api::accept_unix(&fd).await?;
     ///     println!("Accepted Unix connection: {:?}", client_fd);
     ///     Ok(())
@@ -397,9 +387,8 @@ doc_op! {
     ///
     /// ```rust,no_run
     /// async fn listen_example() -> std::io::Result<()> {
-    ///     # use std::os::fd::FromRawFd;
     ///     # use lio::api::resource::Resource;
-    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     # let fd = Resource::stdin();
     ///     lio::api::listen(&fd, 128).await?;
     ///     println!("Socket is now listening for connections");
     ///     Ok(())
@@ -421,9 +410,8 @@ doc_op! {
     /// use std::net::SocketAddr;
     ///
     /// async fn connect_example() -> std::io::Result<()> {
-    ///     # use std::os::fd::FromRawFd;
     ///     # use lio::api::resource::Resource;
-    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     # let fd = Resource::stdin();
     ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     ///     lio::api::connect(&fd, addr).await?;
     ///     println!("Connected to remote address");
@@ -444,9 +432,8 @@ doc_op! {
     ///
     /// ```rust,no_run
     /// async fn send_example() -> std::io::Result<()> {
-    ///     # use std::os::fd::FromRawFd;
     ///     # use lio::api::resource::Resource;
-    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     # let fd = Resource::stdin();
     ///     let data = b"Hello, server!".to_vec();
     ///     let (bytes_sent, _buf) = lio::api::send(&fd, data, None).await;
     ///     println!("Sent {} bytes", bytes_sent?);
@@ -471,9 +458,8 @@ doc_op! {
     ///
     /// ```rust,no_run
     /// async fn recv_example() -> std::io::Result<()> {
-    ///     # use std::os::fd::FromRawFd;
     ///     # use lio::api::resource::Resource;
-    ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+    ///     # let fd = Resource::stdin();
     ///     let buffer = vec![0u8; 1024];
     ///     let (res_bytes_received, buf) = lio::api::recv(&fd, buffer, None).await;
     ///     let bytes_received = res_bytes_received? as usize;
@@ -500,8 +486,8 @@ doc_op! {
     /// use std::ffi::CString;
     ///
     /// async fn openat_example() -> std::io::Result<()> {
-    ///     # use std::os::fd::FromRawFd;
     ///     # use lio::api::resource::Resource;
+    ///     # use std::os::fd::FromRawFd;
     ///     # let dir = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
     ///     let path = CString::new("/tmp/test.txt").unwrap();
     ///     let fd = lio::api::openat(&dir, path, libc::O_RDONLY).await?;

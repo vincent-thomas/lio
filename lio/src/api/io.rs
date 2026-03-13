@@ -30,10 +30,9 @@
 //!
 //! ```no_run
 //! use lio::{Lio, api};
-//! use std::os::fd::FromRawFd;
 //!
 //! let mut lio = Lio::new(64).unwrap();
-//! let fd = unsafe { api::resource::Resource::from_raw_fd(1) };
+//! let fd = api::resource::Resource::stdout();
 //!
 //! // Blocking via .wait()
 //! let (result, buf) = api::write(&fd, vec![0; 10]).with_lio(&mut lio).wait();
@@ -78,10 +77,9 @@ use std::{
 ///
 /// ```no_run
 /// use lio::{Lio, api};
-/// use std::os::fd::FromRawFd;
 ///
 /// let lio = Lio::new(1024).unwrap();
-/// let fd = unsafe { api::resource::Resource::from_raw_fd(0) };
+/// let fd = api::resource::Resource::stdin();
 /// let (result, buf) = api::read(&fd, vec![0u8; 1024])
 ///     .with_lio(&lio)
 ///     .wait();
@@ -129,10 +127,9 @@ where
   /// # Example
   /// ```no_run
   /// use lio::{Lio, api};
-  /// use std::os::fd::FromRawFd;
   ///
   /// let lio = Lio::new(64).unwrap();
-  /// let fd = unsafe { api::resource::Resource::from_raw_fd(1) };
+  /// let fd = api::resource::Resource::stdout();
   /// let receiver = api::write(&fd, vec![0; 10]).with_lio(&lio).send();
   /// lio.try_run().unwrap();
   /// let (result, buffer) = receiver.recv();
@@ -156,12 +153,11 @@ where
   /// ```rust,no_run
   /// use std::sync::mpsc;
   /// use lio::api::resource::Resource;
-  /// use std::os::fd::FromRawFd;
   ///
   /// async fn example() -> std::io::Result<()> {
   ///     # let lio = lio::Lio::new(1024).unwrap();
-  ///     # let fd0 = unsafe { Resource::from_raw_fd(0) };
-  ///     # let fd1 = unsafe { Resource::from_raw_fd(1) };
+  ///     # let fd0 = Resource::stdin();
+  ///     # let fd1 = Resource::stdout();
   ///     let (tx, rx) = mpsc::channel();
   ///
   ///     // Send multiple operations to the same receiver
@@ -191,11 +187,10 @@ where
   /// ```rust,no_run
   /// use std::sync::mpsc::channel;
   /// use lio::api::resource::Resource;
-  /// use std::os::fd::FromRawFd;
   ///
   /// async fn example() -> std::io::Result<()> {
   ///     # let lio = lio::Lio::new(1024).unwrap();
-  ///     # let fd = unsafe { Resource::from_raw_fd(0) };
+  ///     # let fd = Resource::stdin();
   ///     let buffer = vec![0u8; 1024];
   ///     let (tx, rx) = channel();
   ///
@@ -280,11 +275,10 @@ impl<T> Receiver<T> {
   ///
   /// ```no_run
   /// use lio::{Lio, api};
-  /// use std::os::fd::FromRawFd;
   /// use std::time::Duration;
   ///
   /// let mut lio = Lio::new(64).unwrap();
-  /// let fd = unsafe { api::resource::Resource::from_raw_fd(1) };
+  /// let fd = api::resource::Resource::stdout();
   /// let mut receiver = api::write(&fd, vec![0; 10]).with_lio(&mut lio).send();
   ///
   /// // Poll with timeout
@@ -327,10 +321,9 @@ impl<T> Receiver<T> {
   ///
   /// ```no_run
   /// use lio::{Lio, api};
-  /// use std::os::fd::FromRawFd;
   ///
   /// let mut lio = Lio::new(64).unwrap();
-  /// let fd = unsafe { api::resource::Resource::from_raw_fd(1) };
+  /// let fd = api::resource::Resource::stdout();
   /// let mut receiver = api::write(&fd, vec![0; 10]).with_lio(&mut lio).send();
   ///
   /// loop {
@@ -395,10 +388,9 @@ where
   ///
   /// ```no_run
   /// use lio::{Lio, api};
-  /// use std::os::fd::FromRawFd;
   ///
   /// let lio = Lio::new(1024).unwrap();
-  /// let fd = unsafe { api::resource::Resource::from_raw_fd(0) };
+  /// let fd = api::resource::Resource::stdin();
   /// let (result, buf) = api::read(&fd, vec![0u8; 1024])
   ///     .with_lio(&lio)
   ///     .wait();
@@ -451,10 +443,9 @@ where
 ///
 /// ```no_run
 /// use lio::{Lio, api};
-/// use std::os::fd::FromRawFd;
 ///
 /// async fn example(lio: &Lio) {
-///     let fd = unsafe { api::resource::Resource::from_raw_fd(0) };
+///     let fd = api::resource::Resource::stdin();
 ///     let (result, buf) = api::read(&fd, vec![0; 1024]).with_lio(lio).await;
 ///     //                                                             ^^^^^^
 ///     //                                             IntoFuture creates IoFuture

@@ -32,11 +32,9 @@
 //!
 //! ```
 //! use lio::{Lio, api};
-//! use std::os::fd::FromRawFd;
 //!
 //! let mut lio = Lio::new(64).unwrap();
-//! // stdout (fd 1) is always valid
-//! let resource = unsafe { lio::api::resource::Resource::from_raw_fd(1) };
+//! let resource = api::resource::Resource::stdout();
 //! let data = b"Hello\n".to_vec();
 //!
 //! // Callback-based

@@ -87,10 +87,18 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/flake-checker-action@main
 
-  vm-linux:
-    name: Test (Linux VM - io_uring)
+  vm-test:
+    name: Test (${{ matrix.name }})
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [nix-flake-check, lio-build-n-test, lio-cbuild, lint]
+    strategy:
+      matrix:
+        include:
+          - name: Linux VM - io_uring
+            vm: linux
+          - name: FreeBSD VM - kqueue
+            vm: freebsd
     steps:
       - uses: actions/checkout@v6
         with:
@@ -103,30 +111,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/lio-vm
-          key: vm-linux-${{ hashFiles('vm/linux/run.sh') }}
-          restore-keys: vm-linux-
+          key: vm-${{ matrix.vm }}-${{ hashFiles(format('vm/{0}/run.sh', matrix.vm)) }}
+          restore-keys: vm-${{ matrix.vm }}-
 
-      - name: Run Linux VM tests
-        run: nix run .#linux
-
-  vm-freebsd:
-    name: Test (FreeBSD VM - kqueue)
-    runs-on: ubuntu-latest
-    needs: [nix-flake-check, lio-build-n-test, lio-cbuild, lint]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Cache VM images
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/lio-vm
-          key: vm-freebsd-${{ hashFiles('vm/freebsd/run.sh') }}
-          restore-keys: vm-freebsd-
-
-      - name: Run FreeBSD VM tests
-        run: nix run .#freebsd
+      - name: Run VM tests
+        run: nix run .#${{ matrix.vm }}
