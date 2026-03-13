@@ -107,7 +107,7 @@ impl Socket {
   /// ```rust,no_run
   /// use lio::net::Socket;
   ///
-    /// async fn example() -> std::io::Result<()> {
+  /// async fn example() -> std::io::Result<()> {
   ///     // Create a TCP socket for IPv4
   ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
   ///
@@ -116,7 +116,7 @@ impl Socket {
   ///
   ///     Ok(())
   /// }
-    /// ```
+  /// ```
   #[allow(clippy::new_ret_no_self)]
   pub fn new(
     domain: libc::c_int,
@@ -138,7 +138,7 @@ impl Socket {
   /// use std::net::SocketAddr;
   /// use lio::net::Socket;
   ///
-    /// async fn example() -> std::io::Result<()> {
+  /// async fn example() -> std::io::Result<()> {
   ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
   ///
   ///     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
@@ -146,7 +146,7 @@ impl Socket {
   ///
   ///     Ok(())
   /// }
-    /// ```
+  /// ```
   pub fn bind(&self, addr: SocketAddr) -> Io<Bind> {
     api::bind(&self.0, addr)
   }
@@ -162,7 +162,7 @@ impl Socket {
   /// use std::net::SocketAddr;
   /// use lio::net::Socket;
   ///
-    /// async fn example() -> std::io::Result<()> {
+  /// async fn example() -> std::io::Result<()> {
   ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
   ///
   ///     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
@@ -171,7 +171,7 @@ impl Socket {
   ///
   ///     Ok(())
   /// }
-    /// ```
+  /// ```
   pub fn listen(&self) -> Io<Listen> {
     api::listen(&self.0, 128)
   }
@@ -194,7 +194,7 @@ impl Socket {
   /// use std::net::SocketAddr;
   /// use lio::net::Socket;
   ///
-    /// async fn example() -> std::io::Result<()> {
+  /// async fn example() -> std::io::Result<()> {
   ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
   ///
   ///     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
@@ -206,7 +206,7 @@ impl Socket {
   ///
   ///     Ok(())
   /// }
-    /// ```
+  /// ```
   pub fn accept(&self) -> Io<SocketAccept> {
     let socket_accept_op = SocketAccept::new(self.0.clone());
     Io::from_op(socket_accept_op)
@@ -223,7 +223,7 @@ impl Socket {
   /// use std::net::SocketAddr;
   /// use lio::net::Socket;
   ///
-    /// async fn example() -> std::io::Result<()> {
+  /// async fn example() -> std::io::Result<()> {
   ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
   ///
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
@@ -233,7 +233,7 @@ impl Socket {
   ///
   ///     Ok(())
   /// }
-    /// ```
+  /// ```
   pub fn connect(&self, addr: SocketAddr) -> Io<Connect> {
     api::connect(&self.0, addr)
   }
@@ -255,7 +255,7 @@ impl Socket {
   /// ```rust,no_run
   /// use lio::net::Socket;
   ///
-    /// async fn example(socket: Socket) -> std::io::Result<()> {
+  /// async fn example(socket: Socket) -> std::io::Result<()> {
   ///     let buffer = vec![0u8; 1024];
   ///     let (result, buffer) = socket.recv(buffer).await;
   ///     let bytes_read = result? as usize;
@@ -265,7 +265,7 @@ impl Socket {
   ///
   ///     Ok(())
   /// }
-    /// ```
+  /// ```
   pub fn recv(&self, vec: Vec<u8>) -> Io<Recv<Vec<u8>>> {
     api::recv(&self.0, vec, None)
   }
@@ -287,16 +287,16 @@ impl Socket {
   /// ```rust,no_run
   /// use lio::net::Socket;
   ///
-    /// async fn example(socket: Socket) -> std::io::Result<()> {
+  /// async fn example(socket: Socket) -> std::io::Result<()> {
   ///     let data = b"Hello, world!".to_vec();
   ///     let (result, data) = socket.send(data).await;
-///     let bytes_sent = result? as usize;
+  ///     let bytes_sent = result? as usize;
   ///
   ///     println!("Sent {} bytes", bytes_sent);
   ///
   ///     Ok(())
   /// }
-    /// ```
+  /// ```
   pub fn send(&self, vec: Vec<u8>) -> Io<Send<Vec<u8>>> {
     api::send(&self.0, vec, None)
   }
@@ -317,7 +317,7 @@ impl Socket {
   /// ```rust,no_run
   /// use lio::net::Socket;
   ///
-    /// async fn example(socket: Socket) -> std::io::Result<()> {
+  /// async fn example(socket: Socket) -> std::io::Result<()> {
   ///     // Send all data...
   ///
   ///     // Shutdown the write side to signal EOF to the peer
@@ -327,7 +327,7 @@ impl Socket {
   ///
   ///     Ok(())
   /// }
-    /// ```
+  /// ```
   pub fn shutdown(&self, how: i32) -> Io<Shutdown> {
     api::shutdown(&self.0, how)
   }
