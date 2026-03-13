@@ -17,6 +17,12 @@ fn main() {
     }
   }
 
+  #[cfg(feature = "unstable_ffi")]
+  generate_c_bindings();
+}
+
+#[cfg(feature = "unstable_ffi")]
+fn generate_c_bindings() {
   // Re-run if ffi.rs changes
   println!("cargo:rerun-if-changed=src/ffi.rs");
   println!("cargo:rerun-if-changed=cbindgen.toml");
