@@ -3,6 +3,9 @@
 lint:
 	nix develop .#ci -c ./scripts/lint.sh
 
+fmt-fix:
+	nix develop -c cargo fmt
+
 doc: test-doc
 	RUSTDOCFLAGS="--cfg docsrs" nix develop -c cargo doc --no-deps --all-features
 

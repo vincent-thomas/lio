@@ -18,6 +18,7 @@ pkgs.rustPlatform.buildRustPackage {
   nativeBuildInputs = with pkgs; [
     (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
     gnumake
+    clang
   ];
 
   buildInputs = with pkgs; [ stdenv.cc.cc ];
