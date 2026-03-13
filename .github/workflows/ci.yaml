@@ -18,6 +18,7 @@ jobs:
           submodules: true
 
       - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -40,6 +41,7 @@ jobs:
           submodules: true
 
       - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -62,6 +64,7 @@ jobs:
           submodules: true
 
       - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -91,6 +94,7 @@ jobs:
           submodules: true
 
       - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Cache VM images
         uses: actions/cache@v4
@@ -112,6 +116,7 @@ jobs:
           submodules: true
 
       - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Cache VM images
         uses: actions/cache@v4
