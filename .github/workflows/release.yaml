@@ -42,7 +42,7 @@ jobs:
           key: cargo-release-cache
 
       - name: Install cargo-edit
-        run: nix develop -c cargo install cargo-edit
+        run: nix develop -c cargo install cargo-edit -f
 
       - name: Configure git
         run: |
