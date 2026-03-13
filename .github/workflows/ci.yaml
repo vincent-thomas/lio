@@ -32,7 +32,12 @@ jobs:
             ~/.cargo/git
           key: cargo-build-cache
 
-      - name: Lint
+      - name: (main) Lint full
+        if: github.ref != 'refs/heads/main'
+        run: make lint-full
+
+      - name: (not main) Lint
+        if: github.ref == 'refs/heads/main'
         run: make lint
 
   lio-cbuild:

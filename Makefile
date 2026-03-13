@@ -1,7 +1,10 @@
-.PHONY: lint doc cbuild test test-doc test-lib test-integration test-nix vm-linux vm-windows vm-freebsd vm-all
+.PHONY: lint lint-full doc cbuild test test-doc test-lib test-integration test-nix vm-linux vm-windows vm-freebsd vm-all
 
 lint:
 	nix develop .#ci -c ./scripts/lint.sh
+
+lint-full:
+	nix develop .#ci -c ./scripts/lint-full.sh
 
 fmt-fix:
 	nix develop -c cargo fmt

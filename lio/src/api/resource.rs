@@ -312,9 +312,11 @@ impl Resource {
   #[cfg(windows)]
   pub fn stdout() -> Self {
     use windows_sys::Win32::Foundation::{
-      DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
+      DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
     };
-    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+    use windows_sys::Win32::System::Console::{
+      GetStdHandle, STD_OUTPUT_HANDLE,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
     // SAFETY: GetStdHandle is safe to call with valid constants
@@ -376,7 +378,7 @@ impl Resource {
   #[cfg(windows)]
   pub fn stderr() -> Self {
     use windows_sys::Win32::Foundation::{
-      DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
+      DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -440,7 +442,7 @@ impl Resource {
   #[cfg(windows)]
   pub fn stdin() -> Self {
     use windows_sys::Win32::Foundation::{
-      DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
+      DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
