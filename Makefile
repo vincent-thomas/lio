@@ -15,6 +15,9 @@ cbuild:
 test:
 	nix develop -c ./scripts/test.sh
 
+test-ffi:
+	nix develop -c ./scripts/test-ffi.sh
+
 # VM-based cross-platform testing
 vm-linux:
 	./vm/linux/run.sh

@@ -55,9 +55,8 @@ jobs:
             ~/.cargo/git
           key: cargo-build-cache
 
-      - name: Run make lio-cbuild
-        run: make cbuild
-      - run: ./lio/tests/nix-build/test.sh
+      - name: test cbuild
+        run: make test-ffi
 
   lio-build-n-test:
     name: Build n Test
