@@ -166,6 +166,7 @@
                 packages = with pkgs; [
                   cargo-deny
                   cargo-hack
+                  cargo-release
                 ];
               }
             );
