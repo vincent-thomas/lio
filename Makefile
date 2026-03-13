@@ -1,4 +1,4 @@
-.PHONY: lint lint-full doc cbuild test test-doc test-lib test-integration test-nix vm-linux vm-windows vm-freebsd vm-all
+.PHONY: lint lint-full doc cbuild test test-lio-uring test-doc test-lib test-integration test-nix vm-linux vm-windows vm-freebsd vm-all
 
 lint:
 	nix develop .#ci -c ./scripts/lint.sh
@@ -17,6 +17,9 @@ cbuild:
 
 test:
 	nix develop -c ./scripts/test.sh
+
+test-lio-uring:
+	nix develop -c ./scripts/test-lio-uring.sh
 
 test-ffi:
 	nix develop -c ./scripts/test-ffi.sh

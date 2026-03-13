@@ -52,6 +52,12 @@ jobs:
       - name: Run tests before release
         run: make test
 
+      - name: Get old lio-uring version
+        id: old_version
+        run: |
+          OLD_VERSION=$(nix develop -c cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "lio-uring") | .version')
+          echo "lio_uring=$OLD_VERSION" >> $GITHUB_OUTPUT
+
       - name: Bump versions
         run: |
           nix develop -c cargo set-version -p lio-uring --bump ${{ github.event.inputs.bump }}
@@ -65,7 +71,9 @@ jobs:
 
       - name: Update lio dependency on lio-uring
         run: |
-          nix develop -c cargo add -p lio lio-uring@${{ steps.version.outputs.version }}
+          OLD="${{ steps.old_version.outputs.lio_uring }}"
+          NEW="${{ steps.version.outputs.version }}"
+          sed "/^lio-uring = /s/version = \"$OLD\"/version = \"$NEW\"/" lio/Cargo.toml > tmp && mv tmp lio/Cargo.toml
 
       - name: Generate CHANGELOG
         run: |

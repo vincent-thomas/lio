@@ -37,7 +37,7 @@
 use core::mem;
 use std::os::fd::RawFd;
 
-use crate::{Entry, SqeFlags, bindings};
+use crate::{bindings, Entry, SqeFlags};
 
 macro_rules! opcode {
     (@type $name:ty ) => {
@@ -2961,7 +2961,7 @@ mod smoke_tests {
     let completion = ring.wait().unwrap();
     assert_eq!(completion.user_data(), 0x1234);
     assert!(completion.result() >= 0); // openat returns fd >= 0 on success
-    // Close the fd returned by openat
+                                       // Close the fd returned by openat
     unsafe { libc::close(completion.result()) };
   }
 
