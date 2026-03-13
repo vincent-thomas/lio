@@ -119,6 +119,10 @@ fn test_close_invalid_fd() {
 }
 
 #[test]
+#[cfg_attr(
+  any(target_os = "freebsd", target_os = "macos"),
+  ignore = "macOS/FreeBSD may silently succeed on double close"
+)]
 fn test_close_already_closed() {
   let mut lio = Lio::new(64).unwrap();
   let temp = TempFile::new("close_double");

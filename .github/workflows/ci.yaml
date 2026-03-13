@@ -10,8 +10,11 @@ env:
 
 jobs:
   lint:
-    name: Check fmt
-    runs-on: ubuntu-latest
+    name: Lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
         with:
