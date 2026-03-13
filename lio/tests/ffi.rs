@@ -3,7 +3,7 @@
 //! These tests compile the C test programs in tests/ffi/ with both C and C++
 //! compilers to verify the header works with both languages.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "unstable_ffi"))]
 
 use std::env;
 use std::path::{Path, PathBuf};

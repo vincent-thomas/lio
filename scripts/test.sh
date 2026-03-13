@@ -1,4 +1,6 @@
 RUST_BACKTRACE=1 cargo test --doc
 
-cargo test -p lio --all-features --lib --release
-cargo test -p lio --all-features --test '*' --release
+FEATURES=$(cargo metadata --no-deps --format-version 1   | jq -r '.packages[0].features | keys[]'   | grep -v '^unstable_ffi$'   | tr '\n' ' ')
+
+cargo test -p lio --features "$FEATURES" --release --lib
+cargo test -p lio --features "$FEATURES" --release --test '*'
