@@ -1,6 +1,6 @@
 [package]
 name = "lio"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "A platform-independent async I/O library with native support for io_uring (Linux), IOCP (Windows), and kqueue (macOS)"
 license = "MIT"
@@ -32,7 +32,7 @@ bytes = { version = "1.11.0", optional = true, default-features = false, feature
 zeroize = { version = "1.8.2", optional = true, default-features = false, features = ["alloc"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-lio-uring = { path = "../lio-uring", version = "0.2.0" }
+lio-uring = { path = "../lio-uring", version = "0.3.0" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
