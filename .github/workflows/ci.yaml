@@ -54,6 +54,7 @@ jobs:
 
       - name: Run make lio-cbuild
         run: make cbuild
+      - run: ./lio/tests/nix-build/test.sh
 
   lio-build-n-test:
     name: Build n Test
