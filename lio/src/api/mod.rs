@@ -509,7 +509,7 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// # #[cfg(target_os = "linux")]
     /// # async fn example() -> std::io::Result<()> {
     /// use lio::api;
