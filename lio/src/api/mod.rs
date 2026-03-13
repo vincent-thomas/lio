@@ -509,17 +509,21 @@ doc_op! {
     ///
     /// # Examples
     ///
-    /// ```rust
-    ///
+    /// ```rust,no_run
+    /// # #[cfg(target_os = "linux")]
+    /// # async fn example() -> std::io::Result<()> {
     /// use lio::api;
-    /// #[cfg(linux)]
-    /// async fn tee_example() -> std::io::Result<()> {
-    ///     # let fd_in = 0;
-    ///     # let fd_out = 0;
-    ///     let bytes_copied = api::tee(&fd_in, fd_out, 1024).await?;
-    ///     println!("Copied {} bytes", bytes_copied);
-    ///     Ok(())
-    /// }
+    /// use lio::api::resource::Resource;
+    ///
+    /// let fd_in = Resource::stdin();
+    /// let fd_out = Resource::stdout();
+    /// let bytes_copied = api::tee(&fd_in, fd_out, 1024).await?;
+    /// println!("Copied {} bytes", bytes_copied);
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(target_os = "linux"))]
+    /// # fn example() {}
+    /// # fn main() {}
     /// ```
     #[cfg(linux)]
     #[cfg_attr(docsrs, doc(cfg(linux)))]
