@@ -23,6 +23,11 @@ fn main() {
 
 #[cfg(feature = "unstable_ffi")]
 fn generate_c_bindings() {
+  // Skip on docs.rs - filesystem is read-only
+  if std::env::var("DOCS_RS").is_ok() {
+    return;
+  }
+
   // Re-run if ffi.rs changes
   println!("cargo:rerun-if-changed=src/ffi.rs");
   println!("cargo:rerun-if-changed=cbindgen.toml");
