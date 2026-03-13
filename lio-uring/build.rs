@@ -8,20 +8,46 @@ fn main() {
   build_linux();
 }
 
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
+  use std::fs;
+  fs::create_dir_all(dst).unwrap();
+  for entry in fs::read_dir(src).unwrap() {
+    let entry = entry.unwrap();
+    let ty = entry.file_type().unwrap();
+    let src_path = entry.path();
+    let dst_path = dst.join(entry.file_name());
+    if ty.is_dir() {
+      copy_dir_recursive(&src_path, &dst_path);
+    } else if ty.is_file() {
+      fs::copy(&src_path, &dst_path).unwrap();
+    }
+    // Skip symlinks
+  }
+}
+
 fn build_linux() {
   use std::{env, fs, path::PathBuf, process::Command};
-  // This is the directory where the `c` library is located.
-  let libdir_path = PathBuf::from("liburing")
-    // `rustc-link-search` requires an absolute path.
-    .canonicalize()
-    .expect("cannot canonicalize path");
 
-  let headers_path = PathBuf::from("./include/liburing_wrapper.h");
+  let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+  let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+
+  // Copy liburing to OUT_DIR so configure doesn't modify source directory
+  let liburing_src = manifest_dir.join("liburing");
+  let libdir_path = out_dir.join("liburing");
+
+  // Always fresh copy to pick up source changes
+  if libdir_path.exists() {
+    fs::remove_dir_all(&libdir_path).unwrap();
+  }
+  copy_dir_recursive(&liburing_src, &libdir_path);
+
+  let headers_path = manifest_dir.join("include/liburing_wrapper.h");
+
+  // Rerun if liburing sources change
+  println!("cargo:rerun-if-changed={}", liburing_src.display());
+  println!("cargo:rerun-if-changed={}", headers_path.display());
 
   // Run configure to generate necessary headers
-  let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-  fs::create_dir_all(out_dir.join("src/include/liburing")).unwrap();
-
   let result = Command::new("./configure")
     .current_dir(&libdir_path)
     .output()
@@ -110,7 +136,6 @@ fn build_linux() {
   let wrapper_c = out_dir.join("liburing_wrapper.c");
   if wrapper_c.exists() {
     let wrapper_obj = out_dir.join("liburing_wrapper.o");
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let status = Command::new("clang")
       .arg("-c")
       .arg("-o")
