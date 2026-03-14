@@ -32,6 +32,25 @@ unsafe impl Send for RawBuf {}
 // SAFETY: Same as Send - we only access through the owning TypedOp.
 unsafe impl Sync for RawBuf {}
 
+/// Non-owning raw iovec array pointer for scatter-gather I/O operations.
+///
+/// Points to an array of `libc::iovec` structs owned by the typed op
+/// (e.g., `Readv` or `Writev`). The backend uses this to call `readv`/`writev`
+/// without taking ownership of the buffer array.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+pub struct RawIovecBuf {
+  pub ptr: *const libc::iovec,
+  pub len: u32,
+}
+// SAFETY: The pointed-to iovec array is owned by a TypedOp which is Send + Sync.
+// We only use this pointer from the thread that scheduled the operation.
+#[cfg(unix)]
+unsafe impl Send for RawIovecBuf {}
+// SAFETY: Same as Send - we only access through the owning TypedOp.
+#[cfg(unix)]
+unsafe impl Sync for RawIovecBuf {}
+
 /// Type-erased buffer storage with proper cleanup.
 ///
 /// This allows storing buffers of any type without boxing the entire operation.
@@ -210,6 +229,28 @@ pub enum Op {
     dir_fd: Resource,
     target: *const c_char,
     linkpath: *const c_char,
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // Scatter-gather operations
+  // ═══════════════════════════════════════════════════════════════════════════════
+  /// Scatter read: reads data from `fd` into multiple buffers (`readv(2)`).
+  ///
+  /// The `buffer` field contains a [`RawIovecBuf`] pointing to an array of
+  /// `libc::iovec` structs owned by the typed op.
+  #[cfg(unix)]
+  Readv {
+    fd: Resource,
+    buffer: OpBuf,
+  },
+  /// Gather write: writes data from multiple buffers to `fd` (`writev(2)`).
+  ///
+  /// The `buffer` field contains a [`RawIovecBuf`] pointing to an array of
+  /// `libc::iovec` structs owned by the typed op.
+  #[cfg(unix)]
+  Writev {
+    fd: Resource,
+    buffer: OpBuf,
   },
 
   // ═══════════════════════════════════════════════════════════════════════════════

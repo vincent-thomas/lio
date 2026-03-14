@@ -26,6 +26,11 @@ mod truncate;
 mod write;
 mod write_at;
 
+#[cfg(unix)]
+mod readv;
+#[cfg(unix)]
+mod writev;
+
 pub use accept::*;
 pub use accept_unix::*;
 pub use bind::*;
@@ -51,3 +56,8 @@ pub use tee::*;
 pub use truncate::*;
 pub use write::*;
 pub use write_at::*;
+
+#[cfg(unix)]
+pub use readv::*;
+#[cfg(unix)]
+pub use writev::*;

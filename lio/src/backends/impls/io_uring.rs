@@ -4,13 +4,14 @@ use lio_uring::{
   Entry, LioUring,
   operation::{
     self, Accept, Bind, Close, Connect, Fsync, Ftruncate, LinkAt, Listen,
-    OpenAt, Read, Recv, Send, Shutdown, Socket, SymlinkAt, Tee, Timeout, Write,
+    OpenAt, Read, Readv, Recv, Send, Shutdown, Socket, SymlinkAt, Tee, Timeout,
+    Write, Writev,
   },
 };
 
 use crate::{
   backends::{IoBackend, OpCompleted},
-  op::{Op, RawBuf},
+  op::{Op, RawBuf, RawIovecBuf},
 };
 use std::io;
 use std::os::fd::AsRawFd;
@@ -84,6 +85,18 @@ fn create_io_uring_entry(op: &Op) -> Entry {
     .build(),
     Op::SymlinkAt { target, linkpath, dir_fd } => {
       SymlinkAt::new(dir_fd.as_raw_fd(), *target, *linkpath).build()
+    }
+    Op::Readv { fd, buffer } => {
+      // SAFETY: OpBuf stores RawIovecBuf set by into_op; ptr/len are valid for
+      // the lifetime of the TypedOp which outlives this entry.
+      let RawIovecBuf { ptr, len } = unsafe { buffer.peek::<RawIovecBuf>() };
+      Readv::new(fd.as_raw_fd(), ptr, len).build()
+    }
+    Op::Writev { fd, buffer } => {
+      // SAFETY: OpBuf stores RawIovecBuf set by into_op; ptr/len are valid for
+      // the lifetime of the TypedOp which outlives this entry.
+      let RawIovecBuf { ptr, len } = unsafe { buffer.peek::<RawIovecBuf>() };
+      Writev::new(fd.as_raw_fd(), ptr, len).build()
     }
     #[cfg(target_os = "linux")]
     Op::Tee { fd_in, fd_out, size } => {

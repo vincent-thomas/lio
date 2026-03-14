@@ -530,4 +530,66 @@ doc_op! {
     pub fn tee(res_in: &impl AsResource, res_out: impl AsResource, size: u32) -> Io<ops::Tee> {
         Io::from_op(ops::Tee::new(res_in.as_resource().clone(), res_out.as_resource().clone(), size))
     }
+
+    /// Scatter-read: read from a file descriptor into multiple buffers in one call.
+    ///
+    /// Equivalent to the [`readv(2)`](https://man7.org/linux/man-pages/man2/readv.2.html) syscall.
+    ///
+    /// Each `Vec<u8>` in `bufs` is used as a read target up to its **capacity**.
+    /// On success, the vecs have their lengths updated to reflect how many bytes
+    /// were placed in each buffer (filled from first to last).
+    ///
+    /// # Returns
+    ///
+    /// `(io::Result<i32>, Vec<Vec<u8>>)` – the total byte count and the buffers.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use lio::{Lio, api};
+    /// use lio::api::resource::Resource;
+    /// use std::os::fd::FromRawFd;
+    ///
+    /// let mut lio = Lio::new(64).unwrap();
+    /// let fd = unsafe { Resource::from_raw_fd(libc::STDIN_FILENO) };
+    ///
+    /// let bufs = vec![vec![0u8; 512], vec![0u8; 512]];
+    /// let (result, filled) = api::readv(&fd, bufs).with_lio(&mut lio).wait();
+    /// let total = result.unwrap() as usize;
+    /// ```
+    #[cfg(unix)]
+    #[cfg_attr(docsrs, doc(cfg(unix)))]
+    pub fn readv(res: &impl AsResource, bufs: Vec<Vec<u8>>) -> Io<ops::Readv> {
+        Io::from_op(ops::Readv::new(res.as_resource().clone(), bufs))
+    }
+
+    /// Gather-write: write from multiple buffers to a file descriptor in one call.
+    ///
+    /// Equivalent to the [`writev(2)`](https://man7.org/linux/man-pages/man2/writev.2.html) syscall.
+    ///
+    /// Each `Vec<u8>` in `bufs` is written up to its **length** in order.
+    ///
+    /// # Returns
+    ///
+    /// `(io::Result<i32>, Vec<Vec<u8>>)` – the total byte count and the original buffers.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use lio::{Lio, api};
+    /// use lio::api::resource::Resource;
+    /// use std::os::fd::FromRawFd;
+    ///
+    /// let mut lio = Lio::new(64).unwrap();
+    /// let fd = unsafe { Resource::from_raw_fd(libc::STDOUT_FILENO) };
+    ///
+    /// let bufs = vec![b"Hello, ".to_vec(), b"world!\n".to_vec()];
+    /// let (result, _bufs) = api::writev(&fd, bufs).with_lio(&mut lio).wait();
+    /// assert_eq!(result.unwrap(), 14);
+    /// ```
+    #[cfg(unix)]
+    #[cfg_attr(docsrs, doc(cfg(unix)))]
+    pub fn writev(res: &impl AsResource, bufs: Vec<Vec<u8>>) -> Io<ops::Writev> {
+        Io::from_op(ops::Writev::new(res.as_resource().clone(), bufs))
+    }
 }

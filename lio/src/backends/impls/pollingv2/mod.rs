@@ -503,6 +503,30 @@ impl Poller {
           0,
         ))
       },
+      // SAFETY: fd is valid (from AsRawFd), ptr/len are valid iovec array from TypedOp.
+      Op::Readv { fd, buffer } => {
+        let crate::op::RawIovecBuf { ptr, len } =
+          unsafe { buffer.peek::<crate::op::RawIovecBuf>() };
+        unsafe {
+          syscall_result_ssize(libc::readv(
+            fd.as_raw_fd(),
+            ptr,
+            len as libc::c_int,
+          ))
+        }
+      }
+      // SAFETY: fd is valid (from AsRawFd), ptr/len are valid iovec array from TypedOp.
+      Op::Writev { fd, buffer } => {
+        let crate::op::RawIovecBuf { ptr, len } =
+          unsafe { buffer.peek::<crate::op::RawIovecBuf>() };
+        unsafe {
+          syscall_result_ssize(libc::writev(
+            fd.as_raw_fd(),
+            ptr,
+            len as libc::c_int,
+          ))
+        }
+      }
       Op::Timeout { duration, .. } => {
         std::thread::sleep(duration);
         0
@@ -532,7 +556,9 @@ impl IoBackend for Poller {
       Op::ReadAt { .. }
       | Op::WriteAt { .. }
       | Op::Read { .. }
-      | Op::Write { .. } => {
+      | Op::Write { .. }
+      | Op::Readv { .. }
+      | Op::Writev { .. } => {
         let result = Poller::run_op_blocking(op);
         self.immediate.push(ImmediateCompletion { id, result });
         return Ok(());
