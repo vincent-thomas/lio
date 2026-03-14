@@ -124,10 +124,45 @@ fn test_readv_writev_roundtrip() {
   assert_eq!(&combined[..total], full_data.as_slice());
 }
 
+/// Ensure that buffers beyond the last filled one have length 0.
+/// This covers the case where the file is smaller than the combined capacity.
+#[test]
+fn test_readv_partial_fill_clears_unused_buffers() {
+  let mut lio = Lio::new(64).unwrap();
+  let temp = TempFile::new("readv_partial_fill");
+
+  // Write only 10 bytes
+  let test_data = b"0123456789";
+  unsafe {
+    let fd = libc::open(
+      temp.path.as_ptr(),
+      libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+      0o644,
+    );
+    libc::write(fd, test_data.as_ptr() as *const libc::c_void, test_data.len());
+    libc::close(fd);
+  }
+
+  let fd = unsafe {
+    Resource::from_raw_fd(libc::open(temp.path.as_ptr(), libc::O_RDONLY))
+  };
+
+  // Three buffers: first gets 8 bytes, second gets 2 bytes, third gets nothing
+  let bufs = vec![vec![0u8; 8], vec![0u8; 16], vec![0u8; 16]];
+  let mut recv = api::readv(&fd, bufs).with_lio(&mut lio).send();
+  let (result, bufs) = poll_recv(&mut lio, &mut recv);
+  let total = result.expect("readv partial fill failed") as usize;
+
+  assert_eq!(total, test_data.len());
+  assert_eq!(bufs[0], b"01234567");
+  assert_eq!(bufs[1], b"89");
+  // Third buffer received nothing — its length must be 0.
+  assert_eq!(bufs[2].len(), 0);
+}
+
 /// Verify that readv with a single buffer matches a plain read.
 #[test]
-fn test_readv_single_buffer() {
-  let mut lio = Lio::new(64).unwrap();
+fn test_readv_single_buffer() {  let mut lio = Lio::new(64).unwrap();
   let temp = TempFile::new("readv_single");
 
   let test_data = b"single buffer test data";

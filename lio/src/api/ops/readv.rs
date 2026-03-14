@@ -58,9 +58,15 @@ impl TypedOp for Readv {
     if res < 0 {
       (Err(std::io::Error::from_raw_os_error((-res) as i32)), bufs)
     } else {
-      // Distribute the bytes read across the buffers in order.
+      // Distribute the bytes read across buffers in order, then zero-length
+      // any buffers the kernel did not reach.
       let mut remaining = res as usize;
-      for buf in &mut bufs {
+      let mut first_empty = bufs.len(); // first index that got 0 bytes
+      for (i, buf) in bufs.iter_mut().enumerate() {
+        if remaining == 0 {
+          first_empty = i;
+          break;
+        }
         let cap = buf.capacity();
         if remaining >= cap {
           // SAFETY: The kernel filled `cap` bytes into this buffer.
@@ -69,8 +75,14 @@ impl TypedOp for Readv {
         } else {
           // SAFETY: The kernel filled `remaining` bytes into this buffer.
           unsafe { buf.set_len(remaining) };
-          break;
+          first_empty = i + 1;
+          remaining = 0;
         }
+      }
+      // Any buffers after the last filled one received no data.
+      for buf in &mut bufs[first_empty..] {
+        // SAFETY: 0 is always a valid length.
+        unsafe { buf.set_len(0) };
       }
       (Ok(res as i32), bufs)
     }
