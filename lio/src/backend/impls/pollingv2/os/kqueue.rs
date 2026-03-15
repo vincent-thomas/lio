@@ -506,7 +506,7 @@ mod utils {
 #[allow(dead_code)]
 mod notify {
   use super::*;
-  use crate::backends::pollingv2::os::NOTIFY_KEY;
+  use crate::backend::pollingv2::os::NOTIFY_KEY;
   use std::io;
 
   /// A notification pipe.

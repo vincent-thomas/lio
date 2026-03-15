@@ -2,7 +2,7 @@ use std::{io, net::SocketAddr};
 
 use crate::{
   api::resource::Resource, net_utils::std_socketaddr_into_libc,
-  typed_op::TypedOp,
+  api::op::TypedOp,
 };
 
 pub struct Bind {
@@ -19,9 +19,9 @@ impl Bind {
 assert_op_max_size!(Bind);
 
 impl TypedOp for Bind {
-  type Result = io::Result<()>;
+  crate::impl_io_result!();
 
-  fn into_op(&mut self) -> crate::op::Op {
+  fn into_op(&mut self) -> crate::backend::op::Op {
     let addrlen = if self.addr.ss_family == libc::AF_INET as libc::sa_family_t {
       std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
     } else if self.addr.ss_family == libc::AF_INET6 as libc::sa_family_t {
@@ -30,18 +30,10 @@ impl TypedOp for Bind {
       std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t
     };
 
-    crate::op::Op::Bind {
+    crate::backend::op::Op::Bind {
       fd: self.res.clone(),
       addr: &self.addr as *const _,
       addrlen,
-    }
-  }
-
-  fn extract_result(self, res: isize) -> Self::Result {
-    if res < 0 {
-      Err(io::Error::from_raw_os_error((-res) as i32))
-    } else {
-      Ok(())
     }
   }
 

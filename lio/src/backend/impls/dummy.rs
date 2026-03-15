@@ -7,8 +7,8 @@ use std::io;
 use std::time::Duration;
 
 use crate::{
-  backends::{IoBackend, OpCompleted},
-  op::Op,
+  backend::{IoBackend, OpCompleted},
+  backend::op::Op,
 };
 
 /// A pending operation in the dummy backend
@@ -78,14 +78,12 @@ impl IoBackend for DummyBackend {
 mod tests {
   use super::*;
 
-  #[test]
-  fn test_init() {
-    let mut backend = DummyBackend::new();
-    backend.init(64).unwrap();
-  }
+  // Run the standard IoBackend test suite
+  crate::test_io_backend!(DummyBackend::new());
 
+  // Additional DummyBackend-specific tests
   #[test]
-  fn test_push_and_poll() {
+  fn test_all_ops_complete_with_zero() {
     let mut backend = DummyBackend::new();
     backend.init(64).unwrap();
 
@@ -94,5 +92,10 @@ mod tests {
 
     let completions = backend.wait_timeout(Some(Duration::ZERO)).unwrap();
     assert_eq!(completions.len(), 2);
+
+    // DummyBackend completes all ops with result=0
+    for c in completions {
+      assert_eq!(c.result, 0);
+    }
   }
 }

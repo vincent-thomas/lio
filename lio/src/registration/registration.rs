@@ -7,7 +7,7 @@ use std::task::Waker;
 
 use crate::{
   registration::notifier::{Notifier, OpCallback},
-  typed_op::TypedOp,
+  api::op::TypedOp,
 };
 
 /// Opaque wrapper that hides the `pub(crate)` `Notifier` from the public `Registration` enum.

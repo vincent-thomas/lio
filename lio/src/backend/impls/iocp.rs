@@ -47,8 +47,8 @@ use windows_sys::Win32::System::Threading::{
   CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEONLYONCE,
 };
 
-use crate::backends::{IoBackend, OpCompleted};
-use crate::op::{Op, OpBuf, RawBuf};
+use crate::backend::{IoBackend, OpCompleted};
+use crate::backend::op::{Op, OpBuf, RawBuf};
 
 /// Marker value for wake-up notifications (not a real operation).
 const NOTIFY_KEY: usize = usize::MAX;
@@ -294,7 +294,7 @@ impl Iocp {
         }
       }
 
-      Op::OpenAt { dir_fd: _, path, flags } => {
+      Op::OpenAt { dir_fd: _, path, flags, mode: _ } => {
         // Windows doesn't have openat() - we require absolute paths
         // For now, just use CreateFileW with the path
         // Note: This is a simplified implementation
@@ -992,31 +992,14 @@ fn sockaddr_storage_to_ptr(
 mod tests {
   use super::*;
 
-  #[test]
-  fn test_init() {
-    let mut backend = Iocp::new();
-    backend.init(64).unwrap();
-  }
+  // Run the standard IoBackend test suite
+  crate::test_io_backend!(Iocp::new());
 
+  // IOCP-specific tests
   #[test]
   fn test_notify() {
     let mut backend = Iocp::new();
     backend.init(64).unwrap();
     backend.notify().unwrap();
-  }
-
-  #[test]
-  fn test_nop() {
-    let mut backend = Iocp::new();
-    backend.init(64).unwrap();
-
-    backend.push(1, Op::Nop).unwrap();
-    backend.flush().unwrap();
-
-    let completions =
-      backend.wait_timeout(Some(Duration::from_millis(100))).unwrap();
-    assert_eq!(completions.len(), 1);
-    assert_eq!(completions[0].op_id, 1);
-    assert_eq!(completions[0].result, 0);
   }
 }

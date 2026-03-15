@@ -22,7 +22,7 @@
 //! # Example
 //!
 //! ```
-//! use lio::backends::{IoBackend, pollingv2::Poller};
+//! use lio::backend::{IoBackend, op::Op, pollingv2::Poller};
 //! use std::time::Duration;
 //!
 //! // Create and initialize backend
@@ -30,14 +30,19 @@
 //! backend.init(1024).unwrap();  // Pre-allocate for 1024 concurrent ops
 //!
 //! // Submit a nop operation
-//! backend.push(1, lio::op::Op::Nop).unwrap();
+//! backend.push(1, Op::Nop).unwrap();
 //! backend.flush().unwrap();
 //!
 //! // Poll for completions (non-blocking)
 //! let completions = backend.wait_timeout(Some(Duration::ZERO)).unwrap();
 //! ```
 
-#[cfg(test)]
+pub mod op;
+
+/// Test utilities for IoBackend implementations.
+///
+/// Use the [`test_io_backend!`] macro to generate a comprehensive test suite
+/// for your IoBackend implementation.
 #[macro_use]
 pub mod test_macro;
 
@@ -69,28 +74,12 @@ mod impls {
   pub use iocp::*;
 }
 
-mod store;
-pub use store::*;
+pub(crate) mod store;
 
 use std::io;
 use std::time::Duration;
 
-use crate::op::Op;
-
-/// Error types that can occur when submitting operations to the backend.
-#[derive(Debug)]
-pub enum SubmitErr {
-  /// An I/O error occurred during submission.
-  Io(io::Error),
-  /// The submission queue is full and cannot accept more operations.
-  Full,
-}
-
-impl From<io::Error> for SubmitErr {
-  fn from(value: io::Error) -> Self {
-    Self::Io(value)
-  }
-}
+use crate::backend::op::Op;
 
 /// Represents a completed I/O operation.
 ///

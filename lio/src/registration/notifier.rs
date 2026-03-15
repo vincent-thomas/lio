@@ -1,6 +1,6 @@
 use std::task::Waker;
 
-use crate::typed_op::TypedOp;
+use crate::api::op::TypedOp;
 
 use super::Registration;
 

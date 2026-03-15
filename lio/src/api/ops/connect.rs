@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
   api::resource::Resource, net_utils::std_socketaddr_into_libc,
-  typed_op::TypedOp,
+  api::op::TypedOp,
 };
 
 pub struct Connect {
@@ -33,23 +33,15 @@ impl Connect {
 }
 
 impl TypedOp for Connect {
-  type Result = io::Result<()>;
+  crate::impl_io_result!();
 
-  fn into_op(&mut self) -> crate::op::Op {
+  fn into_op(&mut self) -> crate::backend::op::Op {
     let connect_called = self.connect_called.load(Ordering::Relaxed);
-    crate::op::Op::Connect {
+    crate::backend::op::Op::Connect {
       fd: self.res.clone(),
       addr: &self.addr as *const _,
       len: self.len,
       connect_called,
-    }
-  }
-
-  fn extract_result(self, res: isize) -> Self::Result {
-    if res < 0 {
-      Err(io::Error::from_raw_os_error((-res) as i32))
-    } else {
-      Ok(())
     }
   }
 

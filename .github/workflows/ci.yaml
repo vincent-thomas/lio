@@ -41,7 +41,7 @@ jobs:
         run: make lint
 
   lio-cbuild:
-    name: C build
+    name: C build and uring tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -63,6 +63,9 @@ jobs:
       - name: test cbuild
         run: make test-ffi
 
+      - name: test lio-uring
+        run: make test-uring
+
   lio-build-n-test:
     name: Build n Test
     runs-on: ubuntu-latest
@@ -83,8 +86,13 @@ jobs:
             ~/.cargo/git
           key: cargo-build-cache
 
-      - name: Run test
-        run: make test
+      - name: (main) Run release tests
+        if: github.ref == 'refs/heads/main'
+        run: make test-release
+
+      - name: (PR) Run debug tests
+        if: github.ref != 'refs/heads/main'
+        run: make test-debug
 
   nix-flake-check:
     runs-on: ubuntu-latest

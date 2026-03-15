@@ -1,0 +1,13 @@
+[package]
+name = "lio-tls"
+version = "0.1.0"
+edition = "2024"
+description = "TLS support for lio using rustls"
+license = "MIT"
+
+[dependencies]
+lio = { path = "../lio" }
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+
+[dev-dependencies]
+rcgen = "0.13"

@@ -4,12 +4,17 @@ use lio_uring::{
   Entry, LioUring,
   operation::{
     self, Accept, Bind, Close, Connect, Fsync, Ftruncate, LinkAt, Listen,
-    OpenAt, Read, Recv, Send, Shutdown, Socket, SymlinkAt, Tee, Timeout, Write,
+    MkDirAt, OpenAt, Readv, Recv, RecvMsg, RenameAt, Send, SendMsg, Shutdown,
+    Socket, Splice, SymlinkAt, Tee, Timeout, UnlinkAt, Writev,
   },
 };
 
-use crate::{
-  backends::{IoBackend, OpCompleted},
+// Note: All read/write operations use Readv/Writev with a single iovec for
+// single-buffer ops, or multiple iovecs for vectored ops. The .offset() method
+// is used for positional I/O (preadv/pwritev).
+
+use crate::backend::{
+  IoBackend, OpCompleted,
   op::{Op, RawBuf},
 };
 use std::io;
@@ -19,35 +24,19 @@ use std::time::Duration;
 fn create_io_uring_entry(op: &Op) -> Entry {
   match op {
     Op::Nop => operation::Nop::new().build(),
-    Op::Read { fd, buffer } => {
-      // SAFETY: OpBuf stores RawBuf set by into_op
-      let RawBuf { ptr, len } = unsafe { buffer.peek::<RawBuf>() };
-      Read::new(fd.as_raw_fd(), ptr, len as u32).build()
+    Op::Send { fd, flags, buf } => {
+      Send::new(fd.as_raw_fd(), buf.ptr, buf.len as u32).flags(*flags).build()
     }
-    Op::Write { fd, buffer } => {
-      // SAFETY: OpBuf stores (ptr, len) tuple set by into_op
-      let (ptr, len) = unsafe { buffer.peek::<(*const u8, usize)>() };
-      Write::new(fd.as_raw_fd(), ptr, len as u32).build()
+    Op::Recv { fd, flags, buf } => {
+      Recv::new(fd.as_raw_fd(), buf.ptr, buf.len as u32).flags(*flags).build()
     }
-    Op::ReadAt { fd, offset, buffer } => {
-      // SAFETY: OpBuf stores RawBuf set by into_op
-      let RawBuf { ptr, len } = unsafe { buffer.peek::<RawBuf>() };
-      Read::new(fd.as_raw_fd(), ptr, len as u32).offset(*offset as u64).build()
+    Op::SendTo { fd, flags, msghdr, .. } => {
+      // msghdr is pre-constructed in TypedOp with iovec and address already set
+      SendMsg::new(fd.as_raw_fd(), *msghdr).flags(*flags as u32).build()
     }
-    Op::WriteAt { fd, offset, buffer } => {
-      // SAFETY: OpBuf stores (ptr, len) tuple set by into_op
-      let (ptr, len) = unsafe { buffer.peek::<(*const u8, usize)>() };
-      Write::new(fd.as_raw_fd(), ptr, len as u32).offset(*offset as u64).build()
-    }
-    Op::Send { fd, flags, buffer } => {
-      // SAFETY: OpBuf stores (ptr, len) tuple set by into_op
-      let (ptr, len) = unsafe { buffer.peek::<(*const u8, usize)>() };
-      Send::new(fd.as_raw_fd(), ptr, len as u32).flags(*flags).build()
-    }
-    Op::Recv { fd, flags, buffer } => {
-      // SAFETY: OpBuf stores RawBuf set by into_op
-      let RawBuf { ptr, len } = unsafe { buffer.peek::<RawBuf>() };
-      Recv::new(fd.as_raw_fd(), ptr, len as u32).flags(*flags).build()
+    Op::RecvFrom { fd, flags, msghdr, .. } => {
+      // msghdr is pre-constructed in TypedOp with iovec and address already set
+      RecvMsg::new(fd.as_raw_fd(), *msghdr).flags(*flags as u32).build()
     }
     Op::Accept { fd, addr, len } => {
       // Cast sockaddr_storage* to sockaddr*
@@ -66,8 +55,8 @@ fn create_io_uring_entry(op: &Op) -> Entry {
     Op::Socket { domain, ty, proto } => {
       Socket::new(*domain, *ty, *proto).build()
     }
-    Op::OpenAt { dir_fd, path, flags } => {
-      OpenAt::new(dir_fd.as_raw_fd(), *path).flags(*flags).build()
+    Op::OpenAt { dir_fd, path, flags, mode } => {
+      OpenAt::new(dir_fd.as_raw_fd(), *path).flags(*flags).mode(*mode).build()
     }
     Op::Close { fd } => Close::new(*fd).build(),
     Op::Fsync { fd } => Fsync::new(fd.as_raw_fd()).build(),
@@ -85,6 +74,15 @@ fn create_io_uring_entry(op: &Op) -> Entry {
     Op::SymlinkAt { target, linkpath, dir_fd } => {
       SymlinkAt::new(dir_fd.as_raw_fd(), *target, *linkpath).build()
     }
+    Op::UnlinkAt { dir_fd, path, flags } => {
+      UnlinkAt::new(dir_fd.as_raw_fd(), *path).flags(*flags).build()
+    }
+    Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
+      RenameAt::new(old_dir_fd.as_raw_fd(), *old_path, new_dir_fd.as_raw_fd(), *new_path).build()
+    }
+    Op::MkdirAt { dir_fd, path, mode } => {
+      MkDirAt::new(dir_fd.as_raw_fd(), *path).mode(*mode as libc::mode_t).build()
+    }
     #[cfg(target_os = "linux")]
     Op::Tee { fd_in, fd_out, size } => {
       Tee::new(fd_in.as_raw_fd(), fd_out.as_raw_fd(), *size).build()
@@ -93,6 +91,18 @@ fn create_io_uring_entry(op: &Op) -> Entry {
       // __kernel_timespec has same layout as libc::timespec
       // timespec is already a pointer to data in the boxed TypedOp
       Timeout::new(*timespec as *const _).build()
+    }
+    Op::ReadV { fd, iovecs, iov_count, .. } => {
+      Readv::new(fd.as_raw_fd(), *iovecs, *iov_count as u32).build()
+    }
+    Op::WriteV { fd, iovecs, iov_count, .. } => {
+      Writev::new(fd.as_raw_fd(), *iovecs, *iov_count as u32).build()
+    }
+    Op::ReadVAt { fd, iovecs, iov_count, offset, .. } => {
+      Readv::new(fd.as_raw_fd(), *iovecs, *iov_count as u32).offset(*offset as u64).build()
+    }
+    Op::WriteVAt { fd, iovecs, iov_count, offset, .. } => {
+      Writev::new(fd.as_raw_fd(), *iovecs, *iov_count as u32).offset(*offset as u64).build()
     }
   }
 }
@@ -230,9 +240,6 @@ impl IoBackend for IoUring {
 mod tests {
   use super::*;
 
-  #[test]
-  fn test_init() {
-    let mut backend = IoUring::new();
-    backend.init(64).unwrap();
-  }
+  // Run the standard IoBackend test suite
+  crate::test_io_backend!(IoUring::new());
 }

@@ -5,7 +5,7 @@ use std::os::fd::RawFd;
 #[cfg(windows)]
 use std::os::windows::io::RawHandle;
 
-use crate::typed_op::TypedOp;
+use crate::api::op::TypedOp;
 
 pub struct Close {
   #[cfg(unix)]
@@ -31,24 +31,16 @@ impl Close {
 assert_op_max_size!(Close);
 
 impl TypedOp for Close {
-  type Result = io::Result<()>;
+  crate::impl_io_result!();
 
-  fn into_op(&mut self) -> crate::op::Op {
+  fn into_op(&mut self) -> crate::backend::op::Op {
     #[cfg(unix)]
     {
-      crate::op::Op::Close { fd: self.fd }
+      crate::backend::op::Op::Close { fd: self.fd }
     }
     #[cfg(windows)]
     {
-      crate::op::Op::Close { handle: self.handle, is_socket: self.is_socket }
-    }
-  }
-
-  fn extract_result(self, res: isize) -> Self::Result {
-    if res < 0 {
-      Err(io::Error::from_raw_os_error((-res) as i32))
-    } else {
-      Ok(())
+      crate::backend::op::Op::Close { handle: self.handle, is_socket: self.is_socket }
     }
   }
 }

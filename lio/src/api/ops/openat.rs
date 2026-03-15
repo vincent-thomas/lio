@@ -1,75 +1,43 @@
 use std::{ffi::CString, os::fd::FromRawFd};
 
+use crate::api::op::TypedOp;
 use crate::api::resource::Resource;
-use crate::typed_op::TypedOp;
 
 pub struct OpenAt {
   dir_res: Resource,
   pathname: CString,
   flags: i32,
+  mode: u32,
 }
 
 assert_op_max_size!(OpenAt);
 
 impl OpenAt {
+  /// Creates a new OpenAt operation with default mode (0o666).
   pub(crate) fn new(dir_res: Resource, pathname: CString, flags: i32) -> Self {
-    Self { dir_res, pathname, flags }
+    Self { dir_res, pathname, flags, mode: 0o666 }
   }
 
-  pub fn to_op(self) -> crate::op::Op {
-    crate::op::Op::OpenAt {
-      dir_fd: self.dir_res,
-      path: self.pathname.as_ptr(),
-      flags: self.flags,
-    }
+  /// Creates a new OpenAt operation with explicit mode.
+  pub(crate) fn with_mode(
+    dir_res: Resource,
+    pathname: CString,
+    flags: i32,
+    mode: u32,
+  ) -> Self {
+    Self { dir_res, pathname, flags, mode }
   }
 }
 
 impl TypedOp for OpenAt {
-  type Result = std::io::Result<Resource>;
+  crate::impl_io_result!(Resource);
 
-  fn into_op(&mut self) -> crate::op::Op {
-    crate::op::Op::OpenAt {
+  fn into_op(&mut self) -> crate::backend::op::Op {
+    crate::backend::op::Op::OpenAt {
       dir_fd: self.dir_res.clone(),
       path: self.pathname.as_ptr(),
       flags: self.flags,
+      mode: self.mode,
     }
   }
-
-  fn extract_result(self, res: isize) -> Self::Result {
-    if res < 0 {
-      Err(std::io::Error::from_raw_os_error((-res) as i32))
-    } else {
-      // SAFETY: 'res' is valid fd.
-      Ok(unsafe { Resource::from_raw_fd(res as i32) })
-    }
-  }
-
-  // #[cfg(unix)]
-  // fn meta(&self) -> crate::operation::OpMeta {
-  //   crate::operation::OpMeta::CAP_FD
-  // }
-
-  // #[cfg(unix)]
-  // fn cap(&self) -> i32 {
-  //   self.dir_res.as_raw_fd()
-  // }
-
-  // #[cfg(linux)]
-  // fn create_entry(&self) -> lio_uring::submission::Entry {
-  //   lio_uring::operation::OpenAt::new(
-  //     self.dir_res.as_raw_fd(),
-  //     self.pathname.as_ptr(),
-  //   )
-  //   .flags(self.flags)
-  //   .build()
-  // }
-
-  // fn run_blocking(&self) -> isize {
-  //   syscall!(raw openat(
-  //     self.dir_res.as_raw_fd(),
-  //     self.pathname.as_ptr(),
-  //     self.flags
-  //   ))
-  // }
 }

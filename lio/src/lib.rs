@@ -46,25 +46,23 @@
 
 #[macro_use]
 mod macros;
-pub mod buf;
 #[cfg(feature = "unstable_ffi")]
 pub mod ffi;
 mod net_utils;
 
+#[cfg(feature = "quic")]
+pub mod quic;
+
+pub mod buf;
+pub mod fs;
 pub mod net;
 
-pub mod fs;
-
-pub use buf::BufResult;
-
-pub mod op;
-pub mod typed_op;
+pub use buf::{BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec, MAX_IOV_COUNT};
 
 #[path = "registration/registration.rs"]
 mod registration;
 
-#[path = "backends/backends.rs"]
-pub mod backends;
+pub mod backend;
 
 pub mod api;
 #[cfg_attr(docsrs, doc(hidden))]

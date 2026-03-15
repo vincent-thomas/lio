@@ -10,7 +10,7 @@ use std::{
   os::fd::{FromRawFd, RawFd},
 };
 
-use crate::{api::resource::Resource, op::Op, typed_op::TypedOp};
+use crate::{api::resource::Resource, backend::op::Op, api::op::TypedOp};
 
 /// Accept operation for Unix domain sockets.
 ///

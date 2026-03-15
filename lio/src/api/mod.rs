@@ -72,9 +72,12 @@
 //! - [`crate::buf`] - Buffer types and pooling
 
 pub mod io;
+pub mod op;
 pub mod ops;
 pub mod resource;
-use crate::{api::resource::AsResource, buf::BufLike};
+
+use crate::api::resource::AsResource;
+use crate::buf::{IoBuf, IoBufMut, IoBufMutVec, IoBufVec};
 use io::Io;
 use std::{ffi::CString, net::SocketAddr, time::Duration};
 
@@ -170,6 +173,101 @@ doc_op!(
   }
 );
 
+doc_op!(
+  short: "Remove a file or directory.",
+  syscall: "unlinkat(2)",
+  doc_link: "https://man7.org/linux/man-pages/man2/unlinkat.2.html",
+
+  ///
+  /// # Parameters
+  ///
+  /// - `dir_res`: Directory file descriptor (use `AT_FDCWD` for current directory)
+  /// - `path`: Path to the file or directory to remove
+  /// - `flags`: Optional flags. Use `libc::AT_REMOVEDIR` to remove a directory.
+  ///
+  /// # Examples
+  ///
+  /// ```rust,no_run
+  /// use std::ffi::CString;
+  ///
+  /// async fn unlink_example() -> std::io::Result<()> {
+  ///     # use lio::api::resource::Resource;
+  ///     # use std::os::fd::FromRawFd;
+  ///     # let dir = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+  ///     let path = CString::new("/tmp/file.txt").unwrap();
+  ///     lio::api::unlinkat(&dir, path, 0).await?;
+  ///     Ok(())
+  /// }
+  /// ```
+  pub fn unlinkat(dir_res: &impl AsResource, path: CString, flags: i32) -> Io<ops::UnlinkAt> {
+    Io::from_op(ops::UnlinkAt::new(dir_res.as_resource().clone(), path, flags))
+  }
+);
+
+doc_op!(
+  short: "Rename a file or directory.",
+  syscall: "renameat(2)",
+  doc_link: "https://man7.org/linux/man-pages/man2/renameat.2.html",
+
+  ///
+  /// # Parameters
+  ///
+  /// - `old_dir_res`: Directory fd for the old path
+  /// - `old_path`: Current path of the file
+  /// - `new_dir_res`: Directory fd for the new path
+  /// - `new_path`: New path for the file
+  ///
+  /// # Examples
+  ///
+  /// ```rust,no_run
+  /// use std::ffi::CString;
+  ///
+  /// async fn rename_example() -> std::io::Result<()> {
+  ///     # use lio::api::resource::Resource;
+  ///     # use std::os::fd::FromRawFd;
+  ///     # let dir = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+  ///     let old = CString::new("/tmp/old.txt").unwrap();
+  ///     let new = CString::new("/tmp/new.txt").unwrap();
+  ///     lio::api::renameat(&dir, old, &dir, new).await?;
+  ///     Ok(())
+  /// }
+  /// ```
+  pub fn renameat(old_dir_res: &impl AsResource, old_path: CString, new_dir_res: &impl AsResource, new_path: CString) -> Io<ops::RenameAt> {
+    Io::from_op(ops::RenameAt::new(old_dir_res.as_resource().clone(), old_path, new_dir_res.as_resource().clone(), new_path))
+  }
+);
+
+doc_op!(
+  short: "Create a directory.",
+  syscall: "mkdirat(2)",
+  doc_link: "https://man7.org/linux/man-pages/man2/mkdirat.2.html",
+
+  ///
+  /// # Parameters
+  ///
+  /// - `dir_res`: Directory file descriptor (use `AT_FDCWD` for current directory)
+  /// - `path`: Path to the new directory
+  /// - `mode`: Permission bits for the new directory (e.g., `0o755`)
+  ///
+  /// # Examples
+  ///
+  /// ```rust,no_run
+  /// use std::ffi::CString;
+  ///
+  /// async fn mkdir_example() -> std::io::Result<()> {
+  ///     # use lio::api::resource::Resource;
+  ///     # use std::os::fd::FromRawFd;
+  ///     # let dir = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+  ///     let path = CString::new("/tmp/new_dir").unwrap();
+  ///     lio::api::mkdirat(&dir, path, 0o755).await?;
+  ///     Ok(())
+  /// }
+  /// ```
+  pub fn mkdirat(dir_res: &impl AsResource, path: CString, mode: u32) -> Io<ops::MkdirAt> {
+    Io::from_op(ops::MkdirAt::new(dir_res.as_resource().clone(), path, mode))
+  }
+);
+
 doc_op! {
     short: "Synchronizes file data to storage.",
     syscall: "fsync(2)",
@@ -208,11 +306,11 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn write<B>(res: &impl AsResource, buf: B) -> Io<ops::Write<B>>
+    pub fn write<B>(res: &impl AsResource, buf: B) -> Io<ops::WriteV<B>>
     where
-        B: BufLike + std::marker::Send + Sync
+        B: IoBuf
     {
-        Io::from_op(ops::Write::new(res.as_resource().clone(), buf))
+        Io::from_op(ops::WriteV::new(res.as_resource().clone(), buf))
     }
 }
 
@@ -238,11 +336,11 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn write_at<B>(res: &impl AsResource, buf: B, offset: i64) -> Io<ops::WriteAt<B>>
+    pub fn write_at<B>(res: &impl AsResource, buf: B, offset: i64) -> Io<ops::WriteVAt<B>>
     where
-        B: BufLike + std::marker::Send + Sync
+        B: IoBuf
     {
-        Io::from_op(ops::WriteAt::new(res.as_resource().clone(), buf, offset))
+        Io::from_op(ops::WriteVAt::new(res.as_resource().clone(), buf, offset))
     }
 }
 
@@ -251,11 +349,11 @@ doc_op! {
     syscall: "read(2)",
     doc_link: "https://man7.org/linux/man-pages/man2/read.2.html",
 
-    pub fn read<B>(res: &impl AsResource, mem: B) -> Io<ops::Read<B>>
+    pub fn read<B>(res: &impl AsResource, mem: B) -> Io<ops::ReadV<B>>
     where
-        B: BufLike + std::marker::Send + Sync
+        B: IoBufMut
     {
-        Io::from_op(ops::Read::new(res.as_resource().clone(), mem))
+        Io::from_op(ops::ReadV::new(res.as_resource().clone(), mem))
     }
 }
 
@@ -264,11 +362,11 @@ doc_op! {
   syscall: "pread(2)",
   doc_link: "https://man7.org/linux/man-pages/man2/pwrite.2.html",
 
-  pub fn read_at<B>(res: &impl AsResource, mem: B, offset: i64) -> Io<ops::ReadAt<B>>
+  pub fn read_at<B>(res: &impl AsResource, mem: B, offset: i64) -> Io<ops::ReadVAt<B>>
   where
-      B: BufLike + std::marker::Send + Sync
+      B: IoBufMut
   {
-    Io::from_op(ops::ReadAt::new(res.as_resource().clone(), mem, offset))
+    Io::from_op(ops::ReadVAt::new(res.as_resource().clone(), mem, offset))
   }
 }
 
@@ -442,7 +540,7 @@ doc_op! {
     /// ```
     pub fn send<B>(res: &impl AsResource, buf: B, flags: Option<i32>) -> Io<ops::Send<B>>
     where
-        B: BufLike + std::marker::Send + Sync
+        B: IoBuf
     {
         Io::from_op(ops::Send::new(res.as_resource().clone(), buf, flags))
     }
@@ -469,9 +567,80 @@ doc_op! {
     /// ```
     pub fn recv<B>(res: &impl AsResource, buf: B, flags: Option<i32>) -> Io<ops::Recv<B>>
     where
-        B: BufLike + std::marker::Send + Sync
+        B: IoBufMut
     {
         Io::from_op(ops::Recv::new(res.as_resource().clone(), buf, flags))
+    }
+}
+
+doc_op! {
+    short: "Sends data to a specific address over an unconnected socket.",
+    syscall: "sendto(2)",
+    doc_link: "https://man7.org/linux/man-pages/man2/sendto.2.html",
+
+    ///
+    /// Unlike [`send`], this function allows sending data to a specific destination
+    /// address without first connecting the socket. This is commonly used with UDP sockets.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use std::net::SocketAddr;
+    ///
+    /// async fn sendto_example() -> std::io::Result<()> {
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = Resource::stdin();
+    ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    ///     let data = b"Hello, server!".to_vec();
+    ///     let (bytes_sent, _buf) = lio::api::sendto(&fd, data, addr, None).await;
+    ///     println!("Sent {} bytes", bytes_sent?);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn sendto<B>(res: &impl AsResource, buf: B, addr: SocketAddr, flags: Option<i32>) -> Io<ops::SendTo<B>>
+    where
+        B: IoBuf
+    {
+        Io::from_op(ops::SendTo::new(res.as_resource().clone(), buf, addr, flags))
+    }
+}
+
+doc_op! {
+    short: "Receives data and the sender's address from a socket.",
+    syscall: "recvfrom(2)",
+    doc_link: "https://man7.org/linux/man-pages/man2/recvfrom.2.html",
+
+    ///
+    /// Unlike [`recv`], this function also returns the source address of the received
+    /// data. This is commonly used with UDP sockets to know where the data came from.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    /// - `io::Result<i32>`: The number of bytes received, or an error
+    /// - The buffer (returned for reuse)
+    /// - `Option<SocketAddr>`: The source address, if available
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// async fn recvfrom_example() -> std::io::Result<()> {
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = Resource::stdin();
+    ///     let buffer = vec![0u8; 1024];
+    ///     let (res_bytes, buf, peer_addr) = lio::api::recvfrom(&fd, buffer, None).await;
+    ///     let bytes_received = res_bytes? as usize;
+    ///     if let Some(addr) = peer_addr {
+    ///         println!("Received {} bytes from {}", bytes_received, addr);
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn recvfrom<B>(res: &impl AsResource, buf: B, flags: Option<i32>) -> Io<ops::RecvFrom<B>>
+    where
+        B: IoBufMut
+    {
+        Io::from_op(ops::RecvFrom::new(res.as_resource().clone(), buf, flags))
     }
 }
 
@@ -529,5 +698,129 @@ doc_op! {
     #[cfg_attr(docsrs, doc(cfg(linux)))]
     pub fn tee(res_in: &impl AsResource, res_out: impl AsResource, size: u32) -> Io<ops::Tee> {
         Io::from_op(ops::Tee::new(res_in.as_resource().clone(), res_out.as_resource().clone(), size))
+    }
+}
+
+doc_op! {
+    short: "Reads into multiple buffers with a single syscall (scatter read).",
+    syscall: "readv(2)",
+    doc_link: "https://man7.org/linux/man-pages/man2/readv.2.html",
+
+    ///
+    /// This performs vectored I/O, reading into multiple non-contiguous buffers
+    /// in a single syscall. This can be more efficient than multiple `read` calls.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// async fn readv_example() -> std::io::Result<()> {
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = Resource::stdin();
+    ///     let buf1 = vec![0u8; 512];
+    ///     let buf2 = vec![0u8; 512];
+    ///     let (result, (buf1, buf2)) = lio::api::readv(&fd, (buf1, buf2)).await;
+    ///     let bytes_read = result?;
+    ///     println!("Read {} bytes total", bytes_read);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn readv<B>(res: &impl AsResource, bufs: B) -> Io<ops::ReadV<B>>
+    where
+        B: IoBufMutVec
+    {
+        Io::from_op(ops::ReadV::new(res.as_resource().clone(), bufs))
+    }
+}
+
+doc_op! {
+    short: "Writes from multiple buffers with a single syscall (gather write).",
+    syscall: "writev(2)",
+    doc_link: "https://man7.org/linux/man-pages/man2/writev.2.html",
+
+    ///
+    /// This performs vectored I/O, writing from multiple non-contiguous buffers
+    /// in a single syscall. This can be more efficient than multiple `write` calls.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// async fn writev_example() -> std::io::Result<()> {
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = Resource::stdout();
+    ///     let header = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+    ///     let body = b"Hello, World!".to_vec();
+    ///     let (result, (header, body)) = lio::api::writev(&fd, (header, body)).await;
+    ///     let bytes_written = result?;
+    ///     println!("Wrote {} bytes total", bytes_written);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn writev<B>(res: &impl AsResource, bufs: B) -> Io<ops::WriteV<B>>
+    where
+        B: IoBufVec
+    {
+        Io::from_op(ops::WriteV::new(res.as_resource().clone(), bufs))
+    }
+}
+
+doc_op! {
+    short: "Reads into multiple buffers at a specific offset (scatter read at offset).",
+    syscall: "preadv(2)",
+    doc_link: "https://man7.org/linux/man-pages/man2/preadv.2.html",
+
+    ///
+    /// This performs positional vectored I/O, reading from the given offset
+    /// into multiple non-contiguous buffers in a single syscall.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// async fn readv_at_example() -> std::io::Result<()> {
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = Resource::stdin();
+    ///     let buf1 = vec![0u8; 512];
+    ///     let buf2 = vec![0u8; 512];
+    ///     let (result, (buf1, buf2)) = lio::api::readv_at(&fd, (buf1, buf2), 1024).await;
+    ///     let bytes_read = result?;
+    ///     println!("Read {} bytes at offset 1024", bytes_read);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn readv_at<B>(res: &impl AsResource, bufs: B, offset: i64) -> Io<ops::ReadVAt<B>>
+    where
+        B: IoBufMutVec
+    {
+        Io::from_op(ops::ReadVAt::new(res.as_resource().clone(), bufs, offset))
+    }
+}
+
+doc_op! {
+    short: "Writes from multiple buffers at a specific offset (gather write at offset).",
+    syscall: "pwritev(2)",
+    doc_link: "https://man7.org/linux/man-pages/man2/pwritev.2.html",
+
+    ///
+    /// This performs positional vectored I/O, writing from multiple non-contiguous
+    /// buffers to the given offset in a single syscall.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// async fn writev_at_example() -> std::io::Result<()> {
+    ///     # use lio::api::resource::Resource;
+    ///     # let fd = Resource::stdout();
+    ///     let header = b"Header data".to_vec();
+    ///     let body = b"Body data".to_vec();
+    ///     let (result, (header, body)) = lio::api::writev_at(&fd, (header, body), 0).await;
+    ///     let bytes_written = result?;
+    ///     println!("Wrote {} bytes at offset 0", bytes_written);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn writev_at<B>(res: &impl AsResource, bufs: B, offset: i64) -> Io<ops::WriteVAt<B>>
+    where
+        B: IoBufVec
+    {
+        Io::from_op(ops::WriteVAt::new(res.as_resource().clone(), bufs, offset))
     }
 }

@@ -54,7 +54,7 @@
 //! threads than where operations were initiated. This is particularly useful for
 //! delegating I/O completion handling to dedicated threads.
 
-use crate::{lio, lio::Lio, registration::Registration, typed_op::TypedOp};
+use crate::{lio, lio::Lio, registration::Registration, api::op::TypedOp};
 
 use std::{
   future::Future,

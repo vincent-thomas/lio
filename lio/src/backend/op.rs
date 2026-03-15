@@ -4,7 +4,6 @@
 //! as pure data. Backends match on this enum to execute operations.
 
 use std::ffi::c_char;
-use std::ptr::NonNull;
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -16,88 +15,40 @@ use crate::api::resource::Resource;
 // ErasedBuffer - Type-erased buffer storage
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Non-owning raw buffer pointer for use in [`OpBuf`] by the polling backend.
+/// Non-owning raw buffer pointer used by all backends.
 ///
 /// The actual buffer is owned by the typed op (e.g., `Send<Vec<u8>>`). This struct
-/// holds only a pointer + length so the backend can call the syscall without taking
+/// holds only a pointer + length so backends can call syscalls without taking
 /// ownership, leaving the buffer available for `extract_result`.
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct RawBuf {
   pub ptr: *mut u8,
   pub len: usize,
 }
+
+impl RawBuf {
+  /// Creates an empty RawBuf (null pointer, zero length).
+  #[inline]
+  pub const fn empty() -> Self {
+    Self {
+      ptr: std::ptr::null_mut(),
+      len: 0,
+    }
+  }
+
+  /// Creates a RawBuf from a pointer and length.
+  #[inline]
+  pub const fn new(ptr: *mut u8, len: usize) -> Self {
+    Self { ptr, len }
+  }
+}
+
 // SAFETY: The pointed-to data is owned by a TypedOp which is Send + Sync.
 // We only use this pointer from the thread that scheduled the operation.
 unsafe impl Send for RawBuf {}
 // SAFETY: Same as Send - we only access through the owning TypedOp.
 unsafe impl Sync for RawBuf {}
-
-/// Type-erased buffer storage with proper cleanup.
-///
-/// This allows storing buffers of any type without boxing the entire operation.
-/// The buffer is boxed once, but we avoid the `Box<dyn Operation>` indirection.
-pub struct OpBuf {
-  ptr: Option<NonNull<()>>,
-  drop_fn: unsafe fn(*mut ()),
-}
-
-impl OpBuf {
-  /// Creates a new erased buffer from a value.
-  pub fn new<T: Send + 'static>(value: T) -> Self {
-    let boxed = Box::new(value);
-    Self {
-      ptr: Some(NonNull::new(Box::into_raw(boxed).cast()).unwrap()),
-      drop_fn: Self::drop_erased::<T>,
-    }
-  }
-
-  /// Used in [Self::new].
-  unsafe fn drop_erased<T>(ptr: *mut ()) {
-    // SAFETY: ptr was created from Box::into_raw in new(), and T matches the original type.
-    drop(unsafe { Box::from_raw(ptr as *mut T) });
-  }
-
-  /// Peeks at the contained value by copying it (without consuming/dropping).
-  ///
-  /// # Safety
-  /// Caller must ensure T matches the original type and T: Copy.
-  pub unsafe fn peek<T: Copy>(&self) -> T {
-    let ptr = self
-      .ptr
-      .as_ref()
-      .expect("ErasedBuffer already taken")
-      .as_ptr()
-      .cast::<T>();
-    // SAFETY: Caller guarantees type matches and T is Copy
-    unsafe { *ptr }
-  }
-
-  /// Takes the buffer out, consuming self.
-  ///
-  /// # Safety
-  /// Caller must ensure T matches the original type, if not this is **just as unsafe as
-  /// std::mem::transmute**.
-  pub unsafe fn take<T>(mut self) -> T {
-    let ptr = self.ptr.take().unwrap().as_ptr().cast();
-
-    // SAFETY: Caller guarantees type matches
-    *unsafe { Box::from_raw(ptr) }
-  }
-}
-
-impl Drop for OpBuf {
-  fn drop(&mut self) {
-    if let Some(ptr) = self.ptr.take() {
-      // SAFETY: drop_fn matches the original type
-      unsafe { (self.drop_fn)(ptr.as_ptr()) }
-    };
-  }
-}
-
-// SAFETY: The buffer contents are Send (enforced by new())
-unsafe impl Send for OpBuf {}
-// SAFETY: We only access through &mut self or by consuming
-unsafe impl Sync for OpBuf {}
 
 /// All I/O operations as pure data.
 ///
@@ -105,35 +56,35 @@ unsafe impl Sync for OpBuf {}
 /// Backends match on this enum to create submission entries or execute syscalls.
 pub enum Op {
   // ═══════════════════════════════════════════════════════════════════════════════
-  // Buffer operations - buffer field owns the data, ptr/len point into it
+  // Buffer operations - RawBuf (ptr/len) points to TypedOp's buffer
   // ═══════════════════════════════════════════════════════════════════════════════
-  Read {
-    fd: Resource,
-    buffer: OpBuf,
-  },
-  Write {
-    fd: Resource,
-    buffer: OpBuf,
-  },
-  ReadAt {
-    fd: Resource,
-    offset: i64,
-    buffer: OpBuf,
-  },
-  WriteAt {
-    fd: Resource,
-    offset: i64,
-    buffer: OpBuf,
-  },
   Send {
     fd: Resource,
     flags: i32,
-    buffer: OpBuf,
+    buf: RawBuf,
   },
   Recv {
     fd: Resource,
     flags: i32,
-    buffer: OpBuf,
+    buf: RawBuf,
+  },
+  SendTo {
+    fd: Resource,
+    flags: i32,
+    buf: RawBuf,
+    addr: *const libc::sockaddr_storage,
+    addrlen: libc::socklen_t,
+    /// Pointer to msghdr in TypedOp for io_uring sendmsg (null for other backends)
+    msghdr: *const libc::msghdr,
+  },
+  RecvFrom {
+    fd: Resource,
+    flags: i32,
+    buf: RawBuf,
+    addr: *mut libc::sockaddr_storage,
+    addrlen: *mut libc::socklen_t,
+    /// Pointer to msghdr in TypedOp for io_uring recvmsg (null for other backends)
+    msghdr: *mut libc::msghdr,
   },
 
   // ═══════════════════════════════════════════════════════════════════════════════
@@ -177,6 +128,9 @@ pub enum Op {
     dir_fd: Resource,
     path: *const c_char,
     flags: i32,
+    /// File creation mode (permissions). Used when O_CREAT is set.
+    /// On Unix this is passed to openat() as the 4th argument.
+    mode: u32,
   },
   Close {
     /// Raw file descriptor - we do not hold a Resource here to avoid
@@ -211,6 +165,22 @@ pub enum Op {
     target: *const c_char,
     linkpath: *const c_char,
   },
+  UnlinkAt {
+    dir_fd: Resource,
+    path: *const c_char,
+    flags: i32,
+  },
+  RenameAt {
+    old_dir_fd: Resource,
+    old_path: *const c_char,
+    new_dir_fd: Resource,
+    new_path: *const c_char,
+  },
+  MkdirAt {
+    dir_fd: Resource,
+    path: *const c_char,
+    mode: u32,
+  },
 
   // ═══════════════════════════════════════════════════════════════════════════════
   // Misc
@@ -221,6 +191,34 @@ pub enum Op {
     fd_out: Resource,
     size: u32,
   },
+  /// Splice data between file descriptors via pipe (Linux only).
+  #[cfg(target_os = "linux")]
+  Splice {
+    fd_in: Resource,
+    off_in: i64,
+    fd_out: Resource,
+    off_out: i64,
+    len: u32,
+    flags: u32,
+  },
+  /// Send file data to a socket (Unix).
+  #[cfg(unix)]
+  SendFile {
+    out_fd: Resource,
+    in_fd: Resource,
+    offset: i64,
+    count: usize,
+  },
+  /// Copy data between files server-side (Linux only).
+  #[cfg(target_os = "linux")]
+  CopyFileRange {
+    fd_in: Resource,
+    off_in: i64,
+    fd_out: Resource,
+    off_out: i64,
+    len: usize,
+    flags: u32,
+  },
   Timeout {
     duration: Duration,
     #[cfg(target_os = "linux")]
@@ -229,6 +227,36 @@ pub enum Op {
     timespec: *const libc::timespec,
   },
   Nop,
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // Vectored I/O operations (scatter/gather)
+  // ═══════════════════════════════════════════════════════════════════════════════
+  ReadV {
+    fd: Resource,
+    buf: RawBuf,
+    iovecs: *const libc::iovec,
+    iov_count: usize,
+  },
+  WriteV {
+    fd: Resource,
+    buf: RawBuf,
+    iovecs: *const libc::iovec,
+    iov_count: usize,
+  },
+  ReadVAt {
+    fd: Resource,
+    buf: RawBuf,
+    iovecs: *const libc::iovec,
+    iov_count: usize,
+    offset: i64,
+  },
+  WriteVAt {
+    fd: Resource,
+    buf: RawBuf,
+    iovecs: *const libc::iovec,
+    iov_count: usize,
+    offset: i64,
+  },
 }
 
 // SAFETY: Op contains raw pointers but they point to data owned by ErasedBuffer

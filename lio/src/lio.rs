@@ -1,6 +1,5 @@
 use crate::{
-  backends::{IoBackend, OpStore},
-  op::Op,
+  backend::{IoBackend, op::Op, store::OpStore},
   registration::Registration,
 };
 
@@ -84,12 +83,12 @@ impl Lio {
       target_os = "netbsd"
     ))]
     {
-      use crate::backends::pollingv2::Poller;
+      use crate::backend::pollingv2::Poller;
       Self::new_with_backend(Poller::new(), cap)
     }
     #[cfg(linux)]
     {
-      use crate::backends::io_uring::IoUring;
+      use crate::backend::io_uring::IoUring;
       Self::new_with_backend(IoUring::new(), cap)
     }
   }
@@ -105,7 +104,7 @@ impl Lio {
   ///
   /// ```
   /// use lio::Lio;
-  /// use lio::backends::pollingv2::Poller;
+  /// use lio::backend::pollingv2::Poller;
   ///
   /// let mut lio = Lio::new_with_backend(Poller::new(), 1024).unwrap();
   /// ```

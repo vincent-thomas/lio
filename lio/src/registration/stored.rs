@@ -1,6 +1,6 @@
 use std::task::Waker;
 
-use crate::{op::Op, registration::notifier::Notifier, typed_op::TypedOp};
+use crate::{op::Op, registration::notifier::Notifier, api::op::TypedOp};
 
 /// Type-safe stored operation with compile-time result type guarantees.
 ///

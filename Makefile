@@ -1,4 +1,4 @@
-.PHONY: lint lint-full doc cbuild test test-lio-uring test-doc test-lib test-integration test-nix vm-linux vm-windows vm-freebsd vm-all
+.PHONY: lint lint-full doc cbuild test test-debug test-release test-lio-uring test-doc test-lib test-integration test-nix vm-linux vm-windows vm-freebsd vm-all
 
 lint:
 	nix develop .#ci -c ./scripts/lint.sh
@@ -15,10 +15,15 @@ doc: test-doc
 cbuild:
 	cargo rustc -p lio --crate-type dylib,staticlib --features unstable_ffi --release
 
-test:
+test: test-debug
+
+test-debug:
 	nix develop -c ./scripts/test.sh
 
-test-lio-uring:
+test-release:
+	nix develop -c ./scripts/test.sh --release
+
+test-uring:
 	nix develop -c ./scripts/test-lio-uring.sh
 
 test-ffi:

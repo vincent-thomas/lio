@@ -1,8 +1,8 @@
 use std::io;
 use std::os::fd::{FromRawFd, RawFd};
 
+use crate::api::op::TypedOp;
 use crate::api::resource::Resource;
-use crate::typed_op::TypedOp;
 
 // Not detach safe.
 pub struct Socket {
@@ -21,21 +21,13 @@ impl Socket {
   ) -> Self {
     Self { domain, ty, proto }
   }
-  //
-  // pub fn to_op(self) -> crate::op::Op {
-  //   crate::op::Op::Socket {
-  //     domain: self.domain,
-  //     ty: self.ty,
-  //     proto: self.proto,
-  //   }
-  // }
 }
 
 impl TypedOp for Socket {
   type Result = std::io::Result<Resource>;
 
-  fn into_op(&mut self) -> crate::op::Op {
-    crate::op::Op::Socket {
+  fn into_op(&mut self) -> crate::backend::op::Op {
+    crate::backend::op::Op::Socket {
       domain: self.domain,
       ty: self.ty,
       proto: self.proto,
@@ -84,18 +76,4 @@ impl TypedOp for Socket {
       Ok(resource)
     }
   }
-
-  // #[cfg(unix)]
-  // fn meta(&self) -> crate::operation::OpMeta {
-  //   crate::operation::OpMeta::CAP_FD | crate::operation::OpMeta::FD_READ
-  // }
-
-  // #[cfg(unix)]
-  // fn cap(&self) -> i32 {
-  //   -1
-  // }
-
-  // fn run_blocking(&self) -> isize {
-  //   unsafe { libc::socket(self.domain, self.ty, self.proto) as isize }
-  // }
 }

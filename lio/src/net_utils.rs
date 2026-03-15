@@ -5,7 +5,17 @@ use std::{
   ptr,
 };
 
-pub unsafe fn libc_socketaddr_into_std(
+/// Converts a libc sockaddr_storage to a std SocketAddr.
+///
+/// Returns `None` if the address family is not supported (only AF_INET and AF_INET6).
+pub fn libc_socketaddr_into_std(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+  // SAFETY: storage is a valid reference, so the pointer is valid
+  unsafe { libc_socketaddr_into_std_raw(storage as *const _) }.ok()
+}
+
+/// # Safety
+/// `storage` must point to a valid, initialized `sockaddr_storage`.
+pub unsafe fn libc_socketaddr_into_std_raw(
   storage: *const libc::sockaddr_storage,
 ) -> io::Result<SocketAddr> {
   // SAFETY: correct pointer.

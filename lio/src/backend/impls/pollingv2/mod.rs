@@ -26,36 +26,9 @@ use std::io;
 use std::os::fd::RawFd;
 use std::time::Duration;
 
-/// Get the current errno value.
-#[inline]
-fn get_errno() -> libc::c_int {
-  #[cfg(target_os = "linux")]
-  // SAFETY: errno is thread-local and always valid to read after a failed syscall
-  unsafe {
-    *libc::__errno_location()
-  }
-  #[cfg(not(target_os = "linux"))]
-  // SAFETY: errno is thread-local and always valid to read after a failed syscall
-  unsafe {
-    *libc::__error()
-  }
-}
 
-/// Convert a libc syscall result to lio convention.
-/// Libc returns -1 on error and sets errno; we return -errno.
-#[inline]
-fn syscall_result(ret: libc::c_int) -> isize {
-  if ret < 0 { -(get_errno() as isize) } else { ret as isize }
-}
-
-/// Convert a libc syscall result (ssize_t) to lio convention.
-#[inline]
-fn syscall_result_ssize(ret: libc::ssize_t) -> isize {
-  if ret < 0 { -(get_errno() as isize) } else { ret }
-}
-
-use crate::backends::pollingv2::interest::Interest;
-use crate::backends::{IoBackend, OpCompleted};
+use crate::backend::pollingv2::interest::Interest;
+use crate::backend::{IoBackend, OpCompleted};
 // use crate::operation::Operation;
 mod interest;
 
@@ -238,13 +211,13 @@ struct ImmediateCompletion {
 /// # Example
 ///
 /// ```
-/// use lio::backends::{IoBackend, pollingv2::Poller};
+/// use lio::backend::{IoBackend, op::Op, pollingv2::Poller};
 /// use std::time::Duration;
 ///
 /// let mut backend = Poller::default();
 /// backend.init(1024).unwrap();
 ///
-/// backend.push(1, lio::op::Op::Nop).unwrap();
+/// backend.push(1, Op::Nop).unwrap();
 /// backend.flush().unwrap();
 ///
 /// let completions = backend.wait_timeout(Some(Duration::ZERO)).unwrap();
@@ -256,7 +229,7 @@ pub struct Poller {
   /// Map of operation ID to file descriptor (for cleanup)
   fd_map: Option<HashMap<u64, RawFd>>,
   /// Map of operation ID to Op (for completion)
-  op_map: std::collections::HashMap<u64, crate::op::Op>,
+  op_map: std::collections::HashMap<u64, crate::backend::op::Op>,
   /// Event buffer for polling
   events: Events,
   /// Immediate completions (operations that completed without polling)
@@ -284,225 +257,161 @@ impl Poller {
 
   /// Run an op by reference using peek (no ownership transfer of buffers).
   /// Used in wait_timeout so the op can be put back in op_map on EAGAIN.
-  fn run_op_on_event(op: &crate::op::Op) -> isize {
-    use crate::op::Op;
+  fn run_op_on_event(op: &crate::backend::op::Op) -> isize {
+    use crate::backend::op::Op;
     use std::os::fd::AsRawFd;
 
     match op {
-      Op::Read { fd, buffer } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: ErasedBuffer stores RawBuf set by into_op
-        let crate::op::RawBuf { ptr, len } =
-          unsafe { buffer.peek::<crate::op::RawBuf>() };
-        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
-        syscall_result_ssize(unsafe { libc::read(fd, ptr as *mut _, len) })
+      Op::Send { fd, flags, buf } => {
+        syscall!(raw send(fd.as_raw_fd(), buf.ptr as *const _, buf.len, *flags))
       }
-      Op::Write { fd, buffer } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
-        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
-        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
-        syscall_result_ssize(unsafe { libc::write(fd, ptr as *const _, len) })
+      Op::Recv { fd, flags, buf } => {
+        syscall!(raw recv(fd.as_raw_fd(), buf.ptr as *mut _, buf.len, *flags))
       }
-      Op::ReadAt { fd, offset, buffer } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
-        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
-        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
-        syscall_result_ssize(unsafe {
-          libc::pread(fd, ptr as *mut _, len, *offset)
-        })
+      Op::SendTo { fd, flags, buf, addr, addrlen, .. } => {
+        syscall!(raw sendto(fd.as_raw_fd(), buf.ptr as *const _, buf.len, *flags, *addr as *const libc::sockaddr, *addrlen))
       }
-      Op::WriteAt { fd, offset, buffer } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
-        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
-        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
-        syscall_result_ssize(unsafe {
-          libc::pwrite(fd, ptr as *const _, len, *offset)
-        })
+      Op::RecvFrom { fd, flags, buf, addr, addrlen, .. } => {
+        syscall!(raw recvfrom(fd.as_raw_fd(), buf.ptr as *mut _, buf.len, *flags, *addr as *mut libc::sockaddr, *addrlen))
       }
-      Op::Send { fd, flags, buffer } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
-        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
-        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
-        syscall_result_ssize(unsafe {
-          libc::send(fd, ptr as *const _, len, *flags)
-        })
+      Op::Accept { fd, addr, len } => {
+        syscall!(raw accept(fd.as_raw_fd(), *addr as *mut _, *len))
       }
-      Op::Recv { fd, flags, buffer } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
-        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
-        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
-        syscall_result_ssize(unsafe {
-          libc::recv(fd, ptr as *mut _, len, *flags)
-        })
+      Op::ReadV { fd, iovecs, iov_count, .. } => {
+        syscall!(raw readv(fd.as_raw_fd(), *iovecs, *iov_count as libc::c_int))
       }
-      // SAFETY: fd is valid (from AsRawFd), addr/len are valid pointers from Op.
-      Op::Accept { fd, addr, len } => unsafe {
-        syscall_result(libc::accept(fd.as_raw_fd(), *addr as *mut _, *len))
-      },
+      Op::WriteV { fd, iovecs, iov_count, .. } => {
+        syscall!(raw writev(fd.as_raw_fd(), *iovecs, *iov_count as libc::c_int))
+      }
+      Op::ReadVAt { fd, iovecs, iov_count, offset, .. } => {
+        syscall!(raw preadv(fd.as_raw_fd(), *iovecs, *iov_count as libc::c_int, *offset))
+      }
+      Op::WriteVAt { fd, iovecs, iov_count, offset, .. } => {
+        syscall!(raw pwritev(fd.as_raw_fd(), *iovecs, *iov_count as libc::c_int, *offset))
+      }
       Op::Timeout { .. } => 0,
       Op::Connect { fd, addr, len, connect_called } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: fd is valid (from AsRawFd), addr is valid pointer from TypedOp.
-        unsafe {
-          let ret = libc::connect(fd, *addr as *const libc::sockaddr, *len);
-          if ret < 0 {
-            let err = get_errno();
-            if err == libc::EINPROGRESS {
-              return -(err as isize);
-            }
-            // EISCONN means success only when already in the EINPROGRESS flow
-            if err == libc::EISCONN && *connect_called {
-              return 0;
-            }
-            return -(err as isize);
-          }
-          ret as isize
+        let ret = syscall!(raw connect(fd.as_raw_fd(), *addr as *const libc::sockaddr, *len));
+        // EINPROGRESS is returned as-is (caller waits for socket to become writable)
+        // EISCONN means success if we already started connecting
+        if ret == -(libc::EISCONN as isize) && *connect_called {
+          return 0;
         }
+        ret
       }
       _ => panic!("run_op_on_event called for non-event op"),
     }
   }
 
-  fn run_op_blocking(op: crate::op::Op) -> isize {
-    use crate::op::Op;
+  fn run_op_blocking(op: crate::backend::op::Op) -> isize {
+    use crate::backend::op::Op;
     use std::os::fd::AsRawFd;
 
     match op {
-      Op::Read { fd, buffer } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
-        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
-        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
-        syscall_result_ssize(unsafe { libc::read(fd, ptr as *mut _, len) })
+      Op::Send { fd, flags, buf } => {
+        syscall!(raw send(fd.as_raw_fd(), buf.ptr as *const _, buf.len, flags))
       }
-      Op::Write { fd, buffer } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
-        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
-        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
-        syscall_result_ssize(unsafe { libc::write(fd, ptr as *const _, len) })
+      Op::Recv { fd, flags, buf } => {
+        syscall!(raw recv(fd.as_raw_fd(), buf.ptr as *mut _, buf.len, flags))
       }
-      Op::ReadAt { fd, offset, buffer } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
-        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
-        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
-        syscall_result_ssize(unsafe {
-          libc::pread(fd, ptr as *mut _, len, offset)
-        })
+      Op::SendTo { fd, flags, buf, addr, addrlen, .. } => {
+        syscall!(raw sendto(fd.as_raw_fd(), buf.ptr as *const _, buf.len, flags, addr as *const libc::sockaddr, addrlen))
       }
-      Op::WriteAt { fd, offset, buffer } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
-        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
-        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
-        syscall_result_ssize(unsafe {
-          libc::pwrite(fd, ptr as *const _, len, offset)
-        })
+      Op::RecvFrom { fd, flags, buf, addr, addrlen, .. } => {
+        syscall!(raw recvfrom(fd.as_raw_fd(), buf.ptr as *mut _, buf.len, flags, addr as *mut libc::sockaddr, addrlen))
       }
-      Op::Send { fd, flags, buffer } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
-        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
-        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
-        syscall_result_ssize(unsafe {
-          libc::send(fd, ptr as *const _, len, flags)
-        })
+      Op::Accept { fd, addr, len } => {
+        syscall!(raw accept(fd.as_raw_fd(), addr as *mut _, len))
       }
-      Op::Recv { fd, flags, buffer } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: ErasedBuffer stores (ptr, len) tuple set by into_op.
-        let (ptr, len) = unsafe { buffer.peek::<(*mut u8, usize)>() };
-        // SAFETY: fd is valid (from AsRawFd), ptr/len from buffer are valid per Op invariants.
-        syscall_result_ssize(unsafe {
-          libc::recv(fd, ptr as *mut _, len, flags)
-        })
-      }
-      // SAFETY: fd is valid (from AsRawFd), addr/len are valid pointers from Op.
-      Op::Accept { fd, addr, len } => unsafe {
-        syscall_result(libc::accept(fd.as_raw_fd(), addr as *mut _, len))
-      },
       Op::Connect { fd, addr, len, connect_called } => {
-        let fd = fd.as_raw_fd();
-        // SAFETY: fd is valid (from AsRawFd), addr is valid pointer from TypedOp.
-        unsafe {
-          let ret = libc::connect(fd, addr as *const libc::sockaddr, len);
-          if ret < 0 {
-            let err = get_errno();
-            if err == libc::EINPROGRESS {
-              return -(err as isize);
-            }
-            if err == libc::EISCONN && connect_called {
-              return 0;
-            }
-            return -(err as isize);
-          }
-          ret as isize
+        let ret = syscall!(raw connect(fd.as_raw_fd(), addr as *const libc::sockaddr, len));
+        // EINPROGRESS is returned as-is (caller waits for socket to become writable)
+        // EISCONN means success if we already started connecting
+        if ret == -(libc::EISCONN as isize) && connect_called {
+          return 0;
         }
+        ret
       }
-      // SAFETY: fd is valid (from AsRawFd), addr is valid pointer from TypedOp.
-      Op::Bind { fd, addr, addrlen } => unsafe {
-        syscall_result(libc::bind(
-          fd.as_raw_fd(),
-          addr as *const libc::sockaddr,
-          addrlen,
-        ))
-      },
-      // SAFETY: fd is valid (from AsRawFd), backlog is a valid i32.
-      Op::Listen { fd, backlog } => unsafe {
-        syscall_result(libc::listen(fd.as_raw_fd(), backlog))
-      },
-      // SAFETY: fd is valid (from AsRawFd), how is a valid shutdown flag.
-      Op::Shutdown { fd, how } => unsafe {
-        syscall_result(libc::shutdown(fd.as_raw_fd(), how))
-      },
-      // SAFETY: domain, ty, proto are valid socket parameters from Op.
-      Op::Socket { domain, ty, proto } => unsafe {
-        syscall_result(libc::socket(domain, ty, proto))
-      },
-      // SAFETY: dir_fd is valid (from AsRawFd), path is a valid C string from Op.
-      Op::OpenAt { dir_fd, path, flags } => unsafe {
-        syscall_result(libc::openat(dir_fd.as_raw_fd(), path, flags))
-      },
-      // SAFETY: fd is a valid raw fd from Op (ownership transferred to close).
-      Op::Close { fd } => unsafe { syscall_result(libc::close(fd)) },
-      // SAFETY: fd is valid (from AsRawFd).
-      Op::Fsync { fd } => unsafe {
-        syscall_result(libc::fsync(fd.as_raw_fd()))
-      },
-      // SAFETY: fd is valid (from AsRawFd), size is a valid length.
-      Op::Truncate { fd, size } => unsafe {
-        syscall_result(libc::ftruncate(fd.as_raw_fd(), size as libc::off_t))
-      },
-      // SAFETY: dir_fds are valid (from AsRawFd), paths are valid C strings from Op.
-      Op::LinkAt { old_dir_fd, old_path, new_dir_fd, new_path } => unsafe {
-        syscall_result(libc::linkat(
-          old_dir_fd.as_raw_fd(),
-          old_path,
-          new_dir_fd.as_raw_fd(),
-          new_path,
-          0,
-        ))
-      },
-      // SAFETY: dir_fd is valid (from AsRawFd), target/linkpath are valid C strings from Op.
-      Op::SymlinkAt { target, linkpath, dir_fd } => unsafe {
-        syscall_result(libc::symlinkat(target, dir_fd.as_raw_fd(), linkpath))
-      },
+      Op::Bind { fd, addr, addrlen } => {
+        syscall!(raw bind(fd.as_raw_fd(), addr as *const libc::sockaddr, addrlen))
+      }
+      Op::Listen { fd, backlog } => {
+        syscall!(raw listen(fd.as_raw_fd(), backlog))
+      }
+      Op::Shutdown { fd, how } => {
+        syscall!(raw shutdown(fd.as_raw_fd(), how))
+      }
+      Op::Socket { domain, ty, proto } => {
+        syscall!(raw socket(domain, ty, proto))
+      }
+      Op::OpenAt { dir_fd, path, flags, mode } => {
+        syscall!(raw openat(dir_fd.as_raw_fd(), path, flags, mode))
+      }
+      Op::Close { fd } => {
+        syscall!(raw close(fd))
+      }
+      Op::Fsync { fd } => {
+        syscall!(raw fsync(fd.as_raw_fd()))
+      }
+      Op::Truncate { fd, size } => {
+        syscall!(raw ftruncate(fd.as_raw_fd(), size as libc::off_t))
+      }
+      Op::LinkAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
+        syscall!(raw linkat(old_dir_fd.as_raw_fd(), old_path, new_dir_fd.as_raw_fd(), new_path, 0))
+      }
+      Op::SymlinkAt { target, linkpath, dir_fd } => {
+        syscall!(raw symlinkat(target, dir_fd.as_raw_fd(), linkpath))
+      }
+      Op::UnlinkAt { dir_fd, path, flags } => {
+        syscall!(raw unlinkat(dir_fd.as_raw_fd(), path, flags))
+      }
+      Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
+        syscall!(raw renameat(old_dir_fd.as_raw_fd(), old_path, new_dir_fd.as_raw_fd(), new_path))
+      }
+      Op::MkdirAt { dir_fd, path, mode } => {
+        syscall!(raw mkdirat(dir_fd.as_raw_fd(), path, mode as libc::mode_t))
+      }
       #[cfg(target_os = "linux")]
-      // SAFETY: fd_in/fd_out are valid (from AsRawFd), size is a valid length.
-      Op::Tee { fd_in, fd_out, size } => unsafe {
-        syscall_result_ssize(libc::tee(
-          fd_in.as_raw_fd(),
-          fd_out.as_raw_fd(),
-          size as libc::size_t,
-          0,
-        ))
-      },
+      Op::Splice { fd_in, off_in, fd_out, off_out, len, flags } => {
+        let mut off_in_val = off_in;
+        let mut off_out_val = off_out;
+        let off_in_ptr = if off_in == -1 { std::ptr::null_mut() } else { &mut off_in_val };
+        let off_out_ptr = if off_out == -1 { std::ptr::null_mut() } else { &mut off_out_val };
+        syscall!(raw splice(fd_in.as_raw_fd(), off_in_ptr, fd_out.as_raw_fd(), off_out_ptr, len as usize, flags as libc::c_uint))
+      }
+      #[cfg(target_os = "linux")]
+      Op::SendFile { out_fd, in_fd, offset, count } => {
+        let mut off = offset;
+        syscall!(raw sendfile(out_fd.as_raw_fd(), in_fd.as_raw_fd(), &mut off, count))
+      }
+      #[cfg(all(unix, not(target_os = "linux")))]
+      Op::SendFile { out_fd, in_fd, offset, count } => {
+        let mut len: libc::off_t = count as libc::off_t;
+        let ret = syscall!(raw sendfile(in_fd.as_raw_fd(), out_fd.as_raw_fd(), offset, &mut len, std::ptr::null_mut(), 0));
+        if ret == 0 { len as isize } else { ret }
+      }
+      #[cfg(target_os = "linux")]
+      Op::CopyFileRange { fd_in, off_in, fd_out, off_out, len, flags } => {
+        let mut off_in_val = off_in;
+        let mut off_out_val = off_out;
+        syscall!(raw copy_file_range(fd_in.as_raw_fd(), &mut off_in_val, fd_out.as_raw_fd(), &mut off_out_val, len, flags as libc::c_uint))
+      }
+      #[cfg(target_os = "linux")]
+      Op::Tee { fd_in, fd_out, size } => {
+        syscall!(raw tee(fd_in.as_raw_fd(), fd_out.as_raw_fd(), size as libc::size_t, 0))
+      }
+      Op::ReadV { fd, iovecs, iov_count, .. } => {
+        syscall!(raw readv(fd.as_raw_fd(), iovecs, iov_count as libc::c_int))
+      }
+      Op::WriteV { fd, iovecs, iov_count, .. } => {
+        syscall!(raw writev(fd.as_raw_fd(), iovecs, iov_count as libc::c_int))
+      }
+      Op::ReadVAt { fd, iovecs, iov_count, offset, .. } => {
+        syscall!(raw preadv(fd.as_raw_fd(), iovecs, iov_count as libc::c_int, offset))
+      }
+      Op::WriteVAt { fd, iovecs, iov_count, offset, .. } => {
+        syscall!(raw pwritev(fd.as_raw_fd(), iovecs, iov_count as libc::c_int, offset))
+      }
       Op::Timeout { duration, .. } => {
         std::thread::sleep(duration);
         0
@@ -523,22 +432,24 @@ impl IoBackend for Poller {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: crate::op::Op) -> io::Result<()> {
-    use crate::backends::pollingv2::interest::Interest;
-    use crate::op::Op;
+  fn push(&mut self, id: u64, op: crate::backend::op::Op) -> io::Result<()> {
+    use crate::backend::op::Op;
+    use crate::backend::pollingv2::interest::Interest;
     use std::os::fd::AsRawFd;
 
     let fd_and_interest = match &op {
-      Op::ReadAt { .. }
-      | Op::WriteAt { .. }
-      | Op::Read { .. }
-      | Op::Write { .. } => {
+      Op::ReadV { .. }
+      | Op::WriteV { .. }
+      | Op::ReadVAt { .. }
+      | Op::WriteVAt { .. } => {
         let result = Poller::run_op_blocking(op);
         self.immediate.push(ImmediateCompletion { id, result });
         return Ok(());
       }
       Op::Send { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
+      Op::SendTo { fd, .. } => Some((fd.as_raw_fd(), Interest::WRITE)),
       Op::Recv { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
+      Op::RecvFrom { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
       Op::Accept { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
       Op::Connect { .. } => None,
       Op::Bind { .. }
@@ -563,7 +474,23 @@ impl IoBackend for Poller {
         return Ok(());
       }
       Op::Socket { .. } => None,
-      Op::LinkAt { .. } | Op::SymlinkAt { .. } => {
+      Op::LinkAt { .. }
+      | Op::SymlinkAt { .. }
+      | Op::UnlinkAt { .. }
+      | Op::RenameAt { .. }
+      | Op::MkdirAt { .. } => {
+        let result = Poller::run_op_blocking(op);
+        self.immediate.push(ImmediateCompletion { id, result });
+        return Ok(());
+      }
+      #[cfg(target_os = "linux")]
+      Op::Splice { .. } | Op::CopyFileRange { .. } => {
+        let result = Poller::run_op_blocking(op);
+        self.immediate.push(ImmediateCompletion { id, result });
+        return Ok(());
+      }
+      #[cfg(unix)]
+      Op::SendFile { .. } => {
         let result = Poller::run_op_blocking(op);
         self.immediate.push(ImmediateCompletion { id, result });
         return Ok(());
@@ -720,9 +647,6 @@ impl IoBackend for Poller {
 mod unit_tests {
   use super::*;
 
-  #[test]
-  fn test_init() {
-    let mut backend = Poller::new();
-    backend.init(64).unwrap();
-  }
+  // Run the standard IoBackend test suite
+  crate::test_io_backend!(Poller::new());
 }

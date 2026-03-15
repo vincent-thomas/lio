@@ -12,6 +12,22 @@ typedef struct sockaddr_storage sockaddr_storage;
 #endif
 
 /**
+ * Maximum number of buffers supported for vectored I/O operations.
+ *
+ * This matches the typical kernel limit and ensures efficient syscall handling.
+ */
+#define MAX_IOV_COUNT 16
+
+/**
+ * Interest/Event flags for I/O readiness
+ *
+ * This type is used for both:
+ * - Registering interest (what you want to be notified about)
+ * - Receiving events (what actually happened)
+ */
+typedef struct Interest Interest;
+
+/**
  * Opaque lio driver handle.  Create with [`lio_create`], destroy with
  * [`lio_destroy`].  Not thread-safe; use one handle per thread.
  */

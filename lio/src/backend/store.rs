@@ -66,7 +66,7 @@ impl Index {
 ///
 /// Uses a pre-allocated Vec for O(1) indexed access and cache-friendly
 /// memory layout. Generational indices prevent the ABA problem.
-pub struct OpStore {
+pub(crate) struct OpStore {
   /// Pre-allocated slots with generation tracking
   slots: Vec<Slot>,
   /// Free slot indices available for reuse
@@ -78,7 +78,7 @@ pub struct OpStore {
 }
 
 #[derive(Debug)]
-pub struct StoreAtCapacity;
+pub(crate) struct StoreAtCapacity;
 
 impl std::fmt::Display for StoreAtCapacity {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -196,18 +196,6 @@ impl OpStore {
     self.raw_get_mut_slot(Index::from_u64(id))?.entry.as_mut()
   }
 
-  /// Gets read-only access to an operation's registration.
-  ///
-  /// Returns `None` if the ID is invalid or not found.
-  pub fn get(&self, id: u64) -> Option<&Registration> {
-    self.raw_get_slot(Index::from_u64(id))?.entry.as_ref()
-  }
-
-  fn raw_get_slot(&self, index: Index) -> Option<&Slot> {
-    let slot = self.slots.get(index.slot() as usize)?;
-    if slot.generation == index.generation() { Some(slot) } else { None }
-  }
-
   fn raw_get_mut_slot(&mut self, index: Index) -> Option<&mut Slot> {
     let slot = self.slots.get_mut(index.slot() as usize)?;
     if slot.generation == index.generation() { Some(slot) } else { None }
@@ -321,15 +309,6 @@ mod tests {
   }
 
   #[test]
-  fn test_get_works() {
-    let mut store = OpStore::new();
-    let id = store.insert(dummy_stored_op());
-
-    let registration = store.get(id);
-    assert!(registration.is_some());
-  }
-
-  #[test]
   fn test_index_packing_unpacking() {
     let index = Index { slot: 42, generation: 123 };
     let packed = index.as_u64();
@@ -384,8 +363,8 @@ mod tests {
     assert_eq!(idx3.generation(), 2);
 
     // Old IDs should not work
-    assert!(store.get(id1).is_none());
-    assert!(store.get(id2).is_none());
-    assert!(store.get(id3).is_some());
+    assert!(store.get_mut(id1).is_none());
+    assert!(store.get_mut(id2).is_none());
+    assert!(store.get_mut(id3).is_some());
   }
 }

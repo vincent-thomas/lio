@@ -18,7 +18,7 @@ use std::{io, net::SocketAddr, os::fd::FromRawFd};
 use crate::{
   api::{ops, resource::FromResource},
   net::{Socket, TcpListener, TcpSocket},
-  typed_op::TypedOp,
+  api::op::TypedOp,
 };
 
 /// Accept operation specialized for [`Socket`].
@@ -40,7 +40,7 @@ impl SocketAccept {
 impl TypedOp for SocketAccept {
   type Result = io::Result<(Socket, SocketAddr)>;
 
-  fn into_op(&mut self) -> crate::op::Op {
+  fn into_op(&mut self) -> crate::backend::op::Op {
     self.inner.into_op()
   }
 
@@ -71,8 +71,8 @@ impl SocketNew {
 impl TypedOp for SocketNew {
   type Result = io::Result<Socket>;
 
-  fn into_op(&mut self) -> crate::op::Op {
-    crate::op::Op::Socket {
+  fn into_op(&mut self) -> crate::backend::op::Op {
+    crate::backend::op::Op::Socket {
       domain: self.domain,
       ty: self.ty,
       proto: self.proto,
@@ -104,7 +104,7 @@ impl TcpAccept {
 impl TypedOp for TcpAccept {
   type Result = io::Result<(TcpSocket, SocketAddr)>;
 
-  fn into_op(&mut self) -> crate::op::Op {
+  fn into_op(&mut self) -> crate::backend::op::Op {
     self.inner.into_op()
   }
 

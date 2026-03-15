@@ -28,21 +28,22 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-lio = "0.3"
+lio = "0.4"
 ```
 
 ### Optional Features
 
 ```toml
 [dependencies]
-lio = { version = "0.3", features = ["bytes", "zeroize", "high"] }
+lio = { version = "0.4", features = ["bytes", "zeroize", "dns"] }
 ```
 
 | Feature | Description |
 |---------|-------------|
 | `bytes` | Integration with the `bytes` crate |
 | `zeroize` | Secure memory zeroing on drop |
-| `high` | Higher-level `net` and `fs` modules |
+| `dns` | Async DNS resolution |
+| `quic` | QUIC protocol support (includes `bytes`) |
 | `unstable_ffi` | C FFI bindings (unstable) |
 
 ## Quick Start
@@ -99,10 +100,10 @@ All I/O operations are non-blocking and return an `Io<T>` handle representing an
 use lio::api;
 
 // File operations
-api::openat(dir, path, flags, mode)
+api::openat(&dir, path, flags)
 api::read(&resource, buffer)
 api::write(&resource, data)
-api::close(resource)
+api::close(fd)
 api::fsync(&resource)
 api::truncate(&resource, length)
 

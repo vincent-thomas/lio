@@ -27,10 +27,12 @@ use super::socket::Socket;
 ///
 /// ```rust,no_run
 /// use lio::net::TcpListener;
+/// use std::net::SocketAddr;
 ///
 /// async fn example() -> std::io::Result<()> {
 ///     // Bind to an address and start listening
-///     let listener = TcpListener::bind_async("127.0.0.1:8080").await?;
+///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+///     let listener = TcpListener::bind_async(addr).await?;
 ///
 ///     // Accept incoming connections
 ///     loop {
@@ -78,39 +80,69 @@ impl TcpListener {
   /// Binding with a port number of 0 will request that the OS assign a port to this listener.
   /// The port allocated can be queried via the underlying socket's methods.
   ///
-  /// The address type can be any implementor of [`ToSocketAddrs`], including string slices
-  /// and tuples of IP address and port.
-  ///
   /// # Examples
   ///
   /// ```rust,no_run
   /// use lio::net::TcpListener;
+  /// use std::net::SocketAddr;
   ///
   /// async fn example() -> std::io::Result<()> {
-  ///     // Bind using a string
-  ///     let listener = TcpListener::bind_async("127.0.0.1:8080").await?;
+  ///     // Bind using a SocketAddr
+  ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+  ///     let listener = TcpListener::bind_async(addr).await?;
   ///
-  ///     // Bind to any available address
-  ///     let listener = TcpListener::bind_async("0.0.0.0:0").await?;
+  ///     // Bind to any available port
+  ///     let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+  ///     let listener = TcpListener::bind_async(addr).await?;
   ///
   ///     Ok(())
   /// }
   /// ```
-  // TODO: AsyncToSocketAddrs
-  pub async fn bind_async(addr: impl ToSocketAddrs) -> io::Result<Self> {
-    let mut addrs = addr.to_socket_addrs()?;
-
-    let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
-    let addr = addrs.next().unwrap();
+  pub async fn bind_async(addr: SocketAddr) -> io::Result<Self> {
+    let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    let socket = Socket::new(domain, libc::SOCK_STREAM, 0).await?;
     socket.bind(addr).await?;
     socket.listen().await?;
     Ok(TcpListener(socket))
+  }
+
+  /// Creates a new `TcpListener` bound to an address resolved via async DNS.
+  ///
+  /// This method performs async DNS resolution before binding, allowing you to
+  /// bind to hostnames in addition to IP addresses.
+  ///
+  /// # Arguments
+  ///
+  /// * `hostname` - The hostname to resolve (e.g., "localhost", "0.0.0.0")
+  /// * `port` - The port to bind to
+  ///
+  /// # Examples
+  ///
+  /// ```rust,ignore
+  /// use lio::net::TcpListener;
+  ///
+  /// async fn example() -> std::io::Result<()> {
+  ///     // Bind using localhost
+  ///     let listener = TcpListener::bind_host("localhost", 8080).await?;
+  ///
+  ///     Ok(())
+  /// }
+  /// ```
+  #[cfg(feature = "dns")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "dns")))]
+  pub async fn bind_host(hostname: &str, port: u16) -> io::Result<Self> {
+    let addr = super::dns::resolve_one(hostname, port).await?;
+    Self::bind_async(addr).await
   }
 
   /// Creates a new `TcpListener` which will be bound to the specified address synchronously.
   ///
   /// This is the blocking version of [`bind_async`](Self::bind_async). It will block the
   /// current thread until the socket is created, bound, and listening.
+  ///
+  /// Note: This method performs DNS resolution synchronously (blocking) using
+  /// `ToSocketAddrs::to_socket_addrs()`. For async DNS resolution, use
+  /// [`bind_host`](Self::bind_host) instead.
   ///
   /// # Examples
   ///
@@ -127,9 +159,12 @@ impl TcpListener {
   #[allow(deprecated)]
   pub fn bind_sync(addr: impl ToSocketAddrs) -> io::Result<Self> {
     let mut addrs = addr.to_socket_addrs()?;
+    let addr = addrs.next().ok_or_else(|| {
+      io::Error::new(io::ErrorKind::NotFound, "no addresses resolved")
+    })?;
 
-    let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).wait()?;
-    let addr = addrs.next().unwrap();
+    let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    let socket = Socket::new(domain, libc::SOCK_STREAM, 0).wait()?;
     socket.bind(addr).wait()?;
     socket.listen().wait()?;
     Ok(TcpListener(socket))
@@ -151,9 +186,11 @@ impl TcpListener {
   ///
   /// ```rust,no_run
   /// use lio::net::TcpListener;
+  /// use std::net::SocketAddr;
   ///
   /// async fn example() -> std::io::Result<()> {
-  ///     let listener = TcpListener::bind_async("127.0.0.1:8080").await?;
+  ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+  ///     let listener = TcpListener::bind_async(addr).await?;
   ///
   ///     loop {
   ///         let (socket, addr) = listener.accept().await?;
@@ -214,9 +251,11 @@ impl TcpListener {
 ///
 /// ```rust,no_run
 /// use lio::net::TcpListener;
+/// use std::net::SocketAddr;
 ///
 /// async fn example() -> std::io::Result<()> {
-///     let listener = TcpListener::bind_async("127.0.0.1:8080").await?;
+///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+///     let listener = TcpListener::bind_async(addr).await?;
 ///
 ///     let (socket, addr) = listener.accept().await?;
 ///     println!("Connection from: {}", addr);
@@ -272,9 +311,53 @@ impl TcpSocket {
   /// }
   /// ```
   pub async fn connect_async(addr: SocketAddr) -> io::Result<Self> {
-    let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+    let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    let socket = Socket::new(domain, libc::SOCK_STREAM, 0).await?;
     api::connect(&socket, addr).await?;
     Ok(TcpSocket(socket))
+  }
+
+  /// Opens a TCP connection to a remote host by hostname, with async DNS resolution.
+  ///
+  /// This method performs DNS resolution asynchronously, then connects to the first
+  /// resolved address. Unlike [`connect_async`](Self::connect_async), this accepts
+  /// hostnames in addition to IP addresses.
+  ///
+  /// # Arguments
+  ///
+  /// * `hostname` - The hostname to connect to (e.g., "example.com")
+  /// * `port` - The port to connect to
+  ///
+  /// # Examples
+  ///
+  /// ```rust,ignore
+  /// use lio::net::TcpSocket;
+  ///
+  /// async fn example() -> std::io::Result<()> {
+  ///     // Connect using a hostname
+  ///     let socket = TcpSocket::connect_host("example.com", 80).await?;
+  ///
+  ///     println!("Connected to server");
+  ///
+  ///     Ok(())
+  /// }
+  /// ```
+  #[cfg(feature = "dns")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "dns")))]
+  pub async fn connect_host(hostname: &str, port: u16) -> io::Result<Self> {
+    let addrs = super::dns::resolve(hostname, port).await?;
+
+    let mut last_err = None;
+    for addr in addrs {
+      match Self::connect_async(addr).await {
+        Ok(socket) => return Ok(socket),
+        Err(e) => last_err = Some(e),
+      }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+      io::Error::new(io::ErrorKind::NotFound, "no addresses resolved")
+    }))
   }
 
   /// Opens a TCP connection to a remote host synchronously.
@@ -298,9 +381,44 @@ impl TcpSocket {
   /// ```
   #[allow(deprecated)]
   pub fn connect_sync(addr: SocketAddr) -> io::Result<Self> {
-    let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).wait()?;
+    let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    let socket = Socket::new(domain, libc::SOCK_STREAM, 0).wait()?;
     api::connect(&socket, addr).wait()?;
     Ok(TcpSocket(socket))
+  }
+
+  /// Opens a TCP connection to a remote host by hostname synchronously.
+  ///
+  /// This is the blocking version of [`connect_host`](Self::connect_host). Both DNS
+  /// resolution and connection are performed synchronously.
+  ///
+  /// # Examples
+  ///
+  /// ```rust,no_run
+  /// use lio::net::TcpSocket;
+  ///
+  /// fn example() -> std::io::Result<()> {
+  ///     // This will block until connected
+  ///     let socket = TcpSocket::connect_host_sync("example.com:80")?;
+  ///
+  ///     Ok(())
+  /// }
+  /// ```
+  #[allow(deprecated)]
+  pub fn connect_host_sync(addr: impl ToSocketAddrs) -> io::Result<Self> {
+    let addrs = addr.to_socket_addrs()?;
+
+    let mut last_err = None;
+    for addr in addrs {
+      match Self::connect_sync(addr) {
+        Ok(socket) => return Ok(socket),
+        Err(e) => last_err = Some(e),
+      }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+      io::Error::new(io::ErrorKind::NotFound, "no addresses resolved")
+    }))
   }
 
   /// Receives data from the socket into the provided buffer.

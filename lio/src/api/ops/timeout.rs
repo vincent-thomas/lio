@@ -1,9 +1,9 @@
 use std::io;
 use std::time::Duration;
 
+use crate::api::op::TypedOp;
 #[cfg(linux)]
 use crate::api::resource::Resource;
-use crate::typed_op::TypedOp;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, RawFd};
 
@@ -90,8 +90,8 @@ impl Timeout {
 impl TypedOp for Timeout {
   type Result = std::io::Result<()>;
 
-  fn into_op(&mut self) -> crate::op::Op {
-    crate::op::Op::Timeout {
+  fn into_op(&mut self) -> crate::backend::op::Op {
+    crate::backend::op::Op::Timeout {
       duration: self.duration,
       #[cfg(target_os = "linux")]
       timer_fd: self.timer_res.clone(),
@@ -113,22 +113,4 @@ impl TypedOp for Timeout {
       }
     }
   }
-
-  // #[cfg(unix)]
-  // fn meta(&self) -> crate::operation::OpMeta {
-  //   crate::operation::OpMeta::CAP_TIMER
-  // }
-
-  // #[cfg(unix)]
-  // fn cap(&self) -> i32 {
-  //   #[cfg(target_os = "linux")]
-  //   return self.timer_res.as_raw_fd();
-  //   #[cfg(not(target_os = "linux"))]
-  //   return -1;
-  // }
-
-  // fn run_blocking(&self) -> isize {
-  //   std::thread::sleep(self.duration);
-  //   0
-  // }
 }
