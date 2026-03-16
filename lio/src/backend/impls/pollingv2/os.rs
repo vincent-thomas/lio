@@ -13,3 +13,5 @@ pub mod epoll;
 pub mod kqueue;
 
 const NOTIFY_KEY: u64 = u64::MAX;
+/// Reserved key for the timing wheel's kernel timer.
+const WHEEL_TIMER_KEY: u64 = u64::MAX - 1;

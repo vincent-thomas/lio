@@ -72,6 +72,16 @@ impl IoBackend for DummyBackend {
     }
     Ok(&self.completed)
   }
+
+  fn arm_timer(&mut self, _duration: Duration) -> io::Result<()> {
+    // Dummy backend ignores timers
+    Ok(())
+  }
+
+  fn disarm_timer(&mut self) -> io::Result<()> {
+    // Dummy backend ignores timers
+    Ok(())
+  }
 }
 
 #[cfg(test)]

@@ -1,9 +1,24 @@
 use crate::{
   backend::{IoBackend, op::Op, store::OpStore},
   registration::Registration,
+  time::TimeManager,
 };
 
 use std::{cell::RefCell, io, rc::Rc, task::Waker, time::Duration};
+
+/// Result code returned to userspace when a sleep timer fires.
+/// Matches the expected error codes in TypedOp::extract_result for Sleep.
+#[cfg(target_os = "linux")]
+const SLEEP_RESULT: isize = -(libc::ETIME as isize);
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "dragonfly"))]
+const SLEEP_RESULT: isize = -(libc::ETIMEDOUT as isize);
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "macos",
+  target_os = "freebsd",
+  target_os = "dragonfly"
+)))]
+const SLEEP_RESULT: isize = 0;
 
 thread_local! {
   static GLOBAL_LIO: RefCell<Option<Lio>> = const { RefCell::new(None) };
@@ -44,6 +59,7 @@ pub(crate) fn get_global() -> Option<Lio> {
 struct LioInner {
   store: OpStore,
   io: Box<dyn IoBackend>,
+  time: TimeManager,
 }
 
 #[derive(Clone)]
@@ -55,6 +71,8 @@ pub struct Lio {
 pub enum Error {
   EntryNotFound,
   EntryNotCompleted,
+  /// Stream has finished and all results have been consumed.
+  StreamDone,
 }
 
 impl Lio {
@@ -114,8 +132,11 @@ impl Lio {
   {
     backend.init(cap)?;
 
-    let inner =
-      LioInner { io: Box::new(backend), store: OpStore::with_capacity(cap) };
+    let inner = LioInner {
+      io: Box::new(backend),
+      store: OpStore::with_capacity(cap),
+      time: TimeManager::with_capacity(cap),
+    };
     Ok(Self { inner: Rc::new(RefCell::new(inner)) })
   }
 
@@ -128,7 +149,34 @@ impl Lio {
     // Inserting first because of a stable pointer to push is required.
     let id = inner.store.insert(notifier);
 
+    // Handle sleep timers via the userspace timing wheel instead of kernel
+    if let Op::Sleep { duration, .. } = &op {
+      inner.time.schedule(id, *duration);
+      return Ok(id);
+    }
+
     match inner.io.push(id, op) {
+      Ok(()) => Ok(id),
+      Err(err) => {
+        assert!(inner.store.remove(id));
+        Err(err)
+      }
+    }
+  }
+
+  /// Schedule a streaming operation that yields multiple completions.
+  ///
+  /// This uses `push_stream` on the backend, which may use native multishot
+  /// operations (io_uring) or automatic resubmission (pollingv2).
+  pub(crate) fn schedule_stream(
+    &self,
+    op: Op,
+    notifier: Registration,
+  ) -> io::Result<u64> {
+    let mut inner = self.inner.borrow_mut();
+    let id = inner.store.insert(notifier);
+
+    match inner.io.push_stream(id, op) {
       Ok(()) => Ok(id),
       Err(err) => {
         assert!(inner.store.remove(id));
@@ -162,28 +210,52 @@ impl Lio {
     let mut inner = self.inner.borrow_mut();
     inner.io.flush()?;
 
+    // Compute effective timeout: min of user timeout and next timer deadline
+    let effective_timeout = match (timeout, inner.time.next_deadline()) {
+      (Some(user), Some(timer)) => Some(user.min(timer)),
+      (Some(user), None) => Some(user),
+      (None, Some(timer)) => Some(timer),
+      (None, None) => None,
+    };
+
     // Copy completion data to release borrow on inner.io
     let completed: Vec<_> = inner
       .io
-      .wait_timeout(timeout)?
+      .wait_timeout(effective_timeout)?
       .iter()
-      .map(|c| (c.op_id, c.result))
+      .map(|c| (c.op_id, c.result, c.more))
       .collect();
 
     // Collect IDs to remove (callbacks consume the result, wakers don't)
     let mut to_remove = Vec::new();
 
-    for (op_id, result) in &completed {
+    // Process I/O completions
+    for (op_id, result, more) in &completed {
       let Some(op) = inner.store.get_mut(*op_id) else {
         panic!("lio bookkeeping bug: completed op doesn't exist in store.");
       };
-      op.set_done(*result);
+      op.set_done(*result, *more);
 
-      // If the result was consumed (callback path), mark for removal.
+      // For single-shot ops: remove when result consumed (callback path).
+      // For stream ops: remove when done and all results consumed.
       // Waker path leaves result in place for check_done to consume.
-      if op.result_consumed() {
+      if op.is_finished() {
         to_remove.push(*op_id);
       }
+    }
+
+    // Process expired timers
+    let expired_timers: Vec<_> = inner.time.poll_expired().collect();
+    for timer_id in &expired_timers {
+      if let Some(op) = inner.store.get_mut(*timer_id) {
+        // Timers are single-shot, so more=false
+        op.set_done(SLEEP_RESULT, false);
+        if op.is_finished() {
+          to_remove.push(*timer_id);
+        }
+      }
+      // Remove from TimeManager tracking
+      inner.time.remove(*timer_id);
     }
 
     // Remove consumed entries
@@ -191,7 +263,7 @@ impl Lio {
       inner.store.remove(id);
     }
 
-    Ok(completed.len())
+    Ok(completed.len() + expired_timers.len())
   }
 
   pub(crate) fn check_done(&self, key: u64) -> Result<isize, Error> {
@@ -206,10 +278,46 @@ impl Lio {
     }
   }
 
+  /// Checks for a completed result from a streaming operation.
+  ///
+  /// Unlike `check_done`, this pops one result from the stream's queue
+  /// and only removes the entry when the stream is finished.
+  pub(crate) fn check_stream_done(&self, key: u64) -> Result<isize, Error> {
+    let mut inner = self.inner.borrow_mut();
+    match inner.store.get_mut(key) {
+      Some(entry) => {
+        // Check if stream is finished (done and no pending results)
+        if entry.is_stream_done() {
+          assert!(inner.store.remove(key));
+          return Err(Error::StreamDone);
+        }
+        // Try to pop a result from the stream queue
+        let result = entry.try_take_stream_result().ok_or(Error::EntryNotCompleted)?;
+        // Check again if we should clean up after taking this result
+        if entry.is_stream_done() {
+          assert!(inner.store.remove(key));
+        }
+        Ok(result)
+      }
+      None => Err(Error::EntryNotFound),
+    }
+  }
+
   pub(crate) fn set_waker(&self, id: u64, waker: Waker) {
     let mut inner = self.inner.borrow_mut();
     if let Some(entry) = inner.store.get_mut(id) {
       entry.set_waker(waker);
     }
+  }
+
+  /// Cancel an in-flight streaming operation.
+  ///
+  /// This is called when a stream is dropped to stop multishot operations.
+  pub(crate) fn cancel_stream(&self, id: u64) {
+    let mut inner = self.inner.borrow_mut();
+    // Cancel at the backend level (io_uring async cancel, or pollingv2 deregister)
+    let _ = inner.io.cancel(id);
+    // Remove from store
+    inner.store.remove(id);
   }
 }

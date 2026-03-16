@@ -28,6 +28,14 @@ typedef struct sockaddr_storage sockaddr_storage;
 typedef struct Interest Interest;
 
 /**
+ * Mask of events to watch for on a file or directory.
+ *
+ * These flags are cross-platform and get translated to the appropriate
+ * platform-specific flags (inotify on Linux, EVFILT_VNODE on BSD/macOS).
+ */
+typedef struct WatchMask WatchMask;
+
+/**
  * Opaque lio driver handle.  Create with [`lio_create`], destroy with
  * [`lio_destroy`].  Not thread-safe; use one handle per thread.
  */
@@ -246,7 +254,7 @@ void lio_close(struct lio_handle_t *lio, intptr_t fd, void (*callback)(int));
  * # Safety
  * `lio` must be a valid handle.
  */
-void lio_timeout(struct lio_handle_t *lio, unsigned int millis, void (*callback)(int));
+void lio_sleep(struct lio_handle_t *lio, unsigned int millis, void (*callback)(int));
 
 #ifdef __cplusplus
 }  // extern "C"

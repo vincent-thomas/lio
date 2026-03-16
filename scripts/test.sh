@@ -13,5 +13,5 @@ FEATURES=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].fea
 
 flags=(-p lio --features "$FEATURES")
 
-cargo nextest r "${flags[@]}" --lib $RELEASE_FLAG
-cargo nextest r "${flags[@]}" --test '*' $RELEASE_FLAG
+cargo test "${flags[@]}" --lib $RELEASE_FLAG
+cargo test "${flags[@]}" --test '*' $RELEASE_FLAG

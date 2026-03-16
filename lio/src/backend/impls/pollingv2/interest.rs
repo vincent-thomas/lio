@@ -13,6 +13,8 @@ impl Interest {
   pub const READ: Self = Self { bits: 1 << 0 };
   pub const WRITE: Self = Self { bits: 1 << 1 };
   pub const TIMER: Self = Self { bits: 1 << 2 };
+  /// File/directory change notification (kqueue EVFILT_VNODE, inotify on Linux)
+  pub const VNODE: Self = Self { bits: 1 << 3 };
   pub const READ_AND_WRITE: Self =
     Self { bits: Self::READ.bits | Self::WRITE.bits };
 
@@ -26,6 +28,10 @@ impl Interest {
 
   pub const fn is_timer(self) -> bool {
     self.bits & Self::TIMER.bits != 0
+  }
+
+  pub const fn is_vnode(self) -> bool {
+    self.bits & Self::VNODE.bits != 0
   }
 
   pub const fn is_none(self) -> bool {

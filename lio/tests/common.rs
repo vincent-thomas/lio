@@ -2,8 +2,60 @@ use std::{
   ffi::CString, mem::MaybeUninit, net::SocketAddr, sync::mpsc, time::Duration,
 };
 
-use lio::{Lio, api, api::io::Receiver, api::resource::Resource};
+use lio::{Lio, api, api::io::Io, api::io::Receiver, api::ops, api::resource::Resource};
 use std::os::fd::{AsFd, AsRawFd};
+
+// ============================================================================
+// Socket creation utilities
+// ============================================================================
+
+/// Creates a Unix stream socket using lio operations (blocking).
+///
+/// Returns the Resource which must be closed by the caller using `lio::close()`.
+#[allow(dead_code)]
+pub fn unix_stream_socket() -> Io<ops::Socket> {
+  api::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0)
+}
+
+/// Creates a Unix datagram socket using lio operations (blocking).
+///
+/// Returns the Resource which must be closed by the caller using `lio::close()`.
+#[allow(dead_code)]
+pub fn unix_dgram_socket() -> Io<ops::Socket> {
+  api::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0)
+}
+
+/// Creates a TCP IPv4 socket using lio operations.
+///
+/// Returns a Io that can be used with `.send()`, `.when_done()`, `.blocking()`, etc.
+#[allow(dead_code)]
+pub fn tcp_socket() -> Io<ops::Socket> {
+  api::socket(libc::AF_INET, libc::SOCK_STREAM, 0)
+}
+
+/// Creates a TCP IPv6 socket using lio operations.
+///
+/// Returns a Io that can be used with `.send()`, `.when_done()`, `.blocking()`, etc.
+#[allow(dead_code)]
+pub fn tcp6_socket() -> Io<ops::Socket> {
+  api::socket(libc::AF_INET6, libc::SOCK_STREAM, libc::IPPROTO_TCP)
+}
+
+/// Creates a UDP IPv4 socket using lio operations.
+///
+/// Returns a Io that can be used with `.send()`, `.when_done()`, `.blocking()`, etc.
+#[allow(dead_code)]
+pub fn udp_socket() -> Io<ops::Socket> {
+  api::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP)
+}
+
+/// Creates a UDP IPv6 socket using lio operations.
+///
+/// Returns a Io that can be used with `.send()`, `.when_done()`, `.blocking()`, etc.
+#[allow(dead_code)]
+pub fn udp6_socket() -> Io<ops::Socket> {
+  api::socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP)
+}
 
 /// Utility function to create a unique temporary file path for proptest tests.
 /// Returns a CString path that includes the process ID and a unique value to avoid conflicts.
@@ -34,7 +86,7 @@ pub fn setup_tcp_pair(lio: &mut Lio) -> TcpPair {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   // Create server socket
-  lio::test_utils::tcp_socket().with_lio(lio).send_with(sender_sock.clone());
+  tcp_socket().with_lio(lio).send_with(sender_sock.clone());
 
   let server_sock = poll_until_recv(lio, &receiver_sock)
     .expect("Failed to create server socket");
@@ -52,7 +104,7 @@ pub fn setup_tcp_pair(lio: &mut Lio) -> TcpPair {
   poll_until_recv(lio, &receiver_unit).expect("Failed to listen");
 
   // Create client socket
-  lio::test_utils::tcp_socket().with_lio(lio).send_with(sender_sock.clone());
+  tcp_socket().with_lio(lio).send_with(sender_sock.clone());
   let client_sock = poll_until_recv(lio, &receiver_sock)
     .expect("Failed to create client socket");
 

@@ -106,35 +106,6 @@ impl TcpListener {
     Ok(TcpListener(socket))
   }
 
-  /// Creates a new `TcpListener` bound to an address resolved via async DNS.
-  ///
-  /// This method performs async DNS resolution before binding, allowing you to
-  /// bind to hostnames in addition to IP addresses.
-  ///
-  /// # Arguments
-  ///
-  /// * `hostname` - The hostname to resolve (e.g., "localhost", "0.0.0.0")
-  /// * `port` - The port to bind to
-  ///
-  /// # Examples
-  ///
-  /// ```rust,ignore
-  /// use lio::net::TcpListener;
-  ///
-  /// async fn example() -> std::io::Result<()> {
-  ///     // Bind using localhost
-  ///     let listener = TcpListener::bind_host("localhost", 8080).await?;
-  ///
-  ///     Ok(())
-  /// }
-  /// ```
-  #[cfg(feature = "dns")]
-  #[cfg_attr(docsrs, doc(cfg(feature = "dns")))]
-  pub async fn bind_host(hostname: &str, port: u16) -> io::Result<Self> {
-    let addr = super::dns::resolve_one(hostname, port).await?;
-    Self::bind_async(addr).await
-  }
-
   /// Creates a new `TcpListener` which will be bound to the specified address synchronously.
   ///
   /// This is the blocking version of [`bind_async`](Self::bind_async). It will block the
@@ -315,49 +286,6 @@ impl TcpSocket {
     let socket = Socket::new(domain, libc::SOCK_STREAM, 0).await?;
     api::connect(&socket, addr).await?;
     Ok(TcpSocket(socket))
-  }
-
-  /// Opens a TCP connection to a remote host by hostname, with async DNS resolution.
-  ///
-  /// This method performs DNS resolution asynchronously, then connects to the first
-  /// resolved address. Unlike [`connect_async`](Self::connect_async), this accepts
-  /// hostnames in addition to IP addresses.
-  ///
-  /// # Arguments
-  ///
-  /// * `hostname` - The hostname to connect to (e.g., "example.com")
-  /// * `port` - The port to connect to
-  ///
-  /// # Examples
-  ///
-  /// ```rust,ignore
-  /// use lio::net::TcpSocket;
-  ///
-  /// async fn example() -> std::io::Result<()> {
-  ///     // Connect using a hostname
-  ///     let socket = TcpSocket::connect_host("example.com", 80).await?;
-  ///
-  ///     println!("Connected to server");
-  ///
-  ///     Ok(())
-  /// }
-  /// ```
-  #[cfg(feature = "dns")]
-  #[cfg_attr(docsrs, doc(cfg(feature = "dns")))]
-  pub async fn connect_host(hostname: &str, port: u16) -> io::Result<Self> {
-    let addrs = super::dns::resolve(hostname, port).await?;
-
-    let mut last_err = None;
-    for addr in addrs {
-      match Self::connect_async(addr).await {
-        Ok(socket) => return Ok(socket),
-        Err(e) => last_err = Some(e),
-      }
-    }
-
-    Err(last_err.unwrap_or_else(|| {
-      io::Error::new(io::ErrorKind::NotFound, "no addresses resolved")
-    }))
   }
 
   /// Opens a TCP connection to a remote host synchronously.

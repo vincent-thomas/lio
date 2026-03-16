@@ -2,63 +2,6 @@
 
 use crate::backend::op::Op;
 
-/// Implements `type Result` and `fn extract_result` for common io::Result patterns.
-///
-/// # Usage
-///
-/// ```ignore
-/// impl TypedOp for MyOp {
-///   impl_io_result!();           // io::Result<()>
-///   impl_io_result!(i32);        // io::Result<i32>, returns res as i32
-///   impl_io_result!(Resource);   // io::Result<Resource>, returns from_raw_fd(res)
-///
-///   fn into_op(&mut self) -> Op { ... }
-/// }
-/// ```
-#[macro_export]
-macro_rules! impl_io_result {
-  // io::Result<()> - unit result
-  () => {
-    type Result = std::io::Result<()>;
-
-    fn extract_result(self, res: isize) -> Self::Result {
-      if res < 0 {
-        Err(std::io::Error::from_raw_os_error((-res) as i32))
-      } else {
-        Ok(())
-      }
-    }
-  };
-
-  // io::Result<i32> - return res as i32
-  (i32) => {
-    type Result = std::io::Result<i32>;
-
-    fn extract_result(self, res: isize) -> Self::Result {
-      if res < 0 {
-        Err(std::io::Error::from_raw_os_error((-res) as i32))
-      } else {
-        Ok(res as i32)
-      }
-    }
-  };
-
-  // io::Result<Resource> - return from_raw_fd(res)
-  (Resource) => {
-    type Result = std::io::Result<$crate::api::resource::Resource>;
-
-    fn extract_result(self, res: isize) -> Self::Result {
-      use std::os::fd::FromRawFd;
-      if res < 0 {
-        Err(std::io::Error::from_raw_os_error((-res) as i32))
-      } else {
-        // SAFETY: res is a valid file descriptor returned by the kernel
-        Ok(unsafe { $crate::api::resource::Resource::from_raw_fd(res as i32) })
-      }
-    }
-  };
-}
-
 /// Core trait for type-safe operations that can be converted to Op enum.
 ///
 /// This trait provides a bridge between strongly-typed operations and the
@@ -92,4 +35,53 @@ pub trait TypedOp: Send + Sync + 'static {
   /// This method assumes that `self` contains the correct data that was
   /// used to create the Op, ensuring type-safe result extraction.
   fn extract_result(self, op_result: isize) -> Self::Result;
+}
+
+/// Result from extracting a stream item.
+#[derive(Debug)]
+pub enum StreamResult<T> {
+  /// Stream yielded an item.
+  Item(T),
+  /// Stream is done (no more items).
+  Done,
+}
+
+/// Trait for streaming operations that yield multiple items.
+///
+/// Unlike [`TypedOp`] which produces a single result, `StreamOp` can yield
+/// multiple items over time. This is useful for operations like accepting
+/// connections or watching file changes.
+///
+/// # Platform Differences
+///
+/// - **io_uring**: Uses multishot operations where a single submission can
+///   yield multiple completions.
+/// - **kqueue/epoll**: Each completion triggers a resubmission of the operation.
+#[allow(clippy::wrong_self_convention)]
+pub trait StreamOp: Send + Sync + 'static {
+  /// The type of item yielded by each iteration.
+  type Item: Send + Sync;
+
+  /// Convert this operation into the type-erased Op enum.
+  ///
+  /// For streaming operations, this may be called multiple times
+  /// (once per resubmission on non-multishot backends).
+  fn into_op(&mut self) -> Op;
+
+  /// Extract one item from a completion result.
+  ///
+  /// Returns `StreamResult::Item(item)` if the operation yielded an item,
+  /// or `StreamResult::Done` if the stream is complete.
+  ///
+  /// # Parameters
+  ///
+  /// - `result`: The raw result from the backend completion
+  fn extract_item(&mut self, result: isize) -> StreamResult<Self::Item>;
+
+  /// Reset internal state for resubmission.
+  ///
+  /// Called before resubmitting the operation on backends that don't
+  /// support multishot operations. This is now handled internally by
+  /// the backend layer for stream operations.
+  fn reset(&mut self) {}
 }

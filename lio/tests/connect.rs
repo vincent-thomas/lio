@@ -17,7 +17,7 @@ fn test_connect_basic() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -49,7 +49,7 @@ fn test_connect_basic() {
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen");
 
   // Create client socket and connect
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -85,7 +85,7 @@ fn test_connect_ipv6() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel();
 
-  lio::test_utils::tcp6_socket()
+  common::tcp6_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -116,7 +116,7 @@ fn test_connect_ipv6() {
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen");
 
-  lio::test_utils::tcp6_socket()
+  common::tcp6_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -150,7 +150,7 @@ fn test_connect_to_nonexistent() {
 
   let (sender, receiver) = mpsc::channel();
 
-  lio::test_utils::tcp_socket().with_lio(&mut lio).send_with(sender.clone());
+  common::tcp_socket().with_lio(&mut lio).send_with(sender.clone());
 
   let client_sock = poll_until_recv(&mut lio, &receiver)
     .expect("Failed to create client socket");
@@ -175,7 +175,7 @@ fn test_connect_multiple_clients() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -209,7 +209,7 @@ fn test_connect_multiple_clients() {
   // Connect multiple clients
   let mut client_socks = Vec::new();
   for _ in 0..5 {
-    lio::test_utils::tcp_socket()
+    common::tcp_socket()
       .with_lio(&mut lio)
       .send_with(sender_sock.clone());
 
@@ -237,7 +237,7 @@ fn test_connect_already_connected() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -268,7 +268,7 @@ fn test_connect_already_connected() {
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen");
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -303,7 +303,7 @@ fn test_connect_to_localhost() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -334,7 +334,7 @@ fn test_connect_to_localhost() {
 
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen");
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -372,7 +372,7 @@ fn test_connect_concurrent() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -406,7 +406,7 @@ fn test_connect_concurrent() {
   // Connect multiple clients sequentially
   let mut client_socks = Vec::new();
   for _ in 0..10 {
-    lio::test_utils::tcp_socket()
+    common::tcp_socket()
       .with_lio(&mut lio)
       .send_with(sender_sock.clone());
 
@@ -434,7 +434,7 @@ fn test_connect_with_bind() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -466,7 +466,7 @@ fn test_connect_with_bind() {
   poll_until_recv(&mut lio, &receiver_unit).expect("Failed to listen");
 
   // Create client socket and bind it to a specific local address
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 

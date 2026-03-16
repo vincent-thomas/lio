@@ -48,25 +48,22 @@
 mod macros;
 #[cfg(feature = "unstable_ffi")]
 pub mod ffi;
-mod net_utils;
-
-#[cfg(feature = "quic")]
-pub mod quic;
 
 pub mod buf;
 pub mod fs;
+pub mod io;
 pub mod net;
+pub mod time;
 
-pub use buf::{BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec, MAX_IOV_COUNT};
+pub use buf::{
+  BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec, MAX_IOV_COUNT,
+};
 
-#[path = "registration/registration.rs"]
 mod registration;
 
 pub mod backend;
 
 pub mod api;
-#[cfg_attr(docsrs, doc(hidden))]
-pub mod test_utils;
 
 // Re-export core types
 mod lio;

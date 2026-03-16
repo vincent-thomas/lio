@@ -1,3 +1,4 @@
 [toolchain]
 components = ["clippy", "rust-src", "rustfmt"]
 channel = "nightly"
+targets = ["aarch64-unknown-linux-gnu"]

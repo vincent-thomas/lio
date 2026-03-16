@@ -23,13 +23,13 @@ fn poll_recv_timeout<T>(
 }
 
 #[test]
-fn test_timeout_basic() {
+fn test_sleep_basic() {
   let mut lio = Lio::new(64).unwrap();
 
   let start = Instant::now();
   let timeout_duration = Duration::from_millis(500);
 
-  let mut recv = api::timeout(timeout_duration).with_lio(&mut lio).send();
+  let mut recv = api::sleep(timeout_duration).with_lio(&mut lio).send();
 
   let result = loop {
     if let Some(result) = recv.try_recv() {
@@ -54,18 +54,18 @@ fn test_timeout_basic() {
 }
 
 #[test]
-fn test_timeout_multiple() {
+fn test_sleep_multiple() {
   let mut lio = Lio::new(64).unwrap();
 
   let start = Instant::now();
 
   // Start 3 timeouts with different durations
   let mut recv1 =
-    api::timeout(Duration::from_millis(50)).with_lio(&mut lio).send();
+    api::sleep(Duration::from_millis(50)).with_lio(&mut lio).send();
   let mut recv2 =
-    api::timeout(Duration::from_millis(100)).with_lio(&mut lio).send();
+    api::sleep(Duration::from_millis(100)).with_lio(&mut lio).send();
   let mut recv3 =
-    api::timeout(Duration::from_millis(150)).with_lio(&mut lio).send();
+    api::sleep(Duration::from_millis(150)).with_lio(&mut lio).send();
 
   // They should complete in order
   let result1 = loop {
@@ -114,14 +114,14 @@ fn test_timeout_multiple() {
 }
 
 #[test]
-fn test_timeout_zero_duration() {
+fn test_sleep_zero_duration() {
   let mut lio = Lio::new(64).unwrap();
 
   let start = Instant::now();
 
   // Zero duration timeout should complete almost immediately
   let mut recv =
-    api::timeout(Duration::from_millis(0)).with_lio(&mut lio).send();
+    api::sleep(Duration::from_millis(0)).with_lio(&mut lio).send();
 
   let result = poll_recv_timeout(&mut lio, &mut recv, Duration::from_secs(1))
     .expect("Zero timeout should complete");
@@ -137,13 +137,13 @@ fn test_timeout_zero_duration() {
 }
 
 #[test]
-fn test_timeout_short_duration() {
+fn test_sleep_short_duration() {
   let mut lio = Lio::new(64).unwrap();
 
   let start = Instant::now();
   let timeout_duration = Duration::from_millis(10);
 
-  let mut recv = api::timeout(timeout_duration).with_lio(&mut lio).send();
+  let mut recv = api::sleep(timeout_duration).with_lio(&mut lio).send();
 
   let result = poll_recv_timeout(&mut lio, &mut recv, Duration::from_secs(1))
     .expect("Short timeout should complete");
@@ -160,7 +160,7 @@ fn test_timeout_short_duration() {
 }
 
 #[test]
-fn test_timeout_concurrent_same_duration() {
+fn test_sleep_concurrent_same_duration() {
   let mut lio = Lio::new(64).unwrap();
 
   let (sender, receiver) = mpsc::channel();
@@ -168,7 +168,7 @@ fn test_timeout_concurrent_same_duration() {
 
   // Start 5 timeouts with the same duration
   for _ in 0..5 {
-    api::timeout(timeout_duration).with_lio(&mut lio).send_with(sender.clone());
+    api::sleep(timeout_duration).with_lio(&mut lio).send_with(sender.clone());
   }
 
   let start = Instant::now();
@@ -203,7 +203,7 @@ fn test_timeout_concurrent_same_duration() {
 }
 
 #[test]
-fn test_timeout_interleaved_with_io() {
+fn test_sleep_interleaved_with_io() {
   let mut lio = Lio::new(64).unwrap();
 
   // Create a socket for some I/O
@@ -215,7 +215,7 @@ fn test_timeout_interleaved_with_io() {
   let start = Instant::now();
   let timeout_duration = Duration::from_millis(100);
   let mut timeout_recv =
-    api::timeout(timeout_duration).with_lio(&mut lio).send();
+    api::sleep(timeout_duration).with_lio(&mut lio).send();
 
   // Do some nop operations while waiting
   let (nop_sender, nop_receiver) = mpsc::channel();
@@ -252,16 +252,16 @@ fn test_timeout_interleaved_with_io() {
 }
 
 #[test]
-fn test_timeout_ordering() {
+fn test_sleep_ordering() {
   let mut lio = Lio::new(64).unwrap();
 
   // Start timeouts in reverse order of duration
   let mut recv_long =
-    api::timeout(Duration::from_millis(200)).with_lio(&mut lio).send();
+    api::sleep(Duration::from_millis(200)).with_lio(&mut lio).send();
   let mut recv_medium =
-    api::timeout(Duration::from_millis(100)).with_lio(&mut lio).send();
+    api::sleep(Duration::from_millis(100)).with_lio(&mut lio).send();
   let mut recv_short =
-    api::timeout(Duration::from_millis(50)).with_lio(&mut lio).send();
+    api::sleep(Duration::from_millis(50)).with_lio(&mut lio).send();
 
   let start = Instant::now();
 
@@ -292,7 +292,7 @@ fn test_timeout_ordering() {
 }
 
 #[test]
-fn test_timeout_many_concurrent() {
+fn test_sleep_many_concurrent() {
   let mut lio = Lio::new(256).unwrap();
 
   let (sender, receiver) = mpsc::channel();
@@ -300,7 +300,7 @@ fn test_timeout_many_concurrent() {
   // Start 50 timeouts with varying durations
   for i in 0..50 {
     let duration = Duration::from_millis(50 + (i % 10) * 10);
-    api::timeout(duration).with_lio(&mut lio).send_with(sender.clone());
+    api::sleep(duration).with_lio(&mut lio).send_with(sender.clone());
   }
 
   let start = Instant::now();

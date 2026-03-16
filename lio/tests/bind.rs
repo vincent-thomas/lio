@@ -16,7 +16,7 @@ fn test_bind_ipv4_any_port() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -52,7 +52,7 @@ fn test_bind_ipv4_specific_port() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -89,7 +89,7 @@ fn test_bind_ipv6() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
 
-  lio::test_utils::tcp6_socket()
+  common::tcp6_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -126,7 +126,7 @@ fn test_bind_udp() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
 
-  lio::test_utils::udp_socket()
+  common::udp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -165,7 +165,7 @@ fn test_bind_already_bound() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -198,7 +198,7 @@ fn test_bind_already_bound() {
   };
 
   // Try to bind another socket to the same address
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -224,7 +224,7 @@ fn test_bind_double_bind() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -254,7 +254,7 @@ fn test_bind_with_reuseaddr() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -284,7 +284,7 @@ fn test_bind_with_reuseaddr() {
   drop(sock1);
 
   // Immediately bind another socket to the same address with SO_REUSEADDR
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -317,7 +317,7 @@ fn test_bind_localhost() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -356,7 +356,7 @@ fn test_bind_concurrent() {
 
   // Test binding multiple sockets concurrently to different ports
   for _ in 20000..20010 {
-    lio::test_utils::tcp_socket()
+    common::tcp_socket()
       .with_lio(&mut lio)
       .send_with(sender_sock.clone());
   }

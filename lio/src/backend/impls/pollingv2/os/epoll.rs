@@ -1,5 +1,5 @@
 use super::super::{Interest, ReadinessPoll};
-use super::NOTIFY_KEY;
+use super::{NOTIFY_KEY, WHEEL_TIMER_KEY};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -21,6 +21,12 @@ pub struct OsPoller {
   /// Redox does not support timerfd.
   #[cfg(not(target_os = "redox"))]
   timer_fd: Option<OwnedFd>,
+
+  /// File descriptor for the timing wheel's kernel timer.
+  ///
+  /// This is separate from timer_fd which is used for wait timeouts.
+  #[cfg(not(target_os = "redox"))]
+  wheel_timer_fd: Option<OwnedFd>,
 
   /// Marker to make this type `!Send`
   _not_send: PhantomData<*const ()>,
@@ -47,6 +53,14 @@ impl OsPoller {
       unsafe { OwnedFd::from_raw_fd(fd) }
     };
 
+    #[cfg(not(target_os = "redox"))]
+    let wheel_timer_fd = {
+      let fd: RawFd =
+        syscall!(timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC))?;
+      // SAFETY: fd is valid, just returned successfully from timerfd_create
+      unsafe { OwnedFd::from_raw_fd(fd) }
+    };
+
     let epoll = Self {
       epoll_fd,
       notifier,
@@ -54,12 +68,21 @@ impl OsPoller {
       #[cfg(not(target_os = "redox"))]
       timer_fd: Some(timer_fd),
 
+      #[cfg(not(target_os = "redox"))]
+      wheel_timer_fd: Some(wheel_timer_fd),
+
       _not_send: PhantomData,
     };
 
     #[cfg(not(target_os = "redox"))]
     if let Some(ref timer_fd) = epoll.timer_fd {
       epoll.add(timer_fd.as_raw_fd(), NOTIFY_KEY, Interest::NONE)?;
+    }
+
+    #[cfg(not(target_os = "redox"))]
+    if let Some(ref wheel_timer_fd) = epoll.wheel_timer_fd {
+      // Register the wheel timer fd - initially with no interest (disarmed)
+      epoll.add(wheel_timer_fd.as_raw_fd(), WHEEL_TIMER_KEY, Interest::NONE)?;
     }
 
     epoll.add(
@@ -76,6 +99,10 @@ impl Drop for OsPoller {
     #[cfg(not(target_os = "redox"))]
     if let Some(timer_fd) = self.timer_fd.take() {
       let _ = self.delete(timer_fd.as_fd().as_raw_fd());
+    }
+    #[cfg(not(target_os = "redox"))]
+    if let Some(wheel_timer_fd) = self.wheel_timer_fd.take() {
+      let _ = self.delete(wheel_timer_fd.as_fd().as_raw_fd());
     }
     let _ = self.delete(self.notifier.as_fd().as_raw_fd());
   }
@@ -238,11 +265,12 @@ impl ReadinessPoll for OsPoller {
       Interest::READ,
     )?;
 
-    // Filter out internal NOTIFY_KEY events before returning to caller
-    // This includes both the notifier and timerfd events
+    // Filter out internal NOTIFY_KEY and WHEEL_TIMER_KEY events before returning to caller
+    // This includes the notifier, timerfd events, and wheel timer events
     let mut write_idx = 0;
     for read_idx in 0..n as usize {
-      if events[read_idx].u64 != NOTIFY_KEY {
+      let key = events[read_idx].u64;
+      if key != NOTIFY_KEY && key != WHEEL_TIMER_KEY {
         if write_idx != read_idx {
           events[write_idx] = events[read_idx];
         }
@@ -282,6 +310,96 @@ impl ReadinessPoll for OsPoller {
       (false, true) => Interest::WRITE,
       (false, false) => Interest::READ, // Fallback, shouldn't happen
     }
+  }
+
+  #[cfg(not(target_os = "redox"))]
+  fn arm_wheel_timer(&self, duration: Duration) -> io::Result<()> {
+    /// `timespec` value that equals zero.
+    // SAFETY: All-zeros is a valid representation of timespec (all integer fields)
+    const TS_ZERO: libc::timespec = unsafe {
+      std::mem::transmute([0u8; std::mem::size_of::<libc::timespec>()])
+    };
+
+    let Some(ref wheel_timer_fd) = self.wheel_timer_fd else {
+      return Err(io::Error::new(io::ErrorKind::Unsupported, "no wheel timer fd"));
+    };
+
+    // Convert duration to timespec
+    let ts = libc::timespec {
+      tv_sec: duration.as_secs() as libc::time_t,
+      tv_nsec: duration.subsec_nanos() as libc::c_long,
+    };
+
+    // Ensure at least 1ns to avoid immediate expiry issues
+    let ts = if ts.tv_sec == 0 && ts.tv_nsec == 0 {
+      libc::timespec { tv_sec: 0, tv_nsec: 1 }
+    } else {
+      ts
+    };
+
+    let new_val = libc::itimerspec {
+      it_interval: TS_ZERO, // Don't repeat
+      it_value: ts,
+    };
+
+    let mut result = MaybeUninit::<libc::itimerspec>::uninit();
+    syscall!(timerfd_settime(
+      wheel_timer_fd.as_raw_fd(),
+      0,
+      &new_val as *const _,
+      result.as_mut_ptr()
+    ))?;
+
+    // Enable read interest so we get notified when timer fires
+    self.modify(wheel_timer_fd.as_raw_fd(), WHEEL_TIMER_KEY, Interest::READ)?;
+
+    Ok(())
+  }
+
+  #[cfg(target_os = "redox")]
+  fn arm_wheel_timer(&self, _duration: Duration) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "timerfd not supported on Redox"))
+  }
+
+  #[cfg(not(target_os = "redox"))]
+  fn disarm_wheel_timer(&self) -> io::Result<()> {
+    /// `timespec` value that equals zero.
+    // SAFETY: All-zeros is a valid representation of timespec (all integer fields)
+    const TS_ZERO: libc::timespec = unsafe {
+      std::mem::transmute([0u8; std::mem::size_of::<libc::timespec>()])
+    };
+
+    let Some(ref wheel_timer_fd) = self.wheel_timer_fd else {
+      return Ok(());
+    };
+
+    // Setting it_value to zero disarms the timer
+    let new_val = libc::itimerspec {
+      it_interval: TS_ZERO,
+      it_value: TS_ZERO,
+    };
+
+    let mut result = MaybeUninit::<libc::itimerspec>::uninit();
+    syscall!(timerfd_settime(
+      wheel_timer_fd.as_raw_fd(),
+      0,
+      &new_val as *const _,
+      result.as_mut_ptr()
+    ))?;
+
+    // Disable interest
+    self.modify(wheel_timer_fd.as_raw_fd(), WHEEL_TIMER_KEY, Interest::NONE)?;
+
+    Ok(())
+  }
+
+  #[cfg(target_os = "redox")]
+  fn disarm_wheel_timer(&self) -> io::Result<()> {
+    Ok(())
+  }
+
+  fn is_wheel_timer_key(key: u64) -> bool {
+    key == WHEEL_TIMER_KEY
   }
 }
 

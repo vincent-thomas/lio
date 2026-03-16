@@ -129,10 +129,6 @@
 //! - [`crate::api::resource`]: Resource management for file descriptors
 //! - [`crate::api::io`]: Io type for async operations
 
-#[cfg(feature = "dns")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dns")))]
-pub mod dns;
-
 mod socket;
 mod tcp;
 

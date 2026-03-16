@@ -18,7 +18,7 @@ cbuild:
 test: test-debug
 
 test-debug:
-	nix develop -c ./scripts/test.sh
+	nix run .#test
 
 test-release:
 	nix develop -c ./scripts/test.sh --release

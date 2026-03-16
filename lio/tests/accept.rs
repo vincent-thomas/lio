@@ -17,7 +17,7 @@ fn test_accept_basic() {
   let (sender_sock, receiver_sock) = mpsc::channel();
 
   // Create and setup server socket
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -50,7 +50,7 @@ fn test_accept_basic() {
 
   poll_until_recv(&mut lio, &receiver_listen).expect("listen syscall failed");
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -97,7 +97,7 @@ fn test_accept_multiple() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   // Create server socket
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -145,7 +145,7 @@ fn test_accept_multiple() {
     api::accept(&server_sock).with_lio(&mut lio).send_with(sender_a);
 
     // Create client socket
-    lio::test_utils::tcp_socket().with_lio(&mut lio).send_with(sender_s);
+    common::tcp_socket().with_lio(&mut lio).send_with(sender_s);
 
     let client_sock = poll_until_recv(&mut lio, &receiver_s)
       .expect("Failed to create client socket");
@@ -175,7 +175,7 @@ fn test_accept_with_client_info() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -216,7 +216,7 @@ fn test_accept_with_client_info() {
 
   api::accept(&server_sock).with_lio(&mut lio).send_with(sender_a);
 
-  lio::test_utils::tcp_socket().with_lio(&mut lio).send_with(sender_s);
+  common::tcp_socket().with_lio(&mut lio).send_with(sender_s);
 
   let client_sock = poll_until_recv(&mut lio, &receiver_s)
     .expect("Failed to create client socket");
@@ -237,7 +237,7 @@ fn test_accept_ipv6() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel();
 
-  lio::test_utils::tcp6_socket()
+  common::tcp6_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -276,7 +276,7 @@ fn test_accept_ipv6() {
 
   api::accept(&server_sock).with_lio(&mut lio).send_with(sender_a);
 
-  lio::test_utils::tcp6_socket()
+  common::tcp6_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 

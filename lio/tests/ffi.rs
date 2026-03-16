@@ -196,7 +196,7 @@ macro_rules! ffi_test {
 }
 
 ffi_test!(test_lifecycle);
-ffi_test!(test_timeout);
+ffi_test!(test_sleep);
 ffi_test!(test_file_ops);
 ffi_test!(test_socket_ops);
 ffi_test!(test_send_recv);

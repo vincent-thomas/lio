@@ -100,6 +100,41 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/flake-checker-action@main
 
+  native-test:
+    name: Native Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lio-build-n-test, lint]
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            backend: kqueue
+          - os: windows-latest
+            backend: iocp
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.os }}-
+
+      - name: Run tests
+        run: cargo nextest run -p lio --all-features --release
+
   vm-test:
     name: Test (${{ matrix.name }})
     runs-on: ubuntu-latest

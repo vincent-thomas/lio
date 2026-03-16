@@ -203,43 +203,65 @@ macro_rules! syscall {
   }};
 }
 
-#[cfg(test)]
-pub(crate) mod __internal {
-  pub const MAX_OP_SIZE: usize = 144;
+/// Implements `type Result` and `fn extract_result` for common io::Result patterns.
+///
+/// Use inside a `TypedOp` impl block:
+/// - `impl_io_result!()` - for `io::Result<()>`
+/// - `impl_io_result!(i32)` - for `io::Result<i32>`, returns res as i32
+/// - `impl_io_result!(Resource)` - for `io::Result<Resource>`, returns from_raw_fd(res)
+macro_rules! impl_io_result {
+  // io::Result<()> - unit result
+  () => {
+    type Result = std::io::Result<()>;
+
+    fn extract_result(self, res: isize) -> Self::Result {
+      if res < 0 {
+        Err(std::io::Error::from_raw_os_error((-res) as i32))
+      } else {
+        Ok(())
+      }
+    }
+  };
+
+  // io::Result<i32> - return res as i32
+  (i32) => {
+    type Result = std::io::Result<i32>;
+
+    fn extract_result(self, res: isize) -> Self::Result {
+      if res < 0 {
+        Err(std::io::Error::from_raw_os_error((-res) as i32))
+      } else {
+        Ok(res as i32)
+      }
+    }
+  };
+
+  // io::Result<Resource> - return from_raw_fd(res)
+  (Resource) => {
+    type Result = std::io::Result<crate::api::resource::Resource>;
+
+    fn extract_result(self, res: isize) -> Self::Result {
+      use std::os::fd::FromRawFd;
+      if res < 0 {
+        Err(std::io::Error::from_raw_os_error((-res) as i32))
+      } else {
+        // SAFETY: res is a valid file descriptor returned by the kernel
+        Ok(unsafe { crate::api::resource::Resource::from_raw_fd(res as i32) })
+      }
+    }
+  };
 }
+
+#[allow(dead_code)]
+pub(crate) const MAX_OP_SIZE: usize = 144;
 
 macro_rules! assert_op_max_size {
   ($op_type:ty) => {
-    #[test]
-    fn test_op_size() {
-      // Inline storage size - change this one number to adjust limit for all operations
-
-      let size = std::mem::size_of::<$op_type>();
-
-      assert!(
-        size <= crate::macros::__internal::MAX_OP_SIZE,
-        concat!(
-          "\n\n",
-          "╔════════════════════════════════════════════════════════════╗\n",
-          "║ OPERATION SIZE LIMIT EXCEEDED                              ║\n",
-          "╠════════════════════════════════════════════════════════════╣\n",
-          "║ Operation: ",
-          stringify!($op_type),
-          "\n",
-          "║ Size: {} bytes\n",
-          "║ Maximum allowed: {} bytes\n",
-          "║\n",
-          "║ This operation exceeds the bump allocator inline storage\n",
-          "║ and will cause heap allocations.\n",
-          "║\n",
-          "║ To fix this:\n",
-          "║  1. Reduce operation struct size (preferred), OR\n",
-          "║  2. Increase MAX_OP_SIZE in macros.rs if intentional\n",
-          "╚════════════════════════════════════════════════════════════╝\n"
-        ),
-        size,
-        crate::macros::__internal::MAX_OP_SIZE
-      );
-    }
+    const _: () = {
+      const _SIZE: usize = std::mem::size_of::<$op_type>();
+      const _MAX: usize = crate::macros::MAX_OP_SIZE;
+      // This will fail to compile if _SIZE > _MAX
+      const _ASSERT: [(); 0 - (_SIZE > _MAX) as usize] = [];
+    };
   };
 }

@@ -54,6 +54,7 @@ unsafe impl Sync for RawBuf {}
 ///
 /// Each variant contains only the data needed to execute the operation.
 /// Backends match on this enum to create submission entries or execute syscalls.
+#[derive(Clone)]
 pub enum Op {
   // ═══════════════════════════════════════════════════════════════════════════════
   // Buffer operations - RawBuf (ptr/len) points to TypedOp's buffer
@@ -219,14 +220,43 @@ pub enum Op {
     len: usize,
     flags: u32,
   },
-  Timeout {
+  Sleep {
     duration: Duration,
     #[cfg(target_os = "linux")]
     timer_fd: Resource,
     #[cfg(target_os = "linux")]
     timespec: *const libc::timespec,
   },
+  /// Wraps an inner operation with a timeout deadline.
+  ///
+  /// On io_uring: Uses IORING_OP_LINK_TIMEOUT for kernel-native timeout handling.
+  /// On pollingv2: Uses userspace timeout coordination via TimeManager.
+  ///
+  /// If the timeout fires first, the inner operation is cancelled.
+  /// If the inner operation completes first, the timeout is cancelled.
+  #[cfg(unix)]
+  Timeout {
+    /// The wrapped operation
+    inner: Box<Op>,
+    /// Timeout duration
+    duration: Duration,
+    /// Pointer to timespec in the TypedOp (used by io_uring)
+    #[cfg(target_os = "linux")]
+    timespec: *const libc::timespec,
+  },
   Nop,
+
+  /// Watch a file or directory for changes.
+  ///
+  /// On BSD/macOS: Uses EVFILT_VNODE with kqueue.
+  /// On Linux: Uses inotify.
+  #[cfg(unix)]
+  Watch {
+    /// Path to watch (C string, owned by TypedOp)
+    path: *const c_char,
+    /// Events to watch for (platform-specific flags)
+    mask: u32,
+  },
 
   // ═══════════════════════════════════════════════════════════════════════════════
   // Vectored I/O operations (scatter/gather)

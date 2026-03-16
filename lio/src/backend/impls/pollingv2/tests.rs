@@ -984,6 +984,9 @@ where
 }
 
 /// Test edge key values (0 and near-MAX)
+///
+/// Note: u64::MAX is reserved for NOTIFY_KEY, u64::MAX-1 for WHEEL_TIMER_KEY,
+/// and u64::MAX-2 for TIMEOUT_REMOVE_KEY, so we test with MAX-3.
 pub fn test_edge_key_values<P>(poller: P) -> io::Result<()>
 where
   P: ReadinessPoll,
@@ -1004,40 +1007,39 @@ where
   // Test key = 0
   poller.add(fd1, 0, Interest::WRITE)?;
 
-  // Test key = u64::MAX (might conflict with internal NOTIFY_KEY on some platforms)
-  // This is a critical test - some implementations use usize::MAX internally
-  poller.add(fd2, u64::MAX, Interest::WRITE)?;
+  // Test key = 1 (another simple edge case)
+  poller.add(fd2, 1, Interest::WRITE)?;
 
-  // Test key = u64::MAX - 1
-  poller.add(fd3, u64::MAX - 1, Interest::WRITE)?;
+  // Test key = u64::MAX - 3 (avoid reserved keys: MAX, MAX-1, MAX-2)
+  poller.add(fd3, u64::MAX - 3, Interest::WRITE)?;
 
   let n = poller.wait(&mut events, Some(Duration::from_millis(100)))?;
 
-  // Should get 3 events (or 2 if MAX conflicts with internal notify)
+  // Should get 3 events
   assert!(n >= 2, "Should get at least 2 events for edge keys");
   assert!(n <= 3, "Should get at most 3 events");
 
   // Verify we can distinguish the keys
   let mut found_zero = false;
-  let mut _found_max = false;
-  let mut _found_max_minus_1 = false;
+  let mut found_one = false;
+  let mut found_near_max = false;
 
   for i in 0..n {
     let key = P::event_key(&events[i]);
     if key == 0 {
       found_zero = true;
     }
-    if key == u64::MAX {
-      _found_max = true;
+    if key == 1 {
+      found_one = true;
     }
-    if key == u64::MAX - 1 {
-      _found_max_minus_1 = true;
+    if key == u64::MAX - 3 {
+      found_near_max = true;
     }
   }
 
   assert!(found_zero, "Should find event with key 0");
-  // MAX and MAX-1 might conflict with NOTIFY_KEY on some platforms,
-  // so we track them but don't assert - we just verify no crash
+  assert!(found_one, "Should find event with key 1");
+  assert!(found_near_max, "Should find event with key MAX-3");
 
   Ok(())
 }

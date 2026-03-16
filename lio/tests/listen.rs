@@ -17,7 +17,7 @@ fn test_listen_basic() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -64,7 +64,7 @@ fn test_listen_with_backlog() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -106,7 +106,7 @@ fn test_listen_large_backlog() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -146,7 +146,7 @@ fn test_listen_without_bind() {
 
   let (sender_sock, receiver_sock) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -172,7 +172,7 @@ fn test_listen_ipv6() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp6_socket()
+  common::tcp6_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -213,7 +213,7 @@ fn test_listen_on_udp() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::udp_socket()
+  common::udp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -243,7 +243,7 @@ fn test_listen_twice() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -279,7 +279,7 @@ fn test_listen_zero_backlog() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -319,7 +319,7 @@ fn test_listen_after_close() {
 
   let (sender_sock, receiver_sock) = mpsc::channel();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 
@@ -359,7 +359,7 @@ fn test_listen_concurrent() {
 
   // Test listening on multiple sockets concurrently
   for _ in 0..10 {
-    lio::test_utils::tcp_socket().with_lio(&mut lio).send_with(sender.clone());
+    common::tcp_socket().with_lio(&mut lio).send_with(sender.clone());
   }
 
   let mut sockets = Vec::new();
@@ -414,7 +414,7 @@ fn test_listen_on_all_interfaces() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  lio::test_utils::tcp_socket()
+  common::tcp_socket()
     .with_lio(&mut lio)
     .send_with(sender_sock.clone());
 

@@ -41,8 +41,7 @@ use std::{
 
 use crate::{
   Lio,
-  api::{self, resource::Resource},
-  net_utils,
+  api::{self, ops::std_socketaddr_into_libc, resource::Resource},
 };
 
 #[cfg(unix)]
@@ -443,7 +442,7 @@ pub unsafe extern "C" fn lio_accept(
           std::mem::forget(new_res);
           (
             fd,
-            Box::into_raw(Box::new(net_utils::std_socketaddr_into_libc(addr)))
+            Box::into_raw(Box::new(std_socketaddr_into_libc(addr)))
               as *const _,
           )
         }
@@ -598,13 +597,13 @@ pub unsafe extern "C" fn lio_close(
 /// # Safety
 /// `lio` must be a valid handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lio_timeout(
+pub unsafe extern "C" fn lio_sleep(
   lio: *mut lio_handle_t,
   millis: libc::c_uint,
   callback: extern "C" fn(libc::c_int),
 ) {
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::timeout(Duration::from_millis(millis as u64))
+  api::sleep(Duration::from_millis(millis as u64))
     .with_lio(&unsafe { handle(lio) }.inner)
     .when_done(move |res| {
       callback(match res {

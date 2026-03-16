@@ -107,7 +107,7 @@ fn test_unix_stream_basic() {
 
   // Create server socket
   let mut server_recv =
-    lio::test_utils::unix_stream_socket().with_lio(&mut lio).send();
+    common::unix_stream_socket().with_lio(&mut lio).send();
 
   let server_sock = poll_recv(&mut lio, &mut server_recv)
     .expect("Failed to create server socket");
@@ -122,7 +122,7 @@ fn test_unix_stream_basic() {
 
   // Create client socket
   let mut client_recv =
-    lio::test_utils::unix_stream_socket().with_lio(&mut lio).send();
+    common::unix_stream_socket().with_lio(&mut lio).send();
 
   let client_sock = poll_recv(&mut lio, &mut client_recv)
     .expect("Failed to create client socket");
@@ -180,7 +180,7 @@ fn test_unix_stream_bidirectional() {
 
   // Setup server
   let mut server_recv =
-    lio::test_utils::unix_stream_socket().with_lio(&mut lio).send();
+    common::unix_stream_socket().with_lio(&mut lio).send();
   let server_sock = poll_recv(&mut lio, &mut server_recv)
     .expect("Failed to create server socket");
   bind_unix_socket(&server_sock, &sock_path.path).expect("Failed to bind");
@@ -191,7 +191,7 @@ fn test_unix_stream_bidirectional() {
 
   // Setup client
   let mut client_recv =
-    lio::test_utils::unix_stream_socket().with_lio(&mut lio).send();
+    common::unix_stream_socket().with_lio(&mut lio).send();
   let client_sock = poll_recv(&mut lio, &mut client_recv)
     .expect("Failed to create client socket");
 
@@ -245,7 +245,7 @@ fn test_unix_stream_multiple_clients() {
 
   // Setup server
   let mut server_recv =
-    lio::test_utils::unix_stream_socket().with_lio(&mut lio).send();
+    common::unix_stream_socket().with_lio(&mut lio).send();
   let server_sock = poll_recv(&mut lio, &mut server_recv)
     .expect("Failed to create server socket");
   bind_unix_socket(&server_sock, &sock_path.path).expect("Failed to bind");
@@ -261,7 +261,7 @@ fn test_unix_stream_multiple_clients() {
   for i in 0..num_clients {
     // Create client
     let mut client_recv =
-      lio::test_utils::unix_stream_socket().with_lio(&mut lio).send();
+      common::unix_stream_socket().with_lio(&mut lio).send();
     let client_sock = poll_recv(&mut lio, &mut client_recv)
       .expect(&format!("Failed to create client {}", i));
 
@@ -326,7 +326,7 @@ fn test_unix_dgram_basic() {
 
   // Create server datagram socket
   let mut server_recv =
-    lio::test_utils::unix_dgram_socket().with_lio(&mut lio).send();
+    common::unix_dgram_socket().with_lio(&mut lio).send();
   let server_sock = poll_recv(&mut lio, &mut server_recv)
     .expect("Failed to create server socket");
 
@@ -336,7 +336,7 @@ fn test_unix_dgram_basic() {
 
   // Create client datagram socket
   let mut client_recv =
-    lio::test_utils::unix_dgram_socket().with_lio(&mut lio).send();
+    common::unix_dgram_socket().with_lio(&mut lio).send();
   let client_sock = poll_recv(&mut lio, &mut client_recv)
     .expect("Failed to create client socket");
 
@@ -379,7 +379,7 @@ fn test_unix_shutdown() {
 
   // Setup server
   let mut server_recv =
-    lio::test_utils::unix_stream_socket().with_lio(&mut lio).send();
+    common::unix_stream_socket().with_lio(&mut lio).send();
   let server_sock = poll_recv(&mut lio, &mut server_recv)
     .expect("Failed to create server socket");
   bind_unix_socket(&server_sock, &sock_path.path).expect("Failed to bind");
@@ -390,7 +390,7 @@ fn test_unix_shutdown() {
 
   // Setup client
   let mut client_recv =
-    lio::test_utils::unix_stream_socket().with_lio(&mut lio).send();
+    common::unix_stream_socket().with_lio(&mut lio).send();
   let client_sock = poll_recv(&mut lio, &mut client_recv)
     .expect("Failed to create client socket");
 

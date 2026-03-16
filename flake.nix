@@ -141,6 +141,14 @@
         inherit apps;
         packages = {
           default = import ./default.nix { inherit pkgs; };
+          test = pkgs.writeShellApplication {
+            name = "lio-test";
+            text = builtins.readFile ./scripts/test.sh;
+            runtimeInputs = with pkgs; [
+              (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+              jq
+            ];
+          };
         }
         // testPackages;
 
@@ -170,7 +178,7 @@
                 ];
               }
             );
-            default = pkgs.mkShell sharedEnvVars;
+            # default = pkgs.mkShell sharedEnvVars;
           };
       }
     );

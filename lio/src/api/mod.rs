@@ -79,7 +79,7 @@ pub mod resource;
 use crate::api::resource::AsResource;
 use crate::buf::{IoBuf, IoBufMut, IoBufMutVec, IoBufVec};
 use io::Io;
-use std::{ffi::CString, net::SocketAddr, time::Duration};
+use std::{ffi::CString, net::SocketAddr, path::Path, time::Duration};
 
 #[cfg(unix)]
 use std::os::fd::RawFd;
@@ -146,11 +146,142 @@ doc_op! {
 }
 
 doc_op! {
-    short: "Issues a timeout that returns after duration seconds.",
+    short: "Sleeps for the specified duration.",
 
-    pub fn timeout(duration: Duration) -> Io<ops::Timeout> {
-        Io::from_op(ops::Timeout::new(duration))
+    pub fn sleep(duration: Duration) -> Io<ops::Sleep> {
+        Io::from_op(ops::Sleep::new(duration))
     }
+}
+
+/// Wraps an operation with a timeout deadline.
+///
+/// If the timeout fires before the inner operation completes, the inner operation
+/// is cancelled and `Err(TimedOut)` is returned.
+///
+/// If the inner operation completes before the timeout, the timeout is cancelled
+/// and the inner operation's result is returned.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lio::api;
+/// use std::time::Duration;
+///
+/// async fn timeout_example() -> Result<(), api::ops::TimedOut> {
+///     # use lio::api::resource::Resource;
+///     # let socket = Resource::stdin();
+///     let buf = vec![0u8; 1024];
+///     // Wait up to 5 seconds for data
+///     let (result, buf) = api::timeout(
+///         Duration::from_secs(5),
+///         api::recv(&socket, buf, None),
+///     ).await?;
+///     // result is io::Result<isize> from the recv
+///     Ok(())
+/// }
+/// ```
+///
+/// # Platform Support
+///
+/// - **Linux (io_uring)**: Uses `IORING_OP_LINK_TIMEOUT` for efficient kernel-native
+///   timeout handling.
+/// - **Other Unix (pollingv2)**: Uses userspace timeout coordination via TimeManager.
+#[cfg(unix)]
+#[cfg_attr(docsrs, doc(cfg(unix)))]
+pub fn timeout<T: op::TypedOp>(
+    duration: Duration,
+    io: Io<T>,
+) -> Io<ops::Timeout<T>> {
+    Io::from_op(ops::Timeout::new(io.into_inner(), duration))
+}
+
+/// Watches a file or directory for changes.
+///
+/// This is a one-shot operation: it waits until the file changes in any of the
+/// ways specified by `mask`, then returns what actually happened.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lio::api;
+/// use lio::api::ops::WatchMask;
+/// use std::path::Path;
+///
+/// async fn watch_example() -> std::io::Result<()> {
+///     // Watch for modifications or deletions
+///     let events = api::watch(
+///         "/tmp/myfile.txt",
+///         WatchMask::MODIFY | WatchMask::DELETE,
+///     ).await?;
+///
+///     if events.contains(WatchMask::MODIFY) {
+///         println!("File was modified!");
+///     }
+///     if events.contains(WatchMask::DELETE) {
+///         println!("File was deleted!");
+///     }
+///     Ok(())
+/// }
+/// ```
+///
+/// # Platform Support
+///
+/// - **Linux**: Uses inotify
+/// - **BSD/macOS**: Uses kqueue with EVFILT_VNODE
+#[cfg(unix)]
+#[cfg_attr(docsrs, doc(cfg(unix)))]
+pub fn watch(path: impl AsRef<Path>, mask: ops::WatchMask) -> Io<ops::Watch> {
+    let path_cstring = CString::new(path.as_ref().as_os_str().as_encoded_bytes())
+        .expect("path contains null byte");
+    Io::from_op(ops::Watch::new(path_cstring, mask))
+}
+
+/// Creates a streaming watch operation that yields multiple file change events.
+///
+/// Unlike [`watch`] which completes after a single event, `watch_stream` continues
+/// watching the file and yields events as they occur.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lio::{Lio, api};
+/// use lio::api::ops::WatchMask;
+///
+/// async fn watch_file(lio: &Lio) -> std::io::Result<()> {
+///     let mut stream = api::watch_stream(
+///         "/tmp/myfile.txt",
+///         WatchMask::MODIFY | WatchMask::DELETE,
+///     ).with_lio(lio);
+///
+///     while let Some(result) = stream.next().await {
+///         let events = result?;
+///         if events.contains(WatchMask::MODIFY) {
+///             println!("File was modified!");
+///         }
+///         if events.contains(WatchMask::DELETE) {
+///             println!("File was deleted!");
+///             break;
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
+///
+/// # Comparison with [`watch`]
+///
+/// - `watch()` waits for a single event and completes
+/// - `watch_stream()` continues watching and yields events until closed
+///
+/// # Platform Support
+///
+/// - **Linux**: Uses inotify with epoll/io_uring for async notification
+/// - **BSD/macOS**: Uses kqueue with EVFILT_VNODE
+#[cfg(unix)]
+#[cfg_attr(docsrs, doc(cfg(unix)))]
+pub fn watch_stream(path: impl AsRef<Path>, mask: ops::WatchMask) -> io::IoStreamBuilder<ops::WatchStream> {
+    let path_cstring = CString::new(path.as_ref().as_os_str().as_encoded_bytes())
+        .expect("path contains null byte");
+    io::IoStreamBuilder::from_op(ops::WatchStream::new(path_cstring, mask))
 }
 
 doc_op!(
@@ -476,6 +607,43 @@ doc_op! {
     }
 }
 
+/// Creates a streaming accept operation that yields multiple connections.
+///
+/// Returns an [`IoStreamBuilder`](io::IoStreamBuilder) that yields connections
+/// as they arrive on the listening socket. Call `.with_lio()` to bind a Lio
+/// instance, then use `.next().await` to accept each connection.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lio::{Lio, api};
+/// use lio::api::resource::Resource;
+///
+/// async fn server(lio: &Lio, listener: &Resource) -> std::io::Result<()> {
+///     let mut stream = api::accept_stream(listener).with_lio(lio);
+///     while let Some(result) = stream.next().await {
+///         let (client, addr) = result?;
+///         println!("Accepted connection from {}", addr);
+///         // Spawn a task to handle the client...
+///     }
+///     Ok(())
+/// }
+/// ```
+///
+/// # Comparison with [`accept`]
+///
+/// - `accept()` accepts a single connection and completes
+/// - `accept_stream()` continues accepting until the socket closes or errors
+///
+/// # Platform Notes
+///
+/// - **io_uring (Linux)**: Will use multishot accept when available, allowing
+///   a single syscall submission to accept multiple connections.
+/// - **kqueue/epoll**: Resubmits after each accepted connection.
+pub fn accept_stream(res: &impl AsResource) -> io::IoStreamBuilder<ops::AcceptStream> {
+    io::IoStreamBuilder::from_op(ops::AcceptStream::new(res.as_resource().clone()))
+}
+
 doc_op! {
     short: "Marks a socket as listening for incoming connections.",
     syscall: "listen(2)",
@@ -698,6 +866,186 @@ doc_op! {
     #[cfg_attr(docsrs, doc(cfg(linux)))]
     pub fn tee(res_in: &impl AsResource, res_out: impl AsResource, size: u32) -> Io<ops::Tee> {
         Io::from_op(ops::Tee::new(res_in.as_resource().clone(), res_out.as_resource().clone(), size))
+    }
+}
+
+doc_op! {
+    short: "Splices data between file descriptors via a pipe (Linux only).",
+    syscall: "splice(2)",
+    doc_link: "https://man7.org/linux/man-pages/man2/splice.2.html",
+
+    ///
+    /// At least one of `fd_in` or `fd_out` must be a pipe. This enables zero-copy
+    /// data transfer between a pipe and another file descriptor (socket, file, etc.).
+    ///
+    /// # Parameters
+    ///
+    /// - `fd_in`: Source file descriptor
+    /// - `off_in`: Offset for source (None for pipes, Some(offset) for files)
+    /// - `fd_out`: Destination file descriptor
+    /// - `off_out`: Offset for destination (None for pipes, Some(offset) for files)
+    /// - `len`: Maximum number of bytes to transfer
+    /// - `flags`: Splice flags (e.g., `SPLICE_F_MOVE`, `SPLICE_F_NONBLOCK`)
+    ///
+    /// # Returns
+    ///
+    /// Number of bytes transferred on success.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(target_os = "linux")]
+    /// async fn splice_example() -> std::io::Result<()> {
+    ///     use lio::api;
+    ///     use lio::api::resource::Resource;
+    ///
+    ///     // Assuming pipe_read and socket are valid Resources
+    ///     # let pipe_read = Resource::stdin();
+    ///     # let socket = Resource::stdout();
+    ///     let bytes = api::splice(&pipe_read, None, &socket, None, 4096, 0).await?;
+    ///     println!("Spliced {} bytes", bytes);
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
+    pub fn splice(
+        fd_in: &impl AsResource,
+        off_in: Option<i64>,
+        fd_out: &impl AsResource,
+        off_out: Option<i64>,
+        len: u32,
+        flags: u32,
+    ) -> Io<ops::Splice> {
+        Io::from_op(ops::Splice::new(
+            fd_in.as_resource().clone(),
+            off_in,
+            fd_out.as_resource().clone(),
+            off_out,
+            len,
+            flags,
+        ))
+    }
+}
+
+doc_op! {
+    short: "Sends file data to a socket without copying through userspace.",
+    syscall: "sendfile(2)",
+    doc_link: "https://man7.org/linux/man-pages/man2/sendfile.2.html",
+
+    ///
+    /// This is commonly used for serving static files over network sockets,
+    /// as it avoids copying data between kernel and user space.
+    ///
+    /// # Platform Differences
+    ///
+    /// - **Linux**: `out_fd` can be any file descriptor (socket, file, pipe, etc.)
+    /// - **macOS/BSD**: `out_fd` **must** be a socket. Attempting to use a regular
+    ///   file will fail with `ENOTSOCK` ("Socket operation on non-socket").
+    ///
+    /// For copying between files on macOS, use [`copy_file_range`] on Linux or
+    /// fall back to regular read/write operations.
+    ///
+    /// # Parameters
+    ///
+    /// - `out_fd`: Destination (socket on macOS/BSD, any fd on Linux)
+    /// - `in_fd`: Source file
+    /// - `offset`: Starting offset in the source file (None to use current position)
+    /// - `count`: Number of bytes to send
+    ///
+    /// # Returns
+    ///
+    /// Number of bytes sent on success.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// async fn sendfile_example() -> std::io::Result<()> {
+    ///     use lio::api;
+    ///     use lio::api::resource::Resource;
+    ///
+    ///     // Assuming socket and file are valid Resources
+    ///     # let socket = Resource::stdout();
+    ///     # let file = Resource::stdin();
+    ///     let bytes = api::sendfile(&socket, &file, Some(0), 4096).await?;
+    ///     println!("Sent {} bytes", bytes);
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(unix)]
+    #[cfg_attr(docsrs, doc(cfg(unix)))]
+    pub fn sendfile(
+        out_fd: &impl AsResource,
+        in_fd: &impl AsResource,
+        offset: Option<i64>,
+        count: usize,
+    ) -> Io<ops::SendFile> {
+        Io::from_op(ops::SendFile::new(
+            out_fd.as_resource().clone(),
+            in_fd.as_resource().clone(),
+            offset,
+            count,
+        ))
+    }
+}
+
+doc_op! {
+    short: "Copies data between files without going through userspace (Linux only).",
+    syscall: "copy_file_range(2)",
+    doc_link: "https://man7.org/linux/man-pages/man2/copy_file_range.2.html",
+
+    ///
+    /// This performs a server-side copy when possible (e.g., on NFS, Btrfs with reflinks),
+    /// avoiding data transfer through the application. Falls back to kernel-space copy
+    /// on filesystems that don't support server-side copy.
+    ///
+    /// # Parameters
+    ///
+    /// - `fd_in`: Source file
+    /// - `off_in`: Starting offset in source file
+    /// - `fd_out`: Destination file
+    /// - `off_out`: Starting offset in destination file
+    /// - `len`: Number of bytes to copy
+    /// - `flags`: Reserved, must be 0
+    ///
+    /// # Returns
+    ///
+    /// Number of bytes copied on success.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(target_os = "linux")]
+    /// async fn copy_example() -> std::io::Result<()> {
+    ///     use lio::api;
+    ///     use lio::api::resource::Resource;
+    ///
+    ///     // Assuming src and dst are valid file Resources
+    ///     # let src = Resource::stdin();
+    ///     # let dst = Resource::stdout();
+    ///     let bytes = api::copy_file_range(&src, 0, &dst, 0, 4096, 0).await?;
+    ///     println!("Copied {} bytes", bytes);
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
+    pub fn copy_file_range(
+        fd_in: &impl AsResource,
+        off_in: i64,
+        fd_out: &impl AsResource,
+        off_out: i64,
+        len: usize,
+        flags: u32,
+    ) -> Io<ops::CopyFileRange> {
+        Io::from_op(ops::CopyFileRange::new(
+            fd_in.as_resource().clone(),
+            off_in,
+            fd_out.as_resource().clone(),
+            off_out,
+            len,
+            flags,
+        ))
     }
 }
 

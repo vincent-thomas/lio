@@ -1,5 +1,5 @@
 [workspace]
-members = ["lio", "lio-uring", "lio-tls"]
+members = ["lio", "lio-uring"]
 default-members = ["lio"]
 resolver = "3"
 

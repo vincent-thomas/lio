@@ -54,7 +54,12 @@
 //! threads than where operations were initiated. This is particularly useful for
 //! delegating I/O completion handling to dedicated threads.
 
-use crate::{lio, lio::Lio, registration::Registration, api::op::TypedOp};
+use crate::{
+  api::op::{StreamOp, StreamResult, TypedOp},
+  lio,
+  lio::Lio,
+  registration::Registration,
+};
 
 use std::{
   future::Future,
@@ -215,9 +220,10 @@ where
   /// ```
   pub fn when_done<F>(self, f: F)
   where
-    F: FnOnce(T::Result) + Send + 'static,
+    F: Fn(T::Result) + Send + 'static,
   {
     let (lio, typed_op) = self.into_lio();
+
     // IMPORTANT: Box the typed_op FIRST to give it a stable heap address,
     // THEN call into_op(). The Op contains pointers into the TypedOp's data,
     // so the TypedOp must be at its final heap location before into_op() is called.
@@ -226,7 +232,7 @@ where
     let mut boxed = Box::new(typed_op);
     let op = boxed.into_op();
     lio
-      .schedule(op, Registration::new_callback_boxed::<T, F>(f, boxed))
+      .schedule(op, Registration::new_callback::<T, F>(f, boxed))
       .expect("lio error: lio should handle this");
   }
 }
@@ -408,6 +414,13 @@ where
     };
     (lio, self.op)
   }
+
+  /// Extracts the inner operation from this Io.
+  ///
+  /// This is useful for wrapping operations with combinators like `timeout`.
+  pub fn into_inner(self) -> T {
+    self.op
+  }
 }
 
 impl<T> IntoFuture for Io<T>
@@ -504,12 +517,317 @@ where
         Err(crate::lio::Error::EntryNotFound) => {
           panic!("lio bookkeeping bug: operation entry not found");
         }
+        Err(crate::lio::Error::StreamDone) => {
+          // Single-shot operations should never get StreamDone
+          unreachable!("single-shot operation received StreamDone error");
+        }
       },
 
       IoFutureState::Done => {
         panic!("IoFuture polled after completion");
       }
     }
+  }
+}
+
+// ============================================================================
+// IoStream - Async Stream for multi-item operations
+// ============================================================================
+
+/// An async stream that yields multiple items from an operation.
+///
+/// Unlike [`Io`] which produces a single result, `IoStream` can yield
+/// multiple items over time. This is useful for operations like accepting
+/// connections from a listening socket or watching for file changes.
+///
+/// # Async Iterator Pattern
+///
+/// `IoStream` provides an async iterator interface via the `next()` method:
+///
+/// ```no_run
+/// use lio::{Lio, api};
+///
+/// async fn accept_connections(lio: &Lio) -> std::io::Result<()> {
+///     # use lio::api::resource::Resource;
+///     # let listener = Resource::stdin(); // placeholder
+///     let mut stream = api::accept_stream(&listener).with_lio(lio);
+///
+///     while let Some(result) = stream.next().await {
+///         let (client, addr) = result?;
+///         println!("Accepted connection from {}", addr);
+///         // Handle client...
+///     }
+///     Ok(())
+/// }
+/// ```
+///
+/// # Platform Differences
+///
+/// - **io_uring (Linux)**: Uses multishot operations where possible. A single
+///   submission can yield multiple completions without resubmission.
+/// - **kqueue/epoll**: Each completion triggers automatic resubmission of the
+///   operation to continue the stream.
+pub struct IoStream<T>
+where
+  T: Send,
+{
+  op: Option<T>,
+  lio: Lio,
+  state: IoStreamState,
+}
+
+enum IoStreamState {
+  /// Not yet submitted - waiting for first `next()` call.
+  Pending,
+  /// Submitted and awaiting completion.
+  Inflight { id: u64 },
+  /// Stream is done, no more items.
+  Done,
+}
+
+impl<T> IoStream<T>
+where
+  T: StreamOp + Unpin,
+{
+  /// Creates a new `IoStream` from a streaming operation.
+  pub fn from_op(op: T, lio: &Lio) -> Self {
+    Self { op: Some(op), lio: lio.clone(), state: IoStreamState::Pending }
+  }
+
+  /// Returns the next item from the stream.
+  ///
+  /// Returns `Some(item)` if the stream has more items, or `None` if the
+  /// stream is exhausted.
+  ///
+  /// # Example
+  ///
+  /// ```no_run
+  /// # use lio::{Lio, api};
+  /// # use lio::api::resource::Resource;
+  /// # async fn example(lio: &Lio, listener: &Resource) -> std::io::Result<()> {
+  /// let mut stream = api::accept_stream(listener).with_lio(lio);
+  /// while let Some(result) = stream.next().await {
+  ///     let (client, addr) = result?;
+  ///     println!("New connection from {}", addr);
+  /// }
+  /// # Ok(())
+  /// # }
+  /// ```
+  pub async fn next(&mut self) -> Option<T::Item> {
+    IoStreamNextFuture { stream: self }.await
+  }
+}
+
+/// Future for a single `next()` call on an IoStream.
+struct IoStreamNextFuture<'a, T: StreamOp> {
+  stream: &'a mut IoStream<T>,
+}
+
+impl<T: StreamOp + Unpin> Future for IoStreamNextFuture<'_, T> {
+  type Output = Option<T::Item>;
+
+  fn poll(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+  ) -> Poll<Self::Output> {
+    let this = &mut *self;
+    let stream = &mut *this.stream;
+
+    match stream.state {
+      IoStreamState::Done => Poll::Ready(None),
+
+      IoStreamState::Pending => {
+        // First poll - submit the stream operation
+        let op = stream.op.as_mut().expect("IoStream polled after drop");
+        let backend_op = op.into_op();
+
+        // Use stream registration and schedule_stream for multishot support
+        match stream
+          .lio
+          .schedule_stream(backend_op, Registration::new_stream_waker(cx.waker().clone()))
+        {
+          Ok(id) => {
+            stream.state = IoStreamState::Inflight { id };
+            Poll::Pending
+          }
+          Err(_) => {
+            stream.state = IoStreamState::Done;
+            Poll::Ready(None)
+          }
+        }
+      }
+
+      IoStreamState::Inflight { id } => {
+        // Use check_stream_done to pop from the result queue
+        match stream.lio.check_stream_done(id) {
+          Ok(result) => {
+            let op = stream.op.as_mut().expect("IoStream polled after drop");
+            match op.extract_item(result) {
+              StreamResult::Item(item) => {
+                // Backend handles resubmission internally (multishot or auto-resubmit)
+                // Just return the item and stay in Inflight state
+                Poll::Ready(Some(item))
+              }
+              StreamResult::Done => {
+                stream.state = IoStreamState::Done;
+                Poll::Ready(None)
+              }
+            }
+          }
+          Err(crate::lio::Error::EntryNotCompleted) => {
+            stream.lio.set_waker(id, cx.waker().clone());
+            Poll::Pending
+          }
+          Err(crate::lio::Error::StreamDone) => {
+            // Stream finished and all results consumed
+            stream.state = IoStreamState::Done;
+            Poll::Ready(None)
+          }
+          Err(crate::lio::Error::EntryNotFound) => {
+            stream.state = IoStreamState::Done;
+            Poll::Ready(None)
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Drop impl to cancel inflight multishot operations.
+impl<T: Send> Drop for IoStream<T> {
+  fn drop(&mut self) {
+    // If the stream is inflight, cancel the operation
+    if let IoStreamState::Inflight { id } = self.state {
+      self.lio.cancel_stream(id);
+    }
+  }
+}
+
+/// Builder for creating IoStream with a Lio instance.
+pub struct IoStreamBuilder<T>
+where
+  T: Send,
+{
+  op: T,
+}
+
+impl<T> IoStreamBuilder<T>
+where
+  T: StreamOp + Unpin,
+{
+  /// Creates a new builder from a streaming operation.
+  pub fn from_op(op: T) -> Self {
+    Self { op }
+  }
+
+  /// Binds a Lio instance and creates the IoStream.
+  pub fn with_lio(self, lio: &Lio) -> IoStream<T> {
+    IoStream::from_op(self.op, lio)
+  }
+
+  /// Convert the streaming operation into a channel receiver.
+  ///
+  /// Returns a [`StreamReceiver`] which receives each stream item as it
+  /// becomes available.
+  ///
+  /// # Example
+  ///
+  /// ```no_run
+  /// use lio::{Lio, api};
+  /// use lio::api::resource::Resource;
+  ///
+  /// # let lio = Lio::new(64).unwrap();
+  /// # let listener = Resource::stdin();
+  /// let receiver = api::accept_stream(&listener).send(&lio);
+  ///
+  /// // In a loop
+  /// loop {
+  ///     lio.try_run().unwrap();
+  ///     match receiver.try_recv() {
+  ///         Ok(Ok((client, addr))) => println!("Got connection from {}", addr),
+  ///         Ok(Err(e)) => eprintln!("Accept error: {}", e),
+  ///         Err(_) => {} // No item ready yet
+  ///     }
+  /// }
+  /// ```
+  pub fn send(self, lio: &Lio) -> StreamReceiver<T::Item>
+  where
+    T::Item: Send,
+  {
+    let (sender, receiver) = std_mpsc::channel();
+    self.send_with(lio, sender);
+    StreamReceiver { recv: receiver }
+  }
+
+  /// Sends each stream item through a provided channel sender.
+  ///
+  /// # Example
+  ///
+  /// ```no_run
+  /// use std::sync::mpsc;
+  /// use lio::{Lio, api};
+  /// use lio::api::resource::Resource;
+  ///
+  /// # let lio = Lio::new(64).unwrap();
+  /// # let listener = Resource::stdin();
+  /// let (tx, rx) = mpsc::channel();
+  /// api::accept_stream(&listener).send_with(&lio, tx);
+  ///
+  /// // Process items as they arrive
+  /// while let Ok(result) = rx.recv() {
+  ///     match result {
+  ///         Ok((client, addr)) => println!("Got connection from {}", addr),
+  ///         Err(e) => eprintln!("Accept error: {}", e),
+  ///     }
+  /// }
+  /// ```
+  pub fn send_with(self, lio: &Lio, sender: std_mpsc::Sender<T::Item>)
+  where
+    T::Item: Send,
+  {
+    // Box the op first to establish stable address
+    let mut boxed = Box::new(self.op);
+    let backend_op = boxed.into_op();
+
+    let reg = Registration::new_stream_callback(
+      move |item| {
+        let _ = sender.send(item);
+      },
+      boxed,
+    );
+
+    lio
+      .schedule_stream(backend_op, reg)
+      .expect("lio error: failed to schedule stream operation");
+  }
+}
+
+/// A receiver for streaming operation items.
+///
+/// Receives items from a streaming operation via a channel.
+pub struct StreamReceiver<T> {
+  recv: std_mpsc::Receiver<T>,
+}
+
+impl<T> StreamReceiver<T> {
+  /// Blocks until the next item is available.
+  pub fn recv(&self) -> Result<T, std_mpsc::RecvError> {
+    self.recv.recv()
+  }
+
+  /// Attempts to receive the next item without blocking.
+  pub fn try_recv(&self) -> Result<T, std_mpsc::TryRecvError> {
+    self.recv.try_recv()
+  }
+
+  /// Blocks with a timeout waiting for the next item.
+  pub fn recv_timeout(&self, timeout: Duration) -> Result<T, std_mpsc::RecvTimeoutError> {
+    self.recv.recv_timeout(timeout)
+  }
+
+  /// Returns an iterator over stream items.
+  pub fn iter(&self) -> impl Iterator<Item = T> + '_ {
+    self.recv.iter()
   }
 }
 
