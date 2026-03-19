@@ -442,8 +442,7 @@ pub unsafe extern "C" fn lio_accept(
           std::mem::forget(new_res);
           (
             fd,
-            Box::into_raw(Box::new(std_socketaddr_into_libc(addr)))
-              as *const _,
+            Box::into_raw(Box::new(std_socketaddr_into_libc(addr))) as *const _,
           )
         }
         Err(e) => {

@@ -1,7 +1,7 @@
 //! Integration tests for network operations.
 
-use lio_uring::operation::*;
 use lio_uring::LioUring;
+use lio_uring::operation::*;
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;

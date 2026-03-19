@@ -7,8 +7,8 @@ use std::io;
 use std::time::Duration;
 
 use crate::{
-  backend::{IoBackend, OpCompleted},
   backend::op::Op,
+  backend::{IoBackend, OpCompleted},
 };
 
 /// A pending operation in the dummy backend

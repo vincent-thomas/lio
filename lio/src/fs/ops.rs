@@ -1,12 +1,15 @@
 //! Internal operation types for filesystem I/O.
 //!
 //! This module contains specialized operation types that adapt low-level I/O operations
-//! to work with the high-level [`File`](super::File) type. These types implement
-//! the [`TypedOp`](crate::api::op::TypedOp) trait and are used internally by the
-//! filesystem API.
+//! to work with the high-level [`File`] type. These types implement
+//! the [`TypedOp`] trait and are used internally by the filesystem API.
 //!
 //! Most users will not need to use these types directly, as they are returned by
-//! methods on [`File`](super::File) and [`OpenOptions`](super::OpenOptions).
+//! methods on [`File`] and [`OpenOptions`].
+//!
+//! [`File`]: super::File
+//! [`TypedOp`]: crate::api::op::TypedOp
+//! [`OpenOptions`]: super::OpenOptions
 
 use std::{
   ffi::CString,
@@ -33,12 +36,18 @@ pub struct OpenAtFile {
 }
 
 impl OpenAtFile {
-  pub(crate) fn open(options: &OpenOptions, path: &Path) -> crate::api::io::Io<Self> {
+  pub(crate) fn open(
+    options: &OpenOptions,
+    path: &Path,
+  ) -> crate::api::io::Io<Self> {
     let inner = Self::build_inner(options, path);
     crate::api::io::Io::from_op(Self { inner })
   }
 
-  fn build_inner(options: &OpenOptions, path: &Path) -> Result<ops::OpenAt, io::Error> {
+  fn build_inner(
+    options: &OpenOptions,
+    path: &Path,
+  ) -> Result<ops::OpenAt, io::Error> {
     let (flags, mode) = options.to_flags()?;
 
     // Convert path to CString

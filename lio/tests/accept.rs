@@ -17,9 +17,7 @@ fn test_accept_basic() {
   let (sender_sock, receiver_sock) = mpsc::channel();
 
   // Create and setup server socket
-  common::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let server_sock = poll_until_recv(&mut lio, &receiver_sock)
     .expect("socket syscall wasn't done");
@@ -50,9 +48,7 @@ fn test_accept_basic() {
 
   poll_until_recv(&mut lio, &receiver_listen).expect("listen syscall failed");
 
-  common::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let client_sock = poll_until_recv(&mut lio, &receiver_sock)
     .expect("socket didn't finish after tick");
@@ -97,9 +93,7 @@ fn test_accept_multiple() {
   let (sender_unit, receiver_unit) = mpsc::channel();
 
   // Create server socket
-  common::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let server_sock = poll_until_recv(&mut lio, &receiver_sock)
     .expect("Failed to create server socket");
@@ -175,9 +169,7 @@ fn test_accept_with_client_info() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel();
 
-  common::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let server_sock = poll_until_recv(&mut lio, &receiver_sock)
     .expect("Failed to create server socket");
@@ -237,9 +229,7 @@ fn test_accept_ipv6() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel();
 
-  common::tcp6_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp6_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let server_sock = poll_until_recv(&mut lio, &receiver_sock)
     .expect("Failed to create IPv6 server socket");
@@ -276,9 +266,7 @@ fn test_accept_ipv6() {
 
   api::accept(&server_sock).with_lio(&mut lio).send_with(sender_a);
 
-  common::tcp6_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp6_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let client_sock = poll_until_recv(&mut lio, &receiver_sock)
     .expect("Failed to create IPv6 client socket");

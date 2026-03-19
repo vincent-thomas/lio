@@ -2,7 +2,9 @@ use std::{
   ffi::CString, mem::MaybeUninit, net::SocketAddr, sync::mpsc, time::Duration,
 };
 
-use lio::{Lio, api, api::io::Io, api::io::Receiver, api::ops, api::resource::Resource};
+use lio::{
+  Lio, api, api::io::Io, api::io::Receiver, api::ops, api::resource::Resource,
+};
 use std::os::fd::{AsFd, AsRawFd};
 
 // ============================================================================

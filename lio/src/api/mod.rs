@@ -189,10 +189,10 @@ doc_op! {
 #[cfg(unix)]
 #[cfg_attr(docsrs, doc(cfg(unix)))]
 pub fn timeout<T: op::TypedOp>(
-    duration: Duration,
-    io: Io<T>,
+  duration: Duration,
+  io: Io<T>,
 ) -> Io<ops::Timeout<T>> {
-    Io::from_op(ops::Timeout::new(io.into_inner(), duration))
+  Io::from_op(ops::Timeout::new(io.into_inner(), duration))
 }
 
 /// Watches a file or directory for changes.
@@ -231,9 +231,9 @@ pub fn timeout<T: op::TypedOp>(
 #[cfg(unix)]
 #[cfg_attr(docsrs, doc(cfg(unix)))]
 pub fn watch(path: impl AsRef<Path>, mask: ops::WatchMask) -> Io<ops::Watch> {
-    let path_cstring = CString::new(path.as_ref().as_os_str().as_encoded_bytes())
-        .expect("path contains null byte");
-    Io::from_op(ops::Watch::new(path_cstring, mask))
+  let path_cstring = CString::new(path.as_ref().as_os_str().as_encoded_bytes())
+    .expect("path contains null byte");
+  Io::from_op(ops::Watch::new(path_cstring, mask))
 }
 
 /// Creates a streaming watch operation that yields multiple file change events.
@@ -278,10 +278,13 @@ pub fn watch(path: impl AsRef<Path>, mask: ops::WatchMask) -> Io<ops::Watch> {
 /// - **BSD/macOS**: Uses kqueue with EVFILT_VNODE
 #[cfg(unix)]
 #[cfg_attr(docsrs, doc(cfg(unix)))]
-pub fn watch_stream(path: impl AsRef<Path>, mask: ops::WatchMask) -> io::IoStreamBuilder<ops::WatchStream> {
-    let path_cstring = CString::new(path.as_ref().as_os_str().as_encoded_bytes())
-        .expect("path contains null byte");
-    io::IoStreamBuilder::from_op(ops::WatchStream::new(path_cstring, mask))
+pub fn watch_stream(
+  path: impl AsRef<Path>,
+  mask: ops::WatchMask,
+) -> io::IoStreamBuilder<ops::WatchStream> {
+  let path_cstring = CString::new(path.as_ref().as_os_str().as_encoded_bytes())
+    .expect("path contains null byte");
+  io::IoStreamBuilder::from_op(ops::WatchStream::new(path_cstring, mask))
 }
 
 doc_op!(
@@ -640,8 +643,12 @@ doc_op! {
 /// - **io_uring (Linux)**: Will use multishot accept when available, allowing
 ///   a single syscall submission to accept multiple connections.
 /// - **kqueue/epoll**: Resubmits after each accepted connection.
-pub fn accept_stream(res: &impl AsResource) -> io::IoStreamBuilder<ops::AcceptStream> {
-    io::IoStreamBuilder::from_op(ops::AcceptStream::new(res.as_resource().clone()))
+pub fn accept_stream(
+  res: &impl AsResource,
+) -> io::IoStreamBuilder<ops::AcceptStream> {
+  io::IoStreamBuilder::from_op(ops::AcceptStream::new(
+    res.as_resource().clone(),
+  ))
 }
 
 doc_op! {
@@ -943,7 +950,7 @@ doc_op! {
     /// - **macOS/BSD**: `out_fd` **must** be a socket. Attempting to use a regular
     ///   file will fail with `ENOTSOCK` ("Socket operation on non-socket").
     ///
-    /// For copying between files on macOS, use [`copy_file_range`] on Linux or
+    /// For copying between files on macOS, use `copy_file_range` on Linux or
     /// fall back to regular read/write operations.
     ///
     /// # Parameters
@@ -1171,4 +1178,271 @@ doc_op! {
     {
         Io::from_op(ops::WriteVAt::new(res.as_resource().clone(), bufs, offset))
     }
+}
+
+/// Waits for a child process to change state.
+///
+/// This is the async equivalent of `waitid(2)`. It waits for a child process
+/// to exit, stop, or continue, and returns information about the state change.
+///
+/// # Parameters
+///
+/// - `target`: What process(es) to wait for ([`WaitTarget`](ops::WaitTarget))
+/// - `options`: What state changes to wait for ([`WaitOptions`](ops::WaitOptions))
+///
+/// # Returns
+///
+/// Returns `Ok(Some(WaitStatus))` if a child changed state, `Ok(None)` if
+/// `WNOHANG` was specified and no child was ready, or an error.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lio::api;
+/// use lio::api::ops::{WaitTarget, WaitOptions};
+///
+/// async fn wait_for_child(pid: i32) -> std::io::Result<()> {
+///     // Wait for a specific child to exit
+///     let status = api::waitid(
+///         WaitTarget::Pid(pid),
+///         WaitOptions::EXITED,
+///     ).await?;
+///
+///     if let Some(status) = status {
+///         if status.exited() {
+///             println!("Child {} exited with code {:?}", status.pid, status.exit_code());
+///         } else if status.signaled() {
+///             println!("Child {} killed by signal {:?}", status.pid, status.signal());
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
+///
+/// # Platform Support
+///
+/// - **Linux (io_uring 6.7+)**: Uses `IORING_OP_WAITID` for async waiting.
+/// - **Other platforms**: Uses blocking `waitid()` syscall.
+#[cfg(unix)]
+#[cfg_attr(docsrs, doc(cfg(unix)))]
+pub fn waitid(
+  target: ops::WaitTarget,
+  options: ops::WaitOptions,
+) -> Io<ops::Waitid> {
+  Io::from_op(ops::Waitid::new(target, options))
+}
+
+/// Spawns a new process.
+///
+/// Uses `posix_spawn()` to create a new process. Returns the child's PID
+/// on success, which can then be waited on using [`waitid`].
+///
+/// # Parameters
+///
+/// - `path`: Path to the executable
+/// - `argv`: Command-line arguments (`argv[0]` should be the program name)
+/// - `envp`: Environment variables as "KEY=value" strings, or None to inherit
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lio::api;
+/// use lio::api::ops::{WaitTarget, WaitOptions};
+/// use std::ffi::CString;
+///
+/// async fn run_command() -> std::io::Result<()> {
+///     let path = CString::new("/bin/echo").unwrap();
+///     let argv = vec![
+///         CString::new("echo").unwrap(),
+///         CString::new("hello").unwrap(),
+///     ];
+///
+///     // Spawn the process (inherits environment)
+///     let pid = api::spawn(path, argv, None).await?;
+///     println!("Spawned process with PID: {}", pid);
+///
+///     // Wait for it to exit
+///     let status = api::waitid(WaitTarget::Pid(pid), WaitOptions::EXITED).await?;
+///     if let Some(s) = status {
+///         println!("Exit code: {:?}", s.exit_code());
+///     }
+///     Ok(())
+/// }
+/// ```
+#[cfg(unix)]
+#[cfg_attr(docsrs, doc(cfg(unix)))]
+pub fn spawn(
+  path: std::ffi::CString,
+  argv: Vec<std::ffi::CString>,
+  envp: Option<Vec<std::ffi::CString>>,
+) -> Io<ops::Spawn> {
+  Io::from_op(ops::Spawn::new(path, argv, envp))
+}
+
+/// Applies or removes a lock on an open file.
+///
+/// This provides whole-file locking with shared (read) and exclusive (write) modes.
+///
+/// # Lock Operations
+///
+/// Use constants from [`ops::lock`]:
+/// - [`lock::LOCK_SH`][ops::lock::LOCK_SH]: Shared lock (multiple readers allowed)
+/// - [`lock::LOCK_EX`][ops::lock::LOCK_EX]: Exclusive lock (single writer)
+/// - [`lock::LOCK_UN`][ops::lock::LOCK_UN]: Unlock
+///
+/// Add [`lock::LOCK_NB`][ops::lock::LOCK_NB] (e.g., `LOCK_EX | LOCK_NB`) for non-blocking behavior.
+/// Without `LOCK_NB`, the call blocks until the lock can be acquired.
+///
+/// # Platform-specific behavior
+///
+/// This function corresponds to `flock()` on Unix and `LockFileEx`/`UnlockFileEx`
+/// on Windows. Note that this may change in the future.
+///
+/// - **Unix**: Advisory locking. Other processes can ignore locks if they don't
+///   cooperate by also using flock.
+/// - **Windows**: Mandatory locking enforced by the OS. Locking a file will fail
+///   if the file is opened only for append. To lock a file, open it with
+///   `.read(true)`, `.read(true).append(true)`, or `.write(true)`.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lio::api;
+/// use lio::api::ops::lock;
+///
+/// async fn lock_example() -> std::io::Result<()> {
+///     # use lio::api::resource::Resource;
+///     # let file = Resource::stdin();
+///     // Acquire exclusive lock (blocks until available)
+///     api::flock(&file, lock::LOCK_EX).await?;
+///
+///     // ... critical section ...
+///
+///     // Release lock
+///     api::flock(&file, lock::LOCK_UN).await?;
+///     Ok(())
+/// }
+/// ```
+pub fn flock(fd: &impl AsResource, operation: i32) -> Io<ops::Flock> {
+  Io::from_op(ops::Flock::new(fd.as_resource().clone(), operation))
+}
+
+/// Reads directory entries from an open directory file descriptor.
+///
+/// This is a low-level operation that reads raw directory entries into a buffer.
+/// The buffer should be large enough to hold at least one entry (typically 4096 bytes
+/// or more is recommended).
+///
+/// # Returns
+///
+/// A tuple of `(Result<bytes_read>, buffer, parsed_entries)`:
+/// - `bytes_read`: Number of bytes read (0 indicates end of directory)
+/// - `buffer`: The buffer, returned for reuse
+/// - `parsed_entries`: Vector of parsed `DirEntry` structs
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lio::api;
+/// use std::ffi::CString;
+///
+/// async fn list_directory() -> std::io::Result<()> {
+///     # use lio::api::resource::Resource;
+///     # use std::os::fd::FromRawFd;
+///     // Open directory
+///     let cwd = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+///     let dir = api::openat(&cwd, CString::new("/tmp").unwrap(),
+///                           libc::O_RDONLY | libc::O_DIRECTORY).await?;
+///
+///     let mut buf = vec![0u8; 4096];
+///     loop {
+///         let (result, new_buf, entries) = api::getdents(&dir, buf).await;
+///         let bytes_read = result?;
+///         buf = new_buf;
+///
+///         if bytes_read == 0 {
+///             break; // End of directory
+///         }
+///
+///         for entry in entries {
+///             println!("{:?} (type: {})", entry.name, entry.file_type);
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
+///
+/// # Platform Support
+///
+/// - Linux: Uses `getdents64` syscall
+/// - macOS: Uses `getdirentries`
+/// - FreeBSD/DragonFly: Uses `getdirentries`
+#[cfg(unix)]
+#[cfg_attr(docsrs, doc(cfg(unix)))]
+pub fn getdents<B: crate::buf::IoBufMut>(
+  fd: &impl AsResource,
+  buf: B,
+) -> Io<ops::GetDents<B>> {
+  Io::from_op(ops::GetDents::new(fd.as_resource().clone(), buf))
+}
+
+/// Waits for a signal from the specified signal set.
+///
+/// This operation blocks until one of the signals in the set is delivered,
+/// then returns the signal number. The signal must be blocked (via sigprocmask)
+/// before calling this function, otherwise the signal may be delivered to the
+/// default handler instead.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lio::api;
+/// use lio::api::ops::SignalSet;
+///
+/// async fn wait_for_signals() -> std::io::Result<()> {
+///     // Create signal set for SIGTERM and SIGINT
+///     let mut signals = SignalSet::empty();
+///     signals.add(libc::SIGTERM);
+///     signals.add(libc::SIGINT);
+///
+///     // Block signals before waiting (important!)
+///     // Use libc directly to block the signals
+///     unsafe {
+///         let mut sigset: libc::sigset_t = std::mem::zeroed();
+///         libc::sigemptyset(&mut sigset);
+///         libc::sigaddset(&mut sigset, libc::SIGTERM);
+///         libc::sigaddset(&mut sigset, libc::SIGINT);
+///         libc::sigprocmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
+///     }
+///
+///     // Wait for signal
+///     let sig = api::signal(signals).await?;
+///     println!("Received signal: {}", sig);
+///
+///     Ok(())
+/// }
+/// ```
+///
+/// # Platform Support
+///
+/// - Linux: Uses `signalfd`
+/// - BSD/macOS: Uses kqueue `EVFILT_SIGNAL`
+#[cfg(unix)]
+#[cfg_attr(docsrs, doc(cfg(unix)))]
+pub fn signal(signals: ops::SignalSet) -> Io<ops::Signal> {
+  Io::from_op(ops::Signal::new(signals))
+}
+
+/// Connects to a Unix domain socket or other non-IP address.
+///
+/// This is a low-level function that accepts a pre-built `sockaddr_storage`
+/// and length. For Unix domain sockets, prefer using `net::unix::UnixStream::connect`.
+#[cfg(unix)]
+#[cfg_attr(docsrs, doc(cfg(unix)))]
+pub fn connect_unix(
+  fd: &impl AsResource,
+  addr: libc::sockaddr_storage,
+  len: libc::socklen_t,
+) -> Io<ops::Connect> {
+  Io::from_op(ops::Connect::from_storage(fd.as_resource().clone(), addr, len))
 }

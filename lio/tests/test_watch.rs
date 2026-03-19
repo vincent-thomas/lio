@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use lio::api::ops::WatchMask;
-use lio::{api, Lio};
+use lio::{Lio, api};
 
 fn temp_file() -> PathBuf {
   let id = std::process::id();
@@ -31,18 +31,13 @@ fn test_watch_modify() {
   let (sender, receiver) = mpsc::channel();
 
   // Start watching for modifications
-  api::watch(&path, WatchMask::MODIFY)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::watch(&path, WatchMask::MODIFY).with_lio(&mut lio).send_with(sender);
 
   // Modify the file in a separate thread after a short delay
   let path_clone = path.clone();
   std::thread::spawn(move || {
     std::thread::sleep(Duration::from_millis(50));
-    let mut f = fs::OpenOptions::new()
-      .write(true)
-      .open(&path_clone)
-      .unwrap();
+    let mut f = fs::OpenOptions::new().write(true).open(&path_clone).unwrap();
     f.write_all(b"modified!").unwrap();
   });
 
@@ -87,9 +82,7 @@ fn test_watch_delete() {
   let (sender, receiver) = mpsc::channel();
 
   // Start watching for deletions
-  api::watch(&path, WatchMask::DELETE)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::watch(&path, WatchMask::DELETE).with_lio(&mut lio).send_with(sender);
 
   // Delete the file in a separate thread after a short delay
   let path_clone = path.clone();
@@ -134,9 +127,7 @@ fn test_watch_nonexistent_file() {
   let (sender, receiver) = mpsc::channel();
 
   // Try to watch a nonexistent file - should fail
-  api::watch(&path, WatchMask::MODIFY)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::watch(&path, WatchMask::MODIFY).with_lio(&mut lio).send_with(sender);
 
   // Poll once to get the immediate error
   lio.run_timeout(Duration::from_millis(10)).unwrap();

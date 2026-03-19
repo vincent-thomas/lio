@@ -190,8 +190,7 @@ fn test_socket_without_protocol() {
 #[test]
 fn test_socket_unix_stream() {
   let mut lio = Lio::new(64).unwrap();
-  let mut sock_recv =
-    common::unix_stream_socket().with_lio(&mut lio).send();
+  let mut sock_recv = common::unix_stream_socket().with_lio(&mut lio).send();
 
   assert_eq!(lio.try_run().unwrap(), 1);
 
@@ -216,8 +215,7 @@ fn test_socket_unix_stream() {
 #[test]
 fn test_socket_unix_dgram() {
   let mut lio = Lio::new(64).unwrap();
-  let mut sock_recv =
-    common::unix_dgram_socket().with_lio(&mut lio).send();
+  let mut sock_recv = common::unix_dgram_socket().with_lio(&mut lio).send();
 
   assert_eq!(lio.try_run().unwrap(), 1);
 
@@ -278,18 +276,10 @@ fn test_socket_concurrent() {
   for i in 0..20 {
     // Alternate between TCP IPv4, TCP IPv6, UDP IPv4, UDP IPv6
     match i % 4 {
-      0 => common::tcp_socket()
-        .with_lio(&mut lio)
-        .send_with(sender.clone()),
-      1 => common::tcp6_socket()
-        .with_lio(&mut lio)
-        .send_with(sender.clone()),
-      2 => common::udp_socket()
-        .with_lio(&mut lio)
-        .send_with(sender.clone()),
-      _ => common::udp6_socket()
-        .with_lio(&mut lio)
-        .send_with(sender.clone()),
+      0 => common::tcp_socket().with_lio(&mut lio).send_with(sender.clone()),
+      1 => common::tcp6_socket().with_lio(&mut lio).send_with(sender.clone()),
+      2 => common::udp_socket().with_lio(&mut lio).send_with(sender.clone()),
+      _ => common::udp6_socket().with_lio(&mut lio).send_with(sender.clone()),
     };
   }
 

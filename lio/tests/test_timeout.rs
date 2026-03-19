@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use lio::api::ops::TimedOut;
 use lio::api::resource::Resource;
-use lio::{api, Lio};
+use lio::{Lio, api};
 
 /// Helper to poll until we receive a result with a max wait time
 fn poll_recv<T>(
@@ -37,7 +37,9 @@ fn test_timeout_recv_times_out() {
 
   // Create a Unix socketpair - we control both ends
   let mut fds = [0i32; 2];
-  let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+  let ret = unsafe {
+    libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr())
+  };
   assert_eq!(ret, 0, "socketpair failed");
 
   // Wrap the receiving end in a Resource
@@ -50,9 +52,10 @@ fn test_timeout_recv_times_out() {
   let timeout_duration = Duration::from_millis(100);
 
   let start = Instant::now();
-  let mut recv = api::timeout(timeout_duration, api::recv(&recv_sock, buf, None))
-    .with_lio(&mut lio)
-    .send();
+  let mut recv =
+    api::timeout(timeout_duration, api::recv(&recv_sock, buf, None))
+      .with_lio(&mut lio)
+      .send();
 
   let result = poll_recv(&mut lio, &mut recv, Duration::from_secs(5))
     .expect("Should receive a result");
@@ -91,9 +94,8 @@ fn test_timeout_nop_completes() {
   let timeout_duration = Duration::from_secs(1);
 
   let start = Instant::now();
-  let mut recv = api::timeout(timeout_duration, api::nop())
-    .with_lio(&mut lio)
-    .send();
+  let mut recv =
+    api::timeout(timeout_duration, api::nop()).with_lio(&mut lio).send();
 
   let result = poll_recv(&mut lio, &mut recv, Duration::from_secs(5))
     .expect("Should receive a result");

@@ -28,6 +28,11 @@ typedef struct sockaddr_storage sockaddr_storage;
 typedef struct Interest Interest;
 
 /**
+ * Options for waitid() controlling what state changes to wait for.
+ */
+typedef struct WaitOptions WaitOptions;
+
+/**
  * Mask of events to watch for on a file or directory.
  *
  * These flags are cross-platform and get translated to the appropriate

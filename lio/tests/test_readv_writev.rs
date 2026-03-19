@@ -92,7 +92,8 @@ fn test_writev_multiple_buffers() {
   let buf2 = b"Part2-".to_vec();
   let buf3 = b"Part3-".to_vec();
   let buf4 = b"Part4".to_vec();
-  let mut recv = api::writev(&fd, (buf1, buf2, buf3, buf4)).with_lio(&mut lio).send();
+  let mut recv =
+    api::writev(&fd, (buf1, buf2, buf3, buf4)).with_lio(&mut lio).send();
 
   let (result, _bufs) = poll_recv(&mut lio, &mut recv);
   let bytes_written = result.expect("Failed to writev") as usize;
@@ -131,7 +132,8 @@ fn test_readv_multiple_buffers() {
   let buf2 = vec![0u8; 5];
   let buf3 = vec![0u8; 5];
   let buf4 = vec![0u8; 5];
-  let mut recv = api::readv(&fd, (buf1, buf2, buf3, buf4)).with_lio(&mut lio).send();
+  let mut recv =
+    api::readv(&fd, (buf1, buf2, buf3, buf4)).with_lio(&mut lio).send();
 
   let (result, (buf1, buf2, buf3, buf4)) = poll_recv(&mut lio, &mut recv);
   let bytes_read = result.expect("Failed to readv") as usize;
@@ -157,7 +159,8 @@ fn test_writev_array() {
   };
 
   // Write with array of buffers
-  let bufs: [Vec<u8>; 3] = [b"One-".to_vec(), b"Two-".to_vec(), b"Three".to_vec()];
+  let bufs: [Vec<u8>; 3] =
+    [b"One-".to_vec(), b"Two-".to_vec(), b"Three".to_vec()];
   let mut recv = api::writev(&fd, bufs).with_lio(&mut lio).send();
 
   let (result, _bufs) = poll_recv(&mut lio, &mut recv);
@@ -260,7 +263,8 @@ fn test_writev_large_buffers() {
   let buf2: Vec<u8> = (0..100_000).map(|i| ((i + 128) % 256) as u8).collect();
   let expected_total = buf1.len() + buf2.len();
 
-  let mut recv = api::writev(&fd, (buf1.clone(), buf2.clone())).with_lio(&mut lio).send();
+  let mut recv =
+    api::writev(&fd, (buf1.clone(), buf2.clone())).with_lio(&mut lio).send();
 
   let (result, _bufs) = poll_recv(&mut lio, &mut recv);
   let bytes_written = result.expect("Failed to writev large") as usize;
@@ -405,12 +409,8 @@ fn test_readv_vec_dynamic() {
   };
 
   // Dynamic number of buffers
-  let buffers: Vec<Vec<u8>> = vec![
-    vec![0u8; 3],
-    vec![0u8; 3],
-    vec![0u8; 3],
-    vec![0u8; 3],
-  ];
+  let buffers: Vec<Vec<u8>> =
+    vec![vec![0u8; 3], vec![0u8; 3], vec![0u8; 3], vec![0u8; 3]];
 
   let mut recv = api::readv(&fd, buffers).with_lio(&mut lio).send();
 

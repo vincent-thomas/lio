@@ -8,27 +8,37 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Once;
+
+static BUILD_STATICLIB: Once = Once::new();
+
+/// Ensure the static library is built before running FFI tests.
+fn ensure_staticlib_built() {
+  BUILD_STATICLIB.call_once(|| {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let workspace_dir =
+      PathBuf::from(&manifest_dir).parent().unwrap().to_path_buf();
+    let status = Command::new("make")
+      .arg("cbuild")
+      .current_dir(&workspace_dir)
+      .status()
+      .expect("Failed to run make cbuild");
+    assert!(status.success(), "Failed to build staticlib with 'make cbuild'");
+  });
+}
 
 fn get_lib_dir() -> PathBuf {
-  let out_dir = env::var("OUT_DIR").ok();
-
-  if let Some(out) = out_dir {
-    let p = PathBuf::from(out);
-    if let Some(target_dir) = p.ancestors().nth(3) {
-      return target_dir.to_path_buf();
-    }
-  }
-
   let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
   let target_dir =
     PathBuf::from(&manifest_dir).parent().unwrap().join("target");
 
-  if target_dir.join("debug").join("liblio.a").exists() {
-    target_dir.join("debug")
-  } else if target_dir.join("release").join("liblio.a").exists() {
+  // Prefer release since make cbuild builds there
+  if target_dir.join("release").join("liblio.a").exists() {
     target_dir.join("release")
-  } else {
+  } else if target_dir.join("debug").join("liblio.a").exists() {
     target_dir.join("debug")
+  } else {
+    target_dir.join("release")
   }
 }
 
@@ -59,6 +69,7 @@ fn get_cpp_compiler() -> &'static str {
 }
 
 fn compile_test(source: &Path, output: &Path, compiler: &str) -> Output {
+  ensure_staticlib_built();
   let lib_dir = get_lib_dir();
   let include_dir = get_include_dir();
   let ffi_test_dir = get_ffi_test_dir();
@@ -66,51 +77,41 @@ fn compile_test(source: &Path, output: &Path, compiler: &str) -> Output {
   #[cfg(target_os = "macos")]
   {
     let static_lib = lib_dir.join("liblio.a");
-    if static_lib.exists() {
-      return Command::new(compiler)
-        .arg(source)
-        .arg("-o")
-        .arg(output)
-        .arg(format!("-I{}", include_dir.display()))
-        .arg(format!("-I{}", ffi_test_dir.display()))
-        .arg(&static_lib)
-        .arg("-lpthread")
-        .arg("-framework")
-        .arg("CoreFoundation")
-        .output()
-        .expect("Failed to execute compiler");
-    }
+    return Command::new(compiler)
+      .arg(source)
+      .arg("-o")
+      .arg(output)
+      .arg(format!("-I{}", include_dir.display()))
+      .arg(format!("-I{}", ffi_test_dir.display()))
+      .arg(&static_lib)
+      .arg("-lpthread")
+      .arg("-framework")
+      .arg("CoreFoundation")
+      .output()
+      .expect("Failed to execute compiler");
   }
 
-  #[cfg(target_os = "linux")]
+  #[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+  ))]
   {
     let static_lib = lib_dir.join("liblio.a");
-    if static_lib.exists() {
-      return Command::new(compiler)
-        .arg(source)
-        .arg("-o")
-        .arg(output)
-        .arg(format!("-I{}", include_dir.display()))
-        .arg(format!("-I{}", ffi_test_dir.display()))
-        .arg(&static_lib)
-        .arg("-lpthread")
-        .arg("-lm")
-        .output()
-        .expect("Failed to execute compiler");
-    }
+    Command::new(compiler)
+      .arg(source)
+      .arg("-o")
+      .arg(output)
+      .arg(format!("-I{}", include_dir.display()))
+      .arg(format!("-I{}", ffi_test_dir.display()))
+      .arg(&static_lib)
+      .arg("-lpthread")
+      .arg("-lm")
+      .output()
+      .expect("Failed to execute compiler")
   }
-
-  Command::new(compiler)
-    .arg(source)
-    .arg("-o")
-    .arg(output)
-    .arg(format!("-I{}", include_dir.display()))
-    .arg(format!("-I{}", ffi_test_dir.display()))
-    .arg(format!("-L{}", lib_dir.display()))
-    .arg("-llio")
-    .arg("-lpthread")
-    .output()
-    .expect("Failed to execute compiler")
 }
 
 fn run_test_binary(binary: &Path) -> Output {
@@ -120,7 +121,13 @@ fn run_test_binary(binary: &Path) -> Output {
   #[cfg(target_os = "macos")]
   cmd.env("DYLD_LIBRARY_PATH", &lib_dir);
 
-  #[cfg(target_os = "linux")]
+  #[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+  ))]
   cmd.env("LD_LIBRARY_PATH", &lib_dir);
 
   cmd.output().expect("Failed to execute test binary")

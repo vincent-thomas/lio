@@ -94,6 +94,41 @@ impl OsPoller {
     Ok(epoll)
   }
 }
+impl OsPoller {
+  fn add_inner(
+    &self,
+    fd: RawFd,
+    key: u64,
+    interest: Interest,
+    oneshot: bool,
+  ) -> io::Result<()> {
+    let mut events = 0u32;
+
+    if interest.is_readable() {
+      events |= libc::EPOLLIN as u32;
+    }
+    if interest.is_writable() {
+      events |= libc::EPOLLOUT as u32;
+    }
+
+    if oneshot {
+      events |= libc::EPOLLONESHOT as u32;
+    }
+    // Note: EPOLLHUP and EPOLLERR are always reported by the kernel regardless of registration
+
+    let mut event = libc::epoll_event { events, u64: key as u64 };
+
+    syscall!(epoll_ctl(
+      self.epoll_fd.as_raw_fd(),
+      libc::EPOLL_CTL_ADD,
+      fd,
+      &mut event as *mut libc::epoll_event,
+    ))?;
+
+    Ok(())
+  }
+}
+
 impl Drop for OsPoller {
   fn drop(&mut self) {
     #[cfg(not(target_os = "redox"))]
@@ -112,31 +147,11 @@ impl ReadinessPoll for OsPoller {
   type NativeEvent = libc::epoll_event;
 
   fn add(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
-    let mut events = 0u32;
+    self.add_inner(fd, key, interest, true)
+  }
 
-    if interest.is_readable() {
-      events |= libc::EPOLLIN as u32;
-    }
-    if interest.is_writable() {
-      events |= libc::EPOLLOUT as u32;
-    }
-
-    // Use EPOLLONESHOT for consistency with kqueue's EV_ONESHOT behavior
-    events |= libc::EPOLLONESHOT as u32;
-    // Note: EPOLLHUP and EPOLLERR are always reported by the kernel regardless of registration
-
-    let mut event = libc::epoll_event { events, u64: key as u64 };
-
-    syscall!(epoll_ctl(
-      self.epoll_fd.as_raw_fd(),
-      libc::EPOLL_CTL_ADD,
-      fd,
-      &mut event as *mut libc::epoll_event,
-    ))?;
-
-    // Postcondition: if successful, fd is now registered
-    // (no way to verify without tracking state, rely on kernel)
-    Ok(())
+  fn add_level(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
+    self.add_inner(fd, key, interest, false)
   }
 
   fn modify(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
@@ -321,7 +336,10 @@ impl ReadinessPoll for OsPoller {
     };
 
     let Some(ref wheel_timer_fd) = self.wheel_timer_fd else {
-      return Err(io::Error::new(io::ErrorKind::Unsupported, "no wheel timer fd"));
+      return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no wheel timer fd",
+      ));
     };
 
     // Convert duration to timespec
@@ -358,7 +376,10 @@ impl ReadinessPoll for OsPoller {
 
   #[cfg(target_os = "redox")]
   fn arm_wheel_timer(&self, _duration: Duration) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "timerfd not supported on Redox"))
+    Err(io::Error::new(
+      io::ErrorKind::Unsupported,
+      "timerfd not supported on Redox",
+    ))
   }
 
   #[cfg(not(target_os = "redox"))]
@@ -374,10 +395,7 @@ impl ReadinessPoll for OsPoller {
     };
 
     // Setting it_value to zero disarms the timer
-    let new_val = libc::itimerspec {
-      it_interval: TS_ZERO,
-      it_value: TS_ZERO,
-    };
+    let new_val = libc::itimerspec { it_interval: TS_ZERO, it_value: TS_ZERO };
 
     let mut result = MaybeUninit::<libc::itimerspec>::uninit();
     syscall!(timerfd_settime(

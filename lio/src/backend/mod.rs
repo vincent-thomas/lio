@@ -10,7 +10,6 @@
 //!
 //! - **[`IoBackend`]**: Unified trait for submission and completion. Each platform has
 //!   specific implementations (io_uring on Linux, kqueue on macOS/BSD, IOCP on Windows).
-//! - **[`OpStore`]**: Thread-local storage for in-flight operations.
 //!
 //! # Design Goals
 //!
@@ -41,7 +40,7 @@ pub mod op;
 
 /// Test utilities for IoBackend implementations.
 ///
-/// Use the [`test_io_backend!`] macro to generate a comprehensive test suite
+/// Use the `test_io_backend!` macro to generate a comprehensive test suite
 /// for your IoBackend implementation.
 #[macro_use]
 pub mod test_macro;
@@ -167,12 +166,12 @@ pub trait IoBackend {
   /// The operation is queued internally but not yet submitted to the kernel.
   /// Call [`flush`](Self::flush) to actually submit the queued operations.
   ///
-  /// The caller guarantees that the operation is already registered in the [`OpStore`]
+  /// The caller guarantees that the operation is already registered
   /// with the given `id`.
   ///
   /// # Errors
   ///
-  /// - [`SubmitErr::Full`]: Submission queue is full (call flush first)
+  /// Returns an error if the submission queue is full (call flush first).
   fn push(&mut self, id: u64, op: Op) -> io::Result<()>;
 
   /// Flushes all queued operations to the kernel.
@@ -213,23 +212,6 @@ pub trait IoBackend {
   ///
   /// This is a no-op if no timer is currently armed.
   fn disarm_timer(&mut self) -> io::Result<()>;
-
-  /// Pushes a streaming operation that yields multiple completions.
-  ///
-  /// Unlike regular `push`, this method is for operations that produce
-  /// multiple results over time (e.g., accept loops, file watches).
-  ///
-  /// Backend behavior:
-  /// - **io_uring**: Uses native multishot operations (e.g., `AcceptMulti`)
-  ///   where a single submission yields multiple completions with `IORING_CQE_F_MORE`.
-  /// - **pollingv2**: Stores the operation and automatically resubmits after
-  ///   each completion to simulate multishot behavior.
-  ///
-  /// The default implementation falls back to regular `push`, which works
-  /// for backends that don't support multishot but rely on caller resubmission.
-  fn push_stream(&mut self, id: u64, op: Op) -> io::Result<()> {
-    self.push(id, op)
-  }
 
   /// Cancels an in-flight operation.
   ///

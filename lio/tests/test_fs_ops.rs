@@ -2,9 +2,9 @@
 
 mod common;
 
-use common::{poll_until_recv, TempFile};
+use common::{TempFile, poll_until_recv};
 use lio::api::resource::Resource;
-use lio::{api, Lio};
+use lio::{Lio, api};
 use std::ffi::CString;
 use std::os::fd::FromRawFd;
 use std::sync::mpsc;
@@ -19,9 +19,12 @@ struct TempDir {
 
 impl TempDir {
   fn new(name: &str) -> Self {
-    let path =
-      CString::new(format!("/tmp/lio_test_dir_{}_{}", name, std::process::id()))
-        .expect("Failed to create CString path");
+    let path = CString::new(format!(
+      "/tmp/lio_test_dir_{}_{}",
+      name,
+      std::process::id()
+    ))
+    .expect("Failed to create CString path");
     Self { path }
   }
 }
@@ -184,16 +187,11 @@ fn test_unlinkat_directory_not_empty() {
     let ret = libc::mkdir(temp_dir.path.as_ptr(), 0o755);
     assert_eq!(ret, 0, "Failed to create test directory");
 
-    let file_path = CString::new(format!(
-      "{}/file.txt",
-      temp_dir.path.to_str().unwrap()
-    ))
-    .unwrap();
-    let fd = libc::open(
-      file_path.as_ptr(),
-      libc::O_CREAT | libc::O_WRONLY,
-      0o644,
-    );
+    let file_path =
+      CString::new(format!("{}/file.txt", temp_dir.path.to_str().unwrap()))
+        .unwrap();
+    let fd =
+      libc::open(file_path.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o644);
     libc::close(fd);
   }
 
@@ -213,11 +211,9 @@ fn test_unlinkat_directory_not_empty() {
 
   // Cleanup the file inside first
   unsafe {
-    let file_path = CString::new(format!(
-      "{}/file.txt",
-      temp_dir.path.to_str().unwrap()
-    ))
-    .unwrap();
+    let file_path =
+      CString::new(format!("{}/file.txt", temp_dir.path.to_str().unwrap()))
+        .unwrap();
     libc::unlink(file_path.as_ptr());
   }
 
@@ -229,20 +225,15 @@ fn test_unlinkat_with_directory_fd() {
   let mut lio = Lio::new(64).unwrap();
 
   // Create a file in /tmp
-  let filename = CString::new(format!(
-    "lio_test_unlinkat_dirfd_{}.txt",
-    std::process::id()
-  ))
-  .unwrap();
+  let filename =
+    CString::new(format!("lio_test_unlinkat_dirfd_{}.txt", std::process::id()))
+      .unwrap();
   let full_path =
     CString::new(format!("/tmp/{}", filename.to_str().unwrap())).unwrap();
 
   unsafe {
-    let fd = libc::open(
-      full_path.as_ptr(),
-      libc::O_CREAT | libc::O_WRONLY,
-      0o644,
-    );
+    let fd =
+      libc::open(full_path.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o644);
     assert!(fd >= 0, "Failed to create test file");
     libc::close(fd);
   }
@@ -257,9 +248,7 @@ fn test_unlinkat_with_directory_fd() {
 
   // Unlink using relative path
   let (sender, receiver) = mpsc::channel();
-  api::unlinkat(&dir_res, filename, 0)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::unlinkat(&dir_res, filename, 0).with_lio(&mut lio).send_with(sender);
 
   let result = poll_until_recv(&mut lio, &receiver);
   result.expect("unlinkat with directory fd should succeed");
@@ -474,11 +463,9 @@ fn test_renameat_cross_directory() {
   let src_path =
     CString::new(format!("/tmp/lio_test_cross_src_{}.txt", std::process::id()))
       .unwrap();
-  let dest_path = CString::new(format!(
-    "{}/cross_dest.txt",
-    temp_dir.path.to_str().unwrap()
-  ))
-  .unwrap();
+  let dest_path =
+    CString::new(format!("{}/cross_dest.txt", temp_dir.path.to_str().unwrap()))
+      .unwrap();
 
   unsafe {
     let fd =
@@ -630,9 +617,7 @@ fn test_mkdirat_nested_missing_parent() {
 
   // Try to create nested directory without parent - should fail
   let (sender, receiver) = mpsc::channel();
-  api::mkdirat(&cwd, path, 0o755)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::mkdirat(&cwd, path, 0o755).with_lio(&mut lio).send_with(sender);
 
   let result = poll_until_recv(&mut lio, &receiver);
   assert!(result.is_err(), "mkdirat with missing parent should fail");
@@ -663,9 +648,7 @@ fn test_mkdirat_with_directory_fd() {
 
   // Create directory using relative path
   let (sender, receiver) = mpsc::channel();
-  api::mkdirat(&dir_res, dirname, 0o755)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::mkdirat(&dir_res, dirname, 0o755).with_lio(&mut lio).send_with(sender);
 
   let result = poll_until_recv(&mut lio, &receiver);
   result.expect("mkdirat with directory fd should succeed");
@@ -691,12 +674,11 @@ fn test_mkdirat_permission_denied() {
 
   let cwd = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
   // Try to create in root-owned directory
-  let path = CString::new(format!("/root/lio_test_{}", std::process::id())).unwrap();
+  let path =
+    CString::new(format!("/root/lio_test_{}", std::process::id())).unwrap();
 
   let (sender, receiver) = mpsc::channel();
-  api::mkdirat(&cwd, path, 0o755)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::mkdirat(&cwd, path, 0o755).with_lio(&mut lio).send_with(sender);
 
   let result = poll_until_recv(&mut lio, &receiver);
   assert!(result.is_err(), "mkdirat in /root should fail for non-root");
@@ -722,9 +704,11 @@ fn test_create_write_rename_unlink() {
   let mut lio = Lio::new(64).unwrap();
 
   let cwd = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
-  let src_path =
-    CString::new(format!("/tmp/lio_test_combined_src_{}.txt", std::process::id()))
-      .unwrap();
+  let src_path = CString::new(format!(
+    "/tmp/lio_test_combined_src_{}.txt",
+    std::process::id()
+  ))
+  .unwrap();
   let dest_path = CString::new(format!(
     "/tmp/lio_test_combined_dest_{}.txt",
     std::process::id()
@@ -741,7 +725,8 @@ fn test_create_write_rename_unlink() {
   .with_lio(&mut lio)
   .send_with(sender_open);
 
-  let fd = poll_until_recv(&mut lio, &receiver_open).expect("Failed to create file");
+  let fd =
+    poll_until_recv(&mut lio, &receiver_open).expect("Failed to create file");
 
   let data = b"combined test data".to_vec();
   let (sender_write, receiver_write) = mpsc::channel();
@@ -805,18 +790,16 @@ fn test_mkdir_create_file_unlink_rmdir() {
   api::mkdirat(&cwd, dir_path.clone(), 0o755)
     .with_lio(&mut lio)
     .send_with(sender_mkdir);
-  poll_until_recv(&mut lio, &receiver_mkdir).expect("Failed to create directory");
+  poll_until_recv(&mut lio, &receiver_mkdir)
+    .expect("Failed to create directory");
 
   // Create file inside directory
   let (sender_open, receiver_open) = mpsc::channel();
-  api::openat(
-    &cwd,
-    file_path.clone(),
-    libc::O_CREAT | libc::O_WRONLY,
-  )
-  .with_lio(&mut lio)
-  .send_with(sender_open);
-  let fd = poll_until_recv(&mut lio, &receiver_open).expect("Failed to create file");
+  api::openat(&cwd, file_path.clone(), libc::O_CREAT | libc::O_WRONLY)
+    .with_lio(&mut lio)
+    .send_with(sender_open);
+  let fd =
+    poll_until_recv(&mut lio, &receiver_open).expect("Failed to create file");
   drop(fd);
 
   // Unlink file
@@ -831,7 +814,8 @@ fn test_mkdir_create_file_unlink_rmdir() {
   api::unlinkat(&cwd, dir_path.clone(), libc::AT_REMOVEDIR)
     .with_lio(&mut lio)
     .send_with(sender_rmdir);
-  poll_until_recv(&mut lio, &receiver_rmdir).expect("Failed to remove directory");
+  poll_until_recv(&mut lio, &receiver_rmdir)
+    .expect("Failed to remove directory");
 
   // Verify everything is gone
   unsafe {

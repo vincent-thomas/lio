@@ -133,7 +133,10 @@ pub async fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
 ///     Ok(())
 /// }
 /// ```
-pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
+pub async fn write(
+  path: impl AsRef<Path>,
+  contents: impl AsRef<[u8]>,
+) -> io::Result<()> {
   use crate::api;
 
   let file = File::create(path).await?;
@@ -176,7 +179,10 @@ pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Re
 ///     Ok(())
 /// }
 /// ```
-pub async fn read_exact(path: impl AsRef<Path>, len: usize) -> io::Result<Vec<u8>> {
+pub async fn read_exact(
+  path: impl AsRef<Path>,
+  len: usize,
+) -> io::Result<Vec<u8>> {
   use crate::api;
 
   let file = File::open(path).await?;

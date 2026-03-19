@@ -106,8 +106,7 @@ fn test_unix_stream_basic() {
   let sock_path = UnixSocketPath::new("stream_basic");
 
   // Create server socket
-  let mut server_recv =
-    common::unix_stream_socket().with_lio(&mut lio).send();
+  let mut server_recv = common::unix_stream_socket().with_lio(&mut lio).send();
 
   let server_sock = poll_recv(&mut lio, &mut server_recv)
     .expect("Failed to create server socket");
@@ -121,8 +120,7 @@ fn test_unix_stream_basic() {
   poll_until_recv(&mut lio, &receiver).expect("Failed to listen");
 
   // Create client socket
-  let mut client_recv =
-    common::unix_stream_socket().with_lio(&mut lio).send();
+  let mut client_recv = common::unix_stream_socket().with_lio(&mut lio).send();
 
   let client_sock = poll_recv(&mut lio, &mut client_recv)
     .expect("Failed to create client socket");
@@ -179,8 +177,7 @@ fn test_unix_stream_bidirectional() {
   let sock_path = UnixSocketPath::new("stream_bidir");
 
   // Setup server
-  let mut server_recv =
-    common::unix_stream_socket().with_lio(&mut lio).send();
+  let mut server_recv = common::unix_stream_socket().with_lio(&mut lio).send();
   let server_sock = poll_recv(&mut lio, &mut server_recv)
     .expect("Failed to create server socket");
   bind_unix_socket(&server_sock, &sock_path.path).expect("Failed to bind");
@@ -190,8 +187,7 @@ fn test_unix_stream_bidirectional() {
   poll_until_recv(&mut lio, &receiver).expect("Failed to listen");
 
   // Setup client
-  let mut client_recv =
-    common::unix_stream_socket().with_lio(&mut lio).send();
+  let mut client_recv = common::unix_stream_socket().with_lio(&mut lio).send();
   let client_sock = poll_recv(&mut lio, &mut client_recv)
     .expect("Failed to create client socket");
 
@@ -244,8 +240,7 @@ fn test_unix_stream_multiple_clients() {
   let sock_path = UnixSocketPath::new("stream_multi");
 
   // Setup server
-  let mut server_recv =
-    common::unix_stream_socket().with_lio(&mut lio).send();
+  let mut server_recv = common::unix_stream_socket().with_lio(&mut lio).send();
   let server_sock = poll_recv(&mut lio, &mut server_recv)
     .expect("Failed to create server socket");
   bind_unix_socket(&server_sock, &sock_path.path).expect("Failed to bind");
@@ -325,8 +320,7 @@ fn test_unix_dgram_basic() {
   let client_path = UnixSocketPath::new("dgram_client");
 
   // Create server datagram socket
-  let mut server_recv =
-    common::unix_dgram_socket().with_lio(&mut lio).send();
+  let mut server_recv = common::unix_dgram_socket().with_lio(&mut lio).send();
   let server_sock = poll_recv(&mut lio, &mut server_recv)
     .expect("Failed to create server socket");
 
@@ -335,8 +329,7 @@ fn test_unix_dgram_basic() {
     .expect("Failed to bind server");
 
   // Create client datagram socket
-  let mut client_recv =
-    common::unix_dgram_socket().with_lio(&mut lio).send();
+  let mut client_recv = common::unix_dgram_socket().with_lio(&mut lio).send();
   let client_sock = poll_recv(&mut lio, &mut client_recv)
     .expect("Failed to create client socket");
 
@@ -378,8 +371,7 @@ fn test_unix_shutdown() {
   let sock_path = UnixSocketPath::new("shutdown");
 
   // Setup server
-  let mut server_recv =
-    common::unix_stream_socket().with_lio(&mut lio).send();
+  let mut server_recv = common::unix_stream_socket().with_lio(&mut lio).send();
   let server_sock = poll_recv(&mut lio, &mut server_recv)
     .expect("Failed to create server socket");
   bind_unix_socket(&server_sock, &sock_path.path).expect("Failed to bind");
@@ -389,8 +381,7 @@ fn test_unix_shutdown() {
   poll_until_recv(&mut lio, &receiver).expect("Failed to listen");
 
   // Setup client
-  let mut client_recv =
-    common::unix_stream_socket().with_lio(&mut lio).send();
+  let mut client_recv = common::unix_stream_socket().with_lio(&mut lio).send();
   let client_sock = poll_recv(&mut lio, &mut client_recv)
     .expect("Failed to create client socket");
 

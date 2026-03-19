@@ -2,10 +2,7 @@
 
 use std::{io, path::Path};
 
-use crate::{
-  api::io::Io,
-  fs::ops::OpenAtFile,
-};
+use crate::{api::io::Io, fs::ops::OpenAtFile};
 
 /// Options and flags which can be used to configure how a file is opened.
 ///

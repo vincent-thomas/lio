@@ -120,8 +120,7 @@ fn test_sleep_zero_duration() {
   let start = Instant::now();
 
   // Zero duration timeout should complete almost immediately
-  let mut recv =
-    api::sleep(Duration::from_millis(0)).with_lio(&mut lio).send();
+  let mut recv = api::sleep(Duration::from_millis(0)).with_lio(&mut lio).send();
 
   let result = poll_recv_timeout(&mut lio, &mut recv, Duration::from_secs(1))
     .expect("Zero timeout should complete");
@@ -214,8 +213,7 @@ fn test_sleep_interleaved_with_io() {
   // Start a timeout
   let start = Instant::now();
   let timeout_duration = Duration::from_millis(100);
-  let mut timeout_recv =
-    api::sleep(timeout_duration).with_lio(&mut lio).send();
+  let mut timeout_recv = api::sleep(timeout_duration).with_lio(&mut lio).send();
 
   // Do some nop operations while waiting
   let (nop_sender, nop_receiver) = mpsc::channel();

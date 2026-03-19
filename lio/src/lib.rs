@@ -53,6 +53,7 @@ pub mod buf;
 pub mod fs;
 pub mod io;
 pub mod net;
+pub mod process;
 pub mod time;
 
 pub use buf::{

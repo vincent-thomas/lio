@@ -31,10 +31,7 @@ impl RawBuf {
   /// Creates an empty RawBuf (null pointer, zero length).
   #[inline]
   pub const fn empty() -> Self {
-    Self {
-      ptr: std::ptr::null_mut(),
-      len: 0,
-    }
+    Self { ptr: std::ptr::null_mut(), len: 0 }
   }
 
   /// Creates a RawBuf from a pointer and length.
@@ -95,6 +92,13 @@ pub enum Op {
     fd: Resource,
     addr: *mut libc::sockaddr_storage,
     len: *mut libc::socklen_t,
+  },
+  /// Streaming accept - yields multiple connections from a single submission.
+  ///
+  /// On io_uring: Uses IORING_OP_ACCEPT with multishot flag.
+  /// On pollingv2: Auto-resubmits after each accept.
+  AcceptStream {
+    fd: Resource,
   },
   Connect {
     fd: Resource,
@@ -259,6 +263,42 @@ pub enum Op {
   },
 
   // ═══════════════════════════════════════════════════════════════════════════════
+  // Process operations
+  // ═══════════════════════════════════════════════════════════════════════════════
+  /// Wait for a child process to change state.
+  ///
+  /// On Linux with io_uring 6.7+: Uses IORING_OP_WAITID.
+  /// On other platforms: Uses blocking waitid() syscall.
+  #[cfg(unix)]
+  Waitid {
+    /// What type of ID to wait for (P_PID, P_PGID, P_ALL, P_PIDFD).
+    idtype: libc::idtype_t,
+    /// The ID value (pid, pgid, or pidfd depending on idtype).
+    id: libc::id_t,
+    /// Options (WEXITED, WSTOPPED, WCONTINUED, WNOHANG, WNOWAIT).
+    options: libc::c_int,
+    /// Pointer to siginfo_t storage in the TypedOp.
+    infop: *mut libc::siginfo_t,
+  },
+
+  /// Spawn a new process.
+  ///
+  /// Uses posix_spawn() to create a new process.
+  #[cfg(unix)]
+  Spawn {
+    /// Path to executable (C string, owned by TypedOp).
+    path: *const c_char,
+    /// Argument vector (null-terminated array, owned by TypedOp).
+    argv: *const *const c_char,
+    /// Environment vector (null-terminated array, owned by TypedOp).
+    envp: *const *const c_char,
+    /// Pointer to pid_t storage in the TypedOp.
+    pid: *mut libc::pid_t,
+    /// File actions for stdio redirection (null for inherit).
+    file_actions: *const libc::posix_spawn_file_actions_t,
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════════════
   // Vectored I/O operations (scatter/gather)
   // ═══════════════════════════════════════════════════════════════════════════════
   ReadV {
@@ -286,6 +326,51 @@ pub enum Op {
     iovecs: *const libc::iovec,
     iov_count: usize,
     offset: i64,
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // File locking
+  // ═══════════════════════════════════════════════════════════════════════════════
+  /// Advisory file locking.
+  ///
+  /// # Platform-specific behavior
+  ///
+  /// This operation corresponds to `flock()` on Unix with `LOCK_SH`/`LOCK_EX`/`LOCK_UN`,
+  /// and `LockFileEx`/`UnlockFileEx` on Windows.
+  ///
+  /// - **Unix**: Advisory locking (other processes can ignore locks)
+  /// - **Windows**: Mandatory locking (OS enforces). Locking fails if file is opened
+  ///   only for append; open with `.read(true)` or `.write(true)`.
+  ///
+  /// Operations: `LOCK_SH` (shared), `LOCK_EX` (exclusive), `LOCK_UN` (unlock).
+  /// Can be combined with `LOCK_NB` for non-blocking behavior.
+  Flock {
+    fd: Resource,
+    /// Locking operation: LOCK_SH, LOCK_EX, LOCK_UN (optionally | LOCK_NB)
+    operation: i32,
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // Directory operations
+  // ═══════════════════════════════════════════════════════════════════════════════
+  /// Read directory entries (getdents64 on Linux, getdirentries on BSD).
+  #[cfg(unix)]
+  GetDents {
+    fd: Resource,
+    buf: RawBuf,
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // Signal handling
+  // ═══════════════════════════════════════════════════════════════════════════════
+  /// Wait for a signal from the specified signal set.
+  ///
+  /// On Linux: Uses signalfd.
+  /// On BSD/macOS: Uses kqueue EVFILT_SIGNAL.
+  #[cfg(unix)]
+  Signal {
+    /// Pointer to sigset_t in the TypedOp.
+    sigset: *const libc::sigset_t,
   },
 }
 

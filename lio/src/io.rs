@@ -110,7 +110,8 @@ pub async fn copy_n(
   let mut total: u64 = 0;
 
   while total < limit {
-    let to_read = std::cmp::min(DEFAULT_BUF_SIZE as u64, limit - total) as usize;
+    let to_read =
+      std::cmp::min(DEFAULT_BUF_SIZE as u64, limit - total) as usize;
     let buf = vec![0u8; to_read];
     let (read_result, buf) = api::read(reader, buf).await;
     let n = read_result? as usize;

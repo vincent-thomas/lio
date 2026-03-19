@@ -10,7 +10,7 @@ use crate::{
     resource::{AsResource, FromResource, IntoResource, Resource},
   },
   buf::{IoBuf, IoBufMut},
-  fs::{ops::OpenAtFile, OpenOptions},
+  fs::{OpenOptions, ops::OpenAtFile},
 };
 
 /// A reference to an open file on the filesystem.
@@ -129,11 +129,7 @@ impl File {
   /// }
   /// ```
   pub fn create(path: impl AsRef<Path>) -> Io<OpenAtFile> {
-    OpenOptions::new()
-      .write(true)
-      .create(true)
-      .truncate(true)
-      .open(path)
+    OpenOptions::new().write(true).create(true).truncate(true).open(path)
   }
 
   /// Creates a new file in read-write mode; error if the file exists.
@@ -154,11 +150,7 @@ impl File {
   /// }
   /// ```
   pub fn create_new(path: impl AsRef<Path>) -> Io<OpenAtFile> {
-    OpenOptions::new()
-      .read(true)
-      .write(true)
-      .create_new(true)
-      .open(path)
+    OpenOptions::new().read(true).write(true).create_new(true).open(path)
   }
 
   /// Reads data from the file into the provided buffer.

@@ -2,9 +2,9 @@
 
 mod common;
 
-use common::{poll_recv, poll_until_recv, TempFile};
-use lio::fs::{File, OpenOptions};
+use common::{TempFile, poll_recv, poll_until_recv};
 use lio::Lio;
+use lio::fs::{File, OpenOptions};
 use std::sync::mpsc;
 
 // ============================================================================
@@ -48,9 +48,8 @@ fn test_file_open_existing() {
 fn test_file_open_nonexistent() {
   let mut lio = Lio::new(64).unwrap();
 
-  let mut recv = File::open("/tmp/nonexistent_lio_test_12345.txt")
-    .with_lio(&mut lio)
-    .send();
+  let mut recv =
+    File::open("/tmp/nonexistent_lio_test_12345.txt").with_lio(&mut lio).send();
   let result = poll_recv(&mut lio, &mut recv);
 
   assert!(result.is_err(), "Opening nonexistent file should fail");
@@ -147,7 +146,8 @@ fn test_file_create_new_success() {
 
   // File shouldn't exist yet (TempFile just generates a path)
   let mut recv = File::create_new(path).with_lio(&mut lio).send();
-  let _file = poll_recv(&mut lio, &mut recv).expect("create_new should succeed");
+  let _file =
+    poll_recv(&mut lio, &mut recv).expect("create_new should succeed");
 }
 
 #[test]
@@ -241,10 +241,7 @@ fn test_file_write_at() {
   // Write at offset 3
   let data = b"XXX".to_vec();
   let (sender, receiver) = mpsc::channel();
-  file
-    .write_at(data, 3)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  file.write_at(data, 3).with_lio(&mut lio).send_with(sender);
   let (result, _data) = poll_until_recv(&mut lio, &receiver);
   result.expect("write_at should succeed");
 
@@ -404,11 +401,8 @@ fn test_open_options_append() {
   let path = temp.path.to_str().unwrap();
 
   // Open in append mode
-  let mut recv = OpenOptions::new()
-    .append(true)
-    .open(path)
-    .with_lio(&mut lio)
-    .send();
+  let mut recv =
+    OpenOptions::new().append(true).open(path).with_lio(&mut lio).send();
   let file = poll_recv(&mut lio, &mut recv).expect("Failed to open file");
 
   // Write more data (should be appended)

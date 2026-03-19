@@ -1,7 +1,7 @@
 //! Integration tests for file I/O operations.
 
-use lio_uring::operation::*;
 use lio_uring::LioUring;
+use lio_uring::operation::*;
 use std::fs::{self, File};
 use std::io::{Read as IoRead, Seek, SeekFrom, Write as IoWrite};
 use std::os::fd::AsRawFd;

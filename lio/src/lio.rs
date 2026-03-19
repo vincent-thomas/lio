@@ -10,7 +10,11 @@ use std::{cell::RefCell, io, rc::Rc, task::Waker, time::Duration};
 /// Matches the expected error codes in TypedOp::extract_result for Sleep.
 #[cfg(target_os = "linux")]
 const SLEEP_RESULT: isize = -(libc::ETIME as isize);
-#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "dragonfly"))]
+#[cfg(any(
+  target_os = "macos",
+  target_os = "freebsd",
+  target_os = "dragonfly"
+))]
 const SLEEP_RESULT: isize = -(libc::ETIMEDOUT as isize);
 #[cfg(not(any(
   target_os = "linux",
@@ -164,27 +168,6 @@ impl Lio {
     }
   }
 
-  /// Schedule a streaming operation that yields multiple completions.
-  ///
-  /// This uses `push_stream` on the backend, which may use native multishot
-  /// operations (io_uring) or automatic resubmission (pollingv2).
-  pub(crate) fn schedule_stream(
-    &self,
-    op: Op,
-    notifier: Registration,
-  ) -> io::Result<u64> {
-    let mut inner = self.inner.borrow_mut();
-    let id = inner.store.insert(notifier);
-
-    match inner.io.push_stream(id, op) {
-      Ok(()) => Ok(id),
-      Err(err) => {
-        assert!(inner.store.remove(id));
-        Err(err)
-      }
-    }
-  }
-
   /// Non-blocking poll for completed operations.
   ///
   /// Returns immediately, processing any completions that are ready.
@@ -232,7 +215,10 @@ impl Lio {
     // Process I/O completions
     for (op_id, result, more) in &completed {
       let Some(op) = inner.store.get_mut(*op_id) else {
-        panic!("lio bookkeeping bug: completed op doesn't exist in store.");
+        // Op was cancelled and removed - ignore stale completion.
+        // This happens with multishot ops on io_uring where cancellation
+        // is async and completions may arrive after removal.
+        continue;
       };
       op.set_done(*result, *more);
 
@@ -292,7 +278,8 @@ impl Lio {
           return Err(Error::StreamDone);
         }
         // Try to pop a result from the stream queue
-        let result = entry.try_take_stream_result().ok_or(Error::EntryNotCompleted)?;
+        let result =
+          entry.try_take_stream_result().ok_or(Error::EntryNotCompleted)?;
         // Check again if we should clean up after taking this result
         if entry.is_stream_done() {
           assert!(inner.store.remove(key));

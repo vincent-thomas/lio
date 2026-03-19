@@ -16,9 +16,9 @@ use std::{io, net::SocketAddr, os::fd::FromRawFd};
 
 #[allow(unused_imports)] // TcpListener used in doc links
 use crate::{
+  api::op::TypedOp,
   api::{ops, resource::FromResource},
   net::{Socket, TcpListener, TcpSocket},
-  api::op::TypedOp,
 };
 
 /// Accept operation specialized for [`Socket`].

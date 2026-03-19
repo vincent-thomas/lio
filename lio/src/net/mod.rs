@@ -131,6 +131,8 @@
 
 mod socket;
 mod tcp;
+#[cfg(unix)]
+pub mod unix;
 
 pub use socket::*;
 pub use tcp::*;

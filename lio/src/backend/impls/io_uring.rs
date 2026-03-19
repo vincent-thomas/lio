@@ -3,10 +3,10 @@
 use lio_uring::{
   Entry, LioUring,
   operation::{
-    self, Accept, AcceptMulti, AsyncCancel, Bind, Close, Connect, Fsync, Ftruncate, LinkAt, Listen,
-    MkDirAt, OpenAt, PollAdd, Readv, Recv, RecvMsg, RenameAt, Send, SendMsg,
-    Shutdown, Socket, Splice, SymlinkAt, Tee, Timeout, TimeoutRemove, UnlinkAt,
-    Writev,
+    self, Accept, AcceptMulti, AsyncCancel, Bind, Close, Connect, Fsync,
+    Ftruncate, LinkAt, Listen, MkDirAt, OpenAt, PollAdd, Readv, Recv, RecvMsg,
+    RenameAt, Send, SendMsg, Shutdown, Socket, Splice, SymlinkAt, Tee, Timeout,
+    TimeoutRemove, UnlinkAt, WaitId, Writev,
   },
 };
 
@@ -50,6 +50,10 @@ fn create_io_uring_entry(op: &Op) -> Entry {
     Op::Accept { fd, addr, len } => {
       // Cast sockaddr_storage* to sockaddr*
       Accept::new(fd.as_raw_fd(), (*addr) as *mut libc::sockaddr, *len).build()
+    }
+    Op::AcceptStream { fd } => {
+      // Use AcceptMulti for multishot accept (no address - caller uses getpeername)
+      AcceptMulti::new(fd.as_raw_fd()).build()
     }
     Op::Connect { fd, addr, len, .. } => {
       Connect::new(fd.as_raw_fd(), (*addr) as *const libc::sockaddr, *len)
@@ -157,6 +161,15 @@ fn create_io_uring_entry(op: &Op) -> Entry {
     Op::Watch { .. } => {
       // Watch is handled via blocking fallback or special handling in push()
       unreachable!("Watch should be handled as blocking operation")
+    }
+    #[cfg(unix)]
+    Op::Waitid { idtype, id, options, infop } => {
+      WaitId::new(*idtype, *id, *options).infop(*infop).build()
+    }
+    #[cfg(unix)]
+    Op::Spawn { .. } => {
+      // io_uring doesn't have a spawn operation - handled as blocking
+      unreachable!("Spawn should be handled as blocking operation")
     }
   }
 }
@@ -271,11 +284,19 @@ impl IoUring {
     let mut raw_completions: Vec<(u64, isize, bool)> = Vec::new();
 
     if let Some(first) = first {
-      raw_completions.push((first.user_data(), first.result() as isize, first.has_more()));
+      raw_completions.push((
+        first.user_data(),
+        first.result() as isize,
+        first.has_more(),
+      ));
 
       // Drain any additional completions (non-blocking)
       while let Ok(Some(op)) = ring.try_wait() {
-        raw_completions.push((op.user_data(), op.result() as isize, op.has_more()));
+        raw_completions.push((
+          op.user_data(),
+          op.result() as isize,
+          op.has_more(),
+        ));
       }
     }
 
@@ -288,7 +309,12 @@ impl IoUring {
   }
 
   /// Process a single completion, handling special cases like watch poll events.
-  fn process_completion(&mut self, user_data: u64, result: isize, has_more: bool) {
+  fn process_completion(
+    &mut self,
+    user_data: u64,
+    result: isize,
+    has_more: bool,
+  ) {
     if user_data == WHEEL_TIMER_KEY {
       self.wheel_timer_armed = false;
       return;
@@ -337,7 +363,9 @@ impl IoUring {
       return;
     }
 
-    self.completed.push(OpCompleted::new(user_data, result).with_more(has_more));
+    self
+      .completed
+      .push(OpCompleted::new(user_data, result).with_more(has_more));
   }
 }
 
@@ -384,6 +412,24 @@ impl IoBackend for IoUring {
       return Ok(());
     }
 
+    // Handle Spawn via posix_spawn (no io_uring support)
+    #[cfg(unix)]
+    if let Op::Spawn { path, argv, envp, pid } = &op {
+      let ret = unsafe {
+        libc::posix_spawn(
+          *pid,
+          *path,
+          std::ptr::null(), // file_actions
+          std::ptr::null(), // attrp
+          *argv as *const *mut _,
+          *envp as *const *mut _,
+        )
+      };
+      let result = if ret == 0 { 0 } else { -(ret as isize) };
+      self.immediate.push(ImmediateCompletion { id, result });
+      return Ok(());
+    }
+
     // Handle Watch via io_uring poll on inotify fd
     #[cfg(unix)]
     if let Op::Watch { path, mask } = &op {
@@ -391,23 +437,32 @@ impl IoBackend for IoUring {
       use std::ffi::CStr;
 
       // Create inotify fd (non-blocking for poll)
-      let inotify_fd = match syscall!(inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC)) {
-        Ok(fd) => fd,
-        Err(e) => {
-          let errno = e.raw_os_error().unwrap_or(libc::EIO);
-          self.immediate.push(ImmediateCompletion { id, result: -(errno as isize) });
-          return Ok(());
-        }
-      };
+      let inotify_fd =
+        match syscall!(inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC)) {
+          Ok(fd) => fd,
+          Err(e) => {
+            let errno = e.raw_os_error().unwrap_or(libc::EIO);
+            self
+              .immediate
+              .push(ImmediateCompletion { id, result: -(errno as isize) });
+            return Ok(());
+          }
+        };
 
       let path_cstr = unsafe { CStr::from_ptr(*path) };
       let inotify_mask = WatchMask::from_bits(*mask).to_inotify_mask();
 
       // Add watch
-      if let Err(e) = syscall!(inotify_add_watch(inotify_fd, path_cstr.as_ptr(), inotify_mask)) {
+      if let Err(e) = syscall!(inotify_add_watch(
+        inotify_fd,
+        path_cstr.as_ptr(),
+        inotify_mask
+      )) {
         unsafe { libc::close(inotify_fd) };
         let errno = e.raw_os_error().unwrap_or(libc::EIO);
-        self.immediate.push(ImmediateCompletion { id, result: -(errno as isize) });
+        self
+          .immediate
+          .push(ImmediateCompletion { id, result: -(errno as isize) });
         return Ok(());
       }
 
@@ -418,12 +473,14 @@ impl IoBackend for IoUring {
       let poll_entry = PollAdd::new(inotify_fd, libc::POLLIN as u32).build();
 
       // Use flagged user_data so we can identify this as a watch completion
-      unsafe { self.ring().push(poll_entry, id | WATCH_POLL_FLAG) }.map_err(|_| {
-        // Clean up on failure
-        self.watch_fds.remove(&id);
-        unsafe { libc::close(inotify_fd) };
-        io::Error::new(io::ErrorKind::WouldBlock, "submission queue full")
-      })?;
+      unsafe { self.ring().push(poll_entry, id | WATCH_POLL_FLAG) }.map_err(
+        |_| {
+          // Clean up on failure
+          self.watch_fds.remove(&id);
+          unsafe { libc::close(inotify_fd) };
+          io::Error::new(io::ErrorKind::WouldBlock, "submission queue full")
+        },
+      )?;
 
       return Ok(());
     }
@@ -541,27 +598,6 @@ impl IoBackend for IoUring {
 
     self.wheel_timer_armed = false;
     Ok(())
-  }
-
-  fn push_stream(&mut self, id: u64, op: Op) -> io::Result<()> {
-    // For io_uring, use native multishot operations where available
-    match &op {
-      Op::Accept { fd, .. } => {
-        // Use AcceptMulti for multishot accept
-        // Note: AcceptMulti doesn't fill in the address - caller must use getpeername
-        let entry = AcceptMulti::new(fd.as_raw_fd()).build();
-
-        // Push to submission queue
-        unsafe { self.ring().push(entry, id) }.map_err(|_| {
-          io::Error::new(io::ErrorKind::WouldBlock, "submission queue full")
-        })?;
-
-        Ok(())
-      }
-      // For ops that don't have native multishot, fall back to regular push
-      // The API layer will handle resubmission
-      _ => self.push(id, op),
-    }
   }
 
   fn cancel(&mut self, id: u64) -> io::Result<()> {

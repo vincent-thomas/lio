@@ -220,7 +220,7 @@ where
   /// ```
   pub fn when_done<F>(self, f: F)
   where
-    F: Fn(T::Result) + Send + 'static,
+    F: FnOnce(T::Result) + Send + 'static,
   {
     let (lio, typed_op) = self.into_lio();
 
@@ -641,11 +641,11 @@ impl<T: StreamOp + Unpin> Future for IoStreamNextFuture<'_, T> {
         let op = stream.op.as_mut().expect("IoStream polled after drop");
         let backend_op = op.into_op();
 
-        // Use stream registration and schedule_stream for multishot support
-        match stream
-          .lio
-          .schedule_stream(backend_op, Registration::new_stream_waker(cx.waker().clone()))
-        {
+        // Use stream registration for multishot support
+        match stream.lio.schedule(
+          backend_op,
+          Registration::new_stream_waker(cx.waker().clone()),
+        ) {
           Ok(id) => {
             stream.state = IoStreamState::Inflight { id };
             Poll::Pending
@@ -797,7 +797,7 @@ where
     );
 
     lio
-      .schedule_stream(backend_op, reg)
+      .schedule(backend_op, reg)
       .expect("lio error: failed to schedule stream operation");
   }
 }
@@ -821,7 +821,10 @@ impl<T> StreamReceiver<T> {
   }
 
   /// Blocks with a timeout waiting for the next item.
-  pub fn recv_timeout(&self, timeout: Duration) -> Result<T, std_mpsc::RecvTimeoutError> {
+  pub fn recv_timeout(
+    &self,
+    timeout: Duration,
+  ) -> Result<T, std_mpsc::RecvTimeoutError> {
     self.recv.recv_timeout(timeout)
   }
 

@@ -38,92 +38,34 @@ pub(crate) enum SingleState {
 /// - Waker-based: results are queued and a waker is notified
 /// - Callback-based: a callback is invoked for each completion
 pub struct StreamRegistration {
-  pub(crate) notifier: StreamNotifier,
-  pub(crate) done: bool,
+  pub(crate) state: StreamState,
 }
 
-/// Notification mechanism for stream registrations.
-pub(crate) enum StreamNotifier {
-  /// Waker-based: queue results and wake the task.
-  Waker { waker: Option<Waker>, results: VecDeque<isize> },
-  /// Callback-based: invoke callback for each completion.
-  Callback(StreamOpCallback),
-}
-
-impl StreamNotifier {
-  /// Set waker for waker-based streams. No-op for callback-based.
-  fn set_waker(&mut self, new_waker: Waker) {
-    match self {
-      Self::Waker { waker, results } => {
-        if !results.is_empty() {
-          // Has pending results, wake immediately
-          new_waker.wake();
-        } else {
-          *waker = Some(new_waker);
-        }
-      }
-      Self::Callback(_) => {
-        // Callback streams don't use wakers
-      }
-    }
-  }
-
-  /// Notify about a completion.
-  ///
-  /// For waker-based: queues the result and wakes the task.
-  /// For callback-based: invokes the callback with the extracted item.
-  fn notify(&mut self, result: isize) {
-    match self {
-      Self::Waker { waker, results } => {
-        results.push_back(result);
-        if let Some(w) = waker.take() {
-          w.wake();
-        }
-      }
-      Self::Callback(cb) => {
-        cb.call(result);
-      }
-    }
-  }
-
-  /// Pop a result from the queue (waker-based only).
-  fn pop_result(&mut self) -> Option<isize> {
-    match self {
-      Self::Waker { results, .. } => results.pop_front(),
-      Self::Callback(_) => {
-        panic!("pop_result called on callback-based stream")
-      }
-    }
-  }
-
-  /// Check if results queue is empty.
-  ///
-  /// For callback-based streams, always returns true (results are
-  /// consumed immediately).
-  fn is_empty(&self) -> bool {
-    match self {
-      Self::Waker { results, .. } => results.is_empty(),
-      Self::Callback(_) => true,
-    }
-  }
+/// State machine for streaming operations.
+pub(crate) enum StreamState {
+  /// Active waker-based stream, waiting for completions.
+  ActiveWaker { waker: Option<Waker>, results: VecDeque<isize> },
+  /// No more completions coming, but results still queued.
+  DrainingWaker { results: VecDeque<isize> },
+  /// Active callback-based stream.
+  ActiveCallback(StreamOpCallback),
+  /// Done: finished and all results consumed.
+  Done,
 }
 
 impl Registration {
   /// Create a waker-based registration for a single-shot operation.
   pub fn new_waker(waker: Waker) -> Self {
-    Self::Single(SingleRegistration {
-      state: SingleState::PendingWaker(waker),
-    })
+    Self::Single(SingleRegistration { state: SingleState::PendingWaker(waker) })
   }
 
   /// Create a waker-based registration for a streaming operation.
   pub fn new_stream_waker(waker: Waker) -> Self {
     Self::Stream(StreamRegistration {
-      notifier: StreamNotifier::Waker {
+      state: StreamState::ActiveWaker {
         waker: Some(waker),
         results: VecDeque::new(),
       },
-      done: false,
     })
   }
 
@@ -137,10 +79,12 @@ impl Registration {
   pub fn new_callback<T, F>(callback: F, typed_op: Box<T>) -> Self
   where
     T: TypedOp,
-    F: Fn(T::Result) + Send + 'static,
+    F: FnOnce(T::Result) + Send + 'static,
   {
     Self::Single(SingleRegistration {
-      state: SingleState::PendingCallback(SingleOpCallback::new(callback, typed_op)),
+      state: SingleState::PendingCallback(SingleOpCallback::new(
+        callback, typed_op,
+      )),
     })
   }
 
@@ -153,8 +97,9 @@ impl Registration {
     F: Fn(T::Item) + Send + 'static,
   {
     Self::Stream(StreamRegistration {
-      notifier: StreamNotifier::Callback(StreamOpCallback::new(callback, stream_op)),
-      done: false,
+      state: StreamState::ActiveCallback(StreamOpCallback::new(
+        callback, stream_op,
+      )),
     })
   }
 
@@ -176,7 +121,23 @@ impl Registration {
         }
       }
       Self::Stream(inner) => {
-        inner.notifier.set_waker(waker);
+        match &mut inner.state {
+          StreamState::ActiveWaker { waker: w, results } => {
+            if !results.is_empty() {
+              // Has pending results, wake immediately
+              waker.wake();
+            } else {
+              *w = Some(waker);
+            }
+          }
+          StreamState::DrainingWaker { .. } | StreamState::Done => {
+            // Draining or done, wake immediately
+            waker.wake();
+          }
+          StreamState::ActiveCallback(_) => {
+            // Callback streams don't use wakers
+          }
+        }
       }
     }
   }
@@ -209,12 +170,31 @@ impl Registration {
         };
       }
       Self::Stream(inner) => {
-        // Mark done if no more completions coming
-        if !more {
-          inner.done = true;
-        }
-        // Notify based on notifier type
-        inner.notifier.notify(result);
+        // Take ownership of state to transition
+        let state = std::mem::replace(&mut inner.state, StreamState::Done);
+        inner.state = match state {
+          StreamState::ActiveWaker { waker, mut results } => {
+            results.push_back(result);
+            if let Some(w) = waker {
+              w.wake();
+            }
+            if more {
+              StreamState::ActiveWaker { waker: None, results }
+            } else {
+              StreamState::DrainingWaker { results }
+            }
+          }
+          StreamState::ActiveCallback(mut cb) => {
+            cb.call(result);
+            if more {
+              StreamState::ActiveCallback(cb)
+            } else {
+              StreamState::Done
+            }
+          }
+          // DrainingWaker/Done shouldn't receive more completions
+          other => other,
+        };
       }
     }
   }
@@ -225,16 +205,14 @@ impl Registration {
   /// Transitions Completed → Done.
   pub fn try_take_result(&mut self) -> Option<isize> {
     match self {
-      Self::Single(inner) => {
-        match &inner.state {
-          SingleState::Completed(result) => {
-            let result = *result;
-            inner.state = SingleState::Done;
-            Some(result)
-          }
-          _ => None,
+      Self::Single(inner) => match &inner.state {
+        SingleState::Completed(result) => {
+          let result = *result;
+          inner.state = SingleState::Done;
+          Some(result)
         }
-      }
+        _ => None,
+      },
       Self::Stream(_) => {
         panic!(
           "try_take_result called on stream registration - use try_take_stream_result instead"
@@ -258,7 +236,20 @@ impl Registration {
           "try_take_stream_result called on single registration - use try_take_result instead"
         )
       }
-      Self::Stream(inner) => inner.notifier.pop_result(),
+      Self::Stream(inner) => match &mut inner.state {
+        StreamState::ActiveWaker { results, .. } => results.pop_front(),
+        StreamState::DrainingWaker { results } => {
+          let result = results.pop_front();
+          if results.is_empty() {
+            inner.state = StreamState::Done;
+          }
+          result
+        }
+        StreamState::ActiveCallback(_) => {
+          panic!("try_take_stream_result called on callback-based stream")
+        }
+        StreamState::Done => None,
+      },
     }
   }
 
@@ -267,7 +258,7 @@ impl Registration {
   pub fn is_stream_done(&self) -> bool {
     match self {
       Self::Single(_) => false,
-      Self::Stream(inner) => inner.done && inner.notifier.is_empty(),
+      Self::Stream(inner) => matches!(inner.state, StreamState::Done),
     }
   }
 
@@ -279,7 +270,7 @@ impl Registration {
   pub fn result_consumed(&self) -> bool {
     match self {
       Self::Single(inner) => matches!(inner.state, SingleState::Done),
-      Self::Stream(inner) => inner.done && inner.notifier.is_empty(),
+      Self::Stream(inner) => matches!(inner.state, StreamState::Done),
     }
   }
 
@@ -290,7 +281,7 @@ impl Registration {
   pub fn is_finished(&self) -> bool {
     match self {
       Self::Single(inner) => matches!(inner.state, SingleState::Done),
-      Self::Stream(inner) => inner.done && inner.notifier.is_empty(),
+      Self::Stream(inner) => matches!(inner.state, StreamState::Done),
     }
   }
 
@@ -300,7 +291,6 @@ impl Registration {
     matches!(self, Self::Stream(_))
   }
 }
-
 
 /// Callback for single-shot operations (TypedOp).
 ///
@@ -314,7 +304,8 @@ pub(crate) struct SingleOpCallback {
 
 impl Drop for SingleOpCallback {
   fn drop(&mut self) {
-    if !self.op.is_null() {
+    // If callback wasn't consumed (call wasn't invoked), drop both
+    if !self.callback.is_null() {
       (self.drop_fn)(self.callback, self.op);
     }
   }
@@ -330,7 +321,7 @@ impl SingleOpCallback {
   pub(crate) fn new<T, F>(callback: F, typed_op: Box<T>) -> Self
   where
     T: TypedOp,
-    F: Fn(T::Result) + Send + 'static,
+    F: FnOnce(T::Result) + Send + 'static,
   {
     SingleOpCallback {
       callback: Box::into_raw(Box::new(callback)) as *const (),
@@ -342,23 +333,26 @@ impl SingleOpCallback {
 
   /// Call the callback with the operation result.
   ///
-  /// Consumes the op (calls extract_result which takes self).
+  /// Consumes both the callback and op.
   /// Subsequent calls are no-ops.
   pub fn call(&mut self, res: isize) {
-    if self.op.is_null() {
+    if self.callback.is_null() {
       return; // Already called
     }
     (self.call_fn)(self.callback, self.op, res);
-    self.op = std::ptr::null_mut(); // Mark as consumed
+    // Both consumed by call_fn
+    self.callback = std::ptr::null();
+    self.op = std::ptr::null_mut();
   }
 
   fn call_impl<T, F>(callback_ptr: *const (), op_ptr: *mut (), res: isize)
   where
     T: TypedOp,
-    F: Fn(T::Result),
+    F: FnOnce(T::Result),
   {
-    // SAFETY: We consume the op here (extract_result takes self)
-    let callback = unsafe { &*(callback_ptr as *const F) };
+    // SAFETY: callback_ptr was created by Box::into_raw in new(), we're taking ownership back
+    let callback = unsafe { Box::from_raw(callback_ptr as *mut F) };
+    // SAFETY: op_ptr was created by Box::into_raw in new(), we're taking ownership back
     let typed_op = unsafe { Box::from_raw(op_ptr as *mut T) };
     let result = typed_op.extract_result(res);
     callback(result);
@@ -367,8 +361,9 @@ impl SingleOpCallback {
   fn drop_impl<T, F>(callback_ptr: *const (), op_ptr: *mut ())
   where
     T: TypedOp,
-    F: Fn(T::Result),
+    F: FnOnce(T::Result),
   {
+    // SAFETY: Both pointers were created by Box::into_raw in new(), we're dropping them
     unsafe {
       drop(Box::from_raw(callback_ptr as *mut F));
       drop(Box::from_raw(op_ptr as *mut T));
@@ -424,7 +419,9 @@ impl StreamOpCallback {
     T: StreamOp,
     F: Fn(T::Item),
   {
+    // SAFETY: callback_ptr was created by Box::into_raw, we're borrowing (not consuming)
     let callback = unsafe { &*(callback_ptr as *const F) };
+    // SAFETY: op_ptr was created by Box::into_raw, we're borrowing mutably
     let stream_op = unsafe { &mut *(op_ptr as *mut T) };
     if let StreamResult::Item(item) = stream_op.extract_item(res) {
       callback(item);
@@ -436,6 +433,7 @@ impl StreamOpCallback {
     T: StreamOp,
     F: Fn(T::Item),
   {
+    // SAFETY: Both pointers were created by Box::into_raw in new(), we're dropping them
     unsafe {
       drop(Box::from_raw(callback_ptr as *mut F));
       drop(Box::from_raw(op_ptr as *mut T));
@@ -447,6 +445,9 @@ impl StreamOpCallback {
 fn test_op_reg_size() {
   // SingleState: largest variant is PendingCallback with 4 pointers (32 bytes) + discriminant
   assert_eq!(std::mem::size_of::<SingleState>(), 40);
+
+  // StreamState: largest variant is ActiveWaker with Option<Waker> (8) + VecDeque (24) = 32 + discriminant (8) + padding = 48
+  assert_eq!(std::mem::size_of::<StreamState>(), 48);
 }
 
 #[test]

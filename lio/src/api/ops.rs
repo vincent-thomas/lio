@@ -9,11 +9,11 @@ use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::RawHandle;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-#[cfg(windows)]
-use std::os::windows::io::RawHandle;
 
 use crate::api::op::{StreamOp, StreamResult, TypedOp};
 use crate::api::resource::Resource;
@@ -27,7 +27,9 @@ use crate::{BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec, MAX_IOV_COUNT};
 /// Converts a libc sockaddr_storage to a std SocketAddr.
 ///
 /// Returns `None` if the address family is not supported (only AF_INET and AF_INET6).
-fn libc_socketaddr_into_std(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+fn libc_socketaddr_into_std(
+  storage: &libc::sockaddr_storage,
+) -> Option<SocketAddr> {
   // SAFETY: storage is a valid reference, so the pointer is valid
   unsafe { libc_socketaddr_into_std_raw(storage as *const _) }.ok()
 }
@@ -68,7 +70,9 @@ unsafe fn libc_socketaddr_into_std_raw(
   }
 }
 
-pub(crate) fn std_socketaddr_into_libc(addr: SocketAddr) -> libc::sockaddr_storage {
+pub(crate) fn std_socketaddr_into_libc(
+  addr: SocketAddr,
+) -> libc::sockaddr_storage {
   // SAFETY: sockaddr_storage is a C struct designed to hold any socket address type.
   // Zero-initialization is valid - all fields are primitive types where zero is safe.
   let storage: UnsafeCell<libc::sockaddr_storage> =
@@ -283,11 +287,7 @@ impl StreamOp for AcceptStream {
   type Item = io::Result<(Resource, SocketAddr)>;
 
   fn into_op(&mut self) -> Op {
-    Op::Accept {
-      fd: self.res.clone(),
-      addr: &mut self.addr as *mut _,
-      len: &mut self.len as *mut _,
-    }
+    Op::AcceptStream { fd: self.res.clone() }
   }
 
   fn extract_item(&mut self, res: isize) -> StreamResult<Self::Item> {
@@ -306,8 +306,35 @@ impl StreamOp for AcceptStream {
       let fd = res as RawFd;
       // SAFETY: fd is valid from accept syscall.
       let resource = unsafe { Resource::from_raw_fd(fd) };
-      // SAFETY: self.addr was filled by the kernel via the accept syscall.
-      match unsafe { libc_socketaddr_into_std_raw(&self.addr as *const _) } {
+
+      // io_uring's AcceptMulti doesn't fill the address buffer, so check if it's empty.
+      // If ss_family is 0 (uninitialized), use getpeername to get the peer address.
+      let addr_result = if self.addr.ss_family == 0 {
+        // Use getpeername to get the peer address
+        // SAFETY: sockaddr_storage is safe to zero-initialize
+        let mut peer_addr: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let mut peer_len =
+          mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: fd is a valid socket, peer_addr/peer_len are valid pointers
+        let ret = unsafe {
+          libc::getpeername(
+            fd,
+            &mut peer_addr as *mut _ as *mut libc::sockaddr,
+            &mut peer_len,
+          )
+        };
+        if ret == 0 {
+          // SAFETY: peer_addr was filled by getpeername
+          unsafe { libc_socketaddr_into_std_raw(&peer_addr as *const _) }
+        } else {
+          Err(io::Error::last_os_error())
+        }
+      } else {
+        // SAFETY: self.addr was filled by the kernel via the accept syscall.
+        unsafe { libc_socketaddr_into_std_raw(&self.addr as *const _) }
+      };
+
+      match addr_result {
         Ok(addr) => StreamResult::Item(Ok((resource, addr))),
         Err(e) => StreamResult::Item(Err(e)),
       }
@@ -316,6 +343,7 @@ impl StreamOp for AcceptStream {
 
   fn reset(&mut self) {
     // Reset the address storage for the next accept
+    // SAFETY: sockaddr_storage is safe to zero-initialize
     self.addr = unsafe { mem::zeroed() };
     self.len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
   }
@@ -353,11 +381,7 @@ impl TypedOp for Bind {
       mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t
     };
 
-    Op::Bind {
-      fd: self.res.clone(),
-      addr: &self.addr as *const _,
-      addrlen,
-    }
+    Op::Bind { fd: self.res.clone(), addr: &self.addr as *const _, addrlen }
   }
 }
 
@@ -426,6 +450,17 @@ impl Connect {
     } else {
       mem::size_of::<libc::sockaddr_storage>()
     } as libc::socklen_t;
+    Self { res, addr, len, connect_called: AtomicBool::new(false) }
+  }
+
+  /// Creates a Connect operation with a pre-built sockaddr_storage.
+  ///
+  /// This is useful for Unix domain sockets and other address families.
+  pub(crate) fn from_storage(
+    res: Resource,
+    addr: libc::sockaddr_storage,
+    len: libc::socklen_t,
+  ) -> Self {
     Self { res, addr, len, connect_called: AtomicBool::new(false) }
   }
 }
@@ -577,10 +612,7 @@ impl TypedOp for Listen {
   impl_io_result!();
 
   fn into_op(&mut self) -> Op {
-    Op::Listen {
-      fd: self.res.clone(),
-      backlog: self.backlog,
-    }
+    Op::Listen { fd: self.res.clone(), backlog: self.backlog }
   }
 }
 
@@ -685,8 +717,16 @@ pub struct ReadV<B: std::marker::Send + std::marker::Sync> {
   iov_count: usize,
 }
 
-unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Send for ReadV<B> {}
-unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Sync for ReadV<B> {}
+// SAFETY: ReadV only contains Send/Sync types and iovecs which point to owned buffers
+unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Send
+  for ReadV<B>
+{
+}
+// SAFETY: ReadV only contains Send/Sync types and iovecs which point to owned buffers
+unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Sync
+  for ReadV<B>
+{
+}
 
 impl<B: std::marker::Send + std::marker::Sync> ReadV<B> {
   pub(crate) fn new(res: Resource, bufs: B) -> Self
@@ -697,6 +737,7 @@ impl<B: std::marker::Send + std::marker::Sync> ReadV<B> {
     Self {
       res,
       bufs: Some(bufs),
+      // SAFETY: iovec array is safe to zero-initialize
       iovecs: unsafe { mem::zeroed() },
       iov_count,
     }
@@ -753,8 +794,16 @@ pub struct ReadVAt<B: std::marker::Send + std::marker::Sync> {
   offset: i64,
 }
 
-unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Send for ReadVAt<B> {}
-unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Sync for ReadVAt<B> {}
+// SAFETY: ReadVAt only contains Send/Sync types and iovecs which point to owned buffers
+unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Send
+  for ReadVAt<B>
+{
+}
+// SAFETY: ReadVAt only contains Send/Sync types and iovecs which point to owned buffers
+unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Sync
+  for ReadVAt<B>
+{
+}
 
 impl<B: std::marker::Send + std::marker::Sync> ReadVAt<B> {
   pub(crate) fn new(res: Resource, bufs: B, offset: i64) -> Self
@@ -765,6 +814,7 @@ impl<B: std::marker::Send + std::marker::Sync> ReadVAt<B> {
     Self {
       res,
       bufs: Some(bufs),
+      // SAFETY: iovec array is safe to zero-initialize
       iovecs: unsafe { mem::zeroed() },
       iov_count,
       offset,
@@ -883,8 +933,16 @@ where
 // SAFETY: The iovec/msghdr contain raw pointers that point to data within
 // this same struct (addr, buf) or to the buffer owned by this struct.
 // The operation is only accessed from the owning thread (thread-per-core model).
-unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Send for RecvFrom<B> {}
-unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Sync for RecvFrom<B> {}
+// SAFETY: RecvFrom contains raw pointers that point to this same struct's owned data
+unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Send
+  for RecvFrom<B>
+{
+}
+// SAFETY: RecvFrom contains raw pointers that point to this same struct's owned data
+unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Sync
+  for RecvFrom<B>
+{
+}
 
 impl<B> RecvFrom<B>
 where
@@ -898,7 +956,9 @@ where
       // SAFETY: sockaddr_storage, iovec, msghdr are C structs safe to zero-initialize
       addr: unsafe { mem::zeroed() },
       addrlen: mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+      // SAFETY: iovec is a C struct safe to zero-initialize
       iovec: unsafe { mem::zeroed() },
+      // SAFETY: msghdr is a C struct safe to zero-initialize
       msghdr: unsafe { mem::zeroed() },
     }
   }
@@ -1066,12 +1126,7 @@ impl SendFile {
     offset: Option<i64>,
     count: usize,
   ) -> Self {
-    Self {
-      out_fd,
-      in_fd,
-      offset: offset.unwrap_or(0),
-      count,
-    }
+    Self { out_fd, in_fd, offset: offset.unwrap_or(0), count }
   }
 }
 
@@ -1112,28 +1167,41 @@ where
 // SAFETY: The iovec/msghdr contain raw pointers that point to data within
 // this same struct (addr, buf) or to the buffer owned by this struct.
 // The operation is only accessed from the owning thread (thread-per-core model).
-unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Send for SendTo<B> {}
-unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Sync for SendTo<B> {}
+unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Send
+  for SendTo<B>
+{
+}
+// SAFETY: SendTo contains raw pointers that point to this same struct's owned data
+unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Sync
+  for SendTo<B>
+{
+}
 
 impl<B> SendTo<B>
 where
   B: std::marker::Send + std::marker::Sync,
 {
-  pub(crate) fn new(res: Resource, buf: B, addr: SocketAddr, flags: Option<i32>) -> Self {
+  pub(crate) fn new(
+    res: Resource,
+    buf: B,
+    addr: SocketAddr,
+    flags: Option<i32>,
+  ) -> Self {
     let storage = std_socketaddr_into_libc(addr);
     let addrlen = if addr.is_ipv4() {
       mem::size_of::<libc::sockaddr_in>()
     } else {
       mem::size_of::<libc::sockaddr_in6>()
     } as libc::socklen_t;
-    // SAFETY: iovec and msghdr are C structs safe to zero-initialize
     Self {
       res,
       buf: Some(buf),
       flags: flags.unwrap_or(0),
       addr: storage,
       addrlen,
+      // SAFETY: iovec is a C struct safe to zero-initialize
       iovec: unsafe { mem::zeroed() },
+      // SAFETY: msghdr is a C struct safe to zero-initialize
       msghdr: unsafe { mem::zeroed() },
     }
   }
@@ -1231,11 +1299,7 @@ impl TypedOp for Socket {
   type Result = io::Result<Resource>;
 
   fn into_op(&mut self) -> Op {
-    Op::Socket {
-      domain: self.domain,
-      ty: self.ty,
-      proto: self.proto,
-    }
+    Op::Socket { domain: self.domain, ty: self.ty, proto: self.proto }
   }
 
   fn extract_result(self, res: isize) -> Self::Result {
@@ -1802,10 +1866,7 @@ impl TypedOp for Watch {
   type Result = io::Result<WatchMask>;
 
   fn into_op(&mut self) -> Op {
-    Op::Watch {
-      path: self.path.as_ptr(),
-      mask: self.mask.bits(),
-    }
+    Op::Watch { path: self.path.as_ptr(), mask: self.mask.bits() }
   }
 
   fn extract_result(self, res: isize) -> Self::Result {
@@ -1868,10 +1929,7 @@ impl StreamOp for WatchStream {
   type Item = io::Result<WatchMask>;
 
   fn into_op(&mut self) -> Op {
-    Op::Watch {
-      path: self.path.as_ptr(),
-      mask: self.mask.bits(),
-    }
+    Op::Watch { path: self.path.as_ptr(), mask: self.mask.bits() }
   }
 
   fn extract_item(&mut self, res: isize) -> StreamResult<Self::Item> {
@@ -1937,8 +1995,16 @@ pub struct WriteV<B: std::marker::Send + std::marker::Sync> {
   iov_count: usize,
 }
 
-unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Send for WriteV<B> {}
-unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Sync for WriteV<B> {}
+// SAFETY: WriteV only contains Send/Sync types and iovecs which point to owned buffers
+unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Send
+  for WriteV<B>
+{
+}
+// SAFETY: WriteV only contains Send/Sync types and iovecs which point to owned buffers
+unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Sync
+  for WriteV<B>
+{
+}
 
 impl<B: std::marker::Send + std::marker::Sync> WriteV<B> {
   pub(crate) fn new(res: Resource, bufs: B) -> Self
@@ -1946,12 +2012,8 @@ impl<B: std::marker::Send + std::marker::Sync> WriteV<B> {
     B: IoBufVec,
   {
     let iov_count = bufs.buf_count().min(MAX_IOV_COUNT);
-    Self {
-      res,
-      bufs: Some(bufs),
-      iovecs: unsafe { mem::zeroed() },
-      iov_count,
-    }
+    // SAFETY: iovec array is safe to zero-initialize
+    Self { res, bufs: Some(bufs), iovecs: unsafe { mem::zeroed() }, iov_count }
   }
 }
 
@@ -1997,8 +2059,16 @@ pub struct WriteVAt<B: std::marker::Send + std::marker::Sync> {
   offset: i64,
 }
 
-unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Send for WriteVAt<B> {}
-unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Sync for WriteVAt<B> {}
+// SAFETY: WriteVAt only contains Send/Sync types and iovecs which point to owned buffers
+unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Send
+  for WriteVAt<B>
+{
+}
+// SAFETY: WriteVAt only contains Send/Sync types and iovecs which point to owned buffers
+unsafe impl<B: std::marker::Send + std::marker::Sync> std::marker::Sync
+  for WriteVAt<B>
+{
+}
 
 impl<B: std::marker::Send + std::marker::Sync> WriteVAt<B> {
   pub(crate) fn new(res: Resource, bufs: B, offset: i64) -> Self
@@ -2009,6 +2079,7 @@ impl<B: std::marker::Send + std::marker::Sync> WriteVAt<B> {
     Self {
       res,
       bufs: Some(bufs),
+      // SAFETY: iovec array is safe to zero-initialize
       iovecs: unsafe { mem::zeroed() },
       iov_count,
       offset,
@@ -2043,6 +2114,870 @@ impl<B: IoBufVec> TypedOp for WriteVAt<B> {
       (Err(io::Error::from_raw_os_error((-res) as i32)), bufs)
     } else {
       (Ok(res as i32), bufs)
+    }
+  }
+}
+
+// ============================================================================
+// Waitid - Wait for process state changes
+// ============================================================================
+
+/// Specifies what process(es) to wait for.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitTarget {
+  /// Wait for a specific process by PID.
+  Pid(libc::pid_t),
+  /// Wait for any process in a process group.
+  Pgid(libc::pid_t),
+  /// Wait for any child process.
+  Any,
+  /// Wait for the process referred to by a pidfd (Linux 5.4+).
+  #[cfg(target_os = "linux")]
+  Pidfd(libc::pid_t),
+}
+
+#[cfg(unix)]
+impl WaitTarget {
+  /// Get the idtype for waitid().
+  fn idtype(&self) -> libc::idtype_t {
+    match self {
+      Self::Pid(_) => libc::P_PID,
+      Self::Pgid(_) => libc::P_PGID,
+      Self::Any => libc::P_ALL,
+      #[cfg(target_os = "linux")]
+      Self::Pidfd(_) => libc::P_PIDFD,
+    }
+  }
+
+  /// Get the id for waitid().
+  fn id(&self) -> libc::id_t {
+    match self {
+      Self::Pid(pid) => *pid as libc::id_t,
+      Self::Pgid(pgid) => *pgid as libc::id_t,
+      Self::Any => 0,
+      #[cfg(target_os = "linux")]
+      Self::Pidfd(fd) => *fd as libc::id_t,
+    }
+  }
+}
+
+/// Options for waitid() controlling what state changes to wait for.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WaitOptions(libc::c_int);
+
+#[cfg(unix)]
+impl WaitOptions {
+  /// Wait for children that have exited.
+  pub const EXITED: Self = Self(libc::WEXITED);
+  /// Wait for children that have been stopped by a signal.
+  pub const STOPPED: Self = Self(libc::WSTOPPED);
+  /// Wait for children that have been continued.
+  pub const CONTINUED: Self = Self(libc::WCONTINUED);
+  /// Return immediately if no child has changed state (non-blocking).
+  pub const NOHANG: Self = Self(libc::WNOHANG);
+  /// Leave the child in a waitable state (can be waited again).
+  pub const NOWAIT: Self = Self(libc::WNOWAIT);
+
+  /// Create empty options (must combine with at least EXITED, STOPPED, or CONTINUED).
+  pub const fn empty() -> Self {
+    Self(0)
+  }
+
+  /// Combine options with bitwise OR.
+  pub const fn or(self, other: Self) -> Self {
+    Self(self.0 | other.0)
+  }
+
+  /// Check if a flag is set.
+  pub const fn contains(self, flag: Self) -> bool {
+    (self.0 & flag.0) == flag.0
+  }
+
+  /// Get the raw value.
+  pub const fn bits(self) -> libc::c_int {
+    self.0
+  }
+}
+
+#[cfg(unix)]
+impl std::ops::BitOr for WaitOptions {
+  type Output = Self;
+  fn bitor(self, rhs: Self) -> Self {
+    Self(self.0 | rhs.0)
+  }
+}
+
+#[cfg(unix)]
+impl std::ops::BitOrAssign for WaitOptions {
+  fn bitor_assign(&mut self, rhs: Self) {
+    self.0 |= rhs.0;
+  }
+}
+
+/// Information about a process state change.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct WaitStatus {
+  /// The process ID of the child.
+  pub pid: libc::pid_t,
+  /// The user ID of the child.
+  pub uid: libc::uid_t,
+  /// The signal code indicating the type of state change.
+  pub code: WaitCode,
+  /// The exit status or signal number (interpretation depends on code).
+  pub status: i32,
+}
+
+/// The type of process state change.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitCode {
+  /// Child called exit() or _exit(). `status` is the exit code.
+  Exited,
+  /// Child was killed by a signal. `status` is the signal number.
+  Killed,
+  /// Child dumped core. `status` is the signal number.
+  Dumped,
+  /// Child was stopped by a signal. `status` is the signal number.
+  Stopped,
+  /// Child was trapped (ptrace). `status` is the signal number.
+  Trapped,
+  /// Child was continued. `status` is SIGCONT.
+  Continued,
+  /// Unknown code.
+  Unknown(i32),
+}
+
+#[cfg(unix)]
+impl WaitCode {
+  fn from_raw(code: libc::c_int) -> Self {
+    match code {
+      libc::CLD_EXITED => Self::Exited,
+      libc::CLD_KILLED => Self::Killed,
+      libc::CLD_DUMPED => Self::Dumped,
+      libc::CLD_STOPPED => Self::Stopped,
+      libc::CLD_TRAPPED => Self::Trapped,
+      libc::CLD_CONTINUED => Self::Continued,
+      other => Self::Unknown(other),
+    }
+  }
+}
+
+#[cfg(unix)]
+impl WaitStatus {
+  /// Returns true if the process exited normally.
+  pub fn exited(&self) -> bool {
+    matches!(self.code, WaitCode::Exited)
+  }
+
+  /// Returns the exit code if the process exited normally.
+  pub fn exit_code(&self) -> Option<i32> {
+    if self.exited() { Some(self.status) } else { None }
+  }
+
+  /// Returns true if the process was terminated by a signal.
+  pub fn signaled(&self) -> bool {
+    matches!(self.code, WaitCode::Killed | WaitCode::Dumped)
+  }
+
+  /// Returns the signal that terminated the process, if any.
+  pub fn signal(&self) -> Option<i32> {
+    if self.signaled() { Some(self.status) } else { None }
+  }
+
+  /// Returns true if the process produced a core dump.
+  pub fn core_dumped(&self) -> bool {
+    matches!(self.code, WaitCode::Dumped)
+  }
+
+  /// Returns true if the process was stopped.
+  pub fn stopped(&self) -> bool {
+    matches!(self.code, WaitCode::Stopped)
+  }
+
+  /// Returns true if the process was continued.
+  pub fn continued(&self) -> bool {
+    matches!(self.code, WaitCode::Continued)
+  }
+}
+
+/// Wait for a child process to change state.
+#[cfg(unix)]
+pub struct Waitid {
+  target: WaitTarget,
+  options: libc::c_int,
+  /// Storage for siginfo_t result.
+  siginfo: libc::siginfo_t,
+}
+
+// SAFETY: Waitid only uses siginfo_t as an output buffer for waitid().
+// The raw pointers inside siginfo_t point to process-local kernel data
+// and are not dereferenced by user code. We maintain exclusive ownership.
+#[cfg(unix)]
+unsafe impl std::marker::Send for Waitid {}
+// SAFETY: Waitid uses siginfo_t as output buffer, maintaining exclusive ownership
+#[cfg(unix)]
+unsafe impl std::marker::Sync for Waitid {}
+
+#[cfg(unix)]
+impl Waitid {
+  /// Create a new waitid operation.
+  ///
+  /// # Parameters
+  ///
+  /// - `target`: What process(es) to wait for
+  /// - `options`: What state changes to wait for
+  pub fn new(target: WaitTarget, options: WaitOptions) -> Self {
+    Self {
+      target,
+      options: options.bits(),
+      // SAFETY: siginfo_t is a C struct that is safe to zero-initialize.
+      siginfo: unsafe { mem::zeroed() },
+    }
+  }
+}
+
+#[cfg(unix)]
+impl TypedOp for Waitid {
+  type Result = io::Result<Option<WaitStatus>>;
+
+  fn into_op(&mut self) -> Op {
+    Op::Waitid {
+      idtype: self.target.idtype(),
+      id: self.target.id(),
+      options: self.options,
+      infop: &mut self.siginfo as *mut _,
+    }
+  }
+
+  fn extract_result(self, res: isize) -> Self::Result {
+    if res < 0 {
+      return Err(io::Error::from_raw_os_error((-res) as i32));
+    }
+
+    // Extract fields from siginfo_t in a platform-specific way.
+    // si_code is a direct field on all platforms.
+    // si_pid/si_uid/si_status are methods on Linux, fields on BSD/macOS.
+    #[cfg(target_os = "linux")]
+    let (pid, uid, code, status) = unsafe {
+      (
+        self.siginfo.si_pid(),
+        self.siginfo.si_uid(),
+        self.siginfo.si_code,
+        self.siginfo.si_status(),
+      )
+    };
+
+    #[cfg(any(
+      target_os = "macos",
+      target_os = "freebsd",
+      target_os = "dragonfly"
+    ))]
+    let (pid, uid, code, status) = {
+      (
+        self.siginfo.si_pid,
+        self.siginfo.si_uid,
+        self.siginfo.si_code,
+        self.siginfo.si_status,
+      )
+    };
+
+    // Check if any child changed state (si_pid will be 0 if WNOHANG and no child ready)
+    if pid == 0 {
+      // WNOHANG and no child ready
+      return Ok(None);
+    }
+
+    Ok(Some(WaitStatus { pid, uid, code: WaitCode::from_raw(code), status }))
+  }
+}
+
+// ============================================================================
+// Spawn - Create a new process
+// ============================================================================
+
+/// Spawn a new process.
+///
+/// This operation uses `posix_spawn()` to create a new process and returns
+/// the child's PID on success.
+#[cfg(unix)]
+pub struct Spawn {
+  /// Path to the executable.
+  path: std::ffi::CString,
+  /// Command-line arguments (including argv[0]).
+  argv: Vec<std::ffi::CString>,
+  /// Environment variables (None = inherit from parent).
+  envp: Option<Vec<std::ffi::CString>>,
+  /// Argv pointer array (built in into_op).
+  argv_ptrs: Vec<*const libc::c_char>,
+  /// Envp pointer array (built in into_op).
+  envp_ptrs: Vec<*const libc::c_char>,
+  /// Storage for the child PID.
+  pid: libc::pid_t,
+  /// File actions for stdio redirection.
+  file_actions: *const libc::posix_spawn_file_actions_t,
+}
+
+// SAFETY: Spawn owns all the CStrings and pointers point to owned data
+#[cfg(unix)]
+unsafe impl std::marker::Send for Spawn {}
+// SAFETY: Spawn owns all the CStrings and pointers point to owned data
+#[cfg(unix)]
+unsafe impl std::marker::Sync for Spawn {}
+
+#[cfg(unix)]
+impl Spawn {
+  /// Create a new spawn operation.
+  ///
+  /// # Parameters
+  ///
+  /// - `path`: Path to the executable
+  /// - `argv`: Command-line arguments (`argv[0]` should be the program name)
+  /// - `envp`: Environment variables as "KEY=value" strings, or None to inherit
+  pub fn new(
+    path: std::ffi::CString,
+    argv: Vec<std::ffi::CString>,
+    envp: Option<Vec<std::ffi::CString>>,
+  ) -> Self {
+    Self {
+      path,
+      argv,
+      envp,
+      argv_ptrs: Vec::new(),
+      envp_ptrs: Vec::new(),
+      pid: 0,
+      file_actions: ptr::null(),
+    }
+  }
+
+  /// Create an Op with custom file actions for stdio redirection.
+  pub fn into_op_with_file_actions(
+    &mut self,
+    file_actions: *const libc::posix_spawn_file_actions_t,
+  ) -> Op {
+    self.file_actions = file_actions;
+    self.into_op()
+  }
+}
+
+#[cfg(unix)]
+impl TypedOp for Spawn {
+  type Result = io::Result<libc::pid_t>;
+
+  fn into_op(&mut self) -> Op {
+    // Build argv pointer array
+    self.argv_ptrs.clear();
+    self.argv_ptrs.reserve(self.argv.len() + 1);
+    for arg in &self.argv {
+      self.argv_ptrs.push(arg.as_ptr());
+    }
+    self.argv_ptrs.push(std::ptr::null());
+
+    // Build envp pointer array
+    self.envp_ptrs.clear();
+    let envp = if let Some(ref env) = self.envp {
+      self.envp_ptrs.reserve(env.len() + 1);
+      for e in env {
+        self.envp_ptrs.push(e.as_ptr());
+      }
+      self.envp_ptrs.push(std::ptr::null());
+      self.envp_ptrs.as_ptr()
+    } else {
+      // Inherit environment from parent
+      unsafe extern "C" {
+        static environ: *const *const libc::c_char;
+      }
+      // SAFETY: environ is a valid global pointer to the process environment
+      unsafe { environ }
+    };
+
+    Op::Spawn {
+      path: self.path.as_ptr(),
+      argv: self.argv_ptrs.as_ptr(),
+      envp,
+      pid: &mut self.pid as *mut _,
+      file_actions: self.file_actions,
+    }
+  }
+
+  fn extract_result(self, res: isize) -> Self::Result {
+    if res < 0 {
+      Err(io::Error::from_raw_os_error((-res) as i32))
+    } else {
+      Ok(self.pid)
+    }
+  }
+}
+
+// ============================================================================
+// Flock - File locking
+// ============================================================================
+
+/// File locking constants.
+///
+/// These match the Unix `flock()` constants and are used on all platforms.
+pub mod lock {
+  /// Shared lock (multiple readers allowed).
+  pub const LOCK_SH: i32 = 1;
+  /// Exclusive lock (single writer).
+  pub const LOCK_EX: i32 = 2;
+  /// Unlock.
+  pub const LOCK_UN: i32 = 8;
+  /// Non-blocking mode (combine with LOCK_SH or LOCK_EX).
+  pub const LOCK_NB: i32 = 4;
+}
+
+/// File locking operation.
+///
+/// This provides whole-file locking with shared (read) and exclusive (write) modes.
+///
+/// # Lock types
+/// - [`lock::LOCK_SH`]: Shared lock (multiple readers)
+/// - [`lock::LOCK_EX`]: Exclusive lock (single writer)
+/// - [`lock::LOCK_UN`]: Unlock
+///
+/// Add [`lock::LOCK_NB`] for non-blocking behavior.
+///
+/// # Platform-specific behavior
+///
+/// This operation corresponds to `flock()` on Unix and `LockFileEx`/`UnlockFileEx`
+/// on Windows.
+///
+/// - **Unix**: Advisory locking. Other processes can ignore locks if they don't
+///   cooperate by also using flock.
+/// - **Windows**: Mandatory locking enforced by the OS. Additionally, locking a
+///   file will fail if the file is opened only for append. Open with `.read(true)`,
+///   `.read(true).append(true)`, or `.write(true)`.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lio::api;
+/// use lio::api::ops::lock;
+///
+/// async fn lock_file() -> std::io::Result<()> {
+///     # use lio::api::resource::Resource;
+///     # let file = Resource::stdin();
+///     // Acquire exclusive lock
+///     api::flock(&file, lock::LOCK_EX).await?;
+///
+///     // ... do work with file ...
+///
+///     // Release lock
+///     api::flock(&file, lock::LOCK_UN).await?;
+///     Ok(())
+/// }
+/// ```
+pub struct Flock {
+  fd: Resource,
+  operation: i32,
+}
+
+impl Flock {
+  pub(crate) fn new(fd: Resource, operation: i32) -> Self {
+    Self { fd, operation }
+  }
+}
+
+impl TypedOp for Flock {
+  impl_io_result!();
+
+  fn into_op(&mut self) -> Op {
+    Op::Flock { fd: self.fd.clone(), operation: self.operation }
+  }
+}
+
+// ============================================================================
+// GetDents - Read directory entries
+// ============================================================================
+
+/// A directory entry returned by [`GetDents`].
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+  /// Inode number of the entry.
+  pub inode: u64,
+  /// File name (without path).
+  pub name: std::ffi::OsString,
+  /// File type (DT_REG, DT_DIR, DT_LNK, etc.).
+  pub file_type: u8,
+}
+
+#[cfg(unix)]
+impl DirEntry {
+  /// Returns true if this is a regular file.
+  pub fn is_file(&self) -> bool {
+    self.file_type == libc::DT_REG
+  }
+
+  /// Returns true if this is a directory.
+  pub fn is_dir(&self) -> bool {
+    self.file_type == libc::DT_DIR
+  }
+
+  /// Returns true if this is a symbolic link.
+  pub fn is_symlink(&self) -> bool {
+    self.file_type == libc::DT_LNK
+  }
+}
+
+/// Read directory entries operation.
+///
+/// This is a low-level operation that reads raw directory entries into a buffer.
+/// For most use cases, consider using the higher-level `fs` module instead.
+///
+/// # Platform behavior
+/// - Linux: Uses `getdents64` syscall
+/// - BSD/macOS: Uses `__getdirentries64` / `getdirentries`
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lio::api;
+///
+/// async fn list_dir() -> std::io::Result<()> {
+///     # use lio::api::resource::Resource;
+///     # use std::os::fd::FromRawFd;
+///     // Open directory
+///     let dir_fd = api::openat(&unsafe { Resource::from_raw_fd(libc::AT_FDCWD) },
+///                              std::ffi::CString::new("/tmp").unwrap(),
+///                              libc::O_RDONLY | libc::O_DIRECTORY).await?;
+///
+///     let buf = vec![0u8; 4096];
+///     let (result, buf, entries) = api::getdents(&dir_fd, buf).await;
+///     let bytes_read = result?;
+///
+///     for entry in entries {
+///         println!("{:?}", entry.name);
+///     }
+///     Ok(())
+/// }
+/// ```
+#[cfg(unix)]
+pub struct GetDents<B: IoBufMut = Vec<u8>> {
+  fd: Resource,
+  buf: Option<B>,
+}
+
+#[cfg(unix)]
+impl<B: IoBufMut> GetDents<B> {
+  pub(crate) fn new(fd: Resource, buf: B) -> Self {
+    Self { fd, buf: Some(buf) }
+  }
+
+  /// Parse directory entries from the raw buffer.
+  ///
+  /// Returns a vector of parsed entries.
+  #[cfg(target_os = "linux")]
+  pub fn parse_entries(buf: &[u8], bytes_read: usize) -> Vec<DirEntry> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut entries = Vec::new();
+    let mut offset = 0;
+
+    while offset < bytes_read {
+      if offset + 19 > bytes_read {
+        break; // Not enough data for header
+      }
+
+      // linux_dirent64 layout:
+      // d_ino: u64 (8 bytes)
+      // d_off: i64 (8 bytes)
+      // d_reclen: u16 (2 bytes)
+      // d_type: u8 (1 byte)
+      // d_name: [u8] (variable, null-terminated)
+      let d_ino =
+        u64::from_ne_bytes(buf[offset..offset + 8].try_into().unwrap());
+      // d_off at offset+8, skip it
+      let d_reclen =
+        u16::from_ne_bytes(buf[offset + 16..offset + 18].try_into().unwrap())
+          as usize;
+      let d_type = buf[offset + 18];
+
+      if d_reclen == 0 || offset + d_reclen > bytes_read {
+        break;
+      }
+
+      // Find null terminator for name
+      let name_start = offset + 19;
+      let name_end = buf[name_start..offset + d_reclen]
+        .iter()
+        .position(|&b| b == 0)
+        .map(|p| name_start + p)
+        .unwrap_or(offset + d_reclen);
+
+      let name = OsStr::from_bytes(&buf[name_start..name_end]).to_owned();
+
+      entries.push(DirEntry { inode: d_ino, name, file_type: d_type });
+
+      offset += d_reclen;
+    }
+
+    entries
+  }
+
+  /// Parse directory entries from the raw buffer (BSD/macOS).
+  #[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+  ))]
+  pub fn parse_entries(buf: &[u8], bytes_read: usize) -> Vec<DirEntry> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut entries = Vec::new();
+    let mut offset = 0;
+
+    while offset < bytes_read {
+      // dirent layout varies by platform, but generally:
+      // d_ino/d_fileno: u32/u64
+      // d_reclen: u16
+      // d_type: u8
+      // d_namlen: u8/u16
+      // d_name: [u8]
+
+      #[cfg(target_os = "macos")]
+      {
+        if offset + 21 > bytes_read {
+          break;
+        }
+        // macOS dirent64:
+        // d_ino: u64 (8)
+        // d_seekoff: u64 (8)
+        // d_reclen: u16 (2)
+        // d_namlen: u16 (2)
+        // d_type: u8 (1)
+        // d_name: [u8]
+        let d_ino =
+          u64::from_ne_bytes(buf[offset..offset + 8].try_into().unwrap());
+        let d_reclen =
+          u16::from_ne_bytes(buf[offset + 16..offset + 18].try_into().unwrap())
+            as usize;
+        let d_namlen =
+          u16::from_ne_bytes(buf[offset + 18..offset + 20].try_into().unwrap())
+            as usize;
+        let d_type = buf[offset + 20];
+
+        if d_reclen == 0 || offset + d_reclen > bytes_read {
+          break;
+        }
+
+        let name_start = offset + 21;
+        let name_end = (name_start + d_namlen).min(offset + d_reclen);
+        let name = OsStr::from_bytes(&buf[name_start..name_end]).to_owned();
+
+        entries.push(DirEntry { inode: d_ino, name, file_type: d_type });
+
+        offset += d_reclen;
+      }
+
+      #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+      {
+        if offset + 8 > bytes_read {
+          break;
+        }
+        // FreeBSD dirent:
+        // d_fileno: u64 (8)
+        // d_off: i64 (8)
+        // d_reclen: u16 (2)
+        // d_type: u8 (1)
+        // d_namlen: u8 (1)
+        // d_name: [u8]
+        let d_ino =
+          u64::from_ne_bytes(buf[offset..offset + 8].try_into().unwrap());
+        let d_reclen =
+          u16::from_ne_bytes(buf[offset + 16..offset + 18].try_into().unwrap())
+            as usize;
+        let d_type = buf[offset + 18];
+        let d_namlen = buf[offset + 19] as usize;
+
+        if d_reclen == 0 || offset + d_reclen > bytes_read {
+          break;
+        }
+
+        let name_start = offset + 20;
+        let name_end = (name_start + d_namlen).min(offset + d_reclen);
+        let name = OsStr::from_bytes(&buf[name_start..name_end]).to_owned();
+
+        entries.push(DirEntry { inode: d_ino, name, file_type: d_type });
+
+        offset += d_reclen;
+      }
+    }
+
+    entries
+  }
+}
+
+/// Result type for GetDents: (io::Result<bytes_read>, buffer, parsed_entries)
+pub type GetDentsResult<B> = (io::Result<i32>, B, Vec<DirEntry>);
+
+#[cfg(unix)]
+impl<B: IoBufMut> TypedOp for GetDents<B> {
+  type Result = GetDentsResult<B>;
+
+  fn into_op(&mut self) -> Op {
+    let buf = self.buf.as_mut().expect("buffer already taken");
+    Op::GetDents {
+      fd: self.fd.clone(),
+      buf: RawBuf::new(buf.as_mut_ptr(), buf.capacity()),
+    }
+  }
+
+  fn extract_result(mut self, res: isize) -> Self::Result {
+    let mut buf = self.buf.take().expect("buffer already taken");
+
+    if res < 0 {
+      (Err(io::Error::from_raw_os_error((-res) as i32)), buf, Vec::new())
+    } else {
+      let bytes_read = res as usize;
+      // The kernel wrote `bytes_read` bytes into the buffer
+      buf.set_len(bytes_read);
+
+      // Parse entries from the raw buffer data
+      // SAFETY: buf.as_ptr() is valid for bytes_read bytes as set by the kernel
+      let entries = unsafe {
+        let slice = std::slice::from_raw_parts(buf.as_ptr(), bytes_read);
+        Self::parse_entries(slice, bytes_read)
+      };
+      (Ok(res as i32), buf, entries)
+    }
+  }
+}
+
+// ============================================================================
+// Signal - Wait for signals
+// ============================================================================
+
+/// A set of signals to wait for.
+///
+/// This is a wrapper around `sigset_t` providing a safe interface.
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct SignalSet {
+  sigset: libc::sigset_t,
+}
+
+#[cfg(unix)]
+impl SignalSet {
+  /// Creates an empty signal set.
+  pub fn empty() -> Self {
+    // SAFETY: sigset_t is safe to zero-initialize
+    let mut sigset: libc::sigset_t = unsafe { mem::zeroed() };
+    // SAFETY: sigset is a valid pointer to sigset_t
+    unsafe { libc::sigemptyset(&mut sigset) };
+    Self { sigset }
+  }
+
+  /// Creates a signal set containing all signals.
+  pub fn all() -> Self {
+    // SAFETY: sigset_t is safe to zero-initialize
+    let mut sigset: libc::sigset_t = unsafe { mem::zeroed() };
+    // SAFETY: sigset is a valid pointer to sigset_t
+    unsafe { libc::sigfillset(&mut sigset) };
+    Self { sigset }
+  }
+
+  /// Creates a signal set containing SIGINT (Ctrl+C).
+  pub fn ctrl_c() -> Self {
+    let mut set = Self::empty();
+    set.add(libc::SIGINT);
+    set
+  }
+
+  /// Adds a signal to the set.
+  pub fn add(&mut self, sig: i32) {
+    // SAFETY: self.sigset is a valid sigset_t, sig is a valid signal number
+    unsafe { libc::sigaddset(&mut self.sigset, sig) };
+  }
+
+  /// Removes a signal from the set.
+  pub fn remove(&mut self, sig: i32) {
+    // SAFETY: self.sigset is a valid sigset_t, sig is a valid signal number
+    unsafe { libc::sigdelset(&mut self.sigset, sig) };
+  }
+
+  /// Checks if a signal is in the set.
+  pub fn contains(&self, sig: i32) -> bool {
+    // SAFETY: self.sigset is a valid sigset_t, sig is a valid signal number
+    unsafe { libc::sigismember(&self.sigset, sig) == 1 }
+  }
+
+  /// Returns a pointer to the underlying sigset_t.
+  pub(crate) fn as_ptr(&self) -> *const libc::sigset_t {
+    &self.sigset
+  }
+}
+
+#[cfg(unix)]
+impl Default for SignalSet {
+  fn default() -> Self {
+    Self::empty()
+  }
+}
+
+/// Wait for a signal from the specified signal set.
+///
+/// This operation blocks until one of the signals in the set is delivered,
+/// then returns the signal number.
+///
+/// # Platform behavior
+/// - Linux: Uses signalfd
+/// - BSD/macOS: Uses kqueue EVFILT_SIGNAL
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lio::api;
+/// use lio::api::ops::SignalSet;
+///
+/// async fn wait_for_sigterm() -> std::io::Result<i32> {
+///     let mut signals = SignalSet::empty();
+///     signals.add(libc::SIGTERM);
+///     signals.add(libc::SIGINT);
+///
+///     let sig = api::signal(signals).await?;
+///     println!("Received signal: {}", sig);
+///     Ok(sig)
+/// }
+/// ```
+#[cfg(unix)]
+pub struct Signal {
+  sigset: SignalSet,
+  /// On Linux, we need storage for reading signalfd_siginfo
+  #[cfg(target_os = "linux")]
+  siginfo_buf: [u8; 128], // sizeof(signalfd_siginfo)
+}
+
+#[cfg(unix)]
+impl Signal {
+  pub(crate) fn new(sigset: SignalSet) -> Self {
+    Self {
+      sigset,
+      #[cfg(target_os = "linux")]
+      siginfo_buf: [0u8; 128],
+    }
+  }
+}
+
+#[cfg(unix)]
+impl TypedOp for Signal {
+  type Result = io::Result<i32>;
+
+  fn into_op(&mut self) -> Op {
+    Op::Signal { sigset: self.sigset.as_ptr() }
+  }
+
+  fn extract_result(self, res: isize) -> Self::Result {
+    if res < 0 {
+      Err(io::Error::from_raw_os_error((-res) as i32))
+    } else {
+      // Result contains the signal number
+      Ok(res as i32)
     }
   }
 }

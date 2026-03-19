@@ -72,8 +72,7 @@ impl PartialOrd for HeapEntry {
 impl Ord for HeapEntry {
   fn cmp(&self, other: &Self) -> Ordering {
     // Reverse ordering for min-heap (earliest deadline first)
-    other.deadline.cmp(&self.deadline)
-      .then_with(|| other.id.cmp(&self.id))
+    other.deadline.cmp(&self.deadline).then_with(|| other.id.cmp(&self.id))
   }
 }
 
@@ -146,11 +145,8 @@ impl TimeManager {
     let now = Instant::now();
     let deadline = now + duration;
 
-    let entry = TimerEntry {
-      deadline,
-      state: TimerState::Active,
-      remaining: None,
-    };
+    let entry =
+      TimerEntry { deadline, state: TimerState::Active, remaining: None };
 
     self.timers.insert(id, entry);
     self.heap.push(HeapEntry { deadline, id });
@@ -160,18 +156,18 @@ impl TimeManager {
   ///
   /// Returns `true` if the timer was active and is now paused.
   pub fn pause(&mut self, id: TimerId) -> bool {
-    if let Some(entry) = self.timers.get_mut(&id) {
-      if entry.state == TimerState::Active {
-        let now = Instant::now();
-        let remaining = if entry.deadline > now {
-          entry.deadline - now
-        } else {
-          Duration::ZERO
-        };
-        entry.remaining = Some(remaining);
-        entry.state = TimerState::Paused;
-        return true;
-      }
+    if let Some(entry) = self.timers.get_mut(&id)
+      && entry.state == TimerState::Active
+    {
+      let now = Instant::now();
+      let remaining = if entry.deadline > now {
+        entry.deadline - now
+      } else {
+        Duration::ZERO
+      };
+      entry.remaining = Some(remaining);
+      entry.state = TimerState::Paused;
+      return true;
     }
     false
   }
@@ -180,17 +176,16 @@ impl TimeManager {
   ///
   /// Returns `true` if the timer was paused and is now active.
   pub fn resume(&mut self, id: TimerId) -> bool {
-    if let Some(entry) = self.timers.get_mut(&id) {
-      if entry.state == TimerState::Paused {
-        if let Some(remaining) = entry.remaining.take() {
-          let now = Instant::now();
-          entry.deadline = now + remaining;
-          entry.state = TimerState::Active;
-          // Re-add to heap with new deadline
-          self.heap.push(HeapEntry { deadline: entry.deadline, id });
-          return true;
-        }
-      }
+    if let Some(entry) = self.timers.get_mut(&id)
+      && entry.state == TimerState::Paused
+      && let Some(remaining) = entry.remaining.take()
+    {
+      let now = Instant::now();
+      entry.deadline = now + remaining;
+      entry.state = TimerState::Active;
+      // Re-add to heap with new deadline
+      self.heap.push(HeapEntry { deadline: entry.deadline, id });
+      return true;
     }
     false
   }
@@ -199,11 +194,12 @@ impl TimeManager {
   ///
   /// Returns `true` if the timer existed and was cancelled.
   pub fn cancel(&mut self, id: TimerId) -> bool {
-    if let Some(entry) = self.timers.get_mut(&id) {
-      if entry.state != TimerState::Fired && entry.state != TimerState::Cancelled {
-        entry.state = TimerState::Cancelled;
-        return true;
-      }
+    if let Some(entry) = self.timers.get_mut(&id)
+      && entry.state != TimerState::Fired
+      && entry.state != TimerState::Cancelled
+    {
+      entry.state = TimerState::Cancelled;
+      return true;
     }
     false
   }
@@ -230,11 +226,7 @@ impl TimeManager {
 
     self.heap.peek().map(|entry| {
       let now = Instant::now();
-      if entry.deadline <= now {
-        Duration::ZERO
-      } else {
-        entry.deadline - now
-      }
+      if entry.deadline <= now { Duration::ZERO } else { entry.deadline - now }
     })
   }
 

@@ -82,8 +82,6 @@ pub trait IoBufMut: IoBuf {
   ///
   /// Called after a read operation completes to indicate how many bytes were read.
   ///
-  /// # Safety
-  ///
   /// The caller must ensure that `len <= capacity()` and that the first `len` bytes
   /// have been initialized by the kernel.
   fn set_len(&mut self, len: usize);

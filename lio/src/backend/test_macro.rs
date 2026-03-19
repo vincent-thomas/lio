@@ -1,7 +1,9 @@
 //! Macro for generating comprehensive IoBackend tests.
 //!
-//! This macro generates a test suite for any [`IoBackend`](super::IoBackend) implementation,
+//! This macro generates a test suite for any [`IoBackend`] implementation,
 //! including third-party implementations in external crates.
+//!
+//! [`IoBackend`]: crate::backend::IoBackend
 //!
 //! # Usage
 //!
@@ -66,8 +68,8 @@ macro_rules! test_io_backend {
       use super::*;
       use std::time::Duration;
 
-      use $crate::backend::op::Op;
       use $crate::backend::IoBackend;
+      use $crate::backend::op::Op;
 
       const TEST_CAPACITY: usize = 64;
 
@@ -85,7 +87,9 @@ macro_rules! test_io_backend {
       fn test_init_various_capacities() {
         for cap in [1, 16, 64, 256, 1024] {
           let mut backend = $create_backend;
-          backend.init(cap).expect(&format!("init with cap={} should succeed", cap));
+          backend
+            .init(cap)
+            .expect(&format!("init with cap={} should succeed", cap));
         }
       }
 
@@ -124,7 +128,10 @@ macro_rules! test_io_backend {
           .expect("wait_timeout should succeed");
 
         assert_eq!(completions.len(), 1, "should have 1 completion");
-        assert_eq!(completions[0].op_id, 1, "completion should have correct op_id");
+        assert_eq!(
+          completions[0].op_id, 1,
+          "completion should have correct op_id"
+        );
       }
 
       // ═══════════════════════════════════════════════════════════════════════
@@ -171,9 +178,8 @@ macro_rules! test_io_backend {
         // Wait for first batch
         let mut completed = Vec::new();
         while completed.len() < 2 {
-          let completions = backend
-            .wait_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+          let completions =
+            backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
           completed.extend(completions.iter().map(|c| c.op_id));
         }
 
@@ -184,9 +190,8 @@ macro_rules! test_io_backend {
 
         // Wait for second batch
         while completed.len() < 4 {
-          let completions = backend
-            .wait_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+          let completions =
+            backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
           completed.extend(completions.iter().map(|c| c.op_id));
         }
 
@@ -208,7 +213,10 @@ macro_rules! test_io_backend {
           .wait_timeout(Some(Duration::ZERO))
           .expect("non-blocking wait should succeed");
 
-        assert!(completions.is_empty(), "should have no completions when nothing pending");
+        assert!(
+          completions.is_empty(),
+          "should have no completions when nothing pending"
+        );
       }
 
       #[test]
@@ -250,9 +258,8 @@ macro_rules! test_io_backend {
           .unwrap();
         backend.flush().unwrap();
 
-        let completions = backend
-          .wait_timeout(Some(Duration::from_secs(5)))
-          .unwrap();
+        let completions =
+          backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
 
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].op_id, 1);
@@ -284,9 +291,8 @@ macro_rules! test_io_backend {
           .unwrap();
         backend.flush().unwrap();
 
-        let completions = backend
-          .wait_timeout(Some(Duration::from_secs(5)))
-          .unwrap();
+        let completions =
+          backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
 
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].op_id, 1);
@@ -345,9 +351,8 @@ macro_rules! test_io_backend {
 
         let mut completed_ids = Vec::new();
         while completed_ids.len() < ids.len() {
-          let completions = backend
-            .wait_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+          let completions =
+            backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
           completed_ids.extend(completions.iter().map(|c| c.op_id));
         }
 
@@ -368,8 +373,8 @@ macro_rules! test_io_backend {
       #[test]
       #[cfg(unix)]
       fn test_readv_operation() {
-        use $crate::backend::op::RawBuf;
         use std::os::fd::FromRawFd;
+        use $crate::backend::op::RawBuf;
 
         let mut backend = $create_backend;
         backend.init(TEST_CAPACITY).unwrap();
@@ -378,7 +383,8 @@ macro_rules! test_io_backend {
         let path = std::ffi::CString::new(format!(
           "/tmp/lio_test_readv_{}.txt",
           std::process::id()
-        )).unwrap();
+        ))
+        .unwrap();
 
         let test_data = b"Hello, World!";
         let fd = unsafe {
@@ -387,7 +393,11 @@ macro_rules! test_io_backend {
             libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
             0o644,
           );
-          libc::write(fd, test_data.as_ptr() as *const libc::c_void, test_data.len());
+          libc::write(
+            fd,
+            test_data.as_ptr() as *const libc::c_void,
+            test_data.len(),
+          );
           // Seek back to beginning
           libc::lseek(fd, 0, libc::SEEK_SET);
           fd
@@ -422,9 +432,8 @@ macro_rules! test_io_backend {
           .unwrap();
         backend.flush().unwrap();
 
-        let completions = backend
-          .wait_timeout(Some(Duration::from_secs(5)))
-          .unwrap();
+        let completions =
+          backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
 
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].op_id, 1);
@@ -437,7 +446,8 @@ macro_rules! test_io_backend {
           let bytes_read = completions[0].result as usize;
           let first_len = bytes_read.min(buf1.capacity());
           unsafe { buf1.set_len(first_len) };
-          let second_len = bytes_read.saturating_sub(buf1.capacity()).min(buf2.capacity());
+          let second_len =
+            bytes_read.saturating_sub(buf1.capacity()).min(buf2.capacity());
           unsafe { buf2.set_len(second_len) };
 
           assert_eq!(&buf1[..], b"Hello, ");
@@ -452,8 +462,8 @@ macro_rules! test_io_backend {
       #[test]
       #[cfg(unix)]
       fn test_writev_operation() {
-        use $crate::backend::op::RawBuf;
         use std::os::fd::FromRawFd;
+        use $crate::backend::op::RawBuf;
 
         let mut backend = $create_backend;
         backend.init(TEST_CAPACITY).unwrap();
@@ -462,7 +472,8 @@ macro_rules! test_io_backend {
         let path = std::ffi::CString::new(format!(
           "/tmp/lio_test_writev_{}.txt",
           std::process::id()
-        )).unwrap();
+        ))
+        .unwrap();
 
         let fd = unsafe {
           libc::open(
@@ -506,9 +517,8 @@ macro_rules! test_io_backend {
           .unwrap();
         backend.flush().unwrap();
 
-        let completions = backend
-          .wait_timeout(Some(Duration::from_secs(5)))
-          .unwrap();
+        let completions =
+          backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
 
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].op_id, 1);

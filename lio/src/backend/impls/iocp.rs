@@ -12,7 +12,7 @@
 //!
 //! - **Native IOCP**: Read, Write, ReadAt, WriteAt, Send, Recv, Accept, Connect
 //!   - Use OVERLAPPED for async completion
-//! - **Blocking**: Socket, Bind, Listen, Close, Fsync, Truncate, Shutdown, OpenAt, LinkAt, SymlinkAt, Nop
+//! - **Blocking**: Socket, Bind, Listen, Close, Fsync, Truncate, Shutdown, OpenAt, LinkAt, SymlinkAt, Flock, Nop
 //!   - Execute synchronously in push(), complete immediately
 //! - **Timer**: Timeout
 //!   - Use CreateTimerQueueTimer, post to IOCP on expiry
@@ -36,8 +36,9 @@ use windows_sys::Win32::Networking::WinSock::{
   listen, setsockopt, shutdown, socket,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-  CreateFileW, FILE_BEGIN, FlushFileBuffers, OPEN_EXISTING, ReadFile,
-  SetEndOfFile, SetFilePointerEx, WriteFile,
+  CreateFileW, FILE_BEGIN, FlushFileBuffers, LockFileEx, LOCKFILE_EXCLUSIVE_LOCK,
+  LOCKFILE_FAIL_IMMEDIATELY, OPEN_EXISTING, ReadFile, SetEndOfFile,
+  SetFilePointerEx, UnlockFileEx, WriteFile,
 };
 use windows_sys::Win32::System::IO::{
   CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
@@ -47,8 +48,8 @@ use windows_sys::Win32::System::Threading::{
   CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEONLYONCE,
 };
 
-use crate::backend::{IoBackend, OpCompleted};
 use crate::backend::op::{Op, OpBuf, RawBuf};
+use crate::backend::{IoBackend, OpCompleted};
 
 /// Marker value for wake-up notifications (not a real operation).
 const NOTIFY_KEY: usize = usize::MAX;
@@ -327,6 +328,46 @@ impl Iocp {
         // Windows symlinks require elevated privileges
         // Would need CreateSymbolicLinkW
         Self::error_result(windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED)
+      }
+
+      Op::Flock { fd, operation } => {
+        use crate::api::ops::lock;
+        let handle = fd.as_raw_handle() as HANDLE;
+
+        // Lock the entire file (0 to u64::MAX)
+        // SAFETY: Creating a zeroed OVERLAPPED is valid for LockFileEx
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+
+        if *operation & lock::LOCK_UN != 0 {
+          // Unlock
+          // SAFETY: handle is valid, overlapped is properly initialized
+          let result = unsafe {
+            UnlockFileEx(handle, 0, u32::MAX, u32::MAX, &mut overlapped)
+          };
+          if result == 0 {
+            Self::error_result(unsafe { GetLastError() })
+          } else {
+            0
+          }
+        } else {
+          // Lock (shared or exclusive)
+          let mut flags = 0u32;
+          if *operation & lock::LOCK_EX != 0 {
+            flags |= LOCKFILE_EXCLUSIVE_LOCK;
+          }
+          if *operation & lock::LOCK_NB != 0 {
+            flags |= LOCKFILE_FAIL_IMMEDIATELY;
+          }
+          // SAFETY: handle is valid, overlapped is properly initialized
+          let result = unsafe {
+            LockFileEx(handle, flags, 0, u32::MAX, u32::MAX, &mut overlapped)
+          };
+          if result == 0 {
+            Self::error_result(unsafe { GetLastError() })
+          } else {
+            0
+          }
+        }
       }
 
       Op::Nop => 0,
@@ -909,6 +950,7 @@ impl IoBackend for Iocp {
       | Op::OpenAt { .. }
       | Op::LinkAt { .. }
       | Op::SymlinkAt { .. }
+      | Op::Flock { .. }
       | Op::Nop => {
         let result = Self::run_blocking(&op);
         self.immediate.push(ImmediateCompletion { op_id: id, result });

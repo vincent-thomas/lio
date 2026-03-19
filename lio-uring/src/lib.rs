@@ -387,22 +387,28 @@ impl LioUring {
   /// # Errors
   /// Returns an error if waiting fails.
   pub fn wait(&mut self) -> io::Result<Completion> {
-    let mut cqe_ptr = ptr::null_mut();
-    let ret = unsafe {
-      bindings::io_uring_wait_cqe(&raw mut self.ring, &raw mut cqe_ptr)
-    };
+    loop {
+      let mut cqe_ptr = ptr::null_mut();
+      let ret = unsafe {
+        bindings::io_uring_wait_cqe(&raw mut self.ring, &raw mut cqe_ptr)
+      };
 
-    if ret < 0 {
-      return Err(io::Error::from_raw_os_error(-ret));
+      if ret < 0 {
+        let errno = -ret;
+        if errno == libc::EINTR {
+          continue;
+        }
+        return Err(io::Error::from_raw_os_error(errno));
+      }
+
+      let cqe = unsafe { &*cqe_ptr };
+      let completion =
+        Completion { user_data: cqe.user_data, res: cqe.res, flags: cqe.flags };
+
+      unsafe { bindings::io_uring_cqe_seen(&raw mut self.ring, cqe_ptr) };
+
+      return Ok(completion);
     }
-
-    let cqe = unsafe { &*cqe_ptr };
-    let completion =
-      Completion { user_data: cqe.user_data, res: cqe.res, flags: cqe.flags };
-
-    unsafe { bindings::io_uring_cqe_seen(&raw mut self.ring, cqe_ptr) };
-
-    Ok(completion)
   }
 
   /// Wait for and retrieve the next completion with a timeout.
@@ -415,35 +421,40 @@ impl LioUring {
     &mut self,
     timeout: Duration,
   ) -> io::Result<Option<Completion>> {
-    let mut cqe_ptr = ptr::null_mut();
-    let mut ts = bindings::__kernel_timespec {
-      tv_sec: timeout.as_secs() as i64,
-      tv_nsec: timeout.subsec_nanos() as i64,
-    };
+    loop {
+      let mut cqe_ptr = ptr::null_mut();
+      let mut ts = bindings::__kernel_timespec {
+        tv_sec: timeout.as_secs() as i64,
+        tv_nsec: timeout.subsec_nanos() as i64,
+      };
 
-    let ret = unsafe {
-      bindings::io_uring_wait_cqe_timeout(
-        &raw mut self.ring,
-        &raw mut cqe_ptr,
-        &raw mut ts,
-      )
-    };
+      let ret = unsafe {
+        bindings::io_uring_wait_cqe_timeout(
+          &raw mut self.ring,
+          &raw mut cqe_ptr,
+          &raw mut ts,
+        )
+      };
 
-    if ret < 0 {
-      let errno = -ret;
-      if errno == libc::ETIME {
-        return Ok(None);
+      if ret < 0 {
+        let errno = -ret;
+        if errno == libc::EINTR {
+          continue;
+        }
+        if errno == libc::ETIME {
+          return Ok(None);
+        }
+        return Err(io::Error::from_raw_os_error(errno));
       }
-      return Err(io::Error::from_raw_os_error(errno));
+
+      let cqe = unsafe { &*cqe_ptr };
+      let completion =
+        Completion { user_data: cqe.user_data, res: cqe.res, flags: cqe.flags };
+
+      unsafe { bindings::io_uring_cqe_seen(&raw mut self.ring, cqe_ptr) };
+
+      return Ok(Some(completion));
     }
-
-    let cqe = unsafe { &*cqe_ptr };
-    let completion =
-      Completion { user_data: cqe.user_data, res: cqe.res, flags: cqe.flags };
-
-    unsafe { bindings::io_uring_cqe_seen(&raw mut self.ring, cqe_ptr) };
-
-    Ok(Some(completion))
   }
 
   /// Try to retrieve the next completion without blocking.

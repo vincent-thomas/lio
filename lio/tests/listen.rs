@@ -17,9 +17,7 @@ fn test_listen_basic() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  common::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let sock =
     poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
@@ -64,9 +62,7 @@ fn test_listen_with_backlog() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  common::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let sock =
     poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
@@ -106,9 +102,7 @@ fn test_listen_large_backlog() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  common::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let sock =
     poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
@@ -146,9 +140,7 @@ fn test_listen_without_bind() {
 
   let (sender_sock, receiver_sock) = mpsc::channel();
 
-  common::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let sock =
     poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
@@ -172,9 +164,7 @@ fn test_listen_ipv6() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  common::tcp6_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp6_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let sock = poll_until_recv(&mut lio, &receiver_sock)
     .expect("Failed to create IPv6 socket");
@@ -213,9 +203,7 @@ fn test_listen_on_udp() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  common::udp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::udp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let sock = poll_until_recv(&mut lio, &receiver_sock)
     .expect("Failed to create UDP socket");
@@ -243,9 +231,7 @@ fn test_listen_twice() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  common::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let sock =
     poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
@@ -279,9 +265,7 @@ fn test_listen_zero_backlog() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  common::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let sock =
     poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
@@ -319,9 +303,7 @@ fn test_listen_after_close() {
 
   let (sender_sock, receiver_sock) = mpsc::channel();
 
-  common::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let sock =
     poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
@@ -414,9 +396,7 @@ fn test_listen_on_all_interfaces() {
   let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
 
-  common::tcp_socket()
-    .with_lio(&mut lio)
-    .send_with(sender_sock.clone());
+  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
 
   let sock =
     poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");

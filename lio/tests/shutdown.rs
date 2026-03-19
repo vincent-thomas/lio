@@ -311,8 +311,7 @@ fn test_shutdown_after_close() {
 
   listen_recv.recv().expect("Failed to listen");
 
-  let mut client_sock_recv =
-    common::tcp_socket().with_lio(&mut lio).send();
+  let mut client_sock_recv = common::tcp_socket().with_lio(&mut lio).send();
 
   let client_sock = poll_recv(&mut lio, &mut client_sock_recv).unwrap();
 
@@ -655,8 +654,7 @@ fn test_shutdown_concurrent() {
 
   // Test shutting down multiple connections (sequentially)
   for _ in 0..5 {
-    let mut server_sock =
-      common::tcp_socket().with_lio(&mut lio).send();
+    let mut server_sock = common::tcp_socket().with_lio(&mut lio).send();
 
     let server_sock = poll_recv(&mut lio, &mut server_sock)
       .expect("Failed to create server socket");
@@ -686,8 +684,7 @@ fn test_shutdown_concurrent() {
     poll_recv(&mut lio, &mut listen_recv).expect("Failed to listen");
 
     // Create and connect client
-    let mut client_sock =
-      common::tcp_socket().with_lio(&mut lio).send();
+    let mut client_sock = common::tcp_socket().with_lio(&mut lio).send();
 
     let client_sock = poll_recv(&mut lio, &mut client_sock).unwrap();
 

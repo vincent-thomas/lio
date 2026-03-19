@@ -122,6 +122,48 @@ impl OsPoller {
 
   /// Add or modify multiple interests in a single syscall (batched)
   ///
+  /// Helper to build kevent structs for fd-based interests.
+  fn build_fd_kevents(
+    &self,
+    changes: &mut [libc::kevent; 2],
+    n: &mut usize,
+    fd: RawFd,
+    key: usize,
+    interest: Interest,
+    oneshot: bool,
+  ) {
+    let flags = if oneshot {
+      libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT
+    } else {
+      libc::EV_ADD | libc::EV_ENABLE
+    };
+
+    if interest.is_readable() {
+      changes[*n] = make_kevent(
+        fd as libc::uintptr_t,
+        libc::EVFILT_READ,
+        flags,
+        0,
+        0,
+        key as *mut libc::c_void,
+      );
+      *n += 1;
+    }
+
+    if interest.is_writable() {
+      assert!(*n < 2, "Must have space for WRITE event");
+      changes[*n] = make_kevent(
+        fd as libc::uintptr_t,
+        libc::EVFILT_WRITE,
+        flags,
+        0,
+        0,
+        key as *mut libc::c_void,
+      );
+      *n += 1;
+    }
+  }
+
   /// This is more efficient than calling add_interest/modify_interest twice
   /// when both readable and writable interests are needed.
   fn change_interests_batched(
@@ -129,6 +171,26 @@ impl OsPoller {
     fd: RawFd,
     key: usize,
     interest: Interest,
+  ) -> io::Result<()> {
+    self.change_interests_inner(fd, key, interest, true)
+  }
+
+  /// Level-triggered variant of change_interests_batched.
+  fn change_interests_level(
+    &self,
+    fd: RawFd,
+    key: usize,
+    interest: Interest,
+  ) -> io::Result<()> {
+    self.change_interests_inner(fd, key, interest, false)
+  }
+
+  fn change_interests_inner(
+    &self,
+    fd: RawFd,
+    key: usize,
+    interest: Interest,
+    oneshot: bool,
   ) -> io::Result<()> {
     // For kqueue timers, fd contains duration in milliseconds
     if interest.is_timer() {
@@ -160,31 +222,7 @@ impl OsPoller {
     let mut changes: [libc::kevent; 2] = unsafe { std::mem::zeroed() };
     let mut n = 0;
 
-    if interest.is_readable() {
-      changes[n] = make_kevent(
-        fd as libc::uintptr_t,
-        libc::EVFILT_READ,
-        libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
-        0,
-        0,
-        key as *mut libc::c_void,
-      );
-      n += 1;
-    }
-
-    if interest.is_writable() {
-      assert!(n < 2, "Must have space for WRITE event");
-      changes[n] = make_kevent(
-        fd as libc::uintptr_t,
-        libc::EVFILT_WRITE,
-        libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
-        0,
-        0,
-        key as *mut libc::c_void,
-      );
-      n += 1;
-    }
-
+    self.build_fd_kevents(&mut changes, &mut n, fd, key, interest, oneshot);
     assert!(n <= 2, "n must be 0, 1, or 2, got {}", n);
 
     if n > 0 {
@@ -240,6 +278,59 @@ impl OsPoller {
     self.delete_interest(fd, libc::EVFILT_VNODE)
   }
 
+  /// Add signal interest.
+  ///
+  /// This watches for delivery of the specified signal using EVFILT_SIGNAL.
+  pub fn add_signal(&self, sig: i32, key: u64) -> io::Result<()> {
+    let kev = make_kevent(
+      sig as libc::uintptr_t,
+      libc::EVFILT_SIGNAL,
+      libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+      0,
+      0,
+      key as *mut libc::c_void,
+    );
+
+    syscall!(kevent(
+      self.kq_fd.as_raw_fd(),
+      &kev as *const libc::kevent,
+      1,
+      ptr::null_mut(),
+      0,
+      ptr::null(),
+    ))?;
+
+    // Track using negative value to distinguish from fd (signal numbers are small positive ints)
+    self.registered_timers.borrow_mut().insert(key);
+    Ok(())
+  }
+
+  /// Delete signal interest.
+  pub fn delete_signal(&self, sig: i32) -> io::Result<()> {
+    let kev = make_kevent(
+      sig as libc::uintptr_t,
+      libc::EVFILT_SIGNAL,
+      libc::EV_DELETE,
+      0,
+      0,
+      ptr::null_mut(),
+    );
+
+    let result = syscall!(kevent(
+      self.kq_fd.as_raw_fd(),
+      &kev as *const libc::kevent,
+      1,
+      std::ptr::null_mut(),
+      0,
+      std::ptr::null(),
+    ));
+
+    match result {
+      Err(err) if !utils::is_not_found_error(&err) => Err(err),
+      _ => Ok(()),
+    }
+  }
+
   /// Delete interest for a file descriptor
   fn delete_interest(&self, fd: RawFd, filter: i16) -> io::Result<()> {
     let kev = make_kevent(
@@ -267,17 +358,27 @@ impl OsPoller {
   }
 }
 
-impl ReadinessPoll for OsPoller {
-  type NativeEvent = libc::kevent;
+impl OsPoller {
+  fn add_inner(
+    &self,
+    fd: RawFd,
+    key: u64,
+    interest: Interest,
+    oneshot: bool,
+  ) -> io::Result<()> {
+    let change_fn = if oneshot {
+      Self::change_interests_batched
+    } else {
+      Self::change_interests_level
+    };
 
-  fn add(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
     // For timers, track by key instead of fd
     if interest.is_timer() {
       if !self.registered_timers.borrow_mut().insert(key) {
         return Err(io::Error::from_raw_os_error(libc::EEXIST));
       }
 
-      match self.change_interests_batched(fd, key as usize, interest) {
+      match change_fn(self, fd, key as usize, interest) {
         Ok(()) => Ok(()),
         Err(e) => {
           self.registered_timers.borrow_mut().remove(&key);
@@ -292,7 +393,7 @@ impl ReadinessPoll for OsPoller {
       }
 
       // Optimization: batch both read and write into a single syscall
-      match self.change_interests_batched(fd, key as usize, interest) {
+      match change_fn(self, fd, key as usize, interest) {
         Ok(()) => {
           // Postcondition: fd must still be in registered_fds
           assert!(
@@ -312,6 +413,18 @@ impl ReadinessPoll for OsPoller {
         }
       }
     }
+  }
+}
+
+impl ReadinessPoll for OsPoller {
+  type NativeEvent = libc::kevent;
+
+  fn add(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
+    self.add_inner(fd, key, interest, true)
+  }
+
+  fn add_level(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
+    self.add_inner(fd, key, interest, false)
   }
 
   fn modify(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
@@ -470,6 +583,7 @@ impl ReadinessPoll for OsPoller {
       libc::EVFILT_WRITE => Interest::WRITE,
       libc::EVFILT_TIMER => Interest::TIMER,
       libc::EVFILT_VNODE => Interest::VNODE,
+      libc::EVFILT_SIGNAL => Interest::SIGNAL,
       _ => Interest::READ, // Fallback
     }
   }

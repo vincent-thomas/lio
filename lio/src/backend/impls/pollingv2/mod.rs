@@ -50,9 +50,18 @@ pub trait ReadinessPoll {
   /// The native event type used by this implementation
   type NativeEvent;
 
-  /// Add interest for a file descriptor
+  /// Add interest for a file descriptor (one-shot mode).
   /// This is not idempotent.
   fn add(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()>;
+
+  /// Add interest for a file descriptor (level-triggered mode).
+  /// Unlike `add`, this stays registered and fires on every readiness.
+  fn add_level(
+    &self,
+    fd: RawFd,
+    key: u64,
+    interest: Interest,
+  ) -> io::Result<()>;
 
   /// Modify existing interest for a file descriptor
   /// This is idempotent, but fails if not added before.
@@ -267,9 +276,6 @@ pub struct Poller {
   /// Stores the fd we opened/created for watch operations so we can close it on completion.
   #[cfg(unix)]
   watch_fds: HashMap<u64, (RawFd, bool)>,
-  /// Stream operations that should be automatically resubmitted.
-  /// Stores op_id -> (Op clone, fd, interest) for auto-resubmission.
-  stream_ops: HashMap<u64, (crate::backend::op::Op, RawFd, Interest)>,
 }
 
 impl Poller {
@@ -288,9 +294,9 @@ impl Poller {
     self.fd_map.as_mut().expect("Poller not initialized - call init() first")
   }
 
-  /// Run an op by reference using peek (no ownership transfer of buffers).
-  /// Used in wait_timeout so the op can be put back in op_map on EAGAIN.
-  fn run_op_on_event(op: &crate::backend::op::Op) -> isize {
+  /// Execute a syscall for the given operation.
+  #[inline]
+  fn run_op(op: &crate::backend::op::Op) -> isize {
     use crate::backend::op::Op;
     use std::os::fd::AsRawFd;
 
@@ -310,6 +316,56 @@ impl Poller {
       Op::Accept { fd, addr, len } => {
         syscall!(raw accept(fd.as_raw_fd(), *addr as *mut _, *len))
       }
+      Op::AcceptStream { fd } => {
+        syscall!(raw accept(fd.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut()))
+      }
+      Op::Connect { fd, addr, len, connect_called } => {
+        let ret = syscall!(raw connect(fd.as_raw_fd(), *addr as *const libc::sockaddr, *len));
+        if ret == -(libc::EISCONN as isize) && *connect_called {
+          0
+        } else {
+          ret
+        }
+      }
+      Op::Bind { fd, addr, addrlen } => {
+        syscall!(raw bind(fd.as_raw_fd(), *addr as *const libc::sockaddr, *addrlen))
+      }
+      Op::Listen { fd, backlog } => {
+        syscall!(raw listen(fd.as_raw_fd(), *backlog))
+      }
+      Op::Shutdown { fd, how } => {
+        syscall!(raw shutdown(fd.as_raw_fd(), *how))
+      }
+      Op::Socket { domain, ty, proto } => {
+        syscall!(raw socket(*domain, *ty, *proto))
+      }
+      Op::OpenAt { dir_fd, path, flags, mode } => {
+        syscall!(raw openat(dir_fd.as_raw_fd(), *path, *flags, *mode))
+      }
+      Op::Close { fd } => {
+        syscall!(raw close(*fd))
+      }
+      Op::Fsync { fd } => {
+        syscall!(raw fsync(fd.as_raw_fd()))
+      }
+      Op::Truncate { fd, size } => {
+        syscall!(raw ftruncate(fd.as_raw_fd(), *size as libc::off_t))
+      }
+      Op::LinkAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
+        syscall!(raw linkat(old_dir_fd.as_raw_fd(), *old_path, new_dir_fd.as_raw_fd(), *new_path, 0))
+      }
+      Op::SymlinkAt { target, linkpath, dir_fd } => {
+        syscall!(raw symlinkat(*target, dir_fd.as_raw_fd(), *linkpath))
+      }
+      Op::UnlinkAt { dir_fd, path, flags } => {
+        syscall!(raw unlinkat(dir_fd.as_raw_fd(), *path, *flags))
+      }
+      Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
+        syscall!(raw renameat(old_dir_fd.as_raw_fd(), *old_path, new_dir_fd.as_raw_fd(), *new_path))
+      }
+      Op::MkdirAt { dir_fd, path, mode } => {
+        syscall!(raw mkdirat(dir_fd.as_raw_fd(), *path, *mode as libc::mode_t))
+      }
       Op::ReadV { fd, iovecs, iov_count, .. } => {
         syscall!(raw readv(fd.as_raw_fd(), *iovecs, *iov_count as libc::c_int))
       }
@@ -322,156 +378,129 @@ impl Poller {
       Op::WriteVAt { fd, iovecs, iov_count, offset, .. } => {
         syscall!(raw pwritev(fd.as_raw_fd(), *iovecs, *iov_count as libc::c_int, *offset))
       }
-      Op::Sleep { .. } => 0,
-      Op::Connect { fd, addr, len, connect_called } => {
-        let ret = syscall!(raw connect(fd.as_raw_fd(), *addr as *const libc::sockaddr, *len));
-        // EINPROGRESS is returned as-is (caller waits for socket to become writable)
-        // EISCONN means success if we already started connecting
-        if ret == -(libc::EISCONN as isize) && *connect_called {
-          return 0;
-        }
-        ret
-      }
-      _ => panic!("run_op_on_event called for non-event op"),
-    }
-  }
-
-  fn run_op_blocking(op: crate::backend::op::Op) -> isize {
-    use crate::backend::op::Op;
-    use std::os::fd::AsRawFd;
-
-    match op {
-      Op::Send { fd, flags, buf } => {
-        syscall!(raw send(fd.as_raw_fd(), buf.ptr as *const _, buf.len, flags))
-      }
-      Op::Recv { fd, flags, buf } => {
-        syscall!(raw recv(fd.as_raw_fd(), buf.ptr as *mut _, buf.len, flags))
-      }
-      Op::SendTo { fd, flags, buf, addr, addrlen, .. } => {
-        syscall!(raw sendto(fd.as_raw_fd(), buf.ptr as *const _, buf.len, flags, addr as *const libc::sockaddr, addrlen))
-      }
-      Op::RecvFrom { fd, flags, buf, addr, addrlen, .. } => {
-        syscall!(raw recvfrom(fd.as_raw_fd(), buf.ptr as *mut _, buf.len, flags, addr as *mut libc::sockaddr, addrlen))
-      }
-      Op::Accept { fd, addr, len } => {
-        syscall!(raw accept(fd.as_raw_fd(), addr as *mut _, len))
-      }
-      Op::Connect { fd, addr, len, connect_called } => {
-        let ret = syscall!(raw connect(fd.as_raw_fd(), addr as *const libc::sockaddr, len));
-        // EINPROGRESS is returned as-is (caller waits for socket to become writable)
-        // EISCONN means success if we already started connecting
-        if ret == -(libc::EISCONN as isize) && connect_called {
-          return 0;
-        }
-        ret
-      }
-      Op::Bind { fd, addr, addrlen } => {
-        syscall!(raw bind(fd.as_raw_fd(), addr as *const libc::sockaddr, addrlen))
-      }
-      Op::Listen { fd, backlog } => {
-        syscall!(raw listen(fd.as_raw_fd(), backlog))
-      }
-      Op::Shutdown { fd, how } => {
-        syscall!(raw shutdown(fd.as_raw_fd(), how))
-      }
-      Op::Socket { domain, ty, proto } => {
-        syscall!(raw socket(domain, ty, proto))
-      }
-      Op::OpenAt { dir_fd, path, flags, mode } => {
-        syscall!(raw openat(dir_fd.as_raw_fd(), path, flags, mode))
-      }
-      Op::Close { fd } => {
-        syscall!(raw close(fd))
-      }
-      Op::Fsync { fd } => {
-        syscall!(raw fsync(fd.as_raw_fd()))
-      }
-      Op::Truncate { fd, size } => {
-        syscall!(raw ftruncate(fd.as_raw_fd(), size as libc::off_t))
-      }
-      Op::LinkAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
-        syscall!(raw linkat(old_dir_fd.as_raw_fd(), old_path, new_dir_fd.as_raw_fd(), new_path, 0))
-      }
-      Op::SymlinkAt { target, linkpath, dir_fd } => {
-        syscall!(raw symlinkat(target, dir_fd.as_raw_fd(), linkpath))
-      }
-      Op::UnlinkAt { dir_fd, path, flags } => {
-        syscall!(raw unlinkat(dir_fd.as_raw_fd(), path, flags))
-      }
-      Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
-        syscall!(raw renameat(old_dir_fd.as_raw_fd(), old_path, new_dir_fd.as_raw_fd(), new_path))
-      }
-      Op::MkdirAt { dir_fd, path, mode } => {
-        syscall!(raw mkdirat(dir_fd.as_raw_fd(), path, mode as libc::mode_t))
-      }
-      #[cfg(target_os = "linux")]
-      Op::Splice { fd_in, off_in, fd_out, off_out, len, flags } => {
-        let mut off_in_val = off_in;
-        let mut off_out_val = off_out;
-        let off_in_ptr =
-          if off_in == -1 { std::ptr::null_mut() } else { &mut off_in_val };
-        let off_out_ptr =
-          if off_out == -1 { std::ptr::null_mut() } else { &mut off_out_val };
-        syscall!(raw splice(fd_in.as_raw_fd(), off_in_ptr, fd_out.as_raw_fd(), off_out_ptr, len as usize, flags as libc::c_uint))
-      }
-      #[cfg(target_os = "linux")]
-      Op::SendFile { out_fd, in_fd, offset, count } => {
-        let mut off = offset;
-        syscall!(raw sendfile(out_fd.as_raw_fd(), in_fd.as_raw_fd(), &mut off, count))
-      }
-      #[cfg(target_vendor = "apple")]
-      Op::SendFile { out_fd, in_fd, offset, count } => {
-        // macOS: int sendfile(int fd, int s, off_t offset, off_t *len, struct sf_hdtr *hdtr, int flags)
-        let mut len: libc::off_t = count as libc::off_t;
-        let ret = syscall!(raw sendfile(in_fd.as_raw_fd(), out_fd.as_raw_fd(), offset, &mut len, std::ptr::null_mut(), 0));
-        if ret == 0 { len as isize } else { ret }
-      }
-      #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-      Op::SendFile { out_fd, in_fd, offset, count } => {
-        // FreeBSD: int sendfile(int fd, int s, off_t offset, size_t nbytes, struct sf_hdtr *hdtr, off_t *sbytes, int flags)
-        let mut sbytes: libc::off_t = 0;
-        let ret = syscall!(raw sendfile(in_fd.as_raw_fd(), out_fd.as_raw_fd(), offset, count, std::ptr::null_mut(), &mut sbytes, 0));
-        if ret == 0 { sbytes as isize } else { ret }
-      }
-      #[cfg(target_os = "linux")]
-      Op::CopyFileRange { fd_in, off_in, fd_out, off_out, len, flags } => {
-        let mut off_in_val = off_in;
-        let mut off_out_val = off_out;
-        syscall!(raw copy_file_range(fd_in.as_raw_fd(), &mut off_in_val, fd_out.as_raw_fd(), &mut off_out_val, len, flags as libc::c_uint))
-      }
-      #[cfg(target_os = "linux")]
-      Op::Tee { fd_in, fd_out, size } => {
-        syscall!(raw tee(fd_in.as_raw_fd(), fd_out.as_raw_fd(), size as libc::size_t, 0))
-      }
-      Op::ReadV { fd, iovecs, iov_count, .. } => {
-        syscall!(raw readv(fd.as_raw_fd(), iovecs, iov_count as libc::c_int))
-      }
-      Op::WriteV { fd, iovecs, iov_count, .. } => {
-        syscall!(raw writev(fd.as_raw_fd(), iovecs, iov_count as libc::c_int))
-      }
-      Op::ReadVAt { fd, iovecs, iov_count, offset, .. } => {
-        syscall!(raw preadv(fd.as_raw_fd(), iovecs, iov_count as libc::c_int, offset))
-      }
-      Op::WriteVAt { fd, iovecs, iov_count, offset, .. } => {
-        syscall!(raw pwritev(fd.as_raw_fd(), iovecs, iov_count as libc::c_int, offset))
-      }
       Op::Sleep { duration, .. } => {
-        std::thread::sleep(duration);
+        std::thread::sleep(*duration);
         0
       }
       Op::Nop => 0,
-      #[cfg(unix)]
-      Op::Timeout { .. } => {
-        // Op::Timeout should be handled in push() by extracting the inner op.
-        // If we reach here, something went wrong.
-        -(libc::ENOTSUP as isize)
+      #[cfg(target_os = "linux")]
+      Op::Splice { fd_in, off_in, fd_out, off_out, len, flags } => {
+        let mut off_in_val = *off_in;
+        let mut off_out_val = *off_out;
+        let off_in_ptr =
+          if *off_in == -1 { std::ptr::null_mut() } else { &mut off_in_val };
+        let off_out_ptr =
+          if *off_out == -1 { std::ptr::null_mut() } else { &mut off_out_val };
+        syscall!(raw splice(fd_in.as_raw_fd(), off_in_ptr, fd_out.as_raw_fd(), off_out_ptr, *len as usize, *flags as libc::c_uint))
+      }
+      #[cfg(target_os = "linux")]
+      Op::SendFile { out_fd, in_fd, offset, count } => {
+        let mut off = *offset;
+        syscall!(raw sendfile(out_fd.as_raw_fd(), in_fd.as_raw_fd(), &mut off, *count))
+      }
+      Op::SendFile { out_fd, in_fd, offset, count } => {
+        #[cfg(target_vendor = "apple")]
+        {
+          let mut len: libc::off_t = *count as libc::off_t;
+          let ret = syscall!(raw sendfile(in_fd.as_raw_fd(), out_fd.as_raw_fd(), *offset, &mut len, std::ptr::null_mut(), 0));
+          if ret == 0 { len as isize } else { ret }
+        }
+        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+        {
+          let mut sbytes: libc::off_t = 0;
+          let ret = syscall!(raw sendfile(in_fd.as_raw_fd(), out_fd.as_raw_fd(), *offset, *count, std::ptr::null_mut(), &mut sbytes, 0));
+          if ret == 0 { sbytes as isize } else { ret }
+        }
+      }
+      #[cfg(target_os = "linux")]
+      Op::CopyFileRange { fd_in, off_in, fd_out, off_out, len, flags } => {
+        let mut off_in_val = *off_in;
+        let mut off_out_val = *off_out;
+        syscall!(raw copy_file_range(fd_in.as_raw_fd(), &mut off_in_val, fd_out.as_raw_fd(), &mut off_out_val, *len, *flags as libc::c_uint))
+      }
+      #[cfg(target_os = "linux")]
+      Op::Tee { fd_in, fd_out, size } => {
+        syscall!(raw tee(fd_in.as_raw_fd(), fd_out.as_raw_fd(), *size as libc::size_t, 0))
       }
       #[cfg(unix)]
-      Op::Watch { .. } => {
-        // Op::Watch should be handled in push() with proper async registration.
-        // If we reach here, something went wrong.
-        -(libc::ENOTSUP as isize)
+      Op::Timeout { .. } => -(libc::ENOTSUP as isize),
+      #[cfg(unix)]
+      Op::Watch { .. } => -(libc::ENOTSUP as isize),
+      #[cfg(unix)]
+      Op::Waitid { idtype, id, options, infop } => {
+        syscall!(raw waitid(*idtype, *id, *infop, *options))
       }
+      #[cfg(unix)]
+      Op::Spawn { path, argv, envp, pid, file_actions } => {
+        // SAFETY: All pointers are valid and owned by the Op
+        let ret = unsafe {
+          libc::posix_spawn(
+            *pid,
+            *path,
+            *file_actions,
+            std::ptr::null(),
+            *argv as *const *mut _,
+            *envp as *const *mut _,
+          )
+        };
+        if ret == 0 { 0 } else { -(ret as isize) }
+      }
+      #[cfg(unix)]
+      Op::Flock { fd, operation } => {
+        syscall!(raw flock(fd.as_raw_fd(), *operation))
+      }
+      #[cfg(unix)]
+      Op::GetDents { fd, buf } => {
+        #[cfg(target_os = "linux")]
+        {
+          syscall!(raw syscall(libc::SYS_getdents64, fd.as_raw_fd(), buf.ptr as *mut libc::c_void, buf.len))
+        }
+        #[cfg(target_os = "macos")]
+        {
+          unsafe extern "C" {
+            fn __getdirentries64(
+              fd: libc::c_int,
+              buf: *mut libc::c_char,
+              nbytes: libc::c_int,
+              basep: *mut libc::c_long,
+            ) -> libc::c_int;
+          }
+          let mut basep: libc::c_long = 0;
+          // SAFETY: fd is a valid directory fd, buf is a valid buffer
+          let ret = unsafe {
+            __getdirentries64(
+              fd.as_raw_fd(),
+              buf.ptr as *mut libc::c_char,
+              buf.len as libc::c_int,
+              &mut basep,
+            )
+          };
+          if ret < 0 {
+            -(std::io::Error::last_os_error()
+              .raw_os_error()
+              .unwrap_or(libc::EIO) as isize)
+          } else {
+            ret as isize
+          }
+        }
+        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+        {
+          let mut basep: libc::off_t = 0;
+          syscall!(raw getdirentries(fd.as_raw_fd(), buf.ptr as *mut libc::c_char, buf.len as libc::c_int, &mut basep))
+        }
+        #[cfg(not(any(
+          target_os = "linux",
+          target_os = "macos",
+          target_os = "freebsd",
+          target_os = "dragonfly"
+        )))]
+        {
+          let _ = (fd, buf);
+          -(libc::ENOTSUP as isize)
+        }
+      }
+      #[cfg(unix)]
+      Op::Signal { .. } => -(libc::ENOTSUP as isize),
     }
   }
 }
@@ -484,7 +513,6 @@ impl IoBackend for Poller {
     self.events = Events::with_capacity(cap.min(4096));
     self.immediate = Vec::with_capacity(64);
     self.completed = Vec::with_capacity(cap.min(256));
-    self.stream_ops = HashMap::with_capacity(64);
     #[cfg(unix)]
     {
       self.timeout_timers = HashMap::with_capacity(64);
@@ -618,6 +646,7 @@ impl IoBackend for Poller {
         use crate::api::ops::WatchMask;
 
         // BSD/macOS: Open the file and register EVFILT_VNODE
+        // SAFETY: path is a valid null-terminated C string from the TypedOp
         let path_cstr = unsafe { CStr::from_ptr(path) };
         let fd = match syscall!(open(
           path_cstr.as_ptr(),
@@ -638,6 +667,7 @@ impl IoBackend for Poller {
 
         // Register with kqueue
         if let Err(e) = self.sys().add_vnode(fd, id, fflags) {
+          // SAFETY: fd is a valid file descriptor we just opened
           unsafe { libc::close(fd) };
           let errno = e.raw_os_error().unwrap_or(libc::EIO);
           self
@@ -704,12 +734,89 @@ impl IoBackend for Poller {
       }
     }
 
+    // Handle Op::Signal specially - needs platform-specific async registration
+    #[cfg(unix)]
+    if let Op::Signal { sigset } = op {
+      #[cfg(target_os = "linux")]
+      {
+        // Linux: Create signalfd
+        let sigfd = syscall!(signalfd(
+          -1,
+          sigset,
+          libc::SFD_NONBLOCK | libc::SFD_CLOEXEC
+        ));
+        match sigfd {
+          Ok(fd) => {
+            self.fd_map().insert(id, fd);
+            if let Err(e) = self.sys().add(fd, id, Interest::READ) {
+              unsafe { libc::close(fd) };
+              self.fd_map().remove(&id);
+              let errno = e.raw_os_error().unwrap_or(libc::EIO);
+              self
+                .immediate
+                .push(ImmediateCompletion { id, result: -(errno as isize) });
+              return Ok(());
+            }
+            // Track the signalfd so we can close it on completion
+            self.watch_fds.insert(id, (fd, false)); // false = not inotify
+            return Ok(());
+          }
+          Err(e) => {
+            let errno = e.raw_os_error().unwrap_or(libc::EIO);
+            self
+              .immediate
+              .push(ImmediateCompletion { id, result: -(errno as isize) });
+            return Ok(());
+          }
+        }
+      }
+
+      #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd"
+      ))]
+      {
+        // BSD/macOS: Use EVFILT_SIGNAL via kqueue
+        // We need to iterate through the sigset and register each signal
+        // For simplicity, we register for common signals
+        // The actual signal number is returned in kevent's ident field
+
+        // Try to find which signals are in the set
+        for sig in 1..32 {
+          // SAFETY: sigset is valid pointer from TypedOp
+          if unsafe { libc::sigismember(sigset, sig) } == 1 {
+            // Register EVFILT_SIGNAL for this signal
+            if let Err(e) = self.sys().add_signal(sig, id) {
+              let errno = e.raw_os_error().unwrap_or(libc::EIO);
+              self
+                .immediate
+                .push(ImmediateCompletion { id, result: -(errno as isize) });
+              return Ok(());
+            }
+            // Store signal number as "fd" for tracking (we'll use it in completion)
+            self.fd_map().insert(id, sig);
+            return Ok(());
+          }
+        }
+
+        // No signals in set
+        self
+          .immediate
+          .push(ImmediateCompletion { id, result: -(libc::EINVAL as isize) });
+        return Ok(());
+      }
+    }
+
     let fd_and_interest = match &op {
       Op::ReadV { .. }
       | Op::WriteV { .. }
       | Op::ReadVAt { .. }
       | Op::WriteVAt { .. } => {
-        let result = Poller::run_op_blocking(op);
+        let result = Poller::run_op(&op);
         self.immediate.push(ImmediateCompletion { id, result });
         return Ok(());
       }
@@ -718,6 +825,33 @@ impl IoBackend for Poller {
       Op::Recv { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
       Op::RecvFrom { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
       Op::Accept { fd, .. } => Some((fd.as_raw_fd(), Interest::READ)),
+      Op::AcceptStream { fd } => {
+        // Stream operation - use level-triggered mode to drain all pending accepts
+        let raw_fd = fd.as_raw_fd();
+
+        // Set socket to non-blocking mode for level-triggered drain loop
+        // SAFETY: raw_fd is a valid file descriptor from the Resource
+        let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+        if flags == -1 {
+          return Err(io::Error::last_os_error());
+        }
+        // SAFETY: raw_fd is valid, flags is the current flags we just read
+        if unsafe {
+          libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK)
+        } == -1
+        {
+          return Err(io::Error::last_os_error());
+        }
+
+        self.fd_map().insert(id, raw_fd);
+        // Level-triggered: fires on every readiness, no re-arm needed
+        if let Err(e) = self.sys().add_level(raw_fd, id, Interest::READ) {
+          self.fd_map().remove(&id);
+          return Err(e);
+        }
+        self.op_map.insert(id, op);
+        return Ok(());
+      }
       Op::Connect { .. } => None,
       Op::Bind { .. }
       | Op::Listen { .. }
@@ -726,7 +860,7 @@ impl IoBackend for Poller {
       | Op::Close { .. }
       | Op::Fsync { .. }
       | Op::Truncate { .. } => {
-        let result = Poller::run_op_blocking(op);
+        let result = Poller::run_op(&op);
         self.immediate.push(ImmediateCompletion { id, result });
         return Ok(());
       }
@@ -736,7 +870,7 @@ impl IoBackend for Poller {
       }
       Op::Sleep { .. } => None,
       Op::Nop => {
-        let result = Poller::run_op_blocking(op);
+        let result = Poller::run_op(&op);
         self.immediate.push(ImmediateCompletion { id, result });
         return Ok(());
       }
@@ -746,19 +880,33 @@ impl IoBackend for Poller {
       | Op::UnlinkAt { .. }
       | Op::RenameAt { .. }
       | Op::MkdirAt { .. } => {
-        let result = Poller::run_op_blocking(op);
+        let result = Poller::run_op(&op);
         self.immediate.push(ImmediateCompletion { id, result });
         return Ok(());
       }
       #[cfg(target_os = "linux")]
       Op::Splice { .. } | Op::CopyFileRange { .. } => {
-        let result = Poller::run_op_blocking(op);
+        let result = Poller::run_op(&op);
         self.immediate.push(ImmediateCompletion { id, result });
         return Ok(());
       }
       #[cfg(unix)]
       Op::SendFile { .. } => {
-        let result = Poller::run_op_blocking(op);
+        let result = Poller::run_op(&op);
+        self.immediate.push(ImmediateCompletion { id, result });
+        return Ok(());
+      }
+      #[cfg(unix)]
+      Op::Waitid { .. } => {
+        // Waitid is a blocking operation (no fd to poll on)
+        let result = Poller::run_op(&op);
+        self.immediate.push(ImmediateCompletion { id, result });
+        return Ok(());
+      }
+      #[cfg(unix)]
+      Op::Spawn { .. } => {
+        // Spawn is a blocking operation
+        let result = Poller::run_op(&op);
         self.immediate.push(ImmediateCompletion { id, result });
         return Ok(());
       }
@@ -771,6 +919,25 @@ impl IoBackend for Poller {
       Op::Watch { .. } => {
         // Should be handled above, but in case we reach here
         unreachable!("Op::Watch should be handled before this match")
+      }
+      #[cfg(unix)]
+      Op::Signal { .. } => {
+        // Should be handled above, but in case we reach here
+        unreachable!("Op::Signal should be handled before this match")
+      }
+      #[cfg(unix)]
+      Op::Flock { .. } => {
+        // Flock is a blocking operation
+        let result = Poller::run_op(&op);
+        self.immediate.push(ImmediateCompletion { id, result });
+        return Ok(());
+      }
+      #[cfg(unix)]
+      Op::GetDents { .. } => {
+        // GetDents is a blocking operation
+        let result = Poller::run_op(&op);
+        self.immediate.push(ImmediateCompletion { id, result });
+        return Ok(());
       }
     };
 
@@ -785,17 +952,17 @@ impl IoBackend for Poller {
         let op = self.op_map.remove(&id).unwrap();
         let errno = e.raw_os_error().unwrap_or(libc::EIO);
         // Try the operation anyway - it will fail with a proper error
-        let result = Poller::run_op_blocking(op);
+        let result = Poller::run_op(&op);
         let final_result = if result < 0 { result } else { -(errno as isize) };
         self.immediate.push(ImmediateCompletion { id, result: final_result });
         return Ok(());
       }
-    } else {
-      match &self.op_map[&id] {
+    } else if let Some(op) = self.op_map.get(&id) {
+      match op {
         Op::Connect { fd, .. } => {
           let fd = fd.as_raw_fd();
-          let result =
-            Poller::run_op_blocking(self.op_map.remove(&id).unwrap());
+          let result = Poller::run_op(op);
+          self.op_map.remove(&id);
           if result == -(libc::EINPROGRESS as isize) {
             self.fd_map().insert(id, fd);
             self.sys().add(fd, id, Interest::WRITE)?;
@@ -807,11 +974,10 @@ impl IoBackend for Poller {
           let duration_ms = duration.as_millis() as RawFd;
           self.fd_map().insert(id, duration_ms);
           self.sys().add(duration_ms, id, Interest::TIMER)?;
-          // op stays in op_map; kqueue fires when duration elapses
         }
         Op::Socket { .. } => {
-          let result =
-            Poller::run_op_blocking(self.op_map.remove(&id).unwrap());
+          let result = Poller::run_op(op);
+          self.op_map.remove(&id);
           self.immediate.push(ImmediateCompletion { id, result });
         }
         _ => {}
@@ -837,6 +1003,8 @@ impl IoBackend for Poller {
     &mut self,
     timeout: Option<Duration>,
   ) -> io::Result<&[OpCompleted]> {
+    use crate::backend::op::Op;
+
     self.completed.clear();
 
     // First, drain any immediate completions
@@ -974,6 +1142,7 @@ impl IoBackend for Poller {
         };
 
         // Clean up: close the watch fd and remove from tracking
+        // SAFETY: watch_fd is a valid file descriptor from watch_fds
         unsafe { libc::close(watch_fd) };
         // On Linux (inotify), we registered with READ interest, use delete()
         // On BSD/macOS (EVFILT_VNODE), use delete_vnode()
@@ -997,18 +1166,109 @@ impl IoBackend for Poller {
         continue;
       }
 
-      // Check if this is a stream operation
-      let is_stream_op = self.stream_ops.contains_key(&operation_id);
+      // Handle signal events specially
+      #[cfg(unix)]
+      if event.interest.is_signal() {
+        // BSD/macOS: signal number is in event.key (ident from kqueue)
+        // We stored the signal number as the "fd" in fd_map
+        let sig = entry_fd;
 
-      // Remove op temporarily; put it back on EAGAIN
-      let op = match self.op_map.remove(&operation_id) {
-        Some(op) => op,
-        None => {
-          // Op already completed (e.g., by timeout)
+        // Clean up
+        #[cfg(any(
+          target_os = "macos",
+          target_os = "ios",
+          target_os = "freebsd",
+          target_os = "dragonfly",
+          target_os = "openbsd",
+          target_os = "netbsd"
+        ))]
+        {
+          let _ = self.sys().delete_signal(sig);
+        }
+        self.fd_map().remove(&operation_id);
+        self.completed.push(OpCompleted::new(operation_id, sig as isize));
+        continue;
+      }
+
+      // Handle signalfd reads on Linux (stored in watch_fds with is_inotify=false)
+      // This is now handled above in the watch_fds section when is_inotify is false
+      // and the fd is a signalfd - we need to read from it to get the signal number
+      #[cfg(target_os = "linux")]
+      if let Some(&(signal_fd, false)) = self.watch_fds.get(&operation_id) {
+        // This could be a signalfd - check by reading from it
+        if event.interest.is_readable() {
+          // Read signalfd_siginfo from the fd
+          #[repr(C)]
+          struct SignalfdSiginfo {
+            ssi_signo: u32,
+            // ... other fields we don't need
+            _padding: [u8; 124],
+          }
+
+          let mut siginfo: SignalfdSiginfo = unsafe { std::mem::zeroed() };
+          let n = unsafe {
+            libc::read(
+              signal_fd,
+              &mut siginfo as *mut _ as *mut libc::c_void,
+              std::mem::size_of::<SignalfdSiginfo>(),
+            )
+          };
+
+          let result = if n >= 4 {
+            siginfo.ssi_signo as isize
+          } else if n < 0 {
+            -(std::io::Error::last_os_error()
+              .raw_os_error()
+              .unwrap_or(libc::EIO) as isize)
+          } else {
+            -(libc::EIO as isize)
+          };
+
+          // Clean up
+          self.watch_fds.remove(&operation_id);
+          unsafe { libc::close(signal_fd) };
+          let _ = self.sys().delete(signal_fd);
+          self.fd_map().remove(&operation_id);
+          self.completed.push(OpCompleted::new(operation_id, result));
           continue;
         }
+      }
+
+      // Handle AcceptStream specially: drain all pending accepts (level-triggered)
+      // Use get() to avoid remove/insert overhead - op stays in map unless error
+      if let Some(op) = self.op_map.get(&operation_id) {
+        if matches!(op, Op::AcceptStream { .. }) {
+          loop {
+            let result = Poller::run_op(op);
+            if result < 0 {
+              let errno = (-result) as i32;
+              if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                break; // No more pending - op stays in map
+              }
+              // Real error - clean up stream
+              let _ = self.sys().delete(entry_fd);
+              self.fd_map().remove(&operation_id);
+              self.op_map.remove(&operation_id);
+              self
+                .completed
+                .push(OpCompleted::new(operation_id, result).with_more(false));
+              break;
+            }
+            self
+              .completed
+              .push(OpCompleted::new(operation_id, result).with_more(true));
+          }
+          continue;
+        }
+      }
+
+      // Remove op for processing - may be put back on EAGAIN
+      let op = match self.op_map.remove(&operation_id) {
+        Some(op) => op,
+        None => continue, // Op already completed (e.g., by timeout)
       };
-      let result = Poller::run_op_on_event(&op);
+
+      let result = Poller::run_op(&op);
 
       // Check for EAGAIN/EINPROGRESS (would block)
       if result < 0 {
@@ -1022,29 +1282,6 @@ impl IoBackend for Poller {
           self.sys().modify(entry_fd, operation_id, event.interest)?;
           continue;
         }
-      }
-
-      // For stream operations: keep registration, set more=true (unless error)
-      if is_stream_op {
-        let is_error = result < 0;
-        if is_error {
-          // Error on stream - clean up and set more=false
-          if event.interest.is_timer() {
-            self.sys().delete_timer(operation_id)?;
-          } else {
-            let _ = self.sys().delete(entry_fd);
-          }
-          self.fd_map().remove(&operation_id);
-          self.stream_ops.remove(&operation_id);
-          self.completed.push(OpCompleted::new(operation_id, result).with_more(false));
-        } else {
-          // Success on stream - keep registration, put op back, set more=true
-          self.op_map.insert(operation_id, op);
-          // Re-arm for next event
-          self.sys().modify(entry_fd, operation_id, event.interest)?;
-          self.completed.push(OpCompleted::new(operation_id, result).with_more(true));
-        }
-        continue;
       }
 
       // Operation completed (success or error other than would-block)
@@ -1077,49 +1314,11 @@ impl IoBackend for Poller {
     self.sys().disarm_wheel_timer()
   }
 
-  fn push_stream(&mut self, id: u64, op: crate::backend::op::Op) -> io::Result<()> {
-    use crate::backend::op::Op;
-    use std::os::fd::AsRawFd;
-
-    // Determine fd and interest for the stream operation
-    let (fd, interest) = match &op {
-      Op::Accept { fd, .. } => (fd.as_raw_fd(), Interest::READ),
-      // Other stream ops can be added here
-      _ => {
-        // Fall back to regular push for unsupported stream ops
-        return self.push(id, op);
-      }
-    };
-
-    // Store as a stream operation for auto-resubmission
-    self.stream_ops.insert(id, (op.clone(), fd, interest));
-
-    // Register with the poller
-    self.fd_map().insert(id, fd);
-    if let Err(e) = self.sys().add(fd, id, interest) {
-      self.fd_map().remove(&id);
-      self.stream_ops.remove(&id);
-      return Err(e);
-    }
-
-    // Store the op for execution on readiness
-    self.op_map.insert(id, self.stream_ops[&id].0.clone());
-
-    Ok(())
-  }
-
   fn cancel(&mut self, id: u64) -> io::Result<()> {
-    // Remove from stream operations tracking
-    if let Some((_, fd, _)) = self.stream_ops.remove(&id) {
-      // Deregister the fd from the poller
+    if let Some(fd) = self.fd_map().remove(&id) {
       let _ = self.sys().delete(fd);
-      self.fd_map().remove(&id);
-      self.op_map.remove(&id);
-    } else if let Some(fd) = self.fd_map().remove(&id) {
-      // Regular op - just deregister
-      let _ = self.sys().delete(fd);
-      self.op_map.remove(&id);
     }
+    self.op_map.remove(&id);
     Ok(())
   }
 }

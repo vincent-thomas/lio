@@ -112,8 +112,7 @@ impl TcpListener {
   /// current thread until the socket is created, bound, and listening.
   ///
   /// Note: This method performs DNS resolution synchronously (blocking) using
-  /// `ToSocketAddrs::to_socket_addrs()`. For async DNS resolution, use
-  /// [`bind_host`](Self::bind_host) instead.
+  /// `ToSocketAddrs::to_socket_addrs()`.
   ///
   /// # Examples
   ///
@@ -317,8 +316,7 @@ impl TcpSocket {
 
   /// Opens a TCP connection to a remote host by hostname synchronously.
   ///
-  /// This is the blocking version of [`connect_host`](Self::connect_host). Both DNS
-  /// resolution and connection are performed synchronously.
+  /// Both DNS resolution and connection are performed synchronously.
   ///
   /// # Examples
   ///
