@@ -4,7 +4,7 @@
 
 use lio::Lio;
 use lio::api::io::Receiver;
-use lio::process::Command;
+use lio::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Poll the lio event loop until the receiver has a result.
@@ -126,6 +126,8 @@ fn test_command_try_wait_running() {
   let mut recv = Command::new("/bin/sh")
     .arg("-c")
     .arg("sleep 60")
+    .stdout(lio::process::Stdio::Piped)
+    .stderr(lio::process::Stdio::Piped)
     .spawn()
     .with_lio(&lio)
     .send();
@@ -133,8 +135,24 @@ fn test_command_try_wait_running() {
 
   // Child should still be running
   let mut recv = child.try_wait().with_lio(&lio).send();
+
+  let stdout = child.stdout.take().unwrap();
+  let stderr = child.stderr.take().unwrap();
+
   let status = poll_recv(&lio, &mut recv).unwrap();
-  assert!(status.is_none());
+
+  {
+    if !(status.is_none()) {
+      let stderr_data = stderr.read_to_end().blocking(&lio).unwrap_or_default();
+      let stdout_data = stdout.read_to_end().blocking(&lio).unwrap_or_default();
+      panic!(
+        "status = None expected, got: {:?}, stderr: {:?}, stdout: {:?}",
+        status,
+        String::from_utf8_lossy(&stderr_data),
+        String::from_utf8_lossy(&stdout_data)
+      );
+    }
+  };
 
   // Kill it
   child.kill().unwrap();
@@ -316,4 +334,50 @@ fn test_child_dropped_without_wait() {
     // Child is dropped here without waiting
   }
   // If we get here without hanging, the Drop impl worked
+}
+
+#[test]
+fn test_stdout_read_to_end() {
+  let lio = Lio::new(64).unwrap();
+
+  let mut recv = Command::new("/bin/sh")
+    .arg("-c")
+    .arg("echo hello world")
+    .stdout(Stdio::Piped)
+    .spawn()
+    .with_lio(&lio)
+    .send();
+  let mut child = poll_recv(&lio, &mut recv).unwrap();
+
+  let stdout = child.stdout.take().expect("stdout should be piped");
+  let output = stdout.read_to_end().blocking(&lio).unwrap();
+
+  assert_eq!(output, b"hello world\n");
+
+  let mut recv = child.wait().with_lio(&lio).send();
+  let status = poll_recv(&lio, &mut recv).unwrap();
+  assert!(status.success());
+}
+
+#[test]
+fn test_stderr_read_to_end() {
+  let lio = Lio::new(64).unwrap();
+
+  let mut recv = Command::new("/bin/sh")
+    .arg("-c")
+    .arg("echo error >&2")
+    .stderr(Stdio::Piped)
+    .spawn()
+    .with_lio(&lio)
+    .send();
+  let mut child = poll_recv(&lio, &mut recv).unwrap();
+
+  let stderr = child.stderr.take().expect("stderr should be piped");
+  let output = stderr.read_to_end().blocking(&lio).unwrap();
+
+  assert_eq!(output, b"error\n");
+
+  let mut recv = child.wait().with_lio(&lio).send();
+  let status = poll_recv(&lio, &mut recv).unwrap();
+  assert!(status.success());
 }

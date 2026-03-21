@@ -50,11 +50,14 @@ mod macros;
 pub mod ffi;
 
 pub mod buf;
+#[cfg(feature = "high")]
 pub mod fs;
 pub mod io;
+#[cfg(feature = "high")]
 pub mod net;
+#[cfg(feature = "high")]
 pub mod process;
-pub mod time;
+mod time;
 
 pub use buf::{BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec};
 

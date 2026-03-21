@@ -19,6 +19,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = []
 nightly = []
 unstable_ffi = ["dep:cbindgen"]
+high = []
 
 [dependencies]
 

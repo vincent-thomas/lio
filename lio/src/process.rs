@@ -84,6 +84,84 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 // Re-export WaitStatus for convenience
 pub use crate::api::ops::WaitStatus;
 
+/// Operation for reading all data from a pipe until EOF.
+///
+/// This type is returned by [`ChildStdout::read_to_end`] and [`ChildStderr::read_to_end`].
+/// It supports both async (via `.await`) and blocking (via `.blocking()`) usage.
+pub struct ReadToEnd {
+  resource: Resource,
+  accumulated: Vec<u8>,
+  buffer: Vec<u8>,
+}
+
+impl ReadToEnd {
+  /// Blocks the current thread and reads all data until EOF.
+  ///
+  /// This method polls the event loop until all data has been read.
+  pub fn blocking(mut self, lio: &crate::Lio) -> std::io::Result<Vec<u8>> {
+    use crate::api::io::Receiver;
+    use std::time::{Duration, Instant};
+
+    let timeout = Duration::from_secs(60);
+    let start = Instant::now();
+
+    loop {
+      let mut recv: Receiver<(std::io::Result<i32>, Vec<u8>)> =
+        api::read(&self.resource, self.buffer).with_lio(lio).send();
+
+      // Poll until we get a result
+      let (n_result, buf) = loop {
+        if let Some(res) = recv.try_recv() {
+          break res;
+        }
+        if start.elapsed() > timeout {
+          return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "read_to_end timed out",
+          ));
+        }
+        lio.run_timeout(Duration::from_millis(10))?;
+      };
+
+      let n = n_result? as usize;
+      self.buffer = buf;
+
+      if n == 0 {
+        break;
+      }
+
+      self.accumulated.extend_from_slice(&self.buffer[..n]);
+    }
+
+    Ok(self.accumulated)
+  }
+
+  async fn read_async(mut self) -> std::io::Result<Vec<u8>> {
+    loop {
+      let (result, buf) = api::read(&self.resource, self.buffer).await;
+      let n = result? as usize;
+      self.buffer = buf;
+
+      if n == 0 {
+        break;
+      }
+
+      self.accumulated.extend_from_slice(&self.buffer[..n]);
+    }
+
+    Ok(self.accumulated)
+  }
+}
+
+impl std::future::IntoFuture for ReadToEnd {
+  type Output = std::io::Result<Vec<u8>>;
+  type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+
+  fn into_future(self) -> Self::IntoFuture {
+    Box::pin(self.read_async())
+  }
+}
+
 /// The exit status of a finished process.
 ///
 /// This type wraps the underlying `WaitStatus` to provide a more convenient API
@@ -187,6 +265,64 @@ impl ChildStdout {
   pub fn read(&self, buf: Vec<u8>) -> Io<crate::api::ops::Recv<Vec<u8>>> {
     crate::api::recv(&self.inner, buf, None)
   }
+
+  /// Reads all data from stdout until EOF.
+  ///
+  /// Returns a [`ReadToEnd`] operation that can be used in both async and blocking contexts.
+  ///
+  /// # Examples
+  ///
+  /// Blocking usage:
+  /// ```no_run
+  /// use lio::{Lio, process::{Command, Stdio}};
+  ///
+  /// let lio = Lio::new(64).unwrap();
+  /// # /*
+  /// let mut child = Command::new("/bin/sh")
+  ///     .arg("-c")
+  ///     .arg("echo hello")
+  ///     .stdout(Stdio::Piped)
+  ///     .spawn()
+  ///     .with_lio(&lio)
+  ///     .send()
+  ///     .recv()
+  ///     .unwrap();
+  ///
+  /// if let Some(stdout) = child.stdout.take() {
+  ///     let output = stdout.read_to_end().blocking(&lio).unwrap();
+  ///     println!("Output: {}", String::from_utf8_lossy(&output));
+  /// }
+  /// # */
+  /// ```
+  ///
+  /// Async usage:
+  /// ```no_run
+  /// use lio::process::{Command, Stdio};
+  ///
+  /// async fn example() {
+  /// # /*
+  ///     let mut child = Command::new("/bin/sh")
+  ///         .arg("-c")
+  ///         .arg("echo hello")
+  ///         .stdout(Stdio::Piped)
+  ///         .spawn()
+  ///         .await
+  ///         .unwrap();
+  ///
+  ///     if let Some(stdout) = child.stdout.take() {
+  ///         let output = stdout.read_to_end().await.unwrap();
+  ///         println!("Output: {}", String::from_utf8_lossy(&output));
+  ///     }
+  /// # */
+  /// }
+  /// ```
+  pub fn read_to_end(&self) -> ReadToEnd {
+    ReadToEnd {
+      resource: self.inner.clone(),
+      accumulated: Vec::new(),
+      buffer: vec![0u8; 8192],
+    }
+  }
 }
 
 impl AsRawFd for ChildStdout {
@@ -207,6 +343,64 @@ impl ChildStderr {
   /// Reads data from the child's stderr.
   pub fn read(&self, buf: Vec<u8>) -> Io<crate::api::ops::Recv<Vec<u8>>> {
     crate::api::recv(&self.inner, buf, None)
+  }
+
+  /// Reads all data from stderr until EOF.
+  ///
+  /// Returns a [`ReadToEnd`] operation that can be used in both async and blocking contexts.
+  ///
+  /// # Examples
+  ///
+  /// Blocking usage:
+  /// ```no_run
+  /// use lio::{Lio, process::{Command, Stdio}};
+  ///
+  /// let lio = Lio::new(64).unwrap();
+  /// # /*
+  /// let mut child = Command::new("/bin/sh")
+  ///     .arg("-c")
+  ///     .arg("echo error >&2")
+  ///     .stderr(Stdio::Piped)
+  ///     .spawn()
+  ///     .with_lio(&lio)
+  ///     .send()
+  ///     .recv()
+  ///     .unwrap();
+  ///
+  /// if let Some(stderr) = child.stderr.take() {
+  ///     let output = stderr.read_to_end().blocking(&lio).unwrap();
+  ///     println!("Error: {}", String::from_utf8_lossy(&output));
+  /// }
+  /// # */
+  /// ```
+  ///
+  /// Async usage:
+  /// ```no_run
+  /// use lio::process::{Command, Stdio};
+  ///
+  /// async fn example() {
+  /// # /*
+  ///     let mut child = Command::new("/bin/sh")
+  ///         .arg("-c")
+  ///         .arg("echo error >&2")
+  ///         .stderr(Stdio::Piped)
+  ///         .spawn()
+  ///         .await
+  ///         .unwrap();
+  ///
+  ///     if let Some(stderr) = child.stderr.take() {
+  ///         let output = stderr.read_to_end().await.unwrap();
+  ///         println!("Error: {}", String::from_utf8_lossy(&output));
+  ///     }
+  /// # */
+  /// }
+  /// ```
+  pub fn read_to_end(&self) -> ReadToEnd {
+    ReadToEnd {
+      resource: self.inner.clone(),
+      accumulated: Vec::new(),
+      buffer: vec![0u8; 8192],
+    }
   }
 }
 
