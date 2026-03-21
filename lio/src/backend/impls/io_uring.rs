@@ -187,6 +187,11 @@ struct ImmediateCompletion {
 /// post-processing to read from the inotify fd.
 const WATCH_POLL_FLAG: u64 = 1 << 62;
 
+/// Flag bit used to mark signal poll completions.
+/// When set, the completion is for a signal operation's poll and needs
+/// post-processing to read from the signalfd.
+const SIGNAL_POLL_FLAG: u64 = 1 << 61;
+
 #[derive(Default)]
 pub struct IoUring {
   ring: Option<LioUring>,
@@ -201,6 +206,9 @@ pub struct IoUring {
   /// Watch operation tracking: op_id -> inotify_fd
   /// Stores the inotify fd created for watch operations so we can read from it on completion.
   watch_fds: std::collections::HashMap<u64, i32>,
+  /// Signal operation tracking: op_id -> signalfd
+  /// Stores the signalfd created for signal operations so we can read from it on completion.
+  signal_fds: std::collections::HashMap<u64, i32>,
 }
 
 impl IoUring {
@@ -310,6 +318,48 @@ impl IoUring {
       return;
     }
 
+    // Check if this is a signal poll completion
+    if (user_data & SIGNAL_POLL_FLAG) != 0 {
+      let real_id = user_data & !SIGNAL_POLL_FLAG;
+
+      // Get the signalfd and read the signal info
+      if let Some(signal_fd) = self.signal_fds.remove(&real_id) {
+        let final_result = if result < 0 {
+          // Poll failed
+          result
+        } else {
+          // Poll succeeded, read from signalfd to get the signal number
+          let mut info = std::mem::MaybeUninit::<libc::signalfd_siginfo>::uninit();
+          // SAFETY: signal_fd is valid, info is a valid buffer of correct size
+          let n = unsafe {
+            libc::read(
+              signal_fd,
+              info.as_mut_ptr() as *mut _,
+              std::mem::size_of::<libc::signalfd_siginfo>(),
+            )
+          };
+
+          if n == std::mem::size_of::<libc::signalfd_siginfo>() as isize {
+            // SAFETY: we read the full struct
+            let info = unsafe { info.assume_init() };
+            info.ssi_signo as isize
+          } else if n < 0 {
+            -(std::io::Error::last_os_error()
+              .raw_os_error()
+              .unwrap_or(libc::EIO) as isize)
+          } else {
+            -(libc::EIO as isize)
+          }
+        };
+
+        // SAFETY: signal_fd is a valid fd that we own
+        unsafe { libc::close(signal_fd) };
+
+        self.completed.push(OpCompleted::new(real_id, final_result));
+      }
+      return;
+    }
+
     // Check if this is a watch poll completion
     if (user_data & WATCH_POLL_FLAG) != 0 {
       let real_id = user_data & !WATCH_POLL_FLAG;
@@ -365,6 +415,7 @@ impl IoBackend for IoUring {
     self.completed = Vec::with_capacity(cap.min(256));
     self.immediate = Vec::with_capacity(64);
     self.watch_fds = std::collections::HashMap::with_capacity(16);
+    self.signal_fds = std::collections::HashMap::with_capacity(16);
     Ok(())
   }
 
@@ -447,13 +498,13 @@ impl IoBackend for IoUring {
       // Submit poll operation to wait for signalfd to become readable
       let poll_entry = PollAdd::new(sfd as i32, libc::POLLIN as u32).build();
 
-      // Store signalfd for cleanup - reuse watch_fds map
-      self.watch_fds.insert(id, sfd as i32);
+      // Store signalfd for cleanup
+      self.signal_fds.insert(id, sfd as i32);
 
       // SAFETY: pushing to io_uring submission queue
-      unsafe { self.ring().push(poll_entry, id | WATCH_POLL_FLAG) }.map_err(
+      unsafe { self.ring().push(poll_entry, id | SIGNAL_POLL_FLAG) }.map_err(
         |_| {
-          self.watch_fds.remove(&id);
+          self.signal_fds.remove(&id);
           // SAFETY: closing valid fd
           unsafe { libc::close(sfd as i32) };
           io::Error::new(io::ErrorKind::WouldBlock, "submission queue full")
@@ -638,6 +689,18 @@ impl IoBackend for IoUring {
   }
 
   fn cancel(&mut self, id: u64) -> io::Result<()> {
+    // Clean up any signal fd associated with this operation
+    if let Some(signal_fd) = self.signal_fds.remove(&id) {
+      // SAFETY: signal_fd is a valid fd that we own
+      unsafe { libc::close(signal_fd) };
+    }
+
+    // Clean up any watch fd associated with this operation
+    if let Some(watch_fd) = self.watch_fds.remove(&id) {
+      // SAFETY: watch_fd is a valid fd that we own
+      unsafe { libc::close(watch_fd) };
+    }
+
     // Use AsyncCancel to cancel the operation with the given user_data
     let entry = AsyncCancel::new(id).build();
 

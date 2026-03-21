@@ -630,12 +630,18 @@ impl Poller {
         ))]
         {
           let _ = self.sys().delete_signal(sig);
+          // On kqueue, sig is the actual signal number
+          self.completed.push(OpCompleted::new(id, sig as isize));
         }
         #[cfg(target_os = "linux")]
         {
+          // On Linux, sig is the signalfd - read to get actual signal number
+          let signal_num = read_signalfd(sig);
           let _ = self.sys().delete(sig);
+          // SAFETY: sig is a valid signalfd we created
+          unsafe { libc::close(sig) };
+          self.completed.push(OpCompleted::new(id, signal_num));
         }
-        self.completed.push(OpCompleted::new(id, sig as isize));
       }
 
       // Stream: drain loop until EAGAIN
@@ -957,6 +963,30 @@ fn read_inotify(_fd: RawFd) -> isize {
   0
 }
 
+/// Read from a signalfd to get the signal number.
+#[cfg(target_os = "linux")]
+fn read_signalfd(fd: RawFd) -> isize {
+  let mut info = std::mem::MaybeUninit::<libc::signalfd_siginfo>::uninit();
+  // SAFETY: fd is a valid signalfd, info is a valid buffer of correct size
+  let n = unsafe {
+    libc::read(
+      fd,
+      info.as_mut_ptr() as *mut _,
+      std::mem::size_of::<libc::signalfd_siginfo>(),
+    )
+  };
+  if n == std::mem::size_of::<libc::signalfd_siginfo>() as isize {
+    // SAFETY: we read the full struct
+    let info = unsafe { info.assume_init() };
+    info.ssi_signo as isize
+  } else if n < 0 {
+    -(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) as isize)
+  } else {
+    // Unexpected: return EAGAIN as error to indicate something went wrong
+    -(libc::EAGAIN as isize)
+  }
+}
+
 #[cfg(any(
   target_os = "macos",
   target_os = "ios",
@@ -1170,6 +1200,8 @@ impl IoBackend for Poller {
           #[cfg(target_os = "linux")]
           {
             let _ = self.sys().delete(sig);
+            // SAFETY: sig is a valid signalfd we created
+            unsafe { libc::close(sig) };
           }
         }
       }

@@ -110,8 +110,11 @@ fn test_command_spawn_and_wait() {
 fn test_command_try_wait_running() {
   let lio = Lio::new(64).unwrap();
 
-  let mut recv =
-    Command::new("/bin/sleep").arg("10").spawn().with_lio(&lio).send();
+  let mut recv = Command::new("/bin/sh")
+    .args(["-c", "exec sleep 10"])
+    .spawn()
+    .with_lio(&lio)
+    .send();
   let mut child = poll_recv(&lio, &mut recv).unwrap();
 
   // Child should still be running
@@ -133,8 +136,11 @@ fn test_command_try_wait_running() {
 fn test_command_kill() {
   let lio = Lio::new(64).unwrap();
 
-  let mut recv =
-    Command::new("/bin/sleep").arg("100").spawn().with_lio(&lio).send();
+  let mut recv = Command::new("/bin/sh")
+    .args(["-c", "exec sleep 100"])
+    .spawn()
+    .with_lio(&lio)
+    .send();
   let mut child = poll_recv(&lio, &mut recv).unwrap();
 
   child.kill().unwrap();
@@ -149,8 +155,11 @@ fn test_command_kill() {
 fn test_command_signal() {
   let lio = Lio::new(64).unwrap();
 
-  let mut recv =
-    Command::new("/bin/sleep").arg("100").spawn().with_lio(&lio).send();
+  let mut recv = Command::new("/bin/sh")
+    .args(["-c", "exec sleep 100"])
+    .spawn()
+    .with_lio(&lio)
+    .send();
   let mut child = poll_recv(&lio, &mut recv).unwrap();
 
   child.signal(libc::SIGTERM).unwrap();
@@ -254,8 +263,11 @@ fn test_exit_status_methods() {
   assert_eq!(status.signal(), None);
 
   // Test signaled process
-  let mut recv =
-    Command::new("/bin/sleep").arg("100").spawn().with_lio(&lio).send();
+  let mut recv = Command::new("/bin/sh")
+    .args(["-c", "exec sleep 100"])
+    .spawn()
+    .with_lio(&lio)
+    .send();
   let mut child = poll_recv(&lio, &mut recv).unwrap();
   child.kill().unwrap();
 
@@ -275,8 +287,11 @@ fn test_child_dropped_without_wait() {
 
   // This test ensures that dropping a Child without waiting doesn't leave zombies
   {
-    let mut recv =
-      Command::new("/bin/sleep").arg("100").spawn().with_lio(&lio).send();
+    let mut recv = Command::new("/bin/sh")
+      .args(["-c", "exec sleep 100"])
+      .spawn()
+      .with_lio(&lio)
+      .send();
     let _child = poll_recv(&lio, &mut recv).unwrap();
     // Child is dropped here without waiting
   }
