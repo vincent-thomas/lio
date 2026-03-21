@@ -4,7 +4,7 @@
 
 use lio::Lio;
 use lio::api::io::Receiver;
-use lio::process::Command;
+use lio::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Poll the lio event loop until the receiver has a result.
@@ -110,8 +110,9 @@ fn test_command_spawn_and_wait() {
 fn test_command_try_wait_running() {
   let lio = Lio::new(64).unwrap();
 
-  let mut recv = Command::new("/bin/sh")
-    .args(["-c", "tail -f /dev/null"])
+  // Use cat with piped stdin - it blocks waiting for input
+  let mut recv = Command::new("/bin/cat")
+    .stdin(Stdio::Piped)
     .spawn()
     .with_lio(&lio)
     .send();
@@ -136,8 +137,9 @@ fn test_command_try_wait_running() {
 fn test_command_kill() {
   let lio = Lio::new(64).unwrap();
 
-  let mut recv = Command::new("/bin/sh")
-    .args(["-c", "tail -f /dev/null"])
+  // Use cat with piped stdin - it blocks waiting for input
+  let mut recv = Command::new("/bin/cat")
+    .stdin(Stdio::Piped)
     .spawn()
     .with_lio(&lio)
     .send();
@@ -155,8 +157,9 @@ fn test_command_kill() {
 fn test_command_signal() {
   let lio = Lio::new(64).unwrap();
 
-  let mut recv = Command::new("/bin/sh")
-    .args(["-c", "tail -f /dev/null"])
+  // Use cat with piped stdin - it blocks waiting for input
+  let mut recv = Command::new("/bin/cat")
+    .stdin(Stdio::Piped)
     .spawn()
     .with_lio(&lio)
     .send();
@@ -262,9 +265,9 @@ fn test_exit_status_methods() {
   assert_eq!(status.code(), Some(5));
   assert_eq!(status.signal(), None);
 
-  // Test signaled process
-  let mut recv = Command::new("/bin/sh")
-    .args(["-c", "tail -f /dev/null"])
+  // Test signaled process - use cat with piped stdin
+  let mut recv = Command::new("/bin/cat")
+    .stdin(Stdio::Piped)
     .spawn()
     .with_lio(&lio)
     .send();
@@ -287,8 +290,8 @@ fn test_child_dropped_without_wait() {
 
   // This test ensures that dropping a Child without waiting doesn't leave zombies
   {
-    let mut recv = Command::new("/bin/sh")
-      .args(["-c", "tail -f /dev/null"])
+    let mut recv = Command::new("/bin/cat")
+      .stdin(Stdio::Piped)
       .spawn()
       .with_lio(&lio)
       .send();
