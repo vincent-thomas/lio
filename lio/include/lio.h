@@ -651,7 +651,7 @@ void lio_copy_file_range(struct lio_handle_t *lio,
  *
  * - `path`: Path to watch (null-terminated)
  * - `mask`: Events to watch for (WATCH_MODIFY=1, WATCH_ATTRIB=2, WATCH_DELETE=4,
- *           WATCH_RENAME=8, WATCH_EXTEND=16)
+ *   WATCH_RENAME=8, WATCH_EXTEND=16)
  * - `callback(result)`: events that occurred (positive mask) or negative errno
  *
  * # Safety

@@ -151,7 +151,6 @@ impl<T> Slab<T> {
       None
     }
   }
-
 }
 
 impl<T> Drop for Slab<T> {

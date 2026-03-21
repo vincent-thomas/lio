@@ -159,6 +159,23 @@
               pkg-config
             ];
           };
+          lint = pkgs.writeShellApplication {
+            name = "lio-lint";
+            text = builtins.readFile ./scripts/lint.sh;
+            runtimeInputs = with pkgs; [
+              (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+              cargo-deny
+            ];
+          };
+          lint-full = pkgs.writeShellApplication {
+            name = "lio-lint-full";
+            text = builtins.readFile ./scripts/lint-full.sh;
+            runtimeInputs = with pkgs; [
+              (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+              cargo-deny
+              cargo-hack
+            ];
+          };
         }
         // testPackages;
       }

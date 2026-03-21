@@ -391,10 +391,10 @@ impl TimeManager {
       let id = self.pending_fire[self.pending_index];
       self.pending_index += 1;
 
-      if let Some(entry) = self.timers.get(&id) {
-        if entry.state == TimerState::Fired {
-          return Some(id);
-        }
+      if let Some(entry) = self.timers.get(&id)
+        && entry.state == TimerState::Fired
+      {
+        return Some(id);
       }
     }
 

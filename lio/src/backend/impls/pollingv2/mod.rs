@@ -754,7 +754,7 @@ impl Poller {
           id,
           Entry::Timeout {
             fd,
-            timer_result: -(libc::ECANCELED as i32),
+            timer_result: -libc::ECANCELED,
             op: inner.clone(),
           },
         );
@@ -771,7 +771,7 @@ impl Poller {
           id,
           Entry::Timeout {
             fd,
-            timer_result: -(libc::ECANCELED as i32),
+            timer_result: -libc::ECANCELED,
             op: inner.clone(),
           },
         );
