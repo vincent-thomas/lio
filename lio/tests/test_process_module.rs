@@ -27,7 +27,11 @@ fn poll_recv<T>(lio: &Lio, recv: &mut Receiver<T>) -> T {
 fn test_command_spawn_true() {
   let lio = Lio::new(64).unwrap();
 
-  let mut recv = Command::new("/usr/bin/true").spawn().with_lio(&lio).send();
+  let mut recv = Command::new("/bin/sh")
+    .args(["-c", "exit 0"])
+    .spawn()
+    .with_lio(&lio)
+    .send();
   let mut child = poll_recv(&lio, &mut recv).unwrap();
 
   let mut recv = child.wait().with_lio(&lio).send();
@@ -42,7 +46,11 @@ fn test_command_spawn_true() {
 fn test_command_spawn_false() {
   let lio = Lio::new(64).unwrap();
 
-  let mut recv = Command::new("/usr/bin/false").spawn().with_lio(&lio).send();
+  let mut recv = Command::new("/bin/sh")
+    .args(["-c", "exit 1"])
+    .spawn()
+    .with_lio(&lio)
+    .send();
   let mut child = poll_recv(&lio, &mut recv).unwrap();
 
   let mut recv = child.wait().with_lio(&lio).send();
@@ -95,7 +103,11 @@ fn test_command_with_env() {
 fn test_command_spawn_and_wait() {
   let lio = Lio::new(64).unwrap();
 
-  let mut recv = Command::new("/usr/bin/true").spawn().with_lio(&lio).send();
+  let mut recv = Command::new("/bin/sh")
+    .args(["-c", "exit 0"])
+    .spawn()
+    .with_lio(&lio)
+    .send();
   let mut child = poll_recv(&lio, &mut recv).unwrap();
 
   assert!(child.id() > 0);

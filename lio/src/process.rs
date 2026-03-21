@@ -72,6 +72,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+use crate::api;
 use crate::api::resource::Resource;
 use crate::api::{
   io::Io, op::TypedOp, ops::WaitOptions, ops::WaitTarget, ops::Waitid,
