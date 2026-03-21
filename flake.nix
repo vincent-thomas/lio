@@ -149,6 +149,7 @@
                   ''
                     export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include
                     export LIBCLANG_PATH=${pkgs.llvmPackages.libclang.lib}/lib
+                    export BINDGEN_EXTRA_CLANG_ARGS="-I${pkgs.llvmPackages.clang}/resource-root/include -I${pkgs.glibc.dev}/include"
                   ''
                 else
                   ""
@@ -162,6 +163,8 @@
               ]
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                 pkgs.llvmPackages.libclang.lib
+                pkgs.llvmPackages.clang
+                pkgs.glibc.dev
               ];
           };
           test-ffi = pkgs.writeShellApplication {
@@ -172,6 +175,7 @@
                   ''
                     export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include
                     export LIBCLANG_PATH=${pkgs.llvmPackages.libclang.lib}/lib
+                    export BINDGEN_EXTRA_CLANG_ARGS="-I${pkgs.llvmPackages.clang}/resource-root/include -I${pkgs.glibc.dev}/include"
                   ''
                 else
                   ""
@@ -187,6 +191,8 @@
               ]
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                 pkgs.llvmPackages.libclang.lib
+                pkgs.llvmPackages.clang
+                pkgs.glibc.dev
               ]
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
                 pkgs.libiconv
@@ -200,6 +206,7 @@
                   ''
                     export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include
                     export LIBCLANG_PATH=${pkgs.llvmPackages.libclang.lib}/lib
+                    export BINDGEN_EXTRA_CLANG_ARGS="-I${pkgs.llvmPackages.clang}/resource-root/include -I${pkgs.glibc.dev}/include"
                   ''
                 else
                   ""
@@ -212,6 +219,8 @@
               ]
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                 pkgs.llvmPackages.libclang.lib
+                pkgs.llvmPackages.clang
+                pkgs.glibc.dev
               ];
           };
           lint = pkgs.writeShellApplication {
