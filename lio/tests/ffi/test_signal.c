@@ -24,12 +24,9 @@ typedef struct {
 static void* signal_sender(void *arg) {
     signal_sender_args *args = (signal_sender_args*)arg;
     usleep(args->delay_ms * 1000);
-#ifdef __APPLE__
-    /* On macOS, kqueue EVFILT_SIGNAL monitors process-wide signals */
+    /* Both kqueue (macOS) and signalfd (Linux) monitor process-wide signals */
     kill(getpid(), args->signal);
-#else
-    pthread_kill(args->target, args->signal);
-#endif
+    (void)args->target; /* unused but kept for API compatibility */
     return NULL;
 }
 
