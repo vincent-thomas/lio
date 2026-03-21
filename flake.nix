@@ -143,20 +143,31 @@
           default = import ./default.nix { inherit pkgs; };
           test = pkgs.writeShellApplication {
             name = "lio-test";
-            text = builtins.readFile ./scripts/test.sh;
+            text =
+              (
+                if pkgs.stdenv.hostPlatform.isLinux then
+                  "export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include\n"
+                else
+                  ""
+              )
+              + builtins.readFile ./scripts/test.sh;
             runtimeInputs =
               with pkgs;
               [
                 (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
                 jq
-              ]
-              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-                pkgs.linuxHeaders
               ];
           };
           test-ffi = pkgs.writeShellApplication {
             name = "lio-test-ffi";
-            text = builtins.readFile ./scripts/test-ffi.sh;
+            text =
+              (
+                if pkgs.stdenv.hostPlatform.isLinux then
+                  "export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include\n"
+                else
+                  ""
+              )
+              + builtins.readFile ./scripts/test-ffi.sh;
             runtimeInputs =
               with pkgs;
               [
@@ -165,24 +176,23 @@
                 gcc
                 pkg-config
               ]
-              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-                pkgs.linuxHeaders
-              ]
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
                 pkgs.libiconv
               ];
           };
           test-uring = pkgs.writeShellApplication {
             name = "lio-test-uring";
-            text = builtins.readFile ./scripts/test-lio-uring.sh;
-            runtimeInputs =
-              with pkgs;
-              [
-                (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-              ]
-              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-                pkgs.linuxHeaders
-              ];
+            text =
+              (
+                if pkgs.stdenv.hostPlatform.isLinux then
+                  "export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include\n"
+                else
+                  ""
+              )
+              + builtins.readFile ./scripts/test-lio-uring.sh;
+            runtimeInputs = with pkgs; [
+              (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+            ];
           };
           lint = pkgs.writeShellApplication {
             name = "lio-lint";
