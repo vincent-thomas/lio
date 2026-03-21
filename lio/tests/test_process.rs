@@ -51,28 +51,41 @@ fn test_waitid_child_exit() {
 fn test_waitid_nohang_no_child() {
   let lio = Lio::new(64).unwrap();
 
-  // Create pipe for synchronization
-  let mut pipefd: [libc::c_int; 2] = [0; 2];
-  unsafe { libc::pipe(pipefd.as_mut_ptr()) };
+  // Create two pipes:
+  // - ready_pipe: child signals it's ready
+  // - block_pipe: child blocks reading from this
+  let mut ready_pipe: [libc::c_int; 2] = [0; 2];
+  let mut block_pipe: [libc::c_int; 2] = [0; 2];
+  unsafe { libc::pipe(ready_pipe.as_mut_ptr()) };
+  unsafe { libc::pipe(block_pipe.as_mut_ptr()) };
 
   let pid = unsafe { libc::fork() };
 
   match pid {
     -1 => panic!("fork failed"),
     0 => {
-      // Child: close read end, signal ready, then pause
-      unsafe { libc::close(pipefd[0]) };
-      unsafe { libc::write(pipefd[1], b"x".as_ptr() as *const _, 1) };
-      unsafe { libc::close(pipefd[1]) };
-      unsafe { libc::pause() };
+      // Child: signal ready, then block on reading from block_pipe
+      unsafe { libc::close(ready_pipe[0]) };
+      unsafe { libc::close(block_pipe[1]) };
+
+      // Signal we're ready
+      unsafe { libc::write(ready_pipe[1], b"x".as_ptr() as *const _, 1) };
+      unsafe { libc::close(ready_pipe[1]) };
+
+      // Block waiting for data that will never come
+      let mut buf = [0u8; 1];
+      unsafe { libc::read(block_pipe[0], buf.as_mut_ptr() as *mut _, 1) };
       std::process::exit(0);
     }
     child_pid => {
-      // Parent: close write end, wait for child to be ready
-      unsafe { libc::close(pipefd[1]) };
+      // Parent: close unused ends
+      unsafe { libc::close(ready_pipe[1]) };
+      unsafe { libc::close(block_pipe[0]) };
+
+      // Wait for child to signal ready
       let mut buf = [0u8; 1];
-      unsafe { libc::read(pipefd[0], buf.as_mut_ptr() as *mut _, 1) };
-      unsafe { libc::close(pipefd[0]) };
+      unsafe { libc::read(ready_pipe[0], buf.as_mut_ptr() as *mut _, 1) };
+      unsafe { libc::close(ready_pipe[0]) };
 
       // Try to wait with NOHANG - should return None since child is still running
       let mut result = api::waitid(
@@ -86,7 +99,8 @@ fn test_waitid_nohang_no_child() {
       // Should be None because child hasn't exited yet
       assert!(status.is_none());
 
-      // Clean up - kill the child and reap it
+      // Clean up - close the block pipe (unblocks child) and kill
+      unsafe { libc::close(block_pipe[1]) };
       unsafe { libc::kill(child_pid, libc::SIGKILL) };
       let mut wstatus: libc::c_int = 0;
       unsafe { libc::waitpid(child_pid, &mut wstatus, 0) };
@@ -121,6 +135,10 @@ fn test_waitid_exit_zero() {
 fn test_waitid_signal_death() {
   let lio = Lio::new(64).unwrap();
 
+  // Create a pipe for the child to block on
+  let mut pipefd: [libc::c_int; 2] = [0; 2];
+  unsafe { libc::pipe(pipefd.as_mut_ptr()) };
+
   // Use a raw fork to have full control over the child process.
   // This avoids Rust's Child type which may reap the process.
   let pid = unsafe { libc::fork() };
@@ -128,12 +146,16 @@ fn test_waitid_signal_death() {
   match pid {
     -1 => panic!("fork failed"),
     0 => {
-      // Child: sleep forever
-      unsafe { libc::pause() };
+      // Child: block on reading from pipe
+      unsafe { libc::close(pipefd[1]) };
+      let mut buf = [0u8; 1];
+      unsafe { libc::read(pipefd[0], buf.as_mut_ptr() as *mut _, 1) };
       std::process::exit(0);
     }
     child_pid => {
-      // Parent: kill the child with SIGKILL
+      // Parent: close read end, kill the child with SIGKILL
+      unsafe { libc::close(pipefd[0]) };
+      unsafe { libc::close(pipefd[1]) };
       unsafe { libc::kill(child_pid, libc::SIGKILL) };
 
       // Wait for the child using our API
