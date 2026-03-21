@@ -17,10 +17,22 @@ pkgs.rustPlatform.buildRustPackage {
     (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
     gnumake
     cargo-nextest
+    clang
+    llvmPackages.libclang
+    llvmPackages.clang
+  ] ++ lib.optionals stdenv.isLinux [
+    linuxHeaders
+    glibc.dev
   ];
+
+  LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
   buildPhase = ''
     runHook preBuild
+    ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+      export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include
+      export BINDGEN_EXTRA_CLANG_ARGS="-I${pkgs.llvmPackages.clang}/resource-root/include -I${pkgs.glibc.dev}/include"
+    ''}
     make cbuild
     runHook postBuild
   '';
