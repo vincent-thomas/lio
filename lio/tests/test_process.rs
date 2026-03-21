@@ -142,8 +142,13 @@ fn test_waitid_signal_death() {
 fn test_spawn_true() {
   let lio = Lio::new(64).unwrap();
 
-  let path = CString::new("/usr/bin/true").unwrap();
-  let argv = vec![CString::new("true").unwrap()];
+  // Use /bin/sh -c "exit 0" for portability (works in nix sandbox)
+  let path = CString::new("/bin/sh").unwrap();
+  let argv = vec![
+    CString::new("sh").unwrap(),
+    CString::new("-c").unwrap(),
+    CString::new("exit 0").unwrap(),
+  ];
 
   // Spawn the process
   let mut result = api::spawn(path, argv, None).with_lio(&lio).send();
@@ -167,8 +172,13 @@ fn test_spawn_true() {
 fn test_spawn_false() {
   let lio = Lio::new(64).unwrap();
 
-  let path = CString::new("/usr/bin/false").unwrap();
-  let argv = vec![CString::new("false").unwrap()];
+  // Use /bin/sh -c "exit 1" for portability (works in nix sandbox)
+  let path = CString::new("/bin/sh").unwrap();
+  let argv = vec![
+    CString::new("sh").unwrap(),
+    CString::new("-c").unwrap(),
+    CString::new("exit 1").unwrap(),
+  ];
 
   // Spawn the process
   let mut result = api::spawn(path, argv, None).with_lio(&lio).send();
