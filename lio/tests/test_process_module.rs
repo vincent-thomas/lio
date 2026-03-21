@@ -125,7 +125,7 @@ fn test_command_try_wait_running() {
   // Use an infinite loop - it will run forever until killed
   let mut recv = Command::new("/bin/sh")
     .arg("-c")
-    .arg("while :; do :; done")
+    .arg("sleep 60")
     .spawn()
     .with_lio(&lio)
     .send();
