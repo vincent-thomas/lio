@@ -4,7 +4,7 @@
 
 use lio::Lio;
 use lio::api::io::Receiver;
-use lio::process::{Command, Stdio};
+use lio::process::Command;
 use std::time::{Duration, Instant};
 
 /// Poll the lio event loop until the receiver has a result.
@@ -110,9 +110,10 @@ fn test_command_spawn_and_wait() {
 fn test_command_try_wait_running() {
   let lio = Lio::new(64).unwrap();
 
-  // Use cat with piped stdin - it blocks waiting for input
+  // Use an infinite loop - it will run forever until killed
   let mut recv = Command::new("/bin/sh")
-    .stdin(Stdio::Piped)
+    .arg("-c")
+    .arg("while :; do :; done")
     .spawn()
     .with_lio(&lio)
     .send();
@@ -137,9 +138,10 @@ fn test_command_try_wait_running() {
 fn test_command_kill() {
   let lio = Lio::new(64).unwrap();
 
-  // Use cat with piped stdin - it blocks waiting for input
+  // Use an infinite loop - it will run forever until killed
   let mut recv = Command::new("/bin/sh")
-    .stdin(Stdio::Piped)
+    .arg("-c")
+    .arg("while :; do :; done")
     .spawn()
     .with_lio(&lio)
     .send();
@@ -157,9 +159,10 @@ fn test_command_kill() {
 fn test_command_signal() {
   let lio = Lio::new(64).unwrap();
 
-  // Use cat with piped stdin - it blocks waiting for input
+  // Use an infinite loop - it will run forever until killed
   let mut recv = Command::new("/bin/sh")
-    .stdin(Stdio::Piped)
+    .arg("-c")
+    .arg("while :; do :; done")
     .spawn()
     .with_lio(&lio)
     .send();
@@ -265,9 +268,10 @@ fn test_exit_status_methods() {
   assert_eq!(status.code(), Some(5));
   assert_eq!(status.signal(), None);
 
-  // Test signaled process - use cat with piped stdin
+  // Test signaled process - use infinite loop
   let mut recv = Command::new("/bin/sh")
-    .stdin(Stdio::Piped)
+    .arg("-c")
+    .arg("while :; do :; done")
     .spawn()
     .with_lio(&lio)
     .send();
@@ -291,7 +295,8 @@ fn test_child_dropped_without_wait() {
   // This test ensures that dropping a Child without waiting doesn't leave zombies
   {
     let mut recv = Command::new("/bin/sh")
-      .stdin(Stdio::Piped)
+      .arg("-c")
+      .arg("while :; do :; done")
       .spawn()
       .with_lio(&lio)
       .send();
