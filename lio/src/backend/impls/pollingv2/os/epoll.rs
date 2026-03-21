@@ -116,7 +116,7 @@ impl OsPoller {
     }
     // Note: EPOLLHUP and EPOLLERR are always reported by the kernel regardless of registration
 
-    let mut event = libc::epoll_event { events, u64: key as u64 };
+    let mut event = libc::epoll_event { events, u64: key };
 
     syscall!(epoll_ctl(
       self.epoll_fd.as_raw_fd(),
@@ -173,7 +173,7 @@ impl ReadinessPoll for OsPoller {
     events |= libc::EPOLLONESHOT as u32;
     // Note: EPOLLHUP and EPOLLERR are always reported by the kernel regardless of registration
 
-    let mut event = libc::epoll_event { events, u64: key as u64 };
+    let mut event = libc::epoll_event { events, u64: key };
 
     syscall!(epoll_ctl(
       self.epoll_fd.as_raw_fd(),

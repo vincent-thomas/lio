@@ -21,10 +21,10 @@ test-debug:
 	nix run .#test
 
 test-release:
-	nix develop -c ./scripts/test.sh --release
+	nix run .#test -- --release
 
 test-uring:
-	nix develop -c ./scripts/test-lio-uring.sh
+	nix run .#test-uring
 
 test-ffi:
 	nix run .#test-ffi

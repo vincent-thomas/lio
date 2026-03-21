@@ -144,20 +144,45 @@
           test = pkgs.writeShellApplication {
             name = "lio-test";
             text = builtins.readFile ./scripts/test.sh;
-            runtimeInputs = with pkgs; [
-              (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-              jq
-            ];
+            runtimeInputs =
+              with pkgs;
+              [
+                (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+                jq
+              ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                pkgs.linuxHeaders
+              ];
           };
           test-ffi = pkgs.writeShellApplication {
             name = "lio-test-ffi";
             text = builtins.readFile ./scripts/test-ffi.sh;
-            runtimeInputs = with pkgs; [
-              (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-              gnumake
-              gcc
-              pkg-config
-            ];
+            runtimeInputs =
+              with pkgs;
+              [
+                (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+                gnumake
+                gcc
+                pkg-config
+              ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                pkgs.linuxHeaders
+              ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+                pkgs.libiconv
+              ];
+          };
+          test-uring = pkgs.writeShellApplication {
+            name = "lio-test-uring";
+            text = builtins.readFile ./scripts/test-lio-uring.sh;
+            runtimeInputs =
+              with pkgs;
+              [
+                (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+              ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                pkgs.linuxHeaders
+              ];
           };
           lint = pkgs.writeShellApplication {
             name = "lio-lint";

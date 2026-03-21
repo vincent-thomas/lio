@@ -850,6 +850,7 @@ impl Poller {
       if let Err(e) =
         syscall!(inotify_add_watch(fd, path_cstr.as_ptr(), inotify_mask))
       {
+        // SAFETY: fd is a valid inotify fd we just created
         unsafe { libc::close(fd) };
         self
           .immediate
@@ -857,6 +858,7 @@ impl Poller {
         return Ok(());
       }
       if let Err(e) = self.sys().add(fd, id, Interest::READ) {
+        // SAFETY: fd is a valid inotify fd we just created
         unsafe { libc::close(fd) };
         self
           .immediate
@@ -893,6 +895,7 @@ impl Poller {
         }
       };
       if let Err(e) = self.sys().add(fd, id, Interest::READ) {
+        // SAFETY: fd is a valid signalfd we just created
         unsafe { libc::close(fd) };
         self
           .immediate
@@ -900,7 +903,7 @@ impl Poller {
         return Ok(());
       }
       self.entries.insert(id, Entry::Signal { sig: fd });
-      return Ok(());
+      Ok(())
     }
 
     #[cfg(any(
@@ -935,11 +938,13 @@ impl Poller {
 fn read_inotify(fd: RawFd) -> isize {
   use crate::api::ops::WatchMask;
   let mut buf = [0u8; 256];
+  // SAFETY: fd is a valid inotify fd, buf is a valid buffer
   let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
   if n < 0 {
     -(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
       as isize)
   } else if n >= std::mem::size_of::<libc::inotify_event>() as isize {
+    // SAFETY: we verified n >= sizeof(inotify_event), buffer contains valid event
     let ev = unsafe { &*(buf.as_ptr() as *const libc::inotify_event) };
     WatchMask::from_inotify_mask(ev.mask).bits() as isize
   } else {

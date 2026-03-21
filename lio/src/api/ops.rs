@@ -2406,6 +2406,7 @@ impl TypedOp for Waitid {
     // si_code is a direct field on all platforms.
     // si_pid/si_uid/si_status are methods on Linux, fields on BSD/macOS.
     #[cfg(target_os = "linux")]
+    // SAFETY: siginfo_t was initialized by waitid syscall, accessor methods are safe
     let (pid, uid, code, status) = unsafe {
       (
         self.siginfo.si_pid(),

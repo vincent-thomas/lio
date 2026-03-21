@@ -1291,6 +1291,7 @@ pub unsafe extern "C" fn lio_tee(
 ) {
   // SAFETY: caller guarantees fds are valid per fn contract
   let res_in = unsafe { fd_to_borrowed_resource(fd_in) };
+  // SAFETY: caller guarantees fds are valid per fn contract
   let res_out = unsafe { fd_to_borrowed_resource(fd_out) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::tee(&res_in, res_out, len)
@@ -1331,6 +1332,7 @@ pub unsafe extern "C" fn lio_splice(
 ) {
   // SAFETY: caller guarantees fds are valid per fn contract
   let res_in = unsafe { fd_to_borrowed_resource(fd_in) };
+  // SAFETY: caller guarantees fds are valid per fn contract
   let res_out = unsafe { fd_to_borrowed_resource(fd_out) };
   let off_in_opt = if off_in < 0 { None } else { Some(off_in) };
   let off_out_opt = if off_out < 0 { None } else { Some(off_out) };
@@ -1371,6 +1373,7 @@ pub unsafe extern "C" fn lio_copy_file_range(
 ) {
   // SAFETY: caller guarantees fds are valid per fn contract
   let res_in = unsafe { fd_to_borrowed_resource(fd_in) };
+  // SAFETY: caller guarantees fds are valid per fn contract
   let res_out = unsafe { fd_to_borrowed_resource(fd_out) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::copy_file_range(&res_in, off_in, &res_out, off_out, len, 0)

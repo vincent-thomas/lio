@@ -401,6 +401,7 @@ impl Metadata {
   }
 
   /// Returns the permissions of the file (Unix mode bits).
+  #[allow(clippy::unnecessary_cast)]
   pub fn permissions(&self) -> u32 {
     (self.stat.st_mode & 0o7777) as u32
   }

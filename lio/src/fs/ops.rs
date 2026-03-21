@@ -60,6 +60,7 @@ impl OpenAtFile {
     // SAFETY: AT_FDCWD is a special constant that doesn't need to be closed
     let dir_res = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
 
+    #[allow(clippy::unnecessary_cast)]
     Ok(ops::OpenAt::with_mode(dir_res, pathname, flags, mode as u32))
   }
 }

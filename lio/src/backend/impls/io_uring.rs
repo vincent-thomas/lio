@@ -324,6 +324,7 @@ impl IoUring {
           use crate::api::ops::WatchMask;
 
           let mut buf = [0u8; 256];
+          // SAFETY: inotify_fd is valid, buf is a valid buffer
           let n = unsafe {
             libc::read(inotify_fd, buf.as_mut_ptr() as *mut _, buf.len())
           };
@@ -333,6 +334,7 @@ impl IoUring {
               .raw_os_error()
               .unwrap_or(libc::EIO) as isize)
           } else if n >= std::mem::size_of::<libc::inotify_event>() as isize {
+            // SAFETY: we verified n >= sizeof(inotify_event), so buffer contains valid event
             let event =
               unsafe { &*(buf.as_ptr() as *const libc::inotify_event) };
             WatchMask::from_inotify_mask(event.mask).bits() as isize
@@ -341,7 +343,7 @@ impl IoUring {
           }
         };
 
-        // Close the inotify fd
+        // SAFETY: inotify_fd is a valid fd that we own
         unsafe { libc::close(inotify_fd) };
 
         self.completed.push(OpCompleted::new(real_id, final_result));
@@ -419,7 +421,6 @@ impl IoBackend for IoUring {
 
     // Handle Flock via blocking syscall (no io_uring support)
     if let Op::Flock { fd, operation } = &op {
-      // SAFETY: flock syscall with valid fd
       let result = syscall!(raw flock(fd.as_raw_fd(), *operation));
       self.immediate.push(ImmediateCompletion { id, result });
       return Ok(());
@@ -428,7 +429,6 @@ impl IoBackend for IoUring {
     // Handle GetDents via blocking syscall (no io_uring support)
     #[cfg(unix)]
     if let Op::GetDents { fd, buf } = &op {
-      // SAFETY: getdents64 syscall with valid fd and buffer
       let result = syscall!(raw syscall(libc::SYS_getdents64, fd.as_raw_fd(), buf.ptr as *mut libc::c_void, buf.len));
       self.immediate.push(ImmediateCompletion { id, result });
       return Ok(());
@@ -438,7 +438,6 @@ impl IoBackend for IoUring {
     #[cfg(unix)]
     if let Op::Signal { sigset } = &op {
       // Create signalfd for the signal set
-      // SAFETY: signalfd syscall with valid sigset pointer
       let sfd = syscall!(raw signalfd(-1, *sigset, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC));
       if sfd < 0 {
         self.immediate.push(ImmediateCompletion { id, result: sfd });
@@ -483,6 +482,7 @@ impl IoBackend for IoUring {
           }
         };
 
+      // SAFETY: path is a valid null-terminated C string from the Op
       let path_cstr = unsafe { CStr::from_ptr(*path) };
       let inotify_mask = WatchMask::from_bits(*mask).to_inotify_mask();
 
@@ -492,6 +492,7 @@ impl IoBackend for IoUring {
         path_cstr.as_ptr(),
         inotify_mask
       )) {
+        // SAFETY: inotify_fd is a valid fd we just created
         unsafe { libc::close(inotify_fd) };
         let errno = e.raw_os_error().unwrap_or(libc::EIO);
         self
@@ -507,10 +508,12 @@ impl IoBackend for IoUring {
       let poll_entry = PollAdd::new(inotify_fd, libc::POLLIN as u32).build();
 
       // Use flagged user_data so we can identify this as a watch completion
+      // SAFETY: poll_entry is a valid SQE, ring is initialized
       unsafe { self.ring().push(poll_entry, id | WATCH_POLL_FLAG) }.map_err(
         |_| {
           // Clean up on failure
           self.watch_fds.remove(&id);
+          // SAFETY: inotify_fd is a valid fd we just created
           unsafe { libc::close(inotify_fd) };
           io::Error::new(io::ErrorKind::WouldBlock, "submission queue full")
         },
@@ -641,6 +644,7 @@ impl IoBackend for IoUring {
     // Push cancellation request
     // Use a special internal key for the cancel completion
     const CANCEL_KEY: u64 = u64::MAX - 2;
+    // SAFETY: entry is a valid SQE, ring is initialized
     unsafe { self.ring().push(entry, CANCEL_KEY) }.map_err(|_| {
       io::Error::new(io::ErrorKind::WouldBlock, "submission queue full")
     })?;
