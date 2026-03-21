@@ -64,7 +64,7 @@ jobs:
         run: make test-ffi
 
       - name: nix build
-        run: nix build
+        run: nix build '.?submodules=1'
 
       - name: test lio-uring
         run: make test-uring

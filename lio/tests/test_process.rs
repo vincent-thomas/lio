@@ -51,9 +51,11 @@ fn test_waitid_child_exit() {
 fn test_waitid_nohang_no_child() {
   let lio = Lio::new(64).unwrap();
 
-  // Spawn a long-running child
-  let mut child =
-    Command::new("sleep").arg("10").spawn().expect("failed to spawn child");
+  // Spawn a long-running child using sh -c for portability
+  let mut child = Command::new("sh")
+    .args(["-c", "exec sleep 10"])
+    .spawn()
+    .expect("failed to spawn child");
 
   let pid = child.id() as i32;
 
@@ -79,7 +81,10 @@ fn test_waitid_exit_zero() {
   let lio = Lio::new(64).unwrap();
 
   // Spawn a child that exits with code 0
-  let child = Command::new("true").spawn().expect("failed to spawn child");
+  let child = Command::new("sh")
+    .args(["-c", "exit 0"])
+    .spawn()
+    .expect("failed to spawn child");
   let pid = child.id() as i32;
 
   // Wait for specific child
