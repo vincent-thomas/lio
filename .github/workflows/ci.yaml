@@ -143,7 +143,7 @@ jobs:
     name: Test (${{ matrix.name }})
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [lint, lio-linux, lio-build-n-test, nix-flake-check, native-test]
+    needs: [lint, lio-linux, lio-build-n-test, nix-flake-check]
     strategy:
       matrix:
         include:
