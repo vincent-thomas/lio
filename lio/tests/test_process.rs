@@ -52,8 +52,9 @@ fn test_waitid_nohang_no_child() {
   let lio = Lio::new(64).unwrap();
 
   // Spawn a long-running child using sh -c for portability
+  // Use "while :; do :; done" which blocks waiting for stdin (no external commands needed)
   let mut child = Command::new("sh")
-    .args(["-c", "exec sleep 10"])
+    .args(["-c", "while :; do :; done"])
     .spawn()
     .expect("failed to spawn child");
 

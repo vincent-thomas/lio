@@ -980,7 +980,8 @@ fn read_signalfd(fd: RawFd) -> isize {
     let info = unsafe { info.assume_init() };
     info.ssi_signo as isize
   } else if n < 0 {
-    -(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) as isize)
+    -(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+      as isize)
   } else {
     // Unexpected: return EAGAIN as error to indicate something went wrong
     -(libc::EAGAIN as isize)

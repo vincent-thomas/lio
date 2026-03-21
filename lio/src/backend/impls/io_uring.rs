@@ -329,7 +329,8 @@ impl IoUring {
           result
         } else {
           // Poll succeeded, read from signalfd to get the signal number
-          let mut info = std::mem::MaybeUninit::<libc::signalfd_siginfo>::uninit();
+          let mut info =
+            std::mem::MaybeUninit::<libc::signalfd_siginfo>::uninit();
           // SAFETY: signal_fd is valid, info is a valid buffer of correct size
           let n = unsafe {
             libc::read(
