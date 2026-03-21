@@ -160,6 +160,7 @@
               [
                 (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
                 jq
+                cargo-nextest
               ]
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                 pkgs.llvmPackages.libclang.lib
