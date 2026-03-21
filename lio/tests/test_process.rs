@@ -51,30 +51,35 @@ fn test_waitid_child_exit() {
 fn test_waitid_nohang_no_child() {
   let lio = Lio::new(64).unwrap();
 
-  // Spawn a long-running child using sh -c for portability
-  // Use "tail -f /dev/null" which blocks waiting for stdin (no external commands needed)
-  let mut child = Command::new("sh")
-    .args(["-c", "tail -f /dev/null"])
-    .spawn()
-    .expect("failed to spawn child");
+  // Use fork+pause for a reliable long-running child (works in nix sandbox)
+  let pid = unsafe { libc::fork() };
 
-  let pid = child.id() as i32;
+  match pid {
+    -1 => panic!("fork failed"),
+    0 => {
+      // Child: sleep forever
+      unsafe { libc::pause() };
+      std::process::exit(0);
+    }
+    child_pid => {
+      // Try to wait with NOHANG - should return None since child is still running
+      let mut result = api::waitid(
+        WaitTarget::Pid(child_pid),
+        WaitOptions::EXITED | WaitOptions::NOHANG,
+      )
+      .with_lio(&lio)
+      .send();
+      let status = poll_recv(&lio, &mut result).expect("waitid failed");
 
-  // Try to wait with NOHANG - should return None since child is still running
-  let mut result = api::waitid(
-    WaitTarget::Pid(pid),
-    WaitOptions::EXITED | WaitOptions::NOHANG,
-  )
-  .with_lio(&lio)
-  .send();
-  let status = poll_recv(&lio, &mut result).expect("waitid failed");
+      // Should be None because child hasn't exited yet
+      assert!(status.is_none());
 
-  // Should be None because child hasn't exited yet
-  assert!(status.is_none());
-
-  // Clean up - kill the child and wait via std to reap it
-  child.kill().ok();
-  child.wait().ok();
+      // Clean up - kill the child and reap it
+      unsafe { libc::kill(child_pid, libc::SIGKILL) };
+      let mut wstatus: libc::c_int = 0;
+      unsafe { libc::waitpid(child_pid, &mut wstatus, 0) };
+    }
+  }
 }
 
 #[test]
