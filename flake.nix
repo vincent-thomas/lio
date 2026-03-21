@@ -149,37 +149,18 @@
               jq
             ];
           };
+          test-ffi = pkgs.writeShellApplication {
+            name = "lio-test-ffi";
+            text = builtins.readFile ./scripts/test-ffi.sh;
+            runtimeInputs = with pkgs; [
+              (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+              gnumake
+              gcc
+              pkg-config
+            ];
+          };
         }
         // testPackages;
-
-        devShells =
-          let
-            sharedEnvVars = {
-              nativeBuildInputs = with pkgs; [
-                (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-                stdenv.cc.cc
-                gnumake
-                cargo-nextest
-
-                clang
-              ];
-              RUST_BACKTRACE = "1";
-              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-            };
-          in
-          {
-            ci = pkgs.mkShell (
-              sharedEnvVars
-              // {
-                packages = with pkgs; [
-                  cargo-deny
-                  cargo-hack
-                  cargo-release
-                ];
-              }
-            );
-            # default = pkgs.mkShell sharedEnvVars;
-          };
       }
     );
 }

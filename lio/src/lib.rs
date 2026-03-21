@@ -10,16 +10,16 @@
 
 //! # Lio - Low-Level Async I/O Library
 //!
-//! Lio is a non-blocking, platform-independent, zero-copy (when possible)
-//! I/O library that provides control back to the user. It does so by giving
-//! raw access to the syscall arguments, which it then builds upon. For
-//! example Lio (optionally) can [manage buffers in a zero-copy way](crate::buf),
-//! and [can integrate with zeroize](crate::buf#`zeroize`).
+//! Lio is a non-blocking, platform and runtime-independent, I/O library that
+//! provides control back to the user. It does so by giving raw access to the
+//! syscall arguments, which it then builds upon. By default, it uses the most
+//! efficient I/O available based on OS.
+// ! - **Linux**: io_uring, epoll as backup.
+// ! - **BSD/Apple**: kqueue.
+// ! - **Windows**: I/O Completion Ports.
 //!
-//! It uses the most efficient I/O available based on OS. It uses:
-//! - **Linux**: io_uring, epoll as backup.
-//! - **BSD/Apple**: kqueue.
-//! - **Windows**: I/O Completion Ports.
+//! This is of course customizable. You can even make your own I/O backend, just by
+//! implementing [this trait](crate::backend::IoBackend).
 //!
 //! As lio is platform-independent, it needs to abstract over OS resources like
 //! files/sockets. `lio` calls these [resources](crate::api::resource).
@@ -56,11 +56,10 @@ pub mod net;
 pub mod process;
 pub mod time;
 
-pub use buf::{
-  BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec, MAX_IOV_COUNT,
-};
+pub use buf::{BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec};
 
 mod registration;
+pub mod slab;
 
 pub mod backend;
 

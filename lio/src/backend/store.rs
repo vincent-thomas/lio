@@ -12,69 +12,17 @@
 //! When a slot is freed and reused, its generation is incremented. This ensures
 //! that old IDs referring to the same slot are rejected (ABA protection).
 //!
-//! The store uses pre-allocated contiguous memory for cache-friendly access.
-
-use std::collections::VecDeque;
+//! The store uses bump allocation with slot reuse for cache-friendly access.
 
 use crate::registration::Registration;
-
-/// A slot in the store containing generation and optional entry.
-struct Slot {
-  /// Generation counter - incremented each time slot is reused
-  generation: u32,
-  /// The actual entry, None if slot is free
-  entry: Option<Registration>,
-}
-
-/// A generational index combining a slot and generation counter.
-///
-/// The index is packed into a `u64`:
-/// - High 32 bits: generation counter
-/// - Low 32 bits: slot index
-#[derive(Copy, Clone, Debug)]
-struct Index {
-  generation: u32,
-  slot: u32,
-}
-
-impl Index {
-  /// Packs generation and slot into a single u64.
-  pub fn as_u64(&self) -> u64 {
-    ((self.generation as u64) << 32) | (self.slot as u64)
-  }
-
-  /// Extracts an index from a packed u64 ID.
-  pub fn from_u64(packed: u64) -> Self {
-    Index {
-      slot: (packed & 0xFFFFFFFF) as u32,
-      generation: (packed >> 32) as u32,
-    }
-  }
-
-  /// Returns the slot index.
-  pub fn slot(&self) -> u32 {
-    self.slot
-  }
-
-  /// Returns the generation counter.
-  pub fn generation(&self) -> u32 {
-    self.generation
-  }
-}
+use crate::slab::{Slab, SlabKey};
 
 /// Store for in-flight I/O operations using contiguous memory.
 ///
-/// Uses a pre-allocated Vec for O(1) indexed access and cache-friendly
-/// memory layout. Generational indices prevent the ABA problem.
+/// Uses bump allocation with free-list reuse for O(1) operations and
+/// cache-friendly memory layout. Generational indices prevent the ABA problem.
 pub(crate) struct OpStore {
-  /// Pre-allocated slots with generation tracking
-  slots: Vec<Slot>,
-  /// Free slot indices available for reuse
-  free_list: VecDeque<u32>,
-  /// Next slot to use when free_list is empty
-  next_slot: u32,
-  /// Maximum capacity
-  capacity: u32,
+  slab: Slab<Registration>,
 }
 
 #[derive(Debug)]
@@ -101,38 +49,7 @@ impl OpStore {
   ///
   /// - `cap`: The maximum number of concurrent operations.
   pub fn with_capacity(cap: usize) -> OpStore {
-    let capacity = cap.min(u32::MAX as usize) as u32;
-
-    // Pre-allocate all slots
-    let slots =
-      (0..capacity).map(|_| Slot { generation: 0, entry: None }).collect();
-
-    Self {
-      slots,
-      free_list: VecDeque::with_capacity(cap),
-      next_slot: 0,
-      capacity,
-    }
-  }
-
-  /// Allocates the next available slot index and generation.
-  fn next_id(&mut self) -> Option<Index> {
-    // First try to reuse a freed slot
-    if let Some(slot_idx) = self.free_list.pop_front() {
-      let slot = &self.slots[slot_idx as usize];
-      // Generation was already incremented when slot was freed
-      return Some(Index { slot: slot_idx, generation: slot.generation });
-    }
-
-    // Allocate a new slot if within capacity
-    if self.next_slot < self.capacity {
-      let slot_idx = self.next_slot;
-      self.next_slot += 1;
-      return Some(Index { slot: slot_idx, generation: 0 });
-    }
-
-    // Out of capacity
-    None
+    Self { slab: Slab::new(cap) }
   }
 
   /// Inserts an operation into the store and returns its ID.
@@ -149,23 +66,7 @@ impl OpStore {
     &mut self,
     reg: Registration,
   ) -> Result<u64, StoreAtCapacity> {
-    let index = self.next_id().ok_or(StoreAtCapacity)?;
-
-    let slot = &mut self.slots[index.slot() as usize];
-    assert!(
-      slot.entry.is_none(),
-      "OpStore: slot {} should be empty",
-      index.slot()
-    );
-    assert_eq!(
-      slot.generation,
-      index.generation(),
-      "OpStore: generation mismatch"
-    );
-
-    slot.entry = Some(reg);
-
-    Ok(index.as_u64())
+    self.slab.insert(reg).map(|key| key.as_u64()).ok_or(StoreAtCapacity)
   }
 
   /// Removes an operation from the store.
@@ -173,39 +74,21 @@ impl OpStore {
   /// Returns `true` if the operation was found and removed, `false` if the ID
   /// was invalid (not found, already removed, or stale generation).
   pub fn remove(&mut self, id: u64) -> bool {
-    let index = Index::from_u64(id);
-    let slot = match self.raw_get_mut_slot(index) {
-      Some(slot) => slot,
-      None => return false,
-    };
-
-    // Remove the entry
-    slot.entry = None;
-    // Increment generation for next use (ABA protection)
-    slot.generation = slot.generation.strict_add(1);
-    // Return slot to free list
-    self.free_list.push_back(index.slot());
-
-    true
+    self.slab.remove(SlabKey::from_u64(id))
   }
 
   /// Gets mutable access to an operation's registration.
   ///
   /// Returns `None` if the ID is invalid or refers to a stale generation.
   pub fn get_mut(&mut self, id: u64) -> Option<&mut Registration> {
-    self.raw_get_mut_slot(Index::from_u64(id))?.entry.as_mut()
-  }
-
-  fn raw_get_mut_slot(&mut self, index: Index) -> Option<&mut Slot> {
-    let slot = self.slots.get_mut(index.slot() as usize)?;
-    if slot.generation == index.generation() { Some(slot) } else { None }
+    self.slab.get_mut(SlabKey::from_u64(id))
   }
 }
 
 #[cfg(test)]
 mod tests {
-
   use super::*;
+  use crate::slab::SlabKey;
   use std::collections::HashSet;
 
   // Helper to create a dummy StoredOp
@@ -222,6 +105,7 @@ mod tests {
     const VTABLE: RawWakerVTable =
       RawWakerVTable::new(clone, wake, wake_by_ref, drop);
     let raw_waker = RawWaker::new(std::ptr::null(), &VTABLE);
+    // SAFETY: The vtable functions are valid no-ops
     let waker = unsafe { Waker::from_raw(raw_waker) };
 
     Registration::new_waker(waker)
@@ -253,17 +137,17 @@ mod tests {
 
     // Get first ID (generation 0, slot 0)
     let id1 = store.insert(dummy_stored_op());
-    let index1 = Index::from_u64(id1);
-    assert_eq!(index1.generation(), 0);
-    assert_eq!(index1.slot(), 0);
+    let key1 = SlabKey::from_u64(id1);
+    assert_eq!(key1.generation(), 0);
+    assert_eq!(key1.slot(), 0);
 
     store.remove(id1);
 
     // Get next ID - should reuse slot 0 with generation 1
     let id2 = store.insert(dummy_stored_op());
-    let index2 = Index::from_u64(id2);
-    assert_eq!(index2.slot(), 0, "Slot should be reused");
-    assert_eq!(index2.generation(), 1, "Generation should increment");
+    let key2 = SlabKey::from_u64(id2);
+    assert_eq!(key2.slot(), 0, "Slot should be reused");
+    assert_eq!(key2.generation(), 1, "Generation should increment");
   }
 
   #[test]
@@ -309,10 +193,10 @@ mod tests {
   }
 
   #[test]
-  fn test_index_packing_unpacking() {
-    let index = Index { slot: 42, generation: 123 };
-    let packed = index.as_u64();
-    let unpacked = Index::from_u64(packed);
+  fn test_key_packing_unpacking() {
+    let key = SlabKey::from_u64(((123u64) << 32) | 42);
+    let packed = key.as_u64();
+    let unpacked = SlabKey::from_u64(packed);
 
     assert_eq!(unpacked.slot(), 42);
     assert_eq!(unpacked.generation(), 123);
@@ -350,17 +234,17 @@ mod tests {
     let id3 = store.insert(dummy_stored_op());
 
     // All IDs use slot 0 but have different generations
-    let idx1 = Index::from_u64(id1);
-    let idx2 = Index::from_u64(id2);
-    let idx3 = Index::from_u64(id3);
+    let key1 = SlabKey::from_u64(id1);
+    let key2 = SlabKey::from_u64(id2);
+    let key3 = SlabKey::from_u64(id3);
 
-    assert_eq!(idx1.slot(), 0);
-    assert_eq!(idx2.slot(), 0);
-    assert_eq!(idx3.slot(), 0);
+    assert_eq!(key1.slot(), 0);
+    assert_eq!(key2.slot(), 0);
+    assert_eq!(key3.slot(), 0);
 
-    assert_eq!(idx1.generation(), 0);
-    assert_eq!(idx2.generation(), 1);
-    assert_eq!(idx3.generation(), 2);
+    assert_eq!(key1.generation(), 0);
+    assert_eq!(key2.generation(), 1);
+    assert_eq!(key3.generation(), 2);
 
     // Old IDs should not work
     assert!(store.get_mut(id1).is_none());

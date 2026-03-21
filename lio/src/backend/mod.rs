@@ -51,7 +51,7 @@ mod impls {
   #[cfg(test)]
   pub mod dummy;
 
-  #[cfg(linux)]
+  #[cfg(target_os = "linux")]
   pub mod io_uring;
 
   #[cfg(any(
@@ -216,8 +216,6 @@ pub trait IoBackend {
   /// Cancels an in-flight operation.
   ///
   /// This is used to cancel streaming operations when the stream is dropped.
-  /// For io_uring, this uses IORING_OP_ASYNC_CANCEL.
-  /// For pollingv2, this removes the fd registration and stream op tracking.
   ///
   /// The default implementation is a no-op (for backends where operations
   /// complete synchronously or don't need explicit cancellation).

@@ -170,6 +170,7 @@ runcmd:
   - DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential clang curl git pkg-config libssl-dev rsync jq
   - echo "=== Installing Rust ==="
   - su - lio -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+  - su - lio -c 'source ~/.cargo/env && cargo install cargo-nextest --locked'
   - touch /home/lio/.provisioned
   - echo "=== Provisioning complete ==="
   - poweroff

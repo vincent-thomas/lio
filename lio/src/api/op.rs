@@ -77,11 +77,4 @@ pub trait StreamOp: Send + Sync + 'static {
   ///
   /// - `result`: The raw result from the backend completion
   fn extract_item(&mut self, result: isize) -> StreamResult<Self::Item>;
-
-  /// Reset internal state for resubmission.
-  ///
-  /// Called before resubmitting the operation on backends that don't
-  /// support multishot operations. This is now handled internally by
-  /// the backend layer for stream operations.
-  fn reset(&mut self) {}
 }

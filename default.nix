@@ -11,27 +11,23 @@ pkgs.rustPlatform.buildRustPackage {
 
   src = ./.;
 
-  cargoLock = {
-    lockFile = ./Cargo.lock;
-  };
+  cargoLock.lockFile = ./Cargo.lock;
 
   nativeBuildInputs = with pkgs; [
     (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
     gnumake
-    clang
-    llvmPackages.libclang
+    cargo-nextest
   ];
-
-  buildInputs = with pkgs; [ stdenv.cc.cc ];
-
-  LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-
-  doCheck = false;
 
   buildPhase = ''
     runHook preBuild
     make cbuild
     runHook postBuild
+  '';
+
+  checkPhase = ''
+    runHook cargoCheckHook
+    ./scripts/test-ffi.sh
   '';
 
   installPhase = ''

@@ -150,7 +150,12 @@ impl ReadinessPoll for OsPoller {
     self.add_inner(fd, key, interest, true)
   }
 
-  fn add_level(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
+  fn add_level(
+    &self,
+    fd: RawFd,
+    key: u64,
+    interest: Interest,
+  ) -> io::Result<()> {
     self.add_inner(fd, key, interest, false)
   }
 

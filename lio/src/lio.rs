@@ -108,7 +108,7 @@ impl Lio {
       use crate::backend::pollingv2::Poller;
       Self::new_with_backend(Poller::new(), cap)
     }
-    #[cfg(linux)]
+    #[cfg(target_os = "linux")]
     {
       use crate::backend::io_uring::IoUring;
       Self::new_with_backend(IoUring::new(), cap)
@@ -278,8 +278,7 @@ impl Lio {
           return Err(Error::StreamDone);
         }
         // Try to pop a result from the stream queue
-        let result =
-          entry.try_take_stream_result().ok_or(Error::EntryNotCompleted)?;
+        let result = entry.try_take_result().ok_or(Error::EntryNotCompleted)?;
         // Check again if we should clean up after taking this result
         if entry.is_stream_done() {
           assert!(inner.store.remove(key));

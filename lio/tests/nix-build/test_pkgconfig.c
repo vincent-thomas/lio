@@ -25,24 +25,24 @@ static int tests_total = 0;
     exit(1); \
 } while(0)
 
-/* Test 1: Timeout */
-static int timeout_called = 0;
-static void on_timeout(int result) {
-    if (result == 0) timeout_called = 1;
+/* Test 1: Sleep */
+static int sleep_called = 0;
+static void on_sleep(int result) {
+    if (result == 0) sleep_called = 1;
 }
 
-static void test_timeout(lio_handle_t *lio) {
-    TEST("timeout");
+static void test_sleep(lio_handle_t *lio) {
+    TEST("sleep");
 
-    timeout_called = 0;
-    lio_timeout(lio, 1, on_timeout);
+    sleep_called = 0;
+    lio_sleep(lio, 1, on_sleep);
 
-    for (int i = 0; i < 100 && !timeout_called; i++) {
+    for (int i = 0; i < 100 && !sleep_called; i++) {
         lio_tick(lio);
         usleep(1000);
     }
 
-    if (!timeout_called) FAIL("callback not invoked");
+    if (!sleep_called) FAIL("callback not invoked");
     PASS();
 }
 
@@ -150,7 +150,7 @@ int main(void) {
     lio_handle_t *lio = lio_create(64);
     assert(lio != NULL && "lio_create failed");
 
-    test_timeout(lio);
+    test_sleep(lio);
     test_file_io(lio);
     test_socket(lio);
 

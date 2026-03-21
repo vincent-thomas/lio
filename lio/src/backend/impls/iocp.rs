@@ -36,8 +36,8 @@ use windows_sys::Win32::Networking::WinSock::{
   listen, setsockopt, shutdown, socket,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-  CreateFileW, FILE_BEGIN, FlushFileBuffers, LockFileEx, LOCKFILE_EXCLUSIVE_LOCK,
-  LOCKFILE_FAIL_IMMEDIATELY, OPEN_EXISTING, ReadFile, SetEndOfFile,
+  CreateFileW, FILE_BEGIN, FlushFileBuffers, LOCKFILE_EXCLUSIVE_LOCK,
+  LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_EXISTING, ReadFile, SetEndOfFile,
   SetFilePointerEx, UnlockFileEx, WriteFile,
 };
 use windows_sys::Win32::System::IO::{

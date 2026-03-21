@@ -1,4 +1,4 @@
-#![cfg(linux)]
+#![cfg(target_os = "linux")]
 
 use lio::{Lio, api, api::resource::Resource};
 use std::os::fd::FromRawFd;

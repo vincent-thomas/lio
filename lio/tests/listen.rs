@@ -9,7 +9,7 @@ use std::{
   sync::mpsc,
 };
 
-#[cfg(linux)]
+#[cfg(target_os = "linux")]
 #[test]
 fn test_listen_basic() {
   let mut lio = Lio::new(64).unwrap();
@@ -54,7 +54,7 @@ fn test_listen_basic() {
   }
 }
 
-#[cfg(linux)]
+#[cfg(target_os = "linux")]
 #[test]
 fn test_listen_with_backlog() {
   let mut lio = Lio::new(64).unwrap();
@@ -94,7 +94,7 @@ fn test_listen_with_backlog() {
   }
 }
 
-#[cfg(linux)]
+#[cfg(target_os = "linux")]
 #[test]
 fn test_listen_large_backlog() {
   let mut lio = Lio::new(64).unwrap();
@@ -156,7 +156,7 @@ fn test_listen_without_bind() {
   // but behavior may vary by platform
 }
 
-#[cfg(linux)]
+#[cfg(target_os = "linux")]
 #[test]
 fn test_listen_ipv6() {
   let mut lio = Lio::new(64).unwrap();
@@ -257,7 +257,7 @@ fn test_listen_twice() {
   // Behavior may vary - some systems allow it, some don't
 }
 
-#[cfg(linux)]
+#[cfg(target_os = "linux")]
 #[test]
 fn test_listen_zero_backlog() {
   let mut lio = Lio::new(64).unwrap();
@@ -332,7 +332,7 @@ fn test_listen_after_close() {
   assert!(result.is_err(), "Listen should fail on closed socket");
 }
 
-#[cfg(linux)]
+#[cfg(target_os = "linux")]
 #[test]
 fn test_listen_concurrent() {
   let mut lio = Lio::new(64).unwrap();
@@ -388,7 +388,7 @@ fn test_listen_concurrent() {
   }
 }
 
-#[cfg(linux)]
+#[cfg(target_os = "linux")]
 #[test]
 fn test_listen_on_all_interfaces() {
   let mut lio = Lio::new(64).unwrap();

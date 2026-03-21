@@ -15,10 +15,15 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::api::op::{StreamOp, StreamResult, TypedOp};
-use crate::api::resource::Resource;
-use crate::backend::op::{Op, RawBuf};
-use crate::{BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec, MAX_IOV_COUNT};
+use crate::{
+  BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec,
+  api::{
+    op::{StreamOp, StreamResult, TypedOp},
+    resource::Resource,
+  },
+  backend::op::{Op, RawBuf},
+  buf::MAX_IOV_COUNT,
+};
 
 // ============================================================================
 // Socket address conversion utilities
@@ -245,6 +250,98 @@ impl TypedOp for AcceptUnix {
 }
 
 // ============================================================================
+// AcceptedConn
+// ============================================================================
+
+/// An accepted connection from a listening socket.
+///
+/// This is returned by [`AcceptStream`] and provides lazy access to the peer
+/// address. The peer address is only fetched via `getpeername()` when
+/// [`peer_addr()`](Self::peer_addr) is called, avoiding syscall overhead when
+/// the address is not needed.
+///
+/// # Example
+///
+/// ```no_run
+/// use lio::{Lio, api};
+/// use lio::api::resource::Resource;
+///
+/// async fn server(lio: &Lio, listener: &Resource) -> std::io::Result<()> {
+///     let mut stream = api::accept_stream(listener).with_lio(lio);
+///     while let Some(result) = stream.next().await {
+///         let conn = result?;
+///         // Only call getpeername() if you need the address
+///         if let Ok(addr) = conn.peer_addr() {
+///             println!("Accepted connection from {}", addr);
+///         }
+///         let client = conn.into_resource();
+///         // Use client...
+///     }
+///     Ok(())
+/// }
+/// ```
+pub struct AcceptedConn {
+  resource: Resource,
+}
+
+impl AcceptedConn {
+  /// Creates a new `AcceptedConn` from a resource.
+  fn new(resource: Resource) -> Self {
+    Self { resource }
+  }
+
+  /// Returns a reference to the underlying resource.
+  pub fn resource(&self) -> &Resource {
+    &self.resource
+  }
+
+  /// Consumes the `AcceptedConn` and returns the underlying resource.
+  pub fn into_resource(self) -> Resource {
+    self.resource
+  }
+
+  /// Returns the peer address of the connection.
+  ///
+  /// This calls `getpeername()` to fetch the address. If you don't need the
+  /// peer address, avoid calling this method to save a syscall.
+  pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+    use std::os::fd::AsRawFd;
+    let fd = self.resource.as_raw_fd();
+    // SAFETY: sockaddr_storage is safe to zero-initialize
+    let mut addr: libc::sockaddr_storage = unsafe { mem::zeroed() };
+    let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: fd is a valid socket, addr/len are valid pointers
+    let ret = unsafe {
+      libc::getpeername(
+        fd,
+        &mut addr as *mut _ as *mut libc::sockaddr,
+        &mut len,
+      )
+    };
+    if ret == 0 {
+      // SAFETY: addr was filled by getpeername
+      unsafe { libc_socketaddr_into_std_raw(&addr as *const _) }
+    } else {
+      Err(io::Error::last_os_error())
+    }
+  }
+}
+
+impl std::ops::Deref for AcceptedConn {
+  type Target = Resource;
+
+  fn deref(&self) -> &Self::Target {
+    &self.resource
+  }
+}
+
+impl From<AcceptedConn> for Resource {
+  fn from(conn: AcceptedConn) -> Self {
+    conn.resource
+  }
+}
+
+// ============================================================================
 // AcceptStream
 // ============================================================================
 
@@ -262,29 +359,25 @@ impl TypedOp for AcceptUnix {
 /// async fn server(lio: &Lio, listener: &Resource) -> std::io::Result<()> {
 ///     let mut stream = api::accept_stream(listener).with_lio(lio);
 ///     while let Some(result) = stream.next().await {
-///         let (client, addr) = result?;
-///         println!("Accepted connection from {}", addr);
+///         let conn = result?;
+///         // peer_addr() is lazy - only calls getpeername() when invoked
+///         println!("Accepted connection from {}", conn.peer_addr()?);
 ///     }
 ///     Ok(())
 /// }
 /// ```
 pub struct AcceptStream {
   res: Resource,
-  addr: libc::sockaddr_storage,
-  len: libc::socklen_t,
 }
 
 impl AcceptStream {
   pub(crate) fn new(res: Resource) -> Self {
-    // SAFETY: libc::sockaddr_storage is a C struct that is safe to zero-initialize.
-    let addr: libc::sockaddr_storage = unsafe { mem::zeroed() };
-    let len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    Self { res, addr, len }
+    Self { res }
   }
 }
 
 impl StreamOp for AcceptStream {
-  type Item = io::Result<(Resource, SocketAddr)>;
+  type Item = io::Result<AcceptedConn>;
 
   fn into_op(&mut self) -> Op {
     Op::AcceptStream { fd: self.res.clone() }
@@ -294,7 +387,6 @@ impl StreamOp for AcceptStream {
     if res < 0 {
       let err = -res as i32;
       // EAGAIN/EWOULDBLOCK means no more connections right now (for level-triggered)
-      // ECONNABORTED means the connection was aborted before accept completed
       if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
         // For non-blocking sockets, this means we've drained all pending connections
         // The stream isn't done - we'll wait for more
@@ -306,50 +398,9 @@ impl StreamOp for AcceptStream {
       let fd = res as RawFd;
       // SAFETY: fd is valid from accept syscall.
       let resource = unsafe { Resource::from_raw_fd(fd) };
-
-      // io_uring's AcceptMulti doesn't fill the address buffer, so check if it's empty.
-      // If ss_family is 0 (uninitialized), use getpeername to get the peer address.
-      let addr_result = if self.addr.ss_family == 0 {
-        // Use getpeername to get the peer address
-        // SAFETY: sockaddr_storage is safe to zero-initialize
-        let mut peer_addr: libc::sockaddr_storage = unsafe { mem::zeroed() };
-        let mut peer_len =
-          mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        // SAFETY: fd is a valid socket, peer_addr/peer_len are valid pointers
-        let ret = unsafe {
-          libc::getpeername(
-            fd,
-            &mut peer_addr as *mut _ as *mut libc::sockaddr,
-            &mut peer_len,
-          )
-        };
-        if ret == 0 {
-          // SAFETY: peer_addr was filled by getpeername
-          unsafe { libc_socketaddr_into_std_raw(&peer_addr as *const _) }
-        } else {
-          Err(io::Error::last_os_error())
-        }
-      } else {
-        // SAFETY: self.addr was filled by the kernel via the accept syscall.
-        unsafe { libc_socketaddr_into_std_raw(&self.addr as *const _) }
-      };
-
-      match addr_result {
-        Ok(addr) => StreamResult::Item(Ok((resource, addr))),
-        Err(e) => StreamResult::Item(Err(e)),
-      }
+      StreamResult::Item(Ok(AcceptedConn::new(resource)))
     }
   }
-
-  fn reset(&mut self) {
-    // Reset the address storage for the next accept
-    // SAFETY: sockaddr_storage is safe to zero-initialize
-    self.addr = unsafe { mem::zeroed() };
-    self.len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-  }
-
-  // Note: io_uring multishot accept is now implemented in the backend layer.
-  // The backend's push_stream() uses AcceptMulti for native multishot support.
 }
 
 // ============================================================================
@@ -1942,13 +1993,7 @@ impl StreamOp for WatchStream {
       StreamResult::Item(Err(io::Error::from_raw_os_error(err)))
     } else {
       let events = WatchMask::from_bits(res as u32);
-      // If DELETE event occurred, the stream is done after this item
-      if events.contains(WatchMask::DELETE) {
-        // Return the delete event but mark that we should stop
-        StreamResult::Item(Ok(events))
-      } else {
-        StreamResult::Item(Ok(events))
-      }
+      StreamResult::Item(Ok(events))
     }
   }
 }
@@ -2777,33 +2822,41 @@ impl<B: IoBufMut> GetDents<B> {
 
       #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
       {
-        if offset + 8 > bytes_read {
+        // Check minimum bytes to read header
+        // Use offset_of to get correct d_reclen position for this FreeBSD version
+        let reclen_offset = std::mem::offset_of!(libc::dirent, d_reclen);
+        if offset + reclen_offset + 2 > bytes_read {
           break;
         }
-        // FreeBSD dirent:
-        // d_fileno: u64 (8)
-        // d_off: i64 (8)
-        // d_reclen: u16 (2)
-        // d_type: u8 (1)
-        // d_namlen: u8 (1)
-        // d_name: [u8]
-        let d_ino =
-          u64::from_ne_bytes(buf[offset..offset + 8].try_into().unwrap());
-        let d_reclen =
-          u16::from_ne_bytes(buf[offset + 16..offset + 18].try_into().unwrap())
-            as usize;
-        let d_type = buf[offset + 18];
-        let d_namlen = buf[offset + 19] as usize;
 
+        let d_reclen = u16::from_ne_bytes(
+          buf[offset + reclen_offset..offset + reclen_offset + 2]
+            .try_into()
+            .unwrap(),
+        ) as usize;
         if d_reclen == 0 || offset + d_reclen > bytes_read {
           break;
         }
 
-        let name_start = offset + 20;
-        let name_end = (name_start + d_namlen).min(offset + d_reclen);
-        let name = OsStr::from_bytes(&buf[name_start..name_end]).to_owned();
+        // SAFETY: we verified d_reclen bytes are available at offset
+        let dirent_ptr = buf[offset..].as_ptr() as *const libc::dirent;
+        let dirent = unsafe { &*dirent_ptr };
 
-        entries.push(DirEntry { inode: d_ino, name, file_type: d_type });
+        let d_namlen = dirent.d_namlen as usize;
+        // SAFETY: d_name is a valid C string of length d_namlen
+        let name_bytes = unsafe {
+          std::slice::from_raw_parts(
+            dirent.d_name.as_ptr() as *const u8,
+            d_namlen,
+          )
+        };
+        let name = OsStr::from_bytes(name_bytes).to_owned();
+
+        entries.push(DirEntry {
+          inode: dirent.d_fileno as u64,
+          name,
+          file_type: dirent.d_type,
+        });
 
         offset += d_reclen;
       }
@@ -2948,19 +3001,12 @@ impl Default for SignalSet {
 #[cfg(unix)]
 pub struct Signal {
   sigset: SignalSet,
-  /// On Linux, we need storage for reading signalfd_siginfo
-  #[cfg(target_os = "linux")]
-  siginfo_buf: [u8; 128], // sizeof(signalfd_siginfo)
 }
 
 #[cfg(unix)]
 impl Signal {
   pub(crate) fn new(sigset: SignalSet) -> Self {
-    Self {
-      sigset,
-      #[cfg(target_os = "linux")]
-      siginfo_buf: [0u8; 128],
-    }
+    Self { sigset }
   }
 }
 

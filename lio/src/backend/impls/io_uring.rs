@@ -22,10 +22,7 @@ const TIMEOUT_LINK_FLAG: u64 = 1 << 63;
 // single-buffer ops, or multiple iovecs for vectored ops. The .offset() method
 // is used for positional I/O (preadv/pwritev).
 
-use crate::backend::{
-  IoBackend, OpCompleted,
-  op::{Op, RawBuf},
-};
+use crate::backend::{IoBackend, OpCompleted, op::Op};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
@@ -118,29 +115,18 @@ fn create_io_uring_entry(op: &Op) -> Entry {
     )
     .flags(*flags)
     .build(),
-    // SendFile and CopyFileRange don't have io_uring ops - handled via blocking fallback
+    // These operations are handled in push() before reaching this match
     #[cfg(unix)]
-    Op::SendFile { .. } => {
-      // This should not be reached - handled in push() as blocking
-      unreachable!("SendFile should be handled as blocking operation")
-    }
+    Op::SendFile { .. } => operation::Nop::new().build(),
     #[cfg(target_os = "linux")]
-    Op::CopyFileRange { .. } => {
-      // This should not be reached - handled in push() as blocking
-      unreachable!("CopyFileRange should be handled as blocking operation")
-    }
+    Op::CopyFileRange { .. } => operation::Nop::new().build(),
     Op::Sleep { timespec, .. } => {
       // __kernel_timespec has same layout as libc::timespec
       // timespec is already a pointer to data in the boxed TypedOp
       Timeout::new(*timespec as *const _).build()
     }
     #[cfg(target_os = "linux")]
-    Op::Timeout { .. } => {
-      // Op::Timeout is handled specially in push() with linked operations
-      unreachable!(
-        "Op::Timeout should be handled in push(), not create_io_uring_entry()"
-      )
-    }
+    Op::Timeout { .. } => operation::Nop::new().build(),
     Op::ReadV { fd, iovecs, iov_count, .. } => {
       Readv::new(fd.as_raw_fd(), *iovecs, *iov_count as u32).build()
     }
@@ -158,19 +144,19 @@ fn create_io_uring_entry(op: &Op) -> Entry {
         .build()
     }
     #[cfg(unix)]
-    Op::Watch { .. } => {
-      // Watch is handled via blocking fallback or special handling in push()
-      unreachable!("Watch should be handled as blocking operation")
-    }
+    Op::Watch { .. } => operation::Nop::new().build(),
     #[cfg(unix)]
     Op::Waitid { idtype, id, options, infop } => {
       WaitId::new(*idtype, *id, *options).infop(*infop).build()
     }
     #[cfg(unix)]
-    Op::Spawn { .. } => {
-      // io_uring doesn't have a spawn operation - handled as blocking
-      unreachable!("Spawn should be handled as blocking operation")
-    }
+    Op::Spawn { .. } => operation::Nop::new().build(),
+    // These operations are handled in push() before reaching this match
+    Op::Flock { .. } => operation::Nop::new().build(),
+    #[cfg(unix)]
+    Op::GetDents { .. } => operation::Nop::new().build(),
+    #[cfg(unix)]
+    Op::Signal { .. } => operation::Nop::new().build(),
   }
 }
 
@@ -414,12 +400,13 @@ impl IoBackend for IoUring {
 
     // Handle Spawn via posix_spawn (no io_uring support)
     #[cfg(unix)]
-    if let Op::Spawn { path, argv, envp, pid } = &op {
+    if let Op::Spawn { path, argv, envp, pid, file_actions } = &op {
+      // SAFETY: All pointers are valid and owned by the Op
       let ret = unsafe {
         libc::posix_spawn(
           *pid,
           *path,
-          std::ptr::null(), // file_actions
+          *file_actions,
           std::ptr::null(), // attrp
           *argv as *const *mut _,
           *envp as *const *mut _,
@@ -427,6 +414,53 @@ impl IoBackend for IoUring {
       };
       let result = if ret == 0 { 0 } else { -(ret as isize) };
       self.immediate.push(ImmediateCompletion { id, result });
+      return Ok(());
+    }
+
+    // Handle Flock via blocking syscall (no io_uring support)
+    if let Op::Flock { fd, operation } = &op {
+      // SAFETY: flock syscall with valid fd
+      let result = syscall!(raw flock(fd.as_raw_fd(), *operation));
+      self.immediate.push(ImmediateCompletion { id, result });
+      return Ok(());
+    }
+
+    // Handle GetDents via blocking syscall (no io_uring support)
+    #[cfg(unix)]
+    if let Op::GetDents { fd, buf } = &op {
+      // SAFETY: getdents64 syscall with valid fd and buffer
+      let result = syscall!(raw syscall(libc::SYS_getdents64, fd.as_raw_fd(), buf.ptr as *mut libc::c_void, buf.len));
+      self.immediate.push(ImmediateCompletion { id, result });
+      return Ok(());
+    }
+
+    // Handle Signal via signalfd polling (no direct io_uring support)
+    #[cfg(unix)]
+    if let Op::Signal { sigset } = &op {
+      // Create signalfd for the signal set
+      // SAFETY: signalfd syscall with valid sigset pointer
+      let sfd = syscall!(raw signalfd(-1, *sigset, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC));
+      if sfd < 0 {
+        self.immediate.push(ImmediateCompletion { id, result: sfd });
+        return Ok(());
+      }
+
+      // Submit poll operation to wait for signalfd to become readable
+      let poll_entry = PollAdd::new(sfd as i32, libc::POLLIN as u32).build();
+
+      // Store signalfd for cleanup - reuse watch_fds map
+      self.watch_fds.insert(id, sfd as i32);
+
+      // SAFETY: pushing to io_uring submission queue
+      unsafe { self.ring().push(poll_entry, id | WATCH_POLL_FLAG) }.map_err(
+        |_| {
+          self.watch_fds.remove(&id);
+          // SAFETY: closing valid fd
+          unsafe { libc::close(sfd as i32) };
+          io::Error::new(io::ErrorKind::WouldBlock, "submission queue full")
+        },
+      )?;
+
       return Ok(());
     }
 

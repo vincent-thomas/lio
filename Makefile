@@ -27,7 +27,7 @@ test-uring:
 	nix develop -c ./scripts/test-lio-uring.sh
 
 test-ffi:
-	nix develop -c ./scripts/test-ffi.sh
+	nix run .#test-ffi
 
 # VM-based cross-platform testing
 vm-linux:

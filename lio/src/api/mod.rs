@@ -625,8 +625,8 @@ doc_op! {
 /// async fn server(lio: &Lio, listener: &Resource) -> std::io::Result<()> {
 ///     let mut stream = api::accept_stream(listener).with_lio(lio);
 ///     while let Some(result) = stream.next().await {
-///         let (client, addr) = result?;
-///         println!("Accepted connection from {}", addr);
+///         let conn = result?;
+///         println!("Accepted connection from {}", conn.peer_addr()?);
 ///         // Spawn a task to handle the client...
 ///     }
 ///     Ok(())
@@ -869,7 +869,7 @@ doc_op! {
     /// # fn example() {}
     /// # fn main() {}
     /// ```
-    #[cfg(linux)]
+    #[cfg(target_os = "linux")]
     #[cfg_attr(docsrs, doc(cfg(linux)))]
     pub fn tee(res_in: &impl AsResource, res_out: impl AsResource, size: u32) -> Io<ops::Tee> {
         Io::from_op(ops::Tee::new(res_in.as_resource().clone(), res_out.as_resource().clone(), size))

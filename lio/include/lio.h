@@ -12,11 +12,56 @@ typedef struct sockaddr_storage sockaddr_storage;
 #endif
 
 /**
+ * Watch for file content modifications
+ */
+#define WATCH_MODIFY 1
+
+/**
+ * Watch for attribute changes (permissions, ownership, etc.)
+ */
+#define WATCH_ATTRIB 2
+
+/**
+ * Watch for file deletion
+ */
+#define WATCH_DELETE 4
+
+/**
+ * Watch for file rename
+ */
+#define WATCH_RENAME 8
+
+/**
+ * Watch for file size extension (BSD/macOS)
+ */
+#define WATCH_EXTEND 16
+
+/**
  * Maximum number of buffers supported for vectored I/O operations.
  *
  * This matches the typical kernel limit and ensures efficient syscall handling.
  */
 #define MAX_IOV_COUNT 16
+
+/**
+ * Shared lock (multiple readers allowed).
+ */
+#define LOCK_SH 1
+
+/**
+ * Exclusive lock (single writer).
+ */
+#define LOCK_EX 2
+
+/**
+ * Unlock.
+ */
+#define LOCK_UN 8
+
+/**
+ * Non-blocking mode (combine with LOCK_SH or LOCK_EX).
+ */
+#define LOCK_NB 4
 
 /**
  * Interest/Event flags for I/O readiness
@@ -260,6 +305,399 @@ void lio_close(struct lio_handle_t *lio, intptr_t fd, void (*callback)(int));
  * `lio` must be a valid handle.
  */
 void lio_sleep(struct lio_handle_t *lio, unsigned int millis, void (*callback)(int));
+
+/**
+ * A no-op that completes immediately.
+ *
+ * Useful for waking up the event loop or testing.
+ *
+ * - `callback(result)`: always 0
+ *
+ * # Safety
+ * `lio` must be a valid handle.
+ */
+void lio_nop(struct lio_handle_t *lio, void (*callback)(int));
+
+/**
+ * Connect a socket to an address.
+ *
+ * - `callback(result)`: 0 on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; `fd` must be a valid socket; `addr` must point to a
+ * valid sockaddr.
+ */
+void lio_connect(struct lio_handle_t *lio,
+                 intptr_t fd,
+                 const sockaddr *addr,
+                 socklen_t addr_len,
+                 void (*callback)(int));
+
+/**
+ * Send data to a specific address (UDP).
+ *
+ * Ownership of `buf` transfers to lio.
+ *
+ * - `callback(result, buf, len)`: bytes sent (or negative errno), buffer
+ *
+ * # Safety
+ * `lio` must be valid; `buf` must be allocated with malloc; `addr` must be
+ * valid.
+ */
+void lio_sendto(struct lio_handle_t *lio,
+                intptr_t fd,
+                uint8_t *buf,
+                uintptr_t buf_len,
+                int flags,
+                const sockaddr *addr,
+                socklen_t addr_len,
+                void (*callback)(int, uint8_t*, uintptr_t));
+
+/**
+ * Receive data and get the sender's address (UDP).
+ *
+ * Ownership of `buf` transfers to lio.
+ *
+ * - `callback(result, buf, len, addr)`: bytes received, buffer, sender address
+ *   (heap-allocated, caller must free)
+ *
+ * # Safety
+ * `lio` must be valid; `buf` must be allocated with malloc.
+ */
+void lio_recvfrom(struct lio_handle_t *lio,
+                  intptr_t fd,
+                  uint8_t *buf,
+                  uintptr_t buf_len,
+                  int flags,
+                  void (*callback)(int, uint8_t*, uintptr_t, const sockaddr_storage*));
+
+/**
+ * Open a file relative to a directory fd.
+ *
+ * - `path`: null-terminated path string
+ * - `flags`: open flags (O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, etc.)
+ * - `mode`: file mode if O_CREAT is set
+ * - `callback(result)`: new fd on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; `dir_fd` must be a valid directory fd or AT_FDCWD;
+ * `path` must be a valid null-terminated string.
+ */
+void lio_openat(struct lio_handle_t *lio,
+                intptr_t dir_fd,
+                const char *path,
+                int flags,
+                mode_t _mode,
+                void (*callback)(intptr_t));
+
+/**
+ * Read from fd at current position.
+ *
+ * Ownership of `buf` transfers to lio.
+ *
+ * - `callback(result, buf, len)`: bytes read (or negative errno), buffer
+ *
+ * # Safety
+ * `lio` must be valid; `buf` must be allocated with malloc.
+ */
+void lio_read(struct lio_handle_t *lio,
+              intptr_t fd,
+              uint8_t *buf,
+              uintptr_t buf_len,
+              void (*callback)(int, uint8_t*, uintptr_t));
+
+/**
+ * Write to fd at current position.
+ *
+ * Ownership of `buf` transfers to lio.
+ *
+ * - `callback(result, buf, len)`: bytes written (or negative errno), buffer
+ *
+ * # Safety
+ * `lio` must be valid; `buf` must be allocated with malloc.
+ */
+void lio_write(struct lio_handle_t *lio,
+               intptr_t fd,
+               uint8_t *buf,
+               uintptr_t buf_len,
+               void (*callback)(int, uint8_t*, uintptr_t));
+
+/**
+ * Apply or remove an advisory lock on a file.
+ *
+ * - `operation`: LOCK_SH, LOCK_EX, LOCK_UN, optionally OR'd with LOCK_NB
+ * - `callback(result)`: 0 on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; `fd` must be a valid file descriptor.
+ */
+void lio_flock(struct lio_handle_t *lio, intptr_t fd, int operation, void (*callback)(int));
+
+/**
+ * Create a symbolic link.
+ *
+ * - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
+ * - `target`: Target path (null-terminated)
+ * - `linkpath`: Link path (null-terminated)
+ * - `callback(result)`: 0 on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; `target` and `linkpath` must be valid null-terminated strings.
+ */
+void lio_symlinkat(struct lio_handle_t *lio,
+                   intptr_t dir_fd,
+                   const char *target,
+                   const char *linkpath,
+                   void (*callback)(int));
+
+/**
+ * Create a hard link.
+ *
+ * - `old_dir_fd`: Directory fd for old path
+ * - `old_path`: Existing file path (null-terminated)
+ * - `new_dir_fd`: Directory fd for new path
+ * - `new_path`: New link path (null-terminated)
+ * - `callback(result)`: 0 on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; paths must be valid null-terminated strings.
+ */
+void lio_linkat(struct lio_handle_t *lio,
+                intptr_t old_dir_fd,
+                const char *old_path,
+                intptr_t new_dir_fd,
+                const char *new_path,
+                void (*callback)(int));
+
+/**
+ * Remove a file or directory.
+ *
+ * - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
+ * - `path`: Path to remove (null-terminated)
+ * - `flags`: 0 for files, AT_REMOVEDIR for directories
+ * - `callback(result)`: 0 on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; `path` must be a valid null-terminated string.
+ */
+void lio_unlinkat(struct lio_handle_t *lio,
+                  intptr_t dir_fd,
+                  const char *path,
+                  int flags,
+                  void (*callback)(int));
+
+/**
+ * Rename a file or directory.
+ *
+ * - `old_dir_fd`: Directory fd for old path
+ * - `old_path`: Current path (null-terminated)
+ * - `new_dir_fd`: Directory fd for new path
+ * - `new_path`: New path (null-terminated)
+ * - `callback(result)`: 0 on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; paths must be valid null-terminated strings.
+ */
+void lio_renameat(struct lio_handle_t *lio,
+                  intptr_t old_dir_fd,
+                  const char *old_path,
+                  intptr_t new_dir_fd,
+                  const char *new_path,
+                  void (*callback)(int));
+
+/**
+ * Create a directory.
+ *
+ * - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
+ * - `path`: Path to create (null-terminated)
+ * - `mode`: Permission bits (e.g., 0755)
+ * - `callback(result)`: 0 on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; `path` must be a valid null-terminated string.
+ */
+void lio_mkdirat(struct lio_handle_t *lio,
+                 intptr_t dir_fd,
+                 const char *path,
+                 mode_t mode,
+                 void (*callback)(int));
+
+/**
+ * Send file data to a socket without copying through userspace.
+ *
+ * - `out_fd`: Destination socket
+ * - `in_fd`: Source file
+ * - `offset`: Starting offset in source (-1 for current position)
+ * - `count`: Number of bytes to send
+ * - `callback(result)`: bytes sent on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; `out_fd` must be a socket; `in_fd` must be a file.
+ */
+void lio_sendfile(struct lio_handle_t *lio,
+                  intptr_t out_fd,
+                  intptr_t in_fd,
+                  int64_t offset,
+                  size_t count,
+                  void (*callback)(ssize_t));
+
+/**
+ * Spawn a new process.
+ *
+ * - `path`: Path to executable (null-terminated)
+ * - `argv`: Null-terminated array of argument strings
+ * - `envp`: Null-terminated array of environment strings, or NULL to inherit
+ * - `callback(result)`: child PID on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; `path` and `argv` must be valid.
+ */
+void lio_spawn(struct lio_handle_t *lio,
+               const char *path,
+               const char *const *argv,
+               const char *const *envp,
+               void (*callback)(int));
+
+/**
+ * Wait for a child process to change state.
+ *
+ * - `id_type`: 0=P_ALL (any child), 1=P_PID (specific pid), 2=P_PGID (process group)
+ * - `id`: PID or PGID depending on id_type (ignored for P_ALL)
+ * - `options`: Wait options (WEXITED=4, WSTOPPED=2, WCONTINUED=8, WNOHANG=1, WNOWAIT=0x1000000)
+ * - `callback(result, pid, status, code)`:
+ *   - result: 0 on success, negative errno on error
+ *   - pid: child PID that changed state (0 if WNOHANG and no child ready)
+ *   - status: 1=exited, 2=signaled, 3=stopped, 4=continued
+ *   - code: exit code or signal number
+ *
+ * # Safety
+ * `lio` must be valid.
+ */
+void lio_waitid(struct lio_handle_t *lio, int id_type, int id, int options, void (*callback)(int,
+                                                                                             int,
+                                                                                             int,
+                                                                                             int));
+
+/**
+ * Copy data between file descriptors without copying to userspace (Linux only).
+ *
+ * Both `fd_in` and `fd_out` must be pipes. This duplicates data from one pipe
+ * to another without consuming it from the source.
+ *
+ * - `fd_in`: Source pipe
+ * - `fd_out`: Destination pipe
+ * - `len`: Maximum bytes to copy
+ * - `callback(result)`: bytes copied on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; both fds must be pipes.
+ */
+void lio_tee(struct lio_handle_t *lio,
+             intptr_t fd_in,
+             intptr_t fd_out,
+             unsigned int len,
+             void (*callback)(ssize_t));
+
+/**
+ * Splice data between file descriptors via a pipe (Linux only).
+ *
+ * At least one of `fd_in` or `fd_out` must be a pipe.
+ *
+ * - `fd_in`: Source file descriptor
+ * - `off_in`: Offset for source (-1 for pipes or current position)
+ * - `fd_out`: Destination file descriptor
+ * - `off_out`: Offset for destination (-1 for pipes or current position)
+ * - `len`: Maximum bytes to transfer
+ * - `flags`: Splice flags (SPLICE_F_MOVE=1, SPLICE_F_NONBLOCK=2, SPLICE_F_MORE=4)
+ * - `callback(result)`: bytes transferred on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; at least one fd must be a pipe.
+ */
+void lio_splice(struct lio_handle_t *lio,
+                intptr_t fd_in,
+                int64_t off_in,
+                intptr_t fd_out,
+                int64_t off_out,
+                unsigned int len,
+                unsigned int flags,
+                void (*callback)(ssize_t));
+
+/**
+ * Copy data between files without going through userspace (Linux only).
+ *
+ * This performs a server-side copy when possible (NFS, Btrfs reflinks).
+ *
+ * - `fd_in`: Source file
+ * - `off_in`: Starting offset in source
+ * - `fd_out`: Destination file
+ * - `off_out`: Starting offset in destination
+ * - `len`: Number of bytes to copy
+ * - `callback(result)`: bytes copied on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; both fds must be regular files.
+ */
+void lio_copy_file_range(struct lio_handle_t *lio,
+                         intptr_t fd_in,
+                         int64_t off_in,
+                         intptr_t fd_out,
+                         int64_t off_out,
+                         size_t len,
+                         void (*callback)(ssize_t));
+
+/**
+ * Watch a file or directory for changes.
+ *
+ * - `path`: Path to watch (null-terminated)
+ * - `mask`: Events to watch for (WATCH_MODIFY=1, WATCH_ATTRIB=2, WATCH_DELETE=4,
+ *           WATCH_RENAME=8, WATCH_EXTEND=16)
+ * - `callback(result)`: events that occurred (positive mask) or negative errno
+ *
+ * # Safety
+ * `lio` must be valid; `path` must be a valid null-terminated string.
+ */
+void lio_watch(struct lio_handle_t *lio,
+               const char *path,
+               unsigned int mask,
+               void (*callback)(int));
+
+/**
+ * Read directory entries from an open directory fd.
+ *
+ * Returns raw directory entries in kernel format. The buffer should be at least
+ * 4096 bytes. Returns 0 when end of directory is reached.
+ *
+ * - `fd`: Open directory file descriptor
+ * - `buf`: Buffer to read entries into (must be malloc'd)
+ * - `buf_len`: Size of buffer
+ * - `callback(result, buf, len)`: bytes read (0=EOF, negative=error), buffer
+ *
+ * # Safety
+ * `lio` must be valid; `fd` must be an open directory; `buf` must be malloc'd.
+ */
+void lio_getdents(struct lio_handle_t *lio,
+                  intptr_t fd,
+                  uint8_t *buf,
+                  size_t buf_len,
+                  void (*callback)(int, uint8_t*, size_t));
+
+/**
+ * Wait for a signal from the specified set.
+ *
+ * The signals must be blocked (via sigprocmask) before calling this function.
+ *
+ * - `signals`: Array of signal numbers to wait for
+ * - `num_signals`: Number of signals in array
+ * - `callback(result)`: signal number received (positive) or negative errno
+ *
+ * # Safety
+ * `lio` must be valid; `signals` must point to `num_signals` valid signal numbers.
+ */
+void lio_signal(struct lio_handle_t *lio,
+                const int *signals,
+                size_t num_signals,
+                void (*callback)(int));
 
 #ifdef __cplusplus
 }  // extern "C"

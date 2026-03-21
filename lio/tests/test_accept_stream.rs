@@ -116,7 +116,7 @@ fn test_accept_stream_with_connections() {
 
   let result = recv1.recv();
   assert!(result.is_ok(), "Accept should succeed");
-  let (client, addr) = result.unwrap();
+  let (_client, addr) = result.unwrap();
   assert!(addr.port() > 0, "Client should have a port");
   count_clone.fetch_add(1, Ordering::SeqCst);
 

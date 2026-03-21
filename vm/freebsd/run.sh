@@ -200,12 +200,12 @@ runcmd:
   - mkdir -p /home/freebsd/lio
   - dd if=/dev/vtbd2 bs=1M 2>/dev/null | tar -xf - -C /home/freebsd/lio
   - chown -R freebsd:freebsd /home/freebsd/lio
-  - echo "=== Building staticlib for FFI tests ==="
-  - su - freebsd -c 'cd ~/lio && cargo build -p lio --all-features --release'
-  - echo "=== Running lib tests ==="
-  - su - freebsd -c 'cd ~/lio && cargo test -p lio --all-features --lib --release --no-fail-fast' || true
-  - echo "=== Running integration tests ==="
-  - su - freebsd -c 'cd ~/lio && cargo test -p lio --all-features --test "*" --release --no-fail-fast' || true
+  - echo "=== Running tests ==="
+  - su - freebsd -c 'cd ~/lio && cargo test -p lio --all-features --release' || true
+  - echo "=== Running doc tests ==="
+  - su - freebsd -c 'cd ~/lio && RUST_BACKTRACE=1 cargo test -p lio --doc --release' || true
+  - echo "=== Running FFI tests ==="
+  - su - freebsd -c 'cd ~/lio && cargo rustc -p lio --crate-type staticlib --features unstable_ffi --release && cargo test -p lio --features unstable_ffi --release --test ffi' || true
   - echo "=== Tests complete ==="
   - poweroff
 CLOUDINIT

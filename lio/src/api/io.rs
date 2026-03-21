@@ -220,7 +220,7 @@ where
   /// ```
   pub fn when_done<F>(self, f: F)
   where
-    F: FnOnce(T::Result) + Send + 'static,
+    F: Fn(T::Result) + Send + 'static,
   {
     let (lio, typed_op) = self.into_lio();
 
@@ -553,8 +553,8 @@ where
 ///     let mut stream = api::accept_stream(&listener).with_lio(lio);
 ///
 ///     while let Some(result) = stream.next().await {
-///         let (client, addr) = result?;
-///         println!("Accepted connection from {}", addr);
+///         let conn = result?;
+///         println!("Accepted connection from {}", conn.peer_addr()?);
 ///         // Handle client...
 ///     }
 ///     Ok(())
@@ -607,8 +607,8 @@ where
   /// # async fn example(lio: &Lio, listener: &Resource) -> std::io::Result<()> {
   /// let mut stream = api::accept_stream(listener).with_lio(lio);
   /// while let Some(result) = stream.next().await {
-  ///     let (client, addr) = result?;
-  ///     println!("New connection from {}", addr);
+  ///     let conn = result?;
+  ///     println!("New connection from {}", conn.peer_addr()?);
   /// }
   /// # Ok(())
   /// # }
@@ -642,10 +642,10 @@ impl<T: StreamOp + Unpin> Future for IoStreamNextFuture<'_, T> {
         let backend_op = op.into_op();
 
         // Use stream registration for multishot support
-        match stream.lio.schedule(
-          backend_op,
-          Registration::new_stream_waker(cx.waker().clone()),
-        ) {
+        match stream
+          .lio
+          .schedule(backend_op, Registration::new_waker(cx.waker().clone()))
+        {
           Ok(id) => {
             stream.state = IoStreamState::Inflight { id };
             Poll::Pending
@@ -744,7 +744,7 @@ where
   /// loop {
   ///     lio.try_run().unwrap();
   ///     match receiver.try_recv() {
-  ///         Ok(Ok((client, addr))) => println!("Got connection from {}", addr),
+  ///         Ok(Ok(conn)) => println!("Got connection from {}", conn.peer_addr().unwrap()),
   ///         Ok(Err(e)) => eprintln!("Accept error: {}", e),
   ///         Err(_) => {} // No item ready yet
   ///     }
@@ -776,7 +776,7 @@ where
   /// // Process items as they arrive
   /// while let Ok(result) = rx.recv() {
   ///     match result {
-  ///         Ok((client, addr)) => println!("Got connection from {}", addr),
+  ///         Ok(conn) => println!("Got connection from {}", conn.peer_addr().unwrap()),
   ///         Err(e) => eprintln!("Accept error: {}", e),
   ///     }
   /// }

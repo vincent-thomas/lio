@@ -127,7 +127,8 @@ fn test_accept_stream_multiple_connections() {
     let mut next_fut = pin!(stream.next());
     match next_fut.as_mut().poll(&mut cx) {
       Poll::Ready(Some(result)) => {
-        let (_client, addr) = result.expect("Accept should succeed");
+        let conn = result.expect("Accept should succeed");
+        let addr = conn.peer_addr().expect("Should get peer address");
         assert!(addr.port() > 0, "Client should have a valid port");
         accepted.fetch_add(1, Ordering::SeqCst);
       }

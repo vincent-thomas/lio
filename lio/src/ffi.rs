@@ -45,7 +45,20 @@ use crate::{
 };
 
 #[cfg(unix)]
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::RawFd;
+
+// ─── Watch mask constants ─────────────────────────────────────────────────────
+
+/// Watch for file content modifications
+pub const WATCH_MODIFY: u32 = 1;
+/// Watch for attribute changes (permissions, ownership, etc.)
+pub const WATCH_ATTRIB: u32 = 2;
+/// Watch for file deletion
+pub const WATCH_DELETE: u32 = 4;
+/// Watch for file rename
+pub const WATCH_RENAME: u32 = 8;
+/// Watch for file size extension (BSD/macOS)
+pub const WATCH_EXTEND: u32 = 16;
 
 // ─── Opaque handle ────────────────────────────────────────────────────────────
 
@@ -69,16 +82,16 @@ unsafe fn handle(ptr: *mut lio_handle_t) -> &'static mut lio_handle_t {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Convert a C `intptr_t` fd to a `Resource`.
+
+/// Convert a C `intptr_t` to a borrowed `Resource` (won't close on drop).
 ///
 /// # Safety
-/// `fd` must be a valid, open file descriptor.
-/// The returned Resource must be forgotten (via `std::mem::forget`) after use
-/// to prevent it from closing the C-owned fd.
+///
+/// `fd` must be a valid, open file descriptor that outlives the Resource.
 #[cfg(unix)]
-unsafe fn fd_to_resource(fd: libc::intptr_t) -> Resource {
-  // SAFETY: caller guarantees fd is valid
-  unsafe { Resource::from_raw_fd(fd as RawFd) }
+unsafe fn fd_to_borrowed_resource(fd: libc::intptr_t) -> Resource {
+  // SAFETY: caller guarantees fd is valid and will outlive this Resource
+  unsafe { Resource::borrow(fd as RawFd) }
 }
 
 /// Convert a `Resource` to a C `intptr_t`.
@@ -195,7 +208,7 @@ pub unsafe extern "C" fn lio_shutdown(
   callback: extern "C" fn(libc::c_int),
 ) {
   // SAFETY: caller guarantees fd is valid per fn contract
-  let resource = unsafe { fd_to_resource(fd) };
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::shutdown(&resource, how)
     .with_lio(&unsafe { handle(lio) }.inner)
@@ -204,8 +217,6 @@ pub unsafe extern "C" fn lio_shutdown(
         Ok(_) => 0,
         Err(e) => -e.raw_os_error().unwrap_or(1),
       });
-      // Don't close the fd - C owns it
-      std::mem::forget(resource);
     });
 }
 
@@ -222,7 +233,7 @@ pub unsafe extern "C" fn lio_fsync(
   callback: extern "C" fn(libc::c_int),
 ) {
   // SAFETY: caller guarantees fd is valid per fn contract
-  let resource = unsafe { fd_to_resource(fd) };
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::fsync(&resource).with_lio(&unsafe { handle(lio) }.inner).when_done(
     move |res| {
@@ -230,8 +241,6 @@ pub unsafe extern "C" fn lio_fsync(
         Ok(_) => 0,
         Err(e) => -e.raw_os_error().unwrap_or(1),
       });
-      // Don't close the fd - C owns it
-      std::mem::forget(resource);
     },
   );
 }
@@ -250,7 +259,7 @@ pub unsafe extern "C" fn lio_truncate(
   callback: extern "C" fn(libc::c_int),
 ) {
   // SAFETY: caller guarantees fd is valid per fn contract
-  let resource = unsafe { fd_to_resource(fd) };
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::truncate(&resource, len)
     .with_lio(&unsafe { handle(lio) }.inner)
@@ -259,8 +268,6 @@ pub unsafe extern "C" fn lio_truncate(
         Ok(_) => 0,
         Err(e) => -e.raw_os_error().unwrap_or(1),
       });
-      // Don't close the fd - C owns it
-      std::mem::forget(resource);
     });
 }
 
@@ -287,7 +294,7 @@ pub unsafe extern "C" fn lio_write_at(
   // SAFETY: C caller transfers malloc ownership of buf with size buf_len
   let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
   // SAFETY: caller guarantees fd is valid per fn contract
-  let resource = unsafe { fd_to_resource(fd) };
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::write_at(&resource, vec, offset)
     .with_lio(&unsafe { handle(lio) }.inner)
@@ -301,8 +308,6 @@ pub unsafe extern "C" fn lio_write_at(
       // Return buffer ownership to C - caller will free it
       std::mem::forget(buf);
       callback(code, ptr, len);
-      // Don't close the fd - C owns it
-      std::mem::forget(resource);
     });
 }
 
@@ -327,7 +332,7 @@ pub unsafe extern "C" fn lio_read_at(
   // SAFETY: C caller transfers malloc ownership of buf with size buf_len
   let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
   // SAFETY: caller guarantees fd is valid per fn contract
-  let resource = unsafe { fd_to_resource(fd) };
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::read_at(&resource, vec, offset)
     .with_lio(&unsafe { handle(lio) }.inner)
@@ -341,8 +346,6 @@ pub unsafe extern "C" fn lio_read_at(
       // Return buffer ownership to C - caller will free it
       std::mem::forget(buf);
       callback(code, ptr, len);
-      // Don't close the fd - C owns it
-      std::mem::forget(resource);
     });
 }
 
@@ -401,7 +404,7 @@ pub unsafe extern "C" fn lio_bind(
     }
   };
   // SAFETY: caller guarantees fd is valid per fn contract
-  let resource = unsafe { fd_to_resource(fd) };
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::bind(&resource, addr).with_lio(&unsafe { handle(lio) }.inner).when_done(
     move |res| {
@@ -409,8 +412,6 @@ pub unsafe extern "C" fn lio_bind(
         Ok(_) => 0,
         Err(e) => -e.raw_os_error().unwrap_or(1),
       });
-      // Don't close the fd - C owns it
-      std::mem::forget(resource);
     },
   );
 }
@@ -430,7 +431,7 @@ pub unsafe extern "C" fn lio_accept(
   callback: extern "C" fn(libc::intptr_t, *const libc::sockaddr_storage),
 ) {
   // SAFETY: caller guarantees fd is valid per fn contract
-  let resource = unsafe { fd_to_resource(fd) };
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::accept(&resource).with_lio(&unsafe { handle(lio) }.inner).when_done(
     move |res| {
@@ -450,8 +451,6 @@ pub unsafe extern "C" fn lio_accept(
         }
       };
       callback(code, addr_ptr);
-      // Don't close the listener fd - C owns it
-      std::mem::forget(resource);
     },
   );
 }
@@ -470,7 +469,7 @@ pub unsafe extern "C" fn lio_listen(
   callback: extern "C" fn(libc::c_int),
 ) {
   // SAFETY: caller guarantees fd is valid per fn contract
-  let resource = unsafe { fd_to_resource(fd) };
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::listen(&resource, backlog)
     .with_lio(&unsafe { handle(lio) }.inner)
@@ -479,8 +478,6 @@ pub unsafe extern "C" fn lio_listen(
         Ok(_) => 0,
         Err(e) => -e.raw_os_error().unwrap_or(1),
       });
-      // Don't close the fd - C owns it
-      std::mem::forget(resource);
     });
 }
 
@@ -505,7 +502,7 @@ pub unsafe extern "C" fn lio_send(
   // SAFETY: C caller transfers malloc ownership of buf with size buf_len
   let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
   // SAFETY: caller guarantees fd is valid per fn contract
-  let resource = unsafe { fd_to_resource(fd) };
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::send(&resource, vec, Some(flags))
     .with_lio(&unsafe { handle(lio) }.inner)
@@ -519,8 +516,6 @@ pub unsafe extern "C" fn lio_send(
       // Return buffer ownership to C - caller will free it
       std::mem::forget(buf);
       callback(code, ptr, len);
-      // Don't close the fd - C owns it
-      std::mem::forget(resource);
     });
 }
 
@@ -545,7 +540,7 @@ pub unsafe extern "C" fn lio_recv(
   // SAFETY: C caller transfers malloc ownership of buf with size buf_len
   let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
   // SAFETY: caller guarantees fd is valid per fn contract
-  let resource = unsafe { fd_to_resource(fd) };
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::recv(&resource, vec, Some(flags))
     .with_lio(&unsafe { handle(lio) }.inner)
@@ -559,8 +554,6 @@ pub unsafe extern "C" fn lio_recv(
       // Return buffer ownership to C - caller will free it
       std::mem::forget(buf);
       callback(code, ptr, len);
-      // Don't close the fd - C owns it
-      std::mem::forget(resource);
     });
 }
 
@@ -607,6 +600,888 @@ pub unsafe extern "C" fn lio_sleep(
     .when_done(move |res| {
       callback(match res {
         Ok(_) => 0,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
+
+/// A no-op that completes immediately.
+///
+/// Useful for waking up the event loop or testing.
+///
+/// - `callback(result)`: always 0
+///
+/// # Safety
+/// `lio` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_nop(
+  lio: *mut lio_handle_t,
+  callback: extern "C" fn(libc::c_int),
+) {
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::nop().with_lio(&unsafe { handle(lio) }.inner).when_done(move |res| {
+    callback(match res {
+      Ok(_) => 0,
+      Err(e) => -e.raw_os_error().unwrap_or(1),
+    });
+  });
+}
+
+/// Connect a socket to an address.
+///
+/// - `callback(result)`: 0 on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; `fd` must be a valid socket; `addr` must point to a
+/// valid sockaddr.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_connect(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  addr: *const libc::sockaddr,
+  addr_len: libc::socklen_t,
+  callback: extern "C" fn(libc::c_int),
+) {
+  let socket_addr = match sockaddr_to_socketaddr(addr, addr_len) {
+    Some(a) => a,
+    None => {
+      callback(-libc::EINVAL);
+      return;
+    }
+  };
+  // SAFETY: caller guarantees fd is valid per fn contract
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::connect(&resource, socket_addr)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(_) => 0,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
+
+/// Send data to a specific address (UDP).
+///
+/// Ownership of `buf` transfers to lio.
+///
+/// - `callback(result, buf, len)`: bytes sent (or negative errno), buffer
+///
+/// # Safety
+/// `lio` must be valid; `buf` must be allocated with malloc; `addr` must be
+/// valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_sendto(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  buf: *mut u8,
+  buf_len: usize,
+  flags: libc::c_int,
+  addr: *const libc::sockaddr,
+  addr_len: libc::socklen_t,
+  callback: extern "C" fn(libc::c_int, *mut u8, usize),
+) {
+  let socket_addr = match sockaddr_to_socketaddr(addr, addr_len) {
+    Some(a) => a,
+    None => {
+      callback(-libc::EINVAL, buf, buf_len);
+      return;
+    }
+  };
+  // SAFETY: C caller transfers malloc ownership of buf with size buf_len
+  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  // SAFETY: caller guarantees fd is valid per fn contract
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::sendto(&resource, vec, socket_addr, Some(flags))
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, mut buf)| {
+      let code = match res {
+        Ok(n) => n,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      };
+      let ptr = buf.as_mut_ptr();
+      let len = buf.len();
+      std::mem::forget(buf);
+      callback(code, ptr, len);
+    });
+}
+
+/// Receive data and get the sender's address (UDP).
+///
+/// Ownership of `buf` transfers to lio.
+///
+/// - `callback(result, buf, len, addr)`: bytes received, buffer, sender address
+///   (heap-allocated, caller must free)
+///
+/// # Safety
+/// `lio` must be valid; `buf` must be allocated with malloc.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_recvfrom(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  buf: *mut u8,
+  buf_len: usize,
+  flags: libc::c_int,
+  callback: extern "C" fn(libc::c_int, *mut u8, usize, *const libc::sockaddr_storage),
+) {
+  // SAFETY: C caller transfers malloc ownership of buf with size buf_len
+  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  // SAFETY: caller guarantees fd is valid per fn contract
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::recvfrom(&resource, vec, Some(flags))
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, mut buf, addr)| {
+      let (code, addr_ptr): (i32, *const libc::sockaddr_storage) = match res {
+        Ok(n) => {
+          let addr_ptr = match addr {
+            Some(a) => Box::into_raw(Box::new(std_socketaddr_into_libc(a))),
+            None => ptr::null_mut(),
+          };
+          (n, addr_ptr)
+        }
+        Err(e) => (-e.raw_os_error().unwrap_or(1), ptr::null()),
+      };
+      let ptr = buf.as_mut_ptr();
+      let len = buf.len();
+      std::mem::forget(buf);
+      callback(code, ptr, len, addr_ptr);
+    });
+}
+
+/// Open a file relative to a directory fd.
+///
+/// - `path`: null-terminated path string
+/// - `flags`: open flags (O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, etc.)
+/// - `mode`: file mode if O_CREAT is set
+/// - `callback(result)`: new fd on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; `dir_fd` must be a valid directory fd or AT_FDCWD;
+/// `path` must be a valid null-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_openat(
+  lio: *mut lio_handle_t,
+  dir_fd: libc::intptr_t,
+  path: *const libc::c_char,
+  flags: libc::c_int,
+  _mode: libc::mode_t,
+  callback: extern "C" fn(libc::intptr_t),
+) {
+  if path.is_null() {
+    callback(-libc::EINVAL as libc::intptr_t);
+    return;
+  }
+  // SAFETY: caller guarantees path is valid null-terminated string
+  let c_path = unsafe { std::ffi::CStr::from_ptr(path) };
+  let path_owned = std::ffi::CString::from(c_path);
+
+  // SAFETY: caller guarantees dir_fd is valid per fn contract
+  let dir_resource = unsafe { fd_to_borrowed_resource(dir_fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::openat(&dir_resource, path_owned, flags)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(r) => {
+          let fd = resource_to_fd(&r);
+          std::mem::forget(r);
+          fd
+        }
+        Err(e) => -e.raw_os_error().unwrap_or(1) as libc::intptr_t,
+      });
+    });
+}
+
+/// Read from fd at current position.
+///
+/// Ownership of `buf` transfers to lio.
+///
+/// - `callback(result, buf, len)`: bytes read (or negative errno), buffer
+///
+/// # Safety
+/// `lio` must be valid; `buf` must be allocated with malloc.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_read(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  buf: *mut u8,
+  buf_len: usize,
+  callback: extern "C" fn(libc::c_int, *mut u8, usize),
+) {
+  // SAFETY: C caller transfers malloc ownership of buf with size buf_len
+  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  // SAFETY: caller guarantees fd is valid per fn contract
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::read(&resource, vec)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, mut buf)| {
+      let code = match res {
+        Ok(n) => n,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      };
+      let ptr = buf.as_mut_ptr();
+      let len = buf.len();
+      std::mem::forget(buf);
+      callback(code, ptr, len);
+    });
+}
+
+/// Write to fd at current position.
+///
+/// Ownership of `buf` transfers to lio.
+///
+/// - `callback(result, buf, len)`: bytes written (or negative errno), buffer
+///
+/// # Safety
+/// `lio` must be valid; `buf` must be allocated with malloc.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_write(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  buf: *mut u8,
+  buf_len: usize,
+  callback: extern "C" fn(libc::c_int, *mut u8, usize),
+) {
+  // SAFETY: C caller transfers malloc ownership of buf with size buf_len
+  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  // SAFETY: caller guarantees fd is valid per fn contract
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::write(&resource, vec)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, mut buf)| {
+      let code = match res {
+        Ok(n) => n,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      };
+      let ptr = buf.as_mut_ptr();
+      let len = buf.len();
+      std::mem::forget(buf);
+      callback(code, ptr, len);
+    });
+}
+
+/// Apply or remove an advisory lock on a file.
+///
+/// - `operation`: LOCK_SH, LOCK_EX, LOCK_UN, optionally OR'd with LOCK_NB
+/// - `callback(result)`: 0 on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; `fd` must be a valid file descriptor.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_flock(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  operation: libc::c_int,
+  callback: extern "C" fn(libc::c_int),
+) {
+  // SAFETY: caller guarantees fd is valid per fn contract
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::flock(&resource, operation)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(_) => 0,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
+
+/// Create a symbolic link.
+///
+/// - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
+/// - `target`: Target path (null-terminated)
+/// - `linkpath`: Link path (null-terminated)
+/// - `callback(result)`: 0 on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; `target` and `linkpath` must be valid null-terminated strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_symlinkat(
+  lio: *mut lio_handle_t,
+  dir_fd: libc::intptr_t,
+  target: *const libc::c_char,
+  linkpath: *const libc::c_char,
+  callback: extern "C" fn(libc::c_int),
+) {
+  if target.is_null() || linkpath.is_null() {
+    callback(-libc::EINVAL);
+    return;
+  }
+  // SAFETY: caller guarantees strings are valid per fn contract
+  let target_cstr = unsafe { std::ffi::CStr::from_ptr(target) }.to_owned();
+  let linkpath_cstr = unsafe { std::ffi::CStr::from_ptr(linkpath) }.to_owned();
+  // SAFETY: caller guarantees dir_fd is valid per fn contract
+  let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::symlinkat(&dir_res, target_cstr, linkpath_cstr)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(_) => 0,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
+
+/// Create a hard link.
+///
+/// - `old_dir_fd`: Directory fd for old path
+/// - `old_path`: Existing file path (null-terminated)
+/// - `new_dir_fd`: Directory fd for new path
+/// - `new_path`: New link path (null-terminated)
+/// - `callback(result)`: 0 on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; paths must be valid null-terminated strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_linkat(
+  lio: *mut lio_handle_t,
+  old_dir_fd: libc::intptr_t,
+  old_path: *const libc::c_char,
+  new_dir_fd: libc::intptr_t,
+  new_path: *const libc::c_char,
+  callback: extern "C" fn(libc::c_int),
+) {
+  if old_path.is_null() || new_path.is_null() {
+    callback(-libc::EINVAL);
+    return;
+  }
+  // SAFETY: caller guarantees strings are valid per fn contract
+  let old_path_cstr = unsafe { std::ffi::CStr::from_ptr(old_path) }.to_owned();
+  let new_path_cstr = unsafe { std::ffi::CStr::from_ptr(new_path) }.to_owned();
+  // SAFETY: caller guarantees fds are valid per fn contract
+  let old_dir_res = unsafe { fd_to_borrowed_resource(old_dir_fd) };
+  let new_dir_res = unsafe { fd_to_borrowed_resource(new_dir_fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::linkat(&old_dir_res, old_path_cstr, new_dir_res, new_path_cstr)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(_) => 0,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
+
+/// Remove a file or directory.
+///
+/// - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
+/// - `path`: Path to remove (null-terminated)
+/// - `flags`: 0 for files, AT_REMOVEDIR for directories
+/// - `callback(result)`: 0 on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; `path` must be a valid null-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_unlinkat(
+  lio: *mut lio_handle_t,
+  dir_fd: libc::intptr_t,
+  path: *const libc::c_char,
+  flags: libc::c_int,
+  callback: extern "C" fn(libc::c_int),
+) {
+  if path.is_null() {
+    callback(-libc::EINVAL);
+    return;
+  }
+  // SAFETY: caller guarantees string is valid per fn contract
+  let path_cstr = unsafe { std::ffi::CStr::from_ptr(path) }.to_owned();
+  // SAFETY: caller guarantees dir_fd is valid per fn contract
+  let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::unlinkat(&dir_res, path_cstr, flags)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(_) => 0,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
+
+/// Rename a file or directory.
+///
+/// - `old_dir_fd`: Directory fd for old path
+/// - `old_path`: Current path (null-terminated)
+/// - `new_dir_fd`: Directory fd for new path
+/// - `new_path`: New path (null-terminated)
+/// - `callback(result)`: 0 on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; paths must be valid null-terminated strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_renameat(
+  lio: *mut lio_handle_t,
+  old_dir_fd: libc::intptr_t,
+  old_path: *const libc::c_char,
+  new_dir_fd: libc::intptr_t,
+  new_path: *const libc::c_char,
+  callback: extern "C" fn(libc::c_int),
+) {
+  if old_path.is_null() || new_path.is_null() {
+    callback(-libc::EINVAL);
+    return;
+  }
+  // SAFETY: caller guarantees strings are valid per fn contract
+  let old_path_cstr = unsafe { std::ffi::CStr::from_ptr(old_path) }.to_owned();
+  let new_path_cstr = unsafe { std::ffi::CStr::from_ptr(new_path) }.to_owned();
+  // SAFETY: caller guarantees fds are valid per fn contract
+  let old_dir_res = unsafe { fd_to_borrowed_resource(old_dir_fd) };
+  let new_dir_res = unsafe { fd_to_borrowed_resource(new_dir_fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::renameat(&old_dir_res, old_path_cstr, &new_dir_res, new_path_cstr)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(_) => 0,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
+
+/// Create a directory.
+///
+/// - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
+/// - `path`: Path to create (null-terminated)
+/// - `mode`: Permission bits (e.g., 0755)
+/// - `callback(result)`: 0 on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; `path` must be a valid null-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_mkdirat(
+  lio: *mut lio_handle_t,
+  dir_fd: libc::intptr_t,
+  path: *const libc::c_char,
+  mode: libc::mode_t,
+  callback: extern "C" fn(libc::c_int),
+) {
+  if path.is_null() {
+    callback(-libc::EINVAL);
+    return;
+  }
+  // SAFETY: caller guarantees string is valid per fn contract
+  let path_cstr = unsafe { std::ffi::CStr::from_ptr(path) }.to_owned();
+  // SAFETY: caller guarantees dir_fd is valid per fn contract
+  let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::mkdirat(&dir_res, path_cstr, mode.into())
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(_) => 0,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
+
+/// Send file data to a socket without copying through userspace.
+///
+/// - `out_fd`: Destination socket
+/// - `in_fd`: Source file
+/// - `offset`: Starting offset in source (-1 for current position)
+/// - `count`: Number of bytes to send
+/// - `callback(result)`: bytes sent on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; `out_fd` must be a socket; `in_fd` must be a file.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_sendfile(
+  lio: *mut lio_handle_t,
+  out_fd: libc::intptr_t,
+  in_fd: libc::intptr_t,
+  offset: i64,
+  count: libc::size_t,
+  callback: extern "C" fn(libc::ssize_t),
+) {
+  // SAFETY: caller guarantees fds are valid per fn contract
+  let out_res = unsafe { fd_to_borrowed_resource(out_fd) };
+  let in_res = unsafe { fd_to_borrowed_resource(in_fd) };
+  let off = if offset < 0 { None } else { Some(offset) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::sendfile(&out_res, &in_res, off, count)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(n) => n as libc::ssize_t,
+        Err(e) => -(e.raw_os_error().unwrap_or(1) as libc::ssize_t),
+      });
+    });
+}
+
+/// Spawn a new process.
+///
+/// - `path`: Path to executable (null-terminated)
+/// - `argv`: Null-terminated array of argument strings
+/// - `envp`: Null-terminated array of environment strings, or NULL to inherit
+/// - `callback(result)`: child PID on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; `path` and `argv` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_spawn(
+  lio: *mut lio_handle_t,
+  path: *const libc::c_char,
+  argv: *const *const libc::c_char,
+  envp: *const *const libc::c_char,
+  callback: extern "C" fn(libc::c_int),
+) {
+  if path.is_null() || argv.is_null() {
+    callback(-libc::EINVAL);
+    return;
+  }
+
+  // SAFETY: caller guarantees path is valid per fn contract
+  let path_cstr = unsafe { std::ffi::CStr::from_ptr(path) }.to_owned();
+
+  // Parse argv
+  let mut argv_vec = Vec::new();
+  let mut i = 0;
+  // SAFETY: caller guarantees argv is null-terminated per fn contract
+  loop {
+    let arg = unsafe { *argv.add(i) };
+    if arg.is_null() {
+      break;
+    }
+    argv_vec.push(unsafe { std::ffi::CStr::from_ptr(arg) }.to_owned());
+    i += 1;
+  }
+
+  // Parse envp if provided
+  let envp_opt = if envp.is_null() {
+    None
+  } else {
+    let mut envp_vec = Vec::new();
+    let mut i = 0;
+    // SAFETY: caller guarantees envp is null-terminated per fn contract
+    loop {
+      let env = unsafe { *envp.add(i) };
+      if env.is_null() {
+        break;
+      }
+      envp_vec.push(unsafe { std::ffi::CStr::from_ptr(env) }.to_owned());
+      i += 1;
+    }
+    Some(envp_vec)
+  };
+
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::spawn(path_cstr, argv_vec, envp_opt)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(pid) => pid,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
+
+/// Wait for a child process to change state.
+///
+/// - `id_type`: 0=P_ALL (any child), 1=P_PID (specific pid), 2=P_PGID (process group)
+/// - `id`: PID or PGID depending on id_type (ignored for P_ALL)
+/// - `options`: Wait options (WEXITED=4, WSTOPPED=2, WCONTINUED=8, WNOHANG=1, WNOWAIT=0x1000000)
+/// - `callback(result, pid, status, code)`:
+///   - result: 0 on success, negative errno on error
+///   - pid: child PID that changed state (0 if WNOHANG and no child ready)
+///   - status: 1=exited, 2=signaled, 3=stopped, 4=continued
+///   - code: exit code or signal number
+///
+/// # Safety
+/// `lio` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_waitid(
+  lio: *mut lio_handle_t,
+  id_type: libc::c_int,
+  id: libc::c_int,
+  options: libc::c_int,
+  callback: extern "C" fn(libc::c_int, libc::c_int, libc::c_int, libc::c_int),
+) {
+  use api::ops::{WaitOptions, WaitTarget};
+
+  let target = match id_type {
+    0 => WaitTarget::Any,      // P_ALL
+    1 => WaitTarget::Pid(id),  // P_PID
+    2 => WaitTarget::Pgid(id), // P_PGID
+    _ => {
+      callback(-libc::EINVAL, 0, 0, 0);
+      return;
+    }
+  };
+
+  // Construct WaitOptions from raw flags
+  let mut opts = WaitOptions::empty();
+  if (options & libc::WEXITED) != 0 {
+    opts = opts | WaitOptions::EXITED;
+  }
+  if (options & libc::WSTOPPED) != 0 {
+    opts = opts | WaitOptions::STOPPED;
+  }
+  if (options & libc::WCONTINUED) != 0 {
+    opts = opts | WaitOptions::CONTINUED;
+  }
+  if (options & libc::WNOHANG) != 0 {
+    opts = opts | WaitOptions::NOHANG;
+  }
+  if (options & libc::WNOWAIT) != 0 {
+    opts = opts | WaitOptions::NOWAIT;
+  }
+
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::waitid(target, opts)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| match res {
+      Ok(Some(status)) => {
+        let (status_type, code) = if status.exited() {
+          (1, status.exit_code().unwrap_or(0))
+        } else if status.signaled() {
+          (2, status.signal().unwrap_or(0))
+        } else if status.stopped() {
+          (3, status.signal().unwrap_or(0))
+        } else if status.continued() {
+          (4, 0)
+        } else {
+          (0, 0)
+        };
+        callback(0, status.pid, status_type, code);
+      }
+      Ok(None) => callback(0, 0, 0, 0), // WNOHANG and no child ready
+      Err(e) => callback(-e.raw_os_error().unwrap_or(1), 0, 0, 0),
+    });
+}
+
+/// Copy data between file descriptors without copying to userspace (Linux only).
+///
+/// Both `fd_in` and `fd_out` must be pipes. This duplicates data from one pipe
+/// to another without consuming it from the source.
+///
+/// - `fd_in`: Source pipe
+/// - `fd_out`: Destination pipe
+/// - `len`: Maximum bytes to copy
+/// - `callback(result)`: bytes copied on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; both fds must be pipes.
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_tee(
+  lio: *mut lio_handle_t,
+  fd_in: libc::intptr_t,
+  fd_out: libc::intptr_t,
+  len: libc::c_uint,
+  callback: extern "C" fn(libc::ssize_t),
+) {
+  // SAFETY: caller guarantees fds are valid per fn contract
+  let res_in = unsafe { fd_to_borrowed_resource(fd_in) };
+  let res_out = unsafe { fd_to_borrowed_resource(fd_out) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::tee(&res_in, res_out, len)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(n) => n as libc::ssize_t,
+        Err(e) => -(e.raw_os_error().unwrap_or(1) as libc::ssize_t),
+      });
+    });
+}
+
+/// Splice data between file descriptors via a pipe (Linux only).
+///
+/// At least one of `fd_in` or `fd_out` must be a pipe.
+///
+/// - `fd_in`: Source file descriptor
+/// - `off_in`: Offset for source (-1 for pipes or current position)
+/// - `fd_out`: Destination file descriptor
+/// - `off_out`: Offset for destination (-1 for pipes or current position)
+/// - `len`: Maximum bytes to transfer
+/// - `flags`: Splice flags (SPLICE_F_MOVE=1, SPLICE_F_NONBLOCK=2, SPLICE_F_MORE=4)
+/// - `callback(result)`: bytes transferred on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; at least one fd must be a pipe.
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_splice(
+  lio: *mut lio_handle_t,
+  fd_in: libc::intptr_t,
+  off_in: i64,
+  fd_out: libc::intptr_t,
+  off_out: i64,
+  len: libc::c_uint,
+  flags: libc::c_uint,
+  callback: extern "C" fn(libc::ssize_t),
+) {
+  // SAFETY: caller guarantees fds are valid per fn contract
+  let res_in = unsafe { fd_to_borrowed_resource(fd_in) };
+  let res_out = unsafe { fd_to_borrowed_resource(fd_out) };
+  let off_in_opt = if off_in < 0 { None } else { Some(off_in) };
+  let off_out_opt = if off_out < 0 { None } else { Some(off_out) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::splice(&res_in, off_in_opt, &res_out, off_out_opt, len, flags)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(n) => n as libc::ssize_t,
+        Err(e) => -(e.raw_os_error().unwrap_or(1) as libc::ssize_t),
+      });
+    });
+}
+
+/// Copy data between files without going through userspace (Linux only).
+///
+/// This performs a server-side copy when possible (NFS, Btrfs reflinks).
+///
+/// - `fd_in`: Source file
+/// - `off_in`: Starting offset in source
+/// - `fd_out`: Destination file
+/// - `off_out`: Starting offset in destination
+/// - `len`: Number of bytes to copy
+/// - `callback(result)`: bytes copied on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; both fds must be regular files.
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_copy_file_range(
+  lio: *mut lio_handle_t,
+  fd_in: libc::intptr_t,
+  off_in: i64,
+  fd_out: libc::intptr_t,
+  off_out: i64,
+  len: libc::size_t,
+  callback: extern "C" fn(libc::ssize_t),
+) {
+  // SAFETY: caller guarantees fds are valid per fn contract
+  let res_in = unsafe { fd_to_borrowed_resource(fd_in) };
+  let res_out = unsafe { fd_to_borrowed_resource(fd_out) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::copy_file_range(&res_in, off_in, &res_out, off_out, len, 0)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(n) => n as libc::ssize_t,
+        Err(e) => -(e.raw_os_error().unwrap_or(1) as libc::ssize_t),
+      });
+    });
+}
+
+/// Watch a file or directory for changes.
+///
+/// - `path`: Path to watch (null-terminated)
+/// - `mask`: Events to watch for (WATCH_MODIFY=1, WATCH_ATTRIB=2, WATCH_DELETE=4,
+///           WATCH_RENAME=8, WATCH_EXTEND=16)
+/// - `callback(result)`: events that occurred (positive mask) or negative errno
+///
+/// # Safety
+/// `lio` must be valid; `path` must be a valid null-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_watch(
+  lio: *mut lio_handle_t,
+  path: *const libc::c_char,
+  mask: libc::c_uint,
+  callback: extern "C" fn(libc::c_int),
+) {
+  if path.is_null() {
+    callback(-libc::EINVAL);
+    return;
+  }
+  // SAFETY: caller guarantees path is valid per fn contract
+  let path_str = unsafe { std::ffi::CStr::from_ptr(path) };
+  // SAFETY: CStr bytes are valid UTF-8 or platform-native encoding
+  let path_os = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(path_str.to_bytes()) };
+  let watch_mask = api::ops::WatchMask::from_bits(mask);
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::watch(path_os, watch_mask)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(events) => events.bits() as libc::c_int,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
+
+/// Read directory entries from an open directory fd.
+///
+/// Returns raw directory entries in kernel format. The buffer should be at least
+/// 4096 bytes. Returns 0 when end of directory is reached.
+///
+/// - `fd`: Open directory file descriptor
+/// - `buf`: Buffer to read entries into (must be malloc'd)
+/// - `buf_len`: Size of buffer
+/// - `callback(result, buf, len)`: bytes read (0=EOF, negative=error), buffer
+///
+/// # Safety
+/// `lio` must be valid; `fd` must be an open directory; `buf` must be malloc'd.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_getdents(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  buf: *mut u8,
+  buf_len: libc::size_t,
+  callback: extern "C" fn(libc::c_int, *mut u8, libc::size_t),
+) {
+  // SAFETY: C caller transfers malloc ownership of buf with size buf_len
+  let vec = unsafe { Vec::from_raw_parts(buf, 0, buf_len) };
+  // SAFETY: caller guarantees fd is valid per fn contract
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::getdents(&resource, vec)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, mut buf, _entries)| {
+      // We ignore the parsed entries and just return raw bytes
+      let code = match res {
+        Ok(n) => n,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      };
+      let ptr = buf.as_mut_ptr();
+      let len = buf.len();
+      std::mem::forget(buf);
+      callback(code, ptr, len);
+    });
+}
+
+/// Wait for a signal from the specified set.
+///
+/// The signals must be blocked (via sigprocmask) before calling this function.
+///
+/// - `signals`: Array of signal numbers to wait for
+/// - `num_signals`: Number of signals in array
+/// - `callback(result)`: signal number received (positive) or negative errno
+///
+/// # Safety
+/// `lio` must be valid; `signals` must point to `num_signals` valid signal numbers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_signal(
+  lio: *mut lio_handle_t,
+  signals: *const libc::c_int,
+  num_signals: libc::size_t,
+  callback: extern "C" fn(libc::c_int),
+) {
+  if signals.is_null() && num_signals > 0 {
+    callback(-libc::EINVAL);
+    return;
+  }
+
+  let mut sigset = api::ops::SignalSet::empty();
+  for i in 0..num_signals {
+    // SAFETY: caller guarantees signals array is valid per fn contract
+    let sig = unsafe { *signals.add(i) };
+    sigset.add(sig);
+  }
+
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::signal(sigset)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(sig) => sig,
         Err(e) => -e.raw_os_error().unwrap_or(1),
       });
     });

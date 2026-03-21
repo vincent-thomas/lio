@@ -116,39 +116,33 @@ type Inner = RawHandle;
 ///
 /// This type holds the actual platform resource (file descriptor or handle) and a flag
 /// indicating whether it should be automatically closed when dropped.
-struct Owned {
+struct InnerResource {
   /// The platform-specific resource (RawFd on Unix, RawHandle on Windows)
   inner: Inner,
-  // /// Whether to automatically close this resource on drop (not yet implemented)
-  // should_close: AtomicBool,
+  /// Whether to automatically close this resource on drop.
+  should_close: bool,
 }
 
-impl Owned {
-  /// Creates a new owned resource.
-  ///
-  /// By default, `should_close` is false, meaning the resource will NOT be automatically
-  /// closed on drop. This must be explicitly enabled via `Resource::close()`.
+impl InnerResource {
+  /// Creates a new owned resource that will be closed on drop.
   fn new(inner: Inner) -> Self {
-    Self { inner /*should_close: AtomicBool::new(true)*/ }
+    Self { inner, should_close: true }
+  }
+
+  /// Creates a new borrowed resource that will NOT be closed on drop.
+  fn new_borrowed(inner: Inner) -> Self {
+    Self { inner, should_close: false }
   }
 }
 
-impl Drop for Owned {
-  /// Drops the owned resource, potentially closing it automatically.
-  ///
-  /// If `should_close` is true, this will close the underlying resource. Currently
-  /// unimplemented and will panic if enabled.
+impl Drop for InnerResource {
+  /// Drops the owned resource, closing it automatically if `should_close` is true.
   fn drop(&mut self) {
-    // if self.should_close.load(Ordering::Acquire) {
+    if !self.should_close {
+      return;
+    }
+
     let _ = syscall!(close(self.inner));
-    // let op = api::close(UniqueResource(Owned {
-    //   inner: self.inner,
-    //   should_close: AtomicBool::new(true),
-    // }));
-    //
-    // // NOTE: Is this really neccessary?
-    // let _ = op.blocking();
-    // }
   }
 }
 
@@ -156,7 +150,7 @@ impl Drop for Owned {
 ///
 /// See the [module documentation](self) for usage examples and details.
 #[derive(Clone)]
-pub struct Resource(Arc<Owned>);
+pub struct Resource(Arc<InnerResource>);
 
 /// Trait for types that can be converted into a [`Resource`].
 ///
@@ -270,14 +264,31 @@ impl_native_convervions!(Resource);
 #[cfg(unix)]
 impl std::os::fd::FromRawFd for Resource {
   unsafe fn from_raw_fd(fd: std::os::fd::RawFd) -> Self {
-    Resource(Arc::new(Owned::new(fd)))
+    Resource(Arc::new(InnerResource::new(fd)))
+  }
+}
+
+impl Resource {
+  /// Creates a Resource that borrows a file descriptor without taking ownership.
+  ///
+  /// The fd/handle will NOT be closed when this Resource is dropped. Use this when the
+  /// fd is owned by external code (e.g., C FFI callers).
+  ///
+  /// # Safety
+  ///
+  /// The caller must ensure:
+  /// - `fd` is a valid file descriptor
+  /// - `fd` remains valid for the lifetime of this Resource and any clones
+  // TODO: should this be unsafe?
+  pub unsafe fn borrow(fd: Inner) -> Self {
+    Resource(Arc::new(InnerResource::new_borrowed(fd)))
   }
 }
 
 #[cfg(windows)]
 impl std::os::windows::io::FromRawHandle for Resource {
   unsafe fn from_raw_handle(handle: RawHandle) -> Self {
-    Resource(Arc::new(Owned::new(handle)))
+    Resource(Arc::new(InnerResource::new(handle)))
   }
 }
 
@@ -474,6 +485,34 @@ impl Resource {
         dup_handle as *mut std::ffi::c_void,
       )
     }
+  }
+
+  /// Returns a `Resource` representing the current working directory.
+  ///
+  /// This is a special resource that can be used with `openat` and similar
+  /// operations to resolve paths relative to the current working directory.
+  ///
+  /// Unlike other resources, this does **not** represent a real file descriptor
+  /// and will not be closed when dropped. It uses the special `AT_FDCWD` constant.
+  ///
+  /// # Examples
+  ///
+  /// ```rust,no_run
+  /// use lio::api::resource::Resource;
+  /// use std::ffi::CString;
+  ///
+  /// async fn open_file() -> std::io::Result<Resource> {
+  ///     let cwd = Resource::cwd();
+  ///     let path = CString::new("myfile.txt").unwrap();
+  ///     lio::api::openat(&cwd, path, libc::O_RDONLY).await
+  /// }
+  /// ```
+  #[cfg(unix)]
+  pub fn cwd() -> Self {
+    // SAFETY: AT_FDCWD is a special constant (-100 on Linux, -2 on macOS)
+    // that tells *at() syscalls to use the current working directory.
+    // We use borrow_fd so it won't be closed on drop.
+    unsafe { Self::borrow(libc::AT_FDCWD) }
   }
 
   /// Returns the number of strong references to this resource.
