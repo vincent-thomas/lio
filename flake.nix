@@ -146,7 +146,10 @@
             text =
               (
                 if pkgs.stdenv.hostPlatform.isLinux then
-                  "export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include\n"
+                  ''
+                    export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include
+                    export LIBCLANG_PATH=${pkgs.llvmPackages.libclang.lib}/lib
+                  ''
                 else
                   ""
               )
@@ -156,6 +159,9 @@
               [
                 (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
                 jq
+              ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                pkgs.llvmPackages.libclang.lib
               ];
           };
           test-ffi = pkgs.writeShellApplication {
@@ -163,7 +169,10 @@
             text =
               (
                 if pkgs.stdenv.hostPlatform.isLinux then
-                  "export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include\n"
+                  ''
+                    export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include
+                    export LIBCLANG_PATH=${pkgs.llvmPackages.libclang.lib}/lib
+                  ''
                 else
                   ""
               )
@@ -176,6 +185,9 @@
                 gcc
                 pkg-config
               ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                pkgs.llvmPackages.libclang.lib
+              ]
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
                 pkgs.libiconv
               ];
@@ -185,14 +197,22 @@
             text =
               (
                 if pkgs.stdenv.hostPlatform.isLinux then
-                  "export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include\n"
+                  ''
+                    export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include
+                    export LIBCLANG_PATH=${pkgs.llvmPackages.libclang.lib}/lib
+                  ''
                 else
                   ""
               )
               + builtins.readFile ./scripts/test-lio-uring.sh;
-            runtimeInputs = with pkgs; [
-              (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-            ];
+            runtimeInputs =
+              with pkgs;
+              [
+                (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+              ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                pkgs.llvmPackages.libclang.lib
+              ];
           };
           lint = pkgs.writeShellApplication {
             name = "lio-lint";
