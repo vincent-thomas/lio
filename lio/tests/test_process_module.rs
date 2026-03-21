@@ -111,7 +111,7 @@ fn test_command_try_wait_running() {
   let lio = Lio::new(64).unwrap();
 
   // Use cat with piped stdin - it blocks waiting for input
-  let mut recv = Command::new("/bin/cat")
+  let mut recv = Command::new("/bin/sh")
     .stdin(Stdio::Piped)
     .spawn()
     .with_lio(&lio)
@@ -138,7 +138,7 @@ fn test_command_kill() {
   let lio = Lio::new(64).unwrap();
 
   // Use cat with piped stdin - it blocks waiting for input
-  let mut recv = Command::new("/bin/cat")
+  let mut recv = Command::new("/bin/sh")
     .stdin(Stdio::Piped)
     .spawn()
     .with_lio(&lio)
@@ -158,7 +158,7 @@ fn test_command_signal() {
   let lio = Lio::new(64).unwrap();
 
   // Use cat with piped stdin - it blocks waiting for input
-  let mut recv = Command::new("/bin/cat")
+  let mut recv = Command::new("/bin/sh")
     .stdin(Stdio::Piped)
     .spawn()
     .with_lio(&lio)
@@ -266,7 +266,7 @@ fn test_exit_status_methods() {
   assert_eq!(status.signal(), None);
 
   // Test signaled process - use cat with piped stdin
-  let mut recv = Command::new("/bin/cat")
+  let mut recv = Command::new("/bin/sh")
     .stdin(Stdio::Piped)
     .spawn()
     .with_lio(&lio)
@@ -290,7 +290,7 @@ fn test_child_dropped_without_wait() {
 
   // This test ensures that dropping a Child without waiting doesn't leave zombies
   {
-    let mut recv = Command::new("/bin/cat")
+    let mut recv = Command::new("/bin/sh")
       .stdin(Stdio::Piped)
       .spawn()
       .with_lio(&lio)

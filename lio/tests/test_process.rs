@@ -51,17 +51,29 @@ fn test_waitid_child_exit() {
 fn test_waitid_nohang_no_child() {
   let lio = Lio::new(64).unwrap();
 
-  // Use fork+pause for a reliable long-running child (works in nix sandbox)
+  // Create pipe for synchronization
+  let mut pipefd: [libc::c_int; 2] = [0; 2];
+  unsafe { libc::pipe(pipefd.as_mut_ptr()) };
+
   let pid = unsafe { libc::fork() };
 
   match pid {
     -1 => panic!("fork failed"),
     0 => {
-      // Child: sleep forever
+      // Child: close read end, signal ready, then pause
+      unsafe { libc::close(pipefd[0]) };
+      unsafe { libc::write(pipefd[1], b"x".as_ptr() as *const _, 1) };
+      unsafe { libc::close(pipefd[1]) };
       unsafe { libc::pause() };
       std::process::exit(0);
     }
     child_pid => {
+      // Parent: close write end, wait for child to be ready
+      unsafe { libc::close(pipefd[1]) };
+      let mut buf = [0u8; 1];
+      unsafe { libc::read(pipefd[0], buf.as_mut_ptr() as *mut _, 1) };
+      unsafe { libc::close(pipefd[0]) };
+
       // Try to wait with NOHANG - should return None since child is still running
       let mut result = api::waitid(
         WaitTarget::Pid(child_pid),
