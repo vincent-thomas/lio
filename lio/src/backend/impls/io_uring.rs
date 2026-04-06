@@ -52,7 +52,7 @@ fn create_io_uring_entry(op: &Op) -> Entry {
       // Use AcceptMulti for multishot accept (no address - caller uses getpeername)
       AcceptMulti::new(fd.as_raw_fd()).build()
     }
-    Op::Connect { fd, addr, len, .. } => {
+    Op::Connect { fd, addr, len } => {
       Connect::new(fd.as_raw_fd(), (*addr) as *const libc::sockaddr, *len)
         .build()
     }

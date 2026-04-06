@@ -106,39 +106,42 @@ impl TcpListener {
     Ok(TcpListener(socket))
   }
 
-  /// Creates a new `TcpListener` which will be bound to the specified address synchronously.
-  ///
-  /// This is the blocking version of [`bind_async`](Self::bind_async). It will block the
-  /// current thread until the socket is created, bound, and listening.
-  ///
-  /// Note: This method performs DNS resolution synchronously (blocking) using
-  /// `ToSocketAddrs::to_socket_addrs()`.
-  ///
-  /// # Examples
-  ///
-  /// ```rust,no_run
-  /// use lio::net::TcpListener;
-  ///
-  /// fn example() -> std::io::Result<()> {
-  ///     // This will block until the listener is ready
-  ///     let listener = TcpListener::bind_sync("127.0.0.1:8080")?;
-  ///
-  ///     Ok(())
-  /// }
-  /// ```
-  #[allow(deprecated)]
-  pub fn bind_sync(addr: impl ToSocketAddrs) -> io::Result<Self> {
-    let mut addrs = addr.to_socket_addrs()?;
-    let addr = addrs.next().ok_or_else(|| {
-      io::Error::new(io::ErrorKind::NotFound, "no addresses resolved")
-    })?;
-
-    let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-    let socket = Socket::new(domain, libc::SOCK_STREAM, 0).wait()?;
-    socket.bind(addr).wait()?;
-    socket.listen().wait()?;
-    Ok(TcpListener(socket))
-  }
+  // DEPRECATED: bind_sync removed - Io<T>.wait() no longer exists after StreamOp migration.
+  // Use bind_async() instead.
+  //
+  // /// Creates a new `TcpListener` which will be bound to the specified address synchronously.
+  // ///
+  // /// This is the blocking version of [`bind_async`](Self::bind_async). It will block the
+  // /// current thread until the socket is created, bound, and listening.
+  // ///
+  // /// Note: This method performs DNS resolution synchronously (blocking) using
+  // /// `ToSocketAddrs::to_socket_addrs()`.
+  // ///
+  // /// # Examples
+  // ///
+  // /// ```rust,no_run
+  // /// use lio::net::TcpListener;
+  // ///
+  // /// fn example() -> std::io::Result<()> {
+  // ///     // This will block until the listener is ready
+  // ///     let listener = TcpListener::bind_sync("127.0.0.1:8080")?;
+  // ///
+  // ///     Ok(())
+  // /// }
+  // /// ```
+  // #[allow(deprecated)]
+  // pub fn bind_sync(addr: impl ToSocketAddrs) -> io::Result<Self> {
+  //   let mut addrs = addr.to_socket_addrs()?;
+  //   let addr = addrs.next().ok_or_else(|| {
+  //     io::Error::new(io::ErrorKind::NotFound, "no addresses resolved")
+  //   })?;
+  //
+  //   let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+  //   let socket = Socket::new(domain, libc::SOCK_STREAM, 0).wait()?;
+  //   socket.bind(addr).wait()?;
+  //   socket.listen().wait()?;
+  //   Ok(TcpListener(socket))
+  // }
 
   /// Accepts a new incoming connection from this listener.
   ///
@@ -287,65 +290,71 @@ impl TcpSocket {
     Ok(TcpSocket(socket))
   }
 
-  /// Opens a TCP connection to a remote host synchronously.
-  ///
-  /// This is the blocking version of [`connect_async`](Self::connect_async). It will block
-  /// the current thread until the connection is established.
-  ///
-  /// # Examples
-  ///
-  /// ```rust,no_run
-  /// use std::net::SocketAddr;
-  /// use lio::net::TcpSocket;
-  ///
-  /// fn example() -> std::io::Result<()> {
-  ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-  ///     // This will block until connected
-  ///     let socket = TcpSocket::connect_sync(addr)?;
-  ///
-  ///     Ok(())
-  /// }
-  /// ```
-  #[allow(deprecated)]
-  pub fn connect_sync(addr: SocketAddr) -> io::Result<Self> {
-    let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-    let socket = Socket::new(domain, libc::SOCK_STREAM, 0).wait()?;
-    api::connect(&socket, addr).wait()?;
-    Ok(TcpSocket(socket))
-  }
+  // DEPRECATED: connect_sync removed - Io<T>.wait() no longer exists after StreamOp migration.
+  // Use connect_async() instead.
+  //
+  // /// Opens a TCP connection to a remote host synchronously.
+  // ///
+  // /// This is the blocking version of [`connect_async`](Self::connect_async). It will block
+  // /// the current thread until the connection is established.
+  // ///
+  // /// # Examples
+  // ///
+  // /// ```rust,no_run
+  // /// use std::net::SocketAddr;
+  // /// use lio::net::TcpSocket;
+  // ///
+  // /// fn example() -> std::io::Result<()> {
+  // ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+  // ///     // This will block until connected
+  // ///     let socket = TcpSocket::connect_sync(addr)?;
+  // ///
+  // ///     Ok(())
+  // /// }
+  // /// ```
+  // #[allow(deprecated)]
+  // pub fn connect_sync(addr: SocketAddr) -> io::Result<Self> {
+  //   let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+  //   let socket = Socket::new(domain, libc::SOCK_STREAM, 0).wait()?;
+  //   api::connect(&socket, addr).wait()?;
+  //   Ok(TcpSocket(socket))
+  // }
 
-  /// Opens a TCP connection to a remote host by hostname synchronously.
-  ///
-  /// Both DNS resolution and connection are performed synchronously.
-  ///
-  /// # Examples
-  ///
-  /// ```rust,no_run
-  /// use lio::net::TcpSocket;
-  ///
-  /// fn example() -> std::io::Result<()> {
-  ///     // This will block until connected
-  ///     let socket = TcpSocket::connect_host_sync("example.com:80")?;
-  ///
-  ///     Ok(())
-  /// }
-  /// ```
-  #[allow(deprecated)]
-  pub fn connect_host_sync(addr: impl ToSocketAddrs) -> io::Result<Self> {
-    let addrs = addr.to_socket_addrs()?;
-
-    let mut last_err = None;
-    for addr in addrs {
-      match Self::connect_sync(addr) {
-        Ok(socket) => return Ok(socket),
-        Err(e) => last_err = Some(e),
-      }
-    }
-
-    Err(last_err.unwrap_or_else(|| {
-      io::Error::new(io::ErrorKind::NotFound, "no addresses resolved")
-    }))
-  }
+  // DEPRECATED: connect_host_sync removed - depends on connect_sync which was removed.
+  // Use connect_host_async() instead (if it exists) or implement using async DNS + connect_async().
+  //
+  // /// Opens a TCP connection to a remote host by hostname synchronously.
+  // ///
+  // /// Both DNS resolution and connection are performed synchronously.
+  // ///
+  // /// # Examples
+  // ///
+  // /// ```rust,no_run
+  // /// use lio::net::TcpSocket;
+  // ///
+  // /// fn example() -> std::io::Result<()> {
+  // ///     // This will block until connected
+  // ///     let socket = TcpSocket::connect_host_sync("example.com:80")?;
+  // ///
+  // ///     Ok(())
+  // /// }
+  // /// ```
+  // #[allow(deprecated)]
+  // pub fn connect_host_sync(addr: impl ToSocketAddrs) -> io::Result<Self> {
+  //   let addrs = addr.to_socket_addrs()?;
+  //
+  //   let mut last_err = None;
+  //   for addr in addrs {
+  //     match Self::connect_sync(addr) {
+  //       Ok(socket) => return Ok(socket),
+  //       Err(e) => last_err = Some(e),
+  //     }
+  //   }
+  //
+  //   Err(last_err.unwrap_or_else(|| {
+  //     io::Error::new(io::ErrorKind::NotFound, "no addresses resolved")
+  //   }))
+  // }
 
   /// Receives data from the socket into the provided buffer.
   ///

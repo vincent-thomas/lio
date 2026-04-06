@@ -19,7 +19,12 @@ use std::{
 };
 
 use crate::{
-  api::{op::TypedOp, ops, resource::FromResource, resource::Resource},
+  api::{
+    op::{OpModel, Step},
+    ops,
+    resource::FromResource,
+    resource::Resource,
+  },
   fs::{File, OpenOptions},
 };
 
@@ -65,31 +70,33 @@ impl OpenAtFile {
   }
 }
 
-impl TypedOp for OpenAtFile {
-  type Result = io::Result<File>;
-
-  fn into_op(&mut self) -> crate::backend::op::Op {
-    match &mut self.inner {
-      Ok(inner) => inner.into_op(),
-      Err(_) => {
-        // Return a no-op that will fail immediately
-        // The actual error will be returned in extract_result
-        crate::backend::op::Op::Nop
-      }
-    }
-  }
-
-  fn extract_result(self, res: isize) -> Self::Result {
-    match self.inner {
-      Ok(inner) => {
-        // Don't close AT_FDCWD - it's a special constant
-        // The inner OpenAt holds a clone of the Resource, and we need to
-        // prevent it from closing AT_FDCWD when dropped.
-        // This is handled by the extract_result which consumes the inner.
-        let resource = inner.extract_result(res)?;
-        Ok(File::from_resource(resource))
-      }
-      Err(e) => Err(e),
-    }
-  }
-}
+// LEGACY `OpModel` impl parked during the serial-contract migration.
+//
+// impl OpModel for OpenAtFile {
+//   type Item = io::Result<File>;
+//
+//   fn start(&mut self) -> Op {
+//     match &mut self.inner {
+//       Ok(inner) => inner.start(),
+//       Err(_) => {
+//         // Return a no-op that will fail immediately
+//         // The actual error will be returned in result
+//         crate::backend::op::Op::Nop
+//       }
+//     }
+//   }
+//
+//   fn process(&mut self, res: isize) -> Step<Self::Item> {
+//     let inner =
+//       std::mem::replace(&mut self.inner, Err(io::Error::from_raw_os_error(0)));
+//     match inner {
+//       Ok(mut inner_op) => {
+//         // Don't close AT_FDCWD - it's a special constant
+//         // The inner OpenAt holds a clone of the Resource, and we need to
+//         // prevent it from closing AT_FDCWD when dropped.
+//         inner_op.process(res)
+//       }
+//       Err(e) => Step::Done(Err(e)),
+//     }
+//   }
+// }

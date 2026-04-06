@@ -20,15 +20,15 @@ use os::kqueue as sys;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use core::slice;
-use std::collections::HashMap;
-use std::io;
-use std::os::fd::RawFd;
-use std::time::Duration;
+use std::{
+  io,
+  os::fd::{AsRawFd, RawFd},
+  time::Duration,
+};
 
-use crate::backend::pollingv2::interest::Interest;
-use crate::backend::{IoBackend, OpCompleted};
-// use crate::operation::Operation;
+use crate::backend::{
+  IoBackend, OpCompleted, op::Op, pollingv2::interest::Interest,
+};
 mod interest;
 
 /// Trait for OS-specific readiness polling implementations
@@ -46,7 +46,7 @@ mod interest;
 /// Implementations of this trait are intentionally `!Send` to ensure they are
 /// used only from a single thread. This allows for more efficient interior
 /// mutability without synchronization overhead.
-pub trait ReadinessPoll {
+pub(super) trait ReadinessPoll {
   /// The native event type used by this implementation
   type NativeEvent;
 
@@ -145,14 +145,7 @@ impl Default for Events {
 impl Events {
   /// Create a new empty events collection with specified capacity
   pub fn with_capacity(capacity: usize) -> Self {
-    // SAFETY: The native event type (libc::kevent or libc::epoll_event) is a C struct
-    // that is safe to zero-initialize. All fields are primitive types where zero is valid.
-    Self { events: vec![unsafe { std::mem::zeroed() }; capacity] }
-  }
-
-  /// Get an iterator over the events
-  pub fn iter(&self) -> EventsIter<'_> {
-    EventsIter { events: self, index: 0 }
+    Self { events: Vec::with_capacity(capacity) }
   }
 
   /// Get the number of events
@@ -160,23 +153,27 @@ impl Events {
     self.events.len()
   }
 
+  #[inline]
   pub fn is_empty(&self) -> bool {
     self.len() == 0
   }
 
   /// Returns the vec of maybe-initialised values. Meant for OS to fill and
   /// then we set correct length.
-  unsafe fn as_raw_buf(
-    &mut self,
-  ) -> &mut [<sys::OsPoller as ReadinessPoll>::NativeEvent] {
-    // SAFETY: We create a slice spanning the full capacity of the vector.
-    // The caller must ensure they call set_len() with the actual number of events
-    // written by the OS before reading the events. The pointer is valid because
-    // it comes from a Vec that owns the allocation.
+  fn as_buf(&mut self) -> &mut [<sys::OsPoller as ReadinessPoll>::NativeEvent] {
+    assert!(
+      self.events.is_empty(),
+      "lio logic error: Left over items during Events::as_buf call."
+    );
+    let spare = self.events.spare_capacity_mut();
+    // SAFETY: The OS wait syscall will initialize up to `spare.len()` entries.
+    // `set_len()` is called afterward with the actual initialized count.
     unsafe {
-      slice::from_raw_parts_mut(
-        self.events.as_mut_ptr(),
-        self.events.capacity(),
+      std::slice::from_raw_parts_mut(
+        spare
+          .as_mut_ptr()
+          .cast::<<sys::OsPoller as ReadinessPoll>::NativeEvent>(),
+        spare.len(),
       )
     }
   }
@@ -188,75 +185,39 @@ impl Events {
     unsafe { self.events.set_len(len) }
   }
 
-  fn clear(&mut self) {
-    self.events.clear();
+  fn pop(&mut self) -> Option<Event> {
+    let native_event = self.events.pop()?;
+    let key = sys::OsPoller::event_key(&native_event);
+    let interest = sys::OsPoller::event_interest(&native_event);
+    let fflags = sys::OsPoller::event_fflags(&native_event);
+
+    Some(Event { key, interest, fflags })
   }
-
-  fn get_event(&self, index: usize) -> Event {
-    assert!(index < self.events.len(), "get_event: index out of bounds");
-    let native_event = &self.events[index];
-    let key = sys::OsPoller::event_key(native_event);
-    let interest = sys::OsPoller::event_interest(native_event);
-    let fflags = sys::OsPoller::event_fflags(native_event);
-
-    Event { key, interest, fflags }
-  }
-}
-
-/// Iterator over events
-pub struct EventsIter<'a> {
-  events: &'a Events,
-  index: usize,
-}
-
-impl<'a> Iterator for EventsIter<'a> {
-  type Item = Event;
-
-  fn next(&mut self) -> Option<Self::Item> {
-    if self.index >= self.events.len() {
-      return None;
-    }
-
-    let event = self.events.get_event(self.index);
-    self.index += 1;
-
-    // Filter out internal events (notification and wheel timer)
-    if sys::OsPoller::is_wheel_timer_key(event.key) || event.key == u64::MAX {
-      return self.next();
-    }
-
-    Some(event)
-  }
-}
-
-/// Registered operation entry - all state needed for completion in one place.
-enum Entry {
-  /// Standard async I/O - wait for readiness, run op
-  Async { fd: RawFd, interest: Interest, op: crate::backend::op::Op },
-  /// Level-triggered stream - drain loop on readiness
-  Stream { fd: RawFd, op: crate::backend::op::Op },
-  /// Timer - complete when it fires
-  Timer { op: crate::backend::op::Op },
-  /// Timeout wrapper - fd + timer; timer fires = cancel fd
-  #[cfg(unix)]
-  Timeout { fd: RawFd, timer_result: i32, op: crate::backend::op::Op },
-  /// Watch - owned fd to close on completion
-  #[cfg(unix)]
-  Watch { entry_fd: RawFd, watch_fd: RawFd, is_inotify: bool },
-  /// Signal - complete with signal number
-  #[cfg(unix)]
-  Signal { sig: RawFd },
 }
 
 /// Polling-based I/O backend for epoll (Linux) and kqueue (BSD/macOS).
 #[derive(Default)]
 pub struct Poller {
   sys: Option<sys::OsPoller>,
-  entries: HashMap<u64, Entry>,
   events: Events,
-  immediate: Vec<(u64, isize)>,
+  capacity: usize,
+  backlog: Vec<BacklogEntry>,
+  /// Operations that have been registered with the poller and are waiting for readiness
+  pending: std::collections::HashMap<u64, BacklogEntry>,
+  /// Immediate completions produced during `flush()` and surfaced on the next `wait()`.
+  queued_completed: Vec<OpCompleted>,
+  /// Reusable buffer for completed operations
   completed: Vec<OpCompleted>,
 }
+
+pub struct BacklogEntry {
+  id: u64,
+  op: crate::backend::op::Op,
+}
+
+// EAGAIN and EWOULDBLOCK are the same on Linux, but may differ on other systems
+const EAGAIN_NEG: isize = -(libc::EAGAIN as isize);
+const EWOULDBLOCK_NEG: isize = -(libc::EWOULDBLOCK as isize);
 
 impl Poller {
   pub fn new() -> Self {
@@ -268,946 +229,388 @@ impl Poller {
     self.sys.as_ref().expect("Poller not initialized")
   }
 
-  /// Execute a syscall for the given operation.
+  /// Perform vectored read, choosing the appropriate syscall based on offset and flags
   #[inline]
-  fn run_op(op: &crate::backend::op::Op) -> isize {
+  fn do_readv(
+    fd: RawFd,
+    iovecs: *const libc::iovec,
+    iov_count: usize,
+    offset: i64,
+    flags: i32,
+  ) -> isize {
+    if offset < -1 || iovecs == std::ptr::null() {
+      return -(libc::EINVAL as isize);
+    }
+
+    const RWF_HIPRI: i32 = 0x00000001;
+    const RWF_DSYNC: i32 = 0x00000002;
+    const RWF_SYNC: i32 = 0x00000004;
+    const RWF_APPEND: i32 = 0x00000010;
+
+    const ALL_KNOWN_FLAGS: i32 = RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
+
+    // Validate inputs
+    if flags & !ALL_KNOWN_FLAGS != 0 {
+      return -(libc::ENOTSUP as isize);
+    }
+
+    // Linux: native preadv2 support
+    #[cfg(target_os = "linux")]
+    return syscall!(raw preadv2(fd, iovecs, iov_count as i32, offset, flags));
+
+    #[cfg(not(target_os = "linux"))]
+    {
+      // Non-Linux: Emulate flags (all are no-ops for reads)
+      let result = if offset == -1 {
+        syscall!(raw readv(fd, iovecs, iov_count as i32)?)
+      } else {
+        syscall!(raw preadv(fd, iovecs, iov_count as i32, offset)?)
+      };
+
+      assert!(result >= 0, "error did not return");
+      result
+    }
+  }
+
+  /// Perform vectored write, choosing the appropriate syscall based on offset and flags
+  #[inline]
+  fn do_writev(
+    fd: RawFd,
+    iovecs: *const libc::iovec,
+    iov_count: usize,
+    offset: i64,
+    flags: i32,
+  ) -> isize {
+    if offset < -1 || iovecs == std::ptr::null() {
+      return -(libc::EINVAL as isize);
+    }
+    const RWF_HIPRI: i32 = 0x00000001;
+    const RWF_DSYNC: i32 = 0x00000002;
+    const RWF_SYNC: i32 = 0x00000004;
+    const RWF_APPEND: i32 = 0x00000010;
+
+    const ALL_KNOWN_FLAGS: i32 = RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
+
+    // Validate inputs
+    if flags & !ALL_KNOWN_FLAGS != 0 {
+      return -(libc::ENOTSUP as isize);
+    }
+
+    // Linux: native pwritev2 support
+    #[cfg(target_os = "linux")]
+    return syscall!(raw pwritev2(fd, iovecs, iov_count as i32, offset, flags));
+
+    #[cfg(not(target_os = "linux"))]
+    {
+      let has_dsync = flags & RWF_DSYNC != 0;
+      let has_sync = flags & RWF_SYNC != 0;
+      let has_append = flags & RWF_APPEND != 0;
+
+      // Emulate RWF_APPEND: write at end of file
+      let write_offset = if has_append {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let result = syscall!(raw fstat(fd, &mut stat)?);
+        assert_eq!(result, 0);
+        let file_size = stat.st_size as i64;
+        file_size
+      } else {
+        offset
+      };
+
+      let result = if write_offset == -1 {
+        syscall!(raw writev(fd, iovecs, iov_count as i32)?)
+      } else {
+        syscall!(raw pwritev(fd, iovecs, iov_count as i32, write_offset)?)
+      };
+
+      assert!(result >= 0, "error did not return");
+
+      // RWF_SYNC takes precedence over RWF_DSYNC
+      if has_sync {
+        let _ = syscall!(raw fsync(fd)?);
+      } else if has_dsync {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let _ = syscall!(raw fcntl(fd, libc::F_FULLFSYNC)?);
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let _ = syscall!(raw fdatasync(fd)?);
+      }
+      result
+    }
+  }
+
+  /// Extract fd and interest from an operation
+  fn extract_fd_interest(
+    &self,
+    op: &crate::backend::op::Op,
+  ) -> (RawFd, Interest) {
+    match op {
+      crate::backend::op::Op::Read { fd, .. } => {
+        (fd.as_raw_fd(), Interest::READ)
+      }
+      crate::backend::op::Op::Write { fd, .. } => {
+        (fd.as_raw_fd(), Interest::WRITE)
+      }
+      crate::backend::op::Op::Recv { fd, .. } => {
+        (fd.as_raw_fd(), Interest::READ)
+      }
+      crate::backend::op::Op::Send { fd, .. } => {
+        (fd.as_raw_fd(), Interest::WRITE)
+      }
+      crate::backend::op::Op::Accept { fd, .. } => {
+        (fd.as_raw_fd(), Interest::READ)
+      }
+      crate::backend::op::Op::Connect { fd, .. } => {
+        (fd.as_raw_fd(), Interest::WRITE)
+      }
+      crate::backend::op::Op::Nop => (0, Interest::NONE),
+    }
+  }
+
+  fn should_complete_immediately(op: &crate::backend::op::Op) -> bool {
+    let fd = match op {
+      Op::Read { fd, .. } | Op::Write { fd, .. } => fd.as_raw_fd(),
+      _ => return false,
+    };
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if syscall!(raw fstat(fd, &mut stat)) < 0 {
+      return false;
+    }
+
+    (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
+  }
+
+  /// Validate malformed ops that should fail immediately without readiness registration.
+  fn validate_op(op: &crate::backend::op::Op) -> Option<isize> {
+    match op {
+      Op::Read { iovecs, offset, flags, .. } => {
+        if *offset < -1 || iovecs.is_null() {
+          return Some(-(libc::EINVAL as isize));
+        }
+
+        const RWF_HIPRI: i32 = 0x00000001;
+        const RWF_DSYNC: i32 = 0x00000002;
+        const RWF_SYNC: i32 = 0x00000004;
+        const RWF_APPEND: i32 = 0x00000010;
+        const ALL_KNOWN_FLAGS: i32 =
+          RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
+
+        if flags & !ALL_KNOWN_FLAGS != 0 {
+          return Some(-(libc::ENOTSUP as isize));
+        }
+
+        None
+      }
+      Op::Write { iovecs, offset, flags, .. } => {
+        if *offset < -1 || iovecs.is_null() {
+          return Some(-(libc::EINVAL as isize));
+        }
+
+        const RWF_HIPRI: i32 = 0x00000001;
+        const RWF_DSYNC: i32 = 0x00000002;
+        const RWF_SYNC: i32 = 0x00000004;
+        const RWF_APPEND: i32 = 0x00000010;
+        const ALL_KNOWN_FLAGS: i32 =
+          RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
+
+        if flags & !ALL_KNOWN_FLAGS != 0 {
+          return Some(-(libc::ENOTSUP as isize));
+        }
+
+        None
+      }
+      _ => None,
+    }
+  }
+
+  /// Try to execute an operation (non-blocking syscall)
+  /// Returns positive on success (bytes transferred), negative on error (-errno)
+  fn exec_op(op: &crate::backend::op::Op) -> isize {
     use crate::backend::op::Op;
-    use std::os::fd::AsRawFd;
 
     match op {
-      Op::Send { fd, flags, buf } => {
-        syscall!(raw send(fd.as_raw_fd(), buf.ptr as *const _, buf.len, *flags))
+      Op::Read { fd, iovecs, iov_count, offset, flags } => Self::do_readv(
+        fd.as_raw_fd(),
+        iovecs.cast::<libc::iovec>(),
+        *iov_count,
+        *offset,
+        *flags,
+      ),
+
+      Op::Write { fd, iovecs, iov_count, offset, flags } => Self::do_writev(
+        fd.as_raw_fd(),
+        iovecs.cast::<libc::iovec>(),
+        *iov_count,
+        *offset,
+        *flags,
+      ),
+
+      Op::Recv { fd, msg, flags } => {
+        let fd = fd.as_raw_fd();
+        syscall!(raw recvmsg(fd, *msg, *flags))
       }
-      Op::Recv { fd, flags, buf } => {
-        syscall!(raw recv(fd.as_raw_fd(), buf.ptr as *mut _, buf.len, *flags))
+
+      Op::Send { fd, msg, flags } => {
+        let fd = fd.as_raw_fd();
+        syscall!(raw sendmsg(fd, *msg as *mut _, *flags))
       }
-      Op::SendTo { fd, flags, buf, addr, addrlen, .. } => {
-        syscall!(raw sendto(fd.as_raw_fd(), buf.ptr as *const _, buf.len, *flags, *addr as *const libc::sockaddr, *addrlen))
-      }
-      Op::RecvFrom { fd, flags, buf, addr, addrlen, .. } => {
-        syscall!(raw recvfrom(fd.as_raw_fd(), buf.ptr as *mut _, buf.len, *flags, *addr as *mut libc::sockaddr, *addrlen))
-      }
+
       Op::Accept { fd, addr, len } => {
-        syscall!(raw accept(fd.as_raw_fd(), *addr as *mut _, *len))
+        let fd = fd.as_raw_fd();
+        syscall!(raw accept(fd, (*addr).cast(), *len))
       }
-      Op::AcceptStream { fd } => {
-        syscall!(raw accept(fd.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut()))
-      }
-      Op::Connect { fd, addr, len, connect_called } => {
-        let ret = syscall!(raw connect(fd.as_raw_fd(), *addr as *const libc::sockaddr, *len));
-        if ret == -(libc::EISCONN as isize) && *connect_called {
+
+      Op::Connect { fd, .. } => {
+        let fd = fd.as_raw_fd();
+        let mut err: i32 = 0;
+        let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+        let ret = syscall!(raw getsockopt(
+          fd,
+          libc::SOL_SOCKET,
+          libc::SO_ERROR,
+          (&mut err as *mut i32).cast(),
+          &mut len,
+        ));
+
+        if ret < 0 {
+          ret
+        } else if err == 0 {
           0
         } else {
-          ret
+          -(err as isize)
         }
       }
-      Op::Bind { fd, addr, addrlen } => {
-        syscall!(raw bind(fd.as_raw_fd(), *addr as *const libc::sockaddr, *addrlen))
-      }
-      Op::Listen { fd, backlog } => {
-        syscall!(raw listen(fd.as_raw_fd(), *backlog))
-      }
-      Op::Shutdown { fd, how } => {
-        syscall!(raw shutdown(fd.as_raw_fd(), *how))
-      }
-      Op::Socket { domain, ty, proto } => {
-        syscall!(raw socket(*domain, *ty, *proto))
-      }
-      Op::OpenAt { dir_fd, path, flags, mode } => {
-        syscall!(raw openat(dir_fd.as_raw_fd(), *path, *flags, *mode))
-      }
-      Op::Close { fd } => {
-        syscall!(raw close(*fd))
-      }
-      Op::Fsync { fd } => {
-        syscall!(raw fsync(fd.as_raw_fd()))
-      }
-      Op::Truncate { fd, size } => {
-        syscall!(raw ftruncate(fd.as_raw_fd(), *size as libc::off_t))
-      }
-      Op::LinkAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
-        syscall!(raw linkat(old_dir_fd.as_raw_fd(), *old_path, new_dir_fd.as_raw_fd(), *new_path, 0))
-      }
-      Op::SymlinkAt { target, linkpath, dir_fd } => {
-        syscall!(raw symlinkat(*target, dir_fd.as_raw_fd(), *linkpath))
-      }
-      Op::UnlinkAt { dir_fd, path, flags } => {
-        syscall!(raw unlinkat(dir_fd.as_raw_fd(), *path, *flags))
-      }
-      Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
-        syscall!(raw renameat(old_dir_fd.as_raw_fd(), *old_path, new_dir_fd.as_raw_fd(), *new_path))
-      }
-      Op::MkdirAt { dir_fd, path, mode } => {
-        syscall!(raw mkdirat(dir_fd.as_raw_fd(), *path, *mode as libc::mode_t))
-      }
-      Op::ReadV { fd, iovecs, iov_count, .. } => {
-        syscall!(raw readv(fd.as_raw_fd(), *iovecs, *iov_count as libc::c_int))
-      }
-      Op::WriteV { fd, iovecs, iov_count, .. } => {
-        syscall!(raw writev(fd.as_raw_fd(), *iovecs, *iov_count as libc::c_int))
-      }
-      Op::ReadVAt { fd, iovecs, iov_count, offset, .. } => {
-        syscall!(raw preadv(fd.as_raw_fd(), *iovecs, *iov_count as libc::c_int, *offset))
-      }
-      Op::WriteVAt { fd, iovecs, iov_count, offset, .. } => {
-        syscall!(raw pwritev(fd.as_raw_fd(), *iovecs, *iov_count as libc::c_int, *offset))
-      }
-      Op::Sleep { duration, .. } => {
-        std::thread::sleep(*duration);
-        0
-      }
+
       Op::Nop => 0,
-      #[cfg(target_os = "linux")]
-      Op::Splice { fd_in, off_in, fd_out, off_out, len, flags } => {
-        let mut off_in_val = *off_in;
-        let mut off_out_val = *off_out;
-        let off_in_ptr =
-          if *off_in == -1 { std::ptr::null_mut() } else { &mut off_in_val };
-        let off_out_ptr =
-          if *off_out == -1 { std::ptr::null_mut() } else { &mut off_out_val };
-        syscall!(raw splice(fd_in.as_raw_fd(), off_in_ptr, fd_out.as_raw_fd(), off_out_ptr, *len as usize, *flags as libc::c_uint))
-      }
-      #[cfg(target_os = "linux")]
-      Op::SendFile { out_fd, in_fd, offset, count } => {
-        let mut off = *offset;
-        syscall!(raw sendfile(out_fd.as_raw_fd(), in_fd.as_raw_fd(), &mut off, *count))
-      }
-      #[cfg(all(unix, not(target_os = "linux")))]
-      Op::SendFile { out_fd, in_fd, offset, count } => {
-        #[cfg(target_vendor = "apple")]
-        {
-          let mut len: libc::off_t = *count as libc::off_t;
-          let ret = syscall!(raw sendfile(in_fd.as_raw_fd(), out_fd.as_raw_fd(), *offset, &mut len, std::ptr::null_mut(), 0));
-          if ret == 0 { len as isize } else { ret }
-        }
-        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-        {
-          let mut sbytes: libc::off_t = 0;
-          let ret = syscall!(raw sendfile(in_fd.as_raw_fd(), out_fd.as_raw_fd(), *offset, *count, std::ptr::null_mut(), &mut sbytes, 0));
-          if ret == 0 { sbytes as isize } else { ret }
-        }
-        #[cfg(not(any(
-          target_vendor = "apple",
-          target_os = "freebsd",
-          target_os = "dragonfly"
-        )))]
-        {
-          // sendfile not supported on this platform
-          let _ = (out_fd, in_fd, offset, count);
-          -(libc::ENOTSUP as isize)
-        }
-      }
-      #[cfg(target_os = "linux")]
-      Op::CopyFileRange { fd_in, off_in, fd_out, off_out, len, flags } => {
-        let mut off_in_val = *off_in;
-        let mut off_out_val = *off_out;
-        syscall!(raw copy_file_range(fd_in.as_raw_fd(), &mut off_in_val, fd_out.as_raw_fd(), &mut off_out_val, *len, *flags as libc::c_uint))
-      }
-      #[cfg(target_os = "linux")]
-      Op::Tee { fd_in, fd_out, size } => {
-        syscall!(raw tee(fd_in.as_raw_fd(), fd_out.as_raw_fd(), *size as libc::size_t, 0))
-      }
-      #[cfg(unix)]
-      Op::Timeout { .. } => -(libc::ENOTSUP as isize),
-      #[cfg(unix)]
-      Op::Watch { .. } => -(libc::ENOTSUP as isize),
-      #[cfg(unix)]
-      Op::Waitid { idtype, id, options, infop } => {
-        syscall!(raw waitid(*idtype, *id, *infop, *options))
-      }
-      #[cfg(unix)]
-      Op::Spawn { path, argv, envp, pid, file_actions } => {
-        // SAFETY: All pointers are valid and owned by the Op
-        let ret = unsafe {
-          libc::posix_spawn(
-            *pid,
-            *path,
-            *file_actions,
-            std::ptr::null(),
-            *argv as *const *mut _,
-            *envp as *const *mut _,
-          )
-        };
-        if ret == 0 { 0 } else { -(ret as isize) }
-      }
-      #[cfg(unix)]
-      Op::Flock { fd, operation } => {
-        syscall!(raw flock(fd.as_raw_fd(), *operation))
-      }
-      #[cfg(unix)]
-      Op::GetDents { fd, buf } => {
-        #[cfg(target_os = "linux")]
-        {
-          syscall!(raw syscall(libc::SYS_getdents64, fd.as_raw_fd(), buf.ptr as *mut libc::c_void, buf.len))
-        }
-        #[cfg(target_os = "macos")]
-        {
-          unsafe extern "C" {
-            fn __getdirentries64(
-              fd: libc::c_int,
-              buf: *mut libc::c_char,
-              nbytes: libc::c_int,
-              basep: *mut libc::c_long,
-            ) -> libc::c_int;
-          }
-          let mut basep: libc::c_long = 0;
-          // SAFETY: fd is a valid directory fd, buf is a valid buffer
-          let ret = unsafe {
-            __getdirentries64(
-              fd.as_raw_fd(),
-              buf.ptr as *mut libc::c_char,
-              buf.len as libc::c_int,
-              &mut basep,
-            )
-          };
-          if ret < 0 {
-            -(std::io::Error::last_os_error()
-              .raw_os_error()
-              .unwrap_or(libc::EIO) as isize)
-          } else {
-            ret as isize
-          }
-        }
-        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-        {
-          unsafe extern "C" {
-            fn getdirentries(
-              fd: libc::c_int,
-              buf: *mut libc::c_char,
-              nbytes: libc::c_int,
-              basep: *mut libc::c_long,
-            ) -> libc::c_int;
-          }
-          let mut basep: libc::c_long = 0;
-          let ret = unsafe {
-            getdirentries(
-              fd.as_raw_fd(),
-              buf.ptr as *mut libc::c_char,
-              buf.len as libc::c_int,
-              &mut basep,
-            )
-          };
-          if ret < 0 {
-            -(std::io::Error::last_os_error()
-              .raw_os_error()
-              .unwrap_or(libc::EIO) as isize)
-          } else {
-            ret as isize
-          }
-        }
-        #[cfg(not(any(
-          target_os = "linux",
-          target_os = "macos",
-          target_os = "freebsd",
-          target_os = "dragonfly"
-        )))]
-        {
-          let _ = (fd, buf);
-          -(libc::ENOTSUP as isize)
-        }
-      }
-      #[cfg(unix)]
-      Op::Signal { .. } => -(libc::ENOTSUP as isize),
     }
   }
-}
-
-impl Poller {
-  fn push_entry(&mut self, id: u64, entry: Entry) -> io::Result<()> {
-    use Entry::*;
-    match &entry {
-      Async { fd, interest, .. } => {
-        self.sys().add(*fd, id, *interest)?;
-      }
-      Stream { fd, .. } => {
-        // Set non-blocking for drain loop
-        // SAFETY: fcntl with F_GETFL is safe on any valid fd
-        let flags = unsafe { libc::fcntl(*fd, libc::F_GETFL) };
-        if flags != -1 {
-          // SAFETY: fcntl with F_SETFL is safe on any valid fd
-          unsafe { libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        }
-        self.sys().add_level(*fd, id, Interest::READ)?;
-      }
-      Timer { .. } => unreachable!("Timer handled separately"),
-      #[cfg(unix)]
-      Timeout { fd, .. } => {
-        self.sys().add(*fd, id, Interest::READ)?; // fd interest
-        self.sys().add(id as RawFd, id, Interest::TIMER)?; // timer
-      }
-      #[cfg(unix)]
-      Watch { entry_fd, is_inotify, .. } => {
-        if *is_inotify {
-          self.sys().add(*entry_fd, id, Interest::READ)?;
-        } else {
-          #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "dragonfly",
-            target_os = "openbsd",
-            target_os = "netbsd"
-          ))]
-          self.sys().add_vnode(*entry_fd, id, 0)?;
-        }
-      }
-      #[cfg(unix)]
-      Signal { sig } => {
-        #[cfg(target_os = "linux")]
-        self.sys().add(*sig, id, Interest::READ)?;
-        #[cfg(any(
-          target_os = "macos",
-          target_os = "ios",
-          target_os = "freebsd",
-          target_os = "dragonfly",
-          target_os = "openbsd",
-          target_os = "netbsd"
-        ))]
-        self.sys().add_signal(*sig, id)?;
-      }
-    }
-    self.entries.insert(id, entry);
-    Ok(())
-  }
-
-  fn handle_event(&mut self, id: u64, event: &Event) -> io::Result<()> {
-    use Entry::*;
-
-    let Some(entry) = self.entries.get(&id) else { return Ok(()) };
-
-    match entry {
-      // Timeout: timer fired = cancel, fd ready = complete normally
-      #[cfg(unix)]
-      Timeout { fd, timer_result, op } if event.interest.is_timer() => {
-        let result = *timer_result as isize;
-        let fd = *fd;
-        self.entries.remove(&id);
-        let _ = self.sys().delete(fd);
-        self.sys().delete_timer(id)?;
-        self.completed.push(OpCompleted::new(id, result));
-      }
-
-      // Watch: read result and cleanup
-      #[cfg(unix)]
-      Watch { entry_fd, watch_fd, is_inotify } => {
-        let (entry_fd, watch_fd, is_inotify) =
-          (*entry_fd, *watch_fd, *is_inotify);
-        self.entries.remove(&id);
-        let result =
-          if is_inotify { read_inotify(watch_fd) } else { read_vnode(event) };
-        // SAFETY: watch_fd is a valid fd we opened for watching
-        unsafe { libc::close(watch_fd) };
-        if is_inotify {
-          let _ = self.sys().delete(entry_fd);
-        } else {
-          #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "dragonfly",
-            target_os = "openbsd",
-            target_os = "netbsd"
-          ))]
-          {
-            let _ = self.sys().delete_vnode(entry_fd);
-          }
-        }
-        self.completed.push(OpCompleted::new(id, result));
-      }
-
-      // Signal: complete with signal number
-      #[cfg(unix)]
-      Signal { sig } => {
-        let sig = *sig;
-        self.entries.remove(&id);
-        #[cfg(any(
-          target_os = "macos",
-          target_os = "ios",
-          target_os = "freebsd",
-          target_os = "dragonfly",
-          target_os = "openbsd",
-          target_os = "netbsd"
-        ))]
-        {
-          let _ = self.sys().delete_signal(sig);
-          // On kqueue, sig is the actual signal number
-          self.completed.push(OpCompleted::new(id, sig as isize));
-        }
-        #[cfg(target_os = "linux")]
-        {
-          // On Linux, sig is the signalfd - read to get actual signal number
-          let signal_num = read_signalfd(sig);
-          let _ = self.sys().delete(sig);
-          // SAFETY: sig is a valid signalfd we created
-          unsafe { libc::close(sig) };
-          self.completed.push(OpCompleted::new(id, signal_num));
-        }
-      }
-
-      // Stream: drain loop until EAGAIN
-      Stream { fd, op } => {
-        let fd = *fd;
-        loop {
-          let result = Poller::run_op(op);
-          if result < 0 {
-            let errno = (-result) as i32;
-            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-              break;
-            }
-            self.entries.remove(&id);
-            let _ = self.sys().delete(fd);
-            self.completed.push(OpCompleted::new(id, result).with_more(false));
-            return Ok(());
-          }
-          self.completed.push(OpCompleted::new(id, result).with_more(true));
-        }
-      }
-
-      // Async: run op, re-arm on EAGAIN
-      Async { fd, interest, op } => {
-        let (fd, interest) = (*fd, *interest);
-        let result = Poller::run_op(op);
-        if result < 0 {
-          let errno = (-result) as i32;
-          if errno == libc::EAGAIN
-            || errno == libc::EWOULDBLOCK
-            || errno == libc::EINPROGRESS
-          {
-            self.sys().modify(fd, id, interest)?;
-            return Ok(());
-          }
-        }
-        self.entries.remove(&id);
-        let _ = self.sys().delete(fd);
-        self.completed.push(OpCompleted::new(id, result));
-      }
-
-      // Timer: just complete
-      Timer { op } => {
-        let result = Poller::run_op(op);
-        self.entries.remove(&id);
-        self.sys().delete_timer(id)?;
-        self.completed.push(OpCompleted::new(id, result));
-      }
-
-      // Timeout (fd ready, not timer): run op normally
-      #[cfg(unix)]
-      Timeout { fd, op, .. } => {
-        let fd = *fd;
-        let result = Poller::run_op(op);
-        if result < 0 {
-          let errno = (-result) as i32;
-          if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-            return Ok(()); // Still waiting
-          }
-        }
-        self.entries.remove(&id);
-        let _ = self.sys().delete(fd);
-        let _ = self.sys().delete_timer(id);
-        self.completed.push(OpCompleted::new(id, result));
-      }
-    }
-    Ok(())
-  }
-
-  #[cfg(unix)]
-  fn push_timeout(
-    &mut self,
-    id: u64,
-    inner: &crate::backend::op::Op,
-    duration: Duration,
-  ) -> io::Result<()> {
-    use crate::backend::op::Op;
-    use std::os::fd::AsRawFd;
-
-    match inner {
-      // Sleep: use shorter of timeout vs sleep duration
-      Op::Sleep { duration: sleep_dur, .. } => {
-        let ms = duration.min(*sleep_dur).as_millis() as RawFd;
-        self.sys().add(ms, id, Interest::TIMER)?;
-        let result = if duration < *sleep_dur {
-          -(libc::ECANCELED as isize)
-        } else {
-          #[cfg(target_os = "linux")]
-          {
-            -(libc::ETIME as isize)
-          }
-          #[cfg(not(target_os = "linux"))]
-          {
-            -(libc::ETIMEDOUT as isize)
-          }
-        };
-        self.entries.insert(
-          id,
-          Entry::Timeout {
-            fd: 0,
-            timer_result: result as i32,
-            op: inner.clone(),
-          },
-        );
-      }
-
-      // Async I/O: register fd + timer
-      Op::Send { fd, .. } | Op::SendTo { fd, .. } => {
-        let fd = fd.as_raw_fd();
-        self.sys().add(fd, id, Interest::WRITE)?;
-        let ms = duration.as_millis() as RawFd;
-        if let Err(e) = self.sys().add(ms, id, Interest::TIMER) {
-          let _ = self.sys().delete(fd);
-          return Err(e);
-        }
-        self.entries.insert(
-          id,
-          Entry::Timeout {
-            fd,
-            timer_result: -libc::ECANCELED,
-            op: inner.clone(),
-          },
-        );
-      }
-      Op::Recv { fd, .. } | Op::RecvFrom { fd, .. } | Op::Accept { fd, .. } => {
-        let fd = fd.as_raw_fd();
-        self.sys().add(fd, id, Interest::READ)?;
-        let ms = duration.as_millis() as RawFd;
-        if let Err(e) = self.sys().add(ms, id, Interest::TIMER) {
-          let _ = self.sys().delete(fd);
-          return Err(e);
-        }
-        self.entries.insert(
-          id,
-          Entry::Timeout {
-            fd,
-            timer_result: -libc::ECANCELED,
-            op: inner.clone(),
-          },
-        );
-      }
-
-      // Everything else: run immediately (timeout doesn't apply to sync ops)
-      _ => {
-        self.immediate.push((id, Poller::run_op(inner)));
-      }
-    }
-    Ok(())
-  }
-
-  #[cfg(unix)]
-  fn push_watch(
-    &mut self,
-    id: u64,
-    path: *const libc::c_char,
-    mask: u32,
-  ) -> io::Result<()> {
-    use crate::api::ops::WatchMask;
-    use std::ffi::CStr;
-
-    // SAFETY: path is a valid C string pointer from the caller
-    let path_cstr = unsafe { CStr::from_ptr(path) };
-
-    #[cfg(any(
-      target_os = "macos",
-      target_os = "ios",
-      target_os = "freebsd",
-      target_os = "dragonfly",
-      target_os = "openbsd",
-      target_os = "netbsd"
-    ))]
-    {
-      let fd = match syscall!(open(
-        path_cstr.as_ptr(),
-        libc::O_RDONLY | libc::O_CLOEXEC
-      )) {
-        Ok(fd) => fd,
-        Err(e) => {
-          self
-            .immediate
-            .push((id, -(e.raw_os_error().unwrap_or(libc::EIO) as isize)));
-          return Ok(());
-        }
-      };
-      let fflags = WatchMask::from_bits(mask).to_kqueue_fflags();
-      if let Err(e) = self.sys().add_vnode(fd, id, fflags) {
-        // SAFETY: fd is valid, just opened above
-        unsafe { libc::close(fd) };
-        self
-          .immediate
-          .push((id, -(e.raw_os_error().unwrap_or(libc::EIO) as isize)));
-        return Ok(());
-      }
-      self.entries.insert(
-        id,
-        Entry::Watch { entry_fd: fd, watch_fd: fd, is_inotify: false },
-      );
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-      let fd =
-        match syscall!(inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC)) {
-          Ok(fd) => fd,
-          Err(e) => {
-            self
-              .immediate
-              .push((id, -(e.raw_os_error().unwrap_or(libc::EIO) as isize)));
-            return Ok(());
-          }
-        };
-      let inotify_mask = WatchMask::from_bits(mask).to_inotify_mask();
-      if let Err(e) =
-        syscall!(inotify_add_watch(fd, path_cstr.as_ptr(), inotify_mask))
-      {
-        // SAFETY: fd is a valid inotify fd we just created
-        unsafe { libc::close(fd) };
-        self
-          .immediate
-          .push((id, -(e.raw_os_error().unwrap_or(libc::EIO) as isize)));
-        return Ok(());
-      }
-      if let Err(e) = self.sys().add(fd, id, Interest::READ) {
-        // SAFETY: fd is a valid inotify fd we just created
-        unsafe { libc::close(fd) };
-        self
-          .immediate
-          .push((id, -(e.raw_os_error().unwrap_or(libc::EIO) as isize)));
-        return Ok(());
-      }
-      self.entries.insert(
-        id,
-        Entry::Watch { entry_fd: fd, watch_fd: fd, is_inotify: true },
-      );
-    }
-    Ok(())
-  }
-
-  #[cfg(unix)]
-  fn push_signal(
-    &mut self,
-    id: u64,
-    sigset: *const libc::sigset_t,
-  ) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-      let fd = match syscall!(signalfd(
-        -1,
-        sigset,
-        libc::SFD_NONBLOCK | libc::SFD_CLOEXEC
-      )) {
-        Ok(fd) => fd,
-        Err(e) => {
-          self
-            .immediate
-            .push((id, -(e.raw_os_error().unwrap_or(libc::EIO) as isize)));
-          return Ok(());
-        }
-      };
-      if let Err(e) = self.sys().add(fd, id, Interest::READ) {
-        // SAFETY: fd is a valid signalfd we just created
-        unsafe { libc::close(fd) };
-        self
-          .immediate
-          .push((id, -(e.raw_os_error().unwrap_or(libc::EIO) as isize)));
-        return Ok(());
-      }
-      self.entries.insert(id, Entry::Signal { sig: fd });
-      Ok(())
-    }
-
-    #[cfg(any(
-      target_os = "macos",
-      target_os = "ios",
-      target_os = "freebsd",
-      target_os = "dragonfly",
-      target_os = "openbsd",
-      target_os = "netbsd"
-    ))]
-    {
-      for sig in 1..32 {
-        // SAFETY: sigset is a valid pointer from the caller, sig is in valid range
-        if unsafe { libc::sigismember(sigset, sig) } == 1 {
-          if let Err(e) = self.sys().add_signal(sig, id) {
-            self
-              .immediate
-              .push((id, -(e.raw_os_error().unwrap_or(libc::EIO) as isize)));
-            return Ok(());
-          }
-          self.entries.insert(id, Entry::Signal { sig });
-          return Ok(());
-        }
-      }
-      self.immediate.push((id, -(libc::EINVAL as isize)));
-      Ok(())
-    }
-  }
-}
-
-#[cfg(target_os = "linux")]
-fn read_inotify(fd: RawFd) -> isize {
-  use crate::api::ops::WatchMask;
-  let mut buf = [0u8; 256];
-  // SAFETY: fd is a valid inotify fd, buf is a valid buffer
-  let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-  if n < 0 {
-    -(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
-      as isize)
-  } else if n >= std::mem::size_of::<libc::inotify_event>() as isize {
-    // SAFETY: we verified n >= sizeof(inotify_event), buffer contains valid event
-    let ev = unsafe { &*(buf.as_ptr() as *const libc::inotify_event) };
-    WatchMask::from_inotify_mask(ev.mask).bits() as isize
-  } else {
-    0
-  }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn read_inotify(_fd: RawFd) -> isize {
-  0
-}
-
-/// Read from a signalfd to get the signal number.
-#[cfg(target_os = "linux")]
-fn read_signalfd(fd: RawFd) -> isize {
-  let mut info = std::mem::MaybeUninit::<libc::signalfd_siginfo>::uninit();
-  // SAFETY: fd is a valid signalfd, info is a valid buffer of correct size
-  let n = unsafe {
-    libc::read(
-      fd,
-      info.as_mut_ptr() as *mut _,
-      std::mem::size_of::<libc::signalfd_siginfo>(),
-    )
-  };
-  if n == std::mem::size_of::<libc::signalfd_siginfo>() as isize {
-    // SAFETY: we read the full struct
-    let info = unsafe { info.assume_init() };
-    info.ssi_signo as isize
-  } else if n < 0 {
-    -(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
-      as isize)
-  } else {
-    // Unexpected: return EAGAIN as error to indicate something went wrong
-    -(libc::EAGAIN as isize)
-  }
-}
-
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "freebsd",
-  target_os = "dragonfly",
-  target_os = "openbsd",
-  target_os = "netbsd"
-))]
-fn read_vnode(event: &Event) -> isize {
-  use crate::api::ops::WatchMask;
-  WatchMask::from_kqueue_fflags(event.fflags).bits() as isize
-}
-
-#[cfg(not(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "freebsd",
-  target_os = "dragonfly",
-  target_os = "openbsd",
-  target_os = "netbsd"
-)))]
-fn read_vnode(_event: &Event) -> isize {
-  0
 }
 
 impl IoBackend for Poller {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.sys = Some(sys::OsPoller::new()?);
-    self.entries = HashMap::with_capacity(cap);
     self.events = Events::with_capacity(cap.min(4096));
-    self.immediate = Vec::with_capacity(64);
+    self.capacity = cap;
+    self.backlog.clear();
+    self.backlog.reserve_exact(cap);
+    self.pending = std::collections::HashMap::with_capacity(cap);
+    self.queued_completed = Vec::with_capacity(cap.min(256));
     self.completed = Vec::with_capacity(cap.min(256));
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: crate::backend::op::Op) -> io::Result<()> {
-    use crate::backend::op::Op;
-    use std::os::fd::AsRawFd;
+  fn push(&mut self, id: u64, op: crate::backend::op::Op) {
+    assert!(
+      self.backlog.len() + self.pending.len() < self.capacity,
+      "IoBackend capacity exceeded: attempted to queue more than {} operations",
+      self.capacity
+    );
+    self.backlog.push(BacklogEntry { id, op });
+  }
 
-    match &op {
-      // Timer
-      Op::Sleep { duration, .. } => {
-        let ms = duration.as_millis() as RawFd;
-        self.sys().add(ms, id, Interest::TIMER)?;
-        self.entries.insert(id, Entry::Timer { op });
+  fn flush(&mut self) -> io::Result<()> {
+    while let Some(entry) = self.backlog.pop() {
+      if matches!(entry.op, Op::Nop) {
+        continue;
+      };
+
+      if let Some(result) = Self::validate_op(&entry.op) {
+        self.queued_completed.push(OpCompleted::new(entry.id, result));
+        continue;
       }
 
-      // Async I/O (write): try first, register if would block
-      Op::Send { fd, .. } | Op::SendTo { fd, .. } => {
-        let result = Poller::run_op(&op);
-        if result == -(libc::EAGAIN as isize)
-          || result == -(libc::EWOULDBLOCK as isize)
-        {
-          self.push_entry(
-            id,
-            Entry::Async { fd: fd.as_raw_fd(), interest: Interest::WRITE, op },
-          )?;
-        } else {
-          self.immediate.push((id, result));
+      if Self::should_complete_immediately(&entry.op) {
+        let result = Self::exec_op(&entry.op);
+        self.queued_completed.push(OpCompleted::new(entry.id, result));
+        continue;
+      }
+
+      if let Op::Connect { fd, addr, len } = &entry.op {
+        let result = syscall!(raw connect(
+          fd.as_raw_fd(),
+          (*addr).cast(),
+          *len,
+        ));
+
+        match result {
+          0 => {
+            self.queued_completed.push(OpCompleted::new(entry.id, 0));
+            continue;
+          }
+          #[allow(unreachable_patterns)]
+          EAGAIN_NEG | EWOULDBLOCK_NEG => {}
+          #[cfg(unix)]
+          x if x == -(libc::EINPROGRESS as isize) => {}
+          _ => {
+            self.queued_completed.push(OpCompleted::new(entry.id, result));
+            continue;
+          }
         }
       }
 
-      // Async I/O (read): try first, register if would block
-      Op::Recv { fd, .. } | Op::RecvFrom { fd, .. } => {
-        let result = Poller::run_op(&op);
-        if result == -(libc::EAGAIN as isize)
-          || result == -(libc::EWOULDBLOCK as isize)
-        {
-          self.push_entry(
-            id,
-            Entry::Async { fd: fd.as_raw_fd(), interest: Interest::READ, op },
-          )?;
-        } else {
-          self.immediate.push((id, result));
-        }
+      let (fd, interest) = self.extract_fd_interest(&entry.op);
+
+      // Operation-local registration failures still belong to the op result
+      // contract, so surface them as raw completions instead of bubbling them
+      // out as backend infrastructure errors.
+      if let Err(err) = self.sys().add(fd, entry.id, interest) {
+        let result = err
+          .raw_os_error()
+          .map(|code| -(code as isize))
+          .unwrap_or(-(libc::EIO as isize));
+        self.queued_completed.push(OpCompleted::new(entry.id, result));
+        continue;
       }
 
-      // Accept: register for read (wait for incoming connection)
-      Op::Accept { fd, .. } => {
-        self.push_entry(
-          id,
-          Entry::Async { fd: fd.as_raw_fd(), interest: Interest::READ, op },
-        )?;
-      }
-
-      // Stream (level-triggered)
-      Op::AcceptStream { fd } => {
-        self.push_entry(id, Entry::Stream { fd: fd.as_raw_fd(), op })?;
-      }
-
-      // Connect: run immediately, register if EINPROGRESS
-      Op::Connect { fd, .. } => {
-        let result = Poller::run_op(&op);
-        if result == -(libc::EINPROGRESS as isize) {
-          self.push_entry(
-            id,
-            Entry::Async { fd: fd.as_raw_fd(), interest: Interest::WRITE, op },
-          )?;
-        } else {
-          self.immediate.push((id, result));
-        }
-      }
-
-      // Timeout wrapper
-      #[cfg(unix)]
-      Op::Timeout { inner, duration, .. } => {
-        return self.push_timeout(id, inner, *duration);
-      }
-
-      // Watch
-      #[cfg(unix)]
-      Op::Watch { path, mask } => {
-        return self.push_watch(id, *path, *mask);
-      }
-
-      // Signal
-      #[cfg(unix)]
-      Op::Signal { sigset } => {
-        return self.push_signal(id, *sigset);
-      }
-
-      // Everything else: run immediately
-      _ => {
-        self.immediate.push((id, Poller::run_op(&op)));
-      }
+      // Move to pending operations
+      self.pending.insert(entry.id, entry);
     }
+
     Ok(())
   }
 
-  fn flush(&mut self) -> io::Result<usize> {
-    Ok(0)
-  }
-
-  fn wait_timeout(
-    &mut self,
-    timeout: Option<Duration>,
-  ) -> io::Result<&[OpCompleted]> {
+  fn wait(&mut self, timeout: Option<Duration>) -> io::Result<&[OpCompleted]> {
     self.completed.clear();
-
-    // Drain immediate completions
-    for (id, result) in self.immediate.drain(..) {
-      self.completed.push(OpCompleted::new(id, result));
+    if !self.queued_completed.is_empty() {
+      self.completed.append(&mut self.queued_completed);
+      return Ok(&self.completed);
     }
 
-    // Poll for events
-    self.events.clear();
-    let n = {
-      // SAFETY: events buffer is valid and owned by self
-      let events = unsafe { self.events.as_raw_buf() };
-      match self.sys.as_ref().unwrap().wait(events, timeout) {
-        Ok(n) => n,
-        Err(_) if !self.completed.is_empty() => return Ok(&self.completed),
-        Err(e) => return Err(e),
-      }
-    };
-    // SAFETY: n is the count returned by wait(), within buffer capacity
-    unsafe { self.events.set_len(n) };
+    let sys = self.sys.as_ref().unwrap();
 
-    // Process events
-    let events: Vec<_> = self.events.iter().collect();
-    for event in events {
-      self.handle_event(event.key, &event)?;
+    {
+      let event_count = sys.wait(self.events.as_buf(), timeout)?;
+      unsafe { self.events.set_len(event_count) };
+    }
+
+    while let Some(event) = self.events.pop() {
+      let Some(entry) = self.pending.remove(&event.key) else {
+        continue; // Cancelled or doesn't exist
+      };
+
+      // Execute the operation
+      let result = Poller::exec_op(&entry.op);
+
+      match result {
+        #[allow(unreachable_patterns)]
+        EAGAIN_NEG | EWOULDBLOCK_NEG => {
+          // EAGAIN/EWOULDBLOCK - re-register for retry
+          let (fd, interest) = self.extract_fd_interest(&entry.op);
+          sys.add(fd, entry.id, interest)?;
+          self.pending.insert(entry.id, entry);
+        }
+        _ => {
+          let (fd, interest) = self.extract_fd_interest(&entry.op);
+          if !interest.is_none() {
+            let _ = sys.delete(fd);
+          }
+          // Success or real error - add to completions
+          self.completed.push(OpCompleted::new(entry.id, result));
+        }
+      }
     }
 
     Ok(&self.completed)
-  }
-
-  fn arm_timer(&mut self, duration: Duration) -> io::Result<()> {
-    self.sys().arm_wheel_timer(duration)
-  }
-
-  fn disarm_timer(&mut self) -> io::Result<()> {
-    self.sys().disarm_wheel_timer()
-  }
-
-  fn cancel(&mut self, id: u64) -> io::Result<()> {
-    if let Some(entry) = self.entries.remove(&id) {
-      match entry {
-        Entry::Async { fd, .. } | Entry::Stream { fd, .. } => {
-          let _ = self.sys().delete(fd);
-        }
-        Entry::Timer { .. } => {
-          let _ = self.sys().delete_timer(id);
-        }
-        #[cfg(unix)]
-        Entry::Timeout { fd, .. } => {
-          let _ = self.sys().delete(fd);
-          let _ = self.sys().delete_timer(id);
-        }
-        #[cfg(unix)]
-        Entry::Watch { entry_fd, watch_fd, is_inotify } => {
-          // SAFETY: watch_fd is a valid fd we opened for watching
-          unsafe { libc::close(watch_fd) };
-          if is_inotify {
-            let _ = self.sys().delete(entry_fd);
-          }
-        }
-        #[cfg(unix)]
-        Entry::Signal { sig } => {
-          #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "dragonfly",
-            target_os = "openbsd",
-            target_os = "netbsd"
-          ))]
-          {
-            let _ = self.sys().delete_signal(sig);
-          }
-          #[cfg(target_os = "linux")]
-          {
-            let _ = self.sys().delete(sig);
-            // SAFETY: sig is a valid signalfd we created
-            unsafe { libc::close(sig) };
-          }
-        }
-      }
-    }
-    Ok(())
   }
 }
 

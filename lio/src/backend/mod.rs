@@ -48,8 +48,8 @@ pub mod test_macro;
 pub use impls::*;
 mod impls {
 
-  #[cfg(test)]
-  pub mod dummy;
+  // #[cfg(test)]
+  // pub mod dummy;
 
   #[cfg(target_os = "linux")]
   pub mod io_uring;
@@ -86,20 +86,8 @@ use crate::backend::op::Op;
 /// containing the operation ID and its result.
 #[derive(Debug)]
 pub struct OpCompleted {
-  /// The unique identifier of the completed operation.
-  pub(crate) op_id: u64,
-
-  /// Result of the operation:
-  /// - `>= 0` on success (the return value, e.g., bytes transferred)
-  /// - `< 0` on error (negative errno value)
-  pub(crate) result: isize,
-
-  /// True if this is a multishot operation and more completions are coming.
-  ///
-  /// For io_uring, this is set based on the `IORING_CQE_F_MORE` flag.
-  /// For other backends using resubmission, this is always true until
-  /// the stream is explicitly terminated.
-  pub(crate) more: bool,
+  registration_id: u64,
+  result: isize,
 }
 
 impl OpCompleted {
@@ -110,116 +98,53 @@ impl OpCompleted {
   /// - `op_id`: The unique ID of the operation
   /// - `result`: The operation result (non-negative for success, negative errno for error)
   pub fn new(op_id: u64, result: isize) -> Self {
-    Self { op_id, result, more: false }
+    Self { registration_id: op_id, result }
   }
 
-  /// Sets the `more` flag indicating more completions are coming.
-  pub fn with_more(mut self, more: bool) -> Self {
-    self.more = more;
-    self
+  pub fn result(&self) -> isize {
+    self.result
+  }
+
+  pub fn registration_id(&self) -> u64 {
+    self.registration_id
   }
 }
 
-/// Unified I/O backend trait for thread-per-core runtimes.
+/// Unified I/O backend trait to drive `OpModel`'s to completion.
 ///
-/// This trait combines submission and completion handling in a single interface,
-/// designed to be owned by a single thread (`&mut self` everywhere). It's
-/// dyn-compatible, allowing runtime selection of backends via `Box<dyn IoBackend>`.
+/// Designed for single-thread ownership (`&mut self`), dyn-compatible for
+/// runtime backend selection via `Box<dyn IoBackend>`.
 ///
-/// # Lifecycle
+/// # Usage
 ///
-/// 1. Create backend with `Default::default()` or backend-specific constructor
-/// 2. Call [`init`](Self::init) to pre-allocate resources (zero runtime allocation)
-/// 3. Use [`push`](Self::push) + [`flush`](Self::flush) to submit operations
-/// 4. Use [`wait_timeout`](Self::wait_timeout) to retrieve completions
-///
-/// # Timer Support
-///
-/// Backends provide a single kernel timer via [`arm_timer`](Self::arm_timer).
-/// This is used by the timing wheel to multiplex many logical timers onto
-/// one kernel resource. When the timer fires, `wait_timeout` returns, and
-/// the caller should poll the timing wheel for expired timers.
-///
-/// # Thread Safety
-///
-/// Backends are designed for single-thread ownership. They are intentionally
-/// not `Send` by default. Runtime authors control threading by creating one
-/// backend per thread.
+/// ```ignore
+/// let mut backend = Backend::default();
+/// backend.init(1024)?;                    // Pre-allocate for 1024 ops
+/// backend.push(op_id, op)?;               // Queue operation
+/// backend.flush()?;                       // Submit to kernel
+/// let done = backend.wait(timeout)?;      // Get completions
+/// ```
 pub trait IoBackend {
-  /// Initialize the backend with the given capacity.
+  /// Initialize backend with capacity for `cap` concurrent operations.
   ///
-  /// This pre-allocates all resources needed for `cap` concurrent operations.
-  /// Must be called before any other methods. Calling init multiple times
-  /// is undefined behavior.
-  ///
-  /// # Parameters
-  ///
-  /// - `cap`: Maximum number of concurrent in-flight operations
-  ///
-  /// # Errors
-  ///
-  /// Returns an error if resource allocation fails (e.g., io_uring setup fails).
+  /// Pre-allocates all resources for zero-allocation runtime.
+  /// Must be called once before any other methods.
   fn init(&mut self, cap: usize) -> io::Result<()>;
 
-  /// Pushes an operation to the backend's submission queue without syscall.
+  /// Queue an operation for submission.
   ///
-  /// The operation is queued internally but not yet submitted to the kernel.
-  /// Call [`flush`](Self::flush) to actually submit the queued operations.
-  ///
-  /// The caller guarantees that the operation is already registered
-  /// with the given `id`.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error if the submission queue is full (call flush first).
-  fn push(&mut self, id: u64, op: Op) -> io::Result<()>;
+  /// Call `flush()` to submit queued operations.
+  fn push(&mut self, id: u64, op: Op);
 
-  /// Flushes all queued operations to the kernel.
-  ///
-  /// This submits all operations queued via [`push`](Self::push) in a single syscall.
-  /// After this call, the submission queue is empty and ready for new operations.
-  ///
-  /// # Returns
-  ///
-  /// The number of operations submitted.
-  fn flush(&mut self) -> io::Result<usize>;
+  /// Submit all queued operations to kernel.
+  fn flush(&mut self) -> io::Result<()>;
 
-  /// Waits for completed operations with an optional timeout.
+  /// Wait for completions with optional timeout.
   ///
-  /// - `timeout = None`: Block indefinitely until at least one operation completes
-  /// - `timeout = Some(Duration::ZERO)`: Non-blocking poll, return immediately
-  /// - `timeout = Some(duration)`: Wait up to `duration` for completions
+  /// - `None` = block until at least one completion
+  /// - `Some(ZERO)` = non-blocking poll
+  /// - `Some(duration)` = wait up to duration
   ///
-  /// Returns an empty slice if the timeout expires with no completions.
-  ///
-  /// The returned slice is valid until the next call to `wait_timeout`, or `push`.
-  fn wait_timeout(
-    &mut self,
-    timeout: Option<Duration>,
-  ) -> io::Result<&[OpCompleted]>;
-
-  /// Arms the backend's single kernel timer to fire after `duration`.
-  ///
-  /// This is used by the timing wheel to wake `wait_timeout` when the
-  /// earliest timer expires. Only one timer can be armed at a time;
-  /// calling this again replaces the previous timer.
-  ///
-  /// When the timer fires, `wait_timeout` will return (possibly with
-  /// an empty completion slice if no I/O completed).
-  fn arm_timer(&mut self, duration: Duration) -> io::Result<()>;
-
-  /// Disarms the kernel timer if one is armed.
-  ///
-  /// This is a no-op if no timer is currently armed.
-  fn disarm_timer(&mut self) -> io::Result<()>;
-
-  /// Cancels an in-flight operation.
-  ///
-  /// This is used to cancel streaming operations when the stream is dropped.
-  ///
-  /// The default implementation is a no-op (for backends where operations
-  /// complete synchronously or don't need explicit cancellation).
-  fn cancel(&mut self, _id: u64) -> io::Result<()> {
-    Ok(())
-  }
+  /// Slice valid until next `wait()` or `push()`.
+  fn wait(&mut self, timeout: Option<Duration>) -> io::Result<&[OpCompleted]>;
 }

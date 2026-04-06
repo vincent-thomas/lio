@@ -1,545 +1,1967 @@
-//! Macro for generating comprehensive IoBackend tests.
-//!
-//! This macro generates a test suite for any [`IoBackend`] implementation,
-//! including third-party implementations in external crates.
-//!
-//! [`IoBackend`]: crate::backend::IoBackend
-//!
-//! # Usage
-//!
-//! In your crate's test module, invoke the macro with an expression that creates
-//! a new backend instance:
-//!
-//! ```ignore
-//! // In my_backend/src/lib.rs
-//! #[cfg(test)]
-//! mod tests {
-//!     use my_backend::MyBackend;
-//!
-//!     lio::test_io_backend!(MyBackend::new());
-//! }
-//! ```
-//!
-//! # Requirements
-//!
-//! Your crate must have `libc` as a dependency for the socket operation tests on Unix.
-//!
-//! # What's Tested
-//!
-//! The macro generates tests for:
-//! - Initialization with various capacities
-//! - Basic push/flush/wait lifecycle
-//! - Multiple concurrent operations
-//! - Interleaved submission and completion
-//! - Non-blocking and timeout wait behavior
-//! - Socket creation (on Unix)
-//! - Operation ID preservation
-//! - Flush behavior (empty, double flush)
-
-/// Generates a comprehensive test suite for an IoBackend implementation.
+/// Shared contract tests for [`IoBackend`] implementations.
 ///
-/// The macro takes an expression that creates a new backend instance.
-/// Each test will call this expression to get a fresh backend.
+/// Backends that pass `test_io_backend!` conform to the standard observable
+/// contract for the deterministic scenarios covered here.
 ///
-/// # Example
+/// Runtime / queue semantics:
+/// - empty `wait()` after initialization yields no completions
+/// - pushing more than the initialized backend capacity panics
+/// - `wait(Duration::ZERO)` never blocks
+/// - `wait(None)` blocks until at least one completion is available
+/// - `flush()` with an empty backlog is harmless
+/// - immediate completions queued during `flush()` are surfaced on the next `wait()`
+/// - batched immediate completions are surfaced together with exact results
+/// - a completed `wait()` buffer is cleared on the next `wait()`
+/// - completions are not duplicated across `wait()` calls
+/// - deferred readiness completions are delivered exactly once
+/// - mixed pending batches complete each registration exactly once
+/// - completions are routed to the correct registration id
 ///
-/// ```ignore
-/// use lio::backend::dummy::DummyBackend;
+/// `Op::Nop`:
+/// - produces no completion
 ///
-/// // Generate tests for DummyBackend
-/// lio::test_io_backend!(DummyBackend::new());
-/// ```
+/// `Op::Read`:
+/// - success may return short positive byte counts, but repeated successful
+///   submissions must eventually transfer the exact total byte count
+/// - vectored success may return short positive byte counts, but repeated
+///   successful submissions must eventually transfer the exact total byte count
+/// - pending reads remain pending until data arrives
+/// - EOF returns exact `0`
+/// - invalid offset returns exact raw `-EINVAL`
+/// - unsupported flags return exact raw `-ENOTSUP`
+/// - null iovec pointer returns exact raw `-EINVAL`
+/// - invalid fd returns exact raw `-EBADF`
 ///
-/// # Third-Party Usage
+/// `Op::Write`:
+/// - success may return short positive byte counts, but repeated successful
+///   submissions must eventually transfer the exact total byte count
+/// - vectored success may return short positive byte counts, but repeated
+///   successful submissions must eventually transfer the exact total byte count
+/// - invalid offset returns exact raw `-EINVAL`
+/// - unsupported flags return exact raw `-ENOTSUP`
+/// - null iovec pointer returns exact raw `-EINVAL`
+/// - invalid fd returns exact raw `-EBADF`
 ///
-/// External crates implementing their own `IoBackend` can use this macro
-/// to verify correctness:
+/// `Op::Recv`:
+/// - success may return short positive byte counts, but repeated successful
+///   submissions must eventually transfer the exact total byte count
+/// - vectored success may return short positive byte counts, but repeated
+///   successful submissions must eventually transfer the exact total byte count
+/// - pending receives remain pending until data arrives
+/// - EOF returns exact `0`
+/// - invalid fd returns exact raw `-EBADF`
 ///
-/// ```ignore
-/// // In your crate's tests
-/// use my_crate::MyCustomBackend;
+/// `Op::Send`:
+/// - success may return short positive byte counts, but repeated successful
+///   submissions must eventually transfer the exact total byte count
+/// - vectored success may return short positive byte counts, but repeated
+///   successful submissions must eventually transfer the exact total byte count
+/// - invalid fd returns exact raw `-EBADF`
 ///
-/// lio::test_io_backend!(MyCustomBackend::default());
-/// ```
+/// `Op::Accept`:
+/// - success produces exactly one non-error completion on Unix platforms where
+///   local listener registration is supported
+/// - pending accepts remain pending until a client arrives
+/// - invalid fd returns exact raw `-EBADF`
+///
+/// `Op::Connect`:
+/// - success returns exact `0` on Unix platforms where local listener
+///   registration is supported
+/// - missing Unix socket path returns exact raw `-ENOENT`
+/// - invalid fd returns exact raw `-EBADF`
+///
+/// The suite intentionally avoids nondeterministic network cases. It only tests
+/// scenarios where the expected raw `isize` output is stable for a conforming
+/// backend.
 #[macro_export]
 macro_rules! test_io_backend {
-  ($create_backend:expr) => {
-    mod io_backend_tests {
+  ($backend_ctor:expr) => {
+    #[cfg(test)]
+    mod io_backend_contract {
       use super::*;
-      use std::time::Duration;
+      use std::{
+        time::{Duration, SystemTime, Instant},
+        env, fs, mem, path::PathBuf, thread,
+        os::{
+          unix::{ffi::OsStrExt, net::{UnixListener, UnixStream}},
+          fd::{FromRawFd, IntoRawFd, RawFd}
+        },
+      };
 
-      use $crate::backend::IoBackend;
-      use $crate::backend::op::Op;
+      use $crate::api::resource::Resource;
+      use $crate::backend::{IoBackend, op::{Op, RawBuf}};
 
-      const TEST_CAPACITY: usize = 64;
-
-      // ═══════════════════════════════════════════════════════════════════════
-      // Initialization tests
-      // ═══════════════════════════════════════════════════════════════════════
-
-      #[test]
-      fn test_init() {
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).expect("init should succeed");
+      fn new_backend() -> impl IoBackend {
+        $backend_ctor
       }
 
-      #[test]
-      fn test_init_various_capacities() {
-        for cap in [1, 16, 64, 256, 1024] {
-          let mut backend = $create_backend;
-          backend
-            .init(cap)
-            .expect(&format!("init with cap={} should succeed", cap));
-        }
-      }
-
-      // ═══════════════════════════════════════════════════════════════════════
-      // Basic operation flow
-      // ═══════════════════════════════════════════════════════════════════════
-
-      #[test]
-      fn test_push_nop() {
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
-
-        backend.push(1, Op::Nop).expect("push Nop should succeed");
-      }
-
-      #[test]
-      fn test_push_and_flush() {
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
-
-        backend.push(1, Op::Nop).unwrap();
-        let _flushed = backend.flush().expect("flush should succeed");
-      }
-
-      #[test]
-      fn test_push_flush_wait() {
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
-
-        backend.push(1, Op::Nop).unwrap();
-        backend.flush().unwrap();
-
-        // Wait with timeout to avoid hanging
-        let completions = backend
-          .wait_timeout(Some(Duration::from_secs(5)))
-          .expect("wait_timeout should succeed");
-
-        assert_eq!(completions.len(), 1, "should have 1 completion");
+      fn assert_exact_result(
+        completed: &$crate::backend::OpCompleted,
+        id: u64,
+        expected: isize,
+      ) {
+        assert_eq!(completed.registration_id(), id);
         assert_eq!(
-          completions[0].op_id, 1,
-          "completion should have correct op_id"
+          completed.result(),
+          expected,
+          "unexpected raw result for registration {}",
+          id
         );
       }
 
-      // ═══════════════════════════════════════════════════════════════════════
-      // Multiple operations
-      // ═══════════════════════════════════════════════════════════════════════
-
       #[test]
-      fn test_multiple_nops() {
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
-
-        for i in 1..=10 {
-          backend.push(i, Op::Nop).unwrap();
-        }
+      fn init_and_empty_wait() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
         backend.flush().unwrap();
 
-        // Collect all completions (may come in multiple batches)
-        let mut completed_ids = Vec::new();
-        while completed_ids.len() < 10 {
-          let completions = backend
-            .wait_timeout(Some(Duration::from_secs(5)))
-            .expect("wait_timeout should succeed");
+        let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+        assert!(
+          completed.is_empty(),
+          "backend returned completions without submitted operations"
+        );
+      }
 
-          for c in completions {
-            completed_ids.push(c.op_id);
+      #[test]
+      fn zero_timeout_wait_never_blocks() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let start = Instant::now();
+        let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(completed.is_empty(), "zero-timeout wait without work must be empty");
+        assert!(
+          elapsed < Duration::from_millis(200),
+          "wait(Duration::ZERO) blocked for {:?}",
+          elapsed
+        );
+      }
+
+      #[cfg(unix)]
+      #[test]
+      fn wait_none_blocks_until_completion() {
+        use std::os::fd::AsRawFd;
+
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let (read_res, write_res) = socket_pair();
+        let payload = *b"wake";
+        let mut buf = [0_u8; 4];
+        let mut raw_buf = unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
+
+        backend.push(
+          3,
+          Op::Read {
+            fd: read_res.clone(),
+            iovecs: (&mut raw_buf as *mut RawBuf),
+            iov_count: 1,
+            offset: -1,
+            flags: 0,
+          },
+        );
+        backend.flush().unwrap();
+
+        let writer = thread::spawn(move || {
+          std::thread::sleep(Duration::from_millis(20));
+          let wrote = unsafe {
+            libc::send(
+              write_res.as_raw_fd(),
+              payload.as_ptr().cast(),
+              payload.len(),
+              0,
+            )
+          };
+          assert_eq!(wrote, payload.len() as isize);
+        });
+
+        let start = Instant::now();
+        let completed = backend.wait(None).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(completed.len(), 1);
+        assert_exact_result(&completed[0], 3, payload.len() as isize);
+        assert!(
+          elapsed >= Duration::from_millis(5),
+          "wait(None) returned too early to have actually blocked: {:?}",
+          elapsed
+        );
+
+        writer.join().unwrap();
+      }
+
+      #[test]
+      fn empty_flush_is_harmless() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        backend.flush().unwrap();
+        backend.flush().unwrap();
+
+        let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+        assert!(
+          completed.is_empty(),
+          "flush() with an empty backlog must not create completions"
+        );
+      }
+
+      #[test]
+      #[should_panic(expected = "IoBackend capacity exceeded")]
+      fn pushing_more_than_capacity_panics() {
+        let mut backend = new_backend();
+        backend.init(1).unwrap();
+
+        backend.push(1, Op::Nop);
+        backend.push(2, Op::Nop);
+      }
+
+      #[cfg(unix)]
+      fn socket_pair() -> (
+        $crate::api::resource::Resource,
+        $crate::api::resource::Resource,
+      ) {
+        let mut fds = [0; 2];
+        let rc = unsafe {
+          libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM,
+            0,
+            fds.as_mut_ptr(),
+          )
+        };
+        assert_eq!(
+          rc,
+          0,
+          "socketpair() failed: {}",
+          std::io::Error::last_os_error()
+        );
+
+        for &fd in &fds {
+          let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+          assert!(
+            flags >= 0,
+            "fcntl(F_GETFL) failed: {}",
+            std::io::Error::last_os_error()
+          );
+
+          let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+          assert_eq!(
+            rc,
+            0,
+            "fcntl(F_SETFL, O_NONBLOCK) failed: {}",
+            std::io::Error::last_os_error()
+          );
+        }
+
+        // SAFETY: both fds were just returned by `pipe` and are uniquely owned here.
+        let read = unsafe {
+          <$crate::api::resource::Resource as std::os::fd::FromRawFd>::from_raw_fd(fds[0])
+        };
+        // SAFETY: both fds were just returned by `pipe` and are uniquely owned here.
+        let write = unsafe {
+          <$crate::api::resource::Resource as std::os::fd::FromRawFd>::from_raw_fd(fds[1])
+        };
+
+        (read, write)
+      }
+
+      #[cfg(unix)]
+      fn set_nonblocking(fd: RawFd) {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+          flags >= 0,
+          "fcntl(F_GETFL) failed: {}",
+          std::io::Error::last_os_error()
+        );
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        assert_eq!(
+          rc,
+          0,
+          "fcntl(F_SETFL, O_NONBLOCK) failed: {}",
+          std::io::Error::last_os_error()
+        );
+      }
+
+      #[cfg(unix)]
+      fn unix_socket_path(prefix: &str) -> PathBuf {
+        let now = SystemTime::now()
+          .duration_since(SystemTime::UNIX_EPOCH)
+          .expect("system time before UNIX epoch")
+          .as_nanos();
+        let mut path = env::current_dir().expect("cwd unavailable");
+        path.push(".tmp-test-sockets");
+        fs::create_dir_all(&path).expect("failed to create test socket directory");
+        path.push(format!("lio-{}-{}", prefix, now));
+        // Ensure it is unique, append random suffix if necessary.
+        let mut idx = 0;
+        while path.exists() {
+          path.set_file_name(format!("lio-{}-{}-{}", prefix, now, idx));
+          idx += 1;
+        }
+        path
+      }
+
+      #[cfg(unix)]
+      fn unix_sockaddr_un(path: &PathBuf) -> (libc::sockaddr_storage, libc::socklen_t) {
+        let bytes = path.as_os_str().as_bytes();
+
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let sun = unsafe { &mut *(std::ptr::addr_of_mut!(storage) as *mut libc::sockaddr_un) };
+        assert!(
+          bytes.len() < sun.sun_path.len(),
+          "path too long for unix socket test"
+        );
+        sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (i, &byte) in bytes.iter().enumerate() {
+          sun.sun_path[i] = byte as libc::c_char;
+        }
+        sun.sun_path[bytes.len()] = 0;
+
+        let len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+        (storage, len)
+      }
+
+      #[cfg(unix)]
+      fn wait_for_single_completion(
+        backend: &mut impl IoBackend,
+      ) -> $crate::backend::OpCompleted {
+        for _ in 0..20 {
+          let completed = backend
+            .wait(Some(Duration::from_millis(10)))
+            .unwrap();
+          if let Some(first) = completed.first() {
+            return $crate::backend::OpCompleted::new(
+              first.registration_id(),
+              first.result(),
+            );
           }
         }
 
-        // Verify all operations completed
-        completed_ids.sort();
-        assert_eq!(completed_ids, (1..=10).collect::<Vec<_>>());
+        panic!("backend did not produce a completion within the expected timeout");
       }
 
-      #[test]
-      fn test_interleaved_push_wait() {
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
-
-        // Push first batch
-        backend.push(1, Op::Nop).unwrap();
-        backend.push(2, Op::Nop).unwrap();
-        backend.flush().unwrap();
-
-        // Wait for first batch
-        let mut completed = Vec::new();
-        while completed.len() < 2 {
-          let completions =
-            backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
-          completed.extend(completions.iter().map(|c| c.op_id));
-        }
-
-        // Push second batch
-        backend.push(3, Op::Nop).unwrap();
-        backend.push(4, Op::Nop).unwrap();
-        backend.flush().unwrap();
-
-        // Wait for second batch
-        while completed.len() < 4 {
-          let completions =
-            backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
-          completed.extend(completions.iter().map(|c| c.op_id));
-        }
-
-        completed.sort();
-        assert_eq!(completed, vec![1, 2, 3, 4]);
+      #[cfg(unix)]
+      fn invalid_fd_resource() -> Resource {
+        // SAFETY: this intentionally uses an invalid fd to verify exact raw errno output.
+        unsafe { Resource::borrow(-1) }
       }
 
-      // ═══════════════════════════════════════════════════════════════════════
-      // Timeout behavior
-      // ═══════════════════════════════════════════════════════════════════════
-
-      #[test]
-      fn test_wait_nonblocking_empty() {
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
-
-        // Non-blocking wait with no pending ops should return empty
-        let completions = backend
-          .wait_timeout(Some(Duration::ZERO))
-          .expect("non-blocking wait should succeed");
-
+      #[cfg(unix)]
+      fn wait_for_positive_completion(
+        backend: &mut impl IoBackend,
+      ) -> $crate::backend::OpCompleted {
+        let completed = wait_for_single_completion(backend);
         assert!(
-          completions.is_empty(),
-          "should have no completions when nothing pending"
+          completed.result() > 0,
+          "expected a positive completion result, got {}",
+          completed.result()
         );
+        completed
       }
 
-      #[test]
-      fn test_wait_with_short_timeout() {
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
+      mod nop {
+        use super::*;
 
-        // Short timeout with no pending ops
-        let start = std::time::Instant::now();
-        let completions = backend
-          .wait_timeout(Some(Duration::from_millis(10)))
-          .expect("wait with timeout should succeed");
+        #[test]
+        fn nop_produces_no_completion() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
 
-        assert!(completions.is_empty());
-        // Should return quickly (within reasonable bounds)
-        assert!(start.elapsed() < Duration::from_secs(1));
-      }
+          backend.push(40, Op::Nop);
+          backend.flush().unwrap();
 
-      // ═══════════════════════════════════════════════════════════════════════
-      // Socket operation (creates real fd)
-      // ═══════════════════════════════════════════════════════════════════════
-
-      #[test]
-      #[cfg(target_os = "linux")]
-      fn test_socket_operation() {
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
-
-        // Create a TCP socket (Linux has SOCK_NONBLOCK/SOCK_CLOEXEC)
-        backend
-          .push(
-            1,
-            Op::Socket {
-              domain: libc::AF_INET,
-              ty: libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-              proto: 0,
-            },
-          )
-          .unwrap();
-        backend.flush().unwrap();
-
-        let completions =
-          backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
-
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].op_id, 1);
-
-        // Result should be a valid fd (>= 0)
-        let fd = completions[0].result;
-        assert!(fd >= 0, "socket should return valid fd, got {}", fd);
-
-        // Clean up: close the socket
-        unsafe { libc::close(fd as i32) };
-      }
-
-      #[test]
-      #[cfg(all(unix, not(target_os = "linux")))]
-      fn test_socket_operation() {
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
-
-        // Create a TCP socket (macOS/BSD don't have SOCK_NONBLOCK/SOCK_CLOEXEC in socket())
-        backend
-          .push(
-            1,
-            Op::Socket {
-              domain: libc::AF_INET,
-              ty: libc::SOCK_STREAM,
-              proto: 0,
-            },
-          )
-          .unwrap();
-        backend.flush().unwrap();
-
-        let completions =
-          backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
-
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].op_id, 1);
-
-        // Result should be a valid fd (>= 0)
-        let fd = completions[0].result;
-        assert!(fd >= 0, "socket should return valid fd, got {}", fd);
-
-        // Clean up: close the socket
-        unsafe { libc::close(fd as i32) };
-      }
-
-      // ═══════════════════════════════════════════════════════════════════════
-      // Flush behavior
-      // ═══════════════════════════════════════════════════════════════════════
-
-      #[test]
-      fn test_flush_empty() {
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
-
-        // Flushing with nothing queued should succeed
-        let flushed = backend.flush().expect("flush empty should succeed");
-        assert_eq!(flushed, 0, "flushing empty queue should return 0");
-      }
-
-      #[test]
-      fn test_double_flush() {
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
-
-        backend.push(1, Op::Nop).unwrap();
-        let first = backend.flush().unwrap();
-        let second = backend.flush().unwrap();
-
-        // Second flush should have nothing to submit
-        let _ = first; // first may or may not be > 0 depending on backend
-        assert_eq!(second, 0, "second flush should have nothing to submit");
-      }
-
-      // ═══════════════════════════════════════════════════════════════════════
-      // Op ID uniqueness
-      // ═══════════════════════════════════════════════════════════════════════
-
-      #[test]
-      fn test_op_ids_preserved() {
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
-
-        // Use non-sequential IDs
-        let ids = [42, 100, 7, 999, 1];
-        for &id in &ids {
-          backend.push(id, Op::Nop).unwrap();
-        }
-        backend.flush().unwrap();
-
-        let mut completed_ids = Vec::new();
-        while completed_ids.len() < ids.len() {
-          let completions =
-            backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
-          completed_ids.extend(completions.iter().map(|c| c.op_id));
-        }
-
-        // All IDs should be present (order may vary)
-        completed_ids.sort();
-        let mut expected: Vec<_> = ids.to_vec();
-        expected.sort();
-        assert_eq!(completed_ids, expected);
-      }
-
-      // ═══════════════════════════════════════════════════════════════════════
-      // Vectored I/O operations (readv/writev)
-      // These tests are only meaningful for backends that actually perform I/O.
-      // The tests use raw syscalls to prepare/verify data, then test the backend
-      // performs the vectored operation correctly.
-      // ═══════════════════════════════════════════════════════════════════════
-
-      #[test]
-      #[cfg(unix)]
-      fn test_readv_operation() {
-        use std::os::fd::FromRawFd;
-        use $crate::backend::op::RawBuf;
-
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
-
-        // Create a temp file with test data
-        let path = std::ffi::CString::new(format!(
-          "/tmp/lio_test_readv_{}.txt",
-          std::process::id()
-        ))
-        .unwrap();
-
-        let test_data = b"Hello, World!";
-        let fd = unsafe {
-          let fd = libc::open(
-            path.as_ptr(),
-            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-            0o644,
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert!(
+            completed.is_empty(),
+            "Op::Nop must not produce a completion"
           );
-          libc::write(
-            fd,
-            test_data.as_ptr() as *const libc::c_void,
-            test_data.len(),
-          );
-          // Seek back to beginning
-          libc::lseek(fd, 0, libc::SEEK_SET);
-          fd
-        };
-
-        // Create iovecs for reading
-        let mut buf1 = vec![0u8; 7];
-        let mut buf2 = vec![0u8; 6];
-        let mut iovecs: [libc::iovec; 2] = unsafe { std::mem::zeroed() };
-        iovecs[0].iov_base = buf1.as_mut_ptr() as *mut _;
-        iovecs[0].iov_len = buf1.capacity();
-        iovecs[1].iov_base = buf2.as_mut_ptr() as *mut _;
-        iovecs[1].iov_len = buf2.capacity();
-
-        // Create resource and keep it alive for the duration of the operation
-        let resource = unsafe {
-          <$crate::api::resource::Resource as FromRawFd>::from_raw_fd(fd)
-        };
-        // Clone for the op - the original stays alive to keep fd open
-        let resource_for_op = resource.clone();
-
-        backend
-          .push(
-            1,
-            Op::ReadV {
-              fd: resource_for_op,
-              buf: RawBuf::empty(),
-              iovecs: iovecs.as_ptr(),
-              iov_count: 2,
-            },
-          )
-          .unwrap();
-        backend.flush().unwrap();
-
-        let completions =
-          backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
-
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].op_id, 1);
-
-        // Skip validation for dummy backend which always returns 0
-        if completions[0].result > 0 {
-          assert_eq!(completions[0].result, 13, "should read all 13 bytes");
-
-          // Update lengths based on bytes read
-          let bytes_read = completions[0].result as usize;
-          let first_len = bytes_read.min(buf1.capacity());
-          unsafe { buf1.set_len(first_len) };
-          let second_len =
-            bytes_read.saturating_sub(buf1.capacity()).min(buf2.capacity());
-          unsafe { buf2.set_len(second_len) };
-
-          assert_eq!(&buf1[..], b"Hello, ");
-          assert_eq!(&buf2[..], b"World!");
         }
-
-        // Cleanup - drop resource first to close fd, then unlink
-        drop(resource);
-        unsafe { libc::unlink(path.as_ptr()) };
       }
 
-      #[test]
       #[cfg(unix)]
-      fn test_writev_operation() {
-        use std::os::fd::FromRawFd;
-        use $crate::backend::op::RawBuf;
+      mod read {
+        use super::*;
+        use std::os::fd::AsRawFd;
 
-        let mut backend = $create_backend;
-        backend.init(TEST_CAPACITY).unwrap();
+        #[test]
+        fn success_reports_raw_result_and_id() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
 
-        // Create a temp file
-        let path = std::ffi::CString::new(format!(
-          "/tmp/lio_test_writev_{}.txt",
-          std::process::id()
-        ))
-        .unwrap();
-
-        let fd = unsafe {
-          libc::open(
-            path.as_ptr(),
-            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-            0o644,
-          )
-        };
-
-        // Create iovecs for writing
-        let buf1 = b"Hello, ";
-        let buf2 = b"World!";
-        let iovecs: [libc::iovec; 2] = [
-          libc::iovec {
-            iov_base: buf1.as_ptr() as *mut _,
-            iov_len: buf1.len(),
-          },
-          libc::iovec {
-            iov_base: buf2.as_ptr() as *mut _,
-            iov_len: buf2.len(),
-          },
-        ];
-
-        // Create resource and keep it alive for the duration of the operation
-        let resource = unsafe {
-          <$crate::api::resource::Resource as FromRawFd>::from_raw_fd(fd)
-        };
-        // Clone for the op - the original stays alive to keep fd open
-        let resource_for_op = resource.clone();
-
-        backend
-          .push(
-            1,
-            Op::WriteV {
-              fd: resource_for_op,
-              buf: RawBuf::empty(),
-              iovecs: iovecs.as_ptr(),
-              iov_count: 2,
-            },
-          )
-          .unwrap();
-        backend.flush().unwrap();
-
-        let completions =
-          backend.wait_timeout(Some(Duration::from_secs(5))).unwrap();
-
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].op_id, 1);
-
-        // Skip validation for dummy backend which always returns 0
-        if completions[0].result > 0 {
-          assert_eq!(completions[0].result, 13, "should write all 13 bytes");
-
-          // Verify the written data
-          let mut verify_buf = vec![0u8; 20];
-          let bytes_read = unsafe {
-            libc::lseek(fd, 0, libc::SEEK_SET);
-            libc::read(fd, verify_buf.as_mut_ptr() as *mut _, verify_buf.len())
+          let (read_res, write_res) = socket_pair();
+          let payload = *b"read";
+          let mut buf = [0_u8; 4];
+          let wrote = unsafe {
+            libc::send(
+              write_res.as_raw_fd(),
+              payload.as_ptr().cast(),
+              payload.len(),
+              0,
+            )
           };
-          assert_eq!(bytes_read, 13);
-          assert_eq!(&verify_buf[..13], b"Hello, World!");
+          assert_eq!(wrote, payload.len() as isize);
+
+          let mut total = 0usize;
+          let mut id = 43_u64;
+          while total < payload.len() {
+            let mut raw_buf = unsafe {
+              RawBuf::from_raw_parts(
+                buf[total..].as_mut_ptr(),
+                buf.len() - total,
+              )
+            };
+
+            backend.push(
+              id,
+              Op::Read {
+                fd: read_res.clone(),
+                iovecs: (&mut raw_buf as *mut RawBuf),
+                iov_count: 1,
+                offset: -1,
+                flags: 0,
+              },
+            );
+            backend.flush().unwrap();
+
+            let completed = wait_for_positive_completion(&mut backend);
+            assert_eq!(completed.registration_id(), id);
+            let n = completed.result() as usize;
+            assert!(
+              n <= payload.len() - total,
+              "read completed more bytes than remaining: {} > {}",
+              n,
+              payload.len() - total
+            );
+            total += n;
+            id += 1;
+          }
+
+          assert_eq!(total, payload.len());
+          assert_eq!(&buf, &payload);
         }
 
-        // Cleanup - drop resource to close fd, then unlink
-        drop(resource);
-        unsafe { libc::unlink(path.as_ptr()) };
+        #[test]
+        fn pending_then_success() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, write_res) = socket_pair();
+          let payload = *b"late";
+          let mut buf = [0_u8; 4];
+          let mut raw_buf = unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
+
+          backend.push(
+            54,
+            Op::Read {
+              fd: read_res.clone(),
+              iovecs: (&mut raw_buf as *mut RawBuf),
+              iov_count: 1,
+              offset: -1,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert!(
+            completed.is_empty(),
+            "read without available data must remain pending"
+          );
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert!(
+            completed.is_empty(),
+            "read must remain pending across repeated zero-timeout waits"
+          );
+
+          let wrote = unsafe {
+            libc::send(
+              write_res.as_raw_fd(),
+              payload.as_ptr().cast(),
+              payload.len(),
+              0,
+            )
+          };
+          assert_eq!(wrote, payload.len() as isize);
+
+          let completed = wait_for_positive_completion(&mut backend);
+          assert_eq!(completed.registration_id(), 54);
+          let mut total = completed.result() as usize;
+
+          let mut id = 55_u64;
+          while total < payload.len() {
+            let mut raw_buf = unsafe {
+              RawBuf::from_raw_parts(
+                buf[total..].as_mut_ptr(),
+                buf.len() - total,
+              )
+            };
+            backend.push(
+              id,
+              Op::Read {
+                fd: read_res.clone(),
+                iovecs: (&mut raw_buf as *mut RawBuf),
+                iov_count: 1,
+                offset: -1,
+                flags: 0,
+              },
+            );
+            backend.flush().unwrap();
+
+            let completed = wait_for_positive_completion(&mut backend);
+            assert_eq!(completed.registration_id(), id);
+            let n = completed.result() as usize;
+            assert!(
+              n <= payload.len() - total,
+              "read completed more bytes than remaining: {} > {}",
+              n,
+              payload.len() - total
+            );
+            total += n;
+            id += 1;
+          }
+
+          assert_eq!(total, payload.len());
+          assert_eq!(&buf, &payload);
+        }
+
+        #[test]
+        fn deferred_completion_is_delivered_exactly_once() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, write_res) = socket_pair();
+          let payload = *b"once";
+          let mut buf = [0_u8; 4];
+          let mut raw_buf = unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
+
+          backend.push(
+            541,
+            Op::Read {
+              fd: read_res.clone(),
+              iovecs: (&mut raw_buf as *mut RawBuf),
+              iov_count: 1,
+              offset: -1,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          assert!(
+            backend.wait(Some(Duration::ZERO)).unwrap().is_empty(),
+            "read without available data must remain pending"
+          );
+
+          let wrote = unsafe {
+            libc::send(
+              write_res.as_raw_fd(),
+              payload.as_ptr().cast(),
+              payload.len(),
+              0,
+            )
+          };
+          assert_eq!(wrote, payload.len() as isize);
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 541, payload.len() as isize);
+          assert_eq!(&buf, &payload);
+
+          for _ in 0..3 {
+            let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+            assert!(
+              completed.is_empty(),
+              "a deferred read completion already returned once must not be returned again"
+            );
+          }
+        }
+
+        #[test]
+        fn vectored_success_reports_total_byte_count() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, write_res) = socket_pair();
+          let payload = *b"vector";
+          let wrote = unsafe {
+            libc::send(
+              write_res.as_raw_fd(),
+              payload.as_ptr().cast(),
+              payload.len(),
+              0,
+            )
+          };
+          assert_eq!(wrote, payload.len() as isize);
+          let mut left = [0_u8; 3];
+          let mut right = [0_u8; 3];
+          let mut total = 0usize;
+          let mut id = 65_u64;
+          while total < payload.len() {
+            let left_written = total.min(left.len());
+            let right_written = total.saturating_sub(left.len()).min(right.len());
+            let mut bufs = [
+              unsafe {
+                RawBuf::from_raw_parts(
+                  left[left_written..].as_mut_ptr(),
+                  left.len() - left_written,
+                )
+              },
+              unsafe {
+                RawBuf::from_raw_parts(
+                  right[right_written..].as_mut_ptr(),
+                  right.len() - right_written,
+                )
+              },
+            ];
+
+            backend.push(
+              id,
+              Op::Read {
+                fd: read_res.clone(),
+                iovecs: bufs.as_mut_ptr(),
+                iov_count: bufs.len(),
+                offset: -1,
+                flags: 0,
+              },
+            );
+            backend.flush().unwrap();
+
+            let completed = wait_for_positive_completion(&mut backend);
+            assert_eq!(completed.registration_id(), id);
+            let n = completed.result() as usize;
+            assert!(
+              n <= payload.len() - total,
+              "read completed more bytes than remaining: {} > {}",
+              n,
+              payload.len() - total
+            );
+            total += n;
+            id += 1;
+          }
+
+          assert_eq!(total, payload.len());
+          assert_eq!(&left, b"vec");
+          assert_eq!(&right, b"tor");
+        }
+
+        #[test]
+        fn eof_reports_zero() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, write_res) = socket_pair();
+          let mut buf = [0_u8; 4];
+          let mut raw_buf = unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
+
+          backend.push(
+            55,
+            Op::Read {
+              fd: read_res.clone(),
+              iovecs: (&mut raw_buf as *mut RawBuf),
+              iov_count: 1,
+              offset: -1,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+          drop(write_res);
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 55, 0);
+        }
+
+        #[test]
+        fn invalid_fd_reports_ebadf() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let mut buf = [0_u8; 4];
+          let mut raw_buf = unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
+
+          backend.push(
+            47,
+            Op::Read {
+              fd: invalid_fd_resource(),
+              iovecs: (&mut raw_buf as *mut RawBuf),
+              iov_count: 1,
+              offset: -1,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 47, -(libc::EBADF as isize));
+        }
+
+        #[test]
+        fn invalid_offset_reports_einval() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, _write_res) = socket_pair();
+          let mut buf = [0_u8; 4];
+          let mut raw_buf = unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
+
+          backend.push(
+            69,
+            Op::Read {
+              fd: read_res,
+              iovecs: (&mut raw_buf as *mut RawBuf),
+              iov_count: 1,
+              offset: -2,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert_eq!(completed.len(), 1);
+          assert_exact_result(&completed[0], 69, -(libc::EINVAL as isize));
+        }
+
+        #[test]
+        fn unsupported_flags_report_enotsup() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, _write_res) = socket_pair();
+          let mut buf = [0_u8; 4];
+          let mut raw_buf = unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
+
+          backend.push(
+            70,
+            Op::Read {
+              fd: read_res,
+              iovecs: (&mut raw_buf as *mut RawBuf),
+              iov_count: 1,
+              offset: -1,
+              flags: i32::MIN,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert_eq!(completed.len(), 1);
+          assert_exact_result(&completed[0], 70, -(libc::ENOTSUP as isize));
+        }
+
+        #[test]
+        fn null_iovecs_reports_einval() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, _write_res) = socket_pair();
+
+          backend.push(
+            71,
+            Op::Read {
+              fd: read_res,
+              iovecs: std::ptr::null_mut(),
+              iov_count: 1,
+              offset: -1,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert_eq!(completed.len(), 1);
+          assert_exact_result(&completed[0], 71, -(libc::EINVAL as isize));
+        }
+      }
+
+      #[cfg(unix)]
+      mod write {
+        use super::*;
+        use std::os::fd::AsRawFd;
+
+        #[test]
+        fn success_reports_raw_result_and_id() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, write_res) = socket_pair();
+          let mut payload = *b"writ";
+          let mut total = 0usize;
+          let mut id = 44_u64;
+          while total < payload.len() {
+            let raw_buf = unsafe {
+              RawBuf::from_raw_parts(
+                payload[total..].as_mut_ptr(),
+                payload.len() - total,
+              )
+            };
+
+            backend.push(
+              id,
+              Op::Write {
+                fd: write_res.clone(),
+                iovecs: (&raw_buf as *const RawBuf),
+                iov_count: 1,
+                offset: -1,
+                flags: 0,
+              },
+            );
+            backend.flush().unwrap();
+
+            let completed = wait_for_positive_completion(&mut backend);
+            assert_eq!(completed.registration_id(), id);
+            let n = completed.result() as usize;
+            assert!(
+              n <= payload.len() - total,
+              "write completed more bytes than remaining: {} > {}",
+              n,
+              payload.len() - total
+            );
+            total += n;
+            id += 1;
+          }
+
+          assert_eq!(total, payload.len());
+
+          let mut buf = [0_u8; 4];
+          let n = unsafe {
+            libc::recv(
+              read_res.as_raw_fd(),
+              buf.as_mut_ptr().cast(),
+              buf.len(),
+              0,
+            )
+          };
+          assert_eq!(n, payload.len() as isize);
+          assert_eq!(&buf, &payload);
+        }
+
+        #[test]
+        fn vectored_success_reports_total_byte_count() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, write_res) = socket_pair();
+          let left = *b"vec";
+          let right = *b"tor";
+          let mut total = 0usize;
+          let mut id = 66_u64;
+          while total < 6 {
+            let left_done = total.min(left.len());
+            let right_done = total.saturating_sub(left.len()).min(right.len());
+            let bufs = [
+              RawBuf::new(&left[left_done..]),
+              RawBuf::new(&right[right_done..]),
+            ];
+
+            backend.push(
+              id,
+              Op::Write {
+                fd: write_res.clone(),
+                iovecs: bufs.as_ptr(),
+                iov_count: bufs.len(),
+                offset: -1,
+                flags: 0,
+              },
+            );
+            backend.flush().unwrap();
+
+            let completed = wait_for_positive_completion(&mut backend);
+            assert_eq!(completed.registration_id(), id);
+            let n = completed.result() as usize;
+            assert!(n <= 6 - total, "write completed more bytes than remaining");
+            total += n;
+            id += 1;
+          }
+
+          assert_eq!(total, 6);
+
+          let mut buf = [0_u8; 6];
+          let n = unsafe {
+            libc::recv(
+              read_res.as_raw_fd(),
+              buf.as_mut_ptr().cast(),
+              buf.len(),
+              0,
+            )
+          };
+          assert_eq!(n, 6);
+          assert_eq!(&buf, b"vector");
+        }
+
+        #[test]
+        fn invalid_fd_reports_ebadf() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let payload = *b"err!";
+          let raw_buf = unsafe { RawBuf::from_raw_parts(payload.as_ptr().cast_mut(), payload.len()) };
+
+          backend.push(
+            48,
+            Op::Write {
+              fd: invalid_fd_resource(),
+              iovecs: (&raw_buf as *const RawBuf),
+              iov_count: 1,
+              offset: -1,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 48, -(libc::EBADF as isize));
+        }
+
+        #[test]
+        fn invalid_offset_reports_einval() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (_read_res, write_res) = socket_pair();
+          let payload = *b"arg!";
+          let raw_buf = unsafe { RawBuf::from_raw_parts(payload.as_ptr().cast_mut(), payload.len()) };
+
+          backend.push(
+            72,
+            Op::Write {
+              fd: write_res,
+              iovecs: (&raw_buf as *const RawBuf),
+              iov_count: 1,
+              offset: -2,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 72, -(libc::EINVAL as isize));
+        }
+
+        #[test]
+        fn unsupported_flags_report_enotsup() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (_read_res, write_res) = socket_pair();
+          let payload = *b"arg!";
+          let raw_buf = unsafe { RawBuf::from_raw_parts(payload.as_ptr().cast_mut(), payload.len()) };
+
+          backend.push(
+            73,
+            Op::Write {
+              fd: write_res,
+              iovecs: (&raw_buf as *const RawBuf),
+              iov_count: 1,
+              offset: -1,
+              flags: i32::MIN,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 73, -(libc::ENOTSUP as isize));
+        }
+
+        #[test]
+        fn null_iovecs_reports_einval() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (_read_res, write_res) = socket_pair();
+
+          backend.push(
+            74,
+            Op::Write {
+              fd: write_res,
+              iovecs: std::ptr::null(),
+              iov_count: 1,
+              offset: -1,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 74, -(libc::EINVAL as isize));
+        }
+      }
+
+      #[cfg(unix)]
+      mod recv {
+        use super::*;
+        use std::os::fd::AsRawFd;
+
+        #[test]
+        fn success_reports_raw_result_and_id() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, write_res) = socket_pair();
+          let payload = *b"pong";
+          let wrote = unsafe {
+            libc::send(
+              write_res.as_raw_fd(),
+              payload.as_ptr().cast(),
+              payload.len(),
+              0,
+            )
+          };
+          assert_eq!(wrote, payload.len() as isize);
+
+          let mut buf = [0_u8; 4];
+          let mut total = 0usize;
+          let mut id = 42_u64;
+          while total < payload.len() {
+            let mut iov = [libc::iovec {
+              iov_base: buf[total..].as_mut_ptr().cast(),
+              iov_len: buf.len() - total,
+            }];
+            let mut msg = libc::msghdr {
+              msg_name: std::ptr::null_mut(),
+              msg_namelen: 0,
+              msg_iov: iov.as_mut_ptr(),
+              msg_iovlen: 1,
+              msg_control: std::ptr::null_mut(),
+              msg_controllen: 0,
+              msg_flags: 0,
+            };
+
+            backend.push(
+              id,
+              Op::Recv {
+                fd: read_res.clone(),
+                msg: &mut msg,
+                flags: 0,
+              },
+            );
+            backend.flush().unwrap();
+
+            let completed = wait_for_positive_completion(&mut backend);
+            assert_eq!(completed.registration_id(), id);
+            let n = completed.result() as usize;
+            assert!(n <= payload.len() - total, "recv completed more bytes than remaining");
+            total += n;
+            id += 1;
+          }
+          assert_eq!(total, payload.len());
+          assert_eq!(&buf, &payload);
+        }
+
+        #[test]
+        fn pending_then_success() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, write_res) = socket_pair();
+          let payload = *b"wait";
+          let mut buf = [0_u8; 4];
+          let mut iov = [libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+          }];
+          let mut msg = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: iov.as_mut_ptr(),
+            msg_iovlen: 1,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+          };
+
+          backend.push(
+            56,
+            Op::Recv {
+              fd: read_res.clone(),
+              msg: &mut msg,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert!(
+            completed.is_empty(),
+            "recv without available data must remain pending"
+          );
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert!(
+            completed.is_empty(),
+            "recv must remain pending across repeated zero-timeout waits"
+          );
+
+          let wrote = unsafe {
+            libc::send(
+              write_res.as_raw_fd(),
+              payload.as_ptr().cast(),
+              payload.len(),
+              0,
+            )
+          };
+          assert_eq!(wrote, payload.len() as isize);
+
+          let completed = wait_for_positive_completion(&mut backend);
+          assert_eq!(completed.registration_id(), 56);
+          let mut total = completed.result() as usize;
+
+          let mut id = 57_u64;
+          while total < payload.len() {
+            let mut iov = [libc::iovec {
+              iov_base: buf[total..].as_mut_ptr().cast(),
+              iov_len: buf.len() - total,
+            }];
+            let mut msg = libc::msghdr {
+              msg_name: std::ptr::null_mut(),
+              msg_namelen: 0,
+              msg_iov: iov.as_mut_ptr(),
+              msg_iovlen: 1,
+              msg_control: std::ptr::null_mut(),
+              msg_controllen: 0,
+              msg_flags: 0,
+            };
+
+            backend.push(
+              id,
+              Op::Recv {
+                fd: read_res.clone(),
+                msg: &mut msg,
+                flags: 0,
+              },
+            );
+            backend.flush().unwrap();
+
+            let completed = wait_for_positive_completion(&mut backend);
+            assert_eq!(completed.registration_id(), id);
+            let n = completed.result() as usize;
+            assert!(n <= payload.len() - total, "recv completed more bytes than remaining");
+            total += n;
+            id += 1;
+          }
+
+          assert_eq!(total, payload.len());
+          assert_eq!(&buf, &payload);
+        }
+
+        #[test]
+        fn deferred_completion_is_delivered_exactly_once() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, write_res) = socket_pair();
+          let payload = *b"once";
+          let mut buf = [0_u8; 4];
+          let mut iov = [libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+          }];
+          let mut msg = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: iov.as_mut_ptr(),
+            msg_iovlen: 1,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+          };
+
+          backend.push(
+            561,
+            Op::Recv {
+              fd: read_res.clone(),
+              msg: &mut msg,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          assert!(
+            backend.wait(Some(Duration::ZERO)).unwrap().is_empty(),
+            "recv without available data must remain pending"
+          );
+
+          let wrote = unsafe {
+            libc::send(
+              write_res.as_raw_fd(),
+              payload.as_ptr().cast(),
+              payload.len(),
+              0,
+            )
+          };
+          assert_eq!(wrote, payload.len() as isize);
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 561, payload.len() as isize);
+          assert_eq!(&buf, &payload);
+
+          for _ in 0..3 {
+            let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+            assert!(
+              completed.is_empty(),
+              "a deferred recv completion already returned once must not be returned again"
+            );
+          }
+        }
+
+        #[test]
+        fn vectored_success_reports_total_byte_count() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, write_res) = socket_pair();
+          let payload = *b"vector";
+          let wrote = unsafe {
+            libc::send(
+              write_res.as_raw_fd(),
+              payload.as_ptr().cast(),
+              payload.len(),
+              0,
+            )
+          };
+          assert_eq!(wrote, payload.len() as isize);
+
+          let mut left = [0_u8; 3];
+          let mut right = [0_u8; 3];
+          let mut total = 0usize;
+          let mut id = 67_u64;
+          while total < payload.len() {
+            let left_done = total.min(left.len());
+            let right_done = total.saturating_sub(left.len()).min(right.len());
+            let mut iov = [
+              libc::iovec {
+                iov_base: left[left_done..].as_mut_ptr().cast(),
+                iov_len: left.len() - left_done,
+              },
+              libc::iovec {
+                iov_base: right[right_done..].as_mut_ptr().cast(),
+                iov_len: right.len() - right_done,
+              },
+            ];
+            let mut msg = libc::msghdr {
+              msg_name: std::ptr::null_mut(),
+              msg_namelen: 0,
+              msg_iov: iov.as_mut_ptr(),
+              msg_iovlen: iov.len() as _,
+              msg_control: std::ptr::null_mut(),
+              msg_controllen: 0,
+              msg_flags: 0,
+            };
+
+            backend.push(
+              id,
+              Op::Recv {
+                fd: read_res.clone(),
+                msg: &mut msg,
+                flags: 0,
+              },
+            );
+            backend.flush().unwrap();
+
+            let completed = wait_for_positive_completion(&mut backend);
+            assert_eq!(completed.registration_id(), id);
+            let n = completed.result() as usize;
+            assert!(n <= payload.len() - total, "recv completed more bytes than remaining");
+            total += n;
+            id += 1;
+          }
+
+          assert_eq!(total, payload.len());
+          assert_eq!(&left, b"vec");
+          assert_eq!(&right, b"tor");
+        }
+
+        #[test]
+        fn eof_reports_zero() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, write_res) = socket_pair();
+          let mut buf = [0_u8; 4];
+          let mut iov = [libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+          }];
+          let mut msg = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: iov.as_mut_ptr(),
+            msg_iovlen: 1,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+          };
+
+          backend.push(
+            57,
+            Op::Recv {
+              fd: read_res.clone(),
+              msg: &mut msg,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+          drop(write_res);
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 57, 0);
+        }
+
+        #[test]
+        fn invalid_fd_reports_ebadf() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let mut buf = [0_u8; 4];
+          let mut iov = [libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+          }];
+          let mut msg = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: iov.as_mut_ptr(),
+            msg_iovlen: 1,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+          };
+
+          backend.push(
+            49,
+            Op::Recv {
+              fd: invalid_fd_resource(),
+              msg: &mut msg,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 49, -(libc::EBADF as isize));
+        }
+      }
+
+      #[cfg(unix)]
+      mod send {
+        use super::*;
+        use std::os::fd::AsRawFd;
+
+        #[test]
+        fn success_reports_raw_result_and_id() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, write_res) = socket_pair();
+          let payload = *b"ping";
+          let mut total = 0usize;
+          let mut id = 41_u64;
+          while total < payload.len() {
+            let iov = [libc::iovec {
+              iov_base: payload[total..].as_ptr().cast_mut().cast(),
+              iov_len: payload.len() - total,
+            }];
+            let msg = libc::msghdr {
+              msg_name: std::ptr::null_mut(),
+              msg_namelen: 0,
+              msg_iov: iov.as_ptr().cast_mut(),
+              msg_iovlen: 1,
+              msg_control: std::ptr::null_mut(),
+              msg_controllen: 0,
+              msg_flags: 0,
+            };
+
+            backend.push(
+              id,
+              Op::Send {
+                fd: write_res.clone(),
+                msg: &msg,
+                flags: 0,
+              },
+            );
+            backend.flush().unwrap();
+
+            let completed = wait_for_positive_completion(&mut backend);
+            assert_eq!(completed.registration_id(), id);
+            let n = completed.result() as usize;
+            assert!(n <= payload.len() - total, "send completed more bytes than remaining");
+            total += n;
+            id += 1;
+          }
+
+          assert_eq!(total, payload.len());
+
+          let mut buf = [0_u8; 4];
+          let n = unsafe {
+            libc::recv(
+              read_res.as_raw_fd(),
+              buf.as_mut_ptr().cast(),
+              buf.len(),
+              0,
+            )
+          };
+          assert_eq!(n, payload.len() as isize);
+          assert_eq!(&buf, &payload);
+        }
+
+        #[test]
+        fn vectored_success_reports_total_byte_count() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_res, write_res) = socket_pair();
+          let left = *b"vec";
+          let right = *b"tor";
+          let mut total = 0usize;
+          let mut id = 68_u64;
+          while total < 6 {
+            let left_done = total.min(left.len());
+            let right_done = total.saturating_sub(left.len()).min(right.len());
+            let iov = [
+              libc::iovec {
+                iov_base: left[left_done..].as_ptr().cast_mut().cast(),
+                iov_len: left.len() - left_done,
+              },
+              libc::iovec {
+                iov_base: right[right_done..].as_ptr().cast_mut().cast(),
+                iov_len: right.len() - right_done,
+              },
+            ];
+            let msg = libc::msghdr {
+              msg_name: std::ptr::null_mut(),
+              msg_namelen: 0,
+              msg_iov: iov.as_ptr().cast_mut(),
+              msg_iovlen: iov.len() as _,
+              msg_control: std::ptr::null_mut(),
+              msg_controllen: 0,
+              msg_flags: 0,
+            };
+
+            backend.push(
+              id,
+              Op::Send {
+                fd: write_res.clone(),
+                msg: &msg,
+                flags: 0,
+              },
+            );
+            backend.flush().unwrap();
+
+            let completed = wait_for_positive_completion(&mut backend);
+            assert_eq!(completed.registration_id(), id);
+            let n = completed.result() as usize;
+            assert!(n <= 6 - total, "send completed more bytes than remaining");
+            total += n;
+            id += 1;
+          }
+
+          assert_eq!(total, 6);
+
+          let mut buf = [0_u8; 6];
+          let n = unsafe {
+            libc::recv(
+              read_res.as_raw_fd(),
+              buf.as_mut_ptr().cast(),
+              buf.len(),
+              0,
+            )
+          };
+          assert_eq!(n, 6);
+          assert_eq!(&buf, b"vector");
+        }
+
+        #[test]
+        fn invalid_fd_reports_ebadf() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let payload = *b"oops";
+          let iov = [libc::iovec {
+            iov_base: payload.as_ptr().cast_mut().cast(),
+            iov_len: payload.len(),
+          }];
+          let msg = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: iov.as_ptr().cast_mut(),
+            msg_iovlen: 1,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+          };
+
+          backend.push(
+            50,
+            Op::Send {
+              fd: invalid_fd_resource(),
+              msg: &msg,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 50, -(libc::EBADF as isize));
+        }
+      }
+
+      #[cfg(unix)]
+      mod accept {
+        use super::*;
+
+        #[test]
+        fn success_reports_success_and_id() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let path = unix_socket_path("accept-ok");
+          fs::remove_file(&path).ok();
+          let listener = UnixListener::bind(&path).unwrap();
+          listener.set_nonblocking(true).unwrap();
+          let listener_fd = listener.into_raw_fd();
+          let listener_res = unsafe { Resource::from_raw_fd(listener_fd) };
+
+          let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+          let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+
+          backend.push(
+            52,
+            Op::Accept {
+              fd: listener_res,
+              addr: &mut storage,
+              len: &mut len,
+            },
+          );
+          backend.flush().unwrap();
+
+          let path_clone = path.clone();
+          let client = thread::spawn(move || {
+            let stream = UnixStream::connect(&path_clone).unwrap();
+            drop(stream);
+          });
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_eq!(completed.registration_id(), 52);
+          assert!(
+            completed.result() >= 0,
+            "accept must succeed with a nonnegative fd, got {}",
+            completed.result()
+          );
+
+          client.join().unwrap();
+          unsafe {
+            libc::close(completed.result() as libc::c_int);
+          }
+          fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn pending_then_success() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let path = unix_socket_path("accept-pending");
+          fs::remove_file(&path).ok();
+          let listener = UnixListener::bind(&path).unwrap();
+          listener.set_nonblocking(true).unwrap();
+          let listener_fd = listener.into_raw_fd();
+          let listener_res = unsafe { Resource::from_raw_fd(listener_fd) };
+
+          let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+          let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+
+          backend.push(
+            58,
+            Op::Accept {
+              fd: listener_res,
+              addr: &mut storage,
+              len: &mut len,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert!(
+            completed.is_empty(),
+            "accept without a pending client must remain pending"
+          );
+
+          let path_clone = path.clone();
+          let client = thread::spawn(move || {
+            let stream = UnixStream::connect(&path_clone).unwrap();
+            drop(stream);
+          });
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_eq!(completed.registration_id(), 58);
+          assert!(
+            completed.result() >= 0,
+            "accept must succeed with a nonnegative fd, got {}",
+            completed.result()
+          );
+
+          client.join().unwrap();
+          unsafe {
+            libc::close(completed.result() as libc::c_int);
+          }
+          fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn invalid_fd_reports_ebadf() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+          let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+
+          backend.push(
+            51,
+            Op::Accept {
+              fd: invalid_fd_resource(),
+              addr: &mut storage,
+              len: &mut len,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 51, -(libc::EBADF as isize));
+        }
+      }
+
+      #[cfg(unix)]
+      mod connect {
+        use super::*;
+
+        #[test]
+        fn missing_path_reports_enoent() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let path = unix_socket_path("connect");
+          fs::remove_file(&path).ok();
+
+          let client_fd = unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket() failed: {}", std::io::Error::last_os_error());
+            set_nonblocking(fd);
+            fd
+          };
+          let client_res = unsafe { Resource::from_raw_fd(client_fd) };
+          let (storage, len) = unix_sockaddr_un(&path);
+
+          backend.push(
+            46,
+            Op::Connect {
+              fd: client_res.clone(),
+              addr: &storage,
+              len,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert_eq!(completed.len(), 1);
+          assert_exact_result(&completed[0], 46, -(libc::ENOENT as isize));
+        }
+
+        #[test]
+        fn success_reports_zero_and_id() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let path = unix_socket_path("connect-ok");
+          fs::remove_file(&path).ok();
+          let listener = UnixListener::bind(&path).unwrap();
+
+          let acceptor = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+          });
+
+          let client_fd = unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket() failed: {}", std::io::Error::last_os_error());
+            set_nonblocking(fd);
+            fd
+          };
+          let client_res = unsafe { Resource::from_raw_fd(client_fd) };
+          let (storage, len) = unix_sockaddr_un(&path);
+
+          backend.push(
+            53,
+            Op::Connect {
+              fd: client_res,
+              addr: &storage,
+              len,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 53, 0);
+
+          acceptor.join().unwrap();
+          fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn invalid_fd_reports_ebadf() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let path = unix_socket_path("connect-ebadf");
+          let (storage, len) = unix_sockaddr_un(&path);
+
+          backend.push(
+            59,
+            Op::Connect {
+              fd: invalid_fd_resource(),
+              addr: &storage,
+              len,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 59, -(libc::EBADF as isize));
+        }
+
+        #[test]
+        fn immediate_completion_is_surfaced_on_next_wait() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let path = unix_socket_path("connect-immediate");
+          fs::remove_file(&path).ok();
+
+          let client_fd = unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket() failed: {}", std::io::Error::last_os_error());
+            set_nonblocking(fd);
+            fd
+          };
+          let client_res = unsafe { Resource::from_raw_fd(client_fd) };
+          let (storage, len) = unix_sockaddr_un(&path);
+
+          backend.push(
+            63,
+            Op::Connect {
+              fd: client_res,
+              addr: &storage,
+              len,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert_eq!(completed.len(), 1);
+          assert_exact_result(&completed[0], 63, -(libc::ENOENT as isize));
+        }
+      }
+
+      #[cfg(unix)]
+      mod batching {
+        use super::*;
+
+        #[test]
+        fn multiple_immediate_completions_are_returned_together() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let path = unix_socket_path("batch-connect");
+          let (storage, len) = unix_sockaddr_un(&path);
+
+          let mut buf = [0_u8; 4];
+          let mut raw_buf = unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
+
+          backend.push(
+            60,
+            Op::Connect {
+              fd: invalid_fd_resource(),
+              addr: &storage,
+              len,
+            },
+          );
+          backend.push(
+            61,
+            Op::Read {
+              fd: invalid_fd_resource(),
+              iovecs: (&mut raw_buf as *mut RawBuf),
+              iov_count: 1,
+              offset: -1,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          let mut completed = backend
+            .wait(Some(Duration::ZERO))
+            .unwrap()
+            .iter()
+            .map(|item| {
+              $crate::backend::OpCompleted::new(
+                item.registration_id(),
+                item.result(),
+              )
+            })
+            .collect::<Vec<_>>();
+          completed.sort_by_key(|item| item.registration_id());
+
+          assert_eq!(completed.len(), 2);
+          assert_exact_result(&completed[0], 60, -(libc::EBADF as isize));
+          assert_exact_result(&completed[1], 61, -(libc::EBADF as isize));
+        }
+
+        #[test]
+        fn wait_buffer_is_cleared_after_consumption() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let path = unix_socket_path("buffer-reuse");
+          let (storage, len) = unix_sockaddr_un(&path);
+
+          backend.push(
+            62,
+            Op::Connect {
+              fd: invalid_fd_resource(),
+              addr: &storage,
+              len,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert_eq!(completed.len(), 1);
+          assert_exact_result(&completed[0], 62, -(libc::EBADF as isize));
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert!(
+            completed.is_empty(),
+            "completed wait buffer must not retain stale completions"
+          );
+        }
+
+        #[test]
+        fn completions_are_not_duplicated_across_waits() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let path = unix_socket_path("no-dup");
+          let (storage, len) = unix_sockaddr_un(&path);
+
+          backend.push(
+            64,
+            Op::Connect {
+              fd: invalid_fd_resource(),
+              addr: &storage,
+              len,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert_eq!(completed.len(), 1);
+          assert_exact_result(&completed[0], 64, -(libc::EBADF as isize));
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert!(
+            completed.is_empty(),
+            "a completion already returned once must not be returned again"
+          );
+        }
+
+        #[test]
+        fn mixed_pending_batch_completes_each_registration_exactly_once() {
+          use std::os::fd::AsRawFd;
+
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let (read_a, write_a) = socket_pair();
+          let (read_b, write_b) = socket_pair();
+          let payload_a = *b"ab";
+          let payload_b = *b"cd";
+          let mut buf_a = [0_u8; 2];
+          let mut buf_b = [0_u8; 2];
+          let mut raw_a = unsafe { RawBuf::from_raw_parts(buf_a.as_mut_ptr(), buf_a.len()) };
+          let mut raw_b = unsafe { RawBuf::from_raw_parts(buf_b.as_mut_ptr(), buf_b.len()) };
+
+          backend.push(
+            701,
+            Op::Read {
+              fd: read_a.clone(),
+              iovecs: (&mut raw_a as *mut RawBuf),
+              iov_count: 1,
+              offset: -1,
+              flags: 0,
+            },
+          );
+          backend.push(
+            702,
+            Op::Read {
+              fd: read_b.clone(),
+              iovecs: (&mut raw_b as *mut RawBuf),
+              iov_count: 1,
+              offset: -1,
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          assert!(
+            backend.wait(Some(Duration::ZERO)).unwrap().is_empty(),
+            "pending reads must not complete before data arrives"
+          );
+
+          let wrote_a = unsafe {
+            libc::send(
+              write_a.as_raw_fd(),
+              payload_a.as_ptr().cast(),
+              payload_a.len(),
+              0,
+            )
+          };
+          let wrote_b = unsafe {
+            libc::send(
+              write_b.as_raw_fd(),
+              payload_b.as_ptr().cast(),
+              payload_b.len(),
+              0,
+            )
+          };
+          assert_eq!(wrote_a, payload_a.len() as isize);
+          assert_eq!(wrote_b, payload_b.len() as isize);
+
+          let mut seen = std::collections::BTreeMap::new();
+          for _ in 0..10 {
+            let completed = backend.wait(Some(Duration::from_millis(10))).unwrap();
+            for item in completed {
+              let previous = seen.insert(item.registration_id(), item.result());
+              assert!(
+                previous.is_none(),
+                "registration {} completed more than once",
+                item.registration_id()
+              );
+            }
+            if seen.len() == 2 {
+              break;
+            }
+          }
+
+          assert_eq!(seen.len(), 2, "expected exactly two completions");
+          assert_eq!(seen.get(&701), Some(&(payload_a.len() as isize)));
+          assert_eq!(seen.get(&702), Some(&(payload_b.len() as isize)));
+          assert_eq!(&buf_a, &payload_a);
+          assert_eq!(&buf_b, &payload_b);
+
+          for _ in 0..3 {
+            let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+            assert!(
+              completed.is_empty(),
+              "completed pending batch registrations must not be returned again"
+            );
+          }
+        }
       }
     }
   };

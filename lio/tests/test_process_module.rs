@@ -143,8 +143,10 @@ fn test_command_try_wait_running() {
 
   {
     if !(status.is_none()) {
-      let stderr_data = stderr.read_to_end().blocking(&lio).unwrap_or_default();
-      let stdout_data = stdout.read_to_end().blocking(&lio).unwrap_or_default();
+      let mut stderr_recv = stderr.read_to_end().with_lio(&lio).send();
+      let stderr_data = poll_recv(&lio, &mut stderr_recv).unwrap_or_default();
+      let mut stdout_recv = stdout.read_to_end().with_lio(&lio).send();
+      let stdout_data = poll_recv(&lio, &mut stdout_recv).unwrap_or_default();
       panic!(
         "status = None expected, got: {:?}, stderr: {:?}, stdout: {:?}",
         status,
@@ -350,7 +352,8 @@ fn test_stdout_read_to_end() {
   let mut child = poll_recv(&lio, &mut recv).unwrap();
 
   let stdout = child.stdout.take().expect("stdout should be piped");
-  let output = stdout.read_to_end().blocking(&lio).unwrap();
+  let mut stdout_recv = stdout.read_to_end().with_lio(&lio).send();
+  let output = poll_recv(&lio, &mut stdout_recv).unwrap();
 
   assert_eq!(output, b"hello world\n");
 
@@ -373,7 +376,8 @@ fn test_stderr_read_to_end() {
   let mut child = poll_recv(&lio, &mut recv).unwrap();
 
   let stderr = child.stderr.take().expect("stderr should be piped");
-  let output = stderr.read_to_end().blocking(&lio).unwrap();
+  let mut stderr_recv = stderr.read_to_end().with_lio(&lio).send();
+  let output = poll_recv(&lio, &mut stderr_recv).unwrap();
 
   assert_eq!(output, b"error\n");
 

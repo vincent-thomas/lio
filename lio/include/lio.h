@@ -44,24 +44,9 @@ typedef struct sockaddr_storage sockaddr_storage;
 #define MAX_IOV_COUNT 16
 
 /**
- * Shared lock (multiple readers allowed).
+ * Completion flags understood by higher-level operation models.
  */
-#define LOCK_SH 1
-
-/**
- * Exclusive lock (single writer).
- */
-#define LOCK_EX 2
-
-/**
- * Unlock.
- */
-#define LOCK_UN 8
-
-/**
- * Non-blocking mode (combine with LOCK_SH or LOCK_EX).
- */
-#define LOCK_NB 4
+typedef struct CompletionFlags CompletionFlags;
 
 /**
  * Interest/Event flags for I/O readiness
@@ -71,19 +56,6 @@ typedef struct sockaddr_storage sockaddr_storage;
  * - Receiving events (what actually happened)
  */
 typedef struct Interest Interest;
-
-/**
- * Options for waitid() controlling what state changes to wait for.
- */
-typedef struct WaitOptions WaitOptions;
-
-/**
- * Mask of events to watch for on a file or directory.
- *
- * These flags are cross-platform and get translated to the appropriate
- * platform-specific flags (inotify on Linux, EVFILT_VNODE on BSD/macOS).
- */
-typedef struct WatchMask WatchMask;
 
 /**
  * Opaque lio driver handle.  Create with [`lio_create`], destroy with
@@ -557,26 +529,6 @@ void lio_spawn(struct lio_handle_t *lio,
                const char *const *argv,
                const char *const *envp,
                void (*callback)(int));
-
-/**
- * Wait for a child process to change state.
- *
- * - `id_type`: 0=P_ALL (any child), 1=P_PID (specific pid), 2=P_PGID (process group)
- * - `id`: PID or PGID depending on id_type (ignored for P_ALL)
- * - `options`: Wait options (WEXITED=4, WSTOPPED=2, WCONTINUED=8, WNOHANG=1, WNOWAIT=0x1000000)
- * - `callback(result, pid, status, code)`:
- *   - result: 0 on success, negative errno on error
- *   - pid: child PID that changed state (0 if WNOHANG and no child ready)
- *   - status: 1=exited, 2=signaled, 3=stopped, 4=continued
- *   - code: exit code or signal number
- *
- * # Safety
- * `lio` must be valid.
- */
-void lio_waitid(struct lio_handle_t *lio, int id_type, int id, int options, void (*callback)(int,
-                                                                                             int,
-                                                                                             int,
-                                                                                             int));
 
 /**
  * Copy data between file descriptors without copying to userspace (Linux only).

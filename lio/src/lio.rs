@@ -1,5 +1,6 @@
 use crate::{
-  backend::{IoBackend, op::Op, store::OpStore},
+  api::op::{Action, Completion},
+  backend::{IoBackend, store::OpStore},
   registration::Registration,
   time::TimeManager,
 };
@@ -80,6 +81,13 @@ pub enum Error {
 }
 
 impl Lio {
+  fn dispatch_action(inner: &mut LioInner, id: u64, action: Action) {
+    match action {
+      Action::Io(op) => inner.io.push(id, op),
+      Action::Sleep(duration) => inner.time.schedule(id, duration),
+    }
+  }
+
   /// Creates a new Lio driver with the default backend and specified capacity.
   ///
   /// # Arguments
@@ -144,28 +152,28 @@ impl Lio {
     Ok(Self { inner: Rc::new(RefCell::new(inner)) })
   }
 
+  /// Schedule a StreamOp-based Registration for execution.
+  ///
+  /// The Registration already contains the StreamOp. This function:
+  /// 1. Inserts the Registration to get an operation ID
+  /// 2. Calls Registration.next_op(None) to get the first Op to submit
+  /// 3. Submits the Op to the backend
   pub(crate) fn schedule(
     &self,
-    op: Op,
-    notifier: Registration,
+    mut registration: Registration,
   ) -> io::Result<u64> {
     let mut inner = self.inner.borrow_mut();
-    // Inserting first because of a stable pointer to push is required.
-    let id = inner.store.insert(notifier);
 
-    // Handle sleep timers via the userspace timing wheel instead of kernel
-    if let Op::Sleep { duration, .. } = &op {
-      inner.time.schedule(id, *duration);
-      return Ok(id);
-    }
+    let action = registration.action().ok_or_else(|| {
+      io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "OpModel returned no action on first call",
+      )
+    })?;
 
-    match inner.io.push(id, op) {
-      Ok(()) => Ok(id),
-      Err(err) => {
-        assert!(inner.store.remove(id));
-        Err(err)
-      }
-    }
+    let id = inner.store.insert(registration);
+    Self::dispatch_action(&mut inner, id, action);
+    Ok(id)
   }
 
   /// Non-blocking poll for completed operations.
@@ -204,23 +212,27 @@ impl Lio {
     // Copy completion data to release borrow on inner.io
     let completed: Vec<_> = inner
       .io
-      .wait_timeout(effective_timeout)?
+      .wait(effective_timeout)?
       .iter()
-      .map(|c| (c.op_id, c.result, c.more))
+      .map(|c| (c.registration_id(), c.result()))
       .collect();
 
     // Collect IDs to remove (callbacks consume the result, wakers don't)
     let mut to_remove = Vec::new();
+    let mut to_resubmit: Vec<(u64, Action)> = Vec::new();
 
     // Process I/O completions
-    for (op_id, result, more) in &completed {
+    for (op_id, result) in &completed {
       let Some(op) = inner.store.get_mut(*op_id) else {
         // Op was cancelled and removed - ignore stale completion.
         // This happens with multishot ops on io_uring where cancellation
         // is async and completions may arrive after removal.
         continue;
       };
-      op.set_done(*result, *more);
+      // Process completion and get optional next operation to resubmit
+      if let Some(next_action) = op.on_completion(Completion::new(*result)) {
+        to_resubmit.push((*op_id, next_action));
+      }
 
       // For single-shot ops: remove when result consumed (callback path).
       // For stream ops: remove when done and all results consumed.
@@ -230,18 +242,35 @@ impl Lio {
       }
     }
 
+    // Resubmit operations that returned Continue
+    for (op_id, next_action) in to_resubmit {
+      Self::dispatch_action(&mut inner, op_id, next_action);
+    }
+
     // Process expired timers
     let expired_timers: Vec<_> = inner.time.poll_expired().collect();
-    for timer_id in &expired_timers {
-      if let Some(op) = inner.store.get_mut(*timer_id) {
-        // Timers are single-shot, so more=false
-        op.set_done(SLEEP_RESULT, false);
-        if op.is_finished() {
-          to_remove.push(*timer_id);
-        }
+    let expired_timer_count = expired_timers.len();
+    for timer_id in expired_timers {
+      let mut next_action = None;
+      let mut finished = false;
+
+      if let Some(reg) = inner.store.get_mut(timer_id) {
+        next_action = reg.on_completion(Completion::with_flags(
+          SLEEP_RESULT,
+          crate::api::op::CompletionFlags::TIMER,
+        ));
+        finished = reg.is_finished();
       }
-      // Remove from TimeManager tracking
-      inner.time.remove(*timer_id);
+
+      inner.time.remove(timer_id);
+
+      if let Some(action) = next_action {
+        Self::dispatch_action(&mut inner, timer_id, action);
+      }
+
+      if finished {
+        to_remove.push(timer_id);
+      }
     }
 
     // Remove consumed entries
@@ -249,45 +278,11 @@ impl Lio {
       inner.store.remove(id);
     }
 
-    Ok(completed.len() + expired_timers.len())
+    Ok(completed.len() + expired_timer_count)
   }
 
-  pub(crate) fn check_done(&self, key: u64) -> Result<isize, Error> {
-    let mut inner = self.inner.borrow_mut();
-    match inner.store.get_mut(key) {
-      Some(entry) => {
-        let result = entry.try_take_result().ok_or(Error::EntryNotCompleted)?;
-        assert!(inner.store.remove(key));
-        Ok(result)
-      }
-      None => Err(Error::EntryNotFound),
-    }
-  }
-
-  /// Checks for a completed result from a streaming operation.
-  ///
-  /// Unlike `check_done`, this pops one result from the stream's queue
-  /// and only removes the entry when the stream is finished.
-  pub(crate) fn check_stream_done(&self, key: u64) -> Result<isize, Error> {
-    let mut inner = self.inner.borrow_mut();
-    match inner.store.get_mut(key) {
-      Some(entry) => {
-        // Check if stream is finished (done and no pending results)
-        if entry.is_stream_done() {
-          assert!(inner.store.remove(key));
-          return Err(Error::StreamDone);
-        }
-        // Try to pop a result from the stream queue
-        let result = entry.try_take_result().ok_or(Error::EntryNotCompleted)?;
-        // Check again if we should clean up after taking this result
-        if entry.is_stream_done() {
-          assert!(inner.store.remove(key));
-        }
-        Ok(result)
-      }
-      None => Err(Error::EntryNotFound),
-    }
-  }
+  // NOTE: check_done and check_stream_done are no longer needed with the channel-based
+  // architecture. Results are now sent through mpsc channels directly to futures/streams.
 
   pub(crate) fn set_waker(&self, id: u64, waker: Waker) {
     let mut inner = self.inner.borrow_mut();
@@ -301,9 +296,70 @@ impl Lio {
   /// This is called when a stream is dropped to stop multishot operations.
   pub(crate) fn cancel_stream(&self, id: u64) {
     let mut inner = self.inner.borrow_mut();
-    // Cancel at the backend level (io_uring async cancel, or pollingv2 deregister)
-    let _ = inner.io.cancel(id);
-    // Remove from store
+    inner.time.remove(id);
     inner.store.remove(id);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{
+    api::ops::Nop,
+    backend::{IoBackend, OpCompleted, op::Op},
+  };
+  use std::sync::{Arc, Mutex};
+
+  #[derive(Default)]
+  struct TestBackend {
+    queued: Vec<(u64, Op)>,
+    completed: Vec<OpCompleted>,
+  }
+
+  impl IoBackend for TestBackend {
+    fn init(&mut self, _cap: usize) -> io::Result<()> {
+      Ok(())
+    }
+
+    fn push(&mut self, id: u64, op: Op) {
+      self.queued.push((id, op));
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+      for (id, op) in self.queued.drain(..) {
+        match op {
+          Op::Nop => self.completed.push(OpCompleted::new(id, 0)),
+          _ => unreachable!("test backend only supports Nop"),
+        }
+      }
+      Ok(())
+    }
+
+    fn wait(
+      &mut self,
+      _timeout: Option<Duration>,
+    ) -> io::Result<&[OpCompleted]> {
+      Ok(&self.completed)
+    }
+  }
+
+  #[test]
+  fn schedule_and_run_completes_nop_callback() {
+    let lio = Lio::new_with_backend(TestBackend::default(), 8).unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let out = Arc::clone(&received);
+    let reg = Registration::new_callback(
+      move |item| out.lock().unwrap().push(item),
+      Box::new(Nop),
+    );
+
+    let _id = lio.schedule(reg).unwrap();
+
+    let processed = lio.try_run().unwrap();
+    assert_eq!(processed, 1);
+
+    let items = received.lock().unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(matches!(items[0], Ok(())));
   }
 }

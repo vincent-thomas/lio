@@ -555,5 +555,5 @@ impl Notifier {
 #[cfg(test)]
 mod tests {
   use super::*;
-  crate::generate_tests!(OsPoller::new().unwrap());
+  crate::test_readiness_poll_contract!(OsPoller::new().unwrap());
 }

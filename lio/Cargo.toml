@@ -25,7 +25,6 @@ high = []
 
 # Required
 libc.workspace = true
-smallvec = "1.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lio-uring = { path = "../lio-uring", version = "0.3.1" }

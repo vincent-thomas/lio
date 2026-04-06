@@ -54,12 +54,7 @@
 //! threads than where operations were initiated. This is particularly useful for
 //! delegating I/O completion handling to dedicated threads.
 
-use crate::{
-  api::op::{StreamOp, StreamResult, TypedOp},
-  lio,
-  lio::Lio,
-  registration::Registration,
-};
+use crate::{api::op::OpModel, lio, lio::Lio, registration::Registration};
 
 use std::{
   future::Future,
@@ -103,26 +98,26 @@ where
 
 impl<T> Io<T>
 where
-  T: TypedOp,
+  T: OpModel,
 {
-  /// Block the current thread until the operation completes and return the result.
-  ///
-  /// # Deprecated
-  ///
-  /// This method is deprecated because it requires someone else to run the event loop
-  /// (e.g., a background thread calling `lio.run()`). Use `.send()` with manual event
-  /// loop management, or `.when_done()` for callback-based completion instead.
-  #[inline]
-  #[deprecated(
-    since = "0.4.0",
-    note = "wait() requires external event loop management. Use .send() with manual lio.run() calls or .when_done() instead."
-  )]
-  pub fn wait(self) -> T::Result
-  where
-    T::Result: Send,
-  {
-    self.send().recv()
-  }
+  // /// Block the current thread until the operation completes and return the result.
+  // ///
+  // /// # Deprecated
+  // ///
+  // /// This method is deprecated because it requires someone else to run the event loop
+  // /// (e.g., a background thread calling `lio.run()`). Use `.send()` with manual event
+  // /// loop management, or `.when_done()` for callback-based completion instead.
+  // #[inline]
+  // #[deprecated(
+  //   since = "0.4.0",
+  //   note = "wait() requires external event loop management. Use .send() with manual lio.run() calls or .when_done() instead."
+  // )]
+  // pub fn wait(self) -> T::Result
+  // where
+  //   T::Item: Send,
+  // {
+  //   self.send().recv()
+  // }
   /// Convert the operation into a channel receiver.
   ///
   /// Returns a [`Receiver`] which receives the operation result when complete.
@@ -140,9 +135,9 @@ where
   /// let (result, buffer) = receiver.recv();
   /// ```
   #[inline]
-  pub fn send(self) -> Receiver<T::Result>
+  pub fn send(self) -> Receiver<T::Item>
   where
-    T::Result: Send,
+    T::Item: Send,
   {
     let (sender, receiver) = std_mpsc::channel();
 
@@ -177,9 +172,9 @@ where
   /// }
   /// ```
   #[inline]
-  pub fn send_with(self, sender: std_mpsc::Sender<T::Result>)
+  pub fn send_with(self, sender: std_mpsc::Sender<T::Item>)
   where
-    T::Result: Send,
+    T::Item: Send,
   {
     self.when_done(move |res| {
       let _ = sender.send(res);
@@ -220,29 +215,41 @@ where
   /// ```
   pub fn when_done<F>(self, f: F)
   where
-    F: Fn(T::Result) + Send + 'static,
+    F: Fn(T::Item) + Send + 'static,
   {
-    let (lio, typed_op) = self.into_lio();
+    let (lio, stream_op) = self.into_lio();
 
-    // IMPORTANT: Box the typed_op FIRST to give it a stable heap address,
-    // THEN call into_op(). The Op contains pointers into the TypedOp's data,
-    // so the TypedOp must be at its final heap location before into_op() is called.
-    // Previously this was buggy: into_op() was called while typed_op was on the stack,
-    // then typed_op was moved to the heap, leaving dangling pointers in the Op.
-    let mut boxed = Box::new(typed_op);
-    let op = boxed.into_op();
-    lio
-      .schedule(op, Registration::new_callback::<T, F>(f, boxed))
-      .expect("lio error: lio should handle this");
+    // Box the StreamOp to give it a stable heap address before creating Registration.
+    // The Registration stores the StreamOp and calls send_op()/result() on it.
+    let boxed = Box::new(stream_op);
+    let registration = Registration::new_callback::<T, F>(f, boxed);
+
+    lio.schedule(registration).expect("lio error: lio should handle this");
   }
 }
 
 /// Internal handle for accessing the Lio instance.
+#[derive(Clone)]
 enum LioHandle {
   /// No Lio bound - will panic if used. This is the default from `from_op()`.
   GloballyInstalled,
   /// User-provided Lio instance via `.with_lio()`.
   Custom(Lio),
+}
+
+impl LioHandle {
+  fn into_lio(self) -> Lio {
+    match self {
+      LioHandle::GloballyInstalled => lio::get_global().expect(
+        "No Lio instance available. Either call install_global(lio) or use .with_lio(&lio) before consuming the operation.",
+      ),
+      LioHandle::Custom(lio) => lio,
+    }
+  }
+
+  fn lio(&self) -> Lio {
+    self.clone().into_lio()
+  }
 }
 
 /// A blocking receiver for operation results.
@@ -406,12 +413,7 @@ where
   }
 
   fn into_lio(self) -> (Lio, T) {
-    let lio = match self.handle {
-      LioHandle::GloballyInstalled => lio::get_global().expect(
-        "No Lio instance available. Either call install_global(lio) or use .with_lio(&lio) before consuming the operation.",
-      ),
-      LioHandle::Custom(lio) => lio,
-    };
+    let lio = self.handle.into_lio();
     (lio, self.op)
   }
 
@@ -425,66 +427,45 @@ where
 
 impl<T> IntoFuture for Io<T>
 where
-  T: TypedOp + Unpin + 'static,
+  T: OpModel + Unpin + 'static,
 {
-  type Output = T::Result;
-  type IntoFuture = IoFuture<T>;
+  type Output = T::Item;
+  type IntoFuture = IoStreamFuture<T>;
 
   fn into_future(self) -> Self::IntoFuture {
-    let (lio, op) = self.into_lio();
-    IoFuture { state: IoFutureState::Pending(op), lio }
+    let (lio, stream_op) = self.into_lio();
+    IoStreamFuture { state: IoStreamFutureState::Pending(stream_op), lio }
   }
 }
 
-/// A future representing an in-progress I/O operation.
+/// A future representing a single-shot StreamOp operation.
 ///
-/// Created when a [`Io<T>`] is converted into a future via the `IntoFuture` trait,
-/// typically through `.await` syntax. This type implements the `Future` trait and integrates
-/// with async runtimes to provide non-blocking I/O.
-///
-/// # Implementation Details
-///
-/// - Holds the operation until first poll
-/// - On first poll, submits operation to driver with waker
-/// - On subsequent polls, checks for completion and updates waker
-/// - Returns `Poll::Ready(result)` when the I/O operation finishes
-///
-/// # Usage
-///
-/// This type is typically not constructed directly. Instead, it's created automatically
-/// when awaiting a [`Io<T>`]:
-///
-/// ```no_run
-/// use lio::{Lio, api};
-///
-/// async fn example(lio: &Lio) {
-///     let fd = api::resource::Resource::stdin();
-///     let (result, buf) = api::read(&fd, vec![0; 1024]).with_lio(lio).await;
-///     //                                                             ^^^^^^
-///     //                                             IntoFuture creates IoFuture
-/// }
-/// ```
-pub struct IoFuture<T> {
-  state: IoFutureState<T>,
+/// Owns the channel receiver to get typed results.
+pub struct IoStreamFuture<T>
+where
+  T: OpModel,
+{
+  state: IoStreamFutureState<T>,
   lio: Lio,
 }
 
-enum IoFutureState<T> {
-  /// Operation created but not yet submitted.
+enum IoStreamFutureState<T>
+where
+  T: OpModel,
+{
+  /// Not yet submitted.
   Pending(T),
-  /// Operation submitted, awaiting completion.
-  /// The TypedOp is boxed to ensure it has a stable heap address
-  /// before into_op() is called, so pointers in the Op remain valid.
-  Inflight { id: u64, op: Box<T> },
-  /// Result has been extracted. Polling again is a bug.
+  /// Submitted and awaiting completion.
+  Inflight { id: u64, receiver: std::sync::mpsc::Receiver<T::Item> },
+  /// Done.
   Done,
 }
 
-impl<T> Future for IoFuture<T>
+impl<T> Future for IoStreamFuture<T>
 where
-  T: TypedOp + Unpin,
+  T: OpModel + Unpin,
 {
-  type Output = T::Result;
+  type Output = T::Item;
 
   fn poll(
     mut self: Pin<&mut Self>,
@@ -492,39 +473,45 @@ where
   ) -> Poll<Self::Output> {
     let this = &mut *self;
 
-    match std::mem::replace(&mut this.state, IoFutureState::Done) {
-      IoFutureState::Pending(typed) => {
-        // IMPORTANT: Box the typed_op FIRST to give it a stable heap address,
-        // THEN call into_op(). The Op contains pointers into the TypedOp's data,
-        // so the TypedOp must be at its final heap location before into_op() is called.
-        let mut boxed = Box::new(typed);
-        let op = boxed.into_op();
+    match std::mem::replace(&mut this.state, IoStreamFutureState::Done) {
+      IoStreamFutureState::Pending(stream_op) => {
+        // First poll - create channel and schedule operation
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let boxed = Box::new(stream_op);
+        let registration =
+          Registration::new_waker(cx.waker().clone(), tx, boxed);
+
         let id = this
           .lio
-          .schedule(op, Registration::new_waker(cx.waker().clone()))
+          .schedule(registration)
           .expect("lio error: failed to schedule operation");
-        this.state = IoFutureState::Inflight { id, op: boxed };
+
+        this.state = IoStreamFutureState::Inflight { id, receiver: rx };
         Poll::Pending
       }
 
-      IoFutureState::Inflight { id, op } => match this.lio.check_done(id) {
-        Ok(result) => Poll::Ready(op.extract_result(result)),
-        Err(crate::lio::Error::EntryNotCompleted) => {
-          this.lio.set_waker(id, cx.waker().clone());
-          this.state = IoFutureState::Inflight { id, op };
-          Poll::Pending
+      IoStreamFutureState::Inflight { id, receiver } => {
+        // Try to receive typed result from channel
+        match receiver.try_recv() {
+          Ok(item) => {
+            // Got the result!
+            Poll::Ready(item)
+          }
+          Err(std::sync::mpsc::TryRecvError::Empty) => {
+            // No result yet, update waker and stay in Inflight
+            this.lio.set_waker(id, cx.waker().clone());
+            this.state = IoStreamFutureState::Inflight { id, receiver };
+            Poll::Pending
+          }
+          Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            panic!("Channel disconnected - sender dropped prematurely");
+          }
         }
-        Err(crate::lio::Error::EntryNotFound) => {
-          panic!("lio bookkeeping bug: operation entry not found");
-        }
-        Err(crate::lio::Error::StreamDone) => {
-          // Single-shot operations should never get StreamDone
-          unreachable!("single-shot operation received StreamDone error");
-        }
-      },
+      }
 
-      IoFutureState::Done => {
-        panic!("IoFuture polled after completion");
+      IoStreamFutureState::Done => {
+        panic!("IoStreamFuture polled after completion");
       }
     }
   }
@@ -569,29 +556,37 @@ where
 ///   operation to continue the stream.
 pub struct IoStream<T>
 where
-  T: Send,
+  T: OpModel,
 {
-  op: Option<T>,
-  lio: Lio,
-  state: IoStreamState,
+  state: IoStreamState<T>,
+  handle: LioHandle,
 }
 
-enum IoStreamState {
+enum IoStreamState<T>
+where
+  T: OpModel,
+{
   /// Not yet submitted - waiting for first `next()` call.
-  Pending,
+  Pending(T),
   /// Submitted and awaiting completion.
-  Inflight { id: u64 },
+  Inflight { id: u64, receiver: std::sync::mpsc::Receiver<T::Item> },
   /// Stream is done, no more items.
   Done,
 }
 
 impl<T> IoStream<T>
 where
-  T: StreamOp + Unpin,
+  T: OpModel + Unpin,
 {
   /// Creates a new `IoStream` from a streaming operation.
-  pub fn from_op(op: T, lio: &Lio) -> Self {
-    Self { op: Some(op), lio: lio.clone(), state: IoStreamState::Pending }
+  pub fn from_op(op: T) -> Self {
+    Self { state: IoStreamState::Pending(op), handle: LioHandle::GloballyInstalled }
+  }
+
+  /// Binds a Lio instance to this stream.
+  pub fn with_lio(mut self, lio: &Lio) -> Self {
+    self.handle = LioHandle::Custom(lio.clone());
+    self
   }
 
   /// Returns the next item from the stream.
@@ -616,14 +611,51 @@ where
   pub async fn next(&mut self) -> Option<T::Item> {
     IoStreamNextFuture { stream: self }.await
   }
+
+  /// Convert the stream into a channel receiver.
+  pub fn send(self) -> StreamReceiver<T::Item>
+  where
+    T::Item: Send,
+  {
+    let (sender, receiver) = std_mpsc::channel();
+    self.send_with(sender);
+    StreamReceiver { recv: receiver }
+  }
+
+  /// Sends each stream item through a provided channel sender.
+  pub fn send_with(mut self, sender: std_mpsc::Sender<T::Item>)
+  where
+    T::Item: Send,
+  {
+    let lio = self.handle.lio();
+    let op = match std::mem::replace(&mut self.state, IoStreamState::Done) {
+      IoStreamState::Pending(op) => op,
+      IoStreamState::Inflight { .. } => {
+        panic!("lio consumer error: stream already started before send_with()")
+      }
+      IoStreamState::Done => {
+        panic!("lio consumer error: stream already completed before send_with()")
+      }
+    };
+
+    let boxed = Box::new(op);
+    let reg = Registration::new_callback(
+      move |item| {
+        let _ = sender.send(item);
+      },
+      boxed,
+    );
+
+    lio.schedule(reg).expect("lio error: failed to schedule stream operation");
+  }
 }
 
 /// Future for a single `next()` call on an IoStream.
-struct IoStreamNextFuture<'a, T: StreamOp> {
+struct IoStreamNextFuture<'a, T: OpModel> {
   stream: &'a mut IoStream<T>,
 }
 
-impl<T: StreamOp + Unpin> Future for IoStreamNextFuture<'_, T> {
+impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
   type Output = Option<T::Item>;
 
   fn poll(
@@ -633,21 +665,18 @@ impl<T: StreamOp + Unpin> Future for IoStreamNextFuture<'_, T> {
     let this = &mut *self;
     let stream = &mut *this.stream;
 
-    match stream.state {
-      IoStreamState::Done => Poll::Ready(None),
+    match std::mem::replace(&mut stream.state, IoStreamState::Done) {
+      IoStreamState::Pending(stream_op) => {
+        // First poll - create channel and schedule operation
+        let (tx, rx) = std::sync::mpsc::channel();
 
-      IoStreamState::Pending => {
-        // First poll - submit the stream operation
-        let op = stream.op.as_mut().expect("IoStream polled after drop");
-        let backend_op = op.into_op();
+        let boxed = Box::new(stream_op);
+        let registration =
+          Registration::new_waker(cx.waker().clone(), tx, boxed);
 
-        // Use stream registration for multishot support
-        match stream
-          .lio
-          .schedule(backend_op, Registration::new_waker(cx.waker().clone()))
-        {
+        match stream.handle.lio().schedule(registration) {
           Ok(id) => {
-            stream.state = IoStreamState::Inflight { id };
+            stream.state = IoStreamState::Inflight { id, receiver: rx };
             Poll::Pending
           }
           Err(_) => {
@@ -657,148 +686,40 @@ impl<T: StreamOp + Unpin> Future for IoStreamNextFuture<'_, T> {
         }
       }
 
-      IoStreamState::Inflight { id } => {
-        // Use check_stream_done to pop from the result queue
-        match stream.lio.check_stream_done(id) {
-          Ok(result) => {
-            let op = stream.op.as_mut().expect("IoStream polled after drop");
-            match op.extract_item(result) {
-              StreamResult::Item(item) => {
-                // Backend handles resubmission internally (multishot or auto-resubmit)
-                // Just return the item and stay in Inflight state
-                Poll::Ready(Some(item))
-              }
-              StreamResult::Done => {
-                stream.state = IoStreamState::Done;
-                Poll::Ready(None)
-              }
-            }
+      IoStreamState::Inflight { id, receiver } => {
+        // Try to receive typed result from channel
+        match receiver.try_recv() {
+          Ok(item) => {
+            // Got a result! Stay in Inflight for next call (multishot)
+            stream.state = IoStreamState::Inflight { id, receiver };
+            Poll::Ready(Some(item))
           }
-          Err(crate::lio::Error::EntryNotCompleted) => {
-            stream.lio.set_waker(id, cx.waker().clone());
+          Err(std::sync::mpsc::TryRecvError::Empty) => {
+            // No result yet, update waker and stay in Inflight
+            stream.handle.lio().set_waker(id, cx.waker().clone());
+            stream.state = IoStreamState::Inflight { id, receiver };
             Poll::Pending
           }
-          Err(crate::lio::Error::StreamDone) => {
-            // Stream finished and all results consumed
-            stream.state = IoStreamState::Done;
-            Poll::Ready(None)
-          }
-          Err(crate::lio::Error::EntryNotFound) => {
+          Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            // Sender dropped - stream is done
             stream.state = IoStreamState::Done;
             Poll::Ready(None)
           }
         }
       }
+
+      IoStreamState::Done => Poll::Ready(None),
     }
   }
 }
 
 /// Drop impl to cancel inflight multishot operations.
-impl<T: Send> Drop for IoStream<T> {
+impl<T: OpModel> Drop for IoStream<T> {
   fn drop(&mut self) {
     // If the stream is inflight, cancel the operation
-    if let IoStreamState::Inflight { id } = self.state {
-      self.lio.cancel_stream(id);
+    if let IoStreamState::Inflight { id, .. } = self.state {
+      self.handle.lio().cancel_stream(id);
     }
-  }
-}
-
-/// Builder for creating IoStream with a Lio instance.
-pub struct IoStreamBuilder<T>
-where
-  T: Send,
-{
-  op: T,
-}
-
-impl<T> IoStreamBuilder<T>
-where
-  T: StreamOp + Unpin,
-{
-  /// Creates a new builder from a streaming operation.
-  pub fn from_op(op: T) -> Self {
-    Self { op }
-  }
-
-  /// Binds a Lio instance and creates the IoStream.
-  pub fn with_lio(self, lio: &Lio) -> IoStream<T> {
-    IoStream::from_op(self.op, lio)
-  }
-
-  /// Convert the streaming operation into a channel receiver.
-  ///
-  /// Returns a [`StreamReceiver`] which receives each stream item as it
-  /// becomes available.
-  ///
-  /// # Example
-  ///
-  /// ```no_run
-  /// use lio::{Lio, api};
-  /// use lio::api::resource::Resource;
-  ///
-  /// # let lio = Lio::new(64).unwrap();
-  /// # let listener = Resource::stdin();
-  /// let receiver = api::accept_stream(&listener).send(&lio);
-  ///
-  /// // In a loop
-  /// loop {
-  ///     lio.try_run().unwrap();
-  ///     match receiver.try_recv() {
-  ///         Ok(Ok(conn)) => println!("Got connection from {}", conn.peer_addr().unwrap()),
-  ///         Ok(Err(e)) => eprintln!("Accept error: {}", e),
-  ///         Err(_) => {} // No item ready yet
-  ///     }
-  /// }
-  /// ```
-  pub fn send(self, lio: &Lio) -> StreamReceiver<T::Item>
-  where
-    T::Item: Send,
-  {
-    let (sender, receiver) = std_mpsc::channel();
-    self.send_with(lio, sender);
-    StreamReceiver { recv: receiver }
-  }
-
-  /// Sends each stream item through a provided channel sender.
-  ///
-  /// # Example
-  ///
-  /// ```no_run
-  /// use std::sync::mpsc;
-  /// use lio::{Lio, api};
-  /// use lio::api::resource::Resource;
-  ///
-  /// # let lio = Lio::new(64).unwrap();
-  /// # let listener = Resource::stdin();
-  /// let (tx, rx) = mpsc::channel();
-  /// api::accept_stream(&listener).send_with(&lio, tx);
-  ///
-  /// // Process items as they arrive
-  /// while let Ok(result) = rx.recv() {
-  ///     match result {
-  ///         Ok(conn) => println!("Got connection from {}", conn.peer_addr().unwrap()),
-  ///         Err(e) => eprintln!("Accept error: {}", e),
-  ///     }
-  /// }
-  /// ```
-  pub fn send_with(self, lio: &Lio, sender: std_mpsc::Sender<T::Item>)
-  where
-    T::Item: Send,
-  {
-    // Box the op first to establish stable address
-    let mut boxed = Box::new(self.op);
-    let backend_op = boxed.into_op();
-
-    let reg = Registration::new_stream_callback(
-      move |item| {
-        let _ = sender.send(item);
-      },
-      boxed,
-    );
-
-    lio
-      .schedule(backend_op, reg)
-      .expect("lio error: failed to schedule stream operation");
   }
 }
 
@@ -865,10 +786,14 @@ mod tests {
     lio.run_timeout(Duration::from_millis(10)).unwrap();
   }
 
+  fn test_io(lio: &Lio) -> Io<crate::api::ops::Sleep> {
+    api::sleep(Duration::from_millis(1)).with_lio(lio)
+  }
+
   #[test]
   fn test_io_future_completes() {
     let lio = Lio::new(64).unwrap();
-    let io = api::nop().with_lio(&lio);
+    let io = test_io(&lio);
     let mut future = io.into_future();
 
     let waker = noop_waker();
@@ -887,10 +812,10 @@ mod tests {
   }
 
   #[test]
-  #[should_panic(expected = "IoFuture polled after completion")]
+  #[should_panic(expected = "IoStreamFuture polled after completion")]
   fn test_io_future_panics_when_polled_after_completion() {
     let lio = Lio::new(64).unwrap();
-    let io = api::nop().with_lio(&lio);
+    let io = test_io(&lio);
     let mut future = io.into_future();
 
     let waker = noop_waker();
@@ -913,31 +838,31 @@ mod tests {
   #[test]
   fn test_io_future_state_transitions() {
     let lio = Lio::new(64).unwrap();
-    let io = api::nop().with_lio(&lio);
+    let io = test_io(&lio);
     let mut future = io.into_future();
 
     // Initial state is Pending
-    assert!(matches!(future.state, IoFutureState::Pending(_)));
+    assert!(matches!(future.state, IoStreamFutureState::Pending(_)));
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
     // After first poll, state is Inflight
     let _ = Pin::new(&mut future).poll(&mut cx);
-    assert!(matches!(future.state, IoFutureState::Inflight { .. }));
+    assert!(matches!(future.state, IoStreamFutureState::Inflight { .. }));
 
     // Complete the operation
     run_until_done(&lio);
 
     // After completion poll, state is Done
     let _ = Pin::new(&mut future).poll(&mut cx);
-    assert!(matches!(future.state, IoFutureState::Done));
+    assert!(matches!(future.state, IoStreamFutureState::Done));
   }
 
   #[test]
   fn test_io_future_multiple_pending_polls() {
     let lio = Lio::new(64).unwrap();
-    let io = api::nop().with_lio(&lio);
+    let io = test_io(&lio);
     let mut future = io.into_future();
 
     let waker = noop_waker();
@@ -952,7 +877,7 @@ mod tests {
     assert!(poll2.is_pending());
 
     // State should still be Inflight
-    assert!(matches!(future.state, IoFutureState::Inflight { .. }));
+    assert!(matches!(future.state, IoStreamFutureState::Inflight { .. }));
 
     // Now complete and verify
     run_until_done(&lio);
@@ -965,9 +890,9 @@ mod tests {
     let lio = Lio::new(64).unwrap();
 
     // Create multiple futures from the same lio - this was not possible before
-    let fut1 = api::nop().with_lio(&lio).into_future();
-    let fut2 = api::nop().with_lio(&lio).into_future();
-    let fut3 = api::nop().with_lio(&lio).into_future();
+    let fut1 = test_io(&lio).into_future();
+    let fut2 = test_io(&lio).into_future();
+    let fut3 = test_io(&lio).into_future();
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -1004,72 +929,38 @@ mod tests {
     let lio2 = lio1.clone();
 
     // Both refer to the same underlying instance
-    let _fut1 = api::nop().with_lio(&lio1).into_future();
-    let _fut2 = api::nop().with_lio(&lio2).into_future();
+    let _fut1 = test_io(&lio1).into_future();
+    let _fut2 = test_io(&lio2).into_future();
 
     // Running on either handle processes completions for both
     run_until_done(&lio1);
   }
 
   #[test]
-  fn test_global_lio_install_and_use() {
-    // Ensure no global is installed
-    let _ = lio::uninstall_global();
-
+  fn test_lio_with_receiver() {
     let lio = Lio::new(64).unwrap();
-    let lio_for_run = lio.clone();
-    lio::install_global(lio);
 
-    // Now operations work without .with_lio()
-    let mut receiver = api::nop().send();
+    // Operations work with .with_lio()
+    let mut receiver = test_io(&lio).send();
 
     // Run the event loop to complete the operation
-    run_until_done(&lio_for_run);
+    run_until_done(&lio);
 
     let result = receiver.try_recv();
     assert!(result.is_some());
     assert!(result.unwrap().is_ok());
-
-    // Cleanup
-    let _ = lio::uninstall_global();
   }
 
   #[test]
-  fn test_global_lio_uninstall() {
-    // Ensure no global is installed
-    let _ = lio::uninstall_global();
-
+  fn test_stream_send_uses_bound_lio() {
     let lio = Lio::new(64).unwrap();
-    lio::install_global(lio);
 
-    let uninstalled = lio::uninstall_global();
-    assert!(uninstalled.is_some());
+    let receiver = api::interval(Duration::from_millis(1)).with_lio(&lio).send();
 
-    // Second uninstall returns None
-    let uninstalled2 = lio::uninstall_global();
-    assert!(uninstalled2.is_none());
-  }
+    run_until_done(&lio);
 
-  #[test]
-  #[should_panic(expected = "Global Lio already installed")]
-  fn test_global_lio_double_install_panics() {
-    // Ensure no global is installed
-    let _ = lio::uninstall_global();
-
-    let lio1 = Lio::new(64).unwrap();
-    let lio2 = Lio::new(64).unwrap();
-
-    lio::install_global(lio1);
-    lio::install_global(lio2); // Should panic
-  }
-
-  #[test]
-  #[should_panic(expected = "No Lio instance available")]
-  fn test_no_global_panics() {
-    // Ensure no global is installed
-    let _ = lio::uninstall_global();
-
-    // This should panic because no global is installed
-    api::nop().when_done(|_| {});
+    let item = receiver.try_recv();
+    assert!(item.is_ok(), "stream receiver did not get first interval tick");
+    assert!(item.unwrap().is_ok());
   }
 }

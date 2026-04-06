@@ -1194,79 +1194,79 @@ pub unsafe extern "C" fn lio_spawn(
     });
 }
 
-/// Wait for a child process to change state.
-///
-/// - `id_type`: 0=P_ALL (any child), 1=P_PID (specific pid), 2=P_PGID (process group)
-/// - `id`: PID or PGID depending on id_type (ignored for P_ALL)
-/// - `options`: Wait options (WEXITED=4, WSTOPPED=2, WCONTINUED=8, WNOHANG=1, WNOWAIT=0x1000000)
-/// - `callback(result, pid, status, code)`:
-///   - result: 0 on success, negative errno on error
-///   - pid: child PID that changed state (0 if WNOHANG and no child ready)
-///   - status: 1=exited, 2=signaled, 3=stopped, 4=continued
-///   - code: exit code or signal number
-///
-/// # Safety
-/// `lio` must be valid.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn lio_waitid(
-  lio: *mut lio_handle_t,
-  id_type: libc::c_int,
-  id: libc::c_int,
-  options: libc::c_int,
-  callback: extern "C" fn(libc::c_int, libc::c_int, libc::c_int, libc::c_int),
-) {
-  use api::ops::{WaitOptions, WaitTarget};
-
-  let target = match id_type {
-    0 => WaitTarget::Any,      // P_ALL
-    1 => WaitTarget::Pid(id),  // P_PID
-    2 => WaitTarget::Pgid(id), // P_PGID
-    _ => {
-      callback(-libc::EINVAL, 0, 0, 0);
-      return;
-    }
-  };
-
-  // Construct WaitOptions from raw flags
-  let mut opts = WaitOptions::empty();
-  if (options & libc::WEXITED) != 0 {
-    opts |= WaitOptions::EXITED;
-  }
-  if (options & libc::WSTOPPED) != 0 {
-    opts |= WaitOptions::STOPPED;
-  }
-  if (options & libc::WCONTINUED) != 0 {
-    opts |= WaitOptions::CONTINUED;
-  }
-  if (options & libc::WNOHANG) != 0 {
-    opts |= WaitOptions::NOHANG;
-  }
-  if (options & libc::WNOWAIT) != 0 {
-    opts |= WaitOptions::NOWAIT;
-  }
-
-  // SAFETY: caller guarantees lio is valid per fn contract
-  api::waitid(target, opts).with_lio(&unsafe { handle(lio) }.inner).when_done(
-    move |res| match res {
-      Ok(Some(status)) => {
-        let (status_type, code) = if status.exited() {
-          (1, status.exit_code().unwrap_or(0))
-        } else if status.signaled() {
-          (2, status.signal().unwrap_or(0))
-        } else if status.stopped() {
-          (3, status.signal().unwrap_or(0))
-        } else if status.continued() {
-          (4, 0)
-        } else {
-          (0, 0)
-        };
-        callback(0, status.pid, status_type, code);
-      }
-      Ok(None) => callback(0, 0, 0, 0), // WNOHANG and no child ready
-      Err(e) => callback(-e.raw_os_error().unwrap_or(1), 0, 0, 0),
-    },
-  );
-}
+// /// Wait for a child process to change state.
+// ///
+// /// - `id_type`: 0=P_ALL (any child), 1=P_PID (specific pid), 2=P_PGID (process group)
+// /// - `id`: PID or PGID depending on id_type (ignored for P_ALL)
+// /// - `options`: Wait options (WEXITED=4, WSTOPPED=2, WCONTINUED=8, WNOHANG=1, WNOWAIT=0x1000000)
+// /// - `callback(result, pid, status, code)`:
+// ///   - result: 0 on success, negative errno on error
+// ///   - pid: child PID that changed state (0 if WNOHANG and no child ready)
+// ///   - status: 1=exited, 2=signaled, 3=stopped, 4=continued
+// ///   - code: exit code or signal number
+// ///
+// /// # Safety
+// /// `lio` must be valid.
+// #[unsafe(no_mangle)]
+// pub unsafe extern "C" fn lio_waitid(
+//   lio: *mut lio_handle_t,
+//   id_type: libc::c_int,
+//   id: libc::c_int,
+//   options: libc::c_int,
+//   callback: extern "C" fn(libc::c_int, libc::c_int, libc::c_int, libc::c_int),
+// ) {
+//   use api::ops::{WaitOptions, WaitTarget};
+//
+//   let target = match id_type {
+//     0 => WaitTarget::Any,      // P_ALL
+//     1 => WaitTarget::Pid(id),  // P_PID
+//     2 => WaitTarget::Pgid(id), // P_PGID
+//     _ => {
+//       callback(-libc::EINVAL, 0, 0, 0);
+//       return;
+//     }
+//   };
+//
+//   // Construct WaitOptions from raw flags
+//   let mut opts = WaitOptions::empty();
+//   if (options & libc::WEXITED) != 0 {
+//     opts |= WaitOptions::EXITED;
+//   }
+//   if (options & libc::WSTOPPED) != 0 {
+//     opts |= WaitOptions::STOPPED;
+//   }
+//   if (options & libc::WCONTINUED) != 0 {
+//     opts |= WaitOptions::CONTINUED;
+//   }
+//   if (options & libc::WNOHANG) != 0 {
+//     opts |= WaitOptions::NOHANG;
+//   }
+//   if (options & libc::WNOWAIT) != 0 {
+//     opts |= WaitOptions::NOWAIT;
+//   }
+//
+//   // SAFETY: caller guarantees lio is valid per fn contract
+//   api::waitid(target, opts).with_lio(&unsafe { handle(lio) }.inner).when_done(
+//     move |res| match res {
+//       Ok(Some(status)) => {
+//         let (status_type, code) = if status.exited() {
+//           (1, status.exit_code().unwrap_or(0))
+//         } else if status.signaled() {
+//           (2, status.signal().unwrap_or(0))
+//         } else if status.stopped() {
+//           (3, status.signal().unwrap_or(0))
+//         } else if status.continued() {
+//           (4, 0)
+//         } else {
+//           (0, 0)
+//         };
+//         callback(0, status.pid, status_type, code);
+//       }
+//       Ok(None) => callback(0, 0, 0, 0), // WNOHANG and no child ready
+//       Err(e) => callback(-e.raw_os_error().unwrap_or(1), 0, 0, 0),
+//     },
+//   );
+// }
 
 /// Copy data between file descriptors without copying to userspace (Linux only).
 ///

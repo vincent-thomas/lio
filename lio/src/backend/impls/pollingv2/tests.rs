@@ -1244,14 +1244,28 @@ where
   Ok(())
 }
 
-/// Macro to generate individual test functions for a ReadinessPoll implementation
+/// Shared contract tests for [`ReadinessPoll`] implementations.
 ///
-/// Usage: `generate_tests!(PollerType);`
+/// Pollers that pass `test_readiness_poll_contract!` conform to the standard
+/// observable contract for the deterministic readiness scenarios covered here.
 ///
-/// This will create individual `#[test]` functions for each test case, making them
-/// run independently and integrate better with cargo test/nextest.
+/// The contract covers:
+/// - registering read/write/both interests
+/// - modifying and deleting registrations
+/// - readiness delivery for one or many fds
+/// - notify and timeout behavior
+/// - one-shot no-redelivery semantics
+/// - duplicate/add/modify/delete edge cases
+/// - invalid/closed fd handling
+/// - event-key and interest filtering correctness
+/// - fd reuse and re-registration cleanup
+///
+/// Usage: `test_readiness_poll_contract!(PollerExpr);`
+///
+/// The argument is an expression that creates a fresh poller instance for each
+/// generated test.
 #[macro_export]
-macro_rules! generate_tests {
+macro_rules! test_readiness_poll_contract {
   ($poller:expr) => {
     #[test]
     fn test_add_read_no_data() {
@@ -1541,5 +1555,12 @@ macro_rules! generate_tests {
         .expect("test_fd_reuse_after_delete: failed when testing fd reuse after delete");
     }
 
+  };
+}
+
+#[macro_export]
+macro_rules! generate_tests {
+  ($poller:expr) => {
+    $crate::test_readiness_poll_contract!($poller);
   };
 }

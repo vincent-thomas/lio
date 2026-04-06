@@ -108,7 +108,9 @@ mod tests {
     // SAFETY: The vtable functions are valid no-ops
     let waker = unsafe { Waker::from_raw(raw_waker) };
 
-    Registration::new_waker(waker)
+    // Create a dummy StreamOp (Nop) and channel for testing
+    let (tx, _rx) = std::sync::mpsc::channel();
+    Registration::new_waker(waker, tx, Box::new(crate::api::ops::Nop))
   }
 
   #[test]
@@ -218,6 +220,29 @@ mod tests {
     // Remove one and should work again
     store.remove(ids[0]);
     let _ = store.insert(dummy_stored_op()); // Should not panic
+  }
+
+  #[test]
+  fn test_try_insert_returns_store_at_capacity() {
+    let mut store = OpStore::with_capacity(1);
+
+    assert!(store.try_insert(dummy_stored_op()).is_ok());
+    let err = store.try_insert(dummy_stored_op()).unwrap_err();
+    assert_eq!(err.to_string(), "StoreAtCapacity");
+  }
+
+  #[test]
+  fn test_remove_unknown_id_returns_false() {
+    let mut store = OpStore::new();
+    assert!(!store.remove(u64::MAX));
+  }
+
+  #[test]
+  fn test_get_mut_after_remove_returns_none() {
+    let mut store = OpStore::new();
+    let id = store.insert(dummy_stored_op());
+    assert!(store.remove(id));
+    assert!(store.get_mut(id).is_none());
   }
 
   #[test]

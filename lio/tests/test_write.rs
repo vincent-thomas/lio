@@ -129,7 +129,7 @@ fn prop_test_write_arbitrary_data_and_offsets() {
   let mut runner = TestRunner::new(ProptestConfig::default());
 
   runner
-    .run(&(0usize..=8192, 0i64..=4096, any::<u64>()), |props| {
+    .run(&(0usize..=8192, 0u32..=4096, any::<u64>()), |props| {
       prop_test_write_arbitrary_data_and_offsets_run(props.0, props.1, props.2)
     })
     .unwrap();
@@ -137,7 +137,7 @@ fn prop_test_write_arbitrary_data_and_offsets() {
 
 fn prop_test_write_arbitrary_data_and_offsets_run(
   data_size: usize,
-  write_offset: i64,
+  write_offset: u32,
   seed: u64,
 ) -> Result<(), TestCaseError> {
   let mut lio = Lio::new(64)
@@ -236,7 +236,7 @@ fn prop_test_write_arbitrary_data_and_offsets_run(
       fd,
       read_buf.as_mut_ptr() as *mut libc::c_void,
       test_data_clone.len(),
-      write_offset,
+      write_offset as libc::off_t,
     );
 
     if read_bytes < 0 {

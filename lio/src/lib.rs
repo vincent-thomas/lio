@@ -50,13 +50,13 @@ mod macros;
 pub mod ffi;
 
 pub mod buf;
-#[cfg(feature = "high")]
-pub mod fs;
-pub mod io;
-#[cfg(feature = "high")]
-pub mod net;
-#[cfg(feature = "high")]
-pub mod process;
+// #[cfg(feature = "high")]
+// pub mod fs;
+// pub mod io;
+// #[cfg(feature = "high")]
+// pub mod net;
+// #[cfg(feature = "high")]
+// pub mod process;
 mod time;
 
 pub use buf::{BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec};
@@ -68,6 +68,5 @@ pub mod backend;
 
 pub mod api;
 
-// Re-export core types
 mod lio;
 pub use lio::{Lio, install_global, uninstall_global};

@@ -16,8 +16,11 @@ use std::{io, net::SocketAddr, os::fd::FromRawFd};
 
 #[allow(unused_imports)] // TcpListener used in doc links
 use crate::{
-  api::op::TypedOp,
-  api::{ops, resource::FromResource},
+  api::{
+    op::{OpModel, Step},
+    ops,
+    resource::FromResource,
+  },
   net::{Socket, TcpListener, TcpSocket},
 };
 
@@ -37,18 +40,21 @@ impl SocketAccept {
   }
 }
 
-impl TypedOp for SocketAccept {
-  type Result = io::Result<(Socket, SocketAddr)>;
-
-  fn into_op(&mut self) -> crate::backend::op::Op {
-    self.inner.into_op()
-  }
-
-  fn extract_result(self, res: isize) -> Self::Result {
-    let (resource, addr) = self.inner.extract_result(res)?;
-    Ok((Socket::from_resource(resource), addr))
-  }
-}
+// LEGACY `OpModel` impl parked during the serial-contract migration.
+//
+// impl OpModel for SocketAccept {
+//   type Item = io::Result<(Socket, SocketAddr)>;
+//
+//   fn send_op(&mut self) -> OpFlow {
+//     self.inner.send_op()
+//   }
+//
+//   fn result(&mut self, res: isize) -> Step<Self::Item> {
+//     self.inner.result(res).map(|res| {
+//       res.map(|(resource, addr)| (Socket::from_resource(resource), addr))
+//     })
+//   }
+// }
 
 /// Socket creation operation specialized for [`Socket`].
 ///
@@ -68,28 +74,32 @@ impl SocketNew {
   }
 }
 
-impl TypedOp for SocketNew {
-  type Result = io::Result<Socket>;
-
-  fn into_op(&mut self) -> crate::backend::op::Op {
-    crate::backend::op::Op::Socket {
-      domain: self.domain,
-      ty: self.ty,
-      proto: self.proto,
-    }
-  }
-
-  fn extract_result(self, res: isize) -> Self::Result {
-    let result = if res < 0 {
-      return Err(io::Error::from_raw_os_error(-res as i32));
-    } else {
-      res as std::os::fd::RawFd
-    };
-    // SAFETY: result is valid fd.
-    let res = unsafe { crate::api::resource::Resource::from_raw_fd(result) };
-    Ok(Socket::from_resource(res))
-  }
-}
+// LEGACY `OpModel` impl parked during the serial-contract migration.
+//
+// impl OpModel for SocketNew {
+//   type Item = io::Result<Socket>;
+//
+//   fn send_op(&mut self) -> OpFlow {
+//     OpFlow::Send(crate::backend::op::Op::Socket {
+//       domain: self.domain,
+//       ty: self.ty,
+//       proto: self.proto,
+//     })
+//   }
+//
+//   fn result(&mut self, res: isize) -> Step<Self::Item> {
+//     let result = if res < 0 {
+//       return Step::YieldAndSubmit(Err(io::Error::from_raw_os_error(
+//         -res as i32,
+//       )));
+//     } else {
+//       res as std::os::fd::RawFd
+//     };
+//     // SAFETY: result is valid fd.
+//     let res = unsafe { crate::api::resource::Resource::from_raw_fd(result) };
+//     Step::YieldAndSubmit(Ok(Socket::from_resource(res)))
+//   }
+// }
 
 pub struct TcpAccept {
   inner: ops::Accept,
@@ -101,15 +111,18 @@ impl TcpAccept {
   }
 }
 
-impl TypedOp for TcpAccept {
-  type Result = io::Result<(TcpSocket, SocketAddr)>;
-
-  fn into_op(&mut self) -> crate::backend::op::Op {
-    self.inner.into_op()
-  }
-
-  fn extract_result(self, res: isize) -> Self::Result {
-    let (resource, addr) = self.inner.extract_result(res)?;
-    Ok((TcpSocket::from_resource(resource), addr))
-  }
-}
+// LEGACY `OpModel` impl parked during the serial-contract migration.
+//
+// impl OpModel for TcpAccept {
+//   type Item = io::Result<(TcpSocket, SocketAddr)>;
+//
+//   fn send_op(&mut self) -> OpFlow {
+//     self.inner.send_op()
+//   }
+//
+//   fn result(&mut self, res: isize) -> Step<Self::Item> {
+//     self.inner.result(res).map(|res| {
+//       res.map(|(resource, addr)| (TcpSocket::from_resource(resource), addr))
+//     })
+//   }
+// }

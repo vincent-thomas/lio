@@ -336,16 +336,18 @@ impl UnixAccept {
   }
 }
 
-impl crate::api::op::TypedOp for UnixAccept {
-  type Result = io::Result<UnixStream>;
+impl crate::api::op::OpModel for UnixAccept {
+  type Item = io::Result<UnixStream>;
 
-  fn into_op(&mut self) -> crate::backend::op::Op {
-    self.inner.into_op()
+  fn send_op(&mut self) -> crate::api::op::OpFlow {
+    self.inner.send_op()
   }
 
-  fn extract_result(self, res: isize) -> Self::Result {
-    let (socket, _addr) = self.inner.extract_result(res)?;
-    Ok(UnixStream { socket })
+  fn result(&mut self, res: isize) -> crate::api::op::StreamResult<Self::Item> {
+    self
+      .inner
+      .result(res)
+      .map(|res| res.map(|(socket, _addr)| UnixStream { socket }))
   }
 }
 

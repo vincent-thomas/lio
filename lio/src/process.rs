@@ -72,10 +72,13 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use crate::api;
 use crate::api::resource::Resource;
 use crate::api::{
-  io::Io, op::TypedOp, ops::WaitOptions, ops::WaitTarget, ops::Waitid,
+  io::Io,
+  op::{OpModel, Step},
+  ops::WaitOptions,
+  ops::WaitTarget,
+  ops::Waitid,
 };
 use crate::backend::op::Op;
 
@@ -87,80 +90,56 @@ pub use crate::api::ops::WaitStatus;
 /// Operation for reading all data from a pipe until EOF.
 ///
 /// This type is returned by [`ChildStdout::read_to_end`] and [`ChildStderr::read_to_end`].
-/// It supports both async (via `.await`) and blocking (via `.blocking()`) usage.
+/// It implements `StreamOp` and yields the final accumulated data when EOF is reached.
 pub struct ReadToEnd {
   resource: Resource,
   accumulated: Vec<u8>,
   buffer: Vec<u8>,
+  iovec: libc::iovec,
+  done: bool,
 }
 
-impl ReadToEnd {
-  /// Blocks the current thread and reads all data until EOF.
-  ///
-  /// This method polls the event loop until all data has been read.
-  pub fn blocking(mut self, lio: &crate::Lio) -> std::io::Result<Vec<u8>> {
-    use crate::api::io::Receiver;
-    use std::time::{Duration, Instant};
+// SAFETY: The iovec contains a pointer to self.buffer which is owned by this struct.
+// The pointer remains valid as long as the struct exists and buffer isn't reallocated.
+// unsafe impl Send for ReadToEnd {}
+// unsafe impl Sync for ReadToEnd {}
 
-    let timeout = Duration::from_secs(60);
-    let start = Instant::now();
-
-    loop {
-      let mut recv: Receiver<(std::io::Result<i32>, Vec<u8>)> =
-        api::read(&self.resource, self.buffer).with_lio(lio).send();
-
-      // Poll until we get a result
-      let (n_result, buf) = loop {
-        if let Some(res) = recv.try_recv() {
-          break res;
-        }
-        if start.elapsed() > timeout {
-          return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "read_to_end timed out",
-          ));
-        }
-        lio.run_timeout(Duration::from_millis(10))?;
-      };
-
-      let n = n_result? as usize;
-      self.buffer = buf;
-
-      if n == 0 {
-        break;
-      }
-
-      self.accumulated.extend_from_slice(&self.buffer[..n]);
-    }
-
-    Ok(self.accumulated)
-  }
-
-  async fn read_async(mut self) -> std::io::Result<Vec<u8>> {
-    loop {
-      let (result, buf) = api::read(&self.resource, self.buffer).await;
-      let n = result? as usize;
-      self.buffer = buf;
-
-      if n == 0 {
-        break;
-      }
-
-      self.accumulated.extend_from_slice(&self.buffer[..n]);
-    }
-
-    Ok(self.accumulated)
-  }
-}
-
-impl std::future::IntoFuture for ReadToEnd {
-  type Output = std::io::Result<Vec<u8>>;
-  type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
-
-  fn into_future(self) -> Self::IntoFuture {
-    Box::pin(self.read_async())
-  }
-}
+// impl crate::api::op::OpModel for ReadToEnd {
+//   type Item = std::io::Result<Vec<u8>>;
+//
+//   fn start(&mut self) -> Op {
+//     // Set up iovec for the buffer
+//     self.iovec.iov_base = self.buffer.as_mut_ptr() as *mut _;
+//     self.iovec.iov_len = self.buffer.len();
+//
+//     // Submit another read
+//     Op::ReadV {
+//       fd: self.resource.clone(),
+//       iovecs: &self.iovec as *const libc::iovec,
+//       iov_count: 1,
+//     }
+//   }
+//
+//   fn process(&mut self, result: isize) -> crate::api::op::Step<Self::Item> {
+//     if result < 0 {
+//       let errno = -result as i32;
+//       self.done = true;
+//       let err = std::io::Error::from_raw_os_error(errno);
+//       return Step::Done(Err(err));
+//     }
+//
+//     let n = result as usize;
+//     if n == 0 {
+//       // EOF - return final accumulated data
+//       self.done = true;
+//       Step::Done(Ok(std::mem::take(&mut self.accumulated)))
+//     } else {
+//       // More data available - continue
+//       self.accumulated.extend_from_slice(&self.buffer[..n]);
+//       Step::YieldEmpty // No item yet, resubmit for more data
+//     }
+//   }
+// }
 
 /// The exit status of a finished process.
 ///
@@ -316,12 +295,14 @@ impl ChildStdout {
   /// # */
   /// }
   /// ```
-  pub fn read_to_end(&self) -> ReadToEnd {
-    ReadToEnd {
+  pub fn read_to_end(&self) -> Io<ReadToEnd> {
+    Io::from_op(ReadToEnd {
       resource: self.inner.clone(),
       accumulated: Vec::new(),
       buffer: vec![0u8; 8192],
-    }
+      iovec: unsafe { std::mem::zeroed() },
+      done: false,
+    })
   }
 }
 
@@ -395,12 +376,14 @@ impl ChildStderr {
   /// # */
   /// }
   /// ```
-  pub fn read_to_end(&self) -> ReadToEnd {
-    ReadToEnd {
+  pub fn read_to_end(&self) -> Io<ReadToEnd> {
+    Io::from_op(ReadToEnd {
       resource: self.inner.clone(),
       accumulated: Vec::new(),
       buffer: vec![0u8; 8192],
-    }
+      iovec: unsafe { std::mem::zeroed() },
+      done: false,
+    })
   }
 }
 
@@ -583,21 +566,25 @@ impl Wait {
   }
 }
 
-impl TypedOp for Wait {
-  type Result = io::Result<ExitStatus>;
-
-  fn into_op(&mut self) -> Op {
-    self.inner.into_op()
-  }
-
-  fn extract_result(self, res: isize) -> Self::Result {
-    let status = self.inner.extract_result(res)?;
-    match status {
-      Some(s) => Ok(ExitStatus::from(s)),
-      None => Err(io::Error::other("waitid returned no status")),
-    }
-  }
-}
+// LEGACY `OpModel` impl parked during the serial-contract migration.
+//
+// impl OpModel for Wait {
+//   type Item = io::Result<ExitStatus>;
+//
+//   fn send_op(&mut self) -> OpFlow {
+//     self.inner.send_op()
+//   }
+//
+//   fn result(&mut self, res: isize) -> Step<Self::Item> {
+//     self.inner.result(res).map(|res| {
+//       res.and_then(|opt| {
+//         opt
+//           .map(ExitStatus::from)
+//           .ok_or_else(|| io::Error::other("waitid returned no status"))
+//       })
+//     })
+//   }
+// }
 
 // ============================================================================
 // TryWait TypedOp
@@ -619,18 +606,22 @@ impl TryWait {
   }
 }
 
-impl TypedOp for TryWait {
-  type Result = io::Result<Option<ExitStatus>>;
-
-  fn into_op(&mut self) -> Op {
-    self.inner.into_op()
-  }
-
-  fn extract_result(self, res: isize) -> Self::Result {
-    let status = self.inner.extract_result(res)?;
-    Ok(status.map(ExitStatus::from))
-  }
-}
+// LEGACY `OpModel` impl parked during the serial-contract migration.
+//
+// impl OpModel for TryWait {
+//   type Item = io::Result<Option<ExitStatus>>;
+//
+//   fn send_op(&mut self) -> OpFlow {
+//     self.inner.send_op()
+//   }
+//
+//   fn result(&mut self, res: isize) -> Step<Self::Item> {
+//     self
+//       .inner
+//       .result(res)
+//       .map(|res| res.map(|status| status.map(ExitStatus::from)))
+//   }
+// }
 
 // ============================================================================
 // SpawnChild TypedOp
@@ -921,59 +912,61 @@ unsafe impl Send for SpawnChild {}
 // SAFETY: SpawnChild owns all the resources it references (same as Send).
 unsafe impl Sync for SpawnChild {}
 
-impl TypedOp for SpawnChild {
-  type Result = io::Result<Child>;
-
-  fn into_op(&mut self) -> Op {
-    let file_actions_ptr = self.get_file_actions_ptr();
-    self
-      .inner
-      .as_mut()
-      .expect("inner already taken")
-      .into_op_with_file_actions(file_actions_ptr)
-  }
-
-  fn extract_result(mut self, res: isize) -> Self::Result {
-    let inner = self.inner.take().expect("inner already taken");
-    let pid = inner.extract_result(res)?;
-
-    // Close child ends of pipes in parent
-    // For stdin: close read end, keep write end
-    let stdin = if let Some(pipe) = self.stdin_pipe.take() {
-      pipe.close_read();
-      // Set non-blocking for async I/O
-      let _ = set_nonblocking(pipe.write);
-      // SAFETY: pipe.write is a valid fd that we now own (read end was closed)
-      Some(ChildStdin { inner: unsafe { Resource::from_raw_fd(pipe.write) } })
-    } else {
-      None
-    };
-
-    // For stdout: close write end, keep read end
-    let stdout = if let Some(pipe) = self.stdout_pipe.take() {
-      pipe.close_write();
-      // Set non-blocking for async I/O
-      let _ = set_nonblocking(pipe.read);
-      // SAFETY: pipe.read is a valid fd that we now own (write end was closed)
-      Some(ChildStdout { inner: unsafe { Resource::from_raw_fd(pipe.read) } })
-    } else {
-      None
-    };
-
-    // For stderr: close write end, keep read end
-    let stderr = if let Some(pipe) = self.stderr_pipe.take() {
-      pipe.close_write();
-      // Set non-blocking for async I/O
-      let _ = set_nonblocking(pipe.read);
-      // SAFETY: pipe.read is a valid fd that we now own (write end was closed)
-      Some(ChildStderr { inner: unsafe { Resource::from_raw_fd(pipe.read) } })
-    } else {
-      None
-    };
-
-    Ok(Child { pid, waited: false, stdin, stdout, stderr })
-  }
-}
+// LEGACY `OpModel` impl parked during the serial-contract migration.
+//
+// impl OpModel for SpawnChild {
+//   type Item = io::Result<Child>;
+//
+//   fn send_op(&mut self) -> OpFlow {
+//     let file_actions_ptr = self.get_file_actions_ptr();
+//     let inner = self.inner.as_mut().expect("inner already taken");
+//     inner.set_file_actions(file_actions_ptr);
+//     inner.send_op()
+//   }
+//
+//   fn result(&mut self, res: isize) -> Step<Self::Item> {
+//     let mut inner = self.inner.take().expect("inner already taken");
+//     let pid_result = match inner.result(res) {
+//       Step::YieldAndSubmit(r) => r,
+//       Step::Completed(r) => r,
+//       Step::YieldEmpty => {
+//         self.inner = Some(inner);
+//         return Step::YieldEmpty;
+//       }
+//     };
+//
+//     let pid = match pid_result {
+//       Ok(p) => p,
+//       Err(e) => return Step::Completed(Err(e)),
+//     };
+//
+//     let stdin = if let Some(pipe) = self.stdin_pipe.take() {
+//       pipe.close_read();
+//       let _ = set_nonblocking(pipe.write);
+//       Some(ChildStdin { inner: unsafe { Resource::from_raw_fd(pipe.write) } })
+//     } else {
+//       None
+//     };
+//
+//     let stdout = if let Some(pipe) = self.stdout_pipe.take() {
+//       pipe.close_write();
+//       let _ = set_nonblocking(pipe.read);
+//       Some(ChildStdout { inner: unsafe { Resource::from_raw_fd(pipe.read) } })
+//     } else {
+//       None
+//     };
+//
+//     let stderr = if let Some(pipe) = self.stderr_pipe.take() {
+//       pipe.close_write();
+//       let _ = set_nonblocking(pipe.read);
+//       Some(ChildStderr { inner: unsafe { Resource::from_raw_fd(pipe.read) } })
+//     } else {
+//       None
+//     };
+//
+//     Step::Completed(Ok(Child { pid, waited: false, stdin, stdout, stderr }))
+//   }
+// }
 
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
   let flags = syscall!(fcntl(fd, libc::F_GETFL))?;
@@ -999,23 +992,29 @@ impl SpawnChildBuilder {
   }
 }
 
-impl TypedOp for SpawnChildBuilder {
-  type Result = io::Result<Child>;
-
-  fn into_op(&mut self) -> Op {
-    match &mut self.inner {
-      Ok(spawn_child) => spawn_child.into_op(),
-      Err(_) => Op::Nop, // Will be handled in extract_result
-    }
-  }
-
-  fn extract_result(self, res: isize) -> Self::Result {
-    match self.inner {
-      Ok(spawn_child) => spawn_child.extract_result(res),
-      Err(e) => Err(e),
-    }
-  }
-}
+// LEGACY `OpModel` impl parked during the serial-contract migration.
+//
+// impl OpModel for SpawnChildBuilder {
+//   type Item = io::Result<Child>;
+//
+//   fn send_op(&mut self) -> OpFlow {
+//     match &mut self.inner {
+//       Ok(spawn_child) => spawn_child.send_op(),
+//       Err(_) => OpFlow::Send(Op::Nop),
+//     }
+//   }
+//
+//   fn result(&mut self, res: isize) -> Step<Self::Item> {
+//     let inner = std::mem::replace(
+//       &mut self.inner,
+//       Err(io::Error::from_raw_os_error(0)),
+//     );
+//     match inner {
+//       Ok(mut spawn_child) => spawn_child.result(res),
+//       Err(e) => Step::YieldAndSubmit(Err(e)),
+//     }
+//   }
+// }
 
 // ============================================================================
 // Command builder
@@ -1378,3 +1377,50 @@ impl Command {
     child.wait().await
   }
 }
+
+// // ============================================================================
+// // StreamOp Tests
+// // ============================================================================
+//
+// #[cfg(test)]
+// mod stream_op_tests {
+//   use super::*;
+//   use crate::test_stream_op_invariants;
+//
+//   fn test_resource() -> Resource {
+//     use std::fs::File;
+//     use std::os::fd::{FromRawFd, IntoRawFd};
+//
+//     // Open and convert to Resource which will properly close on drop
+//     let file = File::open("/dev/null").expect("Failed to open /dev/null");
+//     unsafe { Resource::from_raw_fd(file.into_raw_fd()) }
+//   }
+//
+//   test_stream_op_invariants! {
+//       test_read_to_end_invariants_inner,
+//       resource_type: (),
+//       new: |_: &()| ReadToEnd {
+//           resource: test_resource(),
+//           accumulated: Vec::new(),
+//           buffer: vec![0u8; 4096],
+//           iovec: unsafe { std::mem::zeroed() },
+//           done: false,
+//       },
+//       test_results: [
+//           100,   // Read 100 bytes
+//           512,   // Read 512 bytes
+//           4096,  // Read full buffer
+//           1024,  // Read 1024 bytes
+//           0,     // EOF
+//           -libc::EAGAIN,  // Would block
+//           -libc::EBADF,   // Bad file descriptor
+//           -libc::EIO,     // I/O error
+//           -libc::EINTR    // Interrupted
+//       ]
+//   }
+//
+//   #[test]
+//   fn test_read_to_end_invariants() {
+//     test_read_to_end_invariants_inner(&());
+//   }
+// }
