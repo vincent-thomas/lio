@@ -91,7 +91,10 @@ macro_rules! test_io_backend {
       };
 
       use $crate::api::resource::Resource;
-      use $crate::backend::{IoBackend, op::{Op, RawBuf}};
+      use $crate::backend::{
+        IoBackend,
+        op::{MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, RawBuf},
+      };
 
       fn new_backend() -> impl IoBackend {
         $backend_ctor
@@ -1068,25 +1071,13 @@ macro_rules! test_io_backend {
           let mut total = 0usize;
           let mut id = 42_u64;
           while total < payload.len() {
-            let mut iov = [libc::iovec {
-              iov_base: buf[total..].as_mut_ptr().cast(),
-              iov_len: buf.len() - total,
-            }];
-            let mut msg = libc::msghdr {
-              msg_name: std::ptr::null_mut(),
-              msg_namelen: 0,
-              msg_iov: iov.as_mut_ptr(),
-              msg_iovlen: 1,
-              msg_control: std::ptr::null_mut(),
-              msg_controllen: 0,
-              msg_flags: 0,
-            };
+            let bufs = [MsgBufMut::from_slice(&mut buf[total..])];
 
             backend.push(
               id,
               Op::Recv {
                 fd: read_res.clone(),
-                msg: &mut msg,
+                msg: MsgRecv::new(&bufs, false),
                 flags: 0,
               },
             );
@@ -1111,25 +1102,13 @@ macro_rules! test_io_backend {
           let (read_res, write_res) = socket_pair();
           let payload = *b"wait";
           let mut buf = [0_u8; 4];
-          let mut iov = [libc::iovec {
-            iov_base: buf.as_mut_ptr().cast(),
-            iov_len: buf.len(),
-          }];
-          let mut msg = libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: iov.as_mut_ptr(),
-            msg_iovlen: 1,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-          };
+          let bufs = [MsgBufMut::from_slice(&mut buf)];
 
           backend.push(
             56,
             Op::Recv {
               fd: read_res.clone(),
-              msg: &mut msg,
+              msg: MsgRecv::new(&bufs, false),
               flags: 0,
             },
           );
@@ -1163,25 +1142,13 @@ macro_rules! test_io_backend {
 
           let mut id = 57_u64;
           while total < payload.len() {
-            let mut iov = [libc::iovec {
-              iov_base: buf[total..].as_mut_ptr().cast(),
-              iov_len: buf.len() - total,
-            }];
-            let mut msg = libc::msghdr {
-              msg_name: std::ptr::null_mut(),
-              msg_namelen: 0,
-              msg_iov: iov.as_mut_ptr(),
-              msg_iovlen: 1,
-              msg_control: std::ptr::null_mut(),
-              msg_controllen: 0,
-              msg_flags: 0,
-            };
+            let bufs = [MsgBufMut::from_slice(&mut buf[total..])];
 
             backend.push(
               id,
               Op::Recv {
                 fd: read_res.clone(),
-                msg: &mut msg,
+                msg: MsgRecv::new(&bufs, false),
                 flags: 0,
               },
             );
@@ -1207,25 +1174,13 @@ macro_rules! test_io_backend {
           let (read_res, write_res) = socket_pair();
           let payload = *b"once";
           let mut buf = [0_u8; 4];
-          let mut iov = [libc::iovec {
-            iov_base: buf.as_mut_ptr().cast(),
-            iov_len: buf.len(),
-          }];
-          let mut msg = libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: iov.as_mut_ptr(),
-            msg_iovlen: 1,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-          };
+          let bufs = [MsgBufMut::from_slice(&mut buf)];
 
           backend.push(
             561,
             Op::Recv {
               fd: read_res.clone(),
-              msg: &mut msg,
+              msg: MsgRecv::new(&bufs, false),
               flags: 0,
             },
           );
@@ -1283,31 +1238,16 @@ macro_rules! test_io_backend {
           while total < payload.len() {
             let left_done = total.min(left.len());
             let right_done = total.saturating_sub(left.len()).min(right.len());
-            let mut iov = [
-              libc::iovec {
-                iov_base: left[left_done..].as_mut_ptr().cast(),
-                iov_len: left.len() - left_done,
-              },
-              libc::iovec {
-                iov_base: right[right_done..].as_mut_ptr().cast(),
-                iov_len: right.len() - right_done,
-              },
+            let bufs = [
+              MsgBufMut::from_slice(&mut left[left_done..]),
+              MsgBufMut::from_slice(&mut right[right_done..]),
             ];
-            let mut msg = libc::msghdr {
-              msg_name: std::ptr::null_mut(),
-              msg_namelen: 0,
-              msg_iov: iov.as_mut_ptr(),
-              msg_iovlen: iov.len() as _,
-              msg_control: std::ptr::null_mut(),
-              msg_controllen: 0,
-              msg_flags: 0,
-            };
 
             backend.push(
               id,
               Op::Recv {
                 fd: read_res.clone(),
-                msg: &mut msg,
+                msg: MsgRecv::new(&bufs, false),
                 flags: 0,
               },
             );
@@ -1333,25 +1273,13 @@ macro_rules! test_io_backend {
 
           let (read_res, write_res) = socket_pair();
           let mut buf = [0_u8; 4];
-          let mut iov = [libc::iovec {
-            iov_base: buf.as_mut_ptr().cast(),
-            iov_len: buf.len(),
-          }];
-          let mut msg = libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: iov.as_mut_ptr(),
-            msg_iovlen: 1,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-          };
+          let bufs = [MsgBufMut::from_slice(&mut buf)];
 
           backend.push(
             57,
             Op::Recv {
               fd: read_res.clone(),
-              msg: &mut msg,
+              msg: MsgRecv::new(&bufs, false),
               flags: 0,
             },
           );
@@ -1368,25 +1296,13 @@ macro_rules! test_io_backend {
           backend.init(64).unwrap();
 
           let mut buf = [0_u8; 4];
-          let mut iov = [libc::iovec {
-            iov_base: buf.as_mut_ptr().cast(),
-            iov_len: buf.len(),
-          }];
-          let mut msg = libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: iov.as_mut_ptr(),
-            msg_iovlen: 1,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-          };
+          let bufs = [MsgBufMut::from_slice(&mut buf)];
 
           backend.push(
             49,
             Op::Recv {
               fd: invalid_fd_resource(),
-              msg: &mut msg,
+              msg: MsgRecv::new(&bufs, false),
               flags: 0,
             },
           );
@@ -1412,25 +1328,13 @@ macro_rules! test_io_backend {
           let mut total = 0usize;
           let mut id = 41_u64;
           while total < payload.len() {
-            let iov = [libc::iovec {
-              iov_base: payload[total..].as_ptr().cast_mut().cast(),
-              iov_len: payload.len() - total,
-            }];
-            let msg = libc::msghdr {
-              msg_name: std::ptr::null_mut(),
-              msg_namelen: 0,
-              msg_iov: iov.as_ptr().cast_mut(),
-              msg_iovlen: 1,
-              msg_control: std::ptr::null_mut(),
-              msg_controllen: 0,
-              msg_flags: 0,
-            };
+            let bufs = [MsgBuf::from_slice(&payload[total..])];
 
             backend.push(
               id,
               Op::Send {
                 fd: write_res.clone(),
-                msg: &msg,
+                msg: MsgSend::new(&bufs, None),
                 flags: 0,
               },
             );
@@ -1472,31 +1376,16 @@ macro_rules! test_io_backend {
           while total < 6 {
             let left_done = total.min(left.len());
             let right_done = total.saturating_sub(left.len()).min(right.len());
-            let iov = [
-              libc::iovec {
-                iov_base: left[left_done..].as_ptr().cast_mut().cast(),
-                iov_len: left.len() - left_done,
-              },
-              libc::iovec {
-                iov_base: right[right_done..].as_ptr().cast_mut().cast(),
-                iov_len: right.len() - right_done,
-              },
+            let bufs = [
+              MsgBuf::from_slice(&left[left_done..]),
+              MsgBuf::from_slice(&right[right_done..]),
             ];
-            let msg = libc::msghdr {
-              msg_name: std::ptr::null_mut(),
-              msg_namelen: 0,
-              msg_iov: iov.as_ptr().cast_mut(),
-              msg_iovlen: iov.len() as _,
-              msg_control: std::ptr::null_mut(),
-              msg_controllen: 0,
-              msg_flags: 0,
-            };
 
             backend.push(
               id,
               Op::Send {
                 fd: write_res.clone(),
-                msg: &msg,
+                msg: MsgSend::new(&bufs, None),
                 flags: 0,
               },
             );
@@ -1531,25 +1420,13 @@ macro_rules! test_io_backend {
           backend.init(64).unwrap();
 
           let payload = *b"oops";
-          let iov = [libc::iovec {
-            iov_base: payload.as_ptr().cast_mut().cast(),
-            iov_len: payload.len(),
-          }];
-          let msg = libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: iov.as_ptr().cast_mut(),
-            msg_iovlen: 1,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-          };
+          let bufs = [MsgBuf::from_slice(&payload)];
 
           backend.push(
             50,
             Op::Send {
               fd: invalid_fd_resource(),
-              msg: &msg,
+              msg: MsgSend::new(&bufs, None),
               flags: 0,
             },
           );

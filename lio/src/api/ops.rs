@@ -7,6 +7,7 @@ use std::ffi::CString;
 use std::io;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::ptr::NonNull;
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
 #[cfg(windows)]
@@ -23,7 +24,10 @@ use crate::{
     },
     resource::Resource,
   },
-  backend::op::{Op, RawBuf, SockDomain, SockProto, SockType},
+  backend::op::{
+    MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, RawBuf, SockDomain, SockProto,
+    SockType,
+  },
   buf::MAX_IOV_COUNT,
 };
 
@@ -766,12 +770,11 @@ pub struct Recv<B: IoBufMutVec + std::marker::Send + Sync> {
   res: Resource,
   buf: Option<B>,
   flags: i32,
-  iovecs: [libc::iovec; MAX_IOV_COUNT],
-  addr: Option<libc::sockaddr_storage>,
-  msg: libc::msghdr,
+  bufs: [MsgBufMut; MAX_IOV_COUNT],
+  from: bool,
 }
 
-// SAFETY: `Recv` owns the buffer and the `iovec` / `msghdr` only point into
+// SAFETY: `Recv` owns the buffer and the message slices only point into
 // that owned buffer and into fields of the same struct. The operation is driven
 // by a single owning thread.
 unsafe impl<B: IoBufMutVec + std::marker::Send + Sync> std::marker::Send
@@ -790,41 +793,33 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> Recv<B> {
     Self {
       res,
       flags: flags.unwrap_or(0),
-      // SAFETY: C structs with primitive fields; zero init is valid before setup.
-      iovecs: unsafe { mem::zeroed() },
-      // SAFETY: zeroed `msghdr` is a valid empty starting state before hydration.
-      msg: unsafe { mem::zeroed() },
-      addr: None,
+      bufs: [unsafe { MsgBufMut::from_raw_parts(NonNull::dangling(), 0) };
+        MAX_IOV_COUNT],
+      from: false,
       buf: Some(buf),
     }
   }
 
   pub fn from(mut self) -> Self {
-    self.addr = Some(unsafe { mem::zeroed() });
+    self.from = true;
     self
   }
 
-  fn hydrate_msghdr(&mut self) {
+  fn hydrate_msg(&mut self) -> MsgRecv {
     let buf = self.buf.as_mut().expect("buffer not available");
-    let iov_count = buf.buf_count().min(MAX_IOV_COUNT);
+    let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
-    for i in 0..iov_count {
+    for i in 0..buf_count {
       let (ptr, len) = buf.buf_mut(i);
-      self.iovecs[i].iov_base = ptr.cast();
-      self.iovecs[i].iov_len = len;
+      self.bufs[i] = unsafe {
+        MsgBufMut::from_raw_parts(
+          NonNull::new(ptr).expect("IoBufMutVec returned null ptr"),
+          len,
+        )
+      };
     }
 
-    self.msg.msg_iov = self.iovecs.as_mut_ptr();
-    self.msg.msg_iovlen =
-      iov_count.try_into().expect("msg_iovlen is a big number!");
-
-    self.msg.msg_name = self
-      .addr
-      .as_mut()
-      .map(|addr| (addr as *mut libc::sockaddr_storage).cast())
-      .unwrap_or(ptr::null_mut());
-    self.msg.msg_namelen =
-      mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    MsgRecv::new(&self.bufs[..buf_count], self.from)
   }
 
   #[cfg(test)]
@@ -858,10 +853,10 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Recv<B> {
   type Item = BufResult<i32, B>;
 
   fn action(&mut self) -> Action {
-    self.hydrate_msghdr();
+    let msg = self.hydrate_msg();
     Action::Io(Op::Recv {
       fd: self.res.clone(),
-      msg: &mut self.msg,
+      msg,
       flags: self.flags,
     })
   }
@@ -872,7 +867,8 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Recv<B> {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
       let mut remaining = completion.result as usize;
-      for i in 0..(self.msg.msg_iovlen as usize) {
+      let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
+      for i in 0..buf_count {
         let (_, cap) = buf.buf_mut(i);
         let len = remaining.min(cap);
         buf.set_buf_len(i, len);
@@ -950,13 +946,11 @@ pub struct Send<B: IoBufVec + std::marker::Send + Sync> {
   res: Resource,
   buf: Option<B>,
   flags: i32,
-  iovecs: [libc::iovec; MAX_IOV_COUNT],
-  addr: Option<libc::sockaddr_storage>,
-  addr_len: libc::socklen_t,
-  msg: libc::msghdr,
+  bufs: [MsgBuf; MAX_IOV_COUNT],
+  addr: Option<SocketAddr>,
 }
 
-// SAFETY: `Send` owns the buffer and the `iovec` / `msghdr` only point into
+// SAFETY: `Send` owns the buffer and the message slices only point into
 // that owned buffer and into fields of the same struct. The operation is driven
 // by a single owning thread.
 unsafe impl<B: IoBufVec + std::marker::Send + Sync> std::marker::Send
@@ -975,45 +969,33 @@ impl<B: IoBufVec + std::marker::Send + Sync> Send<B> {
     Self {
       res,
       flags: flags.unwrap_or(0),
-      // SAFETY: C structs with primitive fields; zero init is valid before setup.
-      iovecs: unsafe { mem::zeroed() },
+      bufs: [unsafe { MsgBuf::from_raw_parts(NonNull::dangling(), 0) };
+        MAX_IOV_COUNT],
       addr: None,
-      addr_len: 0,
-      // SAFETY: zeroed `msghdr` is a valid empty starting state before hydration.
-      msg: unsafe { mem::zeroed() },
       buf: Some(buf),
     }
   }
 
   pub fn to(mut self, addr: SocketAddr) -> Self {
-    self.addr = Some(std_socketaddr_into_libc(addr));
-    self.addr_len = match addr {
-      SocketAddr::V4(_) => mem::size_of::<libc::sockaddr_in>(),
-      SocketAddr::V6(_) => mem::size_of::<libc::sockaddr_in6>(),
-    } as libc::socklen_t;
+    self.addr = Some(addr);
     self
   }
 
-  fn hydrate_msghdr(&mut self) {
+  fn hydrate_msg(&mut self) -> MsgSend {
     let buf = self.buf.as_ref().expect("buffer not available");
-    let iov_count = buf.buf_count().min(MAX_IOV_COUNT);
+    let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
-    for i in 0..iov_count {
+    for i in 0..buf_count {
       let (ptr, len) = buf.buf(i);
-      self.iovecs[i].iov_base = ptr.cast_mut().cast();
-      self.iovecs[i].iov_len = len;
+      self.bufs[i] = unsafe {
+        MsgBuf::from_raw_parts(
+          NonNull::new(ptr.cast_mut()).expect("IoBufVec returned null ptr"),
+          len,
+        )
+      };
     }
 
-    self.msg.msg_iov = self.iovecs.as_mut_ptr();
-    self.msg.msg_iovlen =
-      iov_count.try_into().expect("msg_iovlen is a big number!");
-
-    self.msg.msg_namelen = self.addr_len;
-    self.msg.msg_name = self
-      .addr
-      .as_mut()
-      .map(|addr| (addr as *mut libc::sockaddr_storage).cast())
-      .unwrap_or(ptr::null_mut());
+    MsgSend::new(&self.bufs[..buf_count], self.addr)
   }
 }
 
@@ -1021,10 +1003,10 @@ impl<B: IoBufVec + std::marker::Send + Sync> OpModel for Send<B> {
   type Item = BufResult<i32, B>;
 
   fn action(&mut self) -> Action {
-    self.hydrate_msghdr();
+    let msg = self.hydrate_msg();
     Action::Io(Op::Send {
       fd: self.res.clone(),
-      msg: &self.msg,
+      msg,
       flags: self.flags,
     })
   }

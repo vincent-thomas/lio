@@ -27,7 +27,8 @@ use std::{
 };
 
 use crate::backend::{
-  IoBackend, OpCompleted, impls::pollingv2::interest::Interest, op::Op,
+  IoBackend, OpCompleted, impls::pollingv2::interest::Interest,
+  op::{MsgRecv, MsgSend, Op},
 };
 mod interest;
 
@@ -178,6 +179,74 @@ const EAGAIN_NEG: isize = -(libc::EAGAIN as isize);
 const EWOULDBLOCK_NEG: isize = -(libc::EWOULDBLOCK as isize);
 
 impl Poller {
+  fn lower_recv_msg(
+    msg: &MsgRecv,
+  ) -> Option<(
+    [libc::iovec; crate::buf::MAX_IOV_COUNT],
+    libc::msghdr,
+    Option<(libc::sockaddr_storage, libc::socklen_t)>,
+  )> {
+    let bufs =
+      unsafe { std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get()) };
+    let mut iovecs =
+      [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
+        crate::buf::MAX_IOV_COUNT];
+
+    for (dst, src) in iovecs.iter_mut().zip(bufs.iter()) {
+      dst.iov_base = src.ptr.as_ptr().cast();
+      dst.iov_len = src.len;
+    }
+
+    let mut addr = if msg.from {
+      Some((
+        unsafe { std::mem::zeroed::<libc::sockaddr_storage>() },
+        std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+      ))
+    } else {
+      None
+    };
+
+    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_iov = iovecs.as_mut_ptr();
+    hdr.msg_iovlen = bufs.len() as _;
+    if let Some((storage, len)) = addr.as_mut() {
+      hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
+      hdr.msg_namelen = *len;
+    }
+
+    Some((iovecs, hdr, addr))
+  }
+
+  fn lower_send_msg(
+    msg: &MsgSend,
+  ) -> Option<(
+    [libc::iovec; crate::buf::MAX_IOV_COUNT],
+    libc::msghdr,
+    Option<(libc::sockaddr_storage, libc::socklen_t)>,
+  )> {
+    let bufs =
+      unsafe { std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get()) };
+    let mut iovecs =
+      [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
+        crate::buf::MAX_IOV_COUNT];
+
+    for (dst, src) in iovecs.iter_mut().zip(bufs.iter()) {
+      dst.iov_base = src.ptr.as_ptr().cast();
+      dst.iov_len = src.len;
+    }
+
+    let mut addr = msg.to.map(crate::backend::op::socket_addr_to_storage);
+    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_iov = iovecs.as_mut_ptr();
+    hdr.msg_iovlen = bufs.len() as _;
+    if let Some((storage, len)) = addr.as_mut() {
+      hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
+      hdr.msg_namelen = *len;
+    }
+
+    Some((iovecs, hdr, addr))
+  }
+
   pub fn new() -> Self {
     Self::default()
   }
@@ -409,12 +478,18 @@ impl Poller {
 
       Op::Recv { fd, msg, flags } => {
         let fd = fd.as_raw_fd();
-        syscall!(raw recvmsg(fd, *msg, *flags))
+        let Some((_iovecs, mut hdr, _addr)) = Self::lower_recv_msg(msg) else {
+          return -(libc::EINVAL as isize);
+        };
+        syscall!(raw recvmsg(fd, &mut hdr, *flags))
       }
 
       Op::Send { fd, msg, flags } => {
         let fd = fd.as_raw_fd();
-        syscall!(raw sendmsg(fd, *msg as *mut _, *flags))
+        let Some((_iovecs, mut hdr, _addr)) = Self::lower_send_msg(msg) else {
+          return -(libc::EINVAL as isize);
+        };
+        syscall!(raw sendmsg(fd, &mut hdr, *flags))
       }
 
       Op::Accept { fd, addr, len } => {

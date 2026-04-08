@@ -2,6 +2,7 @@
 
 use std::io;
 use std::collections::HashMap;
+use std::mem;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
@@ -20,13 +21,86 @@ struct BacklogEntry {
   op: Op,
 }
 
+#[derive(Debug)]
+struct NativeMsgState {
+  iovecs: [libc::iovec; crate::buf::MAX_IOV_COUNT],
+  addr: Option<(libc::sockaddr_storage, libc::socklen_t)>,
+  hdr: libc::msghdr,
+}
+
+impl NativeMsgState {
+  fn from_recv(msg: &crate::backend::op::MsgRecv) -> Option<Self> {
+    let bufs =
+      unsafe { std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get()) };
+    let mut state = Self {
+      iovecs: [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
+        crate::buf::MAX_IOV_COUNT],
+      addr: None,
+      hdr: unsafe { mem::zeroed() },
+    };
+
+    for (dst, src) in state.iovecs.iter_mut().zip(bufs.iter()) {
+      dst.iov_base = src.ptr.as_ptr().cast();
+      dst.iov_len = src.len;
+    }
+
+    state.hdr.msg_iov = state.iovecs.as_mut_ptr();
+    state.hdr.msg_iovlen = bufs.len() as _;
+
+    if msg.from {
+      state.addr = Some((
+        unsafe { mem::zeroed::<libc::sockaddr_storage>() },
+        mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+      ));
+      if let Some((storage, len)) = state.addr.as_mut() {
+        state.hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
+        state.hdr.msg_namelen = *len;
+      }
+    }
+
+    Some(state)
+  }
+
+  fn from_send(msg: &crate::backend::op::MsgSend) -> Option<Self> {
+    let bufs =
+      unsafe { std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get()) };
+    let mut state = Self {
+      iovecs: [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
+        crate::buf::MAX_IOV_COUNT],
+      addr: msg.to.map(crate::backend::op::socket_addr_to_storage),
+      hdr: unsafe { mem::zeroed() },
+    };
+
+    for (dst, src) in state.iovecs.iter_mut().zip(bufs.iter()) {
+      dst.iov_base = src.ptr.as_ptr().cast();
+      dst.iov_len = src.len;
+    }
+
+    state.hdr.msg_iov = state.iovecs.as_mut_ptr();
+    state.hdr.msg_iovlen = bufs.len() as _;
+
+    if let Some((storage, len)) = state.addr.as_mut() {
+      state.hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
+      state.hdr.msg_namelen = *len;
+    }
+
+    Some(state)
+  }
+}
+
+#[derive(Debug)]
+struct PendingEntry {
+  op: Op,
+  native_msg: Option<NativeMsgState>,
+}
+
 #[derive(Default)]
 pub struct IoUring {
   ring: Option<LioUring>,
   capacity: usize,
   in_flight: usize,
   backlog: Vec<BacklogEntry>,
-  pending: HashMap<u64, Op>,
+  pending: HashMap<u64, PendingEntry>,
   queued_completed: Vec<OpCompleted>,
   completed: Vec<OpCompleted>,
 }
@@ -88,8 +162,6 @@ impl IoUring {
 
         None
       }
-      Op::Recv { msg, .. } if msg.is_null() => Some(-(libc::EINVAL as isize)),
-      Op::Send { msg, .. } if msg.is_null() => Some(-(libc::EINVAL as isize)),
       Op::Connect { addr, .. } if addr.is_null() => {
         Some(-(libc::EINVAL as isize))
       }
@@ -105,7 +177,7 @@ impl IoUring {
     }
   }
 
-  fn create_entry(op: &Op) -> Entry {
+  fn create_entry(op: &Op, native_msg: Option<&NativeMsgState>) -> Entry {
     match op {
       Op::Nop => Nop::new().build(),
       Op::Read { fd, iovecs, iov_count, offset, flags } => Readv::new(
@@ -124,11 +196,17 @@ impl IoUring {
       .offset(Self::io_offset(*offset))
       .rw_flags(*flags)
       .build(),
-      Op::Recv { fd, msg, flags } => {
-        RecvMsg::new(fd.as_raw_fd(), *msg).flags(*flags as u32).build()
+      Op::Recv { fd, flags, .. } => {
+        let native_msg = native_msg.expect("recv native state must be hydrated");
+        RecvMsg::new(fd.as_raw_fd(), &native_msg.hdr)
+          .flags(*flags as u32)
+          .build()
       }
-      Op::Send { fd, msg, flags } => {
-        SendMsg::new(fd.as_raw_fd(), *msg).flags(*flags as u32).build()
+      Op::Send { fd, flags, .. } => {
+        let native_msg = native_msg.expect("send native state must be hydrated");
+        SendMsg::new(fd.as_raw_fd(), &native_msg.hdr)
+          .flags(*flags as u32)
+          .build()
       }
       Op::Accept { fd, addr, len } => {
         Accept::new(fd.as_raw_fd(), (*addr).cast(), *len).build()
@@ -151,13 +229,18 @@ impl IoUring {
     }
   }
 
-  fn push_op(&mut self, op: &Op, id: u64) -> io::Result<()> {
-    let entry = Self::create_entry(op);
+  fn push_op(
+    &mut self,
+    op: &Op,
+    native_msg: Option<&NativeMsgState>,
+    id: u64,
+  ) -> io::Result<()> {
+    let entry = Self::create_entry(op, native_msg);
     match unsafe { self.ring().push(entry, id) } {
       Ok(()) => Ok(()),
       Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
         self.ring().submit()?;
-        let entry = Self::create_entry(op);
+        let entry = Self::create_entry(op, native_msg);
         unsafe { self.ring().push(entry, id) }
       }
       Err(err) => Err(err),
@@ -205,8 +288,13 @@ impl IoBackend for IoUring {
         continue;
       }
 
-      self.push_op(&entry.op, entry.id)?;
-      self.pending.insert(entry.id, entry.op);
+      let native_msg = match &entry.op {
+        Op::Recv { msg, .. } => NativeMsgState::from_recv(msg),
+        Op::Send { msg, .. } => NativeMsgState::from_send(msg),
+        _ => None,
+      };
+      self.push_op(&entry.op, native_msg.as_ref(), entry.id)?;
+      self.pending.insert(entry.id, PendingEntry { op: entry.op, native_msg });
       self.in_flight += 1;
     }
 

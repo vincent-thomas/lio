@@ -5,6 +5,9 @@
 
 use crate::api::resource::Resource;
 use std::ffi::c_char;
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::ptr::NonNull;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SockDomain(u8);
@@ -125,6 +128,18 @@ pub fn socket_to_raw(
   Ok((domain, ty, proto))
 }
 
+#[cfg(feature = "backend_impls")]
+pub(crate) fn socket_addr_to_storage(
+  addr: SocketAddr,
+) -> (libc::sockaddr_storage, libc::socklen_t) {
+  let storage = crate::api::ops::std_socketaddr_into_libc(addr);
+  let len = match addr {
+    SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>(),
+    SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>(),
+  } as libc::socklen_t;
+  (storage, len)
+}
+
 #[cfg(unix)]
 const fn raw_af_inet() -> i32 {
   libc::AF_INET
@@ -240,6 +255,100 @@ unsafe impl Send for RawBuf {}
 // SAFETY: Same as Send - we only access through the owning TypedOp.
 unsafe impl Sync for RawBuf {}
 
+#[derive(Clone, Copy, Debug)]
+pub struct MsgBuf {
+  pub ptr: NonNull<u8>,
+  pub len: usize,
+}
+
+impl MsgBuf {
+  #[inline]
+  pub fn from_slice(buf: &[u8]) -> Self {
+    Self {
+      ptr: NonNull::new(buf.as_ptr().cast_mut()).expect("slice pointer must be non-null"),
+      len: buf.len(),
+    }
+  }
+
+  /// # Safety
+  /// `ptr` must be non-null and valid for reads of `len` bytes for the operation lifetime.
+  #[inline]
+  pub const unsafe fn from_raw_parts(ptr: NonNull<u8>, len: usize) -> Self {
+    Self { ptr, len }
+  }
+}
+
+unsafe impl Send for MsgBuf {}
+unsafe impl Sync for MsgBuf {}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MsgBufMut {
+  pub ptr: NonNull<u8>,
+  pub len: usize,
+}
+
+impl MsgBufMut {
+  #[inline]
+  pub fn from_slice(buf: &mut [u8]) -> Self {
+    Self {
+      ptr: NonNull::new(buf.as_mut_ptr()).expect("slice pointer must be non-null"),
+      len: buf.len(),
+    }
+  }
+
+  /// # Safety
+  /// `ptr` must be non-null and valid for writes of `len` bytes for the operation lifetime.
+  #[inline]
+  pub const unsafe fn from_raw_parts(ptr: NonNull<u8>, len: usize) -> Self {
+    Self { ptr, len }
+  }
+}
+
+unsafe impl Send for MsgBufMut {}
+unsafe impl Sync for MsgBufMut {}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MsgSend {
+  pub bufs: NonNull<MsgBuf>,
+  pub buf_count: NonZeroUsize,
+  pub to: Option<SocketAddr>,
+}
+
+impl MsgSend {
+  #[inline]
+  pub fn new(bufs: &[MsgBuf], to: Option<SocketAddr>) -> Self {
+    let buf_count =
+      NonZeroUsize::new(bufs.len()).expect("MsgSend must contain at least one buffer");
+    let bufs =
+      NonNull::new(bufs.as_ptr().cast_mut()).expect("buffer slice pointer must be non-null");
+    Self { bufs, buf_count, to }
+  }
+}
+
+unsafe impl Send for MsgSend {}
+unsafe impl Sync for MsgSend {}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MsgRecv {
+  pub bufs: NonNull<MsgBufMut>,
+  pub buf_count: NonZeroUsize,
+  pub from: bool,
+}
+
+impl MsgRecv {
+  #[inline]
+  pub fn new(bufs: &[MsgBufMut], from: bool) -> Self {
+    let buf_count =
+      NonZeroUsize::new(bufs.len()).expect("MsgRecv must contain at least one buffer");
+    let bufs =
+      NonNull::new(bufs.as_ptr().cast_mut()).expect("buffer slice pointer must be non-null");
+    Self { bufs, buf_count, from }
+  }
+}
+
+unsafe impl Send for MsgRecv {}
+unsafe impl Sync for MsgRecv {}
+
 // pub struct IoSlice(libc::iovec);
 
 /// All I/O operations as pure data.
@@ -309,8 +418,8 @@ pub enum Op {
   Recv {
     /// Socket to receive from
     fd: Resource,
-    /// Full msghdr for recvmsg (null if using simpler variant)
-    msg: *mut libc::msghdr,
+    /// Portable message descriptor lowered by the backend.
+    msg: MsgRecv,
     /// Send flags (MSG_NOSIGNAL, MSG_MORE, MSG_DONTWAIT, etc.)
     flags: i32,
   },
@@ -327,8 +436,8 @@ pub enum Op {
   Send {
     /// Socket to send to
     fd: Resource,
-    /// Full msghdr for sendmsg (null if using simpler variant)
-    msg: *const libc::msghdr,
+    /// Portable message descriptor lowered by the backend.
+    msg: MsgSend,
     /// Send flags (MSG_NOSIGNAL, MSG_MORE, MSG_DONTWAIT, etc.)
     flags: i32,
   },
