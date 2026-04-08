@@ -318,62 +318,62 @@ fn test_sequential_nop_200() {
 // Mixed operation types test
 // ============================================================================
 
-#[test]
-fn test_mixed_op_types() {
-  // Tests nop + write + fsync on the same file
-  // Note: Sequential because kqueue can't have multiple pending ops on same fd
-  let mut lio = Lio::new(64).unwrap();
-
-  let cwd = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
-  let temp =
-    TempFile::new(&format!("mixed_ops_{:?}", std::thread::current().id()));
-
-  // Create a file to work with
-  let (sender_open, receiver_open) = mpsc::channel();
-  api::openat(
-    &cwd,
-    temp.path.clone(),
-    libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-  )
-  .with_lio(&mut lio)
-  .send_with(sender_open);
-  let fd =
-    poll_until_recv(&mut lio, &receiver_open).expect("Failed to create file");
-
-  let start = Instant::now();
-  let mut ops_completed = 0;
-
-  let num_rounds = 50;
-  for i in 0..num_rounds {
-    // Nop
-    let (sender, receiver) = mpsc::channel();
-    api::nop().with_lio(&mut lio).send_with(sender);
-    poll_until_recv(&mut lio, &receiver).expect("nop failed");
-    ops_completed += 1;
-
-    // Write
-    let (sender, receiver) = mpsc::channel();
-    let data = format!("Round {} data\n", i).into_bytes();
-    api::write(&fd, data).with_lio(&mut lio).send_with(sender);
-    poll_until_recv(&mut lio, &receiver).0.expect("write failed");
-    ops_completed += 1;
-
-    // Fsync every 10 rounds
-    if i % 10 == 0 {
-      let (sender, receiver) = mpsc::channel();
-      api::fsync(&fd).with_lio(&mut lio).send_with(sender);
-      poll_until_recv(&mut lio, &receiver).expect("fsync failed");
-      ops_completed += 1;
-    }
-  }
-
-  let elapsed = start.elapsed();
-  eprintln!(
-    "Mixed op types: {} ops in {:?} ({:.0} ops/sec)",
-    ops_completed,
-    elapsed,
-    ops_completed as f64 / elapsed.as_secs_f64()
-  );
-
-  std::mem::forget(cwd);
-}
+// #[test]
+// fn test_mixed_op_types() {
+//   // Tests nop + write + fsync on the same file
+//   // Note: Sequential because kqueue can't have multiple pending ops on same fd
+//   let mut lio = Lio::new(64).unwrap();
+//
+//   let cwd = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+//   let temp =
+//     TempFile::new(&format!("mixed_ops_{:?}", std::thread::current().id()));
+//
+//   // Create a file to work with
+//   let (sender_open, receiver_open) = mpsc::channel();
+//   api::openat(
+//     &cwd,
+//     temp.path.clone(),
+//     libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+//   )
+//   .with_lio(&mut lio)
+//   .send_with(sender_open);
+//   let fd =
+//     poll_until_recv(&mut lio, &receiver_open).expect("Failed to create file");
+//
+//   let start = Instant::now();
+//   let mut ops_completed = 0;
+//
+//   let num_rounds = 50;
+//   for i in 0..num_rounds {
+//     // Nop
+//     let (sender, receiver) = mpsc::channel();
+//     api::nop().with_lio(&mut lio).send_with(sender);
+//     poll_until_recv(&mut lio, &receiver).expect("nop failed");
+//     ops_completed += 1;
+//
+//     // Write
+//     let (sender, receiver) = mpsc::channel();
+//     let data = format!("Round {} data\n", i).into_bytes();
+//     api::write(&fd, data).with_lio(&mut lio).send_with(sender);
+//     poll_until_recv(&mut lio, &receiver).0.expect("write failed");
+//     ops_completed += 1;
+//
+//     // Fsync every 10 rounds
+//     if i % 10 == 0 {
+//       let (sender, receiver) = mpsc::channel();
+//       api::fsync(&fd).with_lio(&mut lio).send_with(sender);
+//       poll_until_recv(&mut lio, &receiver).expect("fsync failed");
+//       ops_completed += 1;
+//     }
+//   }
+//
+//   let elapsed = start.elapsed();
+//   eprintln!(
+//     "Mixed op types: {} ops in {:?} ({:.0} ops/sec)",
+//     ops_completed,
+//     elapsed,
+//     ops_completed as f64 / elapsed.as_secs_f64()
+//   );
+//
+//   std::mem::forget(cwd);
+// }

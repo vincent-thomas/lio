@@ -1,63 +1,63 @@
 use std::{
-  ffi::CString, mem::MaybeUninit, net::SocketAddr, sync::mpsc, time::Duration,
+  ffi::CString,
+  mem::MaybeUninit,
+  net::{SocketAddr, TcpListener, TcpStream},
+  sync::mpsc,
+  time::Duration,
 };
 
-use lio::{
-  Lio, api, api::io::Io, api::io::Receiver, api::ops, api::resource::Resource,
-};
-use std::os::fd::{AsFd, AsRawFd};
+use lio::{Lio, api::io::Receiver, api::resource::Resource};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd};
 
 // // ============================================================================
 // // Socket creation utilities
 // // ============================================================================
-//
-// /// Creates a Unix stream socket using lio operations (blocking).
-// ///
-// /// Returns the Resource which must be closed by the caller using `lio::close()`.
-// #[allow(dead_code)]
-// pub fn unix_stream_socket() -> Io<ops::Socket> {
-//   api::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0)
-// }
-//
-// /// Creates a Unix datagram socket using lio operations (blocking).
-// ///
-// /// Returns the Resource which must be closed by the caller using `lio::close()`.
-// #[allow(dead_code)]
-// pub fn unix_dgram_socket() -> Io<ops::Socket> {
-//   api::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0)
-// }
-//
-// /// Creates a TCP IPv4 socket using lio operations.
-// ///
-// /// Returns a Io that can be used with `.send()`, `.when_done()`, `.blocking()`, etc.
-// #[allow(dead_code)]
-// pub fn tcp_socket() -> Io<ops::Socket> {
-//   api::socket(libc::AF_INET, libc::SOCK_STREAM, 0)
-// }
-//
-// /// Creates a TCP IPv6 socket using lio operations.
-// ///
-// /// Returns a Io that can be used with `.send()`, `.when_done()`, `.blocking()`, etc.
-// #[allow(dead_code)]
-// pub fn tcp6_socket() -> Io<ops::Socket> {
-//   api::socket(libc::AF_INET6, libc::SOCK_STREAM, libc::IPPROTO_TCP)
-// }
-//
-// /// Creates a UDP IPv4 socket using lio operations.
-// ///
-// /// Returns a Io that can be used with `.send()`, `.when_done()`, `.blocking()`, etc.
-// #[allow(dead_code)]
-// pub fn udp_socket() -> Io<ops::Socket> {
-//   api::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP)
-// }
-//
-// /// Creates a UDP IPv6 socket using lio operations.
-// ///
-// /// Returns a Io that can be used with `.send()`, `.when_done()`, `.blocking()`, etc.
-// #[allow(dead_code)]
-// pub fn udp6_socket() -> Io<ops::Socket> {
-//   api::socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP)
-// }
+
+fn create_socket(
+  domain: libc::c_int,
+  ty: libc::c_int,
+  proto: libc::c_int,
+) -> Resource {
+  let fd = unsafe { libc::socket(domain, ty, proto) };
+  assert!(fd >= 0, "socket() failed: {}", std::io::Error::last_os_error());
+  unsafe { Resource::from_raw_fd(fd) }
+}
+
+/// Creates a Unix stream socket resource.
+#[allow(dead_code)]
+pub fn unix_stream_socket() -> Resource {
+  create_socket(libc::AF_UNIX, libc::SOCK_STREAM, 0)
+}
+
+/// Creates a Unix datagram socket resource.
+#[allow(dead_code)]
+pub fn unix_dgram_socket() -> Resource {
+  create_socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0)
+}
+
+/// Creates a TCP IPv4 socket resource.
+#[allow(dead_code)]
+pub fn tcp_socket() -> Resource {
+  create_socket(libc::AF_INET, libc::SOCK_STREAM, 0)
+}
+
+/// Creates a TCP IPv6 socket resource.
+#[allow(dead_code)]
+pub fn tcp6_socket() -> Resource {
+  create_socket(libc::AF_INET6, libc::SOCK_STREAM, libc::IPPROTO_TCP)
+}
+
+/// Creates a UDP IPv4 socket resource.
+#[allow(dead_code)]
+pub fn udp_socket() -> Resource {
+  create_socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP)
+}
+
+/// Creates a UDP IPv6 socket resource.
+#[allow(dead_code)]
+pub fn udp6_socket() -> Resource {
+  create_socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP)
+}
 
 /// Utility function to create a unique temporary file path for proptest tests.
 /// Returns a CString path that includes the process ID and a unique value to avoid conflicts.
@@ -80,51 +80,28 @@ pub struct TcpPair {
   pub accepted_fd: Resource,
 }
 
-// /// Setup a connected TCP client-server pair.
-// /// Returns a TcpPair with server_sock, client_sock, and accepted_fd.
-// #[allow(dead_code)]
-// pub fn setup_tcp_pair(lio: &mut Lio) -> TcpPair {
-//   let (sender_sock, receiver_sock) = mpsc::channel();
-//   let (sender_unit, receiver_unit) = mpsc::channel();
-//
-//   // Create server socket
-//   tcp_socket().with_lio(lio).send_with(sender_sock.clone());
-//
-//   let server_sock = poll_until_recv(lio, &receiver_sock)
-//     .expect("Failed to create server socket");
-//
-//   // Bind to any available port
-//   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-//   api::bind(&server_sock, addr).with_lio(lio).send_with(sender_unit.clone());
-//   poll_until_recv(lio, &receiver_unit).expect("Failed to bind");
-//
-//   // Get actual bound address
-//   let bound_addr = get_bound_addr(&server_sock);
-//
-//   // Listen
-//   api::listen(&server_sock, 128).with_lio(lio).send_with(sender_unit.clone());
-//   poll_until_recv(lio, &receiver_unit).expect("Failed to listen");
-//
-//   // Create client socket
-//   tcp_socket().with_lio(lio).send_with(sender_sock.clone());
-//   let client_sock = poll_until_recv(lio, &receiver_sock)
-//     .expect("Failed to create client socket");
-//
-//   // Connect and accept
-//   let (sender_connect, receiver_connect) = mpsc::channel();
-//   let (sender_accept, receiver_accept) = mpsc::channel();
-//
-//   api::connect(&client_sock, bound_addr)
-//     .with_lio(lio)
-//     .send_with(sender_connect);
-//   api::accept(&server_sock).with_lio(lio).send_with(sender_accept);
-//
-//   poll_until_recv(lio, &receiver_connect).expect("Failed to connect");
-//   let (accepted_fd, _) =
-//     poll_until_recv(lio, &receiver_accept).expect("Failed to accept");
-//
-//   TcpPair { server_sock, client_sock, accepted_fd }
-// }
+/// Setup a connected TCP client-server pair.
+/// Returns a `TcpPair` with the listening socket, the connected client socket,
+/// and the accepted server-side connection.
+#[allow(dead_code)]
+pub fn setup_tcp_pair(_lio: &mut Lio) -> TcpPair {
+  let listener =
+    TcpListener::bind("127.0.0.1:0").expect("Failed to bind server socket");
+  let addr =
+    listener.local_addr().expect("Failed to query bound server address");
+  let client =
+    TcpStream::connect(addr).expect("Failed to connect client socket");
+  let (accepted, _) =
+    listener.accept().expect("Failed to accept client connection");
+
+  unsafe {
+    TcpPair {
+      server_sock: Resource::from_raw_fd(listener.into_raw_fd()),
+      client_sock: Resource::from_raw_fd(client.into_raw_fd()),
+      accepted_fd: Resource::from_raw_fd(accepted.into_raw_fd()),
+    }
+  }
+}
 
 /// Get the bound address of a socket.
 #[allow(dead_code)]

@@ -52,7 +52,11 @@
 //! }
 //!
 //! async fn create_socket() -> std::io::Result<Resource> {
-//!     let sock: Resource = lio::api::socket(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+//!     let sock: Resource = lio::api::socket(
+//!         lio::api::SockDomain::IPV4,
+//!         lio::api::SockType::STREAM,
+//!         lio::api::SockProto::DEFAULT,
+//!     ).await?;
 //!     Ok(sock)
 //! }
 //! ```
@@ -232,19 +236,6 @@ impl AsResource for Resource {
 /// Implementors guarantee that the [`Resource`] is compatible with the type being
 /// constructed. For example, constructing a `TcpSocket` from a resource requires
 /// that the resource is actually a TCP socket file descriptor.
-///
-/// # Examples
-///
-/// ```rust,ignore
-/// use lio::api::resource::{Resource, FromResource};
-/// use lio::net::Socket;
-///
-/// // Assuming we have a raw resource that's a socket
-/// let raw_resource: Resource = /* ... */;
-///
-/// // Wrap it in a Socket
-/// let socket = Socket::from_resource(raw_resource);
-/// ```
 pub trait FromResource {
   /// Creates `Self` from a [`Resource`].
   ///

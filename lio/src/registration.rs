@@ -24,7 +24,7 @@ pub(crate) struct WakerResultHandler {
 }
 
 impl WakerResultHandler {
-  pub fn new<T>(sender: mpsc::Sender<T::Item>, op_model: Box<T>) -> Self
+  fn new<T>(sender: mpsc::Sender<T::Item>, op_model: Box<T>) -> Self
   where
     T: OpModel,
   {
@@ -38,14 +38,14 @@ impl WakerResultHandler {
   }
 
   /// Get the next runtime action to perform.
-  pub fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action {
     (self.action_fn)(self.op_model)
   }
 
   /// Process a completion result.
   ///
   /// Returns whether the operation is done and optionally an operation to resubmit.
-  pub fn on_completion(&self, completion: Completion) -> ProcessResult {
+  fn on_completion(&self, completion: Completion) -> ProcessResult {
     (self.on_completion_fn)(self.sender, self.op_model, completion)
   }
 
@@ -110,7 +110,7 @@ pub(crate) struct OpCallback {
 }
 
 impl OpCallback {
-  pub fn new<T, F>(callback: F, op_model: Box<T>) -> Self
+  fn new<T, F>(callback: F, op_model: Box<T>) -> Self
   where
     T: OpModel,
     F: Fn(T::Item) + Send + 'static,
@@ -125,14 +125,14 @@ impl OpCallback {
   }
 
   /// Get the next runtime action to perform.
-  pub fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action {
     (self.action_fn)(self.op_model)
   }
 
   /// Process a completion: call complete() on OpModel and invoke callback with item.
   ///
   /// Returns whether the operation is done and optionally an operation to resubmit.
-  pub fn on_completion(&self, completion: Completion) -> ProcessResult {
+  fn on_completion(&self, completion: Completion) -> ProcessResult {
     (self.on_completion_fn)(self.callback, self.op_model, completion)
   }
 

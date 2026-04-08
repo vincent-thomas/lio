@@ -23,47 +23,7 @@
 //!
 //! Operations that use buffers ([`read`], [`write`](write()), [`recv`], [`send`]) take
 //! ownership of the buffer and return it along with the result. This enables
-//! zero-copy I/O while ensuring memory safety:
-//!
-//! ```no_run
-//! use lio::{Lio, api};
-//!
-//! let mut lio = Lio::new(64).unwrap();
-//! let fd = api::resource::Resource::stdin();
-//! let buf = vec![0u8; 1024];
-//! let (result, buf) = api::read(&fd, buf).with_lio(&mut lio).wait();
-//! // buf is returned and can be reused
-//! ```
-//!
-//! # Example: Echo Server (Conceptual)
-//!
-//! This shows the general pattern for building a server with lio. Note that
-//! in practice you'd use the higher-level `net` module (requires `high` feature).
-//!
-//! ```no_run
-//! use lio::{Lio, api};
-//!
-//! fn echo_server(lio: &mut Lio) -> std::io::Result<()> {
-//!     // Create and bind socket
-//!     let sock = api::socket(libc::AF_INET, libc::SOCK_STREAM, 0)
-//!         .with_lio(lio).wait()?;
-//!     let addr = "127.0.0.1:8080".parse().unwrap();
-//!     api::bind(&sock, addr).with_lio(lio).wait()?;
-//!     api::listen(&sock, 128).with_lio(lio).wait()?;
-//!
-//!     // Accept one connection for this example
-//!     let (client, _addr) = api::accept(&sock).with_lio(lio).wait()?;
-//!
-//!     // Echo once
-//!     let buf = vec![0u8; 1024];
-//!     let (result, buf) = api::recv(&client, buf, None).with_lio(lio).wait();
-//!     let n = result? as usize;
-//!     if n > 0 {
-//!         let _ = api::send(&client, buf[..n].to_vec(), None).with_lio(lio).wait();
-//!     }
-//!     Ok(())
-//! }
-//! ```
+//! zero-copy I/O while ensuring memory safety.
 //!
 //! # See Also
 //!
@@ -77,6 +37,7 @@ pub mod op_contract;
 pub mod ops;
 pub mod resource;
 
+pub use crate::backend::op::{SockDomain, SockProto, SockType};
 pub use io::{Io, IoStream, Receiver, StreamReceiver};
 
 use crate::{IoBufMutVec, IoBufVec};
@@ -100,8 +61,23 @@ doc_op! {
     }
 }
 
-pub fn interval(duration: Duration) -> IoStream<ops::Interval> {
-  IoStream::from_op(ops::Interval::new(duration))
+doc_op! {
+    short: "Runs an interval of said duration.",
+    pub fn interval(duration: Duration) -> IoStream<ops::Interval> {
+      IoStream::from_op(ops::Interval::new(duration))
+    }
+}
+
+doc_op! {
+    short: "Creates a new socket resource.",
+
+    pub fn socket(
+        domain: SockDomain,
+        ty: SockType,
+        proto: SockProto,
+    ) -> Io<ops::Socket> {
+        Io::from_op(ops::Socket::new(domain, ty, proto))
+    }
 }
 
 doc_op! {
@@ -200,6 +176,23 @@ doc_op! {
         addr: SocketAddr,
     ) -> Io<ops::Connect> {
         Io::from_op(ops::Connect::new(res.as_resource().clone(), addr))
+    }
+}
+
+doc_op! {
+    short: "Opens a file relative to a directory file descriptor.",
+
+    pub fn openat(
+        dir_res: &impl AsResource,
+        path: std::ffi::CString,
+        flags: i32,
+    ) -> Io<ops::OpenAt> {
+        Io::from_op(ops::OpenAt::new(
+            dir_res.as_resource().clone(),
+            path,
+            flags,
+            0o666,
+        ))
     }
 }
 
@@ -636,25 +629,6 @@ doc_op! {
 //     }
 // }
 //
-// doc_op! {
-//     short: "Creates a new socket with the specified domain, type, and protocol.",
-//     syscall: "socket(2)",
-//
-//     ///
-//     /// # Examples
-//     ///
-//     /// ```rust,no_run
-//     /// async fn socket_example() -> std::io::Result<()> {
-//     ///     // AF_INET (IPv4), SOCK_STREAM (TCP), protocol 0 (default)
-//     ///     let sock = lio::api::socket(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
-//     ///     println!("Created socket: {:?}", sock);
-//     ///     Ok(())
-//     /// }
-//     /// ```
-//     pub fn socket(domain: libc::c_int, ty: libc::c_int, proto: libc::c_int) -> Io<ops::Socket> {
-//         Io::from_op(ops::Socket::new(domain, ty, proto))
-//     }
-// }
 //
 // doc_op! {
 //     short: "Binds a socket to a specific address.",

@@ -57,7 +57,7 @@ pub mod buf;
 // pub mod net;
 // #[cfg(feature = "high")]
 // pub mod process;
-mod time;
+pub mod time;
 
 pub use buf::{BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec};
 

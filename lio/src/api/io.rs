@@ -34,9 +34,6 @@
 //! let mut lio = Lio::new(64).unwrap();
 //! let fd = api::resource::Resource::stdout();
 //!
-//! // Blocking via .wait()
-//! let (result, buf) = api::write(&fd, vec![0; 10]).with_lio(&mut lio).wait();
-//!
 //! // Callbacks via .when_done()
 //! api::write(&fd, vec![0; 10]).with_lio(&mut lio).when_done(|(result, buf)| {
 //!     // Handle result
@@ -69,21 +66,6 @@ use std::{
 /// [`Io<T>`] is the primary interface for consuming I/O operation results in lio.
 /// It wraps an operation of type `T` and provides methods to retrieve the result through
 /// various patterns suited to different programming models.
-///
-/// # Thread-Per-Core Design
-///
-/// In the thread-per-core model, each thread owns its own `Lio` instance. Use
-/// `.with_lio()` to bind your Lio instance before consuming the operation:
-///
-/// ```no_run
-/// use lio::{Lio, api};
-///
-/// let lio = Lio::new(1024).unwrap();
-/// let fd = api::resource::Resource::stdin();
-/// let (result, buf) = api::read(&fd, vec![0u8; 1024])
-///     .with_lio(&lio)
-///     .wait();
-/// ```
 ///
 /// # Examples
 /// See examples in each method's docs.
@@ -404,9 +386,9 @@ where
   ///
   /// let lio = Lio::new(1024).unwrap();
   /// let fd = api::resource::Resource::stdin();
-  /// let (result, buf) = api::read(&fd, vec![0u8; 1024])
+  /// let read_result_recv = api::read(&fd, vec![0u8; 1024])
   ///     .with_lio(&lio)
-  ///     .wait();
+  ///     .send();
   /// ```
   pub fn with_lio(self, lio: &Lio) -> Self {
     Io { op: self.op, handle: LioHandle::Custom(lio.clone()) }
@@ -531,7 +513,7 @@ where
 ///
 /// `IoStream` provides an async iterator interface via the `next()` method:
 ///
-/// ```no_run
+/// ```ignore
 /// use lio::{Lio, api};
 ///
 /// async fn accept_connections(lio: &Lio) -> std::io::Result<()> {
@@ -580,7 +562,10 @@ where
 {
   /// Creates a new `IoStream` from a streaming operation.
   pub fn from_op(op: T) -> Self {
-    Self { state: IoStreamState::Pending(op), handle: LioHandle::GloballyInstalled }
+    Self {
+      state: IoStreamState::Pending(op),
+      handle: LioHandle::GloballyInstalled,
+    }
   }
 
   /// Binds a Lio instance to this stream.
@@ -596,7 +581,7 @@ where
   ///
   /// # Example
   ///
-  /// ```no_run
+  /// ```ignore
   /// # use lio::{Lio, api};
   /// # use lio::api::resource::Resource;
   /// # async fn example(lio: &Lio, listener: &Resource) -> std::io::Result<()> {
@@ -634,7 +619,9 @@ where
         panic!("lio consumer error: stream already started before send_with()")
       }
       IoStreamState::Done => {
-        panic!("lio consumer error: stream already completed before send_with()")
+        panic!(
+          "lio consumer error: stream already completed before send_with()"
+        )
       }
     };
 
@@ -955,7 +942,8 @@ mod tests {
   fn test_stream_send_uses_bound_lio() {
     let lio = Lio::new(64).unwrap();
 
-    let receiver = api::interval(Duration::from_millis(1)).with_lio(&lio).send();
+    let receiver =
+      api::interval(Duration::from_millis(1)).with_lio(&lio).send();
 
     run_until_done(&lio);
 

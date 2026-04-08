@@ -66,7 +66,7 @@ impl OpenAtFile {
     let dir_res = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
 
     #[allow(clippy::unnecessary_cast)]
-    Ok(ops::OpenAt::with_mode(dir_res, pathname, flags, mode as u32))
+    Ok(ops::OpenAt::new(dir_res, pathname, flags, mode as u32))
   }
 }
 

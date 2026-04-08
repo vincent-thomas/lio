@@ -3,7 +3,7 @@
 use lio_uring::operation::*;
 use lio_uring::{LioUring, Params, SqeFlags};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 

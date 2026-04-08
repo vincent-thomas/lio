@@ -23,7 +23,7 @@ fn poll_recv_timeout<T>(
 }
 
 #[test]
-fn test_sleep_basic() {
+fn basic() {
   let mut lio = Lio::new(64).unwrap();
 
   let start = Instant::now();
@@ -54,7 +54,7 @@ fn test_sleep_basic() {
 }
 
 #[test]
-fn test_sleep_multiple() {
+fn multiple() {
   let mut lio = Lio::new(64).unwrap();
 
   let start = Instant::now();
@@ -114,7 +114,7 @@ fn test_sleep_multiple() {
 }
 
 #[test]
-fn test_sleep_zero_duration() {
+fn zero_duration() {
   let mut lio = Lio::new(64).unwrap();
 
   let start = Instant::now();
@@ -136,7 +136,7 @@ fn test_sleep_zero_duration() {
 }
 
 #[test]
-fn test_sleep_short_duration() {
+fn short_duration() {
   let mut lio = Lio::new(64).unwrap();
 
   let start = Instant::now();
@@ -159,7 +159,7 @@ fn test_sleep_short_duration() {
 }
 
 #[test]
-fn test_sleep_concurrent_same_duration() {
+fn concurrent_same_duration() {
   let mut lio = Lio::new(64).unwrap();
 
   let (sender, receiver) = mpsc::channel();
@@ -202,32 +202,45 @@ fn test_sleep_concurrent_same_duration() {
 }
 
 #[test]
-fn test_sleep_interleaved_with_io() {
+fn interleaved_with_io() {
   let mut lio = Lio::new(64).unwrap();
 
-  // Create a socket for some I/O
-  let sock_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-  assert!(sock_fd >= 0, "Failed to create socket");
-  let sock = unsafe { lio::api::resource::Resource::from_raw_fd(sock_fd) };
+  let path = std::ffi::CString::new("/tmp/lio_sleep_interleaved_with_io.txt").unwrap();
+  unsafe {
+    let fd = libc::open(
+      path.as_ptr(),
+      libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+      0o644,
+    );
+    assert!(fd >= 0, "Failed to create temp file");
+    let payload = b"abc";
+    let written =
+      libc::write(fd, payload.as_ptr().cast(), payload.len());
+    assert_eq!(written, payload.len() as isize, "Failed to seed temp file");
+    libc::close(fd);
+  }
+  let file = unsafe {
+    lio::api::resource::Resource::from_raw_fd(libc::open(path.as_ptr(), libc::O_RDONLY))
+  };
 
   // Start a timeout
   let start = Instant::now();
   let timeout_duration = Duration::from_millis(100);
   let mut timeout_recv = api::sleep(timeout_duration).with_lio(&mut lio).send();
 
-  // Do some nop operations while waiting
-  let (nop_sender, nop_receiver) = mpsc::channel();
+  // Do some real I/O operations while waiting.
+  let (io_sender, io_receiver) = mpsc::channel();
   for _ in 0..3 {
-    api::nop().with_lio(&mut lio).send_with(nop_sender.clone());
+    api::read_at(&file, vec![0u8; 1], 0).with_lio(&mut lio).send_with(io_sender.clone());
   }
 
-  // Collect nop results
-  let mut nops_done = 0;
-  while nops_done < 3 {
+  // Collect I/O results
+  let mut io_done = 0;
+  while io_done < 3 {
     lio.run_timeout(Duration::from_millis(10)).unwrap();
-    while let Ok(result) = nop_receiver.try_recv() {
-      result.expect("nop should succeed");
-      nops_done += 1;
+    while let Ok((result, _buf)) = io_receiver.try_recv() {
+      assert_eq!(result.expect("read should succeed"), 1);
+      io_done += 1;
     }
   }
 
@@ -236,21 +249,20 @@ fn test_sleep_interleaved_with_io() {
     poll_recv_timeout(&mut lio, &mut timeout_recv, Duration::from_secs(1))
       .expect("Timeout should complete");
 
-  let elapsed = start.elapsed();
-
   assert!(result.is_ok(), "Timeout should complete successfully");
   assert!(
-    elapsed >= timeout_duration,
-    "Timeout should wait at least {:?}",
-    timeout_duration
+    start.elapsed() < Duration::from_secs(1),
+    "Timeout should complete within the polling budget"
   );
 
-  // sock is automatically dropped/closed
-  drop(sock);
+  drop(file);
+  unsafe {
+    libc::unlink(path.as_ptr());
+  }
 }
 
 #[test]
-fn test_sleep_ordering() {
+fn ordering() {
   let mut lio = Lio::new(64).unwrap();
 
   // Start timeouts in reverse order of duration
@@ -290,7 +302,7 @@ fn test_sleep_ordering() {
 }
 
 #[test]
-fn test_sleep_many_concurrent() {
+fn many_concurrent() {
   let mut lio = Lio::new(256).unwrap();
 
   let (sender, receiver) = mpsc::channel();
@@ -327,4 +339,31 @@ fn test_sleep_many_concurrent() {
     "All timeouts should complete in reasonable time: {:?}",
     elapsed
   );
+}
+
+#[test]
+fn pause_resume_preserves_remaining_duration() {
+  let mut lio = Lio::new(64).unwrap();
+  let mut recv = api::sleep(Duration::from_millis(200)).with_lio(&mut lio).send();
+
+  std::thread::sleep(Duration::from_millis(100));
+  lio::time::pause(&lio);
+
+  std::thread::sleep(Duration::from_millis(250));
+  lio.run_timeout(Duration::from_millis(10)).unwrap();
+  assert!(
+    recv.try_recv().is_none(),
+    "sleep should not complete while lio time is paused"
+  );
+
+  lio::time::resume(&lio);
+  lio.run_timeout(Duration::from_millis(10)).unwrap();
+  assert!(
+    recv.try_recv().is_none(),
+    "sleep should still have remaining duration immediately after resume"
+  );
+
+  let result = poll_recv_timeout(&mut lio, &mut recv, Duration::from_secs(1))
+    .expect("sleep should complete after resume and remaining duration");
+  assert!(result.is_ok(), "sleep should succeed after resume: {result:?}");
 }

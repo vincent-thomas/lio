@@ -1,8 +1,7 @@
 //! Tests for read and read_at operations.
 
-mod common;
-
-use common::{TempFile, poll_recv, poll_until_recv};
+use super::common;
+use super::common::{TempFile, poll_recv, poll_until_recv};
 use lio::api::resource::Resource;
 use lio::{Lio, api};
 use proptest::{prelude::*, test_runner::TestRunner};
@@ -12,7 +11,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 #[test]
-fn test_read_basic() {
+fn basic() {
   let mut lio = Lio::new(64).unwrap();
   let temp = TempFile::new("read_basic");
 
@@ -45,7 +44,7 @@ fn test_read_basic() {
 }
 
 #[test]
-fn test_read_large_buffer() {
+fn large_buffer() {
   let mut lio = Lio::new(64).unwrap();
   let temp = TempFile::new("read_large");
 
@@ -82,7 +81,7 @@ fn test_read_large_buffer() {
 }
 
 #[test]
-fn test_read_concurrent() {
+fn concurrent() {
   let mut lio = Lio::new(64).unwrap();
 
   // Test multiple concurrent read operations on different files
@@ -124,7 +123,7 @@ fn test_read_concurrent() {
 }
 
 #[test]
-fn test_read_at_basic() {
+fn at_basic() {
   let mut lio = Lio::new(64).unwrap();
   let temp = TempFile::new("read_at_basic");
 
@@ -156,7 +155,7 @@ fn test_read_at_basic() {
 }
 
 #[test]
-fn test_read_at_offset_beyond_file() {
+fn at_offset_beyond_file() {
   let mut lio = Lio::new(64).unwrap();
   let temp = TempFile::new("read_at_beyond");
 
@@ -192,7 +191,7 @@ fn test_read_at_offset_beyond_file() {
 /// doesn't generate readiness events for reading from empty files.
 #[cfg(target_os = "linux")]
 #[test]
-fn test_read_empty_file() {
+fn empty_file() {
   let mut lio = Lio::new(64).unwrap();
   let temp = TempFile::new("read_empty");
 
@@ -222,7 +221,7 @@ fn test_read_empty_file() {
 }
 
 #[test]
-fn test_read_partial_buffer() {
+fn partial_buffer() {
   let mut lio = Lio::new(64).unwrap();
   let temp = TempFile::new("read_partial");
 
@@ -254,7 +253,7 @@ fn test_read_partial_buffer() {
 }
 
 #[test]
-fn test_read_nonexistent_file() {
+fn nonexistent_file() {
   let path =
     CString::new("/tmp/lio_test_nonexistent_12345_abcdef.txt").unwrap();
 

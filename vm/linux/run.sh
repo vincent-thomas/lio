@@ -170,7 +170,7 @@ runcmd:
   - DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential clang curl git pkg-config libssl-dev rsync jq
   - echo "=== Installing Rust ==="
   - su - lio -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
-  - su - lio -c 'source ~/.cargo/env && cargo install cargo-nextest --locked'
+  - su - lio -c 'source ~/.cargo/env'
   - touch /home/lio/.provisioned
   - echo "=== Provisioning complete ==="
   - poweroff
@@ -210,9 +210,9 @@ runcmd:
   - rsync -aL --exclude=target /mnt/lio/ /home/lio/lio/
   - chown -R lio:lio /home/lio/lio
   - echo "=== Running tests ==="
-  - su - lio -c 'source ~/.cargo/env && cd ~/lio && ./scripts/test.sh' || true
+  - su - lio -c 'source ~/.cargo/env && cd ~/lio && ./scripts/test.sh && ./scripts/test-lio-uring.sh' || true
   - echo "=== Running FFI tests ==="
-  - su - lio -c 'source ~/.cargo/env && cd ~/lio && cargo rustc -p lio --crate-type staticlib --features unstable_ffi --release && cargo test -p lio --features unstable_ffi --release --test ffi' || true
+  - su - lio -c 'source ~/.cargo/env && cd ~/lio && ./scripts/test-lio-uring.sh' || true
   - poweroff
 CLOUDINIT
 

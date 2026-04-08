@@ -209,7 +209,7 @@ opcode! {
 pub struct FsyncFlags(u32);
 
 impl FsyncFlags {
-  const DATASYNC: Self = Self(bindings::IORING_FSYNC_DATASYNC);
+  pub const DATASYNC: Self = Self(bindings::IORING_FSYNC_DATASYNC);
 }
 
 impl FsyncFlags {
@@ -2953,7 +2953,7 @@ mod smoke_tests {
   fn smoke_openat() {
     let mut ring = crate::LioUring::new(2).unwrap();
     let path = b"/tmp/lio_uring_test_open\0";
-    let op = Openat::new(-100, path.as_ptr().cast()) // AT_FDCWD
+    let op = OpenAt::new(-100, path.as_ptr().cast()) // AT_FDCWD
       .flags(libc::O_CREAT | libc::O_WRONLY)
       .mode(0o644);
     unsafe { ring.push(op.build(), 0x1234) }.unwrap();
@@ -3030,8 +3030,8 @@ mod smoke_tests {
   fn smoke_fadvise() {
     let mut ring = crate::LioUring::new(2).unwrap();
     let file = File::open("/dev/null").unwrap();
-    let op =
-      Fadvise::new(file.as_raw_fd(), 0, 1024, libc::POSIX_FADV_SEQUENTIAL);
+    let op = Fadvise::new(file.as_raw_fd(), 1024, libc::POSIX_FADV_SEQUENTIAL)
+      .offset(0);
     unsafe { ring.push(op.build(), 0x1234) }.unwrap();
     ring.submit().unwrap();
     let completion = ring.wait().unwrap();
@@ -3059,93 +3059,73 @@ mod smoke_tests {
 
   smoke_test!(PollRemove, PollRemove::new(0x5678));
   smoke_test!(TimeoutRemove, TimeoutRemove::new(0x5678));
-  smoke_test!(Cancel, Cancel::new(0x5678));
-  smoke_test!(Recvmsg, Recvmsg::new(0, core::ptr::null_mut()));
-  smoke_test!(Sendmsg, Sendmsg::new(1, core::ptr::null()));
+  smoke_test!(RecvMsg, RecvMsg::new(0, core::ptr::null_mut()));
+  smoke_test!(SendMsg, SendMsg::new(1, core::ptr::null()));
   smoke_test!(Madvise, Madvise::new(core::ptr::null_mut(), 0, 0));
-  smoke_test!(Splice, Splice::new(0, 1, 0));
+  smoke_test!(Splice, Splice::new(0, -1, 1, -1, 0));
   smoke_test!(Tee, Tee::new(0, 1, 0));
   smoke_test!(Shutdown, Shutdown::new(0, 0));
   smoke_test!(
-    Renameat,
-    Renameat::new(-100, core::ptr::null(), -100, core::ptr::null())
+    RenameAt,
+    RenameAt::new(-100, core::ptr::null(), -100, core::ptr::null())
   );
-  smoke_test!(Unlinkat, Unlinkat::new(-100, core::ptr::null()));
-  smoke_test!(Mkdirat, Mkdirat::new(-100, core::ptr::null(), 0));
+  smoke_test!(UnlinkAt, UnlinkAt::new(-100, core::ptr::null()));
+  smoke_test!(MkDirAt, MkDirAt::new(-100, core::ptr::null()));
   smoke_test!(
-    Symlinkat,
-    Symlinkat::new(core::ptr::null(), -100, core::ptr::null())
+    SymlinkAt,
+    SymlinkAt::new(-100, core::ptr::null(), core::ptr::null())
   );
   smoke_test!(
-    Linkat,
-    Linkat::new(-100, core::ptr::null(), -100, core::ptr::null())
+    LinkAt,
+    LinkAt::new(-100, core::ptr::null(), -100, core::ptr::null())
   );
   smoke_test!(
     Statx,
-    Statx::new(-100, core::ptr::null(), 0, 0, core::ptr::null_mut())
+    Statx::new(-100, core::ptr::null(), core::ptr::null_mut())
   );
   smoke_test!(
-    Fgetxattr,
-    Fgetxattr::new(0, core::ptr::null(), core::ptr::null_mut(), 0)
+    FGetXattr,
+    FGetXattr::new(0, core::ptr::null(), core::ptr::null_mut(), 0)
   );
   smoke_test!(
-    Fsetxattr,
-    Fsetxattr::new(0, core::ptr::null(), core::ptr::null(), 0, 0)
+    FSetXattr,
+    FSetXattr::new(0, core::ptr::null(), core::ptr::null(), 0)
   );
   smoke_test!(Socket, Socket::new(2, 1, 0));
-  smoke_test!(SocketDirect, SocketDirect::new(2, 1, 0, 0));
-  smoke_test!(RecvMulti, RecvMulti::new(0, core::ptr::null_mut(), 0));
+  smoke_test!(RecvMulti, RecvMulti::new(0, 0));
+  smoke_test!(AcceptMulti, AcceptMulti::new(0));
+  smoke_test!(FilesUpdate, FilesUpdate::new(core::ptr::null(), 0));
+  smoke_test!(WaitId, WaitId::new(0, 0, 0));
   smoke_test!(
-    AcceptMulti,
-    AcceptMulti::new(0, core::ptr::null_mut(), core::ptr::null_mut())
-  );
-  smoke_test!(FilesUpdate, FilesUpdate::new(core::ptr::null_mut(), 0, 0));
-  smoke_test!(Waitid, Waitid::new(0, 0, core::ptr::null_mut(), 0));
-  smoke_test!(
-    Getxattr,
-    Getxattr::new(
-      core::ptr::null(),
+    GetXattr,
+    GetXattr::new(
       core::ptr::null(),
       core::ptr::null_mut(),
+      core::ptr::null(),
       0
     )
   );
   smoke_test!(
-    Setxattr,
-    Setxattr::new(
+    SetXattr,
+    SetXattr::new(
       core::ptr::null(),
       core::ptr::null(),
       core::ptr::null(),
-      0,
       0
     )
   );
-  smoke_test!(SyncFileRange, SyncFileRange::new(0, 0, 0));
-  smoke_test!(Epoll, Epoll::new(0, 1, 0, core::ptr::null_mut()));
+  smoke_test!(SyncFileRange, SyncFileRange::new(0, 0));
   smoke_test!(
     ProvideBuffers,
     ProvideBuffers::new(core::ptr::null_mut(), 0, 0, 0, 0)
   );
   smoke_test!(RemoveBuffers, RemoveBuffers::new(0, 0));
-  smoke_test!(MsgRing, MsgRing::new(0, 0, 0));
   smoke_test!(SendZc, SendZc::new(1, core::ptr::null(), 0));
-  smoke_test!(SendmsgZc, SendmsgZc::new(1, core::ptr::null()));
-  smoke_test!(PollUpdate, PollUpdate::new(0, 0, 0));
+  smoke_test!(SendMsgZc, SendMsgZc::new(1, core::ptr::null()));
   smoke_test!(LinkTimeout, LinkTimeout::new(core::ptr::null_mut()));
   smoke_test!(Bind, Bind::new(0, core::ptr::null(), 0));
   smoke_test!(Listen, Listen::new(0, 0));
-  smoke_test!(FixedFdInstall, FixedFdInstall::new(0));
-  smoke_test!(SendZcFixed, SendZcFixed::new(1, core::ptr::null(), 0, 0));
-  smoke_test!(
-    Openat2,
-    Openat2::new(-100, core::ptr::null(), core::ptr::null_mut())
-  );
-  smoke_test!(MsgRingCqeFlags, MsgRingCqeFlags::new(0, 0, 0, 0));
-  smoke_test!(CloseFixed, CloseFixed::new(0));
-  smoke_test!(ReadFixed2, ReadFixed2::new(0, core::ptr::null_mut(), 0, 0, 0));
-  smoke_test!(WriteFixed2, WriteFixed2::new(1, core::ptr::null(), 0, 0, 0));
-  smoke_test!(UringCmd, UringCmd::new(0, 0));
+  smoke_test!(UringCmd16, UringCmd16::new(0, 0));
   smoke_test!(FutexWait, FutexWait::new(core::ptr::null_mut(), 0, 0, 0));
   smoke_test!(FutexWake, FutexWake::new(core::ptr::null_mut(), 0, 0, 0));
-  smoke_test!(FutexWaitv, FutexWaitv::new(core::ptr::null_mut(), 0));
 }

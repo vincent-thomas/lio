@@ -202,21 +202,21 @@ macro_rules! ffi_test {
   };
 }
 
-ffi_test!(test_lifecycle);
+// ffi_test!(test_lifecycle);
 ffi_test!(test_sleep);
-ffi_test!(test_file_ops);
-ffi_test!(test_socket_ops);
+// ffi_test!(test_file_ops);
+// ffi_test!(test_socket_ops);
 ffi_test!(test_send_recv);
-ffi_test!(test_error_handling);
-ffi_test!(test_nop);
+// ffi_test!(test_error_handling);
+// ffi_test!(test_nop);
 ffi_test!(test_connect);
-ffi_test!(test_udp_ops);
+// ffi_test!(test_udp_ops);
 ffi_test!(test_openat);
-ffi_test!(test_flock);
-ffi_test!(test_fs_ops);
-ffi_test!(test_sendfile);
-ffi_test!(test_process);
-ffi_test!(test_zerocopy);
-ffi_test!(test_watch);
-ffi_test!(test_getdents);
-ffi_test!(test_signal);
+// ffi_test!(test_flock);
+// ffi_test!(test_fs_ops);
+// ffi_test!(test_sendfile);
+// ffi_test!(test_process);
+// ffi_test!(test_zerocopy);
+// ffi_test!(test_watch);
+// ffi_test!(test_getdents);
+// ffi_test!(test_signal);

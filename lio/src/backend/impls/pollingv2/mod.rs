@@ -27,7 +27,7 @@ use std::{
 };
 
 use crate::backend::{
-  IoBackend, OpCompleted, op::Op, pollingv2::interest::Interest,
+  IoBackend, OpCompleted, impls::pollingv2::interest::Interest, op::Op,
 };
 mod interest;
 
@@ -46,7 +46,7 @@ mod interest;
 /// Implementations of this trait are intentionally `!Send` to ensure they are
 /// used only from a single thread. This allows for more efficient interior
 /// mutability without synchronization overhead.
-pub(super) trait ReadinessPoll {
+pub(crate) trait ReadinessPoll {
   /// The native event type used by this implementation
   type NativeEvent;
 
@@ -54,26 +54,14 @@ pub(super) trait ReadinessPoll {
   /// This is not idempotent.
   fn add(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()>;
 
-  /// Add interest for a file descriptor (level-triggered mode).
-  /// Unlike `add`, this stays registered and fires on every readiness.
-  fn add_level(
-    &self,
-    fd: RawFd,
-    key: u64,
-    interest: Interest,
-  ) -> io::Result<()>;
-
   /// Modify existing interest for a file descriptor
   /// This is idempotent, but fails if not added before.
+  #[cfg(test)]
   fn modify(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()>;
 
   /// Remove all interest for a file descriptor
   /// This fails if 'fd' hasn't previously been added.
   fn delete(&self, fd: RawFd) -> io::Result<()>;
-
-  /// Remove a timer by key (for timers that don't have fds)
-  /// This fails if 'key' hasn't previously been added as a timer.
-  fn delete_timer(&self, key: u64) -> io::Result<()>;
 
   /// Wait for events, filling the provided buffer
   /// Returns the number of events received
@@ -83,7 +71,8 @@ pub(super) trait ReadinessPoll {
     timeout: Option<Duration>,
   ) -> io::Result<usize>;
 
-  /// Wake up a potentially blocking wait call
+  /// Wake up a potentially blocking wait call.
+  #[cfg(test)]
   fn notify(&self) -> io::Result<()>;
 
   /// Extract the key from a native event
@@ -97,21 +86,6 @@ pub(super) trait ReadinessPoll {
   fn event_fflags(_event: &Self::NativeEvent) -> u32 {
     0
   }
-
-  /// Arms the timing wheel's kernel timer to fire after `duration`.
-  ///
-  /// This is used by Lio to wake up when the earliest timer in the
-  /// timing wheel expires. Only one wheel timer can be armed at a time;
-  /// calling this again replaces the previous timer.
-  fn arm_wheel_timer(&self, duration: Duration) -> io::Result<()>;
-
-  /// Disarms the timing wheel's kernel timer if one is armed.
-  ///
-  /// This is a no-op if no timer is currently armed.
-  fn disarm_wheel_timer(&self) -> io::Result<()>;
-
-  /// Returns true if the given key is the wheel timer key.
-  fn is_wheel_timer_key(key: u64) -> bool;
 }
 
 /// Represents a readiness event from the poller
@@ -126,14 +100,8 @@ pub struct Event {
 }
 
 /// A collection of events returned from polling
-pub struct Events {
+pub(crate) struct Events {
   events: Vec<<sys::OsPoller as ReadinessPoll>::NativeEvent>,
-}
-
-impl AsMut<[<sys::OsPoller as ReadinessPoll>::NativeEvent]> for Events {
-  fn as_mut(&mut self) -> &mut [<sys::OsPoller as ReadinessPoll>::NativeEvent] {
-    &mut self.events
-  }
 }
 
 impl Default for Events {
@@ -144,18 +112,8 @@ impl Default for Events {
 
 impl Events {
   /// Create a new empty events collection with specified capacity
-  pub fn with_capacity(capacity: usize) -> Self {
+  pub(crate) fn with_capacity(capacity: usize) -> Self {
     Self { events: Vec::with_capacity(capacity) }
-  }
-
-  /// Get the number of events
-  pub fn len(&self) -> usize {
-    self.events.len()
-  }
-
-  #[inline]
-  pub fn is_empty(&self) -> bool {
-    self.len() == 0
   }
 
   /// Returns the vec of maybe-initialised values. Meant for OS to fill and
@@ -362,6 +320,8 @@ impl Poller {
       crate::backend::op::Op::Connect { fd, .. } => {
         (fd.as_raw_fd(), Interest::WRITE)
       }
+      crate::backend::op::Op::Socket { .. } => (0, Interest::NONE),
+      crate::backend::op::Op::OpenAt { .. } => (0, Interest::NONE),
       crate::backend::op::Op::Nop => (0, Interest::NONE),
     }
   }
@@ -369,6 +329,8 @@ impl Poller {
   fn should_complete_immediately(op: &crate::backend::op::Op) -> bool {
     let fd = match op {
       Op::Read { fd, .. } | Op::Write { fd, .. } => fd.as_raw_fd(),
+      Op::Socket { .. } => return true,
+      Op::OpenAt { .. } => return true,
       _ => return false,
     };
 
@@ -481,6 +443,20 @@ impl Poller {
         }
       }
 
+      Op::OpenAt { dir_fd, path, flags, mode } => syscall!(raw openat(
+        dir_fd.as_raw_fd(),
+        *path,
+        *flags,
+        *mode,
+      )),
+
+      Op::Socket { domain, ty, proto } => {
+        match crate::backend::op::socket_to_raw(*domain, *ty, *proto) {
+          Ok((domain, ty, proto)) => syscall!(raw socket(domain, ty, proto)),
+          Err(errno) => -(errno as isize),
+        }
+      }
+
       Op::Nop => 0,
     }
   }
@@ -511,6 +487,7 @@ impl IoBackend for Poller {
   fn flush(&mut self) -> io::Result<()> {
     while let Some(entry) = self.backlog.pop() {
       if matches!(entry.op, Op::Nop) {
+        self.queued_completed.push(OpCompleted::new(entry.id, 0));
         continue;
       };
 

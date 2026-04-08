@@ -1,5 +1,5 @@
 /// write in append mode is not tested since `pwrite` doesn't support it.
-mod common;
+use super::common;
 
 use lio::{
   Lio,
@@ -15,7 +15,7 @@ use std::{
 };
 
 #[test]
-fn test_write_large_buffer() {
+fn large_buffer() {
   let mut lio = Lio::new(64).unwrap();
 
   let path = CString::new("/tmp/lio_test_write_large.txt").unwrap();
@@ -71,7 +71,7 @@ fn test_write_large_buffer() {
 }
 
 #[test]
-fn test_write_concurrent() {
+fn concurrent() {
   let mut lio = Lio::new(64).unwrap();
 
   // Test multiple concurrent write operations on different files

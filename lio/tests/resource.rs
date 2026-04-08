@@ -2,7 +2,7 @@ use lio::api::resource::Resource;
 use std::{ffi::CString, os::fd::FromRawFd};
 
 #[test]
-fn test_close_basic() {
+fn will_close() {
   let path = CString::new("/tmp/lio_test_close_basic.txt").unwrap();
 
   // Open a file

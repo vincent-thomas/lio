@@ -178,6 +178,13 @@
                     export LIBCLANG_PATH=${pkgs.llvmPackages.libclang.lib}/lib
                     export BINDGEN_EXTRA_CLANG_ARGS="-I${pkgs.llvmPackages.clang}/resource-root/include -I${pkgs.glibc.dev}/include"
                   ''
+                else if pkgs.stdenv.hostPlatform.isDarwin then
+                  ''
+                    export CC=clang
+                    export CXX=clang++
+                    export LIBRARY_PATH=${pkgs.libiconv}/lib${"$"}{LIBRARY_PATH:+:${"$"}LIBRARY_PATH}
+                    export CPATH=${pkgs.libiconv}/include${"$"}{CPATH:+:${"$"}CPATH}
+                  ''
                 else
                   ""
               )
@@ -187,8 +194,13 @@
               [
                 (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
                 gnumake
-                gcc
                 pkg-config
+              ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+                clang
+              ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                gcc
               ]
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                 pkgs.llvmPackages.libclang.lib

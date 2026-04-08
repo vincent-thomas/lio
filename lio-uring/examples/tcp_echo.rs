@@ -1,100 +1,87 @@
-//! TCP echo server using io_uring
-//!
-//! This example demonstrates:
-//! - Socket operations with io_uring
-//! - Accept connections
-//! - Async read/write on sockets
-//! - Handling multiple concurrent connections
+//! Minimal TCP echo server using io_uring.
 
-use lio_uring::operation::*;
 use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+use lio_uring::{
+  LioUring,
+  operation::{Accept, Bind, Listen, Recv, Send, Socket},
+};
+
 const PORT: u16 = 8080;
 const BACKLOG: i32 = 128;
+
+fn check(result: i32) -> io::Result<i32> {
+  if result < 0 {
+    Err(io::Error::from_raw_os_error(-result))
+  } else {
+    Ok(result)
+  }
+}
 
 fn main() -> io::Result<()> {
   println!("io_uring TCP Echo Server Example");
   println!("=================================\n");
 
-  let (mut cq, mut sq) = lio_uring::with_capacity(256)?;
+  let mut ring = LioUring::new(256)?;
 
-  // Create a socket
-  println!("Creating socket...");
-  let socket_op = Socket {
-    domain: libc::AF_INET,
-    sock_type: libc::SOCK_STREAM,
-    protocol: 0,
-    flags: 0,
-  };
-
-  unsafe { sq.push(&socket_op, 1) }?;
-  sq.submit()?;
-
-  let sock_fd = cq.next()?.result()?;
+  let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).build();
+  unsafe { ring.push(socket, 1)? };
+  ring.submit()?;
+  let sock_fd = check(ring.wait()?.result())?;
   let socket = unsafe { OwnedFd::from_raw_fd(sock_fd) };
-  println!("Socket created: fd={}", sock_fd);
 
-  // Set socket options
   let optval: i32 = 1;
-  unsafe {
+  let rc = unsafe {
     libc::setsockopt(
       socket.as_raw_fd(),
       libc::SOL_SOCKET,
       libc::SO_REUSEADDR,
-      &optval as *const _ as *const _,
-      mem::size_of::<i32>() as u32,
-    );
+      (&optval as *const i32).cast(),
+      mem::size_of::<i32>() as libc::socklen_t,
+    )
+  };
+  if rc != 0 {
+    return Err(io::Error::last_os_error());
   }
 
-  // Bind to address
-  println!("Binding to 0.0.0.0:{}...", PORT);
   let mut addr: libc::sockaddr_in = unsafe { mem::zeroed() };
-  addr.sin_family = libc::AF_INET as u16;
+  addr.sin_family = libc::AF_INET as libc::sa_family_t;
   addr.sin_port = PORT.to_be();
   addr.sin_addr.s_addr = libc::INADDR_ANY.to_be();
 
-  let bind_op = Bind {
-    sockfd: socket.as_raw_fd(),
-    addr: &addr as *const _ as *const _,
-    addrlen: mem::size_of::<libc::sockaddr_in>() as u32,
-  };
+  let bind = Bind::new(
+    socket.as_raw_fd(),
+    (&addr as *const libc::sockaddr_in).cast(),
+    mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+  )
+  .build();
+  unsafe { ring.push(bind, 2)? };
+  ring.submit()?;
+  check(ring.wait()?.result())?;
 
-  unsafe { sq.push(&bind_op, 2) }?;
-  sq.submit()?;
-  cq.next()?.result()?;
-  println!("Bound successfully");
+  let listen = Listen::new(socket.as_raw_fd(), BACKLOG).build();
+  unsafe { ring.push(listen, 3)? };
+  ring.submit()?;
+  check(ring.wait()?.result())?;
 
-  // Listen for connections
-  println!("Listening for connections...");
-  let listen_op = Listen { sockfd: socket.as_raw_fd(), backlog: BACKLOG };
+  println!("Listening on 0.0.0.0:{PORT}");
+  println!("Try: echo 'Hello' | nc localhost {PORT}\n");
 
-  unsafe { sq.push(&listen_op, 3) }?;
-  sq.submit()?;
-  cq.next()?.result()?;
-  println!("Listening on port {}", PORT);
-  println!("\nWaiting for connections (press Ctrl+C to exit)...");
-  println!("Try: echo 'Hello' | nc localhost {}\n", PORT);
-
-  // Accept one connection as demonstration
   let mut client_addr: libc::sockaddr_in = unsafe { mem::zeroed() };
-  let mut client_addrlen = mem::size_of::<libc::sockaddr_in>() as u32;
-
-  let accept_op = Accept {
-    fd: socket.as_raw_fd(),
-    addr: &mut client_addr as *mut _ as *mut _,
-    addrlen: &mut client_addrlen as *mut _,
-    flags: 0,
-  };
-
-  unsafe { sq.push(&accept_op, 4) }?;
-  sq.submit()?;
-
-  let client_fd = cq.next()?.result()?;
+  let mut client_addrlen = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+  let accept = Accept::new(
+    socket.as_raw_fd(),
+    (&mut client_addr as *mut libc::sockaddr_in).cast(),
+    &mut client_addrlen,
+  )
+  .build();
+  unsafe { ring.push(accept, 4)? };
+  ring.submit()?;
+  let client_fd = check(ring.wait()?.result())?;
   let client_socket = unsafe { OwnedFd::from_raw_fd(client_fd) };
 
-  // Convert address for display
   let ip = u32::from_be(client_addr.sin_addr.s_addr);
   let port = u16::from_be(client_addr.sin_port);
   println!(
@@ -106,50 +93,39 @@ fn main() -> io::Result<()> {
     port
   );
 
-  // Echo loop: read data and write it back
-  let mut buffer = vec![0u8; 4096];
+  let mut buffer = vec![0_u8; 4096];
   loop {
-    // Read from client
-    let recv_op = Recv {
-      sockfd: client_socket.as_raw_fd(),
-      buf: buffer.as_mut_ptr().cast(),
-      len: buffer.len(),
-      flags: 0,
-    };
+    let recv = Recv::new(
+      client_socket.as_raw_fd(),
+      buffer.as_mut_ptr(),
+      buffer.len() as u32,
+    )
+    .build();
+    unsafe { ring.push(recv, 10)? };
+    ring.submit()?;
 
-    unsafe { sq.push(&recv_op, 10) }?;
-    sq.submit()?;
-
-    let recv_completion = cq.next()?;
-    let bytes_read = recv_completion.result()?;
-
+    let bytes_read = check(ring.wait()?.result())?;
     if bytes_read == 0 {
       println!("Client disconnected");
       break;
     }
 
-    println!("Received {} bytes", bytes_read);
     println!(
-      "Data: {:?}",
+      "Received: {:?}",
       String::from_utf8_lossy(&buffer[..bytes_read as usize])
     );
 
-    // Echo back to client
-    let send_op = Send {
-      sockfd: client_socket.as_raw_fd(),
-      buf: buffer.as_ptr().cast(),
-      len: bytes_read as usize,
-      flags: 0,
-    };
-
-    unsafe { sq.push(&send_op, 11) }?;
-    sq.submit()?;
-
-    let send_completion = cq.next()?;
-    let bytes_sent = send_completion.result()?;
-    println!("Echoed {} bytes back", bytes_sent);
+    let send = Send::new(
+      client_socket.as_raw_fd(),
+      buffer.as_ptr(),
+      bytes_read as u32,
+    )
+    .build();
+    unsafe { ring.push(send, 11)? };
+    ring.submit()?;
+    let bytes_sent = check(ring.wait()?.result())?;
+    println!("Echoed {bytes_sent} bytes back");
   }
 
-  println!("\nServer shutting down...");
   Ok(())
 }

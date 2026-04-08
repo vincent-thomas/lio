@@ -3,7 +3,7 @@
 use lio_uring::LioUring;
 use lio_uring::operation::*;
 use std::fs::{self, File};
-use std::io::{Read as IoRead, Seek, SeekFrom, Write as IoWrite};
+use std::io::Write as IoWrite;
 use std::os::fd::AsRawFd;
 
 fn temp_path(name: &str) -> String {
@@ -260,7 +260,7 @@ fn test_openat_create() {
   let mut ring = LioUring::new(8).unwrap();
   let path_cstr = format!("{}\0", path);
 
-  let op = Openat::new(-100, path_cstr.as_ptr().cast()) // AT_FDCWD
+  let op = OpenAt::new(-100, path_cstr.as_ptr().cast()) // AT_FDCWD
     .flags(libc::O_CREAT | libc::O_WRONLY)
     .mode(0o644);
   unsafe { ring.push(op.build(), 1) }.unwrap();
@@ -285,7 +285,7 @@ fn test_openat_read_existing() {
   let mut ring = LioUring::new(8).unwrap();
   let path_cstr = format!("{}\0", path);
 
-  let op = Openat::new(-100, path_cstr.as_ptr().cast()).flags(libc::O_RDONLY);
+  let op = OpenAt::new(-100, path_cstr.as_ptr().cast()).flags(libc::O_RDONLY);
   unsafe { ring.push(op.build(), 1) }.unwrap();
   ring.submit().unwrap();
 
@@ -303,7 +303,7 @@ fn test_openat_nonexistent() {
   let mut ring = LioUring::new(8).unwrap();
   let path = b"/tmp/lio_uring_nonexistent_12345\0";
 
-  let op = Openat::new(-100, path.as_ptr().cast()).flags(libc::O_RDONLY);
+  let op = OpenAt::new(-100, path.as_ptr().cast()).flags(libc::O_RDONLY);
   unsafe { ring.push(op.build(), 1) }.unwrap();
   ring.submit().unwrap();
 
@@ -384,7 +384,7 @@ fn test_fsync_datasync() {
 
   let mut ring = LioUring::new(8).unwrap();
 
-  let op = Fsync::new(file.as_raw_fd()).datasync();
+  let op = Fsync::new(file.as_raw_fd()).flags(FsyncFlags::DATASYNC);
   unsafe { ring.push(op.build(), 1) }.unwrap();
   ring.submit().unwrap();
 
@@ -486,11 +486,8 @@ fn test_symlinkat() {
   let target_cstr = format!("{}\0", target);
   let link_cstr = format!("{}\0", link);
 
-  let op = Symlinkat::new(
-    target_cstr.as_ptr().cast(),
-    -100,
-    link_cstr.as_ptr().cast(),
-  );
+  let op =
+    SymlinkAt::new(-100, target_cstr.as_ptr().cast(), link_cstr.as_ptr().cast());
   unsafe { ring.push(op.build(), 1) }.unwrap();
   ring.submit().unwrap();
 
@@ -516,7 +513,7 @@ fn test_linkat() {
   let original_cstr = format!("{}\0", original);
   let link_cstr = format!("{}\0", link);
 
-  let op = Linkat::new(
+  let op = LinkAt::new(
     -100,
     original_cstr.as_ptr().cast(),
     -100,
@@ -547,7 +544,7 @@ fn test_unlinkat_file() {
   let mut ring = LioUring::new(8).unwrap();
   let path_cstr = format!("{}\0", path);
 
-  let op = Unlinkat::new(-100, path_cstr.as_ptr().cast());
+  let op = UnlinkAt::new(-100, path_cstr.as_ptr().cast());
   unsafe { ring.push(op.build(), 1) }.unwrap();
   ring.submit().unwrap();
 
@@ -566,7 +563,7 @@ fn test_unlinkat_directory() {
   let path_cstr = format!("{}\0", path);
 
   let op =
-    Unlinkat::new(-100, path_cstr.as_ptr().cast()).flags(libc::AT_REMOVEDIR);
+    UnlinkAt::new(-100, path_cstr.as_ptr().cast()).flags(libc::AT_REMOVEDIR);
   unsafe { ring.push(op.build(), 1) }.unwrap();
   ring.submit().unwrap();
 
@@ -588,7 +585,7 @@ fn test_mkdirat() {
   let mut ring = LioUring::new(8).unwrap();
   let path_cstr = format!("{}\0", path);
 
-  let op = Mkdirat::new(-100, path_cstr.as_ptr().cast(), 0o755);
+  let op = MkDirAt::new(-100, path_cstr.as_ptr().cast()).mode(0o755);
   unsafe { ring.push(op.build(), 1) }.unwrap();
   ring.submit().unwrap();
 
@@ -617,7 +614,7 @@ fn test_renameat() {
   let old_cstr = format!("{}\0", old_path);
   let new_cstr = format!("{}\0", new_path);
 
-  let op = Renameat::new(
+  let op = RenameAt::new(
     -100,
     old_cstr.as_ptr().cast(),
     -100,
@@ -708,9 +705,9 @@ fn test_concurrent_writes() {
 
   // Verify file contents
   let contents = fs::read(&path).unwrap();
-  for i in 0..8 {
-    let expected = (i + b'A') as u8;
-    for j in 0..128 {
+  for i in 0usize..8 {
+    let expected = (b'A' + i as u8) as u8;
+    for j in 0usize..128 {
       assert_eq!(contents[i * 128 + j], expected);
     }
   }

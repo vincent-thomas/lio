@@ -72,15 +72,15 @@ pub struct Lio {
   inner: Rc<RefCell<LioInner>>,
 }
 
-#[non_exhaustive]
-pub enum Error {
-  EntryNotFound,
-  EntryNotCompleted,
-  /// Stream has finished and all results have been consumed.
-  StreamDone,
-}
-
 impl Lio {
+  pub(crate) fn pause_time(&self) {
+    self.inner.borrow_mut().time.pause();
+  }
+
+  pub(crate) fn resume_time(&self) {
+    self.inner.borrow_mut().time.resume();
+  }
+
   fn dispatch_action(inner: &mut LioInner, id: u64, action: Action) {
     match action {
       Action::Io(op) => inner.io.push(id, op),
@@ -101,6 +101,7 @@ impl Lio {
   ///
   /// let mut lio = Lio::new(1024).unwrap();
   /// ```
+  #[cfg(feature = "backend_impls")]
   pub fn new(cap: usize) -> io::Result<Self> {
     #[cfg(any(
       target_os = "macos",
@@ -113,12 +114,12 @@ impl Lio {
       target_os = "netbsd"
     ))]
     {
-      use crate::backend::pollingv2::Poller;
+      use crate::backend::impls::Poller;
       Self::new_with_backend(Poller::new(), cap)
     }
     #[cfg(target_os = "linux")]
     {
-      use crate::backend::io_uring::IoUring;
+      use crate::backend::impls::IoUring;
       Self::new_with_backend(IoUring::new(), cap)
     }
   }
@@ -129,15 +130,6 @@ impl Lio {
   ///
   /// * `backend` - The I/O backend implementation (e.g., io_uring, epoll/kqueue)
   /// * `cap` - The maximum number of concurrent operations
-  ///
-  /// # Example
-  ///
-  /// ```
-  /// use lio::Lio;
-  /// use lio::backend::pollingv2::Poller;
-  ///
-  /// let mut lio = Lio::new_with_backend(Poller::new(), 1024).unwrap();
-  /// ```
   pub fn new_with_backend<D>(mut backend: D, cap: usize) -> io::Result<Self>
   where
     D: IoBackend + 'static,

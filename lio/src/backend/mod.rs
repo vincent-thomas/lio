@@ -21,7 +21,7 @@
 //! # Example
 //!
 //! ```
-//! use lio::backend::{IoBackend, op::Op, pollingv2::Poller};
+//! use lio::backend::{IoBackend, op::Op, impls::Poller};
 //! use std::time::Duration;
 //!
 //! // Create and initialize backend
@@ -29,11 +29,11 @@
 //! backend.init(1024).unwrap();  // Pre-allocate for 1024 concurrent ops
 //!
 //! // Submit a nop operation
-//! backend.push(1, Op::Nop).unwrap();
+//! backend.push(1, Op::Nop);
 //! backend.flush().unwrap();
 //!
 //! // Poll for completions (non-blocking)
-//! let completions = backend.wait_timeout(Some(Duration::ZERO)).unwrap();
+//! let completions = backend.wait(Some(Duration::ZERO)).unwrap();
 //! ```
 
 pub mod op;
@@ -45,14 +45,17 @@ pub mod op;
 #[macro_use]
 pub mod test_macro;
 
-pub use impls::*;
-mod impls {
+#[cfg(feature = "backend_impls")]
+pub mod impls {
 
   // #[cfg(test)]
   // pub mod dummy;
 
   #[cfg(target_os = "linux")]
-  pub mod io_uring;
+  mod io_uring;
+
+  #[cfg(target_os = "linux")]
+  pub use io_uring::IoUring;
 
   #[cfg(any(
     target_os = "linux",
@@ -65,7 +68,19 @@ mod impls {
     target_os = "openbsd",
     target_os = "netbsd"
   ))]
-  pub mod pollingv2;
+  mod pollingv2;
+  #[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+  ))]
+  pub use pollingv2::Poller;
 
   #[cfg(windows)]
   mod iocp;

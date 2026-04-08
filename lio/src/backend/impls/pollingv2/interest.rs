@@ -12,13 +12,13 @@ impl Interest {
   pub const NONE: Self = Self { bits: 0 };
   pub const READ: Self = Self { bits: 1 << 0 };
   pub const WRITE: Self = Self { bits: 1 << 1 };
+  pub const READ_AND_WRITE: Self =
+    Self { bits: Self::READ.bits | Self::WRITE.bits };
   pub const TIMER: Self = Self { bits: 1 << 2 };
   /// File/directory change notification (kqueue EVFILT_VNODE, inotify on Linux)
   pub const VNODE: Self = Self { bits: 1 << 3 };
   /// Signal notification (kqueue EVFILT_SIGNAL, signalfd on Linux)
   pub const SIGNAL: Self = Self { bits: 1 << 4 };
-  pub const READ_AND_WRITE: Self =
-    Self { bits: Self::READ.bits | Self::WRITE.bits };
 
   pub const fn is_readable(self) -> bool {
     self.bits & Self::READ.bits != 0
@@ -31,15 +31,6 @@ impl Interest {
   pub const fn is_timer(self) -> bool {
     self.bits & Self::TIMER.bits != 0
   }
-
-  pub const fn is_vnode(self) -> bool {
-    self.bits & Self::VNODE.bits != 0
-  }
-
-  pub const fn is_signal(self) -> bool {
-    self.bits & Self::SIGNAL.bits != 0
-  }
-
   pub const fn is_none(self) -> bool {
     self.bits == 0
   }
@@ -47,11 +38,6 @@ impl Interest {
   /// Combine interests using bitwise OR
   pub const fn or(self, other: Self) -> Self {
     Self { bits: self.bits | other.bits }
-  }
-
-  /// Check if this interest contains all bits from another
-  pub const fn contains(self, other: Self) -> bool {
-    (self.bits & other.bits) == other.bits
   }
 }
 

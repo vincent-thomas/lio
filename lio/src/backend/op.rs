@@ -3,13 +3,201 @@
 //! This module defines the [`Op`] enum which represents all I/O operations
 //! as pure data. Backends match on this enum to execute operations.
 
+use crate::api::resource::Resource;
 use std::ffi::c_char;
-use std::time::Duration;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SockDomain(u8);
+
+impl SockDomain {
+  pub const IPV4: Self = Self(1);
+  pub const IPV6: Self = Self(2);
+  pub const UNIX: Self = Self(3);
+
+  pub fn from_raw(raw: i32) -> Result<Self, i32> {
+    if raw == raw_af_inet() {
+      Ok(Self::IPV4)
+    } else if raw == raw_af_inet6() {
+      Ok(Self::IPV6)
+    } else if raw_af_unix().ok() == Some(raw) {
+      Ok(Self::UNIX)
+    } else {
+      Err(libc::EAFNOSUPPORT)
+    }
+  }
+
+  pub fn to_raw(self) -> Result<i32, i32> {
+    match self {
+      Self::IPV4 => Ok(raw_af_inet()),
+      Self::IPV6 => Ok(raw_af_inet6()),
+      Self::UNIX => raw_af_unix(),
+      _ => Err(libc::EAFNOSUPPORT),
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SockType(u8);
+
+impl SockType {
+  pub const STREAM: Self = Self(1);
+  pub const DGRAM: Self = Self(2);
+
+  pub fn from_raw(raw: i32) -> Result<Self, i32> {
+    if raw == raw_sock_stream() {
+      Ok(Self::STREAM)
+    } else if raw == raw_sock_dgram() {
+      Ok(Self::DGRAM)
+    } else {
+      Err(libc::EINVAL)
+    }
+  }
+
+  pub fn to_raw(self) -> Result<i32, i32> {
+    match self {
+      Self::STREAM => Ok(raw_sock_stream()),
+      Self::DGRAM => Ok(raw_sock_dgram()),
+      _ => Err(libc::EINVAL),
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SockProto(u8);
+
+impl SockProto {
+  pub const DEFAULT: Self = Self(0);
+  pub const TCP: Self = Self(1);
+  pub const UDP: Self = Self(2);
+
+  pub fn from_raw(raw: i32) -> Result<Self, i32> {
+    if raw == raw_proto_default() {
+      Ok(Self::DEFAULT)
+    } else if raw == raw_proto_tcp() {
+      Ok(Self::TCP)
+    } else if raw == raw_proto_udp() {
+      Ok(Self::UDP)
+    } else {
+      Err(libc::EPROTONOSUPPORT)
+    }
+  }
+}
+
+pub fn socket_from_raw(
+  domain: i32,
+  ty: i32,
+  proto: i32,
+) -> Result<(SockDomain, SockType, SockProto), i32> {
+  let domain = SockDomain::from_raw(domain)?;
+  let ty = SockType::from_raw(ty)?;
+  let proto = SockProto::from_raw(proto)?;
+  let _ = socket_to_raw(domain, ty, proto)?;
+  Ok((domain, ty, proto))
+}
+
+pub fn socket_to_raw(
+  domain: SockDomain,
+  ty: SockType,
+  proto: SockProto,
+) -> Result<(i32, i32, i32), i32> {
+  if matches!(domain, SockDomain::UNIX) && !matches!(proto, SockProto::DEFAULT) {
+    return Err(libc::EINVAL);
+  }
+
+  let domain = domain.to_raw()?;
+
+  let (ty, proto) = match (ty, proto) {
+    (SockType::STREAM, SockProto::DEFAULT) => {
+      (raw_sock_stream(), raw_proto_default())
+    }
+    (SockType::STREAM, SockProto::TCP) => {
+      (raw_sock_stream(), raw_proto_tcp())
+    }
+    (SockType::DGRAM, SockProto::DEFAULT) => {
+      (raw_sock_dgram(), raw_proto_default())
+    }
+    (SockType::DGRAM, SockProto::UDP) => {
+      (raw_sock_dgram(), raw_proto_udp())
+    }
+    _ => return Err(libc::EINVAL),
+  };
+
+  Ok((domain, ty, proto))
+}
 
 #[cfg(unix)]
-use std::os::fd::RawFd;
+const fn raw_af_inet() -> i32 {
+  libc::AF_INET
+}
 
-use crate::api::resource::Resource;
+#[cfg(windows)]
+const fn raw_af_inet() -> i32 {
+  windows_sys::Win32::Networking::WinSock::AF_INET
+}
+
+#[cfg(unix)]
+const fn raw_af_inet6() -> i32 {
+  libc::AF_INET6
+}
+
+#[cfg(windows)]
+const fn raw_af_inet6() -> i32 {
+  windows_sys::Win32::Networking::WinSock::AF_INET6
+}
+
+#[cfg(unix)]
+const fn raw_af_unix() -> Result<i32, i32> {
+  Ok(libc::AF_UNIX)
+}
+
+#[cfg(windows)]
+const fn raw_af_unix() -> Result<i32, i32> {
+  Ok(windows_sys::Win32::Networking::WinSock::AF_UNIX)
+}
+
+#[cfg(unix)]
+const fn raw_sock_stream() -> i32 {
+  libc::SOCK_STREAM
+}
+
+#[cfg(windows)]
+const fn raw_sock_stream() -> i32 {
+  windows_sys::Win32::Networking::WinSock::SOCK_STREAM
+}
+
+#[cfg(unix)]
+const fn raw_sock_dgram() -> i32 {
+  libc::SOCK_DGRAM
+}
+
+#[cfg(windows)]
+const fn raw_sock_dgram() -> i32 {
+  windows_sys::Win32::Networking::WinSock::SOCK_DGRAM
+}
+
+const fn raw_proto_default() -> i32 {
+  0
+}
+
+#[cfg(unix)]
+const fn raw_proto_tcp() -> i32 {
+  libc::IPPROTO_TCP
+}
+
+#[cfg(windows)]
+const fn raw_proto_tcp() -> i32 {
+  windows_sys::Win32::Networking::WinSock::IPPROTO_TCP
+}
+
+#[cfg(unix)]
+const fn raw_proto_udp() -> i32 {
+  libc::IPPROTO_UDP
+}
+
+#[cfg(windows)]
+const fn raw_proto_udp() -> i32 {
+  windows_sys::Win32::Networking::WinSock::IPPROTO_UDP
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ErasedBuffer - Type-erased buffer storage
@@ -186,6 +374,32 @@ pub enum Op {
     /// Length of `addr` in bytes.
     len: libc::socklen_t,
   },
+  /// Open a path relative to a directory file descriptor.
+  ///
+  /// This is an immediate operation on readiness backends: it should execute
+  /// during `flush()` and surface its completion on the next `wait()`.
+  OpenAt {
+    /// Directory file descriptor used as the base for relative paths.
+    dir_fd: Resource,
+    /// Null-terminated pathname pointer.
+    path: *const c_char,
+    /// Open flags passed to `openat(2)`.
+    flags: i32,
+    /// File creation mode used when `O_CREAT` is set.
+    mode: u32,
+  },
+  /// Create a new socket descriptor.
+  ///
+  /// This is an immediate operation on readiness backends: it should execute
+  /// during `flush()` and surface its completion on the next `wait()`.
+  Socket {
+    /// Cross-platform semantic socket domain.
+    domain: SockDomain,
+    /// Cross-platform semantic socket type.
+    ty: SockType,
+    /// Cross-platform semantic socket protocol.
+    proto: SockProto,
+  },
   Nop,
 }
 
@@ -209,23 +423,9 @@ pub enum Op {
 //   fd: Resource,
 //   how: i32,
 // },
-// Socket {
-//   domain: i32,
-//   ty: i32,
-//   proto: i32,
-// },
-
 // // ═══════════════════════════════════════════════════════════════════════════════
 // // File operations
 // // ═══════════════════════════════════════════════════════════════════════════════
-// OpenAt {
-//   dir_fd: Resource,
-//   path: *const c_char,
-//   flags: i32,
-//   /// File creation mode (permissions). Used when O_CREAT is set.
-//   /// On Unix this is passed to openat() as the 4th argument.
-//   mode: u32,
-// },
 // Close {
 //   /// Raw file descriptor - we do not hold a Resource here to avoid
 //   /// double-close (the op itself performs the close syscall).

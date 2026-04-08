@@ -152,7 +152,7 @@ runcmd:
   - uname -a
   - freebsd-version
   - echo "=== Installing packages ==="
-  - pkg install -y curl git gmake pkgconf rust
+  - pkg install -y curl git gmake pkgconf rust bash
   - touch /home/freebsd/.provisioned
   - echo "=== Provisioning complete ==="
   - poweroff
@@ -201,11 +201,9 @@ runcmd:
   - dd if=/dev/vtbd2 bs=1M 2>/dev/null | tar -xf - -C /home/freebsd/lio
   - chown -R freebsd:freebsd /home/freebsd/lio
   - echo "=== Running tests ==="
-  - su - freebsd -c 'cd ~/lio && cargo test -p lio --all-features --release' || true
-  - echo "=== Running doc tests ==="
-  - su - freebsd -c 'cd ~/lio && RUST_BACKTRACE=1 cargo test -p lio --doc --release' || true
+  - su - freebsd -c 'cd ~/lio && ./scripts/test.sh' || true
   - echo "=== Running FFI tests ==="
-  - su - freebsd -c 'cd ~/lio && cargo rustc -p lio --crate-type staticlib --features unstable_ffi --release && cargo test -p lio --features unstable_ffi --release --test ffi' || true
+  - su - freebsd -c 'cd ~/lio && ./scripts/test-ffi.sh' || true
   - echo "=== Tests complete ==="
   - poweroff
 CLOUDINIT

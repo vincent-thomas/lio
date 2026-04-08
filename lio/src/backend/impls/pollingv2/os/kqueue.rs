@@ -1,8 +1,3 @@
-use super::{
-  super::{Interest, ReadinessPoll},
-  NOTIFY_KEY, WHEEL_TIMER_KEY,
-};
-
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::time::Duration;
@@ -12,8 +7,8 @@ use std::{
 };
 use std::{io, ptr};
 
-/// Special identifier for EVFILT_USER notification events
-const NOTIFY_IDENT: usize = NOTIFY_KEY as usize;
+use crate::backend::impls::pollingv2::ReadinessPoll;
+use crate::backend::impls::pollingv2::interest::Interest;
 
 /// Helper to create a kevent struct that works across BSD variants.
 /// FreeBSD has an extra `ext` field that macOS/iOS don't have.
@@ -55,8 +50,6 @@ pub struct OsPoller {
   registered_fds: RefCell<HashSet<RawFd>>,
   /// Track registered timer keys separately (timers don't have fds)
   registered_timers: RefCell<HashSet<u64>>,
-  /// Whether the wheel timer is currently armed
-  wheel_timer_armed: RefCell<bool>,
   notify: notify::Notify,
   /// Marker to make this type `!Send`
   _not_send: PhantomData<*const ()>,
@@ -75,7 +68,6 @@ impl OsPoller {
       kq_fd: kqueue_fd,
       registered_fds: RefCell::new(HashSet::new()),
       registered_timers: RefCell::new(HashSet::new()),
-      wheel_timer_armed: RefCell::new(false),
       notify: notify::Notify::new()?,
       _not_send: PhantomData,
     };
@@ -85,7 +77,7 @@ impl OsPoller {
     Ok(kqueue)
   }
 
-  pub(crate) fn submit_changes(
+  fn submit_changes(
     &self,
     changelist: &[<Self as ReadinessPoll>::NativeEvent],
   ) -> io::Result<()> {
@@ -175,16 +167,6 @@ impl OsPoller {
     self.change_interests_inner(fd, key, interest, true)
   }
 
-  /// Level-triggered variant of change_interests_batched.
-  fn change_interests_level(
-    &self,
-    fd: RawFd,
-    key: usize,
-    interest: Interest,
-  ) -> io::Result<()> {
-    self.change_interests_inner(fd, key, interest, false)
-  }
-
   fn change_interests_inner(
     &self,
     fd: RawFd,
@@ -245,92 +227,6 @@ impl OsPoller {
     Ok(())
   }
 
-  /// Add VNODE (file change) interest for a file descriptor.
-  ///
-  /// This watches for file system events on the given fd.
-  /// The fflags specify what events to watch for (NOTE_WRITE, NOTE_DELETE, etc.).
-  pub fn add_vnode(&self, fd: RawFd, key: u64, fflags: u32) -> io::Result<()> {
-    let kev = make_kevent(
-      fd as libc::uintptr_t,
-      libc::EVFILT_VNODE,
-      libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT | libc::EV_CLEAR,
-      fflags,
-      0,
-      key as *mut libc::c_void,
-    );
-
-    syscall!(kevent(
-      self.kq_fd.as_raw_fd(),
-      &kev as *const libc::kevent,
-      1,
-      ptr::null_mut(),
-      0,
-      ptr::null(),
-    ))?;
-
-    self.registered_fds.borrow_mut().insert(fd);
-    Ok(())
-  }
-
-  /// Delete VNODE interest for a file descriptor.
-  pub fn delete_vnode(&self, fd: RawFd) -> io::Result<()> {
-    self.registered_fds.borrow_mut().remove(&fd);
-    self.delete_interest(fd, libc::EVFILT_VNODE)
-  }
-
-  /// Add signal interest.
-  ///
-  /// This watches for delivery of the specified signal using EVFILT_SIGNAL.
-  pub fn add_signal(&self, sig: i32, key: u64) -> io::Result<()> {
-    let kev = make_kevent(
-      sig as libc::uintptr_t,
-      libc::EVFILT_SIGNAL,
-      libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
-      0,
-      0,
-      key as *mut libc::c_void,
-    );
-
-    syscall!(kevent(
-      self.kq_fd.as_raw_fd(),
-      &kev as *const libc::kevent,
-      1,
-      ptr::null_mut(),
-      0,
-      ptr::null(),
-    ))?;
-
-    // Track using negative value to distinguish from fd (signal numbers are small positive ints)
-    self.registered_timers.borrow_mut().insert(key);
-    Ok(())
-  }
-
-  /// Delete signal interest.
-  pub fn delete_signal(&self, sig: i32) -> io::Result<()> {
-    let kev = make_kevent(
-      sig as libc::uintptr_t,
-      libc::EVFILT_SIGNAL,
-      libc::EV_DELETE,
-      0,
-      0,
-      ptr::null_mut(),
-    );
-
-    let result = syscall!(kevent(
-      self.kq_fd.as_raw_fd(),
-      &kev as *const libc::kevent,
-      1,
-      std::ptr::null_mut(),
-      0,
-      std::ptr::null(),
-    ));
-
-    match result {
-      Err(err) if !utils::is_not_found_error(&err) => Err(err),
-      _ => Ok(()),
-    }
-  }
-
   /// Delete interest for a file descriptor
   fn delete_interest(&self, fd: RawFd, filter: i16) -> io::Result<()> {
     let kev = make_kevent(
@@ -364,21 +260,14 @@ impl OsPoller {
     fd: RawFd,
     key: u64,
     interest: Interest,
-    oneshot: bool,
   ) -> io::Result<()> {
-    let change_fn = if oneshot {
-      Self::change_interests_batched
-    } else {
-      Self::change_interests_level
-    };
-
     // For timers, track by key instead of fd
     if interest.is_timer() {
       if !self.registered_timers.borrow_mut().insert(key) {
         return Err(io::Error::from_raw_os_error(libc::EEXIST));
       }
 
-      match change_fn(self, fd, key as usize, interest) {
+      match Self::change_interests_batched(self, fd, key as usize, interest) {
         Ok(()) => Ok(()),
         Err(e) => {
           self.registered_timers.borrow_mut().remove(&key);
@@ -393,7 +282,7 @@ impl OsPoller {
       }
 
       // Optimization: batch both read and write into a single syscall
-      match change_fn(self, fd, key as usize, interest) {
+      match Self::change_interests_batched(self, fd, key as usize, interest) {
         Ok(()) => {
           // Postcondition: fd must still be in registered_fds
           assert!(
@@ -414,39 +303,26 @@ impl OsPoller {
       }
     }
   }
-}
 
-impl ReadinessPoll for OsPoller {
-  type NativeEvent = libc::kevent;
-
-  fn add(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
-    self.add_inner(fd, key, interest, true)
-  }
-
-  fn add_level(
+  #[cfg(test)]
+  fn modify_interest(
     &self,
     fd: RawFd,
     key: u64,
     interest: Interest,
   ) -> io::Result<()> {
-    self.add_inner(fd, key, interest, false)
-  }
-
-  fn modify(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
     if interest.is_timer() {
       if !self.registered_timers.borrow().contains(&key) {
         return Err(io::Error::from_raw_os_error(libc::ENOENT));
       }
       self.change_interests_batched(fd, key as usize, interest)
     } else {
-      // Check if fd is registered (match epoll's ENOENT behavior)
       if !self.registered_fds.borrow().contains(&fd) {
         return Err(io::Error::from_raw_os_error(libc::ENOENT));
       }
 
       let result = self.change_interests_batched(fd, key as usize, interest);
 
-      // Postcondition: fd should still be registered regardless of success/failure
       assert!(
         self.registered_fds.borrow().contains(&fd),
         "fd should still be in registered_fds after modify"
@@ -454,6 +330,19 @@ impl ReadinessPoll for OsPoller {
 
       result
     }
+  }
+}
+
+impl ReadinessPoll for OsPoller {
+  type NativeEvent = libc::kevent;
+
+  fn add(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
+    self.add_inner(fd, key, interest)
+  }
+
+  #[cfg(test)]
+  fn modify(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
+    self.modify_interest(fd, key, interest)
   }
 
   fn delete(&self, fd: RawFd) -> io::Result<()> {
@@ -491,37 +380,6 @@ impl ReadinessPoll for OsPoller {
     }
   }
 
-  fn delete_timer(&self, key: u64) -> io::Result<()> {
-    // Check if timer key is registered, fail with ENOENT if not
-    if !self.registered_timers.borrow_mut().remove(&key) {
-      return Err(io::Error::from_raw_os_error(libc::ENOENT));
-    }
-
-    // Delete EVFILT_TIMER using the key as ident
-    let kev = make_kevent(
-      key as libc::uintptr_t,
-      libc::EVFILT_TIMER,
-      libc::EV_DELETE,
-      0,
-      0,
-      ptr::null_mut(),
-    );
-
-    let result = syscall!(kevent(
-      self.kq_fd.as_raw_fd(),
-      &kev as *const libc::kevent,
-      1,
-      std::ptr::null_mut(),
-      0,
-      std::ptr::null(),
-    ));
-
-    match result {
-      Err(err) if !utils::is_not_found_error(&err) => Err(err),
-      _ => Ok(()),
-    }
-  }
-
   fn wait(
     &self,
     events: &mut [Self::NativeEvent],
@@ -553,15 +411,18 @@ impl ReadinessPoll for OsPoller {
     Ok(n)
   }
 
+  #[cfg(test)]
   fn notify(&self) -> io::Result<()> {
     // Use kqueue-native EVFILT_USER notification
+
+    use crate::backend::impls::pollingv2::os::NOTIFY_KEY;
     let mut kev = make_kevent(
-      NOTIFY_IDENT as libc::uintptr_t,
+      NOTIFY_KEY as libc::uintptr_t,
       libc::EVFILT_USER,
       0,
       0,
       0,
-      NOTIFY_IDENT as *mut libc::c_void,
+      NOTIFY_KEY as *mut libc::c_void,
     );
     kev.fflags = libc::NOTE_TRIGGER; // Trigger the user event
 
@@ -595,69 +456,6 @@ impl ReadinessPoll for OsPoller {
 
   fn event_fflags(event: &Self::NativeEvent) -> u32 {
     event.fflags
-  }
-
-  fn arm_wheel_timer(&self, duration: Duration) -> io::Result<()> {
-    let duration_ms = duration.as_millis() as i64;
-    // Use a minimum of 1ms to avoid immediate expiry issues
-    let duration_ms = if duration_ms == 0 { 1 } else { duration_ms };
-
-    let kev = make_kevent(
-      WHEEL_TIMER_KEY as libc::uintptr_t,
-      libc::EVFILT_TIMER,
-      libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
-      0,
-      duration_ms,
-      WHEEL_TIMER_KEY as *mut libc::c_void,
-    );
-
-    syscall!(kevent(
-      self.kq_fd.as_raw_fd(),
-      &kev as *const libc::kevent,
-      1,
-      ptr::null_mut(),
-      0,
-      ptr::null(),
-    ))?;
-
-    *self.wheel_timer_armed.borrow_mut() = true;
-    Ok(())
-  }
-
-  fn disarm_wheel_timer(&self) -> io::Result<()> {
-    if !*self.wheel_timer_armed.borrow() {
-      return Ok(());
-    }
-
-    let kev = make_kevent(
-      WHEEL_TIMER_KEY as libc::uintptr_t,
-      libc::EVFILT_TIMER,
-      libc::EV_DELETE,
-      0,
-      0,
-      ptr::null_mut(),
-    );
-
-    let result = syscall!(kevent(
-      self.kq_fd.as_raw_fd(),
-      &kev as *const libc::kevent,
-      1,
-      ptr::null_mut(),
-      0,
-      ptr::null(),
-    ));
-
-    *self.wheel_timer_armed.borrow_mut() = false;
-
-    // Ignore ENOENT - timer might have already fired
-    match result {
-      Err(err) if err.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-      other => other.map(|_| ()),
-    }
-  }
-
-  fn is_wheel_timer_key(key: u64) -> bool {
-    key == WHEEL_TIMER_KEY
   }
 }
 
@@ -757,10 +555,9 @@ mod utils {
   target_os = "dragonfly",
   target_vendor = "apple",
 ))]
-#[allow(dead_code)]
 mod notify {
   use super::*;
-  use crate::backend::pollingv2::os::NOTIFY_KEY;
+  use crate::backend::impls::pollingv2::os::NOTIFY_KEY;
   use std::io;
 
   /// A notification pipe.
@@ -780,7 +577,7 @@ mod notify {
       // Register an EVFILT_USER event.
       // IMPORTANT: ident must match what notify() uses to trigger the event
       let kev = super::make_kevent(
-        NOTIFY_IDENT as libc::uintptr_t,
+        NOTIFY_KEY as libc::uintptr_t,
         libc::EVFILT_USER,
         libc::EV_ADD | libc::EV_RECEIPT | libc::EV_CLEAR,
         0,
@@ -790,13 +587,8 @@ mod notify {
       poller.submit_changes(std::slice::from_ref(&kev))
     }
 
-    /// Reregister this notification pipe in the `Poller`.
-    pub(super) fn reregister(&self, _poller: &OsPoller) -> io::Result<()> {
-      // We don't need to do anything, it's already registered as EV_CLEAR.
-      Ok(())
-    }
-
     /// Notifies the `Poller`.
+    #[cfg(test)]
     pub(super) fn notify(&self, poller: &OsPoller) -> io::Result<()> {
       // Trigger the EVFILT_USER event.
       let mut kev = super::make_kevent(
@@ -811,20 +603,6 @@ mod notify {
       poller.submit_changes(std::slice::from_ref(&kev))?;
 
       Ok(())
-    }
-
-    /// Deregisters this notification pipe from the `Poller`.
-    pub(super) fn deregister(&self, poller: &OsPoller) -> io::Result<()> {
-      // Deregister the EVFILT_USER event.
-      let kev = super::make_kevent(
-        0,
-        libc::EVFILT_USER,
-        libc::EV_DELETE | libc::EV_RECEIPT,
-        0,
-        0,
-        NOTIFY_KEY as *mut _,
-      );
-      poller.submit_changes(std::slice::from_ref(&kev))
     }
   }
 }

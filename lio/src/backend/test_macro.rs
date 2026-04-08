@@ -9,6 +9,7 @@
 /// - `wait(Duration::ZERO)` never blocks
 /// - `wait(None)` blocks until at least one completion is available
 /// - `flush()` with an empty backlog is harmless
+/// - `flush()` is allowed to produce completions without creating pending work
 /// - immediate completions queued during `flush()` are surfaced on the next `wait()`
 /// - batched immediate completions are surfaced together with exact results
 /// - a completed `wait()` buffer is cleared on the next `wait()`
@@ -18,7 +19,8 @@
 /// - completions are routed to the correct registration id
 ///
 /// `Op::Nop`:
-/// - produces no completion
+/// - produces one immediate success completion with exact result `0`
+/// - completion is surfaced on the next `wait()` and never replayed
 ///
 /// `Op::Read`:
 /// - success may return short positive byte counts, but repeated successful
@@ -207,6 +209,43 @@ macro_rules! test_io_backend {
         );
       }
 
+      #[cfg(unix)]
+      #[test]
+      fn flush_can_produce_immediate_completions_without_pending_work() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let invalid_fd = unsafe { Resource::from_raw_fd(-1) };
+        let mut raw_buf = unsafe { RawBuf::from_raw_parts(std::ptr::null_mut(), 0) };
+
+        backend.push(
+          91,
+          Op::Read {
+            fd: invalid_fd,
+            iovecs: (&mut raw_buf as *mut RawBuf),
+            iov_count: 1,
+            offset: -2,
+            flags: 0,
+          },
+        );
+
+        backend.flush().unwrap();
+
+        let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+        assert_eq!(
+          completed.len(),
+          1,
+          "flush-produced completion must be surfaced on the next wait()"
+        );
+        assert_exact_result(&completed[0], 91, -(libc::EINVAL as isize));
+
+        let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+        assert!(
+          completed.is_empty(),
+          "flush-produced completion must not be replayed on later wait() calls"
+        );
+      }
+
       #[test]
       #[should_panic(expected = "IoBackend capacity exceeded")]
       fn pushing_more_than_capacity_panics() {
@@ -290,16 +329,30 @@ macro_rules! test_io_backend {
           .duration_since(SystemTime::UNIX_EPOCH)
           .expect("system time before UNIX epoch")
           .as_nanos();
-        let mut path = env::current_dir().expect("cwd unavailable");
-        path.push(".tmp-test-sockets");
-        fs::create_dir_all(&path).expect("failed to create test socket directory");
-        path.push(format!("lio-{}-{}", prefix, now));
-        // Ensure it is unique, append random suffix if necessary.
-        let mut idx = 0;
+        let pid = std::process::id();
+        let mut path = env::temp_dir();
+        let mut name = format!("lio-{}-{:x}-{:x}", prefix, pid, now);
+        let max_name_len = 40;
+        if name.len() > max_name_len {
+          name.truncate(max_name_len);
+        }
+        path.push(&name);
+        // Ensure it is unique, append a compact suffix if necessary.
+        let mut idx = 0u32;
         while path.exists() {
-          path.set_file_name(format!("lio-{}-{}-{}", prefix, now, idx));
+          path.set_file_name(format!("{name}-{:x}", idx));
           idx += 1;
         }
+        let bytes = path.as_os_str().as_bytes();
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let sun = unsafe { &mut *(std::ptr::addr_of_mut!(storage) as *mut libc::sockaddr_un) };
+        assert!(
+          bytes.len() < sun.sun_path.len(),
+          "unix socket test path too long: {} >= {} ({})",
+          bytes.len(),
+          sun.sun_path.len(),
+          path.display()
+        );
         path
       }
 
@@ -365,7 +418,7 @@ macro_rules! test_io_backend {
         use super::*;
 
         #[test]
-        fn nop_produces_no_completion() {
+        fn nop_produces_immediate_success_completion() {
           let mut backend = new_backend();
           backend.init(64).unwrap();
 
@@ -373,9 +426,13 @@ macro_rules! test_io_backend {
           backend.flush().unwrap();
 
           let completed = backend.wait(Some(Duration::ZERO)).unwrap();
+          assert_eq!(completed.len(), 1, "Op::Nop must complete immediately");
+          assert_exact_result(&completed[0], 40, 0);
+
+          let completed = backend.wait(Some(Duration::ZERO)).unwrap();
           assert!(
             completed.is_empty(),
-            "Op::Nop must not produce a completion"
+            "Op::Nop completion must not be replayed on later wait() calls"
           );
         }
       }
