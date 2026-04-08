@@ -16,23 +16,26 @@ fn main() -> io::Result<()> {
     return Ok(());
   }
   let verbose = args.iter().any(|arg| arg == "-v" || arg == "--verbose");
-  let url = args
-    .iter()
-    .find(|arg| !arg.starts_with('-'))
-    .cloned()
-    .unwrap_or_else(|| {
-      eprintln!("Usage: curl <http://host[:port][/path]> [-v|--verbose]");
-    std::process::exit(1);
-  });
+  let url =
+    args.iter().find(|arg| !arg.starts_with('-')).cloned().unwrap_or_else(
+      || {
+        eprintln!("Usage: curl <http://host[:port][/path]> [-v|--verbose]");
+        std::process::exit(1);
+      },
+    );
 
   let request = HttpRequest::parse(&url)?;
   let addr = resolve_first(&request.host, request.port)?;
 
   let socket = run(
     &lio,
-    api::socket(api::SockDomain::IPV4, api::SockType::STREAM, api::SockProto::TCP)
-      .with_lio(&lio)
-      .send(),
+    api::socket(
+      api::SockDomain::IPV4,
+      api::SockType::STREAM,
+      api::SockProto::TCP,
+    )
+    .with_lio(&lio)
+    .send(),
   )?;
 
   run(&lio, api::connect(&socket, addr).with_lio(&lio).send())?;
@@ -47,7 +50,8 @@ fn main() -> io::Result<()> {
   let mut buf = vec![0u8; 16 * 1024];
   let mut response = Vec::new();
   loop {
-    let ((result, returned_buf), ()) = (run(&lio, api::recv(&socket, buf, None).with_lio(&lio).send()), ());
+    let ((result, returned_buf), ()) =
+      (run(&lio, api::recv(&socket, buf, None).with_lio(&lio).send()), ());
     buf = returned_buf;
     let n = result? as usize;
     if n == 0 {
@@ -128,10 +132,9 @@ impl HttpRequest {
 }
 
 fn resolve_first(host: &str, port: u16) -> io::Result<SocketAddr> {
-  (host, port)
-    .to_socket_addrs()?
-    .find(|addr| addr.is_ipv4())
-    .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no IPv4 address found"))
+  (host, port).to_socket_addrs()?.find(|addr| addr.is_ipv4()).ok_or_else(|| {
+    io::Error::new(io::ErrorKind::AddrNotAvailable, "no IPv4 address found")
+  })
 }
 
 fn print_help(lio: &Lio) -> io::Result<()> {
@@ -168,7 +171,9 @@ fn parse_http_response(response: Vec<u8>) -> io::Result<HttpResponse> {
     .windows(4)
     .position(|window| window == b"\r\n\r\n")
     .map(|idx| idx + 4)
-    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP response"))?;
+    .ok_or_else(|| {
+      io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP response")
+    })?;
 
   let headers = &response[..header_end - 4];
   let body = &response[header_end..];
@@ -177,19 +182,25 @@ fn parse_http_response(response: Vec<u8>) -> io::Result<HttpResponse> {
     .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
   let mut lines = header_text.split("\r\n");
-  let status_line = lines
-    .next()
-    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing status line"))?;
+  let status_line = lines.next().ok_or_else(|| {
+    io::Error::new(io::ErrorKind::InvalidData, "missing status line")
+  })?;
   let mut status_parts = status_line.splitn(3, ' ');
   let version = status_parts
     .next()
-    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP version"))?
+    .ok_or_else(|| {
+      io::Error::new(io::ErrorKind::InvalidData, "missing HTTP version")
+    })?
     .to_string();
   let status = status_parts
     .next()
-    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP status"))?
+    .ok_or_else(|| {
+      io::Error::new(io::ErrorKind::InvalidData, "missing HTTP status")
+    })?
     .parse::<u16>()
-    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP status"))?;
+    .map_err(|_| {
+      io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP status")
+    })?;
   let reason = status_parts.next().unwrap_or("").to_string();
 
   let mut parsed_headers = Vec::new();
@@ -211,7 +222,8 @@ fn parse_http_response(response: Vec<u8>) -> io::Result<HttpResponse> {
     parsed_headers.push((name, value));
   }
 
-  let body = if is_chunked { decode_chunked_body(body)? } else { body.to_vec() };
+  let body =
+    if is_chunked { decode_chunked_body(body)? } else { body.to_vec() };
 
   Ok(HttpResponse { version, status, reason, headers: parsed_headers, body })
 }
@@ -220,16 +232,17 @@ fn decode_chunked_body(mut body: &[u8]) -> io::Result<Vec<u8>> {
   let mut decoded = Vec::new();
 
   loop {
-    let line_end = body
-      .windows(2)
-      .position(|window| window == b"\r\n")
-      .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed chunk header"))?;
+    let line_end =
+      body.windows(2).position(|window| window == b"\r\n").ok_or_else(
+        || io::Error::new(io::ErrorKind::InvalidData, "malformed chunk header"),
+      )?;
 
     let size_line = std::str::from_utf8(&body[..line_end])
       .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     let size_str = size_line.split(';').next().unwrap_or("").trim();
-    let size = usize::from_str_radix(size_str, 16)
-      .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
+    let size = usize::from_str_radix(size_str, 16).map_err(|_| {
+      io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size")
+    })?;
 
     body = &body[line_end + 2..];
 
@@ -260,7 +273,10 @@ fn decode_chunked_body(mut body: &[u8]) -> io::Result<Vec<u8>> {
 fn write_all(lio: &Lio, fd: &Resource, buf: Vec<u8>) -> io::Result<()> {
   let mut written = 0usize;
   while written < buf.len() {
-    let (result, _) = run(lio, api::send(fd, buf[written..].to_vec(), None).with_lio(lio).send());
+    let (result, _) = run(
+      lio,
+      api::send(fd, buf[written..].to_vec(), None).with_lio(lio).send(),
+    );
     let n = result? as usize;
     if n == 0 {
       return Err(io::Error::new(
@@ -276,8 +292,10 @@ fn write_all(lio: &Lio, fd: &Resource, buf: Vec<u8>) -> io::Result<()> {
 fn write_all_stdout(lio: &Lio, fd: &Resource, buf: Vec<u8>) -> io::Result<()> {
   let mut written = 0usize;
   while written < buf.len() {
-    let ((result, _), ()) =
-      (run(lio, api::write(fd, buf[written..].to_vec()).with_lio(lio).send()), ());
+    let ((result, _), ()) = (
+      run(lio, api::write(fd, buf[written..].to_vec()).with_lio(lio).send()),
+      (),
+    );
     let n = result? as usize;
     if n == 0 {
       return Err(io::Error::new(

@@ -7,12 +7,12 @@ use std::ffi::CString;
 use std::io;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::ptr::NonNull;
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::RawHandle;
 use std::ptr;
+use std::ptr::NonNull;
 use std::time::Duration;
 
 use crate::{
@@ -30,6 +30,8 @@ use crate::{
   },
   buf::MAX_IOV_COUNT,
 };
+
+pub use crate::backend::op::LinkKind;
 
 #[cfg(target_os = "linux")]
 const TIMER_FIRED_ERRNO: i32 = libc::ETIME;
@@ -854,11 +856,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Recv<B> {
 
   fn action(&mut self) -> Action {
     let msg = self.hydrate_msg();
-    Action::Io(Op::Recv {
-      fd: self.res.clone(),
-      msg,
-      flags: self.flags,
-    })
+    Action::Io(Op::Recv { fd: self.res.clone(), msg, flags: self.flags })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -1004,11 +1002,7 @@ impl<B: IoBufVec + std::marker::Send + Sync> OpModel for Send<B> {
 
   fn action(&mut self) -> Action {
     let msg = self.hydrate_msg();
-    Action::Io(Op::Send {
-      fd: self.res.clone(),
-      msg,
-      flags: self.flags,
-    })
+    Action::Io(Op::Send { fd: self.res.clone(), msg, flags: self.flags })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -1253,6 +1247,345 @@ impl OpModel for OpenAt {
 
 impl OneshotOpModel for OpenAt {}
 
+pub struct UnlinkAt {
+  dir_res: Resource,
+  pathname: CString,
+  flags: i32,
+}
+
+impl UnlinkAt {
+  pub(crate) fn new(dir_res: Resource, pathname: CString, flags: i32) -> Self {
+    Self { dir_res, pathname, flags }
+  }
+}
+
+impl OpModel for UnlinkAt {
+  type Item = std::io::Result<()>;
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::UnlinkAt {
+      dir_fd: self.dir_res.clone(),
+      path: self.pathname.as_ptr(),
+      flags: self.flags,
+    })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    let res = if completion.result < 0 {
+      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+    } else {
+      Ok(())
+    };
+    OpResult::Done(res)
+  }
+}
+
+impl OneshotOpModel for UnlinkAt {}
+
+#[cfg(test)]
+impl OpModelContract for UnlinkAt {
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(
+      Resource::cwd(),
+      CString::new("tmp-file").expect("cstring"),
+      libc::AT_REMOVEDIR,
+    )
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action| {
+        matches!(
+          action,
+          Action::Io(Op::UnlinkAt { flags, .. }) if *flags == libc::AT_REMOVEDIR
+        )
+      },
+      Completion::new(0),
+      |result| matches!(result, OpResult::Done(Ok(()))),
+    )]
+  }
+}
+
+pub struct RenameAt {
+  old_dir_res: Resource,
+  old_pathname: CString,
+  new_dir_res: Resource,
+  new_pathname: CString,
+}
+
+impl RenameAt {
+  pub(crate) fn new(
+    old_dir_res: Resource,
+    old_pathname: CString,
+    new_dir_res: Resource,
+    new_pathname: CString,
+  ) -> Self {
+    Self { old_dir_res, old_pathname, new_dir_res, new_pathname }
+  }
+}
+
+impl OpModel for RenameAt {
+  type Item = std::io::Result<()>;
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::RenameAt {
+      old_dir_fd: self.old_dir_res.clone(),
+      old_path: self.old_pathname.as_ptr(),
+      new_dir_fd: self.new_dir_res.clone(),
+      new_path: self.new_pathname.as_ptr(),
+    })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    let res = if completion.result < 0 {
+      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+    } else {
+      Ok(())
+    };
+    OpResult::Done(res)
+  }
+}
+
+impl OneshotOpModel for RenameAt {}
+
+#[cfg(test)]
+impl OpModelContract for RenameAt {
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(
+      Resource::cwd(),
+      CString::new("old-name").expect("cstring"),
+      Resource::cwd(),
+      CString::new("new-name").expect("cstring"),
+    )
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action| matches!(action, Action::Io(Op::RenameAt { .. })),
+      Completion::new(0),
+      |result| matches!(result, OpResult::Done(Ok(()))),
+    )]
+  }
+}
+
+pub struct MkdirAt {
+  dir_res: Resource,
+  pathname: CString,
+  mode: u32,
+}
+
+impl MkdirAt {
+  pub(crate) fn new(dir_res: Resource, pathname: CString, mode: u32) -> Self {
+    Self { dir_res, pathname, mode }
+  }
+}
+
+impl OpModel for MkdirAt {
+  type Item = std::io::Result<()>;
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::MkdirAt {
+      dir_fd: self.dir_res.clone(),
+      path: self.pathname.as_ptr(),
+      mode: self.mode,
+    })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    let res = if completion.result < 0 {
+      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+    } else {
+      Ok(())
+    };
+    OpResult::Done(res)
+  }
+}
+
+impl OneshotOpModel for MkdirAt {}
+
+#[cfg(test)]
+impl OpModelContract for MkdirAt {
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::cwd(), CString::new("new-dir").expect("cstring"), 0o755)
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action| matches!(action, Action::Io(Op::MkdirAt { mode, .. }) if *mode == 0o755),
+      Completion::new(0),
+      |result| matches!(result, OpResult::Done(Ok(()))),
+    )]
+  }
+}
+
+pub struct LinkAt {
+  source_dir_res: Resource,
+  source_pathname: CString,
+  new_dir_res: Resource,
+  new_pathname: CString,
+  kind: LinkKind,
+}
+
+impl LinkAt {
+  pub(crate) fn new(
+    source_dir_res: Resource,
+    source_pathname: CString,
+    new_dir_res: Resource,
+    new_pathname: CString,
+    kind: LinkKind,
+  ) -> Self {
+    Self { source_dir_res, source_pathname, new_dir_res, new_pathname, kind }
+  }
+}
+
+impl OpModel for LinkAt {
+  type Item = std::io::Result<()>;
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::LinkAt {
+      kind: self.kind,
+      source_dir_fd: self.source_dir_res.clone(),
+      source_path: self.source_pathname.as_ptr(),
+      new_dir_fd: self.new_dir_res.clone(),
+      new_path: self.new_pathname.as_ptr(),
+    })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    let res = if completion.result < 0 {
+      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+    } else {
+      Ok(())
+    };
+    OpResult::Done(res)
+  }
+}
+
+impl OneshotOpModel for LinkAt {}
+
+#[cfg(test)]
+impl OpModelContract for LinkAt {
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(
+      Resource::cwd(),
+      CString::new("old-name").expect("cstring"),
+      Resource::cwd(),
+      CString::new("new-name").expect("cstring"),
+      LinkKind::Hard,
+    )
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action| {
+        matches!(action, Action::Io(Op::LinkAt { kind: LinkKind::Hard, .. }))
+      },
+      Completion::new(0),
+      |result| matches!(result, OpResult::Done(Ok(()))),
+    )]
+  }
+}
+
+pub struct ReadlinkAt<B: IoBufMutVec + std::marker::Send + Sync> {
+  dir_res: Resource,
+  pathname: CString,
+  buf: Option<B>,
+  raw: RawBuf,
+  raw_len: usize,
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> ReadlinkAt<B> {
+  pub(crate) fn new(dir_res: Resource, pathname: CString, buf: B) -> Self {
+    Self {
+      dir_res,
+      pathname,
+      buf: Some(buf),
+      raw: unsafe { RawBuf::from_raw_parts(ptr::null_mut(), 0) },
+      raw_len: 0,
+    }
+  }
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
+  type Item = BufResult<i32, B>;
+
+  fn action(&mut self) -> Action {
+    let buf = self.buf.as_mut().expect("buffer not available");
+    let (ptr, len) = buf.buf_mut(0);
+    self.raw = unsafe { RawBuf::from_raw_parts(ptr, len) };
+    self.raw_len = len;
+
+    Action::Io(Op::ReadlinkAt {
+      dir_fd: self.dir_res.clone(),
+      path: self.pathname.as_ptr(),
+      buf: ptr,
+      buf_len: self.raw_len,
+    })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    let mut buf = self.buf.take().expect("buffer not available");
+    let result = if completion.result < 0 {
+      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+    } else {
+      buf.set_buf_len(0, completion.result as usize);
+      Ok(completion.result as i32)
+    };
+    OpResult::Done((result, buf))
+  }
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> OneshotOpModel
+  for ReadlinkAt<B>
+{
+}
+
+#[cfg(test)]
+impl OpModelContract for ReadlinkAt<Vec<u8>> {
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(
+      Resource::cwd(),
+      CString::new("link-name").expect("cstring"),
+      vec![0; 32],
+    )
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action| matches!(action, Action::Io(Op::ReadlinkAt { .. })),
+      |model| {
+        model.buf.as_mut().expect("buffer available")[..4]
+          .copy_from_slice(b"dest");
+      },
+      Completion::new(4),
+      |result| match result {
+        OpResult::Done((Ok(bytes), buf)) => *bytes == 4 && &buf[..4] == b"dest",
+        _ => false,
+      },
+    )]
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1291,6 +1624,36 @@ mod tests {
     use super::*;
 
     crate::test_op_model_contract!(Write<(Vec<u8>, Vec<u8>)>);
+  }
+
+  mod unlinkat_contract {
+    use super::*;
+
+    crate::test_op_model_contract!(UnlinkAt);
+  }
+
+  mod renameat_contract {
+    use super::*;
+
+    crate::test_op_model_contract!(RenameAt);
+  }
+
+  mod mkdirat_contract {
+    use super::*;
+
+    crate::test_op_model_contract!(MkdirAt);
+  }
+
+  mod linkat_contract {
+    use super::*;
+
+    crate::test_op_model_contract!(LinkAt);
+  }
+
+  mod readlinkat_contract {
+    use super::*;
+
+    crate::test_op_model_contract!(ReadlinkAt<Vec<u8>>);
   }
 
   mod accept_contract {

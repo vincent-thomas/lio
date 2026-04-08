@@ -319,7 +319,6 @@ impl ReadinessPoll for OsPoller {
       (false, false) => Interest::READ, // Fallback, shouldn't happen
     }
   }
-
 }
 
 enum Notifier {

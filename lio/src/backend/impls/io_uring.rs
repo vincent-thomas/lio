@@ -1,19 +1,23 @@
 //! `lio`-provided [`IoBackend`] impl for `io_uring`.
 
-use std::io;
 use std::collections::HashMap;
+use std::io;
 use std::mem;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use lio_uring::{
-  operation::{
-    Accept, Connect, Nop, OpenAt, Readv, RecvMsg, SendMsg, Socket, Writev,
-  },
   Entry, LioUring,
+  operation::{
+    Accept, Connect, LinkAt, MkDirAt, Nop, OpenAt, Readv, RecvMsg, RenameAt,
+    SendMsg, Socket, SymlinkAt, UnlinkAt, Writev,
+  },
 };
 
-use crate::backend::{op::Op, IoBackend, OpCompleted};
+use crate::backend::{
+  IoBackend, OpCompleted,
+  op::{LinkKind, Op},
+};
 
 #[derive(Debug)]
 struct BacklogEntry {
@@ -30,8 +34,9 @@ struct NativeMsgState {
 
 impl NativeMsgState {
   fn from_recv(msg: &crate::backend::op::MsgRecv) -> Option<Self> {
-    let bufs =
-      unsafe { std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get()) };
+    let bufs = unsafe {
+      std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
+    };
     let mut state = Self {
       iovecs: [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
         crate::buf::MAX_IOV_COUNT],
@@ -62,8 +67,9 @@ impl NativeMsgState {
   }
 
   fn from_send(msg: &crate::backend::op::MsgSend) -> Option<Self> {
-    let bufs =
-      unsafe { std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get()) };
+    let bufs = unsafe {
+      std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
+    };
     let mut state = Self {
       iovecs: [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
         crate::buf::MAX_IOV_COUNT],
@@ -117,11 +123,7 @@ impl IoUring {
 
   #[inline]
   fn io_offset(offset: i64) -> u64 {
-    if offset < 0 {
-      u64::MAX
-    } else {
-      offset as u64
-    }
+    if offset < 0 { u64::MAX } else { offset as u64 }
   }
 
   fn validate_op(op: &Op) -> Option<isize> {
@@ -168,6 +170,25 @@ impl IoUring {
       Op::OpenAt { path, .. } if path.is_null() => {
         Some(-(libc::EINVAL as isize))
       }
+      Op::UnlinkAt { path, .. } if path.is_null() => {
+        Some(-(libc::EINVAL as isize))
+      }
+      Op::RenameAt { old_path, new_path, .. }
+        if old_path.is_null() || new_path.is_null() =>
+      {
+        Some(-(libc::EINVAL as isize))
+      }
+      Op::MkdirAt { path, .. } if path.is_null() => {
+        Some(-(libc::EINVAL as isize))
+      }
+      Op::LinkAt { source_path, new_path, .. }
+        if source_path.is_null() || new_path.is_null() =>
+      {
+        Some(-(libc::EINVAL as isize))
+      }
+      Op::ReadlinkAt { path, buf, .. } if path.is_null() || buf.is_null() => {
+        Some(-(libc::EINVAL as isize))
+      }
       Op::Socket { domain, ty, proto } => {
         crate::backend::op::socket_to_raw(*domain, *ty, *proto)
           .err()
@@ -197,13 +218,15 @@ impl IoUring {
       .rw_flags(*flags)
       .build(),
       Op::Recv { fd, flags, .. } => {
-        let native_msg = native_msg.expect("recv native state must be hydrated");
+        let native_msg =
+          native_msg.expect("recv native state must be hydrated");
         RecvMsg::new(fd.as_raw_fd(), &native_msg.hdr)
           .flags(*flags as u32)
           .build()
       }
       Op::Send { fd, flags, .. } => {
-        let native_msg = native_msg.expect("send native state must be hydrated");
+        let native_msg =
+          native_msg.expect("send native state must be hydrated");
         SendMsg::new(fd.as_raw_fd(), &native_msg.hdr)
           .flags(*flags as u32)
           .build()
@@ -219,6 +242,38 @@ impl IoUring {
           .flags(*flags)
           .mode(*mode as libc::mode_t)
           .build()
+      }
+      Op::UnlinkAt { dir_fd, path, flags } => {
+        UnlinkAt::new(dir_fd.as_raw_fd(), *path).flags(*flags).build()
+      }
+      Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
+        RenameAt::new(
+          old_dir_fd.as_raw_fd(),
+          *old_path,
+          new_dir_fd.as_raw_fd(),
+          *new_path,
+        )
+        .build()
+      }
+      Op::MkdirAt { dir_fd, path, mode } => {
+        MkDirAt::new(dir_fd.as_raw_fd(), *path)
+          .mode(*mode as libc::mode_t)
+          .build()
+      }
+      Op::LinkAt { kind, source_dir_fd, source_path, new_dir_fd, new_path } => {
+        match kind {
+          LinkKind::Hard => LinkAt::new(
+            source_dir_fd.as_raw_fd(),
+            *source_path,
+            new_dir_fd.as_raw_fd(),
+            *new_path,
+          )
+          .build(),
+          LinkKind::Soft => {
+            SymlinkAt::new(new_dir_fd.as_raw_fd(), *source_path, *new_path)
+              .build()
+          }
+        }
       }
       Op::Socket { domain, ty, proto } => {
         let (domain, ty, proto) =
@@ -249,6 +304,27 @@ impl IoUring {
 
   fn drain_completion(&mut self, user_data: u64, result: i32) {
     self.completed.push(OpCompleted::new(user_data, result as isize));
+  }
+
+  fn execute_immediate(op: &Op) -> Option<io::Result<isize>> {
+    match op {
+      Op::ReadlinkAt { dir_fd, path, buf, buf_len } => {
+        let result = unsafe {
+          libc::readlinkat(
+            dir_fd.as_raw_fd(),
+            *path,
+            (*buf).cast::<libc::c_char>(),
+            *buf_len,
+          )
+        };
+        Some(if result < 0 {
+          Err(io::Error::last_os_error())
+        } else {
+          Ok(result as isize)
+        })
+      }
+      _ => None,
+    }
   }
 }
 
@@ -285,6 +361,15 @@ impl IoBackend for IoUring {
 
       if matches!(entry.op, Op::Nop) {
         self.queued_completed.push(OpCompleted::new(entry.id, 0));
+        continue;
+      }
+
+      if let Some(result) = Self::execute_immediate(&entry.op) {
+        let result = match result {
+          Ok(value) => value,
+          Err(err) => -(err.raw_os_error().unwrap_or(libc::EIO) as isize),
+        };
+        self.queued_completed.push(OpCompleted::new(entry.id, result));
         continue;
       }
 

@@ -104,3 +104,15 @@ fn zero_duration_still_waits_one_tick() {
   clock.advance_by(1);
   assert_eq!(collect_expired(&mut clock), vec![1]);
 }
+
+#[test]
+fn sub_millisecond_duration_rounds_up() {
+  let mut clock = Clock::new();
+  clock.schedule(1, Duration::from_micros(1_500));
+
+  clock.advance_by(1);
+  assert!(collect_expired(&mut clock).is_empty());
+
+  clock.advance_by(1);
+  assert_eq!(collect_expired(&mut clock), vec![1]);
+}

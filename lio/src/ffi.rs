@@ -907,199 +907,161 @@ pub unsafe extern "C" fn lio_write(
 //     });
 // }
 
-// /// Create a symbolic link.
-// ///
-// /// - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
-// /// - `target`: Target path (null-terminated)
-// /// - `linkpath`: Link path (null-terminated)
-// /// - `callback(result)`: 0 on success, negative errno on error
-// ///
-// /// # Safety
-// /// `lio` must be valid; `target` and `linkpath` must be valid null-terminated strings.
-// #[unsafe(no_mangle)]
-// pub unsafe extern "C" fn lio_symlinkat(
-//   lio: *mut lio_handle_t,
-//   dir_fd: libc::intptr_t,
-//   target: *const libc::c_char,
-//   linkpath: *const libc::c_char,
-//   callback: extern "C" fn(libc::c_int),
-// ) {
-//   if target.is_null() || linkpath.is_null() {
-//     callback(-libc::EINVAL);
-//     return;
-//   }
-//   // SAFETY: caller guarantees strings are valid per fn contract
-//   let target_cstr = unsafe { std::ffi::CStr::from_ptr(target) }.to_owned();
-//   // SAFETY: caller guarantees strings are valid per fn contract
-//   let linkpath_cstr = unsafe { std::ffi::CStr::from_ptr(linkpath) }.to_owned();
-//   // SAFETY: caller guarantees dir_fd is valid per fn contract
-//   let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
-//   // SAFETY: caller guarantees lio is valid per fn contract
-//   api::symlinkat(&dir_res, target_cstr, linkpath_cstr)
-//     .with_lio(&unsafe { handle(lio) }.inner)
-//     .when_done(move |res| {
-//       callback(match res {
-//         Ok(_) => 0,
-//         Err(e) => -e.raw_os_error().unwrap_or(1),
-//       });
-//     });
-// }
+/// Create a hard or symbolic link.
+///
+/// - `kind`: 0 for hard links, 1 for symbolic links
+/// - `source_dir_fd`: Directory fd for source path (ignored for symbolic links)
+/// - `source_path`: Existing path or symlink target (null-terminated)
+/// - `new_dir_fd`: Directory fd for new path
+/// - `new_path`: New link path (null-terminated)
+/// - `callback(result)`: 0 on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; paths must be valid null-terminated strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_linkat(
+  lio: *mut lio_handle_t,
+  kind: libc::c_int,
+  source_dir_fd: libc::intptr_t,
+  source_path: *const libc::c_char,
+  new_dir_fd: libc::intptr_t,
+  new_path: *const libc::c_char,
+  callback: extern "C" fn(libc::c_int),
+) {
+  if source_path.is_null() || new_path.is_null() {
+    callback(-libc::EINVAL);
+    return;
+  }
+  let Ok(kind) = link_kind_from_ffi(kind) else {
+    callback(-libc::EINVAL);
+    return;
+  };
+  let source_path_cstr =
+    unsafe { std::ffi::CStr::from_ptr(source_path) }.to_owned();
+  let new_path_cstr = unsafe { std::ffi::CStr::from_ptr(new_path) }.to_owned();
+  let source_dir_res = unsafe { fd_to_borrowed_resource(source_dir_fd) };
+  let new_dir_res = unsafe { fd_to_borrowed_resource(new_dir_fd) };
+  api::linkat(
+    &source_dir_res,
+    source_path_cstr,
+    &new_dir_res,
+    new_path_cstr,
+    kind,
+  )
+  .with_lio(&unsafe { handle(lio) }.inner)
+  .when_done(move |res| {
+    callback(match res {
+      Ok(_) => 0,
+      Err(e) => -e.raw_os_error().unwrap_or(1),
+    });
+  });
+}
 
-// /// Create a hard link.
-// ///
-// /// - `old_dir_fd`: Directory fd for old path
-// /// - `old_path`: Existing file path (null-terminated)
-// /// - `new_dir_fd`: Directory fd for new path
-// /// - `new_path`: New link path (null-terminated)
-// /// - `callback(result)`: 0 on success, negative errno on error
-// ///
-// /// # Safety
-// /// `lio` must be valid; paths must be valid null-terminated strings.
-// #[unsafe(no_mangle)]
-// pub unsafe extern "C" fn lio_linkat(
-//   lio: *mut lio_handle_t,
-//   old_dir_fd: libc::intptr_t,
-//   old_path: *const libc::c_char,
-//   new_dir_fd: libc::intptr_t,
-//   new_path: *const libc::c_char,
-//   callback: extern "C" fn(libc::c_int),
-// ) {
-//   if old_path.is_null() || new_path.is_null() {
-//     callback(-libc::EINVAL);
-//     return;
-//   }
-//   // SAFETY: caller guarantees strings are valid per fn contract
-//   let old_path_cstr = unsafe { std::ffi::CStr::from_ptr(old_path) }.to_owned();
-//   // SAFETY: caller guarantees strings are valid per fn contract
-//   let new_path_cstr = unsafe { std::ffi::CStr::from_ptr(new_path) }.to_owned();
-//   // SAFETY: caller guarantees fds are valid per fn contract
-//   let old_dir_res = unsafe { fd_to_borrowed_resource(old_dir_fd) };
-//   // SAFETY: caller guarantees fds are valid per fn contract
-//   let new_dir_res = unsafe { fd_to_borrowed_resource(new_dir_fd) };
-//   // SAFETY: caller guarantees lio is valid per fn contract
-//   api::linkat(&old_dir_res, old_path_cstr, new_dir_res, new_path_cstr)
-//     .with_lio(&unsafe { handle(lio) }.inner)
-//     .when_done(move |res| {
-//       callback(match res {
-//         Ok(_) => 0,
-//         Err(e) => -e.raw_os_error().unwrap_or(1),
-//       });
-//     });
-// }
+/// Remove a file or directory.
+///
+/// - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
+/// - `path`: Path to remove (null-terminated)
+/// - `flags`: 0 for files, AT_REMOVEDIR for directories
+/// - `callback(result)`: 0 on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; `path` must be a valid null-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_unlinkat(
+  lio: *mut lio_handle_t,
+  dir_fd: libc::intptr_t,
+  path: *const libc::c_char,
+  flags: libc::c_int,
+  callback: extern "C" fn(libc::c_int),
+) {
+  if path.is_null() {
+    callback(-libc::EINVAL);
+    return;
+  }
+  // SAFETY: caller guarantees string is valid per fn contract
+  let path_cstr = unsafe { std::ffi::CStr::from_ptr(path) }.to_owned();
+  // SAFETY: caller guarantees dir_fd is valid per fn contract
+  let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
+  // SAFETY: caller guarantees lio is valid per fn contract
+  api::unlinkat(&dir_res, path_cstr, flags)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(_) => 0,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
 
-// /// Remove a file or directory.
-// ///
-// /// - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
-// /// - `path`: Path to remove (null-terminated)
-// /// - `flags`: 0 for files, AT_REMOVEDIR for directories
-// /// - `callback(result)`: 0 on success, negative errno on error
-// ///
-// /// # Safety
-// /// `lio` must be valid; `path` must be a valid null-terminated string.
-// #[unsafe(no_mangle)]
-// pub unsafe extern "C" fn lio_unlinkat(
-//   lio: *mut lio_handle_t,
-//   dir_fd: libc::intptr_t,
-//   path: *const libc::c_char,
-//   flags: libc::c_int,
-//   callback: extern "C" fn(libc::c_int),
-// ) {
-//   if path.is_null() {
-//     callback(-libc::EINVAL);
-//     return;
-//   }
-//   // SAFETY: caller guarantees string is valid per fn contract
-//   let path_cstr = unsafe { std::ffi::CStr::from_ptr(path) }.to_owned();
-//   // SAFETY: caller guarantees dir_fd is valid per fn contract
-//   let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
-//   // SAFETY: caller guarantees lio is valid per fn contract
-//   api::unlinkat(&dir_res, path_cstr, flags)
-//     .with_lio(&unsafe { handle(lio) }.inner)
-//     .when_done(move |res| {
-//       callback(match res {
-//         Ok(_) => 0,
-//         Err(e) => -e.raw_os_error().unwrap_or(1),
-//       });
-//     });
-// }
+/// Rename a file or directory.
+///
+/// - `old_dir_fd`: Directory fd for old path
+/// - `old_path`: Current path (null-terminated)
+/// - `new_dir_fd`: Directory fd for new path
+/// - `new_path`: New path (null-terminated)
+/// - `callback(result)`: 0 on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; paths must be valid null-terminated strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_renameat(
+  lio: *mut lio_handle_t,
+  old_dir_fd: libc::intptr_t,
+  old_path: *const libc::c_char,
+  new_dir_fd: libc::intptr_t,
+  new_path: *const libc::c_char,
+  callback: extern "C" fn(libc::c_int),
+) {
+  if old_path.is_null() || new_path.is_null() {
+    callback(-libc::EINVAL);
+    return;
+  }
+  let old_path_cstr = unsafe { std::ffi::CStr::from_ptr(old_path) }.to_owned();
+  let new_path_cstr = unsafe { std::ffi::CStr::from_ptr(new_path) }.to_owned();
+  let old_dir_res = unsafe { fd_to_borrowed_resource(old_dir_fd) };
+  let new_dir_res = unsafe { fd_to_borrowed_resource(new_dir_fd) };
+  api::renameat(&old_dir_res, old_path_cstr, &new_dir_res, new_path_cstr)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(_) => 0,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
 
-// /// Rename a file or directory.
-// ///
-// /// - `old_dir_fd`: Directory fd for old path
-// /// - `old_path`: Current path (null-terminated)
-// /// - `new_dir_fd`: Directory fd for new path
-// /// - `new_path`: New path (null-terminated)
-// /// - `callback(result)`: 0 on success, negative errno on error
-// ///
-// /// # Safety
-// /// `lio` must be valid; paths must be valid null-terminated strings.
-// #[unsafe(no_mangle)]
-// pub unsafe extern "C" fn lio_renameat(
-//   lio: *mut lio_handle_t,
-//   old_dir_fd: libc::intptr_t,
-//   old_path: *const libc::c_char,
-//   new_dir_fd: libc::intptr_t,
-//   new_path: *const libc::c_char,
-//   callback: extern "C" fn(libc::c_int),
-// ) {
-//   if old_path.is_null() || new_path.is_null() {
-//     callback(-libc::EINVAL);
-//     return;
-//   }
-//   // SAFETY: caller guarantees strings are valid per fn contract
-//   let old_path_cstr = unsafe { std::ffi::CStr::from_ptr(old_path) }.to_owned();
-//   // SAFETY: caller guarantees strings are valid per fn contract
-//   let new_path_cstr = unsafe { std::ffi::CStr::from_ptr(new_path) }.to_owned();
-//   // SAFETY: caller guarantees fds are valid per fn contract
-//   let old_dir_res = unsafe { fd_to_borrowed_resource(old_dir_fd) };
-//   // SAFETY: caller guarantees fds are valid per fn contract
-//   let new_dir_res = unsafe { fd_to_borrowed_resource(new_dir_fd) };
-//   // SAFETY: caller guarantees lio is valid per fn contract
-//   api::renameat(&old_dir_res, old_path_cstr, &new_dir_res, new_path_cstr)
-//     .with_lio(&unsafe { handle(lio) }.inner)
-//     .when_done(move |res| {
-//       callback(match res {
-//         Ok(_) => 0,
-//         Err(e) => -e.raw_os_error().unwrap_or(1),
-//       });
-//     });
-// }
-
-// /// Create a directory.
-// ///
-// /// - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
-// /// - `path`: Path to create (null-terminated)
-// /// - `mode`: Permission bits (e.g., 0755)
-// /// - `callback(result)`: 0 on success, negative errno on error
-// ///
-// /// # Safety
-// /// `lio` must be valid; `path` must be a valid null-terminated string.
-// #[unsafe(no_mangle)]
-// pub unsafe extern "C" fn lio_mkdirat(
-//   lio: *mut lio_handle_t,
-//   dir_fd: libc::intptr_t,
-//   path: *const libc::c_char,
-//   mode: libc::mode_t,
-//   callback: extern "C" fn(libc::c_int),
-// ) {
-//   if path.is_null() {
-//     callback(-libc::EINVAL);
-//     return;
-//   }
-//   // SAFETY: caller guarantees string is valid per fn contract
-//   let path_cstr = unsafe { std::ffi::CStr::from_ptr(path) }.to_owned();
-//   // SAFETY: caller guarantees dir_fd is valid per fn contract
-//   let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
-//   // SAFETY: caller guarantees lio is valid per fn contract
-//   api::mkdirat(&dir_res, path_cstr, mode.into())
-//     .with_lio(&unsafe { handle(lio) }.inner)
-//     .when_done(move |res| {
-//       callback(match res {
-//         Ok(_) => 0,
-//         Err(e) => -e.raw_os_error().unwrap_or(1),
-//       });
-//     });
-// }
+/// Create a directory.
+///
+/// - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
+/// - `path`: Path to create (null-terminated)
+/// - `mode`: Permission bits (e.g., 0755)
+/// - `callback(result)`: 0 on success, negative errno on error
+///
+/// # Safety
+/// `lio` must be valid; `path` must be a valid null-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_mkdirat(
+  lio: *mut lio_handle_t,
+  dir_fd: libc::intptr_t,
+  path: *const libc::c_char,
+  mode: libc::mode_t,
+  callback: extern "C" fn(libc::c_int),
+) {
+  if path.is_null() {
+    callback(-libc::EINVAL);
+    return;
+  }
+  let path_cstr = unsafe { std::ffi::CStr::from_ptr(path) }.to_owned();
+  let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
+  api::mkdirat(&dir_res, path_cstr, mode.into())
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(_) => 0,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
 
 // /// Send file data to a socket without copying through userspace.
 // ///
@@ -1514,3 +1476,10 @@ pub unsafe extern "C" fn lio_write(
 //     },
 //   );
 // }
+fn link_kind_from_ffi(kind: libc::c_int) -> Result<api::ops::LinkKind, ()> {
+  match kind {
+    0 => Ok(api::ops::LinkKind::Hard),
+    1 => Ok(api::ops::LinkKind::Soft),
+    _ => Err(()),
+  }
+}

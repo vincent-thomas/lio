@@ -42,11 +42,8 @@ fn main() -> io::Result<()> {
   assert!(completion.is_ok());
 
   let mut read_back = vec![0u8; pattern.len()];
-  let read = Read::new(
-    file.as_raw_fd(),
-    read_back.as_mut_ptr(),
-    read_back.len() as u32,
-  );
+  let read =
+    Read::new(file.as_raw_fd(), read_back.as_mut_ptr(), read_back.len() as u32);
   let read = read.offset(0);
   unsafe { ring.push(read.build(), 3)? };
   ring.submit()?;

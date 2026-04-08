@@ -64,13 +64,10 @@ fn main() -> io::Result<()> {
   }
 
   let mut read_buf = vec![0_u8; 1024];
-  let read = Read::new(
-    file.as_raw_fd(),
-    read_buf.as_mut_ptr(),
-    read_buf.len() as u32,
-  )
-  .offset(0)
-  .build();
+  let read =
+    Read::new(file.as_raw_fd(), read_buf.as_mut_ptr(), read_buf.len() as u32)
+      .offset(0)
+      .build();
   unsafe { ring.push(read, 30)? };
   ring.submit()?;
   let read_cqe = ring.wait()?;

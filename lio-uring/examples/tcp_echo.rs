@@ -70,7 +70,8 @@ fn main() -> io::Result<()> {
   println!("Try: echo 'Hello' | nc localhost {PORT}\n");
 
   let mut client_addr: libc::sockaddr_in = unsafe { mem::zeroed() };
-  let mut client_addrlen = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+  let mut client_addrlen =
+    mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
   let accept = Accept::new(
     socket.as_raw_fd(),
     (&mut client_addr as *mut libc::sockaddr_in).cast(),
@@ -115,12 +116,9 @@ fn main() -> io::Result<()> {
       String::from_utf8_lossy(&buffer[..bytes_read as usize])
     );
 
-    let send = Send::new(
-      client_socket.as_raw_fd(),
-      buffer.as_ptr(),
-      bytes_read as u32,
-    )
-    .build();
+    let send =
+      Send::new(client_socket.as_raw_fd(), buffer.as_ptr(), bytes_read as u32)
+        .build();
     unsafe { ring.push(send, 11)? };
     ring.submit()?;
     let bytes_sent = check(ring.wait()?.result())?;

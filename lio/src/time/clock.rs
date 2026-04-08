@@ -6,6 +6,7 @@ pub type TimerId = u64;
 
 /// Time resolution: 1ms per tick.
 pub(crate) const TICK_MS: u64 = 1;
+const TICK_NS: u128 = TICK_MS as u128 * 1_000_000;
 
 /// State of a timer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,8 +99,13 @@ impl Clock {
     }
   }
 
+  fn duration_to_ticks(duration: Duration) -> u64 {
+    let ticks = duration.as_nanos().div_ceil(TICK_NS).max(1);
+    ticks.min(u64::MAX as u128) as u64
+  }
+
   pub fn schedule(&mut self, id: TimerId, duration: Duration) {
-    let duration_ticks = duration.as_millis() as u64 / TICK_MS;
+    let duration_ticks = Self::duration_to_ticks(duration);
     let deadline_ticks = self.current_tick + duration_ticks.max(1);
 
     self.insert_timer(id, deadline_ticks);

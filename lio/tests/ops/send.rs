@@ -38,7 +38,8 @@ fn basic() {
     setup_tcp_pair(&mut lio);
 
   let data = b"Hello, Server!".to_vec();
-  let mut sender = api::send(&client_sock, data.clone(), None).with_lio(&mut lio).send();
+  let mut sender =
+    api::send(&client_sock, data.clone(), None).with_lio(&mut lio).send();
 
   let (bytes_sent, returned_buf) = poll_recv(&mut lio, &mut sender);
   let bytes_sent = bytes_sent.expect("Failed to send data") as usize;
@@ -56,7 +57,8 @@ fn large_data() {
 
   let large_data: Vec<u8> = (0..64 * 1024).map(|i| (i % 256) as u8).collect();
   let expected = large_data.clone();
-  let mut sender = api::send(&client_sock, large_data, None).with_lio(&mut lio).send();
+  let mut sender =
+    api::send(&client_sock, large_data, None).with_lio(&mut lio).send();
 
   let (bytes_sent, returned_buf) = poll_recv(&mut lio, &mut sender);
   let bytes_sent = bytes_sent.expect("Failed to send large data") as usize;

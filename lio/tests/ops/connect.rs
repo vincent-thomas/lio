@@ -29,14 +29,17 @@ fn tcp_socket_v6() -> Resource {
 }
 
 fn setup_listener_v4() -> (TcpListener, std::net::SocketAddr) {
-  let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind TCP listener");
+  let listener =
+    TcpListener::bind("127.0.0.1:0").expect("Failed to bind TCP listener");
   let addr = listener.local_addr().expect("Failed to query listener address");
   (listener, addr)
 }
 
 fn setup_listener_v6() -> (TcpListener, std::net::SocketAddr) {
-  let listener = TcpListener::bind("[::1]:0").expect("Failed to bind IPv6 listener");
-  let addr = listener.local_addr().expect("Failed to query IPv6 listener address");
+  let listener =
+    TcpListener::bind("[::1]:0").expect("Failed to bind IPv6 listener");
+  let addr =
+    listener.local_addr().expect("Failed to query IPv6 listener address");
   (listener, addr)
 }
 
@@ -50,10 +53,12 @@ fn basic() {
   api::connect(&client_sock, addr).with_lio(&mut lio).send_with(sender);
   poll_until_recv(&mut lio, &receiver).expect("Failed to connect");
 
-  let (_accepted, _) = listener.accept().expect("Failed to accept connected client");
+  let (_accepted, _) =
+    listener.accept().expect("Failed to accept connected client");
 
   unsafe {
-    let mut peer_addr = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    let mut peer_addr =
+      std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
     let mut peer_len =
       std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     let result = libc::getpeername(
@@ -78,7 +83,8 @@ fn ipv6() {
   let (_accepted, _) = listener.accept().expect("Failed to accept IPv6 client");
 
   unsafe {
-    let mut peer_addr = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    let mut peer_addr =
+      std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
     let mut peer_len =
       std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     let result = libc::getpeername(
@@ -133,7 +139,8 @@ fn already_connected() {
   api::connect(&client_sock, addr).with_lio(&mut lio).send_with(sender);
   poll_until_recv(&mut lio, &receiver).expect("First connect should succeed");
 
-  let (_accepted, _) = listener.accept().expect("Failed to accept connected client");
+  let (_accepted, _) =
+    listener.accept().expect("Failed to accept connected client");
 
   let (sender2, receiver2) = mpsc::channel();
   api::connect(&client_sock, addr).with_lio(&mut lio).send_with(sender2);
@@ -150,7 +157,9 @@ fn concurrent() {
 
   for _ in 0..10 {
     let client_sock = tcp_socket_v4();
-    api::connect(&client_sock, addr).with_lio(&mut lio).send_with(sender.clone());
+    api::connect(&client_sock, addr)
+      .with_lio(&mut lio)
+      .send_with(sender.clone());
     clients.push(client_sock);
   }
 
@@ -175,7 +184,8 @@ fn localhost() {
   api::connect(&client_sock, addr).with_lio(&mut lio).send_with(sender);
   poll_until_recv(&mut lio, &receiver).expect("Failed to connect to localhost");
 
-  let (_accepted, _) = listener.accept().expect("Failed to accept connected client");
+  let (_accepted, _) =
+    listener.accept().expect("Failed to accept connected client");
 
   unsafe {
     let mut peer_addr = std::mem::MaybeUninit::<libc::sockaddr_in>::zeroed();

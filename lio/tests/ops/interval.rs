@@ -105,5 +105,8 @@ fn pause_resume_stops_and_restores_ticks() {
 
   lio::time::resume(&lio);
   let second = run_until_recv(&mut lio, &recv, Duration::from_secs(1));
-  assert!(second.is_ok(), "interval tick after resume should succeed: {second:?}");
+  assert!(
+    second.is_ok(),
+    "interval tick after resume should succeed: {second:?}"
+  );
 }

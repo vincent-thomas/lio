@@ -179,7 +179,11 @@ impl OpModel for TcpBindModel {
   fn op(&mut self) -> Op {
     match self.state {
       TcpBindState::Socket => Op::Socket {
-        domain: if self.addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 },
+        domain: if self.addr.is_ipv4() {
+          libc::AF_INET
+        } else {
+          libc::AF_INET6
+        },
         ty: libc::SOCK_STREAM,
         proto: libc::IPPROTO_TCP,
       },
@@ -221,7 +225,9 @@ impl OpModel for TcpBindModel {
           OpResult::Done(Err(err))
         }
       },
-      TcpBindState::Done => panic!("TcpBindModel received completion after finish"),
+      TcpBindState::Done => {
+        panic!("TcpBindModel received completion after finish")
+      }
     }
   }
 }
@@ -256,10 +262,7 @@ impl OpModelContract for TcpBindModel {
         |op| matches!(op, Op::Listen { fd: 7, backlog: 128 }),
         Completion::ok(0),
         |result| {
-          matches!(
-            result,
-            OpResult::Done(Ok(TcpListenerBound { fd: 7, .. }))
-          )
+          matches!(result, OpResult::Done(Ok(TcpListenerBound { fd: 7, .. })))
         },
       ),
     ]

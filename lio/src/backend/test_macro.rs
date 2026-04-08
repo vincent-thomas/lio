@@ -72,6 +72,27 @@
 /// - missing Unix socket path returns exact raw `-ENOENT`
 /// - invalid fd returns exact raw `-EBADF`
 ///
+/// `Op::UnlinkAt`:
+/// - success returns exact `0`
+/// - missing path returns exact raw `-ENOENT`
+///
+/// `Op::RenameAt`:
+/// - success returns exact `0`
+/// - missing source returns exact raw `-ENOENT`
+///
+/// `Op::MkdirAt`:
+/// - success returns exact `0`
+/// - existing path returns exact raw `-EEXIST`
+///
+/// `Op::LinkAt`:
+/// - hard-link success returns exact `0`
+/// - symbolic-link success returns exact `0`
+/// - hard-link with missing source returns exact raw `-ENOENT`
+///
+/// `Op::ReadlinkAt`:
+/// - success returns the exact symlink-target byte count
+/// - missing path returns exact raw `-ENOENT`
+///
 /// The suite intentionally avoids nondeterministic network cases. It only tests
 /// scenarios where the expected raw `isize` output is stable for a conforming
 /// backend.
@@ -93,7 +114,7 @@ macro_rules! test_io_backend {
       use $crate::api::resource::Resource;
       use $crate::backend::{
         IoBackend,
-        op::{MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, RawBuf},
+        op::{LinkKind, MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, RawBuf},
       };
 
       fn new_backend() -> impl IoBackend {
@@ -356,6 +377,18 @@ macro_rules! test_io_backend {
           sun.sun_path.len(),
           path.display()
         );
+        path
+      }
+
+      #[cfg(unix)]
+      fn temp_path(prefix: &str) -> PathBuf {
+        let now = SystemTime::now()
+          .duration_since(SystemTime::UNIX_EPOCH)
+          .expect("system time before UNIX epoch")
+          .as_nanos();
+        let pid = std::process::id();
+        let mut path = env::temp_dir();
+        path.push(format!("lio-{}-{:x}-{:x}", prefix, pid, now));
         path
       }
 
@@ -1690,6 +1723,348 @@ macro_rules! test_io_backend {
           let completed = backend.wait(Some(Duration::ZERO)).unwrap();
           assert_eq!(completed.len(), 1);
           assert_exact_result(&completed[0], 63, -(libc::ENOENT as isize));
+        }
+      }
+
+      #[cfg(unix)]
+      mod unlinkat {
+        use super::*;
+
+        #[test]
+        fn success_reports_zero_and_id() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let path = temp_path("unlinkat-ok");
+          fs::write(&path, b"hello").unwrap();
+          let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+
+          backend.push(
+            70,
+            Op::UnlinkAt {
+              dir_fd: Resource::cwd(),
+              path: c_path.as_ptr(),
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 70, 0);
+          assert!(!path.exists(), "unlinkat should remove the file");
+        }
+
+        #[test]
+        fn missing_path_reports_enoent() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let path = temp_path("unlinkat-missing");
+          let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+
+          backend.push(
+            71,
+            Op::UnlinkAt {
+              dir_fd: Resource::cwd(),
+              path: c_path.as_ptr(),
+              flags: 0,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 71, -(libc::ENOENT as isize));
+        }
+      }
+
+      #[cfg(unix)]
+      mod renameat {
+        use super::*;
+
+        #[test]
+        fn success_reports_zero_and_id() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let source = temp_path("renameat-source");
+          let dest = temp_path("renameat-dest");
+          fs::write(&source, b"hello").unwrap();
+          fs::remove_file(&dest).ok();
+          let c_source =
+            std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+          let c_dest =
+            std::ffi::CString::new(dest.as_os_str().as_bytes()).unwrap();
+
+          backend.push(
+            72,
+            Op::RenameAt {
+              old_dir_fd: Resource::cwd(),
+              old_path: c_source.as_ptr(),
+              new_dir_fd: Resource::cwd(),
+              new_path: c_dest.as_ptr(),
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 72, 0);
+          assert!(!source.exists(), "renameat should remove the old path");
+          assert!(dest.exists(), "renameat should create the new path");
+          fs::remove_file(dest).ok();
+        }
+
+        #[test]
+        fn missing_source_reports_enoent() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let source = temp_path("renameat-missing");
+          let dest = temp_path("renameat-target");
+          fs::remove_file(&dest).ok();
+          let c_source =
+            std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+          let c_dest =
+            std::ffi::CString::new(dest.as_os_str().as_bytes()).unwrap();
+
+          backend.push(
+            73,
+            Op::RenameAt {
+              old_dir_fd: Resource::cwd(),
+              old_path: c_source.as_ptr(),
+              new_dir_fd: Resource::cwd(),
+              new_path: c_dest.as_ptr(),
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 73, -(libc::ENOENT as isize));
+        }
+      }
+
+      #[cfg(unix)]
+      mod mkdirat {
+        use super::*;
+
+        #[test]
+        fn success_reports_zero_and_id() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let path = temp_path("mkdirat-ok");
+          fs::remove_dir(&path).ok();
+          let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+
+          backend.push(
+            74,
+            Op::MkdirAt {
+              dir_fd: Resource::cwd(),
+              path: c_path.as_ptr(),
+              mode: 0o755,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 74, 0);
+          assert!(path.is_dir(), "mkdirat should create the directory");
+          fs::remove_dir(path).ok();
+        }
+
+        #[test]
+        fn existing_path_reports_eexist() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let path = temp_path("mkdirat-exists");
+          fs::create_dir(&path).unwrap();
+          let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+
+          backend.push(
+            75,
+            Op::MkdirAt {
+              dir_fd: Resource::cwd(),
+              path: c_path.as_ptr(),
+              mode: 0o755,
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 75, -(libc::EEXIST as isize));
+          fs::remove_dir(path).ok();
+        }
+      }
+
+      #[cfg(unix)]
+      mod linkat {
+        use super::*;
+
+        #[test]
+        fn hard_link_success_reports_zero_and_id() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let source = temp_path("linkat-hard-source");
+          let dest = temp_path("linkat-hard-dest");
+          fs::write(&source, b"hello").unwrap();
+          fs::remove_file(&dest).ok();
+          let c_source =
+            std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+          let c_dest =
+            std::ffi::CString::new(dest.as_os_str().as_bytes()).unwrap();
+
+          backend.push(
+            76,
+            Op::LinkAt {
+              kind: LinkKind::Hard,
+              source_dir_fd: Resource::cwd(),
+              source_path: c_source.as_ptr(),
+              new_dir_fd: Resource::cwd(),
+              new_path: c_dest.as_ptr(),
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 76, 0);
+          assert!(dest.exists(), "hard link should create the destination");
+          fs::remove_file(dest).ok();
+          fs::remove_file(source).ok();
+        }
+
+        #[test]
+        fn soft_link_success_reports_zero_and_id() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let source = temp_path("linkat-soft-source");
+          let dest = temp_path("linkat-soft-dest");
+          fs::write(&source, b"hello").unwrap();
+          fs::remove_file(&dest).ok();
+          let c_source =
+            std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+          let c_dest =
+            std::ffi::CString::new(dest.as_os_str().as_bytes()).unwrap();
+
+          backend.push(
+            77,
+            Op::LinkAt {
+              kind: LinkKind::Soft,
+              source_dir_fd: Resource::cwd(),
+              source_path: c_source.as_ptr(),
+              new_dir_fd: Resource::cwd(),
+              new_path: c_dest.as_ptr(),
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 77, 0);
+          assert!(
+            fs::symlink_metadata(&dest).unwrap().file_type().is_symlink(),
+            "soft link should create a symlink destination"
+          );
+          fs::remove_file(dest).ok();
+          fs::remove_file(source).ok();
+        }
+
+        #[test]
+        fn hard_link_missing_source_reports_enoent() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let source = temp_path("linkat-missing-source");
+          let dest = temp_path("linkat-missing-dest");
+          fs::remove_file(&dest).ok();
+          let c_source =
+            std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+          let c_dest =
+            std::ffi::CString::new(dest.as_os_str().as_bytes()).unwrap();
+
+          backend.push(
+            78,
+            Op::LinkAt {
+              kind: LinkKind::Hard,
+              source_dir_fd: Resource::cwd(),
+              source_path: c_source.as_ptr(),
+              new_dir_fd: Resource::cwd(),
+              new_path: c_dest.as_ptr(),
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 78, -(libc::ENOENT as isize));
+        }
+      }
+
+      #[cfg(unix)]
+      mod readlinkat {
+        use super::*;
+
+        #[test]
+        fn success_reports_target_length_and_id() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let target = temp_path("readlinkat-target");
+          let link = temp_path("readlinkat-link");
+          fs::write(&target, b"hello").unwrap();
+          std::os::unix::fs::symlink(&target, &link).unwrap();
+          let c_link =
+            std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+          let mut buf = [0_u8; 512];
+
+          backend.push(
+            79,
+            Op::ReadlinkAt {
+              dir_fd: Resource::cwd(),
+              path: c_link.as_ptr(),
+              buf: buf.as_mut_ptr(),
+              buf_len: buf.len(),
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 79, target.as_os_str().as_bytes().len() as isize);
+          assert_eq!(
+            &buf[..target.as_os_str().as_bytes().len()],
+            target.as_os_str().as_bytes()
+          );
+
+          fs::remove_file(link).ok();
+          fs::remove_file(target).ok();
+        }
+
+        #[test]
+        fn missing_path_reports_enoent() {
+          let mut backend = new_backend();
+          backend.init(64).unwrap();
+
+          let link = temp_path("readlinkat-missing");
+          let c_link =
+            std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+          let mut buf = [0_u8; 64];
+
+          backend.push(
+            80,
+            Op::ReadlinkAt {
+              dir_fd: Resource::cwd(),
+              path: c_link.as_ptr(),
+              buf: buf.as_mut_ptr(),
+              buf_len: buf.len(),
+            },
+          );
+          backend.flush().unwrap();
+
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, 80, -(libc::ENOENT as isize));
         }
       }
 

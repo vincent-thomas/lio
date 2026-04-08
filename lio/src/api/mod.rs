@@ -196,6 +196,92 @@ doc_op! {
     }
 }
 
+doc_op! {
+    short: "Removes a file or directory relative to a directory file descriptor.",
+
+    pub fn unlinkat(
+        dir_res: &impl AsResource,
+        path: std::ffi::CString,
+        flags: i32,
+    ) -> Io<ops::UnlinkAt> {
+        Io::from_op(ops::UnlinkAt::new(
+            dir_res.as_resource().clone(),
+            path,
+            flags,
+        ))
+    }
+}
+
+doc_op! {
+    short: "Renames a file or directory relative to directory file descriptors.",
+
+    pub fn renameat(
+        old_dir_res: &impl AsResource,
+        old_path: std::ffi::CString,
+        new_dir_res: &impl AsResource,
+        new_path: std::ffi::CString,
+    ) -> Io<ops::RenameAt> {
+        Io::from_op(ops::RenameAt::new(
+            old_dir_res.as_resource().clone(),
+            old_path,
+            new_dir_res.as_resource().clone(),
+            new_path,
+        ))
+    }
+}
+
+doc_op! {
+    short: "Creates a directory relative to a directory file descriptor.",
+
+    pub fn mkdirat(
+        dir_res: &impl AsResource,
+        path: std::ffi::CString,
+        mode: u32,
+    ) -> Io<ops::MkdirAt> {
+        Io::from_op(ops::MkdirAt::new(
+            dir_res.as_resource().clone(),
+            path,
+            mode,
+        ))
+    }
+}
+
+doc_op! {
+    short: "Creates a hard or symbolic link relative to directory file descriptors.",
+
+    pub fn linkat(
+        source_dir_res: &impl AsResource,
+        source_path: std::ffi::CString,
+        new_dir_res: &impl AsResource,
+        new_path: std::ffi::CString,
+        kind: ops::LinkKind,
+    ) -> Io<ops::LinkAt> {
+        Io::from_op(ops::LinkAt::new(
+            source_dir_res.as_resource().clone(),
+            source_path,
+            new_dir_res.as_resource().clone(),
+            new_path,
+            kind,
+        ))
+    }
+}
+
+doc_op! {
+    short: "Reads the target of a symbolic link relative to a directory file descriptor.",
+
+    pub fn readlinkat(
+        dir_res: &impl AsResource,
+        path: std::ffi::CString,
+        buf: Vec<u8>,
+    ) -> Io<ops::ReadlinkAt<Vec<u8>>> {
+        Io::from_op(ops::ReadlinkAt::new(
+            dir_res.as_resource().clone(),
+            path,
+            buf,
+        ))
+    }
+}
+
 // Legacy syscall helpers are still temporarily disabled during the serial
 // `OpModel` migration. Keep the active surface limited to migrated ops.
 //

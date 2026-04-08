@@ -35,9 +35,13 @@ fn test_socket_simple() {
 
   let (sender, receiver) = mpsc::channel::<SocketResult>();
 
-  api::socket(api::SockDomain::IPV4, api::SockType::STREAM, api::SockProto::DEFAULT)
-    .with_lio(&mut lio)
-    .send_with(sender.clone());
+  api::socket(
+    api::SockDomain::IPV4,
+    api::SockType::STREAM,
+    api::SockProto::DEFAULT,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender.clone());
 
   let sock = poll_until_recv(&mut lio, &receiver)
     .expect("Failed to create TCP IPv4 socket");
@@ -70,9 +74,13 @@ fn test_socket_tcp_ipv4() {
 
   let (sender, receiver) = mpsc::channel::<SocketResult>();
 
-  api::socket(api::SockDomain::IPV4, api::SockType::STREAM, api::SockProto::DEFAULT)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::socket(
+    api::SockDomain::IPV4,
+    api::SockType::STREAM,
+    api::SockProto::DEFAULT,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender);
 
   let sock = poll_until_recv(&mut lio, &receiver)
     .expect("Failed to create TCP IPv4 socket");
@@ -100,9 +108,13 @@ fn test_socket_tcp_ipv6() {
 
   let (sender, receiver) = mpsc::channel::<SocketResult>();
 
-  api::socket(api::SockDomain::IPV6, api::SockType::STREAM, api::SockProto::DEFAULT)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::socket(
+    api::SockDomain::IPV6,
+    api::SockType::STREAM,
+    api::SockProto::DEFAULT,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender);
 
   let sock = poll_until_recv(&mut lio, &receiver)
     .expect("Failed to create TCP IPv6 socket");
@@ -130,9 +142,13 @@ fn test_socket_udp_ipv4() {
 
   let (sender, receiver) = mpsc::channel::<SocketResult>();
 
-  api::socket(api::SockDomain::IPV4, api::SockType::DGRAM, api::SockProto::DEFAULT)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::socket(
+    api::SockDomain::IPV4,
+    api::SockType::DGRAM,
+    api::SockProto::DEFAULT,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender);
 
   let sock = poll_until_recv(&mut lio, &receiver)
     .expect("Failed to create UDP IPv4 socket");
@@ -160,9 +176,13 @@ fn test_socket_udp_ipv6() {
 
   let (sender, receiver) = mpsc::channel::<SocketResult>();
 
-  api::socket(api::SockDomain::IPV6, api::SockType::DGRAM, api::SockProto::DEFAULT)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::socket(
+    api::SockDomain::IPV6,
+    api::SockType::DGRAM,
+    api::SockProto::DEFAULT,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender);
 
   let sock = poll_until_recv(&mut lio, &receiver)
     .expect("Failed to create UDP IPv6 socket");
@@ -189,9 +209,13 @@ fn test_socket_without_protocol() {
 
   let (sender, receiver) = mpsc::channel::<SocketResult>();
 
-  api::socket(api::SockDomain::IPV4, api::SockType::STREAM, api::SockProto::DEFAULT)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::socket(
+    api::SockDomain::IPV4,
+    api::SockType::STREAM,
+    api::SockProto::DEFAULT,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender);
 
   let sock = poll_until_recv(&mut lio, &receiver)
     .expect("Failed to create socket without explicit protocol");
@@ -202,8 +226,13 @@ fn test_socket_without_protocol() {
 #[test]
 fn test_socket_unix_stream() {
   let mut lio = Lio::new(64).unwrap();
-  let mut sock_recv =
-    api::socket(api::SockDomain::UNIX, api::SockType::STREAM, api::SockProto::DEFAULT).with_lio(&mut lio).send();
+  let mut sock_recv = api::socket(
+    api::SockDomain::UNIX,
+    api::SockType::STREAM,
+    api::SockProto::DEFAULT,
+  )
+  .with_lio(&mut lio)
+  .send();
 
   assert_eq!(lio.try_run().unwrap(), 1);
 
@@ -228,8 +257,13 @@ fn test_socket_unix_stream() {
 #[test]
 fn test_socket_unix_dgram() {
   let mut lio = Lio::new(64).unwrap();
-  let mut sock_recv =
-    api::socket(api::SockDomain::UNIX, api::SockType::DGRAM, api::SockProto::DEFAULT).with_lio(&mut lio).send();
+  let mut sock_recv = api::socket(
+    api::SockDomain::UNIX,
+    api::SockType::DGRAM,
+    api::SockProto::DEFAULT,
+  )
+  .with_lio(&mut lio)
+  .send();
 
   assert_eq!(lio.try_run().unwrap(), 1);
 
@@ -258,17 +292,29 @@ fn test_socket_multiple() {
   let (sender, receiver) = mpsc::channel::<SocketResult>();
 
   // Create multiple sockets
-  api::socket(api::SockDomain::IPV4, api::SockType::STREAM, api::SockProto::DEFAULT)
-    .with_lio(&mut lio)
-    .send_with(sender.clone());
+  api::socket(
+    api::SockDomain::IPV4,
+    api::SockType::STREAM,
+    api::SockProto::DEFAULT,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender.clone());
 
-  api::socket(api::SockDomain::IPV4, api::SockType::STREAM, api::SockProto::DEFAULT)
-    .with_lio(&mut lio)
-    .send_with(sender.clone());
+  api::socket(
+    api::SockDomain::IPV4,
+    api::SockType::STREAM,
+    api::SockProto::DEFAULT,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender.clone());
 
-  api::socket(api::SockDomain::IPV4, api::SockType::DGRAM, api::SockProto::DEFAULT)
-    .with_lio(&mut lio)
-    .send_with(sender.clone());
+  api::socket(
+    api::SockDomain::IPV4,
+    api::SockType::DGRAM,
+    api::SockProto::DEFAULT,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender.clone());
 
   let sock1 = poll_until_recv(&mut lio, &receiver)
     .expect("Failed to create first socket");
@@ -296,18 +342,34 @@ fn test_socket_concurrent() {
   for i in 0..20 {
     // Alternate between TCP IPv4, TCP IPv6, UDP IPv4, UDP IPv6
     match i % 4 {
-      0 => api::socket(api::SockDomain::IPV4, api::SockType::STREAM, api::SockProto::DEFAULT)
-        .with_lio(&mut lio)
-        .send_with(sender.clone()),
-      1 => api::socket(api::SockDomain::IPV6, api::SockType::STREAM, api::SockProto::DEFAULT)
-        .with_lio(&mut lio)
-        .send_with(sender.clone()),
-      2 => api::socket(api::SockDomain::IPV4, api::SockType::DGRAM, api::SockProto::DEFAULT)
-        .with_lio(&mut lio)
-        .send_with(sender.clone()),
-      _ => api::socket(api::SockDomain::IPV6, api::SockType::DGRAM, api::SockProto::DEFAULT)
-        .with_lio(&mut lio)
-        .send_with(sender.clone()),
+      0 => api::socket(
+        api::SockDomain::IPV4,
+        api::SockType::STREAM,
+        api::SockProto::DEFAULT,
+      )
+      .with_lio(&mut lio)
+      .send_with(sender.clone()),
+      1 => api::socket(
+        api::SockDomain::IPV6,
+        api::SockType::STREAM,
+        api::SockProto::DEFAULT,
+      )
+      .with_lio(&mut lio)
+      .send_with(sender.clone()),
+      2 => api::socket(
+        api::SockDomain::IPV4,
+        api::SockType::DGRAM,
+        api::SockProto::DEFAULT,
+      )
+      .with_lio(&mut lio)
+      .send_with(sender.clone()),
+      _ => api::socket(
+        api::SockDomain::IPV6,
+        api::SockType::DGRAM,
+        api::SockProto::DEFAULT,
+      )
+      .with_lio(&mut lio)
+      .send_with(sender.clone()),
     };
   }
 
@@ -325,9 +387,13 @@ fn test_socket_options_after_creation() {
 
   let (sender, receiver) = mpsc::channel::<SocketResult>();
 
-  api::socket(api::SockDomain::IPV4, api::SockType::STREAM, api::SockProto::DEFAULT)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::socket(
+    api::SockDomain::IPV4,
+    api::SockType::STREAM,
+    api::SockProto::DEFAULT,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender);
 
   let sock =
     poll_until_recv(&mut lio, &receiver).expect("Failed to create socket");
@@ -365,9 +431,13 @@ fn test_socket_nonblocking() {
 
   let (sender, receiver) = mpsc::channel::<SocketResult>();
 
-  api::socket(api::SockDomain::IPV4, api::SockType::STREAM, api::SockProto::DEFAULT)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::socket(
+    api::SockDomain::IPV4,
+    api::SockType::STREAM,
+    api::SockProto::DEFAULT,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender);
 
   let sock =
     poll_until_recv(&mut lio, &receiver).expect("Failed to create socket");

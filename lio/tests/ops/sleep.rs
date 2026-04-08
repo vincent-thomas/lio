@@ -22,6 +22,18 @@ fn poll_recv_timeout<T>(
   }
 }
 
+fn run_sleep_and_measure(lio: &mut Lio, duration: Duration) -> Duration {
+  let start = Instant::now();
+  let mut recv = api::sleep(duration).with_lio(lio).send();
+
+  let result =
+    poll_recv_timeout(lio, &mut recv, duration + Duration::from_secs(1))
+      .expect("sleep should complete within the polling budget");
+  assert!(result.is_ok(), "sleep should complete successfully: {result:?}");
+
+  start.elapsed()
+}
+
 #[test]
 fn basic() {
   let mut lio = Lio::new(64).unwrap();
@@ -205,7 +217,8 @@ fn concurrent_same_duration() {
 fn interleaved_with_io() {
   let mut lio = Lio::new(64).unwrap();
 
-  let path = std::ffi::CString::new("/tmp/lio_sleep_interleaved_with_io.txt").unwrap();
+  let path =
+    std::ffi::CString::new("/tmp/lio_sleep_interleaved_with_io.txt").unwrap();
   unsafe {
     let fd = libc::open(
       path.as_ptr(),
@@ -214,13 +227,15 @@ fn interleaved_with_io() {
     );
     assert!(fd >= 0, "Failed to create temp file");
     let payload = b"abc";
-    let written =
-      libc::write(fd, payload.as_ptr().cast(), payload.len());
+    let written = libc::write(fd, payload.as_ptr().cast(), payload.len());
     assert_eq!(written, payload.len() as isize, "Failed to seed temp file");
     libc::close(fd);
   }
   let file = unsafe {
-    lio::api::resource::Resource::from_raw_fd(libc::open(path.as_ptr(), libc::O_RDONLY))
+    lio::api::resource::Resource::from_raw_fd(libc::open(
+      path.as_ptr(),
+      libc::O_RDONLY,
+    ))
   };
 
   // Start a timeout
@@ -231,7 +246,9 @@ fn interleaved_with_io() {
   // Do some real I/O operations while waiting.
   let (io_sender, io_receiver) = mpsc::channel();
   for _ in 0..3 {
-    api::read_at(&file, vec![0u8; 1], 0).with_lio(&mut lio).send_with(io_sender.clone());
+    api::read_at(&file, vec![0u8; 1], 0)
+      .with_lio(&mut lio)
+      .send_with(io_sender.clone());
   }
 
   // Collect I/O results
@@ -344,7 +361,8 @@ fn many_concurrent() {
 #[test]
 fn pause_resume_preserves_remaining_duration() {
   let mut lio = Lio::new(64).unwrap();
-  let mut recv = api::sleep(Duration::from_millis(200)).with_lio(&mut lio).send();
+  let mut recv =
+    api::sleep(Duration::from_millis(200)).with_lio(&mut lio).send();
 
   std::thread::sleep(Duration::from_millis(100));
   lio::time::pause(&lio);
@@ -366,4 +384,26 @@ fn pause_resume_preserves_remaining_duration() {
   let result = poll_recv_timeout(&mut lio, &mut recv, Duration::from_secs(1))
     .expect("sleep should complete after resume and remaining duration");
   assert!(result.is_ok(), "sleep should succeed after resume: {result:?}");
+}
+
+#[test]
+// #[ignore = "timing-sensitive wall-clock accuracy check; run on a quiet machine"]
+fn accuracy_within_two_milliseconds() {
+  let mut lio = Lio::new(64).unwrap();
+  let sleep_duration = Duration::from_millis(100);
+  let threshold = Duration::from_millis(2);
+
+  for _ in 0..5 {
+    let _ = run_sleep_and_measure(&mut lio, Duration::from_millis(10));
+  }
+
+  for sample in 0..10 {
+    let elapsed = run_sleep_and_measure(&mut lio, sleep_duration);
+    let overshoot = elapsed.saturating_sub(sleep_duration);
+
+    assert!(
+      overshoot <= threshold,
+      "sleep sample {sample} exceeded the 2ms threshold: requested {sleep_duration:?}, elapsed {elapsed:?}, overshoot {overshoot:?}",
+    );
+  }
 }

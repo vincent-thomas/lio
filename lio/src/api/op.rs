@@ -128,12 +128,7 @@ impl<M: OpModel> ContractStep<M> {
     completion: Completion,
     assert_result: fn(&OpResult<M::Item>) -> bool,
   ) -> Self {
-    Self {
-      assert_action,
-      before_complete: |_| {},
-      completion,
-      assert_result,
-    }
+    Self { assert_action, before_complete: |_| {}, completion, assert_result }
   }
 
   pub fn with_setup(
@@ -208,8 +203,7 @@ macro_rules! test_op_model_contract {
               saw_done = true;
               saw_terminal = true;
               assert_eq!(
-                index,
-                last_index,
+                index, last_index,
                 "Done must be the final scripted step"
               );
             }

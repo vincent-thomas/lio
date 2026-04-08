@@ -313,6 +313,80 @@ void lio_write(struct lio_handle_t *lio,
                uintptr_t buf_len,
                void (*callback)(int, uint8_t*, uintptr_t));
 
+/**
+ * Create a hard or symbolic link.
+ *
+ * - `kind`: 0 for hard links, 1 for symbolic links
+ * - `source_dir_fd`: Directory fd for source path (ignored for symbolic links)
+ * - `source_path`: Existing path or symlink target (null-terminated)
+ * - `new_dir_fd`: Directory fd for new path
+ * - `new_path`: New link path (null-terminated)
+ * - `callback(result)`: 0 on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; paths must be valid null-terminated strings.
+ */
+void lio_linkat(struct lio_handle_t *lio,
+                int kind,
+                intptr_t source_dir_fd,
+                const char *source_path,
+                intptr_t new_dir_fd,
+                const char *new_path,
+                void (*callback)(int));
+
+/**
+ * Remove a file or directory.
+ *
+ * - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
+ * - `path`: Path to remove (null-terminated)
+ * - `flags`: 0 for files, AT_REMOVEDIR for directories
+ * - `callback(result)`: 0 on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; `path` must be a valid null-terminated string.
+ */
+void lio_unlinkat(struct lio_handle_t *lio,
+                  intptr_t dir_fd,
+                  const char *path,
+                  int flags,
+                  void (*callback)(int));
+
+/**
+ * Rename a file or directory.
+ *
+ * - `old_dir_fd`: Directory fd for old path
+ * - `old_path`: Current path (null-terminated)
+ * - `new_dir_fd`: Directory fd for new path
+ * - `new_path`: New path (null-terminated)
+ * - `callback(result)`: 0 on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; paths must be valid null-terminated strings.
+ */
+void lio_renameat(struct lio_handle_t *lio,
+                  intptr_t old_dir_fd,
+                  const char *old_path,
+                  intptr_t new_dir_fd,
+                  const char *new_path,
+                  void (*callback)(int));
+
+/**
+ * Create a directory.
+ *
+ * - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
+ * - `path`: Path to create (null-terminated)
+ * - `mode`: Permission bits (e.g., 0755)
+ * - `callback(result)`: 0 on success, negative errno on error
+ *
+ * # Safety
+ * `lio` must be valid; `path` must be a valid null-terminated string.
+ */
+void lio_mkdirat(struct lio_handle_t *lio,
+                 intptr_t dir_fd,
+                 const char *path,
+                 mode_t mode,
+                 void (*callback)(int));
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

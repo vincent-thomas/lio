@@ -289,18 +289,16 @@ impl Registration {
           }
         }
       }
-      State::Callback(cb) => {
-        match cb.on_completion(completion) {
-          ProcessResult::Continue(next_action) => {
-            self.state = State::Callback(cb);
-            Some(next_action)
-          }
-          ProcessResult::Done => {
-            self.state = State::Done;
-            None
-          }
+      State::Callback(cb) => match cb.on_completion(completion) {
+        ProcessResult::Continue(next_action) => {
+          self.state = State::Callback(cb);
+          Some(next_action)
         }
-      }
+        ProcessResult::Done => {
+          self.state = State::Done;
+          None
+        }
+      },
       State::Done => {
         self.state = State::Done;
         None
@@ -428,7 +426,10 @@ mod tests {
       Box::new(Nop),
     );
 
-    assert!(matches!(reg.action(), Some(Action::Io(crate::backend::op::Op::Nop))));
+    assert!(matches!(
+      reg.action(),
+      Some(Action::Io(crate::backend::op::Op::Nop))
+    ));
     assert!(reg.on_completion(Completion::new(0)).is_none());
     assert!(reg.is_finished());
 
@@ -444,7 +445,10 @@ mod tests {
     let (tx, rx) = mpsc::channel();
     let mut reg = Registration::new_waker(waker, tx, Box::new(Nop));
 
-    assert!(matches!(reg.action(), Some(Action::Io(crate::backend::op::Op::Nop))));
+    assert!(matches!(
+      reg.action(),
+      Some(Action::Io(crate::backend::op::Op::Nop))
+    ));
     assert!(reg.on_completion(Completion::new(0)).is_none());
     assert!(reg.is_finished());
     assert_eq!(wake_count.load(Ordering::SeqCst), 1);
@@ -462,7 +466,10 @@ mod tests {
       Box::new(AgainThenDone { stage: 0 }),
     );
 
-    assert!(matches!(reg.action(), Some(Action::Io(crate::backend::op::Op::Nop))));
+    assert!(matches!(
+      reg.action(),
+      Some(Action::Io(crate::backend::op::Op::Nop))
+    ));
     assert!(matches!(
       reg.on_completion(Completion::new(0)),
       Some(Action::Io(crate::backend::op::Op::Nop))
@@ -485,7 +492,10 @@ mod tests {
       Box::new(YieldTwiceThenDone { stage: 0 }),
     );
 
-    assert!(matches!(reg.action(), Some(Action::Io(crate::backend::op::Op::Nop))));
+    assert!(matches!(
+      reg.action(),
+      Some(Action::Io(crate::backend::op::Op::Nop))
+    ));
     assert!(matches!(
       reg.on_completion(Completion::new(0)),
       Some(Action::Io(crate::backend::op::Op::Nop))
@@ -496,7 +506,10 @@ mod tests {
       reg.on_completion(Completion::new(1)),
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
-    assert!(!reg.is_finished(), "subsequent Yield must keep the registration live");
+    assert!(
+      !reg.is_finished(),
+      "subsequent Yield must keep the registration live"
+    );
 
     assert!(reg.on_completion(Completion::new(2)).is_none());
     assert!(reg.is_finished());
@@ -510,11 +523,8 @@ mod tests {
     let wake_count = Arc::new(AtomicUsize::new(0));
     let waker = test_waker(Arc::clone(&wake_count));
     let (tx, rx) = mpsc::channel();
-    let mut reg = Registration::new_waker(
-      waker,
-      tx,
-      Box::new(AgainThenDone { stage: 0 }),
-    );
+    let mut reg =
+      Registration::new_waker(waker, tx, Box::new(AgainThenDone { stage: 0 }));
 
     assert!(matches!(
       reg.on_completion(Completion::new(0)),
@@ -582,7 +592,8 @@ mod tests {
 
   #[test]
   fn done_registration_has_no_further_action_or_completion() {
-    let mut reg = Registration::new_callback(|_: std::io::Result<()>| {}, Box::new(Nop));
+    let mut reg =
+      Registration::new_callback(|_: std::io::Result<()>| {}, Box::new(Nop));
 
     assert!(reg.on_completion(Completion::new(0)).is_none());
     assert!(reg.is_finished());

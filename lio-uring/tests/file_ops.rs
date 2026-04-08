@@ -486,8 +486,11 @@ fn test_symlinkat() {
   let target_cstr = format!("{}\0", target);
   let link_cstr = format!("{}\0", link);
 
-  let op =
-    SymlinkAt::new(-100, target_cstr.as_ptr().cast(), link_cstr.as_ptr().cast());
+  let op = SymlinkAt::new(
+    -100,
+    target_cstr.as_ptr().cast(),
+    link_cstr.as_ptr().cast(),
+  );
   unsafe { ring.push(op.build(), 1) }.unwrap();
   ring.submit().unwrap();
 

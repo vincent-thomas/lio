@@ -88,7 +88,8 @@ fn test_openat_concurrent() {
   }
 
   // All fds should be unique
-  let raw_fds: Vec<_> = fds.iter().map(|f: &Resource| f.as_fd().as_raw_fd()).collect();
+  let raw_fds: Vec<_> =
+    fds.iter().map(|f: &Resource| f.as_fd().as_raw_fd()).collect();
   for i in 0..raw_fds.len() {
     for j in i + 1..raw_fds.len() {
       assert_ne!(raw_fds[i], raw_fds[j], "File descriptors should be unique");

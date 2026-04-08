@@ -1,4 +1,4 @@
-/* test_fs_ops.c - Tests for filesystem operations: symlinkat, linkat, unlinkat, renameat, mkdirat */
+/* test_fs_ops.c - Tests for filesystem operations: linkat, unlinkat, renameat, mkdirat */
 #include "test_utils.h"
 #include <sys/stat.h>
 
@@ -135,7 +135,7 @@ static void test_renameat_basic(void) {
     TEST_PASS("test_renameat_basic");
 }
 
-static void test_symlinkat_basic(void) {
+static void test_linkat_soft_basic(void) {
     lio_handle_t *lio = lio_create(TEST_CAPACITY);
     ASSERT_NOT_NULL(lio, "lio_create should succeed");
 
@@ -151,11 +151,11 @@ static void test_symlinkat_basic(void) {
     g_op_called = 0;
     g_op_result = -999;
 
-    lio_symlinkat(lio, AT_FDCWD, target_path, link_path, op_callback);
+    lio_linkat(lio, LIO_LINK_SOFT, AT_FDCWD, target_path, AT_FDCWD, link_path, op_callback);
     tick_until_flag(lio, &g_op_called, 1000);
 
-    ASSERT(g_op_called, "symlinkat callback should be called");
-    ASSERT_EQ(g_op_result, 0, "symlinkat should succeed");
+    ASSERT(g_op_called, "linkat soft callback should be called");
+    ASSERT_EQ(g_op_result, 0, "linkat soft should succeed");
 
     /* Verify symlink exists */
     struct stat st;
@@ -166,10 +166,10 @@ static void test_symlinkat_basic(void) {
     unlink(link_path);
     unlink(target_path);
     lio_destroy(lio);
-    TEST_PASS("test_symlinkat_basic");
+    TEST_PASS("test_linkat_soft_basic");
 }
 
-static void test_linkat_basic(void) {
+static void test_linkat_hard_basic(void) {
     lio_handle_t *lio = lio_create(TEST_CAPACITY);
     ASSERT_NOT_NULL(lio, "lio_create should succeed");
 
@@ -185,7 +185,7 @@ static void test_linkat_basic(void) {
     g_op_called = 0;
     g_op_result = -999;
 
-    lio_linkat(lio, AT_FDCWD, old_path, AT_FDCWD, new_path, op_callback);
+    lio_linkat(lio, LIO_LINK_HARD, AT_FDCWD, old_path, AT_FDCWD, new_path, op_callback);
     tick_until_flag(lio, &g_op_called, 1000);
 
     ASSERT(g_op_called, "linkat callback should be called");
@@ -202,7 +202,7 @@ static void test_linkat_basic(void) {
     unlink(new_path);
     unlink(old_path);
     lio_destroy(lio);
-    TEST_PASS("test_linkat_basic");
+    TEST_PASS("test_linkat_hard_basic");
 }
 
 /* ─── Main ───────────────────────────────────────────────────────────────── */
@@ -214,8 +214,8 @@ int main(void) {
     test_unlinkat_file();
     test_unlinkat_dir();
     test_renameat_basic();
-    test_symlinkat_basic();
-    test_linkat_basic();
+    test_linkat_soft_basic();
+    test_linkat_hard_basic();
 
     printf(GREEN "All filesystem operation tests passed\n" RESET);
     return 0;

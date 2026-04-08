@@ -86,6 +86,12 @@ impl SockProto {
   }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkKind {
+  Hard,
+  Soft,
+}
+
 pub fn socket_from_raw(
   domain: i32,
   ty: i32,
@@ -103,7 +109,8 @@ pub fn socket_to_raw(
   ty: SockType,
   proto: SockProto,
 ) -> Result<(i32, i32, i32), i32> {
-  if matches!(domain, SockDomain::UNIX) && !matches!(proto, SockProto::DEFAULT) {
+  if matches!(domain, SockDomain::UNIX) && !matches!(proto, SockProto::DEFAULT)
+  {
     return Err(libc::EINVAL);
   }
 
@@ -113,15 +120,11 @@ pub fn socket_to_raw(
     (SockType::STREAM, SockProto::DEFAULT) => {
       (raw_sock_stream(), raw_proto_default())
     }
-    (SockType::STREAM, SockProto::TCP) => {
-      (raw_sock_stream(), raw_proto_tcp())
-    }
+    (SockType::STREAM, SockProto::TCP) => (raw_sock_stream(), raw_proto_tcp()),
     (SockType::DGRAM, SockProto::DEFAULT) => {
       (raw_sock_dgram(), raw_proto_default())
     }
-    (SockType::DGRAM, SockProto::UDP) => {
-      (raw_sock_dgram(), raw_proto_udp())
-    }
+    (SockType::DGRAM, SockProto::UDP) => (raw_sock_dgram(), raw_proto_udp()),
     _ => return Err(libc::EINVAL),
   };
 
@@ -265,7 +268,8 @@ impl MsgBuf {
   #[inline]
   pub fn from_slice(buf: &[u8]) -> Self {
     Self {
-      ptr: NonNull::new(buf.as_ptr().cast_mut()).expect("slice pointer must be non-null"),
+      ptr: NonNull::new(buf.as_ptr().cast_mut())
+        .expect("slice pointer must be non-null"),
       len: buf.len(),
     }
   }
@@ -291,7 +295,8 @@ impl MsgBufMut {
   #[inline]
   pub fn from_slice(buf: &mut [u8]) -> Self {
     Self {
-      ptr: NonNull::new(buf.as_mut_ptr()).expect("slice pointer must be non-null"),
+      ptr: NonNull::new(buf.as_mut_ptr())
+        .expect("slice pointer must be non-null"),
       len: buf.len(),
     }
   }
@@ -317,10 +322,10 @@ pub struct MsgSend {
 impl MsgSend {
   #[inline]
   pub fn new(bufs: &[MsgBuf], to: Option<SocketAddr>) -> Self {
-    let buf_count =
-      NonZeroUsize::new(bufs.len()).expect("MsgSend must contain at least one buffer");
-    let bufs =
-      NonNull::new(bufs.as_ptr().cast_mut()).expect("buffer slice pointer must be non-null");
+    let buf_count = NonZeroUsize::new(bufs.len())
+      .expect("MsgSend must contain at least one buffer");
+    let bufs = NonNull::new(bufs.as_ptr().cast_mut())
+      .expect("buffer slice pointer must be non-null");
     Self { bufs, buf_count, to }
   }
 }
@@ -338,10 +343,10 @@ pub struct MsgRecv {
 impl MsgRecv {
   #[inline]
   pub fn new(bufs: &[MsgBufMut], from: bool) -> Self {
-    let buf_count =
-      NonZeroUsize::new(bufs.len()).expect("MsgRecv must contain at least one buffer");
-    let bufs =
-      NonNull::new(bufs.as_ptr().cast_mut()).expect("buffer slice pointer must be non-null");
+    let buf_count = NonZeroUsize::new(bufs.len())
+      .expect("MsgRecv must contain at least one buffer");
+    let bufs = NonNull::new(bufs.as_ptr().cast_mut())
+      .expect("buffer slice pointer must be non-null");
     Self { bufs, buf_count, from }
   }
 }
@@ -496,6 +501,75 @@ pub enum Op {
     flags: i32,
     /// File creation mode used when `O_CREAT` is set.
     mode: u32,
+  },
+  /// Remove a file or directory relative to a directory file descriptor.
+  ///
+  /// This is an immediate operation on readiness backends: it should execute
+  /// during `flush()` and surface its completion on the next `wait()`.
+  UnlinkAt {
+    /// Directory file descriptor used as the base for relative paths.
+    dir_fd: Resource,
+    /// Null-terminated pathname pointer.
+    path: *const c_char,
+    /// Flags passed to `unlinkat(2)`.
+    flags: i32,
+  },
+  /// Rename a file or directory relative to directory file descriptors.
+  ///
+  /// This is an immediate operation on readiness backends: it should execute
+  /// during `flush()` and surface its completion on the next `wait()`.
+  RenameAt {
+    /// Directory file descriptor used as the base for the old path.
+    old_dir_fd: Resource,
+    /// Null-terminated old pathname pointer.
+    old_path: *const c_char,
+    /// Directory file descriptor used as the base for the new path.
+    new_dir_fd: Resource,
+    /// Null-terminated new pathname pointer.
+    new_path: *const c_char,
+  },
+  /// Create a directory relative to a directory file descriptor.
+  ///
+  /// This is an immediate operation on readiness backends: it should execute
+  /// during `flush()` and surface its completion on the next `wait()`.
+  MkdirAt {
+    /// Directory file descriptor used as the base for relative paths.
+    dir_fd: Resource,
+    /// Null-terminated pathname pointer.
+    path: *const c_char,
+    /// Mode passed to `mkdirat(2)`.
+    mode: u32,
+  },
+  /// Create a hard or symbolic link relative to directory file descriptors.
+  ///
+  /// For symbolic links, `source_dir_fd` is ignored on Unix and `source_path`
+  /// is used as the target string for the new link.
+  LinkAt {
+    /// Link flavor to create.
+    kind: LinkKind,
+    /// Directory file descriptor used as the base for the source path.
+    source_dir_fd: Resource,
+    /// Null-terminated source pathname pointer or symlink target string.
+    source_path: *const c_char,
+    /// Directory file descriptor used as the base for the new path.
+    new_dir_fd: Resource,
+    /// Null-terminated new pathname pointer.
+    new_path: *const c_char,
+  },
+  /// Read the target of a symbolic link relative to a directory file descriptor.
+  ///
+  /// This is an immediate operation on readiness backends. On io_uring it is
+  /// completed through a userspace immediate syscall path because there is no
+  /// native opcode in the bundled `lio-uring` surface.
+  ReadlinkAt {
+    /// Directory file descriptor used as the base for relative paths.
+    dir_fd: Resource,
+    /// Null-terminated pathname pointer.
+    path: *const c_char,
+    /// Output buffer pointer.
+    buf: *mut u8,
+    /// Output buffer length.
+    buf_len: usize,
   },
   /// Create a new socket descriptor.
   ///

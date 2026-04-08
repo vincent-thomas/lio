@@ -46,7 +46,7 @@ extern crate core;
 use core::mem::MaybeUninit;
 use core::ptr;
 use std::io::{self, IoSlice};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub mod operation;
 
@@ -421,11 +421,18 @@ impl LioUring {
     &mut self,
     timeout: Duration,
   ) -> io::Result<Option<Completion>> {
+    let deadline = Instant::now() + timeout;
+
     loop {
+      let remaining = deadline.saturating_duration_since(Instant::now());
+      if remaining.is_zero() {
+        return Ok(None);
+      }
+
       let mut cqe_ptr = ptr::null_mut();
       let mut ts = bindings::__kernel_timespec {
-        tv_sec: timeout.as_secs() as i64,
-        tv_nsec: timeout.subsec_nanos() as i64,
+        tv_sec: remaining.as_secs() as i64,
+        tv_nsec: remaining.subsec_nanos() as i64,
       };
 
       let ret = unsafe {

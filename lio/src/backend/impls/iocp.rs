@@ -12,7 +12,7 @@
 //!
 //! - **Native IOCP**: Read, Write, ReadAt, WriteAt, Send, Recv, Accept, Connect
 //!   - Use OVERLAPPED for async completion
-//! - **Blocking**: Socket, Bind, Listen, Close, Fsync, Truncate, Shutdown, OpenAt, LinkAt, SymlinkAt, Flock, Nop
+//! - **Blocking**: Socket, Bind, Listen, Close, Fsync, Truncate, Shutdown, OpenAt, LinkAt, Flock, Nop
 //!   - Execute synchronously in push(), complete immediately
 //! - **Timer**: Timeout
 //!   - Use CreateTimerQueueTimer, post to IOCP on expiry
@@ -203,10 +203,11 @@ impl Iocp {
   fn run_blocking(op: &Op) -> isize {
     match op {
       Op::Socket { domain, ty, proto } => {
-        let (domain, ty, proto) = match crate::backend::op::socket_to_raw(*domain, *ty, *proto) {
-          Ok(raw) => raw,
-          Err(errno) => return -(errno as isize),
-        };
+        let (domain, ty, proto) =
+          match crate::backend::op::socket_to_raw(*domain, *ty, *proto) {
+            Ok(raw) => raw,
+            Err(errno) => return -(errno as isize),
+          };
         let sock = unsafe { socket(domain, ty, proto) };
         if sock == INVALID_SOCKET {
           Self::error_result(unsafe { WSAGetLastError() } as u32)
@@ -322,15 +323,25 @@ impl Iocp {
         }
       }
 
-      Op::LinkAt { .. } => {
-        // Windows doesn't support linkat directly
-        // Would need CreateHardLinkW but lacks dir_fd semantics
+      Op::UnlinkAt { .. } => {
         Self::error_result(windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED)
       }
 
-      Op::SymlinkAt { .. } => {
-        // Windows symlinks require elevated privileges
-        // Would need CreateSymbolicLinkW
+      Op::RenameAt { .. } => {
+        Self::error_result(windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED)
+      }
+
+      Op::MkdirAt { .. } => {
+        Self::error_result(windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED)
+      }
+
+      Op::LinkAt { .. } => {
+        // Windows would need CreateHardLinkW/CreateSymbolicLinkW plus custom
+        // dir-fd semantics for this path-based operation.
+        Self::error_result(windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED)
+      }
+
+      Op::ReadlinkAt { .. } => {
         Self::error_result(windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED)
       }
 
@@ -952,8 +963,11 @@ impl IoBackend for Iocp {
       | Op::Truncate { .. }
       | Op::Shutdown { .. }
       | Op::OpenAt { .. }
+      | Op::UnlinkAt { .. }
+      | Op::RenameAt { .. }
+      | Op::MkdirAt { .. }
       | Op::LinkAt { .. }
-      | Op::SymlinkAt { .. }
+      | Op::ReadlinkAt { .. }
       | Op::Flock { .. }
       | Op::Nop => {
         let result = Self::run_blocking(&op);

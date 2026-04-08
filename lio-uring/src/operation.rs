@@ -3107,12 +3107,7 @@ mod smoke_tests {
   );
   smoke_test!(
     SetXattr,
-    SetXattr::new(
-      core::ptr::null(),
-      core::ptr::null(),
-      core::ptr::null(),
-      0
-    )
+    SetXattr::new(core::ptr::null(), core::ptr::null(), core::ptr::null(), 0)
   );
   smoke_test!(SyncFileRange, SyncFileRange::new(0, 0));
   smoke_test!(

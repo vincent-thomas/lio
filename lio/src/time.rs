@@ -13,8 +13,8 @@ use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 
 use crate::Lio;
-pub use clock::{Clock, TimerId};
 use clock::TICK_MS;
+pub use clock::{Clock, TimerId};
 
 /// Runtime-facing time manager that adapts [`Clock`] to wall-clock time.
 #[derive(Debug)]
@@ -54,7 +54,9 @@ impl TimeManager {
 
   fn now_ticks(&self) -> u64 {
     match self.state {
-      TimeState::Running { epoch } => epoch.elapsed().as_millis() as u64 / TICK_MS,
+      TimeState::Running { epoch } => {
+        epoch.elapsed().as_millis() as u64 / TICK_MS
+      }
       TimeState::Paused => self.clock.current_tick(),
     }
   }

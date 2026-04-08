@@ -1,6 +1,9 @@
 mod clock;
 
-use crate::{Lio, time::{self, TimeManager}};
+use crate::{
+  Lio,
+  time::{self, TimeManager},
+};
 use std::{thread, time::Duration};
 
 #[test]

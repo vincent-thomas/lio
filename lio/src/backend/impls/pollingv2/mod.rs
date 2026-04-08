@@ -27,7 +27,8 @@ use std::{
 };
 
 use crate::backend::{
-  IoBackend, OpCompleted, impls::pollingv2::interest::Interest,
+  IoBackend, OpCompleted,
+  impls::pollingv2::interest::Interest,
   op::{MsgRecv, MsgSend, Op},
 };
 mod interest;
@@ -186,8 +187,9 @@ impl Poller {
     libc::msghdr,
     Option<(libc::sockaddr_storage, libc::socklen_t)>,
   )> {
-    let bufs =
-      unsafe { std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get()) };
+    let bufs = unsafe {
+      std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
+    };
     let mut iovecs =
       [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
         crate::buf::MAX_IOV_COUNT];
@@ -224,8 +226,9 @@ impl Poller {
     libc::msghdr,
     Option<(libc::sockaddr_storage, libc::socklen_t)>,
   )> {
-    let bufs =
-      unsafe { std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get()) };
+    let bufs = unsafe {
+      std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
+    };
     let mut iovecs =
       [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
         crate::buf::MAX_IOV_COUNT];
@@ -391,6 +394,11 @@ impl Poller {
       }
       crate::backend::op::Op::Socket { .. } => (0, Interest::NONE),
       crate::backend::op::Op::OpenAt { .. } => (0, Interest::NONE),
+      crate::backend::op::Op::UnlinkAt { .. } => (0, Interest::NONE),
+      crate::backend::op::Op::RenameAt { .. } => (0, Interest::NONE),
+      crate::backend::op::Op::MkdirAt { .. } => (0, Interest::NONE),
+      crate::backend::op::Op::LinkAt { .. } => (0, Interest::NONE),
+      crate::backend::op::Op::ReadlinkAt { .. } => (0, Interest::NONE),
       crate::backend::op::Op::Nop => (0, Interest::NONE),
     }
   }
@@ -400,6 +408,11 @@ impl Poller {
       Op::Read { fd, .. } | Op::Write { fd, .. } => fd.as_raw_fd(),
       Op::Socket { .. } => return true,
       Op::OpenAt { .. } => return true,
+      Op::UnlinkAt { .. } => return true,
+      Op::RenameAt { .. } => return true,
+      Op::MkdirAt { .. } => return true,
+      Op::LinkAt { .. } => return true,
+      Op::ReadlinkAt { .. } => return true,
       _ => return false,
     };
 
@@ -523,6 +536,48 @@ impl Poller {
         *path,
         *flags,
         *mode,
+      )),
+      Op::UnlinkAt { dir_fd, path, flags } => syscall!(raw unlinkat(
+        dir_fd.as_raw_fd(),
+        *path,
+        *flags,
+      )),
+      Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
+        syscall!(raw renameat(
+          old_dir_fd.as_raw_fd(),
+          *old_path,
+          new_dir_fd.as_raw_fd(),
+          *new_path,
+        ))
+      }
+      Op::MkdirAt { dir_fd, path, mode } => {
+        syscall!(raw mkdirat(
+          dir_fd.as_raw_fd(),
+          *path,
+          *mode as libc::mode_t,
+        ))
+      }
+      Op::LinkAt { kind, source_dir_fd, source_path, new_dir_fd, new_path } => {
+        match kind {
+          crate::backend::op::LinkKind::Hard => syscall!(raw linkat(
+            source_dir_fd.as_raw_fd(),
+            *source_path,
+            new_dir_fd.as_raw_fd(),
+            *new_path,
+            0,
+          )),
+          crate::backend::op::LinkKind::Soft => syscall!(raw symlinkat(
+            *source_path,
+            new_dir_fd.as_raw_fd(),
+            *new_path,
+          )),
+        }
+      }
+      Op::ReadlinkAt { dir_fd, path, buf, buf_len } => syscall!(raw readlinkat(
+        dir_fd.as_raw_fd(),
+        *path,
+        (*buf).cast::<libc::c_char>(),
+        *buf_len,
       )),
 
       Op::Socket { domain, ty, proto } => {
