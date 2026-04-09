@@ -1,16 +1,28 @@
 use std::{
   ffi::CString,
   fs, io,
-  os::unix::fs::PermissionsExt,
+  os::unix::fs::{MetadataExt, PermissionsExt},
   path::{Path, PathBuf},
 };
 
 use lio::{api, api::ops::LinkKind};
 
-use crate::{app::AppContext, command::Command, util::io as io_util};
+use crate::{
+  app::AppContext,
+  applets::readlink::read_link_target,
+  command::Command,
+  util::{
+    flags::{FlagParser, FlagSpec},
+    fs as fs_util, io as io_util,
+  },
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct MvCommand {
+  pub force: bool,
+  pub no_clobber: bool,
+  pub update: bool,
+  pub verbose: bool,
   pub sources: Vec<String>,
   pub dest: String,
 }
@@ -25,26 +37,61 @@ impl Command for MvCommand {
   }
 
   fn usage() -> &'static str {
-    "mv <source>... <dest>"
+    "mv [-fnuv] <source>... <dest>"
   }
 
   fn parse(args: &[String]) -> io::Result<Self> {
-    if args.len() < 2 {
+    const SPECS: &[FlagSpec<'static>] = &[
+      FlagSpec {
+        name: "force",
+        short: &['f'],
+        long: &["force"],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "no-clobber",
+        short: &['n'],
+        long: &["no-clobber"],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "update",
+        short: &['u'],
+        long: &["update"],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "verbose",
+        short: &['v'],
+        long: &["verbose"],
+        takes_value: false,
+      },
+    ];
+    let parsed = FlagParser::new("mv", SPECS).parse(args)?;
+
+    if parsed.positional().len() < 2 {
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "mv: missing file operand",
       ));
     }
 
-    let (dest, sources) = args.split_last().expect("validated arg length");
-    Ok(Self { sources: sources.to_vec(), dest: dest.clone() })
+    let (dest, sources) =
+      parsed.positional().split_last().expect("validated arg length");
+    Ok(Self {
+      force: parsed.get_flag_exists("force"),
+      no_clobber: parsed.get_flag_exists("no-clobber"),
+      update: parsed.get_flag_exists("update"),
+      verbose: parsed.get_flag_exists("verbose"),
+      sources: sources.to_vec(),
+      dest: dest.clone(),
+    })
   }
 
   fn execute(&self, ctx: &AppContext) -> io::Result<()> {
     let dest_path = Path::new(&self.dest);
-    let dest_is_dir = fs::metadata(dest_path)
-      .map(|metadata| metadata.is_dir())
-      .unwrap_or(false);
+    let dest_is_dir = fs_util::stat_path(ctx, dest_path, true)?
+      .is_some_and(|stat| stat.is_dir());
 
     if self.sources.len() > 1 && !dest_is_dir {
       return Err(io::Error::new(
@@ -56,11 +103,38 @@ impl Command for MvCommand {
     for source in &self.sources {
       let source_path = Path::new(source);
       let target = resolve_destination(source_path, dest_path, dest_is_dir)?;
-      move_path(ctx, source_path, &target)?;
+      validate_move(source_path, &target)?;
+      move_path(ctx, source_path, &target, self)?;
     }
 
     Ok(())
   }
+}
+
+fn validate_move(source: &Path, dest: &Path) -> io::Result<()> {
+  if source == dest {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidInput,
+      format!(
+        "mv: '{}' and '{}' are the same file",
+        source.display(),
+        dest.display()
+      ),
+    ));
+  }
+
+  if source.is_dir() && dest.starts_with(source) {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidInput,
+      format!(
+        "mv: cannot move '{}' to a subdirectory of itself, '{}'",
+        source.display(),
+        dest.display()
+      ),
+    ));
+  }
+
+  Ok(())
 }
 
 fn resolve_destination(
@@ -81,14 +155,48 @@ fn resolve_destination(
   Ok(dest.to_path_buf())
 }
 
-fn move_path(ctx: &AppContext, source: &Path, dest: &Path) -> io::Result<()> {
+fn move_path(
+  ctx: &AppContext,
+  source: &Path,
+  dest: &Path,
+  command: &MvCommand,
+) -> io::Result<()> {
+  if should_skip_move(source, dest, command)? {
+    return Ok(());
+  }
+
   match rename_path(ctx, source, dest) {
-    Ok(()) => Ok(()),
+    Ok(()) => write_verbose(ctx, command.verbose, source, dest),
     Err(err) if err.raw_os_error() == Some(libc::EXDEV) => {
-      copy_and_remove_source(ctx, source, dest)
+      copy_and_remove_source(ctx, source, dest, command)
     }
     Err(err) => Err(err),
   }
+}
+
+fn should_skip_move(
+  source: &Path,
+  dest: &Path,
+  command: &MvCommand,
+) -> io::Result<bool> {
+  if !dest.exists() {
+    return Ok(false);
+  }
+
+  if command.no_clobber {
+    return Ok(true);
+  }
+
+  if command.update {
+    let source_mtime = fs::metadata(source)?.mtime();
+    let dest_mtime = fs::metadata(dest)?.mtime();
+    if dest_mtime >= source_mtime {
+      return Ok(true);
+    }
+  }
+
+  let _ = command.force;
+  Ok(false)
 }
 
 fn rename_path(ctx: &AppContext, source: &Path, dest: &Path) -> io::Result<()> {
@@ -104,24 +212,38 @@ fn copy_and_remove_source(
   ctx: &AppContext,
   source: &Path,
   dest: &Path,
+  command: &MvCommand,
 ) -> io::Result<()> {
-  let metadata = fs::symlink_metadata(source)?;
-  let file_type = metadata.file_type();
+  let metadata = fs_util::stat_path(ctx, source, false)?
+    .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
 
-  if file_type.is_dir() {
-    copy_dir_recursive(ctx, source, dest, metadata.permissions())?;
+  if metadata.is_dir() {
+    remove_existing_destination(dest, true)?;
+    copy_dir_recursive(ctx, source, dest, metadata.permissions, command)?;
     remove_source_dir_tree(ctx, source)?;
+    write_verbose(ctx, command.verbose, source, dest)?;
     return Ok(());
   }
 
-  if file_type.is_symlink() {
+  if metadata.is_symlink() {
+    remove_existing_destination(dest, false)?;
     copy_symlink_and_remove_source(ctx, source, dest)?;
+    write_verbose(ctx, command.verbose, source, dest)?;
     return Ok(());
   }
 
-  fs::copy(source, dest)?;
-  fs::set_permissions(dest, metadata.permissions())?;
+  remove_existing_destination(dest, false)?;
+  let source_metadata = fs::metadata(source)?;
+  copy_regular_file(
+    ctx,
+    source,
+    dest,
+    metadata.permissions,
+    source_metadata.atime(),
+    source_metadata.mtime(),
+  )?;
   unlink_path(ctx, source)?;
+  write_verbose(ctx, command.verbose, source, dest)?;
   Ok(())
 }
 
@@ -130,8 +252,10 @@ fn copy_symlink_and_remove_source(
   source: &Path,
   dest: &Path,
 ) -> io::Result<()> {
-  let target = fs::read_link(source)?;
-  let source_cpath = path_to_cstring(&target, "mv")?;
+  let target = read_link_target(ctx, source)?;
+  let source_cpath = CString::new(target.as_str()).map_err(|_| {
+    io::Error::new(io::ErrorKind::InvalidInput, "mv: invalid symlink target")
+  })?;
   let dest_cpath = path_to_cstring(dest, "mv")?;
   let mut receiver = api::linkat(
     &ctx.cwd(),
@@ -143,25 +267,44 @@ fn copy_symlink_and_remove_source(
   .with_lio(ctx.lio())
   .send();
   io_util::run_recv(ctx.lio(), &mut receiver)?;
+  let metadata = fs::symlink_metadata(source)?;
+  preserve_file_times(dest, metadata.atime(), metadata.mtime(), true)?;
   unlink_path(ctx, source)
+}
+
+fn copy_regular_file(
+  ctx: &AppContext,
+  source: &Path,
+  dest: &Path,
+  mode: u32,
+  atime: i64,
+  mtime: i64,
+) -> io::Result<()> {
+  let _ = ctx;
+  fs::copy(source, dest)?;
+  fs::set_permissions(dest, fs::Permissions::from_mode(mode & 0o7777))?;
+  preserve_file_times(dest, atime, mtime, false)?;
+  Ok(())
 }
 
 fn copy_dir_recursive(
   ctx: &AppContext,
   source: &Path,
   dest: &Path,
-  permissions: fs::Permissions,
+  permissions: u32,
+  command: &MvCommand,
 ) -> io::Result<()> {
-  mkdir_path(ctx, dest, permissions.mode())?;
+  mkdir_path(ctx, dest, permissions)?;
 
-  for entry in fs::read_dir(source)? {
-    let entry = entry?;
-    let child_source = entry.path();
-    let child_dest = dest.join(entry.file_name());
-    copy_and_remove_source(ctx, &child_source, &child_dest)?;
+  for entry in fs_util::read_dir_path(ctx, source)? {
+    let child_source = source.join(&entry.name);
+    let child_dest = dest.join(entry.name);
+    copy_and_remove_source(ctx, &child_source, &child_dest, command)?;
   }
 
-  fs::set_permissions(dest, permissions)?;
+  fs::set_permissions(dest, fs::Permissions::from_mode(permissions))?;
+  let metadata = fs::metadata(source)?;
+  preserve_file_times(dest, metadata.atime(), metadata.mtime(), false)?;
   Ok(())
 }
 
@@ -196,6 +339,62 @@ fn path_to_cstring(path: &Path, command: &str) -> io::Result<CString> {
   })
 }
 
+fn remove_existing_destination(
+  dest: &Path,
+  source_is_dir: bool,
+) -> io::Result<()> {
+  let Ok(metadata) = fs::symlink_metadata(dest) else {
+    return Ok(());
+  };
+
+  if metadata.is_dir() {
+    if !source_is_dir {
+      return Err(io::Error::new(
+        io::ErrorKind::IsADirectory,
+        format!("mv: cannot overwrite directory '{}'", dest.display()),
+      ));
+    }
+    fs::remove_dir(dest)
+  } else {
+    fs::remove_file(dest)
+  }
+}
+
+fn preserve_file_times(
+  path: &Path,
+  atime_secs: i64,
+  mtime_secs: i64,
+  no_follow: bool,
+) -> io::Result<()> {
+  let c_path = CString::new(path.as_os_str().to_string_lossy().as_bytes())
+    .map_err(|_| {
+      io::Error::new(io::ErrorKind::InvalidInput, "mv: invalid path")
+    })?;
+  let times = [
+    libc::timespec { tv_sec: atime_secs, tv_nsec: 0 },
+    libc::timespec { tv_sec: mtime_secs, tv_nsec: 0 },
+  ];
+  let flags = if no_follow { libc::AT_SYMLINK_NOFOLLOW } else { 0 };
+  let rc = unsafe {
+    libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), flags)
+  };
+  if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+fn write_verbose(
+  ctx: &AppContext,
+  enabled: bool,
+  source: &Path,
+  dest: &Path,
+) -> io::Result<()> {
+  if !enabled {
+    return Ok(());
+  }
+  let line =
+    format!("renamed '{}' -> '{}'\n", source.display(), dest.display());
+  io_util::write_all(ctx.lio(), &ctx.stdout(), line.into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -218,6 +417,17 @@ mod tests {
   }
 
   #[test]
+  fn parse_mv_supports_overwrite_policy_flags() {
+    let parsed =
+      MvCommand::parse(&["-nuv".into(), "a".into(), "dest".into()]).unwrap();
+    assert!(parsed.no_clobber);
+    assert!(parsed.update);
+    assert!(parsed.verbose);
+    assert_eq!(parsed.sources, vec!["a"]);
+    assert_eq!(parsed.dest, "dest");
+  }
+
+  #[test]
   fn mv_renames_single_path() {
     let ctx = AppContext::new().unwrap();
     let source = unique_temp_path("mv-source");
@@ -227,6 +437,7 @@ mod tests {
     MvCommand {
       sources: vec![source.display().to_string()],
       dest: dest.display().to_string(),
+      ..MvCommand::default()
     }
     .execute(&ctx)
     .unwrap();
@@ -249,6 +460,7 @@ mod tests {
     MvCommand {
       sources: vec![source.display().to_string()],
       dest: dest_dir.display().to_string(),
+      ..MvCommand::default()
     }
     .execute(&ctx)
     .unwrap();
@@ -275,6 +487,7 @@ mod tests {
         source_b.display().to_string(),
       ],
       dest: dest.display().to_string(),
+      ..MvCommand::default()
     }
     .execute(&ctx)
     .unwrap_err();
@@ -306,6 +519,7 @@ mod tests {
         source_b.display().to_string(),
       ],
       dest: dest_dir.display().to_string(),
+      ..MvCommand::default()
     }
     .execute(&ctx)
     .unwrap();
@@ -319,13 +533,51 @@ mod tests {
   }
 
   #[test]
+  fn mv_rejects_same_source_and_destination() {
+    let ctx = AppContext::new().unwrap();
+    let source = unique_temp_path("mv-same");
+    fs::write(&source, b"hello").unwrap();
+
+    let err = MvCommand {
+      sources: vec![source.display().to_string()],
+      dest: source.display().to_string(),
+      ..MvCommand::default()
+    }
+    .execute(&ctx)
+    .unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    fs::remove_file(source).unwrap();
+  }
+
+  #[test]
+  fn mv_rejects_moving_directory_into_itself() {
+    let ctx = AppContext::new().unwrap();
+    let source = unique_temp_path("mv-self-dir");
+    fs::create_dir(&source).unwrap();
+    let dest = source.join("nested");
+
+    let err = MvCommand {
+      sources: vec![source.display().to_string()],
+      dest: dest.display().to_string(),
+      ..MvCommand::default()
+    }
+    .execute(&ctx)
+    .unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    fs::remove_dir(source).unwrap();
+  }
+
+  #[test]
   fn fallback_copy_removes_source_for_regular_file() {
     let ctx = AppContext::new().unwrap();
     let source = unique_temp_path("mv-fallback-source");
     let dest = unique_temp_path("mv-fallback-dest");
     fs::write(&source, b"hello").unwrap();
 
-    copy_and_remove_source(&ctx, &source, &dest).unwrap();
+    copy_and_remove_source(&ctx, &source, &dest, &MvCommand::default())
+      .unwrap();
 
     assert!(!source.exists());
     assert_eq!(fs::read(&dest).unwrap(), b"hello");
@@ -340,7 +592,8 @@ mod tests {
     let dest = unique_temp_path("mv-fallback-dir-dest");
     fs::create_dir(&source).unwrap();
 
-    copy_and_remove_source(&ctx, &source, &dest).unwrap();
+    copy_and_remove_source(&ctx, &source, &dest, &MvCommand::default())
+      .unwrap();
 
     assert!(!source.exists());
     assert!(dest.exists());
@@ -359,7 +612,8 @@ mod tests {
     fs::create_dir(&nested).unwrap();
     fs::write(nested.join("file.txt"), b"hello").unwrap();
 
-    copy_and_remove_source(&ctx, &source, &dest).unwrap();
+    copy_and_remove_source(&ctx, &source, &dest, &MvCommand::default())
+      .unwrap();
 
     assert!(!source.exists());
     assert_eq!(
@@ -391,6 +645,110 @@ mod tests {
 
     fs::remove_file(dest).unwrap();
     fs::remove_file(target).unwrap();
+  }
+
+  #[test]
+  fn fallback_copy_replaces_existing_symlink_destination() {
+    let ctx = AppContext::new().unwrap();
+    let source = unique_temp_path("mv-replace-source");
+    let stale_target = unique_temp_path("mv-replace-stale");
+    let dest = unique_temp_path("mv-replace-dest");
+    fs::write(&source, b"hello").unwrap();
+    fs::write(&stale_target, b"stale").unwrap();
+    std::os::unix::fs::symlink(&stale_target, &dest).unwrap();
+
+    copy_and_remove_source(&ctx, &source, &dest, &MvCommand::default())
+      .unwrap();
+
+    assert!(!source.exists());
+    assert_eq!(fs::read(&dest).unwrap(), b"hello");
+    assert!(fs::symlink_metadata(&dest).unwrap().file_type().is_file());
+
+    fs::remove_file(dest).unwrap();
+    fs::remove_file(stale_target).unwrap();
+  }
+
+  #[test]
+  fn fallback_copy_preserves_permissions_for_regular_files() {
+    let ctx = AppContext::new().unwrap();
+    let source = unique_temp_path("mv-preserve-source");
+    let dest = unique_temp_path("mv-preserve-dest");
+    fs::write(&source, b"hello").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o751)).unwrap();
+
+    copy_and_remove_source(&ctx, &source, &dest, &MvCommand::default())
+      .unwrap();
+
+    let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o751);
+
+    fs::remove_file(dest).unwrap();
+  }
+
+  #[test]
+  fn mv_n_keeps_existing_destination_and_source() {
+    let ctx = AppContext::new().unwrap();
+    let source = unique_temp_path("mv-no-clobber-source");
+    let dest = unique_temp_path("mv-no-clobber-dest");
+    fs::write(&source, b"source").unwrap();
+    fs::write(&dest, b"dest").unwrap();
+
+    MvCommand {
+      no_clobber: true,
+      sources: vec![source.display().to_string()],
+      dest: dest.display().to_string(),
+      ..MvCommand::default()
+    }
+    .execute(&ctx)
+    .unwrap();
+
+    assert_eq!(fs::read(&source).unwrap(), b"source");
+    assert_eq!(fs::read(&dest).unwrap(), b"dest");
+
+    fs::remove_file(source).unwrap();
+    fs::remove_file(dest).unwrap();
+  }
+
+  #[test]
+  fn mv_u_skips_when_destination_is_newer() {
+    let ctx = AppContext::new().unwrap();
+    let source = unique_temp_path("mv-update-source");
+    let dest = unique_temp_path("mv-update-dest");
+    fs::write(&source, b"old-source").unwrap();
+    fs::write(&dest, b"new-dest").unwrap();
+    let newer = [libc::timespec { tv_sec: 2_000_000_000, tv_nsec: 0 }; 2];
+    let older = [libc::timespec { tv_sec: 1_000_000_000, tv_nsec: 0 }; 2];
+    let source_c =
+      CString::new(source.as_os_str().to_string_lossy().as_bytes()).unwrap();
+    let dest_c =
+      CString::new(dest.as_os_str().to_string_lossy().as_bytes()).unwrap();
+    assert_eq!(
+      unsafe {
+        libc::utimensat(libc::AT_FDCWD, source_c.as_ptr(), older.as_ptr(), 0)
+      },
+      0
+    );
+    assert_eq!(
+      unsafe {
+        libc::utimensat(libc::AT_FDCWD, dest_c.as_ptr(), newer.as_ptr(), 0)
+      },
+      0
+    );
+
+    MvCommand {
+      update: true,
+      sources: vec![source.display().to_string()],
+      dest: dest.display().to_string(),
+      ..MvCommand::default()
+    }
+    .execute(&ctx)
+    .unwrap();
+
+    assert_eq!(fs::read(&source).unwrap(), b"old-source");
+    assert_eq!(fs::read(&dest).unwrap(), b"new-dest");
+
+    fs::remove_file(source).unwrap();
+    fs::remove_file(dest).unwrap();
   }
 
   fn unique_temp_path(name: &str) -> PathBuf {

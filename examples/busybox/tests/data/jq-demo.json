@@ -1,0 +1,47 @@
+{
+  "meta": {
+    "project": "lio",
+    "tags": [
+      "async",
+      "io",
+      "rust"
+    ]
+  },
+  "users": [
+    {
+      "name": "vt",
+      "active": true,
+      "scores": [
+        3,
+        5,
+        8
+      ]
+    },
+    {
+      "name": "ada",
+      "active": false,
+      "scores": [
+        13,
+        21
+      ]
+    },
+    {
+      "name": "linus",
+      "active": true
+    }
+  ],
+  "builds": [
+    {
+      "id": 101,
+      "status": "ok"
+    },
+    {
+      "id": 102,
+      "status": "failed"
+    },
+    {
+      "id": 103,
+      "status": "ok"
+    }
+  ]
+}

@@ -1,6 +1,8 @@
-use std::{fs, io};
+use std::{io, path::Path};
 
-use crate::{app::AppContext, command::Command, exit_with_status};
+use crate::{
+  app::AppContext, command::Command, exit_with_status, util::fs as fs_util,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct TestCommand {
@@ -40,17 +42,20 @@ impl Command for TestCommand {
     Ok(Self { negate, operands })
   }
 
-  fn execute(&self, _ctx: &AppContext) -> io::Result<()> {
-    let result = evaluate_expression(&self.operands)?;
+  fn execute(&self, ctx: &AppContext) -> io::Result<()> {
+    let result = evaluate_expression(ctx, &self.operands)?;
     if self.negate ^ result { Ok(()) } else { Err(exit_with_status(1)) }
   }
 }
 
-fn evaluate_expression(operands: &[String]) -> io::Result<bool> {
+fn evaluate_expression(
+  ctx: &AppContext,
+  operands: &[String],
+) -> io::Result<bool> {
   match operands {
     [] => Ok(false),
     [value] => Ok(!value.is_empty()),
-    [operator, value] => evaluate_unary(operator, value),
+    [operator, value] => evaluate_unary(ctx, operator, value),
     [left, operator, right] => evaluate_binary(left, operator, right),
     _ => Err(io::Error::new(
       io::ErrorKind::InvalidInput,
@@ -59,18 +64,20 @@ fn evaluate_expression(operands: &[String]) -> io::Result<bool> {
   }
 }
 
-fn evaluate_unary(operator: &str, value: &str) -> io::Result<bool> {
+fn evaluate_unary(
+  ctx: &AppContext,
+  operator: &str,
+  value: &str,
+) -> io::Result<bool> {
   match operator {
     "-n" => Ok(!value.is_empty()),
     "-z" => Ok(value.is_empty()),
-    "-e" => Ok(fs::metadata(value).is_ok()),
-    "-f" => Ok(fs::metadata(value).map(|meta| meta.is_file()).unwrap_or(false)),
-    "-d" => Ok(fs::metadata(value).map(|meta| meta.is_dir()).unwrap_or(false)),
-    "-L" | "-h" => Ok(
-      fs::symlink_metadata(value)
-        .map(|meta| meta.file_type().is_symlink())
-        .unwrap_or(false),
-    ),
+    "-e" => Ok(stat_path(ctx, value, true)?.is_some()),
+    "-f" => Ok(stat_path(ctx, value, true)?.is_some_and(|meta| meta.is_file())),
+    "-d" => Ok(stat_path(ctx, value, true)?.is_some_and(|meta| meta.is_dir())),
+    "-L" | "-h" => {
+      Ok(stat_path(ctx, value, false)?.is_some_and(|meta| meta.is_symlink()))
+    }
     _ => Err(io::Error::new(
       io::ErrorKind::InvalidInput,
       format!("test: unsupported unary operator {operator}"),
@@ -108,10 +115,18 @@ fn parse_integer(value: &str) -> io::Result<i64> {
   })
 }
 
+fn stat_path(
+  ctx: &AppContext,
+  value: &str,
+  follow_symlinks: bool,
+) -> io::Result<Option<lio::api::FileStat>> {
+  fs_util::stat_path(ctx, Path::new(value), follow_symlinks)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::path::PathBuf;
+  use std::{fs, path::PathBuf};
 
   #[test]
   fn parse_test_command_supports_bracket_suffix() {
@@ -129,29 +144,34 @@ mod tests {
 
   #[test]
   fn test_evaluates_string_and_numeric_expressions() {
+    let ctx = AppContext::new().unwrap();
     assert!(
-      evaluate_expression(&["a".into(), "=".into(), "a".into()]).unwrap()
+      evaluate_expression(&ctx, &["a".into(), "=".into(), "a".into()]).unwrap()
     );
     assert!(
-      evaluate_expression(&["7".into(), "-gt".into(), "3".into()]).unwrap()
+      evaluate_expression(&ctx, &["7".into(), "-gt".into(), "3".into()])
+        .unwrap()
     );
-    assert!(!evaluate_expression(&["".into()]).unwrap());
+    assert!(!evaluate_expression(&ctx, &["".into()]).unwrap());
   }
 
   #[test]
   fn test_evaluates_file_predicates() {
+    let ctx = AppContext::new().unwrap();
     let path = std::env::temp_dir()
       .join(format!("busybox-test-command-{}.txt", std::process::id()));
     fs::write(&path, b"hello").unwrap();
 
     assert!(
-      evaluate_expression(&["-e".into(), path.display().to_string(),]).unwrap()
+      evaluate_expression(&ctx, &["-e".into(), path.display().to_string(),])
+        .unwrap()
     );
     assert!(
-      evaluate_expression(&["-f".into(), path.display().to_string(),]).unwrap()
+      evaluate_expression(&ctx, &["-f".into(), path.display().to_string(),])
+        .unwrap()
     );
     assert!(
-      !evaluate_expression(&["-d".into(), path.display().to_string(),])
+      !evaluate_expression(&ctx, &["-d".into(), path.display().to_string(),])
         .unwrap()
     );
 
@@ -160,6 +180,7 @@ mod tests {
 
   #[test]
   fn test_file_predicates_follow_symlinks() {
+    let ctx = AppContext::new().unwrap();
     let file = unique_temp_path("test-symlink-file");
     let file_link = unique_temp_path("test-symlink-file-link");
     let dir = unique_temp_path("test-symlink-dir");
@@ -170,29 +191,41 @@ mod tests {
     std::os::unix::fs::symlink(&dir, &dir_link).unwrap();
 
     assert!(
-      evaluate_expression(&["-e".into(), file_link.display().to_string()])
-        .unwrap()
+      evaluate_expression(
+        &ctx,
+        &["-e".into(), file_link.display().to_string()]
+      )
+      .unwrap()
     );
     assert!(
-      evaluate_expression(&["-f".into(), file_link.display().to_string()])
-        .unwrap()
+      evaluate_expression(
+        &ctx,
+        &["-f".into(), file_link.display().to_string()]
+      )
+      .unwrap()
     );
     assert!(
-      !evaluate_expression(&["-d".into(), file_link.display().to_string()])
-        .unwrap()
+      !evaluate_expression(
+        &ctx,
+        &["-d".into(), file_link.display().to_string()]
+      )
+      .unwrap()
     );
 
     assert!(
-      evaluate_expression(&["-e".into(), dir_link.display().to_string()])
+      evaluate_expression(&ctx, &["-e".into(), dir_link.display().to_string()])
         .unwrap()
     );
     assert!(
-      evaluate_expression(&["-d".into(), dir_link.display().to_string()])
+      evaluate_expression(&ctx, &["-d".into(), dir_link.display().to_string()])
         .unwrap()
     );
     assert!(
-      !evaluate_expression(&["-f".into(), dir_link.display().to_string()])
-        .unwrap()
+      !evaluate_expression(
+        &ctx,
+        &["-f".into(), dir_link.display().to_string()]
+      )
+      .unwrap()
     );
 
     fs::remove_file(file_link).unwrap();
@@ -203,6 +236,7 @@ mod tests {
 
   #[test]
   fn test_file_predicates_treat_broken_symlink_as_missing() {
+    let ctx = AppContext::new().unwrap();
     let target = unique_temp_path("test-broken-target");
     let link = unique_temp_path("test-broken-link");
     fs::write(&target, b"hello").unwrap();
@@ -210,13 +244,16 @@ mod tests {
     fs::remove_file(&target).unwrap();
 
     assert!(
-      !evaluate_expression(&["-e".into(), link.display().to_string()]).unwrap()
+      !evaluate_expression(&ctx, &["-e".into(), link.display().to_string()])
+        .unwrap()
     );
     assert!(
-      !evaluate_expression(&["-f".into(), link.display().to_string()]).unwrap()
+      !evaluate_expression(&ctx, &["-f".into(), link.display().to_string()])
+        .unwrap()
     );
     assert!(
-      !evaluate_expression(&["-d".into(), link.display().to_string()]).unwrap()
+      !evaluate_expression(&ctx, &["-d".into(), link.display().to_string()])
+        .unwrap()
     );
 
     fs::remove_file(link).unwrap();
@@ -224,19 +261,22 @@ mod tests {
 
   #[test]
   fn test_symlink_predicates_detect_symlinks_without_following() {
+    let ctx = AppContext::new().unwrap();
     let target = unique_temp_path("test-link-target");
     let link = unique_temp_path("test-link");
     fs::write(&target, b"hello").unwrap();
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
     assert!(
-      evaluate_expression(&["-L".into(), link.display().to_string()]).unwrap()
+      evaluate_expression(&ctx, &["-L".into(), link.display().to_string()])
+        .unwrap()
     );
     assert!(
-      evaluate_expression(&["-h".into(), link.display().to_string()]).unwrap()
+      evaluate_expression(&ctx, &["-h".into(), link.display().to_string()])
+        .unwrap()
     );
     assert!(
-      !evaluate_expression(&["-L".into(), target.display().to_string()])
+      !evaluate_expression(&ctx, &["-L".into(), target.display().to_string()])
         .unwrap()
     );
 
@@ -246,6 +286,7 @@ mod tests {
 
   #[test]
   fn test_symlink_predicates_match_broken_symlink() {
+    let ctx = AppContext::new().unwrap();
     let target = unique_temp_path("test-broken-link-target");
     let link = unique_temp_path("test-broken-link-predicate");
     fs::write(&target, b"hello").unwrap();
@@ -253,10 +294,12 @@ mod tests {
     fs::remove_file(&target).unwrap();
 
     assert!(
-      evaluate_expression(&["-L".into(), link.display().to_string()]).unwrap()
+      evaluate_expression(&ctx, &["-L".into(), link.display().to_string()])
+        .unwrap()
     );
     assert!(
-      evaluate_expression(&["-h".into(), link.display().to_string()]).unwrap()
+      evaluate_expression(&ctx, &["-h".into(), link.display().to_string()])
+        .unwrap()
     );
 
     fs::remove_file(link).unwrap();

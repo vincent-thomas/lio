@@ -1,3 +1,9 @@
+#![allow(
+  clippy::duplicate_mod,
+  clippy::unnecessary_mut_passed,
+  clippy::expect_fun_call
+)]
+
 //! Tests for send operations.
 
 use super::common;
@@ -119,24 +125,26 @@ fn with_flags() {
 fn concurrent_pairs() {
   let mut lio = Lio::new(256).unwrap();
   let mut pairs = Vec::new();
+  let mut receivers = Vec::new();
 
   for _ in 0..5 {
     pairs.push(setup_tcp_pair(&mut lio));
   }
 
-  let (sender_send, receiver_send) = mpsc::channel();
   let mut expected = Vec::new();
 
   for (i, pair) in pairs.iter().enumerate() {
     let data = format!("Client {} data", i).into_bytes();
     expected.push((i, data.clone()));
+    let (sender_send, receiver_send) = mpsc::channel();
     api::send(&pair.client_sock, data, None)
       .with_lio(&mut lio)
-      .send_with(sender_send.clone());
+      .send_with(sender_send);
+    receivers.push(receiver_send);
   }
 
-  for (_, data) in &expected {
-    let (res, returned) = poll_until_recv(&mut lio, &receiver_send);
+  for ((_, data), receiver) in expected.iter().zip(receivers.iter()) {
+    let (res, returned) = poll_until_recv(&mut lio, receiver);
     assert_eq!(res.expect("Send should succeed") as usize, data.len());
     assert_eq!(&returned, data);
   }

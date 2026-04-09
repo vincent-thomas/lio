@@ -1,3 +1,9 @@
+#![allow(
+  clippy::duplicate_mod,
+  clippy::unnecessary_mut_passed,
+  clippy::expect_fun_call
+)]
+
 /// write in append mode is not tested since `pwrite` doesn't support it.
 use super::common;
 

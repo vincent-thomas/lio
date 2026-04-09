@@ -11,16 +11,21 @@
 //!
 //! - [`SocketAccept`]: Accept operation that returns a [`Socket`]
 //! - [`SocketNew`]: Socket creation operation that returns a [`Socket`]
+//! - [`TcpBindListener`]: Socket-create/bind/listen operation that returns a [`TcpListener`]
+//! - [`TcpConnectSocket`]: Socket-create/connect operation that returns a [`TcpSocket`]
 
-use std::{io, net::SocketAddr, os::fd::FromRawFd};
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+use std::{io, net::SocketAddr};
 
 #[allow(unused_imports)] // TcpListener used in doc links
 use crate::{
   api::{
-    op::{OpModel, Step},
+    op::{Action, Completion, OneshotOpModel, OpModel, OpResult},
     ops,
     resource::FromResource,
   },
+  backend::op::{SockDomain, SockProto, SockType},
   net::{Socket, TcpListener, TcpSocket},
 };
 
@@ -40,21 +45,26 @@ impl SocketAccept {
   }
 }
 
-// LEGACY `OpModel` impl parked during the serial-contract migration.
-//
-// impl OpModel for SocketAccept {
-//   type Item = io::Result<(Socket, SocketAddr)>;
-//
-//   fn send_op(&mut self) -> OpFlow {
-//     self.inner.send_op()
-//   }
-//
-//   fn result(&mut self, res: isize) -> Step<Self::Item> {
-//     self.inner.result(res).map(|res| {
-//       res.map(|(resource, addr)| (Socket::from_resource(resource), addr))
-//     })
-//   }
-// }
+impl OpModel for SocketAccept {
+  type Item = io::Result<(Socket, SocketAddr)>;
+
+  fn action(&mut self) -> Action {
+    self.inner.action()
+  }
+
+  fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
+    match self.inner.complete(res) {
+      OpResult::Done(Ok((resource, addr))) => {
+        OpResult::Done(Ok((Socket::from_resource(resource), addr)))
+      }
+      OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
+      OpResult::Again => OpResult::Again,
+      OpResult::Yield(item) => OpResult::Yield(
+        item.map(|(resource, addr)| (Socket::from_resource(resource), addr)),
+      ),
+    }
+  }
+}
 
 /// Socket creation operation specialized for [`Socket`].
 ///
@@ -74,32 +84,47 @@ impl SocketNew {
   }
 }
 
-// LEGACY `OpModel` impl parked during the serial-contract migration.
-//
-// impl OpModel for SocketNew {
-//   type Item = io::Result<Socket>;
-//
-//   fn send_op(&mut self) -> OpFlow {
-//     OpFlow::Send(crate::backend::op::Op::Socket {
-//       domain: self.domain,
-//       ty: self.ty,
-//       proto: self.proto,
-//     })
-//   }
-//
-//   fn result(&mut self, res: isize) -> Step<Self::Item> {
-//     let result = if res < 0 {
-//       return Step::YieldAndSubmit(Err(io::Error::from_raw_os_error(
-//         -res as i32,
-//       )));
-//     } else {
-//       res as std::os::fd::RawFd
-//     };
-//     // SAFETY: result is valid fd.
-//     let res = unsafe { crate::api::resource::Resource::from_raw_fd(result) };
-//     Step::YieldAndSubmit(Ok(Socket::from_resource(res)))
-//   }
-// }
+impl OpModel for SocketNew {
+  type Item = io::Result<Socket>;
+
+  fn action(&mut self) -> Action {
+    Action::Io(crate::backend::op::Op::Socket {
+      domain: SockDomain::from_raw(self.domain)
+        .expect("SocketNew must be constructed with a valid socket domain"),
+      ty: SockType::from_raw(self.ty)
+        .expect("SocketNew must be constructed with a valid socket type"),
+      proto: SockProto::from_raw(self.proto)
+        .expect("SocketNew must be constructed with a valid socket protocol"),
+    })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    if completion.result < 0 {
+      return OpResult::Done(Err(io::Error::from_raw_os_error(
+        (-completion.result) as i32,
+      )));
+    }
+
+    #[cfg(unix)]
+    {
+      // SAFETY: successful socket creation returns a live file descriptor
+      // owned by this operation.
+      let resource = unsafe {
+        crate::api::resource::Resource::from_raw_fd(completion.result as _)
+      };
+      OpResult::Done(Ok(Socket::from_resource(resource)))
+    }
+
+    #[cfg(windows)]
+    {
+      // SAFETY: successful socket creation returns a valid socket handle.
+      let resource = unsafe {
+        crate::api::resource::Resource::from_raw_handle(completion.result as _)
+      };
+      OpResult::Done(Ok(Socket::from_resource(resource)))
+    }
+  }
+}
 
 pub struct TcpAccept {
   inner: ops::Accept,
@@ -113,16 +138,200 @@ impl TcpAccept {
 
 // LEGACY `OpModel` impl parked during the serial-contract migration.
 //
-// impl OpModel for TcpAccept {
-//   type Item = io::Result<(TcpSocket, SocketAddr)>;
-//
-//   fn send_op(&mut self) -> OpFlow {
-//     self.inner.send_op()
-//   }
-//
-//   fn result(&mut self, res: isize) -> Step<Self::Item> {
-//     self.inner.result(res).map(|res| {
-//       res.map(|(resource, addr)| (TcpSocket::from_resource(resource), addr))
-//     })
-//   }
-// }
+impl OpModel for TcpAccept {
+  type Item = io::Result<(TcpSocket, SocketAddr)>;
+
+  fn action(&mut self) -> Action {
+    self.inner.action()
+  }
+
+  fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
+    match self.inner.complete(res) {
+      OpResult::Done(Ok((resource, addr))) => {
+        OpResult::Done(Ok((TcpSocket::from_resource(resource), addr)))
+      }
+      OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
+      OpResult::Again => OpResult::Again,
+      OpResult::Yield(item) => OpResult::Yield(
+        item.map(|(resource, addr)| (TcpSocket::from_resource(resource), addr)),
+      ),
+    }
+  }
+}
+
+pub struct TcpBindListener {
+  state: TcpBindState,
+  addr: SocketAddr,
+}
+
+enum TcpBindState {
+  Socket(ops::Socket),
+  Bind { resource: crate::api::resource::Resource },
+  Listen { resource: crate::api::resource::Resource },
+  Done,
+}
+
+impl TcpBindListener {
+  pub(crate) fn new(addr: SocketAddr) -> Self {
+    let domain =
+      if addr.is_ipv4() { SockDomain::IPV4 } else { SockDomain::IPV6 };
+    Self {
+      state: TcpBindState::Socket(ops::Socket::new(
+        domain,
+        SockType::STREAM,
+        SockProto::TCP,
+      )),
+      addr,
+    }
+  }
+}
+
+impl OpModel for TcpBindListener {
+  type Item = io::Result<TcpListener>;
+
+  fn action(&mut self) -> Action {
+    match &mut self.state {
+      TcpBindState::Socket(inner) => inner.action(),
+      TcpBindState::Bind { resource } => {
+        Action::Io(crate::backend::op::Op::Bind {
+          fd: resource.clone(),
+          addr: self.addr,
+        })
+      }
+      TcpBindState::Listen { resource } => {
+        Action::Io(crate::backend::op::Op::Listen {
+          fd: resource.clone(),
+          backlog: 128,
+        })
+      }
+      TcpBindState::Done => panic!("TcpBindListener polled after completion"),
+    }
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    match &mut self.state {
+      TcpBindState::Socket(inner) => match inner.complete(completion) {
+        OpResult::Done(Ok(resource)) => {
+          self.state = TcpBindState::Bind { resource };
+          OpResult::Again
+        }
+        OpResult::Done(Err(err)) => {
+          self.state = TcpBindState::Done;
+          OpResult::Done(Err(err))
+        }
+        OpResult::Again => {
+          panic!("socket creation unexpectedly requested Again")
+        }
+        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
+      },
+      TcpBindState::Bind { resource } => {
+        if completion.result < 0 {
+          self.state = TcpBindState::Done;
+          OpResult::Done(Err(io::Error::from_raw_os_error(
+            (-completion.result) as i32,
+          )))
+        } else {
+          let resource = resource.clone();
+          self.state = TcpBindState::Listen { resource };
+          OpResult::Again
+        }
+      }
+      TcpBindState::Listen { resource } => {
+        let resource = resource.clone();
+        self.state = TcpBindState::Done;
+        if completion.result < 0 {
+          OpResult::Done(Err(io::Error::from_raw_os_error(
+            (-completion.result) as i32,
+          )))
+        } else {
+          OpResult::Done(Ok(TcpListener::from_resource(resource)))
+        }
+      }
+      TcpBindState::Done => {
+        panic!("TcpBindListener received completion after finish")
+      }
+    }
+  }
+}
+
+impl OneshotOpModel for TcpBindListener {}
+
+pub struct TcpConnectSocket {
+  state: TcpConnectState,
+  addr: SocketAddr,
+}
+
+enum TcpConnectState {
+  Socket(ops::Socket),
+  Connect { resource: crate::api::resource::Resource },
+  Done,
+}
+
+impl TcpConnectSocket {
+  pub(crate) fn new(addr: SocketAddr) -> Self {
+    let domain =
+      if addr.is_ipv4() { SockDomain::IPV4 } else { SockDomain::IPV6 };
+    Self {
+      state: TcpConnectState::Socket(ops::Socket::new(
+        domain,
+        SockType::STREAM,
+        SockProto::TCP,
+      )),
+      addr,
+    }
+  }
+}
+
+impl OpModel for TcpConnectSocket {
+  type Item = io::Result<TcpSocket>;
+
+  fn action(&mut self) -> Action {
+    match &mut self.state {
+      TcpConnectState::Socket(inner) => inner.action(),
+      TcpConnectState::Connect { resource } => {
+        Action::Io(crate::backend::op::Op::Connect {
+          fd: resource.clone(),
+          addr: crate::backend::op::socket_addr_into_buf(self.addr),
+        })
+      }
+      TcpConnectState::Done => {
+        panic!("TcpConnectSocket polled after completion")
+      }
+    }
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    match &mut self.state {
+      TcpConnectState::Socket(inner) => match inner.complete(completion) {
+        OpResult::Done(Ok(resource)) => {
+          self.state = TcpConnectState::Connect { resource };
+          OpResult::Again
+        }
+        OpResult::Done(Err(err)) => {
+          self.state = TcpConnectState::Done;
+          OpResult::Done(Err(err))
+        }
+        OpResult::Again => {
+          panic!("socket creation unexpectedly requested Again")
+        }
+        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
+      },
+      TcpConnectState::Connect { resource } => {
+        let resource = resource.clone();
+        self.state = TcpConnectState::Done;
+        if completion.result < 0 {
+          OpResult::Done(Err(io::Error::from_raw_os_error(
+            (-completion.result) as i32,
+          )))
+        } else {
+          OpResult::Done(Ok(TcpSocket::from_resource(resource)))
+        }
+      }
+      TcpConnectState::Done => {
+        panic!("TcpConnectSocket received completion after finish")
+      }
+    }
+  }
+}
+
+impl OneshotOpModel for TcpConnectSocket {}

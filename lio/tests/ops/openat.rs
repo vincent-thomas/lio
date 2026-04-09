@@ -1,3 +1,9 @@
+#![allow(
+  clippy::duplicate_mod,
+  clippy::unnecessary_mut_passed,
+  clippy::expect_fun_call
+)]
+
 //! Additional tests for openat operation.
 //!
 //! Note: Basic openat tests are in test_file_ops.rs. This file contains
@@ -36,6 +42,7 @@ fn test_openat_with_directory_fd() {
     &dir_res,
     file_path.clone(),
     libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+    0o666,
   )
   .with_lio(&mut lio)
   .send_with(sender);
@@ -72,6 +79,7 @@ fn test_openat_concurrent() {
       &cwd,
       temp.path.clone(),
       libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+      0o666,
     )
     .with_lio(&mut lio)
     .send_with(sender.clone());
@@ -119,7 +127,7 @@ fn test_openat_append_mode() {
 
   // Open in append mode
   let (sender, receiver) = mpsc::channel();
-  api::openat(&cwd, temp.path.clone(), libc::O_WRONLY | libc::O_APPEND)
+  api::openat(&cwd, temp.path.clone(), libc::O_WRONLY | libc::O_APPEND, 0)
     .with_lio(&mut lio)
     .send_with(sender);
 
@@ -161,9 +169,14 @@ fn test_openat_excl_flag() {
 
   // First create should succeed
   let (sender, receiver) = mpsc::channel();
-  api::openat(&cwd, path.clone(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR)
-    .with_lio(&mut lio)
-    .send_with(sender);
+  api::openat(
+    &cwd,
+    path.clone(),
+    libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+    0o666,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender);
 
   let fd = poll_until_recv(&mut lio, &receiver)
     .expect("First O_EXCL create should succeed");
@@ -171,9 +184,14 @@ fn test_openat_excl_flag() {
 
   // Second create with O_EXCL should fail (file exists)
   let (sender2, receiver2) = mpsc::channel();
-  api::openat(&cwd, path.clone(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR)
-    .with_lio(&mut lio)
-    .send_with(sender2);
+  api::openat(
+    &cwd,
+    path.clone(),
+    libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+    0o666,
+  )
+  .with_lio(&mut lio)
+  .send_with(sender2);
 
   let result = poll_until_recv(&mut lio, &receiver2);
   assert!(result.is_err(), "O_EXCL should fail when file exists");
@@ -210,7 +228,7 @@ fn test_openat_permission_denied() {
 
   // Try to open - should fail with permission denied
   let (sender, receiver) = mpsc::channel();
-  api::openat(&cwd, temp.path.clone(), libc::O_RDONLY)
+  api::openat(&cwd, temp.path.clone(), libc::O_RDONLY, 0)
     .with_lio(&mut lio)
     .send_with(sender);
 
@@ -234,7 +252,7 @@ fn test_openat_directory() {
 
   // Open directory with O_DIRECTORY
   let (sender, receiver) = mpsc::channel();
-  api::openat(&cwd, path.clone(), libc::O_RDONLY | libc::O_DIRECTORY)
+  api::openat(&cwd, path.clone(), libc::O_RDONLY | libc::O_DIRECTORY, 0)
     .with_lio(&mut lio)
     .send_with(sender);
 
@@ -264,7 +282,7 @@ fn test_openat_directory_flag_on_file() {
 
   // Try to open file with O_DIRECTORY - should fail
   let (sender, receiver) = mpsc::channel();
-  api::openat(&cwd, temp.path.clone(), libc::O_RDONLY | libc::O_DIRECTORY)
+  api::openat(&cwd, temp.path.clone(), libc::O_RDONLY | libc::O_DIRECTORY, 0)
     .with_lio(&mut lio)
     .send_with(sender);
 

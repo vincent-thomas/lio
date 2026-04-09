@@ -35,10 +35,15 @@ pub mod io;
 pub mod op;
 pub mod op_contract;
 pub mod ops;
+pub mod pid;
 pub mod resource;
 
-pub use crate::backend::op::{SockDomain, SockProto, SockType};
+pub use crate::backend::op::{
+  DirEntryRef, DirEntryView, FileStat, FileType, ReadDirBuf, ReadDirResult,
+  SockDomain, SockProto, SockType,
+};
 pub use io::{Io, IoStream, Receiver, StreamReceiver};
+pub use pid::Pid;
 
 use crate::{IoBufMutVec, IoBufVec};
 use resource::AsResource;
@@ -180,19 +185,83 @@ doc_op! {
 }
 
 doc_op! {
+    short: "Binds a socket resource to a local address.",
+
+    pub fn bind(
+        res: &impl AsResource,
+        addr: SocketAddr,
+    ) -> Io<ops::Bind> {
+        Io::from_op(ops::Bind::new(res.as_resource().clone(), addr))
+    }
+}
+
+doc_op! {
+    short: "Marks a socket resource as listening.",
+
+    pub fn listen(
+        res: &impl AsResource,
+        backlog: i32,
+    ) -> Io<ops::Listen> {
+        Io::from_op(ops::Listen::new(res.as_resource().clone(), backlog))
+    }
+}
+
+doc_op! {
+    short: "Shuts down part or all of a socket connection.",
+
+    pub fn shutdown(
+        res: &impl AsResource,
+        how: i32,
+    ) -> Io<ops::Shutdown> {
+        Io::from_op(ops::Shutdown::new(res.as_resource().clone(), how))
+    }
+}
+
+doc_op! {
     short: "Opens a file relative to a directory file descriptor.",
 
     pub fn openat(
         dir_res: &impl AsResource,
         path: std::ffi::CString,
         flags: i32,
+        mode: u32
     ) -> Io<ops::OpenAt> {
         Io::from_op(ops::OpenAt::new(
             dir_res.as_resource().clone(),
             path,
             flags,
-            0o666,
+            mode
         ))
+    }
+}
+
+doc_op! {
+    short: "Reads metadata for a path relative to a directory file descriptor.",
+
+    pub fn statat(
+        dir_res: &impl AsResource,
+        path: std::ffi::CString,
+        follow_symlinks: bool,
+    ) -> Io<ops::Stat> {
+        Io::from_op(ops::Stat::new(
+            dir_res.as_resource().clone(),
+            path,
+            follow_symlinks,
+        ))
+    }
+}
+
+doc_op! {
+    short: "Reads one batch of directory entries into caller-managed buffers.",
+
+    // Repeated calls on the same open directory continue from that directory
+    // stream's native OS position until `eof` is reported.
+
+    pub fn readdir(
+        fd: &impl AsResource,
+        buf: ReadDirBuf,
+    ) -> Io<ops::ReadDir> {
+        Io::from_op(ops::ReadDir::new(fd.as_resource().clone(), buf))
     }
 }
 
@@ -279,6 +348,27 @@ doc_op! {
             path,
             buf,
         ))
+    }
+}
+
+doc_op! {
+    short: "Reads the current working directory into a caller-provided buffer.",
+
+    pub fn getcwd(buf: Vec<u8>) -> Io<ops::GetCwd<Vec<u8>>> {
+        Io::from_op(ops::GetCwd::new(buf))
+    }
+}
+
+doc_op! {
+    short: "Spawns a new process using posix_spawn().",
+
+    #[cfg(unix)]
+    pub fn spawn(
+        path: std::ffi::CString,
+        argv: Vec<std::ffi::CString>,
+        envp: Option<Vec<std::ffi::CString>>,
+    ) -> Io<ops::Spawn> {
+        Io::from_op(ops::Spawn::new(path, argv, envp))
     }
 }
 

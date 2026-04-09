@@ -278,7 +278,7 @@ void lio_openat(struct lio_handle_t *lio,
                 intptr_t dir_fd,
                 const char *path,
                 int flags,
-                mode_t _mode,
+                mode_t mode,
                 void (*callback)(intptr_t));
 
 /**

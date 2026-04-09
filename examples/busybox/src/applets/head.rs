@@ -4,6 +4,8 @@ use lio::{api, api::resource::Resource};
 
 use crate::{app::AppContext, command::Command, util::io as io_util};
 
+const OUTPUT_FLUSH_THRESHOLD: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 enum HeadMode {
   Lines(usize),
@@ -13,6 +15,8 @@ enum HeadMode {
 #[derive(Debug, Clone, Default)]
 pub struct HeadCommand {
   mode: Option<HeadMode>,
+  pub quiet: bool,
+  pub verbose: bool,
   pub files: Vec<String>,
 }
 
@@ -26,12 +30,29 @@ impl Command for HeadCommand {
   }
 
   fn usage() -> &'static str {
-    "head [-n N|-c N] [file...]"
+    "head [-q] [-v] [-n N|-c N] [file...]"
   }
 
   fn parse(args: &[String]) -> io::Result<Self> {
-    let (mode, files) = parse_count_mode(args, HeadMode::Lines(10), "head")?;
-    Ok(Self { mode: Some(mode), files: files.to_vec() })
+    let mut quiet = false;
+    let mut verbose = false;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+      match arg.as_str() {
+        "-q" => {
+          quiet = true;
+          index += 1;
+        }
+        "-v" => {
+          verbose = true;
+          index += 1;
+        }
+        _ => break,
+      }
+    }
+    let (mode, files) =
+      parse_count_mode(&args[index..], HeadMode::Lines(10), "head")?;
+    Ok(Self { mode: Some(mode), quiet, verbose, files: files.to_vec() })
   }
 
   fn execute(&self, ctx: &AppContext) -> io::Result<()> {
@@ -44,7 +65,7 @@ impl Command for HeadCommand {
     for path in &self.files {
       let cpath = CString::new(path.as_str())?;
       open_receivers.push(
-        api::openat(&ctx.cwd(), cpath, libc::O_RDONLY)
+        api::openat(&ctx.cwd(), cpath, libc::O_RDONLY, 0)
           .with_lio(ctx.lio())
           .send(),
       );
@@ -56,7 +77,7 @@ impl Command for HeadCommand {
       .zip(io_util::run_all(ctx.lio(), open_receivers))
       .enumerate()
     {
-      if self.files.len() > 1 {
+      if should_print_headers(self.files.len(), self.quiet, self.verbose) {
         if i > 0 {
           io_util::write_all(ctx.lio(), &ctx.stdout(), b"\n".to_vec())?;
         }
@@ -70,6 +91,16 @@ impl Command for HeadCommand {
     }
 
     Ok(())
+  }
+}
+
+fn should_print_headers(file_count: usize, quiet: bool, verbose: bool) -> bool {
+  if quiet {
+    false
+  } else if verbose {
+    true
+  } else {
+    file_count > 1
   }
 }
 
@@ -89,6 +120,7 @@ fn head_fd_lines(
   let mut buf = vec![0u8; 8192];
   let mut lines_printed = 0usize;
   let mut pending = Vec::new();
+  let mut out = Vec::new();
 
   'outer: loop {
     let rx = api::read(fd, buf).with_lio(ctx.lio()).send();
@@ -107,14 +139,20 @@ fn head_fd_lines(
 
     while let Some(newline_pos) = pending.iter().position(|&b| b == b'\n') {
       let line_end = newline_pos + 1;
-      let line = pending[..line_end].to_vec();
-      pending = pending[line_end..].to_vec();
-      io_util::write_all(ctx.lio(), &stdout, line)?;
+      out.extend_from_slice(&pending[..line_end]);
+      pending.drain(..line_end);
       lines_printed += 1;
+      if out.len() >= OUTPUT_FLUSH_THRESHOLD {
+        io_util::write_all(ctx.lio(), &stdout, std::mem::take(&mut out))?;
+      }
       if lines_printed >= num_lines {
         break 'outer;
       }
     }
+  }
+
+  if !out.is_empty() {
+    io_util::write_all(ctx.lio(), &stdout, out)?;
   }
 
   Ok(())
@@ -139,7 +177,9 @@ fn head_fd_bytes(
     }
 
     let count = n.min(remaining);
-    io_util::write_all(ctx.lio(), &stdout, buf[..count].to_vec())?;
+    buf.truncate(count);
+    buf = io_util::write_all_reusing_buffer(ctx.lio(), &stdout, buf)?;
+    buf.resize(8192, 0);
     remaining -= count;
   }
 
@@ -151,6 +191,15 @@ fn parse_count_mode<'a>(
   default: HeadMode,
   applet: &str,
 ) -> io::Result<(HeadMode, &'a [String])> {
+  if let Some(value) = args
+    .first()
+    .and_then(|arg| arg.strip_prefix('-'))
+    .filter(|value| !value.is_empty())
+    .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+  {
+    let count = parse_usize_arg(value, applet)?;
+    return Ok((HeadMode::Lines(count), &args[1..]));
+  }
   if args.len() >= 2 && args[0] == "-n" {
     let count = parse_usize_arg(&args[1], applet)?;
     return Ok((HeadMode::Lines(count), &args[2..]));
@@ -169,4 +218,41 @@ fn parse_usize_arg(value: &str, applet: &str) -> io::Result<usize> {
       format!("{applet}: invalid count '{value}'"),
     )
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn parse_head_supports_short_numeric_count() {
+    let parsed = HeadCommand::parse(&["-20".into(), "file".into()]).unwrap();
+    assert!(matches!(parsed.mode, Some(HeadMode::Lines(20))));
+    assert_eq!(parsed.files, vec!["file"]);
+  }
+
+  #[test]
+  fn parse_head_supports_n_flag_count() {
+    let parsed =
+      HeadCommand::parse(&["-n".into(), "20".into(), "file".into()]).unwrap();
+    assert!(matches!(parsed.mode, Some(HeadMode::Lines(20))));
+    assert_eq!(parsed.files, vec!["file"]);
+  }
+
+  #[test]
+  fn parse_head_supports_q_and_v() {
+    let parsed =
+      HeadCommand::parse(&["-q".into(), "-v".into(), "file".into()]).unwrap();
+    assert!(parsed.quiet);
+    assert!(parsed.verbose);
+    assert_eq!(parsed.files, vec!["file"]);
+  }
+
+  #[test]
+  fn head_header_policy_matches_flags() {
+    assert!(!should_print_headers(2, true, false));
+    assert!(should_print_headers(1, false, true));
+    assert!(should_print_headers(2, false, false));
+    assert!(!should_print_headers(1, false, false));
+  }
 }

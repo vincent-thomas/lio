@@ -1,3 +1,9 @@
+#![allow(
+  clippy::duplicate_mod,
+  clippy::unnecessary_mut_passed,
+  clippy::expect_fun_call
+)]
+
 //! Tests for read and read_at operations.
 
 use super::common;

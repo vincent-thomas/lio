@@ -226,6 +226,7 @@ fn create_candidate(
       &ctx.cwd(),
       cpath,
       libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+      0o600,
     )
     .with_lio(ctx.lio())
     .send();

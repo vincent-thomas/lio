@@ -1,16 +1,13 @@
-use std::{
-  io,
-  net::{SocketAddr, ToSocketAddrs},
-};
+use std::{io, net::SocketAddr};
 
 use crate::{
   api::{
-    self,
     io::Io,
     ops::{self, Recv, Shutdown},
     resource::{AsResource, FromResource, IntoResource, Resource},
   },
-  net::ops::TcpAccept,
+  buf,
+  net::ops::{TcpAccept, TcpBindListener, TcpConnectSocket},
 };
 
 use super::socket::Socket;
@@ -32,7 +29,7 @@ use super::socket::Socket;
 /// async fn example() -> std::io::Result<()> {
 ///     // Bind to an address and start listening
 ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-///     let listener = TcpListener::bind_async(addr).await?;
+///     let listener = TcpListener::bind(addr).await?;
 ///
 ///     // Accept incoming connections
 ///     loop {
@@ -44,19 +41,6 @@ use super::socket::Socket;
 /// }
 /// ```
 ///
-/// ## Synchronous binding
-///
-/// ```rust,no_run
-/// use lio::net::TcpListener;
-///
-/// fn example() -> std::io::Result<()> {
-///     // Bind synchronously (blocks until ready)
-///     let listener = TcpListener::bind_sync("127.0.0.1:8080")?;
-///
-///     // Accept connections asynchronously
-///     Ok(())
-/// }
-/// ```
 pub struct TcpListener(Socket);
 
 impl IntoResource for TcpListener {
@@ -72,7 +56,7 @@ impl FromResource for TcpListener {
 }
 
 impl TcpListener {
-  /// Creates a new `TcpListener` which will be bound to the specified address asynchronously.
+  /// Creates a new `TcpListener` bound to the specified address.
   ///
   /// The returned listener is ready for accepting connections. This method creates a TCP
   /// socket, binds it to the provided address, and starts listening for incoming connections.
@@ -89,59 +73,18 @@ impl TcpListener {
   /// async fn example() -> std::io::Result<()> {
   ///     // Bind using a SocketAddr
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-  ///     let listener = TcpListener::bind_async(addr).await?;
+  ///     let listener = TcpListener::bind(addr).await?;
   ///
   ///     // Bind to any available port
   ///     let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-  ///     let listener = TcpListener::bind_async(addr).await?;
+  ///     let listener = TcpListener::bind(addr).await?;
   ///
   ///     Ok(())
   /// }
   /// ```
-  pub async fn bind_async(addr: SocketAddr) -> io::Result<Self> {
-    let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-    let socket = Socket::new(domain, libc::SOCK_STREAM, 0).await?;
-    socket.bind(addr).await?;
-    socket.listen().await?;
-    Ok(TcpListener(socket))
+  pub fn bind(addr: SocketAddr) -> Io<TcpBindListener> {
+    Io::from_op(TcpBindListener::new(addr))
   }
-
-  // DEPRECATED: bind_sync removed - Io<T>.wait() no longer exists after StreamOp migration.
-  // Use bind_async() instead.
-  //
-  // /// Creates a new `TcpListener` which will be bound to the specified address synchronously.
-  // ///
-  // /// This is the blocking version of [`bind_async`](Self::bind_async). It will block the
-  // /// current thread until the socket is created, bound, and listening.
-  // ///
-  // /// Note: This method performs DNS resolution synchronously (blocking) using
-  // /// `ToSocketAddrs::to_socket_addrs()`.
-  // ///
-  // /// # Examples
-  // ///
-  // /// ```rust,no_run
-  // /// use lio::net::TcpListener;
-  // ///
-  // /// fn example() -> std::io::Result<()> {
-  // ///     // This will block until the listener is ready
-  // ///     let listener = TcpListener::bind_sync("127.0.0.1:8080")?;
-  // ///
-  // ///     Ok(())
-  // /// }
-  // /// ```
-  // #[allow(deprecated)]
-  // pub fn bind_sync(addr: impl ToSocketAddrs) -> io::Result<Self> {
-  //   let mut addrs = addr.to_socket_addrs()?;
-  //   let addr = addrs.next().ok_or_else(|| {
-  //     io::Error::new(io::ErrorKind::NotFound, "no addresses resolved")
-  //   })?;
-  //
-  //   let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-  //   let socket = Socket::new(domain, libc::SOCK_STREAM, 0).wait()?;
-  //   socket.bind(addr).wait()?;
-  //   socket.listen().wait()?;
-  //   Ok(TcpListener(socket))
-  // }
 
   /// Accepts a new incoming connection from this listener.
   ///
@@ -163,7 +106,7 @@ impl TcpListener {
   ///
   /// async fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-  ///     let listener = TcpListener::bind_async(addr).await?;
+  ///     let listener = TcpListener::bind(addr).await?;
   ///
   ///     loop {
   ///         let (socket, addr) = listener.accept().await?;
@@ -174,8 +117,7 @@ impl TcpListener {
   /// }
   /// ```
   pub fn accept(&self) -> Io<TcpAccept> {
-    let socket_accept_op = TcpAccept::new(self.0.as_resource().clone());
-    Io::from_op(socket_accept_op)
+    Io::from_op(TcpAccept::new(self.0.as_resource().clone()))
   }
 
   /// Returns the local address this listener is bound to.
@@ -204,7 +146,7 @@ impl TcpListener {
 /// async fn example() -> std::io::Result<()> {
 ///     // Connect to a server
 ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-///     let socket = TcpSocket::connect_async(addr).await?;
+///     let socket = TcpSocket::connect(addr).await?;
 ///
 ///     // Send data
 ///     let data = b"Hello, server!".to_vec();
@@ -228,7 +170,7 @@ impl TcpListener {
 ///
 /// async fn example() -> std::io::Result<()> {
 ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-///     let listener = TcpListener::bind_async(addr).await?;
+///     let listener = TcpListener::bind(addr).await?;
 ///
 ///     let (socket, addr) = listener.accept().await?;
 ///     println!("Connection from: {}", addr);
@@ -262,7 +204,7 @@ impl FromResource for TcpSocket {
 }
 
 impl TcpSocket {
-  /// Opens a TCP connection to a remote host asynchronously.
+  /// Opens a TCP connection to a remote host.
   ///
   /// This method creates a new TCP socket and connects it to the specified remote address.
   /// The connection is established asynchronously, and the method returns once the
@@ -276,52 +218,19 @@ impl TcpSocket {
   ///
   /// async fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-  ///     let socket = TcpSocket::connect_async(addr).await?;
+  ///     let socket = TcpSocket::connect(addr).await?;
   ///
   ///     println!("Connected to server");
   ///
   ///     Ok(())
   /// }
   /// ```
-  pub async fn connect_async(addr: SocketAddr) -> io::Result<Self> {
-    let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-    let socket = Socket::new(domain, libc::SOCK_STREAM, 0).await?;
-    api::connect(&socket, addr).await?;
-    Ok(TcpSocket(socket))
+  pub fn connect(addr: SocketAddr) -> Io<TcpConnectSocket> {
+    Io::from_op(TcpConnectSocket::new(addr))
   }
 
-  // DEPRECATED: connect_sync removed - Io<T>.wait() no longer exists after StreamOp migration.
-  // Use connect_async() instead.
-  //
-  // /// Opens a TCP connection to a remote host synchronously.
-  // ///
-  // /// This is the blocking version of [`connect_async`](Self::connect_async). It will block
-  // /// the current thread until the connection is established.
-  // ///
-  // /// # Examples
-  // ///
-  // /// ```rust,no_run
-  // /// use std::net::SocketAddr;
-  // /// use lio::net::TcpSocket;
-  // ///
-  // /// fn example() -> std::io::Result<()> {
-  // ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-  // ///     // This will block until connected
-  // ///     let socket = TcpSocket::connect_sync(addr)?;
-  // ///
-  // ///     Ok(())
-  // /// }
-  // /// ```
-  // #[allow(deprecated)]
-  // pub fn connect_sync(addr: SocketAddr) -> io::Result<Self> {
-  //   let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-  //   let socket = Socket::new(domain, libc::SOCK_STREAM, 0).wait()?;
-  //   api::connect(&socket, addr).wait()?;
-  //   Ok(TcpSocket(socket))
-  // }
-
   // DEPRECATED: connect_host_sync removed - depends on connect_sync which was removed.
-  // Use connect_host_async() instead (if it exists) or implement using async DNS + connect_async().
+  // Use a hostname-resolving helper plus connect() instead.
   //
   // /// Opens a TCP connection to a remote host by hostname synchronously.
   // ///
@@ -376,7 +285,7 @@ impl TcpSocket {
   ///
   /// async fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-  ///     let socket = TcpSocket::connect_async(addr).await?;
+  ///     let socket = TcpSocket::connect(addr).await?;
   ///
   ///     let buffer = vec![0u8; 1024];
   ///     let (result, buffer) = socket.recv(buffer).await;
@@ -388,7 +297,10 @@ impl TcpSocket {
   ///     Ok(())
   /// }
   /// ```
-  pub fn recv(&self, vec: Vec<u8>) -> Io<Recv<Vec<u8>>> {
+  pub fn recv<V>(&self, vec: V) -> Io<Recv<V>>
+  where
+    V: buf::IoBufMutVec,
+  {
     self.0.recv(vec)
   }
 
@@ -412,7 +324,7 @@ impl TcpSocket {
   ///
   /// async fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-  ///     let socket = TcpSocket::connect_async(addr).await?;
+  ///     let socket = TcpSocket::connect(addr).await?;
   ///
   ///     let data = b"Hello, server!".to_vec();
   ///     let (result, data) = socket.send(data).await;
@@ -423,7 +335,10 @@ impl TcpSocket {
   ///     Ok(())
   /// }
   /// ```
-  pub fn send(&self, vec: Vec<u8>) -> Io<ops::Send<Vec<u8>>> {
+  pub fn send<V>(&self, vec: V) -> Io<ops::Send<V>>
+  where
+    V: buf::IoBufVec,
+  {
     self.0.send(vec)
   }
 
@@ -448,7 +363,7 @@ impl TcpSocket {
   ///
   /// async fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-  ///     let socket = TcpSocket::connect_async(addr).await?;
+  ///     let socket = TcpSocket::connect(addr).await?;
   ///
   ///     // Send request
   ///     let data = b"GET / HTTP/1.1\r\n\r\n".to_vec();

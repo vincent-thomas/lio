@@ -2,13 +2,15 @@ use std::io;
 
 use lio::{Lio, api::resource::Resource};
 
+const APP_LIO_CAPACITY: usize = 4096;
+
 pub struct AppContext {
   lio: Lio,
 }
 
 impl AppContext {
   pub fn new() -> io::Result<Self> {
-    Ok(Self { lio: Lio::new(64)? })
+    Ok(Self { lio: Lio::new(APP_LIO_CAPACITY)? })
   }
 
   pub fn lio(&self) -> &Lio {

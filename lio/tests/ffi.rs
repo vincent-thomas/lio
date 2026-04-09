@@ -77,7 +77,7 @@ fn compile_test(source: &Path, output: &Path, compiler: &str) -> Output {
   #[cfg(target_os = "macos")]
   {
     let static_lib = lib_dir.join("liblio.a");
-    return Command::new(compiler)
+    Command::new(compiler)
       .arg(source)
       .arg("-o")
       .arg(output)
@@ -88,7 +88,7 @@ fn compile_test(source: &Path, output: &Path, compiler: &str) -> Output {
       .arg("-framework")
       .arg("CoreFoundation")
       .output()
-      .expect("Failed to execute compiler");
+      .expect("Failed to execute compiler")
   }
 
   #[cfg(any(

@@ -1,6 +1,17 @@
 use std::io;
 
-use crate::{app::AppContext, command::Command, util::io as io_util};
+use lio::api;
+
+use crate::{
+  app::AppContext,
+  command::Command,
+  util::{
+    flags::{FlagParser, FlagSpec},
+    io as io_util,
+  },
+};
+
+const OUTPUT_FLUSH_THRESHOLD: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct CommOptions {
@@ -36,93 +47,119 @@ impl Command for CommCommand {
   }
 
   fn parse(args: &[String]) -> io::Result<Self> {
-    let mut options = CommOptions::default();
-    let mut index = 0;
-    while let Some(arg) = args.get(index) {
-      match arg.as_str() {
-        "-1" => {
-          options.show_left = false;
-          index += 1;
-        }
-        "-2" => {
-          options.show_right = false;
-          index += 1;
-        }
-        "-3" => {
-          options.show_common = false;
-          index += 1;
-        }
-        _ => break,
-      }
-    }
-    if args.len() != index + 2 {
+    const SPECS: &[FlagSpec<'static>] = &[
+      FlagSpec {
+        name: "hide_left",
+        short: &['1'],
+        long: &[],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "hide_right",
+        short: &['2'],
+        long: &[],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "hide_common",
+        short: &['3'],
+        long: &[],
+        takes_value: false,
+      },
+    ];
+    let parsed = FlagParser::new("comm", SPECS).parse(args)?;
+    if parsed.positional().len() != 2 {
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "comm: expected two input files",
       ));
     }
     Ok(Self {
-      options: Some(options),
-      left_path: args[index].clone(),
-      right_path: args[index + 1].clone(),
+      options: Some(CommOptions {
+        show_left: !parsed.get_flag_exists("hide_left"),
+        show_right: !parsed.get_flag_exists("hide_right"),
+        show_common: !parsed.get_flag_exists("hide_common"),
+      }),
+      left_path: parsed.positional()[0].clone(),
+      right_path: parsed.positional()[1].clone(),
     })
   }
 
   fn execute(&self, ctx: &AppContext) -> io::Result<()> {
     let options = self.options.expect("comm options should be parsed");
-    let left: Vec<String> =
-      io_util::read_to_string(ctx.lio(), Some(&self.left_path))?
-        .lines()
-        .map(str::to_string)
-        .collect();
-    let right: Vec<String> =
-      io_util::read_to_string(ctx.lio(), Some(&self.right_path))?
-        .lines()
-        .map(str::to_string)
-        .collect();
+    let left_fd = io_util::run(
+      ctx.lio(),
+      api::openat(
+        &ctx.cwd(),
+        std::ffi::CString::new(self.left_path.as_str())?,
+        libc::O_RDONLY,
+        0,
+      )
+      .with_lio(ctx.lio())
+      .send(),
+    )?;
+    let right_fd = io_util::run(
+      ctx.lio(),
+      api::openat(
+        &ctx.cwd(),
+        std::ffi::CString::new(self.right_path.as_str())?,
+        libc::O_RDONLY,
+        0,
+      )
+      .with_lio(ctx.lio())
+      .send(),
+    )?;
+    let mut left = LineReader::new(left_fd);
+    let mut right = LineReader::new(right_fd);
+    let mut left_line = left.next_line(ctx)?;
+    let mut right_line = right.next_line(ctx)?;
 
     let stdout = ctx.stdout();
-    let mut i = 0usize;
-    let mut j = 0usize;
-    while i < left.len() || j < right.len() {
-      let line = match (left.get(i), right.get(j)) {
+    let mut out = Vec::new();
+    while left_line.is_some() || right_line.is_some() {
+      let line = match (left_line.as_ref(), right_line.as_ref()) {
         (Some(l), Some(r)) if l == r => {
-          i += 1;
-          j += 1;
+          let content = l.clone();
+          left_line = left.next_line(ctx)?;
+          right_line = right.next_line(ctx)?;
           if options.show_common {
-            format!("{}{}{}\n", comm_prefix(&options, 3), "", l)
+            format!("{}{}\n", comm_prefix(&options, 3), content)
           } else {
             String::new()
           }
         }
         (Some(l), Some(r)) if l < r => {
-          i += 1;
+          let content = l.clone();
+          left_line = left.next_line(ctx)?;
           if options.show_left {
-            format!("{}{}\n", comm_prefix(&options, 1), l)
+            format!("{}{}\n", comm_prefix(&options, 1), content)
           } else {
             String::new()
           }
         }
         (Some(_), Some(r)) => {
-          j += 1;
+          let content = r.clone();
+          right_line = right.next_line(ctx)?;
           if options.show_right {
-            format!("{}{}\n", comm_prefix(&options, 2), r)
+            format!("{}{}\n", comm_prefix(&options, 2), content)
           } else {
             String::new()
           }
         }
         (Some(l), None) => {
-          i += 1;
+          let content = l.clone();
+          left_line = left.next_line(ctx)?;
           if options.show_left {
-            format!("{}{}\n", comm_prefix(&options, 1), l)
+            format!("{}{}\n", comm_prefix(&options, 1), content)
           } else {
             String::new()
           }
         }
         (None, Some(r)) => {
-          j += 1;
+          let content = r.clone();
+          right_line = right.next_line(ctx)?;
           if options.show_right {
-            format!("{}{}\n", comm_prefix(&options, 2), r)
+            format!("{}{}\n", comm_prefix(&options, 2), content)
           } else {
             String::new()
           }
@@ -130,8 +167,14 @@ impl Command for CommCommand {
         (None, None) => break,
       };
       if !line.is_empty() {
-        io_util::write_all(ctx.lio(), &stdout, line.into_bytes())?;
+        out.extend_from_slice(line.as_bytes());
+        if out.len() >= OUTPUT_FLUSH_THRESHOLD {
+          io_util::write_all(ctx.lio(), &stdout, std::mem::take(&mut out))?;
+        }
       }
+    }
+    if !out.is_empty() {
+      io_util::write_all(ctx.lio(), &stdout, out)?;
     }
     Ok(())
   }
@@ -153,5 +196,67 @@ fn comm_prefix(options: &CommOptions, column: u8) -> &'static str {
       (false, false) => "",
     },
     _ => "",
+  }
+}
+
+struct LineReader {
+  fd: lio::api::resource::Resource,
+  buf: Vec<u8>,
+  pending: Vec<u8>,
+  eof: bool,
+}
+
+impl LineReader {
+  fn new(fd: lio::api::resource::Resource) -> Self {
+    Self { fd, buf: vec![0u8; 8192], pending: Vec::new(), eof: false }
+  }
+
+  fn next_line(&mut self, ctx: &AppContext) -> io::Result<Option<String>> {
+    loop {
+      if let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
+        let line = decode_line(&self.pending[..pos])?;
+        self.pending.drain(..=pos);
+        return Ok(Some(line));
+      }
+
+      if self.eof {
+        if self.pending.is_empty() {
+          return Ok(None);
+        }
+        let line = decode_line(&self.pending)?;
+        self.pending.clear();
+        return Ok(Some(line));
+      }
+
+      let rx = api::read(&self.fd, std::mem::take(&mut self.buf))
+        .with_lio(ctx.lio())
+        .send();
+      let (result, returned_buf) = io_util::run(ctx.lio(), rx);
+      self.buf = returned_buf;
+      let n = result? as usize;
+      if n == 0 {
+        self.eof = true;
+      } else {
+        self.pending.extend_from_slice(&self.buf[..n]);
+      }
+    }
+  }
+}
+
+fn decode_line(bytes: &[u8]) -> io::Result<String> {
+  String::from_utf8(bytes.to_vec())
+    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn comm_prefix_matches_enabled_columns() {
+    let opts = CommOptions::default();
+    assert_eq!(comm_prefix(&opts, 1), "");
+    assert_eq!(comm_prefix(&opts, 2), "\t");
+    assert_eq!(comm_prefix(&opts, 3), "\t\t");
   }
 }

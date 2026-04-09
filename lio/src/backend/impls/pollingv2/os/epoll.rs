@@ -7,6 +7,34 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 use std::{io, ptr};
 
+#[cfg(target_os = "linux")]
+fn epoll_pwait2_raw(
+  epfd: RawFd,
+  events: *mut libc::epoll_event,
+  maxevents: i32,
+  timeout: *const libc::timespec,
+  sigmask: *const libc::sigset_t,
+) -> io::Result<i32> {
+  let res = unsafe {
+    libc::syscall(
+      libc::SYS_epoll_pwait2,
+      epfd,
+      events,
+      maxevents,
+      timeout,
+      sigmask,
+      std::mem::size_of::<libc::sigset_t>(),
+    )
+  };
+
+  if res >= 0 {
+    Ok(res as i32)
+  } else {
+    let errno = unsafe { *libc::__errno_location() };
+    Err(io::Error::from_raw_os_error(errno))
+  }
+}
+
 /// Wrapper around an epoll file descriptor
 ///
 /// This type is intentionally `!Send` to ensure it's only used from a single thread.
@@ -256,13 +284,13 @@ impl ReadinessPoll for OsPoller {
     };
 
     // Wait for I/O events.
-    let n = syscall!(epoll_pwait2(
+    let n = epoll_pwait2_raw(
       self.epoll_fd.as_raw_fd(),
       events.as_mut_ptr(),
       events.len() as i32,
       timeout.as_ref().map(|v| v as *const _).unwrap_or(ptr::null()),
-      ptr::null_mut()
-    ))?;
+      ptr::null(),
+    )?;
 
     // Clear the notification (if received) and re-register interest in it.
     self.notifier.clear();

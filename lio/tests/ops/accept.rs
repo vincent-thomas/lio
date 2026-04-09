@@ -1,3 +1,9 @@
+#![allow(
+  clippy::duplicate_mod,
+  clippy::unnecessary_mut_passed,
+  clippy::expect_fun_call
+)]
+
 use super::common::poll_until_recv;
 use lio::api::resource::Resource;
 use lio::{Lio, api};

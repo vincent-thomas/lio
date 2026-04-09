@@ -1,5 +1,5 @@
 [workspace]
-members = ["examples/busybox","lio", "lio-uring"]
+members = ["lio", "examples/busybox", "lio-uring"]
 default-members = ["lio"]
 resolver = "3"
 

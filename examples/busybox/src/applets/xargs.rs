@@ -1,10 +1,10 @@
-use std::{io, process::Command as ProcessCommand};
+use std::io;
 
 use crate::{
   app::AppContext,
   applets::support::{XargsSeparator, build_xargs_groups, read_yes_from_tty},
   command::Command,
-  util::io as io_util,
+  util::{io as io_util, process as process_util},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -181,12 +181,22 @@ impl Command for XargsCommand {
           continue;
         }
       }
-      let status =
-        ProcessCommand::new(&self.command).args(&effective_args).status()?;
+      let pid =
+        process_util::spawn_command(ctx, &self.command, &effective_args)
+          .map_err(|err| io::Error::new(err.kind(), format!("xargs: {err}")))?;
+      let status = process_util::wait_for_child(pid)?;
       if !status.success() {
-        return Err(io::Error::other(format!(
-          "xargs child exited with status {status}"
-        )));
+        return match status {
+          process_util::ChildStatus::Exited(code) => Err(io::Error::other(
+            format!("xargs child exited with status {code}"),
+          )),
+          process_util::ChildStatus::Signaled(signal) => Err(io::Error::other(
+            format!("xargs child terminated by signal {signal}"),
+          )),
+          process_util::ChildStatus::Other(raw) => Err(io::Error::other(
+            format!("xargs child did not exit normally ({raw})"),
+          )),
+        };
       }
     }
     Ok(())

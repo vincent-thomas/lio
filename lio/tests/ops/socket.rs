@@ -1,3 +1,9 @@
+#![allow(
+  clippy::duplicate_mod,
+  clippy::unnecessary_mut_passed,
+  clippy::expect_fun_call
+)]
+
 use lio::{Lio, api};
 use std::{
   os::fd::{AsFd, AsRawFd},

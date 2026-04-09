@@ -7,7 +7,14 @@ use std::{
 
 use lio::api;
 
-use crate::{app::AppContext, command::Command, util::io as io_util};
+use crate::{
+  app::AppContext,
+  command::Command,
+  util::{
+    flags::{FlagParser, FlagSpec},
+    fs as fs_util, io as io_util,
+  },
+};
 
 #[derive(Debug, Clone)]
 pub struct MkdirCommand {
@@ -37,48 +44,53 @@ impl Command for MkdirCommand {
   }
 
   fn parse(args: &[String]) -> io::Result<Self> {
-    let mut command = Self::default();
-    let mut index = 0;
+    const SPECS: &[FlagSpec<'static>] = &[
+      FlagSpec {
+        name: "parents",
+        short: &['p'],
+        long: &[],
+        takes_value: false,
+      },
+      FlagSpec { name: "mode", short: &['m'], long: &[], takes_value: true },
+      FlagSpec {
+        name: "verbose",
+        short: &['v'],
+        long: &[],
+        takes_value: false,
+      },
+    ];
 
-    while let Some(arg) = args.get(index) {
-      match arg.as_str() {
-        "-p" => {
-          command.parents = true;
-          index += 1;
-        }
-        "-v" => {
-          command.verbose = true;
-          index += 1;
-        }
-        "-m" => {
-          let Some(mode) = args.get(index + 1) else {
-            return Err(io::Error::new(
-              io::ErrorKind::InvalidInput,
-              "mkdir: option requires an argument -- 'm'",
-            ));
-          };
-          command.mode = parse_mode(mode)?;
-          index += 2;
-        }
-        _ if arg.starts_with('-') => {
-          return Err(io::Error::new(
+    let parsed =
+      FlagParser::new("mkdir", SPECS).parse(args).map_err(|err| {
+        if err.kind() == io::ErrorKind::InvalidInput
+          && err.to_string().contains("missing value for '-m'")
+        {
+          io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("mkdir: unrecognized option '{arg}'"),
-          ));
+            "mkdir: option requires an argument -- 'm'",
+          )
+        } else {
+          err
         }
-        _ => break,
-      }
-    }
+      })?;
 
-    if index == args.len() {
+    if parsed.positional().is_empty() {
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "mkdir: missing operand",
       ));
     }
 
-    command.paths = args[index..].to_vec();
-    Ok(command)
+    Ok(Self {
+      parents: parsed.get_flag_exists("parents"),
+      mode: parsed
+        .get_flag_value("mode")
+        .map(parse_mode)
+        .transpose()?
+        .unwrap_or(0o777),
+      verbose: parsed.get_flag_exists("verbose"),
+      paths: parsed.positional().to_vec(),
+    })
   }
 
   fn execute(&self, ctx: &AppContext) -> io::Result<()> {
@@ -127,7 +139,7 @@ fn create_directory_parents(
       Component::ParentDir => current.push(component.as_os_str()),
       Component::Normal(part) => {
         current.push(part);
-        let existed = current.exists();
+        let existed = fs_util::stat_path(ctx, &current, true)?.is_some();
         match mkdir_path(ctx, &current, options.mode) {
           Ok(()) => {
             fs::set_permissions(
@@ -140,7 +152,8 @@ fn create_directory_parents(
           }
           Err(err)
             if err.kind() == io::ErrorKind::AlreadyExists
-              && current.is_dir() => {}
+              && fs_util::stat_path(ctx, &current, true)?
+                .is_some_and(|stat| stat.is_dir()) => {}
           Err(err) => return Err(err),
         }
       }
@@ -196,6 +209,12 @@ mod tests {
     assert!(parsed.verbose);
     assert_eq!(parsed.mode, 0o755);
     assert_eq!(parsed.paths, vec!["a", "b"]);
+  }
+
+  #[test]
+  fn parse_mkdir_supports_double_dash() {
+    let parsed = MkdirCommand::parse(&["--".into(), "-dir".into()]).unwrap();
+    assert_eq!(parsed.paths, vec!["-dir"]);
   }
 
   #[test]

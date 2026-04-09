@@ -65,9 +65,17 @@ pub fn write_once(
 }
 
 pub fn write_all(lio: &Lio, fd: &Resource, buf: Vec<u8>) -> io::Result<()> {
-  let mut written = 0usize;
-  while written < buf.len() {
-    let (result, _) = write_once(lio, fd, buf[written..].to_vec());
+  let _ = write_all_reusing_buffer(lio, fd, buf)?;
+  Ok(())
+}
+
+pub fn write_all_reusing_buffer(
+  lio: &Lio,
+  fd: &Resource,
+  mut buf: Vec<u8>,
+) -> io::Result<Vec<u8>> {
+  while !buf.is_empty() {
+    let (result, mut returned_buf) = write_once(lio, fd, buf);
     let n = result? as usize;
     if n == 0 {
       return Err(io::Error::new(
@@ -75,43 +83,17 @@ pub fn write_all(lio: &Lio, fd: &Resource, buf: Vec<u8>) -> io::Result<()> {
         "write returned zero before completing output",
       ));
     }
-    written += n;
-  }
-  Ok(())
-}
-
-pub fn write_all_many(
-  lio: &Lio,
-  bufs: Vec<(Resource, Vec<u8>)>,
-) -> io::Result<()> {
-  let mut pending: Vec<(Resource, Vec<u8>, usize)> =
-    bufs.into_iter().map(|(fd, buf)| (fd, buf, 0usize)).collect();
-
-  while pending.iter().any(|(_, buf, written)| *written < buf.len()) {
-    let mut rxs = Vec::new();
-    let mut active = Vec::new();
-
-    for (idx, (fd, buf, written)) in pending.iter().enumerate() {
-      if *written >= buf.len() {
-        continue;
-      }
-      rxs.push(api::write(fd, buf[*written..].to_vec()).with_lio(lio).send());
-      active.push(idx);
+    if n >= returned_buf.len() {
+      return Ok(returned_buf);
     }
 
-    for (idx, (result, _)) in active.into_iter().zip(run_all(lio, rxs)) {
-      let n = result? as usize;
-      if n == 0 {
-        return Err(io::Error::new(
-          io::ErrorKind::WriteZero,
-          "write returned zero before completing output",
-        ));
-      }
-      pending[idx].2 += n;
-    }
+    let remaining = returned_buf.len() - n;
+    returned_buf.copy_within(n.., 0);
+    returned_buf.truncate(remaining);
+    buf = returned_buf;
   }
 
-  Ok(())
+  Ok(buf)
 }
 
 pub fn read_to_string(lio: &Lio, path: Option<&str>) -> io::Result<String> {
@@ -131,7 +113,7 @@ pub fn read_to_bytes(lio: &Lio, path: Option<&str>) -> io::Result<Vec<u8>> {
       let fd = run_all(
         lio,
         vec![
-          api::openat(&Resource::cwd(), cpath, libc::O_RDONLY)
+          api::openat(&Resource::cwd(), cpath, libc::O_RDONLY, 0)
             .with_lio(lio)
             .send(),
         ],

@@ -25,6 +25,7 @@ backend_impls = ["dep:lio-uring"]
 [dependencies]
 
 # Required
+bumpalo = { version = "3", features = ["boxed"] }
 libc.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

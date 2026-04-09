@@ -2,10 +2,20 @@ use std::{ffi::CString, io, path::Path};
 
 use lio::api;
 
-use crate::{app::AppContext, command::Command, util::io as io_util};
+use crate::{
+  app::AppContext,
+  command::Command,
+  util::{
+    flags::{FlagParser, FlagSpec},
+    io as io_util,
+  },
+};
+
+use super::realpath::{CanonicalizeMode, write_resolved_path};
 
 #[derive(Debug, Clone, Default)]
 pub struct ReadlinkCommand {
+  pub canonicalize: Option<CanonicalizeMode>,
   pub no_newline: bool,
   pub path: String,
 }
@@ -20,48 +30,71 @@ impl Command for ReadlinkCommand {
   }
 
   fn usage() -> &'static str {
-    "readlink [-n] <path>"
+    "readlink [-f|-e|-m] [-n] <path>"
   }
 
   fn parse(args: &[String]) -> io::Result<Self> {
-    let mut no_newline = false;
-    let mut index = 0;
+    const SPECS: &[FlagSpec<'static>] = &[
+      FlagSpec {
+        name: "canonicalize_existing",
+        short: &['f', 'e'],
+        long: &[],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "canonicalize_missing",
+        short: &['m'],
+        long: &[],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "no_newline",
+        short: &['n'],
+        long: &[],
+        takes_value: false,
+      },
+    ];
+    let parsed = FlagParser::new("readlink", SPECS).parse(args)?;
 
-    while let Some(arg) = args.get(index) {
-      match arg.as_str() {
-        "-n" => {
-          no_newline = true;
-          index += 1;
-        }
-        _ if arg.starts_with('-') => {
-          return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("readlink: unrecognized option '{arg}'"),
-          ));
-        }
-        _ => break,
-      }
-    }
-
-    let Some(path) = args.get(index) else {
+    let Some(path) = parsed.positional().first() else {
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "readlink: missing operand",
       ));
     };
-    if index + 1 != args.len() {
+    if parsed.positional().len() != 1 {
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "readlink: extra operand",
       ));
     }
 
-    Ok(Self { no_newline, path: path.clone() })
+    let canonicalize = if parsed.get_flag_exists("canonicalize_missing") {
+      Some(CanonicalizeMode::MissingOk)
+    } else if parsed.get_flag_exists("canonicalize_existing") {
+      Some(CanonicalizeMode::Existing)
+    } else {
+      None
+    };
+
+    Ok(Self {
+      canonicalize,
+      no_newline: parsed.get_flag_exists("no_newline"),
+      path: path.clone(),
+    })
   }
 
   fn execute(&self, ctx: &AppContext) -> io::Result<()> {
-    let target = read_link_target(ctx, Path::new(&self.path))?;
-    let mut output = target.into_bytes();
+    if let Some(mode) = self.canonicalize {
+      return write_resolved_path(
+        ctx,
+        Path::new(&self.path),
+        mode,
+        !self.no_newline,
+      );
+    }
+
+    let mut output = read_link_target(ctx, Path::new(&self.path))?.into_bytes();
     if !self.no_newline {
       output.push(b'\n');
     }
@@ -89,13 +122,36 @@ pub(crate) fn read_link_target(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::applets::realpath::resolve_realpath;
   use std::{fs, os::unix::fs::symlink, path::PathBuf};
 
   #[test]
   fn parse_readlink_supports_n_flag() {
     let parsed = ReadlinkCommand::parse(&["-n".into(), "link".into()]).unwrap();
     assert!(parsed.no_newline);
+    assert_eq!(parsed.canonicalize, None);
     assert_eq!(parsed.path, "link");
+  }
+
+  #[test]
+  fn parse_readlink_supports_f_flag() {
+    let parsed =
+      ReadlinkCommand::parse(&["-f".into(), "-n".into(), "link".into()])
+        .unwrap();
+    assert_eq!(parsed.canonicalize, Some(CanonicalizeMode::Existing));
+    assert!(parsed.no_newline);
+    assert_eq!(parsed.path, "link");
+  }
+
+  #[test]
+  fn parse_readlink_supports_e_and_m_flags() {
+    let existing =
+      ReadlinkCommand::parse(&["-e".into(), "link".into()]).unwrap();
+    assert_eq!(existing.canonicalize, Some(CanonicalizeMode::Existing));
+
+    let missing =
+      ReadlinkCommand::parse(&["-m".into(), "link".into()]).unwrap();
+    assert_eq!(missing.canonicalize, Some(CanonicalizeMode::MissingOk));
   }
 
   #[test]
@@ -111,6 +167,37 @@ mod tests {
 
     fs::remove_file(link).unwrap();
     fs::remove_file(target).unwrap();
+  }
+
+  #[test]
+  fn readlink_f_resolves_absolute_target_path() {
+    let ctx = AppContext::new().unwrap();
+    let root = unique_temp_path("readlink-f-root");
+    let dir = root.join("dir");
+    let file = dir.join("file.txt");
+    let link = root.join("link");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&dir).unwrap();
+    fs::write(&file, b"hello").unwrap();
+    symlink("dir/file.txt", &link).unwrap();
+
+    let command = ReadlinkCommand {
+      canonicalize: Some(CanonicalizeMode::Existing),
+      no_newline: true,
+      path: link.display().to_string(),
+    };
+    let resolved = if let Some(mode) = command.canonicalize {
+      resolve_realpath(&ctx, Path::new(&command.path), mode).unwrap()
+    } else {
+      Path::new(&read_link_target(&ctx, Path::new(&command.path)).unwrap())
+        .to_path_buf()
+    };
+    assert_eq!(resolved, fs::canonicalize(&file).unwrap());
+
+    fs::remove_file(link).unwrap();
+    fs::remove_file(file).unwrap();
+    fs::remove_dir(dir).unwrap();
+    fs::remove_dir(root).unwrap();
   }
 
   fn unique_temp_path(name: &str) -> PathBuf {

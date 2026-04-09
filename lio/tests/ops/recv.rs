@@ -1,3 +1,9 @@
+#![allow(
+  clippy::duplicate_mod,
+  clippy::unnecessary_mut_passed,
+  clippy::expect_fun_call
+)]
+
 //! Tests for recv operations.
 
 use super::common;
@@ -166,6 +172,7 @@ fn partial_buffer() {
 fn concurrent_pairs() {
   let mut lio = Lio::new(256).unwrap();
   let mut pairs = Vec::new();
+  let mut receivers = Vec::new();
 
   for _ in 0..5 {
     pairs.push(setup_tcp_pair(&mut lio));
@@ -178,21 +185,17 @@ fn concurrent_pairs() {
     expected.push(data);
   }
 
-  let (sender_recv, receiver_recv) = mpsc::channel();
   for pair in &pairs {
+    let (sender_recv, receiver_recv) = mpsc::channel();
     api::recv(&pair.accepted_fd, vec![0u8; 64], None)
       .with_lio(&mut lio)
-      .send_with(sender_recv.clone());
+      .send_with(sender_recv);
+    receivers.push(receiver_recv);
   }
 
-  let mut seen = Vec::new();
-  for _ in 0..expected.len() {
-    let (res, buf) = poll_until_recv(&mut lio, &receiver_recv);
+  for (message, receiver) in expected.iter().zip(receivers.iter()) {
+    let (res, buf) = poll_until_recv(&mut lio, receiver);
     let bytes = res.expect("Recv should succeed") as usize;
-    seen.push(buf[..bytes].to_vec());
-  }
-
-  for message in expected {
-    assert!(seen.iter().any(|got| got == &message));
+    assert_eq!(&buf[..bytes], message.as_slice());
   }
 }

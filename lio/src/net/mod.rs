@@ -29,7 +29,7 @@
 //! use lio::net::TcpListener;
 //!
 //! async fn echo_server() -> std::io::Result<()> {
-//!     let listener = TcpListener::bind_async("127.0.0.1:8080").await?;
+//!     let listener = TcpListener::bind("127.0.0.1:8080".parse().unwrap()).await?;
 //!     println!("Server listening on 127.0.0.1:8080");
 //!
 //!     loop {
@@ -59,7 +59,7 @@
 //! async fn send_message() -> std::io::Result<()> {
 //!     // Connect to server
 //!     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-//!     let socket = TcpSocket::connect_async(addr).await?;
+//!     let socket = TcpSocket::connect(addr).await?;
 //!
 //!     // Send a message
 //!     let message = b"Hello, server!".to_vec();
@@ -109,21 +109,6 @@
 //!
 //! # Synchronous vs Asynchronous
 //!
-//! Most operations in this module are async by default. However, some types like
-//! [`TcpListener`] and [`TcpSocket`] provide `_sync` variants for blocking operations:
-//!
-//! ```rust,ignore
-//! use lio::net::TcpListener;
-//!
-//! fn sync_example() -> std::io::Result<()> {
-//!     // This blocks until the listener is ready
-//!     let listener = TcpListener::bind_sync("127.0.0.1:8080")?;
-//!
-//!     // Accept is still async
-//!     Ok(())
-//! }
-//! ```
-//!
 //! # See Also
 //!
 //! - [`crate::api::resource`]: Resource management for file descriptors
@@ -131,8 +116,8 @@
 
 mod socket;
 mod tcp;
-#[cfg(unix)]
-pub mod unix;
+// #[cfg(unix)]
+// pub mod unix;
 
 pub use socket::*;
 pub use tcp::*;

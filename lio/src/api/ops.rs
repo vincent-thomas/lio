@@ -18,6 +18,7 @@ use std::time::Duration;
 use crate::{
   BufResult, IoBufMutVec, IoBufVec,
   api::{
+    Pid,
     op::{
       Action, Completion, CompletionFlags, ContractKind, ContractStep,
       OneshotOpModel, OpModel, OpModelContract, OpResult, StreamOpModel,
@@ -25,8 +26,9 @@ use crate::{
     resource::Resource,
   },
   backend::op::{
-    MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, RawBuf, SockDomain, SockProto,
-    SockType,
+    FileStat, MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, RawBuf, ReadDirBuf,
+    SockDomain, SockProto, SockType, SocketAddrBuf, socket_addr_from_buf,
+    socket_addr_into_buf,
   },
   buf::MAX_IOV_COUNT,
 };
@@ -41,6 +43,11 @@ const TIMER_FIRED_ERRNO: i32 = libc::ETIME;
   target_os = "dragonfly"
 ))]
 const TIMER_FIRED_ERRNO: i32 = libc::ETIMEDOUT;
+
+#[cfg(test)]
+type TwoVecBufResult = BufResult<i32, (Vec<u8>, Vec<u8>)>;
+#[cfg(test)]
+type TwoVecOpResult = OpResult<TwoVecBufResult>;
 #[cfg(not(any(
   target_os = "linux",
   target_os = "macos",
@@ -55,7 +62,7 @@ const TIMER_FIRED_ERRNO: i32 = 0;
 
 /// # Safety
 /// `storage` must point to a valid, initialized `sockaddr_storage`.
-unsafe fn libc_socketaddr_into_std_raw(
+pub(crate) unsafe fn libc_socketaddr_into_std_raw(
   storage: *const libc::sockaddr_storage,
 ) -> io::Result<SocketAddr> {
   // SAFETY: correct pointer.
@@ -200,18 +207,6 @@ impl Socket {
   }
 }
 
-#[cfg(unix)]
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-  let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-  if flags < 0 {
-    return Err(io::Error::last_os_error());
-  }
-
-  let result =
-    unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-  if result < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
-}
-
 impl OpModel for Socket {
   type Item = io::Result<Resource>;
 
@@ -232,16 +227,10 @@ impl OpModel for Socket {
 
     #[cfg(unix)]
     {
-      let fd = completion.result as RawFd;
-      if let Err(err) = set_nonblocking(fd) {
-        unsafe {
-          libc::close(fd);
-        }
-        return OpResult::Done(Err(err));
-      }
-
       // SAFETY: `fd` was returned by `socket(2)` and ownership transfers here.
-      return OpResult::Done(Ok(unsafe { Resource::from_raw_fd(fd) }));
+      OpResult::Done(Ok(unsafe {
+        Resource::from_raw_fd(completion.result as RawFd)
+      }))
     }
 
     #[cfg(windows)]
@@ -279,6 +268,7 @@ impl OpModelContract for Socket {
         )
       },
       #[cfg(unix)]
+      // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
       Completion::new(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
       #[cfg(windows)]
       Completion::new(1),
@@ -293,27 +283,17 @@ impl OpModelContract for Socket {
 
 pub struct Accept {
   res: Resource,
-  addr: libc::sockaddr_storage,
-  len: libc::socklen_t,
+  addr: SocketAddrBuf,
 }
 
 impl Accept {
   pub(crate) fn new(res: Resource) -> Self {
-    Self {
-      res,
-      // SAFETY: `sockaddr_storage` is a plain C output buffer.
-      addr: unsafe { mem::zeroed() },
-      len: mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
-    }
+    Self { res, addr: SocketAddrBuf::unspecified() }
   }
 
   #[cfg(test)]
   fn stage_peer_addr(&mut self, addr: SocketAddr) {
-    self.addr = std_socketaddr_into_libc(addr);
-    self.len = match addr {
-      SocketAddr::V4(_) => mem::size_of::<libc::sockaddr_in>(),
-      SocketAddr::V6(_) => mem::size_of::<libc::sockaddr_in6>(),
-    } as libc::socklen_t;
+    self.addr = socket_addr_into_buf(addr);
   }
 }
 
@@ -323,8 +303,7 @@ impl OpModel for Accept {
   fn action(&mut self) -> Action {
     Action::Io(Op::Accept {
       fd: self.res.clone(),
-      addr: &mut self.addr,
-      len: &mut self.len,
+      addr: NonNull::from(&mut self.addr),
     })
   }
 
@@ -339,7 +318,7 @@ impl OpModel for Accept {
     // SAFETY: successful accept returns a live file descriptor owned by us.
     let resource = unsafe { Resource::from_raw_fd(completion.result as RawFd) };
 
-    let addr = match unsafe { libc_socketaddr_into_std_raw(&self.addr) } {
+    let addr = match socket_addr_from_buf(&self.addr) {
       Ok(addr) => addr,
       Err(err) => return OpResult::Done(Err(err)),
     };
@@ -365,6 +344,7 @@ impl OpModelContract for Accept {
       |action| matches!(action, Action::Io(Op::Accept { .. })),
       |model| model.stage_peer_addr("127.0.0.1:8080".parse().unwrap()),
       #[cfg(unix)]
+      // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
       Completion::new(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
       |result| {
         matches!(
@@ -383,21 +363,12 @@ impl OpModelContract for Accept {
 
 pub struct Connect {
   res: Resource,
-  addr: libc::sockaddr_storage,
-  len: libc::socklen_t,
+  addr: SocketAddrBuf,
 }
 
 impl Connect {
   pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {
-    let addr = std_socketaddr_into_libc(addr);
-    let len = if addr.ss_family == libc::AF_INET as libc::sa_family_t {
-      mem::size_of::<libc::sockaddr_in>()
-    } else if addr.ss_family == libc::AF_INET6 as libc::sa_family_t {
-      mem::size_of::<libc::sockaddr_in6>()
-    } else {
-      mem::size_of::<libc::sockaddr_storage>()
-    } as libc::socklen_t;
-    Self { res, addr, len }
+    Self { res, addr: socket_addr_into_buf(addr) }
   }
 }
 
@@ -405,11 +376,7 @@ impl OpModel for Connect {
   type Item = std::io::Result<()>;
 
   fn action(&mut self) -> Action {
-    Action::Io(Op::Connect {
-      fd: self.res.clone(),
-      addr: &self.addr,
-      len: self.len,
-    })
+    Action::Io(Op::Connect { fd: self.res.clone(), addr: self.addr })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -441,6 +408,105 @@ impl OpModelContract for Connect {
     )]
   }
 }
+
+// ============================================================================
+// Bind
+// ============================================================================
+
+pub struct Bind {
+  res: Resource,
+  addr: SocketAddr,
+}
+
+impl Bind {
+  pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {
+    Self { res, addr }
+  }
+}
+
+impl OpModel for Bind {
+  type Item = io::Result<()>;
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::Bind { fd: self.res.clone(), addr: self.addr })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    OpResult::Done(if completion.result < 0 {
+      Err(io::Error::from_raw_os_error((-completion.result) as i32))
+    } else {
+      Ok(())
+    })
+  }
+}
+
+impl OneshotOpModel for Bind {}
+
+// ============================================================================
+// Listen
+// ============================================================================
+
+pub struct Listen {
+  res: Resource,
+  backlog: i32,
+}
+
+impl Listen {
+  pub(crate) fn new(res: Resource, backlog: i32) -> Self {
+    Self { res, backlog }
+  }
+}
+
+impl OpModel for Listen {
+  type Item = io::Result<()>;
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::Listen { fd: self.res.clone(), backlog: self.backlog })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    OpResult::Done(if completion.result < 0 {
+      Err(io::Error::from_raw_os_error((-completion.result) as i32))
+    } else {
+      Ok(())
+    })
+  }
+}
+
+impl OneshotOpModel for Listen {}
+
+// ============================================================================
+// Shutdown
+// ============================================================================
+
+pub struct Shutdown {
+  res: Resource,
+  how: i32,
+}
+
+impl Shutdown {
+  pub(crate) fn new(res: Resource, how: i32) -> Self {
+    Self { res, how }
+  }
+}
+
+impl OpModel for Shutdown {
+  type Item = io::Result<()>;
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::Shutdown { fd: self.res.clone(), how: self.how })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    OpResult::Done(if completion.result < 0 {
+      Err(io::Error::from_raw_os_error((-completion.result) as i32))
+    } else {
+      Ok(())
+    })
+  }
+}
+
+impl OneshotOpModel for Shutdown {}
 
 // ============================================================================
 // Nop
@@ -499,8 +565,8 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> Read<B> {
     Self {
       res,
       buf: Some(buf),
-      // SAFETY: `RawBuf` is repr(transparent) over `libc::iovec`, which is safe
-      // to zero-initialize before the entries are filled in `op()`.
+      // SAFETY: `RawBuf` is a plain pointer/length pair and is immediately
+      // overwritten before submission.
       raws: unsafe { mem::zeroed() },
       iov_count,
       offset: -1,
@@ -553,7 +619,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Read<B> {
 
     Action::Io(Op::Read {
       fd: self.res.clone(),
-      iovecs: self.raws.as_mut_ptr(),
+      iovecs: NonNull::from(&mut self.raws[0]),
       iov_count: self.iov_count,
       offset: self.offset,
       flags: 0,
@@ -632,7 +698,7 @@ impl OpModelContract for Read<(Vec<u8>, Vec<u8>)> {
       },
       |model| model.stage_read_data(b"abcde"),
       Completion::new(5),
-      |result: &OpResult<BufResult<i32, (Vec<u8>, Vec<u8>)>>| match result {
+      |result: &TwoVecOpResult| match result {
         OpResult::Done((Ok(5), (a, b))) => {
           a.as_slice() == b"abc" && b.as_slice() == b"de"
         }
@@ -650,7 +716,7 @@ pub struct Write<B: IoBufVec + std::marker::Send + Sync> {
   res: Resource,
   buf: Option<B>,
   raws: [RawBuf; MAX_IOV_COUNT],
-  iov_count: usize,
+  count: usize,
   offset: i64,
 }
 
@@ -660,10 +726,10 @@ impl<B: IoBufVec + std::marker::Send + Sync> Write<B> {
     Self {
       res,
       buf: Some(buf),
-      // SAFETY: `RawBuf` is repr(transparent) over `libc::iovec`, which is safe
-      // to zero-initialize before the entries are filled in `op()`.
+      // SAFETY: `RawBuf` is a plain pointer/length pair and is immediately
+      // overwritten before submission.
       raws: unsafe { mem::zeroed() },
-      iov_count,
+      count: iov_count,
       offset: -1,
     }
   }
@@ -679,7 +745,7 @@ impl<B: IoBufVec + std::marker::Send + Sync> OpModel for Write<B> {
 
   fn action(&mut self) -> Action {
     let buf = self.buf.as_ref().expect("buffer not available");
-    for i in 0..self.iov_count {
+    for i in 0..self.count {
       let (ptr, len) = buf.buf(i);
       // SAFETY: `IoBufVec` guarantees each segment is valid for `len`
       // initialized bytes until completion.
@@ -688,8 +754,8 @@ impl<B: IoBufVec + std::marker::Send + Sync> OpModel for Write<B> {
 
     Action::Io(Op::Write {
       fd: self.res.clone(),
-      iovecs: self.raws.as_ptr(),
-      iov_count: self.iov_count,
+      iovecs: NonNull::from(&mut self.raws[0]),
+      iov_count: self.count,
       offset: self.offset,
       flags: 0,
     })
@@ -754,7 +820,7 @@ impl OpModelContract for Write<(Vec<u8>, Vec<u8>)> {
         )
       },
       Completion::new(5),
-      |result: &OpResult<BufResult<i32, (Vec<u8>, Vec<u8>)>>| match result {
+      |result: &TwoVecOpResult| match result {
         OpResult::Done((Ok(5), (a, b))) => {
           a.as_slice() == b"ab" && b.as_slice() == b"cde"
         }
@@ -795,6 +861,8 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> Recv<B> {
     Self {
       res,
       flags: flags.unwrap_or(0),
+      // SAFETY: a dangling pointer with zero length is a placeholder until
+      // `hydrate_msg` installs real buffer slices.
       bufs: [unsafe { MsgBufMut::from_raw_parts(NonNull::dangling(), 0) };
         MAX_IOV_COUNT],
       from: false,
@@ -813,6 +881,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> Recv<B> {
 
     for i in 0..buf_count {
       let (ptr, len) = buf.buf_mut(i);
+      // SAFETY: `buf_mut(i)` returns a valid writable region for this buffer slot.
       self.bufs[i] = unsafe {
         MsgBufMut::from_raw_parts(
           NonNull::new(ptr).expect("IoBufMutVec returned null ptr"),
@@ -926,7 +995,7 @@ impl OpModelContract for Recv<(Vec<u8>, Vec<u8>)> {
       },
       |model| model.stage_recv_data(b"hello"),
       Completion::new(5),
-      |result: &OpResult<BufResult<i32, (Vec<u8>, Vec<u8>)>>| match result {
+      |result: &TwoVecOpResult| match result {
         OpResult::Done((Ok(5), (a, b))) => {
           a.as_slice() == b"he" && b.as_slice() == b"llo"
         }
@@ -967,6 +1036,8 @@ impl<B: IoBufVec + std::marker::Send + Sync> Send<B> {
     Self {
       res,
       flags: flags.unwrap_or(0),
+      // SAFETY: a dangling pointer with zero length is a placeholder until
+      // `hydrate_msg` installs real buffer slices.
       bufs: [unsafe { MsgBuf::from_raw_parts(NonNull::dangling(), 0) };
         MAX_IOV_COUNT],
       addr: None,
@@ -985,6 +1056,7 @@ impl<B: IoBufVec + std::marker::Send + Sync> Send<B> {
 
     for i in 0..buf_count {
       let (ptr, len) = buf.buf(i);
+      // SAFETY: `buf(i)` returns a valid readable region for this buffer slot.
       self.bufs[i] = unsafe {
         MsgBuf::from_raw_parts(
           NonNull::new(ptr.cast_mut()).expect("IoBufVec returned null ptr"),
@@ -1062,7 +1134,7 @@ impl OpModelContract for Send<(Vec<u8>, Vec<u8>)> {
         matches!(action, Action::Io(Op::Send { flags: libc::MSG_NOSIGNAL, .. }))
       },
       Completion::new(5),
-      |result: &OpResult<BufResult<i32, (Vec<u8>, Vec<u8>)>>| match result {
+      |result: &TwoVecOpResult| match result {
         OpResult::Done((Ok(5), (a, b))) => {
           a.as_slice() == b"he" && b.as_slice() == b"llo"
         }
@@ -1227,7 +1299,8 @@ impl OpModel for OpenAt {
   fn action(&mut self) -> Action {
     Action::Io(Op::OpenAt {
       dir_fd: self.dir_res.clone(),
-      path: self.pathname.as_ptr(),
+      path: NonNull::new(self.pathname.as_ptr().cast_mut())
+        .expect("CString pointer must be non-null"),
       flags: self.flags,
       mode: self.mode,
     })
@@ -1247,6 +1320,166 @@ impl OpModel for OpenAt {
 
 impl OneshotOpModel for OpenAt {}
 
+pub struct Stat {
+  dir_res: Resource,
+  pathname: CString,
+  follow_symlinks: bool,
+  out: FileStat,
+}
+
+impl Stat {
+  pub(crate) fn new(
+    dir_res: Resource,
+    pathname: CString,
+    follow_symlinks: bool,
+  ) -> Self {
+    Self { dir_res, pathname, follow_symlinks, out: FileStat::zeroed() }
+  }
+}
+
+impl OpModel for Stat {
+  type Item = std::io::Result<FileStat>;
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::Stat {
+      dir_fd: self.dir_res.clone(),
+      path: NonNull::new(self.pathname.as_ptr().cast_mut())
+        .expect("CString pointer must be non-null"),
+      follow_symlinks: self.follow_symlinks,
+      out: NonNull::from(&mut self.out),
+    })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    let res = if completion.result < 0 {
+      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+    } else {
+      Ok(self.out)
+    };
+    OpResult::Done(res)
+  }
+}
+
+impl OneshotOpModel for Stat {}
+
+pub struct ReadDir {
+  fd: Resource,
+  buf: ReadDirBuf,
+}
+
+impl ReadDir {
+  pub(crate) fn new(fd: Resource, buf: ReadDirBuf) -> Self {
+    Self { fd, buf }
+  }
+}
+
+impl OpModel for ReadDir {
+  type Item = std::io::Result<ReadDirBuf>;
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::ReadDir {
+      fd: self.fd.clone(),
+      raw_buf: NonNull::new(self.buf.raw.as_mut_ptr()).expect("raw buffer"),
+      raw_cap: self.buf.raw.len(),
+      entries: NonNull::new(self.buf.entries.as_mut_ptr())
+        .expect("entry buffer"),
+      entries_cap: self.buf.entries.len(),
+      opaque: NonNull::from(&mut self.buf.opaque),
+      opaque_drop: NonNull::from(&mut self.buf.opaque_drop),
+      out: NonNull::from(&mut self.buf.result),
+    })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    let res = if completion.result < 0 {
+      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+    } else {
+      Ok(std::mem::take(&mut self.buf))
+    };
+    OpResult::Done(res)
+  }
+}
+
+impl OneshotOpModel for ReadDir {}
+
+#[cfg(test)]
+impl OpModelContract for ReadDir {
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::cwd(), ReadDirBuf::with_capacity(64, 4))
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action| matches!(action, Action::Io(Op::ReadDir { .. })),
+      |model| {
+        model.buf.raw[..5].copy_from_slice(b"child");
+        model.buf.entries[0] = crate::backend::op::DirEntryRef {
+          name_offset: 0,
+          name_len: 5,
+          file_type: Some(crate::backend::op::FileType::File),
+          ino: Some(1),
+        };
+        model.buf.result = crate::backend::op::ReadDirResult {
+          entries: 1,
+          raw_written: 5,
+          eof: true,
+        };
+      },
+      Completion::new(0),
+      |result| {
+        matches!(
+          result,
+          OpResult::Done(Ok(buf))
+            if buf.result.entries == 1
+              && buf.iter().next().map(|entry| entry.name) == Some(&b"child"[..])
+        )
+      },
+    )]
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Stat {
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::cwd(), CString::new("file").expect("cstring"), true)
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action| {
+        matches!(action, Action::Io(Op::Stat { follow_symlinks: true, .. }))
+      },
+      |model| {
+        model.out = FileStat {
+          file_type: crate::backend::op::FileType::File,
+          size: 7,
+          permissions: 0o644,
+          mode: (libc::S_IFREG as u32) | 0o644,
+          nlink: 1,
+          uid: 1000,
+          gid: 1000,
+        };
+      },
+      Completion::new(0),
+      |result| {
+        matches!(
+          result,
+          OpResult::Done(Ok(stat))
+            if stat.is_file() && stat.len() == 7 && stat.permissions == 0o644
+        )
+      },
+    )]
+  }
+}
+
 pub struct UnlinkAt {
   dir_res: Resource,
   pathname: CString,
@@ -1265,7 +1498,8 @@ impl OpModel for UnlinkAt {
   fn action(&mut self) -> Action {
     Action::Io(Op::UnlinkAt {
       dir_fd: self.dir_res.clone(),
-      path: self.pathname.as_ptr(),
+      path: NonNull::new(self.pathname.as_ptr().cast_mut())
+        .expect("CString pointer must be non-null"),
       flags: self.flags,
     })
   }
@@ -1334,9 +1568,11 @@ impl OpModel for RenameAt {
   fn action(&mut self) -> Action {
     Action::Io(Op::RenameAt {
       old_dir_fd: self.old_dir_res.clone(),
-      old_path: self.old_pathname.as_ptr(),
+      old_path: NonNull::new(self.old_pathname.as_ptr().cast_mut())
+        .expect("CString pointer must be non-null"),
       new_dir_fd: self.new_dir_res.clone(),
-      new_path: self.new_pathname.as_ptr(),
+      new_path: NonNull::new(self.new_pathname.as_ptr().cast_mut())
+        .expect("CString pointer must be non-null"),
     })
   }
 
@@ -1394,7 +1630,8 @@ impl OpModel for MkdirAt {
   fn action(&mut self) -> Action {
     Action::Io(Op::MkdirAt {
       dir_fd: self.dir_res.clone(),
-      path: self.pathname.as_ptr(),
+      path: NonNull::new(self.pathname.as_ptr().cast_mut())
+        .expect("CString pointer must be non-null"),
       mode: self.mode,
     })
   }
@@ -1457,9 +1694,11 @@ impl OpModel for LinkAt {
     Action::Io(Op::LinkAt {
       kind: self.kind,
       source_dir_fd: self.source_dir_res.clone(),
-      source_path: self.source_pathname.as_ptr(),
+      source_path: NonNull::new(self.source_pathname.as_ptr().cast_mut())
+        .expect("CString pointer must be non-null"),
       new_dir_fd: self.new_dir_res.clone(),
-      new_path: self.new_pathname.as_ptr(),
+      new_path: NonNull::new(self.new_pathname.as_ptr().cast_mut())
+        .expect("CString pointer must be non-null"),
     })
   }
 
@@ -1516,6 +1755,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> ReadlinkAt<B> {
       dir_res,
       pathname,
       buf: Some(buf),
+      // SAFETY: null with zero length is a placeholder until `action()`.
       raw: unsafe { RawBuf::from_raw_parts(ptr::null_mut(), 0) },
       raw_len: 0,
     }
@@ -1528,13 +1768,15 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
   fn action(&mut self) -> Action {
     let buf = self.buf.as_mut().expect("buffer not available");
     let (ptr, len) = buf.buf_mut(0);
+    // SAFETY: `buf_mut(0)` returns a valid writable region for the op lifetime.
     self.raw = unsafe { RawBuf::from_raw_parts(ptr, len) };
     self.raw_len = len;
 
     Action::Io(Op::ReadlinkAt {
       dir_fd: self.dir_res.clone(),
-      path: self.pathname.as_ptr(),
-      buf: ptr,
+      path: NonNull::new(self.pathname.as_ptr().cast_mut())
+        .expect("CString pointer must be non-null"),
+      buf: NonNull::new(ptr).expect("readlink buffer pointer must be non-null"),
       buf_len: self.raw_len,
     })
   }
@@ -1554,6 +1796,175 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
 impl<B: IoBufMutVec + std::marker::Send + Sync> OneshotOpModel
   for ReadlinkAt<B>
 {
+}
+
+pub struct GetCwd<B: IoBufMutVec + std::marker::Send + Sync> {
+  buf: Option<B>,
+  raw: RawBuf,
+  raw_len: usize,
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> GetCwd<B> {
+  pub(crate) fn new(buf: B) -> Self {
+    Self {
+      buf: Some(buf),
+      // SAFETY: null with zero length is a placeholder until `action()`.
+      raw: unsafe { RawBuf::from_raw_parts(ptr::null_mut(), 0) },
+      raw_len: 0,
+    }
+  }
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
+  type Item = BufResult<i32, B>;
+
+  fn action(&mut self) -> Action {
+    let buf = self.buf.as_mut().expect("buffer not available");
+    let (ptr, len) = buf.buf_mut(0);
+    // SAFETY: `buf_mut(0)` returns a valid writable region for the op lifetime.
+    self.raw = unsafe { RawBuf::from_raw_parts(ptr, len) };
+    self.raw_len = len;
+
+    Action::Io(Op::GetCwd {
+      buf: NonNull::new(ptr).expect("getcwd buffer pointer must be non-null"),
+      buf_len: self.raw_len,
+    })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    let mut buf = self.buf.take().expect("buffer not available");
+    let result = if completion.result < 0 {
+      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+    } else {
+      buf.set_buf_len(0, completion.result as usize);
+      Ok(completion.result as i32)
+    };
+    OpResult::Done((result, buf))
+  }
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> OneshotOpModel for GetCwd<B> {}
+
+#[cfg(test)]
+impl OpModelContract for GetCwd<Vec<u8>> {
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(vec![0; 32])
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action| matches!(action, Action::Io(Op::GetCwd { .. })),
+      |model| {
+        model.buf.as_mut().expect("buffer available")[..4]
+          .copy_from_slice(b"/tmp");
+      },
+      Completion::new(4),
+      |result| match result {
+        OpResult::Done((Ok(bytes), buf)) => *bytes == 4 && &buf[..4] == b"/tmp",
+        _ => false,
+      },
+    )]
+  }
+}
+
+#[cfg(unix)]
+pub struct Spawn {
+  path: CString,
+  argv: Vec<CString>,
+  argv_ptrs: Vec<*mut libc::c_char>,
+  envp: Option<Vec<CString>>,
+  envp_ptrs: Option<Vec<*mut libc::c_char>>,
+}
+
+#[cfg(unix)]
+impl Spawn {
+  pub(crate) fn new(
+    path: CString,
+    argv: Vec<CString>,
+    envp: Option<Vec<CString>>,
+  ) -> Self {
+    let argv_ptrs = argv
+      .iter()
+      .map(|arg| arg.as_ptr().cast_mut())
+      .chain(std::iter::once(ptr::null_mut()))
+      .collect();
+    let envp_ptrs = envp.as_ref().map(|vars| {
+      vars
+        .iter()
+        .map(|var| var.as_ptr().cast_mut())
+        .chain(std::iter::once(ptr::null_mut()))
+        .collect()
+    });
+
+    Self { path, argv, argv_ptrs, envp, envp_ptrs }
+  }
+}
+
+#[cfg(unix)]
+impl OpModel for Spawn {
+  type Item = std::io::Result<Pid>;
+
+  fn action(&mut self) -> Action {
+    let _ = &self.argv;
+    let _ = &self.envp;
+    Action::Io(Op::Spawn {
+      path: NonNull::new(self.path.as_ptr().cast_mut())
+        .expect("CString pointer must be non-null"),
+      argv: NonNull::new(self.argv_ptrs.as_mut_ptr())
+        .expect("argv pointer must be non-null"),
+      envp: self
+        .envp_ptrs
+        .as_mut()
+        .and_then(|vars| NonNull::new(vars.as_mut_ptr())),
+    })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    let result = if completion.result < 0 {
+      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+    } else {
+      Ok(Pid::from_raw(completion.result as i64))
+    };
+    OpResult::Done(result)
+  }
+}
+
+#[cfg(unix)]
+impl OneshotOpModel for Spawn {}
+
+// SAFETY: Spawn owns its CString storage and the raw pointers only reference
+// that owned storage for the lifetime of the op.
+#[cfg(unix)]
+unsafe impl std::marker::Send for Spawn {}
+// SAFETY: Same reasoning as Send. The op is immutable while submitted.
+#[cfg(unix)]
+unsafe impl std::marker::Sync for Spawn {}
+
+#[cfg(all(test, unix))]
+impl OpModelContract for Spawn {
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(
+      CString::new("/bin/echo").expect("cstring"),
+      vec![CString::new("echo").expect("cstring")],
+      None,
+    )
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action| matches!(action, Action::Io(Op::Spawn { .. })),
+      Completion::new(1234),
+      |result: &OpResult<std::io::Result<Pid>>| matches!(result, OpResult::Done(Ok(pid)) if pid.as_raw() == 1234),
+    )]
+  }
 }
 
 #[cfg(test)]
@@ -1600,6 +2011,31 @@ mod tests {
     use super::*;
 
     crate::test_op_model_contract!(Socket);
+  }
+
+  mod getcwd_contract {
+    use super::*;
+
+    crate::test_op_model_contract!(GetCwd<Vec<u8>>);
+  }
+
+  mod stat_contract {
+    use super::*;
+
+    crate::test_op_model_contract!(Stat);
+  }
+
+  mod readdir_contract {
+    use super::*;
+
+    crate::test_op_model_contract!(ReadDir);
+  }
+
+  #[cfg(unix)]
+  mod spawn_contract {
+    use super::*;
+
+    crate::test_op_model_contract!(Spawn);
   }
 
   mod read_contract {

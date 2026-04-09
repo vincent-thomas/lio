@@ -12,6 +12,9 @@ impl Interest {
   pub const NONE: Self = Self { bits: 0 };
   pub const READ: Self = Self { bits: 1 << 0 };
   pub const WRITE: Self = Self { bits: 1 << 1 };
+
+  // Only epoll supports read and write.
+  #[allow(dead_code)]
   pub const READ_AND_WRITE: Self =
     Self { bits: Self::READ.bits | Self::WRITE.bits };
   pub const TIMER: Self = Self { bits: 1 << 2 };

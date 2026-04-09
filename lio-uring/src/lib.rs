@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 pub mod operation;
 
 mod bindings;
+pub use bindings::statx;
 
 /// A completed operation with result and metadata
 #[derive(Debug, Clone, Copy)]
@@ -363,6 +364,19 @@ impl LioUring {
     } else {
       Ok(pending as usize)
     }
+  }
+
+  /// Submit queued operations and wait for at least `want` completions.
+  ///
+  /// Returns the number of operations submitted.
+  pub fn submit_and_wait(&mut self, want: usize) -> io::Result<usize> {
+    let ret = unsafe {
+      bindings::io_uring_submit_and_wait(&raw mut self.ring, want as u32)
+    };
+    if ret < 0 {
+      return Err(io::Error::from_raw_os_error(-ret));
+    }
+    Ok(ret as usize)
   }
 
   /// Check if SQPOLL mode is enabled.

@@ -1,6 +1,31 @@
+#![allow(
+  clippy::collapsible_if,
+  clippy::default_constructed_unit_structs,
+  clippy::explicit_counter_loop,
+  clippy::field_reassign_with_default,
+  clippy::if_same_then_else,
+  clippy::io_other_error,
+  clippy::let_and_return,
+  clippy::manual_clamp,
+  clippy::manual_is_multiple_of,
+  clippy::needless_borrow,
+  clippy::needless_ifs,
+  clippy::needless_question_mark,
+  clippy::needless_range_loop,
+  clippy::nonminimal_bool,
+  clippy::ptr_arg,
+  clippy::redundant_closure,
+  clippy::too_many_arguments,
+  clippy::type_complexity,
+  clippy::unnecessary_mut_passed,
+  clippy::unnecessary_sort_by
+)]
+
 mod app;
 pub mod applets;
 pub mod command;
+#[cfg(feature = "query")]
+pub mod query;
 mod registry;
 mod util;
 
@@ -70,11 +95,41 @@ pub fn run_from_env_exit_code() -> ExitCode {
     Err(err) => match extract_exit_status(&err) {
       Some(status) => ExitCode::from(status),
       None => {
-        eprintln!("{err}");
-        ExitCode::FAILURE
+        if err.kind() != io::ErrorKind::BrokenPipe {
+          eprintln!("{err}");
+        }
+        ExitCode::from(default_exit_status(&err))
       }
     },
   }
+}
+
+fn default_exit_status(err: &io::Error) -> u8 {
+  if is_unknown_applet_error(err) {
+    return 127;
+  }
+
+  match err.kind() {
+    io::ErrorKind::BrokenPipe => 0,
+    io::ErrorKind::InvalidInput => 2,
+    io::ErrorKind::NotFound => 1,
+    _ => {
+      if is_usage_error(err) {
+        return 2;
+      }
+
+      1
+    }
+  }
+}
+
+fn is_unknown_applet_error(err: &io::Error) -> bool {
+  err.kind() == io::ErrorKind::NotFound
+    && err.to_string().starts_with("unknown applet:")
+}
+
+fn is_usage_error(err: &io::Error) -> bool {
+  matches!(err.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported)
 }
 
 fn run_with_args(args: Vec<String>) -> io::Result<()> {
@@ -148,7 +203,7 @@ fn print_top_level_help(
   bin: &str,
 ) -> io::Result<()> {
   let mut output = format!(
-    "{bin} - BusyBox-style lio example\n\nUsage:\n  {bin} <applet> [args...]\n  <applet> [args...]\n\nCommands:\n"
+    "{bin} - a rust implementation\n\nUsage:\n  {bin} <applet> [args...]\n  <applet> [args...]\n\nCommands:\n"
   );
 
   for command in registry.commands() {
@@ -240,5 +295,42 @@ mod tests {
     let registry = Registry::new();
     let command = registry.find("test").unwrap();
     assert_eq!(format_command_display_name(command), "test, [");
+  }
+
+  #[test]
+  fn default_exit_status_uses_shell_compatible_mappings() {
+    assert_eq!(
+      default_exit_status(&io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "bad flag"
+      )),
+      2
+    );
+    assert_eq!(
+      default_exit_status(&io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "broken pipe"
+      )),
+      0
+    );
+    assert_eq!(
+      default_exit_status(&io::Error::new(
+        io::ErrorKind::NotFound,
+        "cat: missing"
+      )),
+      1
+    );
+    assert_eq!(
+      default_exit_status(&io::Error::new(
+        io::ErrorKind::NotFound,
+        "unknown applet: nope"
+      )),
+      127
+    );
+  }
+
+  #[test]
+  fn explicit_exit_status_errors_are_preserved() {
+    assert_eq!(extract_exit_status(&exit_with_status(42)), Some(42));
   }
 }

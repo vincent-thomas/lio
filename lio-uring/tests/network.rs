@@ -108,9 +108,7 @@ fn test_connect_tcp() {
   let addr = libc::sockaddr_in {
     sin_family: libc::AF_INET as u16,
     sin_port: port.to_be(),
-    sin_addr: libc::in_addr {
-      s_addr: u32::from_ne_bytes([127, 0, 0, 1]).to_be(),
-    },
+    sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes([127, 0, 0, 1]) },
     sin_zero: [0; 8],
   };
 
@@ -145,9 +143,7 @@ fn test_connect_refused() {
   let addr = libc::sockaddr_in {
     sin_family: libc::AF_INET as u16,
     sin_port: 65432u16.to_be(), // Unlikely to be in use
-    sin_addr: libc::in_addr {
-      s_addr: u32::from_ne_bytes([127, 0, 0, 1]).to_be(),
-    },
+    sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes([127, 0, 0, 1]) },
     sin_zero: [0; 8],
   };
 
@@ -428,9 +424,7 @@ fn test_concurrent_connections() {
   let addr = libc::sockaddr_in {
     sin_family: libc::AF_INET as u16,
     sin_port: port.to_be(),
-    sin_addr: libc::in_addr {
-      s_addr: u32::from_ne_bytes([127, 0, 0, 1]).to_be(),
-    },
+    sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes([127, 0, 0, 1]) },
     sin_zero: [0; 8],
   };
 

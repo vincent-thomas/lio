@@ -527,6 +527,8 @@ mod utils {
       assert!(!ptr.is_null());
 
       // Verify the pointer points to valid data
+      // SAFETY: `ptr` was derived from `&ts`, so it is non-null, aligned, and
+      // points to the same initialized `timespec` for the duration of this check.
       unsafe {
         assert_eq!((*ptr).tv_sec, 2);
         assert_eq!((*ptr).tv_nsec, 500_000_000);
@@ -589,6 +591,10 @@ mod notify {
 
     /// Notifies the `Poller`.
     #[cfg(test)]
+    #[expect(
+      dead_code,
+      reason = "Only used by backend-specific tests on some targets"
+    )]
     pub(super) fn notify(&self, poller: &OsPoller) -> io::Result<()> {
       // Trigger the EVFILT_USER event.
       let mut kev = super::make_kevent(

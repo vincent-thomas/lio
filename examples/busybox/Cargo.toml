@@ -3,6 +3,25 @@ name = "busybox"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["hashsum", "jq", "fd", "rg", "query", "yq"]
+hashsum = []
+jq = ["query", "dep:serde_json"]
+yq = ["query", "dep:serde_norway"]
+fd = ["dep:ignore", "dep:regex", "dep:crossbeam-deque"]
+rg = ["dep:ignore", "dep:regex", "dep:serde_json", "dep:crossbeam-deque", "dep:crossbeam-queue", "dep:memchr", "dep:kanal"]
+query = ["dep:serde", "dep:indexmap"]
+
 [dependencies]
 libc.workspace = true
 lio = { path = "../../lio" }
+serde = { version = "1.0", optional = true, features = ["derive"] }
+serde_json = { version = "1.0", optional = true, default-features = false, features = ["alloc", "preserve_order"] }
+serde_norway = { version = "0.9.42", optional = true }
+indexmap = { version = "2.7", optional = true, features = ["serde"] }
+ignore = { version = "0.4", optional = true }
+regex = { version = "1.12", optional = true }
+crossbeam-deque = { version = "0.8", optional = true }
+crossbeam-queue = { version = "0.3", optional = true }
+memchr = { version = "2.7", optional = true }
+kanal = { version = "0.1", optional = true }

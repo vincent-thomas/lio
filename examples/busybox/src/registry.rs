@@ -13,6 +13,7 @@ impl Registry {
       applets::cat::CatCommand::registration(),
       applets::cp::CpCommand::registration(),
       applets::less::LessCommand::registration(),
+      applets::ls::LsCommand::registration(),
       applets::ln::LnCommand::registration(),
       applets::mkdir::MkdirCommand::registration(),
       applets::mktemp::MktempCommand::registration(),
@@ -23,10 +24,16 @@ impl Registry {
       applets::sleep::SleepCommand::registration(),
       applets::clear::ClearCommand::registration(),
       applets::printf::PrintfCommand::registration(),
+      applets::pwd::PwdCommand::registration(),
       applets::readlink::ReadlinkCommand::registration(),
       applets::realpath::RealpathCommand::registration(),
       applets::seq::SeqCommand::registration(),
+      applets::sed::SedCommand::registration(),
       applets::echo::EchoCommand::registration(),
+      #[cfg(feature = "fd")]
+      applets::fd::FdCommand::registration(),
+      #[cfg(feature = "rg")]
+      applets::grep::GrepCommand::registration(),
       applets::dirname::DirnameCommand::registration(),
       applets::basename::BasenameCommand::registration(),
       applets::head::HeadCommand::registration(),
@@ -47,6 +54,12 @@ impl Registry {
       applets::cksum::CksumCommand::registration(),
       applets::fold::FoldCommand::registration(),
       applets::hexdump::HexdumpCommand::registration(),
+      #[cfg(feature = "jq")]
+      applets::jq::JqCommand::registration(),
+      #[cfg(feature = "yq")]
+      applets::yq::YqCommand::registration(),
+      #[cfg(feature = "rg")]
+      applets::rg::RgCommand::registration(),
       applets::od::OdCommand::registration(),
       applets::strings::StringsCommand::registration(),
       applets::sort::SortCommand::registration(),
@@ -54,12 +67,19 @@ impl Registry {
       applets::comm::CommCommand::registration(),
       applets::base64::Base64Command::registration(),
       applets::base32::Base32Command::registration(),
-      applets::md5sum::Md5sumCommand::registration(),
-      applets::sha1sum::Sha1sumCommand::registration(),
-      applets::sha256sum::Sha256sumCommand::registration(),
-      applets::sha512sum::Sha512sumCommand::registration(),
-      applets::sha3sum::Sha3sumCommand::registration(),
+      #[cfg(feature = "hashsum")]
+      applets::Md5sumCommand::registration(),
+      #[cfg(feature = "hashsum")]
+      applets::Sha1sumCommand::registration(),
+      #[cfg(feature = "hashsum")]
+      applets::Sha256sumCommand::registration(),
+      #[cfg(feature = "hashsum")]
+      applets::Sha512sumCommand::registration(),
+      #[cfg(feature = "hashsum")]
+      applets::Sha3sumCommand::registration(),
       applets::test::TestCommand::registration(),
+      applets::timeout::TimeoutCommand::registration(),
+      applets::watch::WatchCommand::registration(),
       applets::xargs::XargsCommand::registration(),
     ];
     Self { commands }

@@ -197,16 +197,14 @@ where
   /// ```
   pub fn when_done<F>(self, f: F)
   where
-    F: Fn(T::Item) + Send + 'static,
+    F: Fn(T::Item) + 'static,
   {
     let (lio, stream_op) = self.into_lio();
-
-    // Box the StreamOp to give it a stable heap address before creating Registration.
-    // The Registration stores the StreamOp and calls send_op()/result() on it.
-    let boxed = Box::new(stream_op);
-    let registration = Registration::new_callback::<T, F>(f, boxed);
-
-    lio.schedule(registration).expect("lio error: lio should handle this");
+    lio
+      .schedule_with(move |arena| {
+        Registration::new_callback_in::<T, F>(arena, f, stream_op)
+      })
+      .expect("lio error: lio should handle this");
   }
 }
 
@@ -460,13 +458,11 @@ where
         // First poll - create channel and schedule operation
         let (tx, rx) = std::sync::mpsc::channel();
 
-        let boxed = Box::new(stream_op);
-        let registration =
-          Registration::new_waker(cx.waker().clone(), tx, boxed);
-
         let id = this
           .lio
-          .schedule(registration)
+          .schedule_with(move |arena| {
+            Registration::new_waker_in(arena, cx.waker().clone(), tx, stream_op)
+          })
           .expect("lio error: failed to schedule operation");
 
         this.state = IoStreamFutureState::Inflight { id, receiver: rx };
@@ -625,15 +621,17 @@ where
       }
     };
 
-    let boxed = Box::new(op);
-    let reg = Registration::new_callback(
-      move |item| {
-        let _ = sender.send(item);
-      },
-      boxed,
-    );
-
-    lio.schedule(reg).expect("lio error: failed to schedule stream operation");
+    lio
+      .schedule_with(move |arena| {
+        Registration::new_callback_in(
+          arena,
+          move |item| {
+            let _ = sender.send(item);
+          },
+          op,
+        )
+      })
+      .expect("lio error: failed to schedule stream operation");
   }
 }
 
@@ -657,11 +655,9 @@ impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
         // First poll - create channel and schedule operation
         let (tx, rx) = std::sync::mpsc::channel();
 
-        let boxed = Box::new(stream_op);
-        let registration =
-          Registration::new_waker(cx.waker().clone(), tx, boxed);
-
-        match stream.handle.lio().schedule(registration) {
+        match stream.handle.lio().schedule_with(move |arena| {
+          Registration::new_waker_in(arena, cx.waker().clone(), tx, stream_op)
+        }) {
           Ok(id) => {
             stream.state = IoStreamState::Inflight { id, receiver: rx };
             Poll::Pending
@@ -762,6 +758,8 @@ mod tests {
       |_| {},
       |_| {},
     );
+    // SAFETY: the raw waker uses a static no-op vtable whose functions ignore
+    // the null data pointer, so it is valid to construct a `Waker` from it.
     unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
   }
 

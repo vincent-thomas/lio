@@ -1,17 +1,33 @@
 use std::{
   collections::VecDeque,
-  ffi::{CStr, CString},
+  ffi::CString,
   io,
   path::{Component, Path, PathBuf},
 };
 
-use crate::{app::AppContext, command::Command, util::io as io_util};
+use crate::{
+  app::AppContext,
+  command::Command,
+  util::{
+    cwd,
+    flags::{FlagParser, FlagSpec},
+    io as io_util,
+  },
+};
 
 use super::readlink::read_link_target;
 
 #[derive(Debug, Clone, Default)]
 pub struct RealpathCommand {
+  pub mode: CanonicalizeMode,
   pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CanonicalizeMode {
+  #[default]
+  Existing,
+  MissingOk,
 }
 
 impl Command for RealpathCommand {
@@ -24,33 +40,71 @@ impl Command for RealpathCommand {
   }
 
   fn usage() -> &'static str {
-    "realpath <path...>"
+    "realpath [-e|-m] <path...>"
   }
 
   fn parse(args: &[String]) -> io::Result<Self> {
-    if args.is_empty() {
+    const SPECS: &[FlagSpec<'static>] = &[
+      FlagSpec {
+        name: "existing",
+        short: &['e'],
+        long: &[],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "missing_ok",
+        short: &['m'],
+        long: &[],
+        takes_value: false,
+      },
+    ];
+    let parsed = FlagParser::new("realpath", SPECS).parse(args)?;
+    if parsed.positional().is_empty() {
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "realpath: missing operand",
       ));
     }
-    Ok(Self { paths: args.to_vec() })
+    let mode = if parsed.get_flag_exists("missing_ok") {
+      CanonicalizeMode::MissingOk
+    } else {
+      CanonicalizeMode::Existing
+    };
+    Ok(Self { mode, paths: parsed.positional().to_vec() })
   }
 
   fn execute(&self, ctx: &AppContext) -> io::Result<()> {
     for path in &self.paths {
-      let resolved = resolve_realpath(ctx, Path::new(path))?;
-      let mut output = resolved.into_os_string().into_encoded_bytes();
-      output.push(b'\n');
-      io_util::write_all(ctx.lio(), &ctx.stdout(), output)?;
+      write_resolved_path(ctx, Path::new(path), self.mode, true)?;
     }
     Ok(())
   }
 }
 
-fn resolve_realpath(ctx: &AppContext, path: &Path) -> io::Result<PathBuf> {
-  let mut current =
-    if path.is_absolute() { PathBuf::from("/") } else { getcwd()? };
+pub(crate) fn write_resolved_path(
+  ctx: &AppContext,
+  path: &Path,
+  mode: CanonicalizeMode,
+  trailing_newline: bool,
+) -> io::Result<()> {
+  let resolved = resolve_realpath(ctx, path, mode)?;
+  let mut output = resolved.into_os_string().into_encoded_bytes();
+  if trailing_newline {
+    output.push(b'\n');
+  }
+  io_util::write_all(ctx.lio(), &ctx.stdout(), output)
+}
+
+pub(crate) fn resolve_realpath(
+  ctx: &AppContext,
+  path: &Path,
+  mode: CanonicalizeMode,
+) -> io::Result<PathBuf> {
+  let mut current = if path.is_absolute() {
+    PathBuf::from("/")
+  } else {
+    cwd::current_working_directory(ctx)?
+  };
   let mut queue = owned_components(path);
   let mut traversals = 0usize;
 
@@ -63,7 +117,16 @@ fn resolve_realpath(ctx: &AppContext, path: &Path) -> io::Result<PathBuf> {
       }
       _ => {
         current.push(&component);
-        let kind = lstat_kind(&current)?;
+        let kind = match lstat_kind(&current) {
+          Ok(kind) => kind,
+          Err(err)
+            if mode == CanonicalizeMode::MissingOk
+              && err.kind() == io::ErrorKind::NotFound =>
+          {
+            continue;
+          }
+          Err(err) => return Err(err),
+        };
         if kind == FileKind::Symlink {
           traversals += 1;
           if traversals > 40 {
@@ -136,16 +199,6 @@ fn lstat_kind(path: &Path) -> io::Result<FileKind> {
   }
 }
 
-fn getcwd() -> io::Result<PathBuf> {
-  let mut buf = vec![0u8; 4096];
-  let ptr = unsafe { libc::getcwd(buf.as_mut_ptr().cast(), buf.len()) };
-  if ptr.is_null() {
-    return Err(io::Error::last_os_error());
-  }
-  let cwd = unsafe { CStr::from_ptr(ptr) };
-  Ok(PathBuf::from(cwd.to_string_lossy().into_owned()))
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -163,7 +216,8 @@ mod tests {
     fs::write(&file, b"hello").unwrap();
     symlink("dir/file.txt", &link).unwrap();
 
-    let resolved = resolve_realpath(&ctx, &link).unwrap();
+    let resolved =
+      resolve_realpath(&ctx, &link, CanonicalizeMode::Existing).unwrap();
     assert_eq!(resolved, fs::canonicalize(&file).unwrap());
 
     fs::remove_file(link).unwrap();
@@ -182,5 +236,33 @@ mod tests {
         .unwrap()
         .as_nanos()
     ))
+  }
+
+  #[test]
+  fn parse_realpath_supports_e_and_m() {
+    let existing =
+      RealpathCommand::parse(&["-e".into(), "path".into()]).unwrap();
+    assert_eq!(existing.mode, CanonicalizeMode::Existing);
+    let missing =
+      RealpathCommand::parse(&["-m".into(), "path".into()]).unwrap();
+    assert_eq!(missing.mode, CanonicalizeMode::MissingOk);
+  }
+
+  #[test]
+  fn realpath_m_allows_missing_tail_components() {
+    let ctx = AppContext::new().unwrap();
+    let root = unique_temp_path("realpath-m-root");
+    let existing = root.join("existing");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&existing).unwrap();
+    let missing = existing.join("missing").join("leaf");
+
+    let resolved =
+      resolve_realpath(&ctx, &missing, CanonicalizeMode::MissingOk).unwrap();
+    let canonical_existing = fs::canonicalize(&existing).unwrap();
+    assert_eq!(resolved, canonical_existing.join("missing").join("leaf"));
+
+    fs::remove_dir(existing).unwrap();
+    fs::remove_dir(root).unwrap();
   }
 }

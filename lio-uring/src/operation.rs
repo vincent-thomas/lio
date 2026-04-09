@@ -905,7 +905,7 @@ opcode! {
     pub struct Statx {
         dirfd: { RawFd },
         pathname: { *const libc::c_char },
-        statxbuf: { *mut libc::statx },
+        statxbuf: { *mut crate::bindings::statx },
         ;;
         flags: i32 = 0,
         mask: u32 = 0

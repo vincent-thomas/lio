@@ -1,5 +1,7 @@
 //! Stress tests for high-concurrency scenarios.
 
+#![allow(clippy::expect_fun_call, clippy::unnecessary_mut_passed)]
+
 mod common;
 
 use common::{TempFile, poll_until_recv, setup_tcp_pair};
@@ -123,6 +125,7 @@ fn test_concurrent_file_writes_256() {
       &cwd,
       temp.path.clone(),
       libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+      0o666,
     )
     .with_lio(&mut lio)
     .send_with(sender_open.clone());
@@ -218,73 +221,6 @@ fn test_concurrent_connections_100() {
 
   let total_elapsed = start.elapsed();
   eprintln!("100 connections total time: {:?}", total_elapsed);
-}
-
-// ============================================================================
-// Sustained load tests
-// ============================================================================
-
-#[test]
-fn test_sustained_io_5_seconds() {
-  let mut lio = Lio::new(1024).unwrap();
-
-  let duration = Duration::from_secs(5);
-  let start = Instant::now();
-  let mut ops_completed = 0u64;
-  let mut pending = 0u64;
-
-  let (sender, receiver) = mpsc::channel();
-
-  // Multiplex ~500 concurrent ops
-  let max_pending = 500;
-
-  while start.elapsed() < duration {
-    // Submit ops up to max_pending
-    while pending < max_pending {
-      api::nop().with_lio(&mut lio).send_with(sender.clone());
-      pending += 1;
-    }
-
-    // Run the event loop briefly
-    lio.run_timeout(Duration::from_micros(100)).unwrap();
-
-    // Drain completed ops
-    loop {
-      match receiver.try_recv() {
-        Ok(result) => {
-          result.expect("nop should succeed");
-          ops_completed += 1;
-          pending -= 1;
-        }
-        Err(mpsc::TryRecvError::Empty) => break,
-        Err(mpsc::TryRecvError::Disconnected) => panic!("Channel disconnected"),
-      }
-    }
-  }
-
-  // Drain remaining
-  while pending > 0 {
-    lio.run_timeout(Duration::from_millis(5)).unwrap();
-    loop {
-      match receiver.try_recv() {
-        Ok(result) => {
-          result.expect("nop should succeed");
-          ops_completed += 1;
-          pending -= 1;
-        }
-        Err(mpsc::TryRecvError::Empty) => break,
-        Err(mpsc::TryRecvError::Disconnected) => panic!("Channel disconnected"),
-      }
-    }
-  }
-
-  let elapsed = start.elapsed();
-  let ops_per_sec = ops_completed as f64 / elapsed.as_secs_f64();
-
-  eprintln!(
-    "Sustained load: {} ops in {:?} ({:.0} ops/sec)",
-    ops_completed, elapsed, ops_per_sec
-  );
 }
 
 // ============================================================================

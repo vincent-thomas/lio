@@ -11,7 +11,8 @@
 //! async fn example() -> std::io::Result<()> {
 //!     # let dir = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
 //!     let path = CString::new("/tmp/test").unwrap();
-//!     let fd: Resource = lio::api::openat(&dir, path, libc::O_RDONLY).await?;
+//!     let fd: Resource =
+//!         lio::api::openat(&dir, path, libc::O_RDONLY, 0).await?;
 //!
 //!     // Use the resource...
 //!     // Resource is automatically closed when dropped.
@@ -47,7 +48,8 @@
 //! async fn open_file() -> std::io::Result<Resource> {
 //!     # let dir = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
 //!     let path = CString::new("/tmp/test").unwrap();
-//!     let resource: Resource = lio::api::openat(&dir, path, libc::O_RDONLY).await?;
+//!     let resource: Resource =
+//!         lio::api::openat(&dir, path, libc::O_RDONLY, 0).await?;
 //!     Ok(resource)
 //! }
 //!
@@ -303,11 +305,8 @@ impl Resource {
   /// ```
   #[cfg(unix)]
   pub fn stdout() -> Self {
-    // SAFETY: dup returns a new valid fd if successful
-    let fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
-    assert!(fd >= 0, "Failed to dup stdout");
-    // SAFETY: fd is valid, just returned from dup
-    unsafe { <Self as std::os::fd::FromRawFd>::from_raw_fd(fd) }
+    // SAFETY: fd is valid
+    unsafe { Self::borrow(libc::STDOUT_FILENO) }
   }
 
   /// Returns a `Resource` for standard output (stdout).
@@ -369,11 +368,8 @@ impl Resource {
   /// ```
   #[cfg(unix)]
   pub fn stderr() -> Self {
-    // SAFETY: dup returns a new valid fd if successful
-    let fd = unsafe { libc::dup(libc::STDERR_FILENO) };
-    assert!(fd >= 0, "Failed to dup stderr");
-    // SAFETY: fd is valid, just returned from dup
-    unsafe { <Self as std::os::fd::FromRawFd>::from_raw_fd(fd) }
+    // SAFETY: fd is valid
+    unsafe { Self::borrow(libc::STDERR_FILENO) }
   }
 
   /// Returns a `Resource` for standard error (stderr).
@@ -433,11 +429,8 @@ impl Resource {
   /// ```
   #[cfg(unix)]
   pub fn stdin() -> Self {
-    // SAFETY: dup returns a new valid fd if successful
-    let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
-    assert!(fd >= 0, "Failed to dup stdin");
-    // SAFETY: fd is valid, just returned from dup
-    unsafe { <Self as std::os::fd::FromRawFd>::from_raw_fd(fd) }
+    // SAFETY: fd is valid
+    unsafe { Self::borrow(libc::STDIN_FILENO) }
   }
 
   /// Returns a `Resource` for standard input (stdin).
@@ -495,7 +488,7 @@ impl Resource {
   /// async fn open_file() -> std::io::Result<Resource> {
   ///     let cwd = Resource::cwd();
   ///     let path = CString::new("myfile.txt").unwrap();
-  ///     lio::api::openat(&cwd, path, libc::O_RDONLY).await
+  ///     lio::api::openat(&cwd, path, libc::O_RDONLY, 0).await
   /// }
   /// ```
   #[cfg(unix)]

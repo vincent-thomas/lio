@@ -61,6 +61,8 @@ pub struct Slab<T> {
   next_slot: u32,
   /// Maximum capacity
   capacity: u32,
+  /// Number of occupied slots
+  len: u32,
 }
 
 impl<T> Slab<T> {
@@ -74,6 +76,7 @@ impl<T> Slab<T> {
       free_list: Vec::new(),
       next_slot: 0,
       capacity,
+      len: 0,
     }
   }
 
@@ -88,6 +91,7 @@ impl<T> Slab<T> {
       debug_assert!(!slot.occupied);
       slot.value = MaybeUninit::new(value);
       slot.occupied = true;
+      self.len += 1;
       return Some(SlabKey { slot: slot_idx, generation: slot.generation });
     }
 
@@ -109,10 +113,22 @@ impl<T> Slab<T> {
         slot.occupied = true;
       }
 
+      self.len += 1;
       return Some(SlabKey { slot: slot_idx, generation: 0 });
     }
 
     None // At capacity
+  }
+
+  /// Insert a value and return both its key and a mutable reference to it.
+  ///
+  /// Returns `None` if at capacity.
+  #[inline]
+  pub fn insert_get_mut(&mut self, value: T) -> Option<(SlabKey, &mut T)> {
+    let key = self.insert(value)?;
+    let value =
+      self.get_mut(key).expect("just-inserted slab entry must be retrievable");
+    Some((key, value))
   }
 
   /// Remove a value by key.
@@ -132,12 +148,33 @@ impl<T> Slab<T> {
     // SAFETY: slot.occupied is true, so value was initialized via insert()
     unsafe { slot.value.assume_init_drop() };
     slot.occupied = false;
+    self.len -= 1;
     // Increment generation for ABA protection
     slot.generation = slot.generation.wrapping_add(1);
     // Return to free list
     self.free_list.push(key.slot);
 
     true
+  }
+
+  /// Remove a value by key and return it.
+  ///
+  /// Returns `None` if the key was invalid or stale.
+  #[inline]
+  pub fn remove_value(&mut self, key: SlabKey) -> Option<T> {
+    let slot = self.slots.get_mut(key.slot as usize)?;
+
+    if slot.generation != key.generation || !slot.occupied {
+      return None;
+    }
+
+    slot.occupied = false;
+    self.len -= 1;
+    slot.generation = slot.generation.wrapping_add(1);
+    self.free_list.push(key.slot);
+
+    // SAFETY: slot.occupied was true, so value was initialized via insert().
+    Some(unsafe { slot.value.assume_init_read() })
   }
 
   /// Get a mutable reference to a value by key.
@@ -150,6 +187,16 @@ impl<T> Slab<T> {
     } else {
       None
     }
+  }
+
+  #[inline]
+  pub fn len(&self) -> usize {
+    self.len as usize
+  }
+
+  #[inline]
+  pub fn is_empty(&self) -> bool {
+    self.len == 0
   }
 }
 

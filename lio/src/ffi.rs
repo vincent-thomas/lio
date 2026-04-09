@@ -1,3 +1,8 @@
+#![allow(
+  clippy::undocumented_unsafe_blocks,
+  clippy::unnecessary_safety_comment
+)]
+
 //! # `lio` C API
 //!
 //! The C API is built around an opaque `lio_t` handle that wraps a [`Lio`]
@@ -782,7 +787,7 @@ pub unsafe extern "C" fn lio_openat(
   dir_fd: libc::intptr_t,
   path: *const libc::c_char,
   flags: libc::c_int,
-  _mode: libc::mode_t,
+  mode: libc::mode_t,
   callback: extern "C" fn(libc::intptr_t),
 ) {
   if path.is_null() {
@@ -796,7 +801,7 @@ pub unsafe extern "C" fn lio_openat(
   // SAFETY: caller guarantees dir_fd is valid per fn contract
   let dir_resource = unsafe { fd_to_borrowed_resource(dir_fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::openat(&dir_resource, path_owned, flags)
+  api::openat(&dir_resource, path_owned, flags, mode as u32)
     .with_lio(&unsafe { handle(lio) }.inner)
     .when_done(move |res| {
       callback(match res {

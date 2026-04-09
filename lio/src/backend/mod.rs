@@ -29,11 +29,12 @@
 //! backend.init(1024).unwrap();  // Pre-allocate for 1024 concurrent ops
 //!
 //! // Submit a nop operation
-//! backend.push(1, Op::Nop);
+//! backend.push(1, Op::Nop, &mut bumpalo::Bump::new());
 //! backend.flush().unwrap();
 //!
 //! // Poll for completions (non-blocking)
-//! let completions = backend.wait(Some(Duration::ZERO)).unwrap();
+//! let mut completions = Vec::new();
+//! backend.wait(Some(Duration::ZERO), &mut completions).unwrap();
 //! ```
 
 pub mod op;
@@ -93,6 +94,8 @@ pub(crate) mod store;
 use std::io;
 use std::time::Duration;
 
+use bumpalo::Bump;
+
 use crate::backend::op::Op;
 
 /// Represents a completed I/O operation.
@@ -149,7 +152,7 @@ pub trait IoBackend {
   /// Queue an operation for submission.
   ///
   /// Call `flush()` to submit queued operations.
-  fn push(&mut self, id: u64, op: Op);
+  fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump);
 
   /// Submit all queued operations to kernel.
   fn flush(&mut self) -> io::Result<()>;
@@ -161,5 +164,9 @@ pub trait IoBackend {
   /// - `Some(duration)` = wait up to duration
   ///
   /// Slice valid until next `wait()` or `push()`.
-  fn wait(&mut self, timeout: Option<Duration>) -> io::Result<&[OpCompleted]>;
+  fn wait(
+    &mut self,
+    timeout: Option<Duration>,
+    completed: &mut Vec<OpCompleted>,
+  ) -> io::Result<()>;
 }

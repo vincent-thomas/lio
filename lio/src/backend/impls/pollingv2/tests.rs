@@ -41,6 +41,14 @@ pub fn make_nonblocking(fd: RawFd) -> io::Result<()> {
   Ok(())
 }
 
+fn zeroed_events<E: Clone>(len: usize) -> Vec<E> {
+  // SAFETY: these tests allocate OS event buffers exactly the same way the
+  // backend does; the native event structs are plain C event records that are
+  // valid when zero-initialized before the poller fills them in.
+  let zeroed_event = unsafe { std::mem::zeroed() };
+  vec![zeroed_event; len]
+}
+
 // Focused test functions
 
 /// Test that adding read interest and waiting returns no events when no data is available
@@ -53,7 +61,7 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   poller.add(fd1, 1, Interest::READ)?;
 
@@ -75,7 +83,7 @@ where
   make_nonblocking(fd1)?;
   make_nonblocking(fd2)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Write data to sock2, making sock1 readable
   let data = b"hello";
@@ -106,7 +114,7 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   poller.add(fd1, 2, Interest::WRITE)?;
 
@@ -114,9 +122,9 @@ where
   assert!(n >= 1, "Expected at least 1 write event");
 
   let mut found_write = false;
-  for i in 0..n {
-    let key = P::event_key(&events[i]);
-    let interest = P::event_interest(&events[i]);
+  for event in events.iter().take(n) {
+    let key = P::event_key(event);
+    let interest = P::event_interest(event);
     if key == 2 && interest.is_writable() {
       found_write = true;
       break;
@@ -137,7 +145,7 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   let both = Interest::READ_AND_WRITE;
   poller.add(fd1, 3, both)?;
@@ -147,8 +155,8 @@ where
 
   // Should get at least write event (sockets are usually writable)
   let mut found_event = false;
-  for i in 0..n {
-    let key = P::event_key(&events[i]);
+  for event in events.iter().take(n) {
+    let key = P::event_key(event);
     if key == 3 {
       found_event = true;
       break;
@@ -169,7 +177,7 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // First add read interest
   poller.add(fd1, 4, Interest::READ)?;
@@ -193,15 +201,15 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   poller.add(fd1, 5, Interest::WRITE)?;
   poller.delete(fd1)?;
 
   // After delete, should not get events for fd1
   let n = poller.wait(&mut events, Some(Duration::from_millis(10)))?;
-  for i in 0..n {
-    let key = P::event_key(&events[i]);
+  for event in events.iter().take(n) {
+    let key = P::event_key(event);
     assert_ne!(key, 5, "Should not get events after delete");
   }
 
@@ -221,7 +229,7 @@ where
   make_nonblocking(fd1)?;
   make_nonblocking(fd2)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   poller.add(fd1, 10, Interest::WRITE)?;
   poller.add(fd2, 20, Interest::WRITE)?;
@@ -231,8 +239,8 @@ where
 
   let mut found_fd1 = false;
   let mut found_fd2 = false;
-  for i in 0..n {
-    let key = P::event_key(&events[i]);
+  for event in events.iter().take(n) {
+    let key = P::event_key(event);
     if key == 10 {
       found_fd1 = true;
     }
@@ -256,7 +264,7 @@ where
   poller.notify()?;
 
   // And that wait returns promptly after notify
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
   let start = std::time::Instant::now();
   let _n = poller.wait(&mut events, Some(Duration::from_millis(100)))?;
   let elapsed = start.elapsed();
@@ -300,7 +308,7 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Add with key 1
   poller.add(fd1, 1, Interest::WRITE)?;
@@ -324,7 +332,7 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Add read interest but don't write any data
   poller.add(fd1, 1, Interest::READ)?;
@@ -353,7 +361,7 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   poller.add(fd1, 1, Interest::READ)?;
 
@@ -375,7 +383,7 @@ where
   P: ReadinessPoll,
   P::NativeEvent: Clone,
 {
-  let mut events = vec![unsafe { std::mem::zeroed() }; 128];
+  let mut events = zeroed_events(128);
   let mut sockets = Vec::new();
 
   // Create 20 socket pairs
@@ -406,7 +414,7 @@ where
   make_nonblocking(fd1)?;
   make_nonblocking(fd2)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Write some data
   let data = b"hello world";
@@ -443,7 +451,7 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Rapidly add and delete
   for i in 0..10 {
@@ -471,7 +479,7 @@ where
   make_nonblocking(fd1)?;
   make_nonblocking(fd2)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Start with read interest (no data, won't trigger)
   poller.add(fd1, 1, Interest::READ)?;
@@ -503,7 +511,7 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   poller.add(fd1, 1, Interest::WRITE)?;
 
@@ -523,7 +531,7 @@ where
   P: ReadinessPoll,
   P::NativeEvent: Clone,
 {
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Send multiple notifies in quick succession from the same thread
   poller.notify()?;
@@ -555,7 +563,7 @@ where
   make_nonblocking(fd1)?;
   make_nonblocking(fd2)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Start with write interest (should trigger immediately)
   poller.add(fd1, 1, Interest::WRITE)?;
@@ -590,7 +598,7 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Add, delete, then re-add the same fd
   poller.add(fd1, 100, Interest::WRITE)?;
@@ -621,7 +629,7 @@ where
   make_nonblocking(fd1)?;
   make_nonblocking(fd2)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Write data to make sock1 readable
   let data = b"hello";
@@ -657,7 +665,7 @@ where
   make_nonblocking(fd1)?;
   make_nonblocking(fd2)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   poller.add(fd1, 1, Interest::READ)?;
 
@@ -690,7 +698,7 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Add with write interest
   poller.add(fd1, 1, Interest::WRITE)?;
@@ -723,7 +731,7 @@ where
   }
 
   // Buffer can only hold 3 events, but 10 fds are ready
-  let mut events = vec![unsafe { std::mem::zeroed() }; 3];
+  let mut events = zeroed_events(3);
 
   let n = poller.wait(&mut events, Some(Duration::from_millis(100)))?;
 
@@ -731,9 +739,9 @@ where
   assert_eq!(n, 3, "Should return buffer size when more events are ready");
 
   // Verify we got valid events
-  for i in 0..n {
-    let key = P::event_key(&events[i]);
-    let interest = P::event_interest(&events[i]);
+  for event in events.iter().take(n) {
+    let key = P::event_key(event);
+    let interest = P::event_interest(event);
     assert!(key < 10, "Key should be in valid range");
     assert!(interest.is_writable(), "Event should be writable");
   }
@@ -753,7 +761,7 @@ where
   make_nonblocking(fd1)?;
   make_nonblocking(fd2)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Write data to make sock1 readable
   let data = b"hello";
@@ -793,7 +801,7 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Add write interest (immediately ready)
   poller.add(fd1, 1, Interest::WRITE)?;
@@ -822,7 +830,7 @@ where
   let fd1 = sock1.as_raw_fd();
   make_nonblocking(fd1)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Add fd with key 1
   poller.add(fd1, 1, Interest::READ)?;
@@ -869,7 +877,7 @@ where
   make_nonblocking(fd1)?;
   make_nonblocking(fd2)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Use same key (42) for both fds
   poller.add(fd1, 42, Interest::WRITE)?;
@@ -881,11 +889,11 @@ where
   assert_eq!(n, 2, "Should get events for both fds despite key collision");
 
   // Both events should have key 42
-  for i in 0..n {
-    let key = P::event_key(&events[i]);
+  for event in events.iter().take(n) {
+    let key = P::event_key(event);
     assert_eq!(key, 42, "All events should have the same key");
 
-    let interest = P::event_interest(&events[i]);
+    let interest = P::event_interest(event);
     assert!(interest.is_writable(), "Events should be writable");
   }
 
@@ -965,7 +973,8 @@ where
   let (sock1, _sock2) = create_socket_pair()?;
   let fd1 = sock1.as_raw_fd();
 
-  // Close the fd
+  // SAFETY: `fd1` is still the live descriptor owned by `sock1`; this test
+  // intentionally closes it early to exercise closed-fd registration handling.
   unsafe {
     libc::close(fd1);
   }
@@ -1002,7 +1011,7 @@ where
   make_nonblocking(fd2)?;
   make_nonblocking(fd3)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Test key = 0
   poller.add(fd1, 0, Interest::WRITE)?;
@@ -1024,8 +1033,8 @@ where
   let mut found_one = false;
   let mut found_near_max = false;
 
-  for i in 0..n {
-    let key = P::event_key(&events[i]);
+  for event in events.iter().take(n) {
+    let key = P::event_key(event);
     if key == 0 {
       found_zero = true;
     }
@@ -1056,7 +1065,7 @@ where
   make_nonblocking(fd1)?;
   make_nonblocking(fd2)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Register fd1 with READ interest only
   poller.add(fd1, 1, Interest::READ)?;
@@ -1069,6 +1078,8 @@ where
 
   // Now write data to fd2 so fd1 becomes readable
   let data = b"test";
+  // SAFETY: `fd2` is a live socket and `data` points to a stable buffer for
+  // the duration of this synchronous write used to make `fd1` readable.
   let _ = unsafe {
     libc::write(fd2, data.as_ptr() as *const libc::c_void, data.len())
   };
@@ -1078,8 +1089,7 @@ where
   assert!(n > 0, "Should get read event when data is available");
 
   let mut found_readable = false;
-  for i in 0..n {
-    let event = &events[i];
+  for event in events.iter().take(n) {
     let key = P::event_key(event);
     let interest = P::event_interest(event);
 
@@ -1106,7 +1116,7 @@ where
   make_nonblocking(fd1)?;
   make_nonblocking(fd2)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Register fd1 with WRITE interest only
   poller.add(fd1, 1, Interest::WRITE)?;
@@ -1116,8 +1126,7 @@ where
   assert!(n > 0, "Should get write event when socket is writable");
 
   let mut found_writable = false;
-  for i in 0..n {
-    let event = &events[i];
+  for event in events.iter().take(n) {
     let key = P::event_key(event);
     let interest = P::event_interest(event);
 
@@ -1133,6 +1142,8 @@ where
 
   // Write data to fd2 so fd1 becomes readable too
   let data = b"test";
+  // SAFETY: `fd2` is a live socket and `data` points to a stable buffer for
+  // the duration of this synchronous write used to add readability.
   let _ = unsafe {
     libc::write(fd2, data.as_ptr() as *const libc::c_void, data.len())
   };
@@ -1142,8 +1153,7 @@ where
   assert!(n > 0, "Should get write event");
 
   let mut found_writable_only = false;
-  for i in 0..n {
-    let event = &events[i];
+  for event in events.iter().take(n) {
     let key = P::event_key(event);
     let interest = P::event_interest(event);
 
@@ -1189,13 +1199,15 @@ where
   make_nonblocking(fd1)?;
   make_nonblocking(fd2)?;
 
-  let mut events = vec![unsafe { std::mem::zeroed() }; 16];
+  let mut events = zeroed_events(16);
 
   // Register fd1 with key 1
   poller.add(fd1, 1, Interest::READ)?;
 
   // Write data so fd1 becomes readable
   let data = b"test";
+  // SAFETY: `fd2` is a live socket and `data` points to a stable buffer for
+  // the duration of this synchronous write used to seed readability.
   let _ = unsafe {
     libc::write(fd2, data.as_ptr() as *const libc::c_void, data.len())
   };
@@ -1222,6 +1234,8 @@ where
   poller.add(fd3, 2, Interest::READ)?;
 
   // Write data to the new socket
+  // SAFETY: `fd4` is a live socket and `data` points to a stable buffer for
+  // the duration of this synchronous write used to seed readability.
   let _ = unsafe {
     libc::write(fd4, data.as_ptr() as *const libc::c_void, data.len())
   };
@@ -1231,8 +1245,7 @@ where
 
   if n > 0 {
     // If we get an event, verify it has the correct key (2, not 1)
-    for i in 0..n {
-      let event = &events[i];
+    for event in events.iter().take(n) {
       let key = P::event_key(event);
       assert_eq!(
         key, 2,
@@ -1271,7 +1284,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_add_read_no_data() {
       println!("Running test: add read interest with no data available");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_add_read_no_data(poller)
+      $crate::backend::impls::pollingv2::tests::test_add_read_no_data(poller)
         .expect("test_add_read_no_data: failed to add read interest with no data");
     }
 
@@ -1279,7 +1292,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_read_becomes_ready() {
       println!("Running test: read interest triggers when data is written");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_read_becomes_ready(poller)
+      $crate::backend::impls::pollingv2::tests::test_read_becomes_ready(poller)
         .expect("test_read_becomes_ready: failed when testing read interest triggers on data write");
     }
 
@@ -1287,7 +1300,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_write_immediately_ready() {
       println!("Running test: write interest triggers immediately");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_write_immediately_ready(poller)
+      $crate::backend::impls::pollingv2::tests::test_write_immediately_ready(poller)
         .expect("test_write_immediately_ready: failed when testing immediate write readiness");
     }
 
@@ -1295,7 +1308,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_add_both_interests() {
       println!("Running test: adding both read and write interests simultaneously");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_add_both_interests(poller)
+      $crate::backend::impls::pollingv2::tests::test_add_both_interests(poller)
         .expect("test_add_both_interests: failed when adding both read and write interests");
     }
 
@@ -1303,7 +1316,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_modify_interest() {
       println!("Running test: modifying interest on existing fd");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_modify_interest(poller)
+      $crate::backend::impls::pollingv2::tests::test_modify_interest(poller)
         .expect("test_modify_interest: failed when modifying interest on existing fd");
     }
 
@@ -1311,7 +1324,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_delete_interest() {
       println!("Running test: deleting interest prevents further events");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_delete_interest(poller)
+      $crate::backend::impls::pollingv2::tests::test_delete_interest(poller)
         .expect("test_delete_interest: failed when testing delete prevents events");
     }
 
@@ -1319,7 +1332,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_multiple_fds() {
       println!("Running test: monitoring multiple file descriptors simultaneously");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_multiple_fds(poller)
+      $crate::backend::impls::pollingv2::tests::test_multiple_fds(poller)
         .expect("test_multiple_fds: failed when monitoring multiple file descriptors");
     }
 
@@ -1327,7 +1340,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_notify_works() {
       println!("Running test: notify() can be called without error");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_notify_works(poller)
+      $crate::backend::impls::pollingv2::tests::test_notify_works(poller)
         .expect("test_notify_works: failed when testing notify()");
     }
 
@@ -1335,7 +1348,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_delete_nonexistent_fd() {
       println!("Running test: deleting non-existent fd returns ENOENT");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_delete_nonexistent_fd(poller)
+      $crate::backend::impls::pollingv2::tests::test_delete_nonexistent_fd(poller)
         .expect("test_delete_nonexistent_fd: failed when testing deletion of non-existent fd");
     }
 
@@ -1343,7 +1356,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_reregister_same_fd() {
       println!("Running test: modifying same fd with different keys");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_reregister_same_fd(poller)
+      $crate::backend::impls::pollingv2::tests::test_reregister_same_fd(poller)
         .expect("test_reregister_same_fd: failed when modifying same fd with different keys");
     }
 
@@ -1351,7 +1364,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_timeout_no_events() {
       println!("Running test: timeout works correctly when no events are ready");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_timeout_no_events(poller)
+      $crate::backend::impls::pollingv2::tests::test_timeout_no_events(poller)
         .expect("test_timeout_no_events: failed when testing timeout with no events");
     }
 
@@ -1359,7 +1372,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_zero_timeout() {
       println!("Running test: zero timeout returns immediately");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_zero_timeout(poller)
+      $crate::backend::impls::pollingv2::tests::test_zero_timeout(poller)
         .expect("test_zero_timeout: failed when testing zero timeout immediate return");
     }
 
@@ -1367,7 +1380,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_many_fds() {
       println!("Running test: handling many file descriptors");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_many_fds(poller)
+      $crate::backend::impls::pollingv2::tests::test_many_fds(poller)
         .expect("test_many_fds: failed when handling many file descriptors");
     }
 
@@ -1375,7 +1388,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_partial_read() {
       println!("Running test: reads work with partial data");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_partial_read(poller)
+      $crate::backend::impls::pollingv2::tests::test_partial_read(poller)
         .expect("test_partial_read: failed when testing partial read handling");
     }
 
@@ -1383,7 +1396,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_rapid_add_delete() {
       println!("Running test: rapid add/delete cycles");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_rapid_add_delete(poller)
+      $crate::backend::impls::pollingv2::tests::test_rapid_add_delete(poller)
         .expect("test_rapid_add_delete: failed when testing rapid add/delete cycles");
     }
 
@@ -1391,7 +1404,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_modify_read_to_write() {
       println!("Running test: modifying from read to write interest");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_modify_read_to_write(poller)
+      $crate::backend::impls::pollingv2::tests::test_modify_read_to_write(poller)
         .expect("test_modify_read_to_write: failed when modifying from read to write interest");
     }
 
@@ -1399,7 +1412,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_close_registered_fd() {
       println!("Running test: closing a registered fd doesn't crash");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_close_registered_fd(poller)
+      $crate::backend::impls::pollingv2::tests::test_close_registered_fd(poller)
         .expect("test_close_registered_fd: failed when testing closing registered fd");
     }
 
@@ -1407,7 +1420,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_multiple_notifies() {
       println!("Running test: multiple notifies in quick succession");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_multiple_notifies(poller)
+      $crate::backend::impls::pollingv2::tests::test_multiple_notifies(poller)
         .expect("test_multiple_notifies: failed when testing multiple notifies in succession");
     }
 
@@ -1415,7 +1428,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_modify_write_to_read() {
       println!("Running test: modifying from write to read interest");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_modify_write_to_read(poller)
+      $crate::backend::impls::pollingv2::tests::test_modify_write_to_read(poller)
         .expect("test_modify_write_to_read: failed when modifying from write to read interest");
     }
 
@@ -1423,7 +1436,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_readd_after_delete() {
       println!("Running test: re-adding file descriptor after deletion");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_readd_after_delete(poller)
+      $crate::backend::impls::pollingv2::tests::test_readd_after_delete(poller)
         .expect("test_readd_after_delete: failed when re-adding fd after deletion");
     }
 
@@ -1431,7 +1444,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_simultaneous_read_write() {
       println!("Running test: simultaneous read and write events on same fd");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_simultaneous_read_write(poller)
+      $crate::backend::impls::pollingv2::tests::test_simultaneous_read_write(poller)
         .expect("test_simultaneous_read_write: failed when testing simultaneous read/write events");
     }
 
@@ -1439,7 +1452,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_peer_closed() {
       println!("Running test: handling socket peer close (HUP/ERR conditions)");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_peer_closed(poller)
+      $crate::backend::impls::pollingv2::tests::test_peer_closed(poller)
         .expect("test_peer_closed: failed when testing socket peer close handling");
     }
 
@@ -1447,7 +1460,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_modify_to_no_interest() {
       println!("Running test: modifying interest to none (edge case)");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_modify_to_no_interest(poller)
+      $crate::backend::impls::pollingv2::tests::test_modify_to_no_interest(poller)
         .expect("test_modify_to_no_interest: failed when modifying interest to none");
     }
 
@@ -1455,7 +1468,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_buffer_smaller_than_ready_events() {
       println!("Running test: buffer too small for all ready events");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_buffer_smaller_than_ready_events(poller)
+      $crate::backend::impls::pollingv2::tests::test_buffer_smaller_than_ready_events(poller)
         .expect("test_buffer_smaller_than_ready_events: failed when testing small buffer with many ready events");
     }
 
@@ -1463,7 +1476,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_oneshot_no_redelivery() {
       println!("Running test: ONESHOT events should not re-deliver without re-arm");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_oneshot_no_redelivery(poller)
+      $crate::backend::impls::pollingv2::tests::test_oneshot_no_redelivery(poller)
         .expect("test_oneshot_no_redelivery: failed when verifying ONESHOT semantics");
     }
 
@@ -1471,7 +1484,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_wait_infinite_timeout() {
       println!("Running test: infinite timeout (None) should wait indefinitely");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_wait_infinite_timeout(poller)
+      $crate::backend::impls::pollingv2::tests::test_wait_infinite_timeout(poller)
         .expect("test_wait_infinite_timeout: failed when testing None timeout");
     }
 
@@ -1479,7 +1492,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_add_duplicate_fd() {
       println!("Running test: adding already-registered fd");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_add_duplicate_fd(poller)
+      $crate::backend::impls::pollingv2::tests::test_add_duplicate_fd(poller)
         .expect("test_add_duplicate_fd: failed when testing duplicate fd registration");
     }
 
@@ -1487,7 +1500,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_same_key_different_fds() {
       println!("Running test: same key used for different fds");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_same_key_different_fds(poller)
+      $crate::backend::impls::pollingv2::tests::test_same_key_different_fds(poller)
         .expect("test_same_key_different_fds: failed when testing key collision");
     }
 
@@ -1495,7 +1508,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_wait_empty_buffer() {
       println!("Running test: wait with empty event buffer");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_wait_empty_buffer(poller)
+      $crate::backend::impls::pollingv2::tests::test_wait_empty_buffer(poller)
         .expect("test_wait_empty_buffer: failed when testing empty buffer");
     }
 
@@ -1503,7 +1516,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_add_invalid_fd() {
       println!("Running test: adding invalid file descriptor (-1)");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_add_invalid_fd(poller)
+      $crate::backend::impls::pollingv2::tests::test_add_invalid_fd(poller)
         .expect("test_add_invalid_fd: failed when testing invalid fd");
     }
 
@@ -1511,7 +1524,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_add_closed_fd() {
       println!("Running test: adding already-closed file descriptor");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_add_closed_fd(poller)
+      $crate::backend::impls::pollingv2::tests::test_add_closed_fd(poller)
         .expect("test_add_closed_fd: failed when testing closed fd");
     }
 
@@ -1519,7 +1532,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_edge_key_values() {
       println!("Running test: edge key values (0, MAX, MAX-1)");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_edge_key_values(poller)
+      $crate::backend::impls::pollingv2::tests::test_edge_key_values(poller)
         .expect("test_edge_key_values: failed when testing edge key values");
     }
 
@@ -1527,7 +1540,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_read_interest_filtering() {
       println!("Running test: READ interest filtering");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_read_interest_filtering(poller)
+      $crate::backend::impls::pollingv2::tests::test_read_interest_filtering(poller)
         .expect("test_read_interest_filtering: failed when testing READ interest filtering");
     }
 
@@ -1535,7 +1548,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_write_interest_filtering() {
       println!("Running test: WRITE interest filtering");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_write_interest_filtering(poller)
+      $crate::backend::impls::pollingv2::tests::test_write_interest_filtering(poller)
         .expect("test_write_interest_filtering: failed when testing WRITE interest filtering");
     }
 
@@ -1543,7 +1556,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_modify_nonexistent_fd() {
       println!("Running test: modifying non-existent fd");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_modify_nonexistent_fd(poller)
+      $crate::backend::impls::pollingv2::tests::test_modify_nonexistent_fd(poller)
         .expect("test_modify_nonexistent_fd: failed when testing modify on non-existent fd");
     }
 
@@ -1551,7 +1564,7 @@ macro_rules! test_readiness_poll_contract {
     fn test_fd_reuse_after_delete() {
       println!("Running test: fd reuse after delete");
       let poller = $poller;
-      crate::backend::impls::pollingv2::tests::test_fd_reuse_after_delete(poller)
+      $crate::backend::impls::pollingv2::tests::test_fd_reuse_after_delete(poller)
         .expect("test_fd_reuse_after_delete: failed when testing fd reuse after delete");
     }
 

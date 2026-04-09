@@ -71,7 +71,7 @@ impl Command for DdCommand {
         let cpath = CString::new(path.as_str())?;
         io_util::run(
           ctx.lio(),
-          api::openat(&ctx.cwd(), cpath, libc::O_RDONLY)
+          api::openat(&ctx.cwd(), cpath, libc::O_RDONLY, 0)
             .with_lio(ctx.lio())
             .send(),
         )?
@@ -87,6 +87,7 @@ impl Command for DdCommand {
             &ctx.cwd(),
             cpath,
             libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o666,
           )
           .with_lio(ctx.lio())
           .send(),

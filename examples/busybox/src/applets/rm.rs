@@ -1,10 +1,15 @@
-use std::{ffi::CString, fs, io, path::Path};
+use std::{ffi::CString, io, path::Path};
 
 use lio::api;
 
 use crate::{
-  app::AppContext, applets::support::read_yes_from_tty, command::Command,
-  util::io as io_util,
+  app::AppContext,
+  applets::support::read_yes_from_tty,
+  command::Command,
+  util::{
+    flags::{FlagParser, FlagSpec},
+    fs as fs_util, io as io_util,
+  },
 };
 
 #[derive(Debug, Clone, Default)]
@@ -31,40 +36,56 @@ impl Command for RmCommand {
   }
 
   fn parse(args: &[String]) -> io::Result<Self> {
-    let mut dir = false;
-    let mut force = false;
-    let mut interactive = false;
-    let mut recursive = false;
-    let mut verbose = false;
-    let mut index = 0;
+    const SPECS: &[FlagSpec<'static>] = &[
+      FlagSpec {
+        name: "dir",
+        short: &['d'],
+        long: &["dir"],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "force",
+        short: &['f'],
+        long: &["force"],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "interactive",
+        short: &['i'],
+        long: &["interactive"],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "recursive",
+        short: &['r', 'R'],
+        long: &["recursive"],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "verbose",
+        short: &['v'],
+        long: &["verbose"],
+        takes_value: false,
+      },
+    ];
+    let parsed = FlagParser::new("rm", SPECS).parse(args)?;
 
-    while let Some(arg) = args.get(index) {
-      match arg.as_str() {
-        "-d" => {
-          dir = true;
-          index += 1;
-        }
-        "-f" => {
-          force = true;
-          index += 1;
-        }
-        "-i" => {
-          interactive = true;
-          index += 1;
-        }
-        "-r" | "-R" => {
-          recursive = true;
-          index += 1;
-        }
-        "-v" => {
-          verbose = true;
-          index += 1;
-        }
-        _ => break,
+    if parsed.positional().is_empty() {
+      let dir = parsed.get_flag_exists("dir");
+      let force = parsed.get_flag_exists("force");
+      let interactive = parsed.get_flag_exists("interactive");
+      let recursive = parsed.get_flag_exists("recursive");
+      let verbose = parsed.get_flag_exists("verbose");
+      if force {
+        return Ok(Self {
+          dir,
+          force,
+          interactive,
+          recursive,
+          verbose,
+          paths: Vec::new(),
+        });
       }
-    }
-
-    if index == args.len() {
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "rm: missing operand",
@@ -72,12 +93,12 @@ impl Command for RmCommand {
     }
 
     Ok(Self {
-      dir,
-      force,
-      interactive,
-      recursive,
-      verbose,
-      paths: args[index..].to_vec(),
+      dir: parsed.get_flag_exists("dir"),
+      force: parsed.get_flag_exists("force"),
+      interactive: parsed.get_flag_exists("interactive"),
+      recursive: parsed.get_flag_exists("recursive"),
+      verbose: parsed.get_flag_exists("verbose"),
+      paths: parsed.positional().to_vec(),
     })
   }
 
@@ -99,24 +120,24 @@ fn remove_path(
   path: &Path,
   options: &RmCommand,
 ) -> io::Result<()> {
-  let metadata = match fs::symlink_metadata(path) {
-    Ok(metadata) => metadata,
-    Err(err) if options.force && err.kind() == io::ErrorKind::NotFound => {
+  reject_protected_path(path)?;
+  let metadata = match fs_util::stat_path(ctx, path, false)? {
+    Some(metadata) => metadata,
+    None if options.force => {
       return Ok(());
     }
-    Err(err) => return Err(err),
+    None => return Err(io::Error::from_raw_os_error(libc::ENOENT)),
   };
 
-  let is_dir = metadata.file_type().is_dir();
+  let is_dir = metadata.is_dir();
   if options.interactive && !confirm_removal(ctx, path, is_dir)? {
     return Ok(());
   }
 
   if is_dir {
     if options.recursive {
-      for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        remove_path(ctx, &entry.path(), options)?;
+      for entry in fs_util::read_dir_path(ctx, path)? {
+        remove_path(ctx, &path.join(entry.name), options)?;
       }
 
       unlink_path(ctx, path, libc::AT_REMOVEDIR)?;
@@ -141,6 +162,22 @@ fn remove_path(
     io_util::write_all(ctx.lio(), &ctx.stdout(), rendered.into_bytes())?;
   }
 
+  Ok(())
+}
+
+fn reject_protected_path(path: &Path) -> io::Result<()> {
+  if matches!(
+    path.file_name().and_then(|value| value.to_str()),
+    Some("." | "..")
+  ) || path == Path::new(".")
+    || path == Path::new("..")
+    || path.parent().is_none()
+  {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidInput,
+      format!("rm: refusing to remove '{}'", path.display()),
+    ));
+  }
   Ok(())
 }
 
@@ -175,6 +212,7 @@ fn confirm_removal(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::fs;
   use std::path::PathBuf;
 
   #[test]
@@ -195,6 +233,21 @@ mod tests {
     assert!(parsed.recursive);
     assert!(parsed.verbose);
     assert_eq!(parsed.paths, vec!["a", "b"]);
+  }
+
+  #[test]
+  fn parse_rm_force_without_operands_is_ok() {
+    let parsed = RmCommand::parse(&["-f".into()]).unwrap();
+    assert!(parsed.force);
+    assert!(parsed.paths.is_empty());
+  }
+
+  #[test]
+  fn parse_rm_command_supports_double_dash() {
+    let parsed =
+      RmCommand::parse(&["-f".into(), "--".into(), "-file".into()]).unwrap();
+    assert!(parsed.force);
+    assert_eq!(parsed.paths, vec!["-file"]);
   }
 
   #[test]
@@ -250,6 +303,18 @@ mod tests {
     )
     .unwrap();
     assert!(!path.exists());
+  }
+
+  #[test]
+  fn rm_rejects_dot_and_dotdot() {
+    let ctx = AppContext::new().unwrap();
+    let err =
+      remove_path(&ctx, Path::new("."), &RmCommand::default()).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+    let err =
+      remove_path(&ctx, Path::new(".."), &RmCommand::default()).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
   }
 
   fn unique_temp_path(name: &str) -> PathBuf {

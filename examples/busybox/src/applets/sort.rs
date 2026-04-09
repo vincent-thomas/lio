@@ -1,6 +1,13 @@
 use std::io;
 
-use crate::{app::AppContext, command::Command, util::io as io_util};
+use crate::{
+  app::AppContext,
+  command::Command,
+  util::{
+    flags::{FlagParser, FlagSpec},
+    io as io_util,
+  },
+};
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SortOptions {
@@ -29,32 +36,36 @@ impl Command for SortCommand {
   }
 
   fn parse(args: &[String]) -> io::Result<Self> {
-    let mut options = SortOptions::default();
-    let mut index = 0;
-    while let Some(arg) = args.get(index) {
-      match arg.as_str() {
-        "-r" => {
-          options.reverse = true;
-          index += 1;
-        }
-        "-n" => {
-          options.numeric = true;
-          index += 1;
-        }
-        "-u" => {
-          options.unique = true;
-          index += 1;
-        }
-        _ => break,
-      }
-    }
-    if args.len() > index + 1 {
+    const SPECS: &[FlagSpec<'static>] = &[
+      FlagSpec {
+        name: "reverse",
+        short: &['r'],
+        long: &[],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "numeric",
+        short: &['n'],
+        long: &[],
+        takes_value: false,
+      },
+      FlagSpec { name: "unique", short: &['u'], long: &[], takes_value: false },
+    ];
+    let parsed = FlagParser::new("sort", SPECS).parse(args)?;
+    if parsed.positional().len() > 1 {
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "sort: too many file operands",
       ));
     }
-    Ok(Self { options: Some(options), path: args.get(index).cloned() })
+    Ok(Self {
+      options: Some(SortOptions {
+        reverse: parsed.get_flag_exists("reverse"),
+        numeric: parsed.get_flag_exists("numeric"),
+        unique: parsed.get_flag_exists("unique"),
+      }),
+      path: parsed.positional().first().cloned(),
+    })
   }
 
   fn execute(&self, ctx: &AppContext) -> io::Result<()> {
@@ -77,12 +88,12 @@ impl Command for SortCommand {
       lines.reverse();
     }
 
-    let stdout = ctx.stdout();
+    let total_len: usize = lines.iter().map(|line| line.len() + 1).sum();
+    let mut out = Vec::with_capacity(total_len);
     for line in lines {
-      let mut out = line.into_bytes();
+      out.extend_from_slice(line.as_bytes());
       out.push(b'\n');
-      io_util::write_all(ctx.lio(), &stdout, out)?;
     }
-    Ok(())
+    io_util::write_all(ctx.lio(), &ctx.stdout(), out)
   }
 }

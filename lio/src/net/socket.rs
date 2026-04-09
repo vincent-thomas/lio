@@ -7,6 +7,7 @@ use crate::{
     ops::{Bind, Connect, Listen, Recv, Send, Shutdown},
     resource::{AsResource, FromResource, IntoResource, Resource},
   },
+  buf,
   net::ops::{SocketAccept, SocketNew},
 };
 
@@ -266,7 +267,10 @@ impl Socket {
   ///     Ok(())
   /// }
   /// ```
-  pub fn recv(&self, vec: Vec<u8>) -> Io<Recv<Vec<u8>>> {
+  pub fn recv<V>(&self, vec: V) -> Io<Recv<V>>
+  where
+    V: buf::IoBufMutVec,
+  {
     api::recv(&self.0, vec, None)
   }
 
@@ -297,7 +301,10 @@ impl Socket {
   ///     Ok(())
   /// }
   /// ```
-  pub fn send(&self, vec: Vec<u8>) -> Io<Send<Vec<u8>>> {
+  pub fn send<V>(&self, vec: V) -> Io<Send<V>>
+  where
+    V: buf::IoBufVec,
+  {
     api::send(&self.0, vec, None)
   }
 

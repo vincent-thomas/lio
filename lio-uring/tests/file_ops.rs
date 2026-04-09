@@ -159,7 +159,7 @@ fn test_write_at_offset() {
 
   drop(file);
   let contents = fs::read_to_string(&path).unwrap();
-  assert_eq!(contents, "AAABBBAAA\0"); // Note: might have null if file was extended
+  assert_eq!(contents, "AAABBBAAAA");
 
   fs::remove_file(&path).ok();
 }

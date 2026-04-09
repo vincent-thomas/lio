@@ -2,9 +2,12 @@ use std::io;
 
 use crate::{
   app::AppContext,
-  applets::support::{digest_command, hex_digest, md5_digest},
+  applets::hashsum::digest::{Md5State, hex_digest, stream_digest_command},
   command::Command,
 };
+
+#[cfg(test)]
+use crate::applets::hashsum::digest::md5_digest;
 
 #[derive(Debug, Clone, Default)]
 pub struct Md5sumCommand {
@@ -15,17 +18,27 @@ impl Command for Md5sumCommand {
   fn name() -> &'static str {
     "md5sum"
   }
+
   fn summary() -> &'static str {
     "Compute MD5 digests."
   }
+
   fn usage() -> &'static str {
     "md5sum [file...]"
   }
+
   fn parse(args: &[String]) -> io::Result<Self> {
     Ok(Self { files: args.to_vec() })
   }
+
   fn execute(&self, ctx: &AppContext) -> io::Result<()> {
-    digest_command(ctx.lio(), &self.files, |data| hex_digest(&md5_digest(data)))
+    stream_digest_command(
+      ctx.lio(),
+      &self.files,
+      Md5State::new,
+      |state, chunk| state.update(chunk),
+      |state| hex_digest(&state.finalize()),
+    )
   }
 }
 
@@ -46,5 +59,13 @@ mod tests {
       hex_digest(&md5_digest(b"hello")),
       "5d41402abc4b2a76b9719d911017c592"
     );
+  }
+
+  #[test]
+  fn md5_streaming_matches_one_shot() {
+    let mut state = Md5State::new();
+    state.update(b"he");
+    state.update(b"llo");
+    assert_eq!(state.finalize(), md5_digest(b"hello"));
   }
 }

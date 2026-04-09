@@ -18,7 +18,7 @@ pub use clock::{Clock, TimerId};
 
 /// Runtime-facing time manager that adapts [`Clock`] to wall-clock time.
 #[derive(Debug)]
-pub struct TimeManager {
+pub(crate) struct TimeManager {
   clock: Clock,
   state: TimeState,
   /// Marker to make this type `!Send`
@@ -106,6 +106,7 @@ impl TimeManager {
     }
   }
 
+  #[allow(dead_code)]
   pub fn is_paused(&self) -> bool {
     matches!(self.state, TimeState::Paused)
   }

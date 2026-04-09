@@ -1,3 +1,5 @@
+#![allow(clippy::duplicate_mod, clippy::unnecessary_mut_passed, clippy::expect_fun_call)]
+
 //! Tests for close operation.
 
 mod common;

@@ -5,6 +5,7 @@
 
 use crate::api::resource::Resource;
 use std::ffi::c_char;
+use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
@@ -90,6 +91,171 @@ impl SockProto {
 pub enum LinkKind {
   Hard,
   Soft,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketAddrFamily {
+  Unspecified,
+  Ipv4,
+  Ipv6,
+  Unix,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketAddrBuf {
+  pub family: SocketAddrFamily,
+  pub port_be: u16,
+  pub ip: [u8; 16],
+  pub flowinfo: u32,
+  pub scope_id: u32,
+  pub unix_path_len: u16,
+  pub unix_path: [u8; 108],
+}
+
+impl SocketAddrBuf {
+  pub const fn unspecified() -> Self {
+    Self {
+      family: SocketAddrFamily::Unspecified,
+      port_be: 0,
+      ip: [0; 16],
+      flowinfo: 0,
+      scope_id: 0,
+      unix_path_len: 0,
+      unix_path: [0; 108],
+    }
+  }
+}
+
+pub fn socket_addr_into_buf(addr: SocketAddr) -> SocketAddrBuf {
+  match addr {
+    SocketAddr::V4(addr) => {
+      let mut ip = [0; 16];
+      ip[..4].copy_from_slice(&addr.ip().octets());
+      SocketAddrBuf {
+        family: SocketAddrFamily::Ipv4,
+        port_be: addr.port().to_be(),
+        ip,
+        flowinfo: 0,
+        scope_id: 0,
+        unix_path_len: 0,
+        unix_path: [0; 108],
+      }
+    }
+    SocketAddr::V6(addr) => SocketAddrBuf {
+      family: SocketAddrFamily::Ipv6,
+      port_be: addr.port().to_be(),
+      ip: addr.ip().octets(),
+      flowinfo: addr.flowinfo(),
+      scope_id: addr.scope_id(),
+      unix_path_len: 0,
+      unix_path: [0; 108],
+    },
+  }
+}
+
+pub fn socket_addr_from_buf(buf: &SocketAddrBuf) -> io::Result<SocketAddr> {
+  match buf.family {
+    SocketAddrFamily::Ipv4 => Ok(SocketAddr::V4(std::net::SocketAddrV4::new(
+      std::net::Ipv4Addr::from([buf.ip[0], buf.ip[1], buf.ip[2], buf.ip[3]]),
+      u16::from_be(buf.port_be),
+    ))),
+    SocketAddrFamily::Ipv6 => Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
+      std::net::Ipv6Addr::from(buf.ip),
+      u16::from_be(buf.port_be),
+      buf.flowinfo,
+      buf.scope_id,
+    ))),
+    SocketAddrFamily::Unspecified => {
+      Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
+    }
+    SocketAddrFamily::Unix => {
+      Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
+    }
+  }
+}
+
+#[cfg(unix)]
+pub fn unix_socket_addr_buf(path: &[u8]) -> io::Result<SocketAddrBuf> {
+  if path.len() >= 108 {
+    return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+  }
+  let mut buf = SocketAddrBuf::unspecified();
+  buf.family = SocketAddrFamily::Unix;
+  buf.unix_path_len = path.len() as u16;
+  buf.unix_path[..path.len()].copy_from_slice(path);
+  Ok(buf)
+}
+
+#[cfg(feature = "backend_impls")]
+pub(crate) fn socket_addr_buf_to_storage(
+  addr: &SocketAddrBuf,
+) -> io::Result<(libc::sockaddr_storage, libc::socklen_t)> {
+  match addr.family {
+    SocketAddrFamily::Ipv4 | SocketAddrFamily::Ipv6 => {
+      let std_addr = socket_addr_from_buf(addr)?;
+      Ok(socket_addr_to_storage(std_addr))
+    }
+    #[cfg(unix)]
+    SocketAddrFamily::Unix => {
+      // SAFETY: `sockaddr_storage` is plain old data and may be zero-initialized.
+      let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+      // SAFETY: a `sockaddr_un` fits inside `sockaddr_storage` and we only
+      // write fields belonging to the Unix socket representation.
+      let unix =
+        unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_un) };
+      unix.sun_family = libc::AF_UNIX as libc::sa_family_t;
+      let len = addr.unix_path_len as usize;
+      for (dst, src) in
+        unix.sun_path[..len].iter_mut().zip(addr.unix_path[..len].iter())
+      {
+        *dst = *src as libc::c_char;
+      }
+      let socklen =
+        (std::mem::size_of::<libc::sa_family_t>() + len + 1) as libc::socklen_t;
+      Ok((storage, socklen))
+    }
+    #[cfg(not(unix))]
+    SocketAddrFamily::Unix => {
+      Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
+    }
+    SocketAddrFamily::Unspecified => {
+      Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
+    }
+  }
+}
+
+#[cfg(feature = "backend_impls")]
+pub(crate) fn socket_addr_buf_from_storage(
+  storage: &libc::sockaddr_storage,
+  len: libc::socklen_t,
+) -> io::Result<SocketAddrBuf> {
+  if storage.ss_family == raw_af_inet() as libc::sa_family_t
+    || storage.ss_family == raw_af_inet6() as libc::sa_family_t
+  {
+    // SAFETY: `storage` points to a valid initialized sockaddr storage value
+    // received from the OS, and the helper only reads from it.
+    let std_addr =
+      unsafe { crate::api::ops::libc_socketaddr_into_std_raw(storage) }?;
+    return Ok(socket_addr_into_buf(std_addr));
+  }
+
+  #[cfg(unix)]
+  if storage.ss_family == raw_af_unix().unwrap_or_default() as libc::sa_family_t
+  {
+    // SAFETY: when `ss_family` is AF_UNIX, the storage bytes are laid out as
+    // a `sockaddr_un`.
+    let unix = unsafe { &*(storage as *const _ as *const libc::sockaddr_un) };
+    let base = std::mem::size_of::<libc::sa_family_t>();
+    let path_len = (len as usize).saturating_sub(base).saturating_sub(1);
+    // SAFETY: `sun_path` is valid for `path_len` bytes as computed from the
+    // sockaddr length returned by the OS.
+    let bytes = unsafe {
+      std::slice::from_raw_parts(unix.sun_path.as_ptr().cast::<u8>(), path_len)
+    };
+    return unix_socket_addr_buf(bytes);
+  }
+
+  Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
 }
 
 pub fn socket_from_raw(
@@ -221,23 +387,22 @@ const fn raw_proto_udp() -> i32 {
 // ErasedBuffer - Type-erased buffer storage
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Non-owning raw buffer pointer used by all backends.
+/// Non-owning raw byte span used by all backends.
 ///
 /// The actual buffer is owned by the typed op (e.g., `Send<Vec<u8>>`). This struct
-/// holds only a pointer + length so backends can call syscalls without taking
-/// ownership, leaving the buffer available for `extract_result`.
-#[derive(Debug)]
-#[repr(transparent)]
-pub struct RawBuf(libc::iovec);
+/// holds only a pointer + length so backends can lower it to native descriptors
+/// without taking ownership, leaving the buffer available for result extraction.
+#[derive(Clone, Copy, Debug)]
+pub struct RawBuf {
+  pub ptr: *mut u8,
+  pub len: usize,
+}
 
 impl RawBuf {
   /// Creates a RawBuf from a pointer and length.
   #[inline]
   pub const fn new(buf: &[u8]) -> Self {
-    Self(libc::iovec {
-      iov_base: buf.as_ptr().cast_mut().cast(),
-      iov_len: buf.len(),
-    })
+    Self { ptr: buf.as_ptr().cast_mut(), len: buf.len() }
   }
 
   /// Creates a RawBuf from raw parts.
@@ -248,7 +413,7 @@ impl RawBuf {
   /// the submitted operation.
   #[inline]
   pub const unsafe fn from_raw_parts(ptr: *mut u8, len: usize) -> Self {
-    Self(libc::iovec { iov_base: ptr.cast(), iov_len: len })
+    Self { ptr, len }
   }
 }
 
@@ -282,7 +447,10 @@ impl MsgBuf {
   }
 }
 
+// SAFETY: `MsgBuf` is a plain pointer/length pair describing external memory;
+// sending or sharing it does not change aliasing guarantees by itself.
 unsafe impl Send for MsgBuf {}
+// SAFETY: `MsgBuf` carries no interior mutability and does not own the memory.
 unsafe impl Sync for MsgBuf {}
 
 #[derive(Clone, Copy, Debug)]
@@ -309,7 +477,11 @@ impl MsgBufMut {
   }
 }
 
+// SAFETY: `MsgBufMut` is just a pointer/length pair. Callers are responsible
+// for ensuring exclusive access to the pointed-to memory for the operation lifetime.
 unsafe impl Send for MsgBufMut {}
+// SAFETY: sharing the descriptor value does not itself permit mutation without
+// dereferencing the raw pointer.
 unsafe impl Sync for MsgBufMut {}
 
 #[derive(Clone, Copy, Debug)]
@@ -330,7 +502,9 @@ impl MsgSend {
   }
 }
 
+// SAFETY: `MsgSend` is metadata over caller-owned buffers and socket address data.
 unsafe impl Send for MsgSend {}
+// SAFETY: it contains no interior mutability beyond raw pointers.
 unsafe impl Sync for MsgSend {}
 
 #[derive(Clone, Copy, Debug)]
@@ -351,8 +525,206 @@ impl MsgRecv {
   }
 }
 
+// SAFETY: `MsgRecv` is metadata over caller-owned mutable buffers.
 unsafe impl Send for MsgRecv {}
+// SAFETY: sharing the descriptor does not by itself dereference or mutate buffers.
 unsafe impl Sync for MsgRecv {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileType {
+  Unknown,
+  File,
+  Directory,
+  Symlink,
+  BlockDevice,
+  CharDevice,
+  Fifo,
+  Socket,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirEntryRef {
+  pub name_offset: u32,
+  pub name_len: u16,
+  pub file_type: Option<FileType>,
+  pub ino: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadDirResult {
+  /// Number of valid `DirEntryRef`s written to the front of
+  /// `ReadDirBuf::entries`.
+  pub entries: usize,
+  /// Number of bytes written into the provided raw buffer for this batch.
+  pub raw_written: usize,
+  /// True only when the backend knows the directory stream is exhausted.
+  pub eof: bool,
+}
+
+pub type OpaqueDropFn = unsafe fn(*mut ());
+
+#[derive(Debug, Default)]
+pub struct ReadDirBuf {
+  pub raw: Vec<u8>,
+  pub entries: Vec<DirEntryRef>,
+  pub result: ReadDirResult,
+  pub(crate) opaque: *mut (),
+  pub(crate) opaque_drop: Option<OpaqueDropFn>,
+}
+
+// SAFETY: The opaque pointer is backend-managed continuation state. `ReadDirBuf`
+// only transports that opaque value between calls; dereferencing and meaning
+// remain backend-specific.
+unsafe impl Send for ReadDirBuf {}
+// SAFETY: Shared access does not by itself dereference or mutate the opaque
+// pointer. Backends are responsible for its interpretation.
+unsafe impl Sync for ReadDirBuf {}
+
+impl Drop for ReadDirBuf {
+  fn drop(&mut self) {
+    if self.opaque.is_null() {
+      return;
+    }
+    if let Some(drop_fn) = self.opaque_drop {
+      // SAFETY: `opaque` and `opaque_drop` are paired backend-owned continuation
+      // state set by the backend that created this `ReadDirBuf`.
+      unsafe {
+        drop_fn(self.opaque);
+      }
+    }
+    self.opaque = std::ptr::null_mut();
+    self.opaque_drop = None;
+  }
+}
+
+impl ReadDirBuf {
+  pub fn with_capacity(scratch_bytes: usize, entries_cap: usize) -> Self {
+    Self {
+      raw: vec![0; scratch_bytes],
+      entries: vec![DirEntryRef::default(); entries_cap],
+      result: ReadDirResult::default(),
+      opaque: std::ptr::null_mut(),
+      opaque_drop: None,
+    }
+  }
+
+  pub fn iter(&self) -> ReadDirIter<'_> {
+    ReadDirIter {
+      raw: &self.raw[..self.result.raw_written],
+      iter: self.entries[..self.result.entries].iter(),
+    }
+  }
+}
+
+pub struct DirEntryView<'a> {
+  pub name: &'a [u8],
+  pub file_type: Option<FileType>,
+  pub ino: Option<u64>,
+}
+
+pub struct ReadDirIter<'a> {
+  raw: &'a [u8],
+  iter: std::slice::Iter<'a, DirEntryRef>,
+}
+
+impl<'a> Iterator for ReadDirIter<'a> {
+  type Item = DirEntryView<'a>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    let entry = self.iter.next()?;
+    let start = entry.name_offset as usize;
+    let end = start + entry.name_len as usize;
+    Some(DirEntryView {
+      name: &self.raw[start..end],
+      file_type: entry.file_type,
+      ino: entry.ino,
+    })
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStat {
+  pub file_type: FileType,
+  pub size: u64,
+  pub permissions: u32,
+  pub mode: u32,
+  pub nlink: u64,
+  pub uid: u32,
+  pub gid: u32,
+}
+
+impl FileStat {
+  pub const fn zeroed() -> Self {
+    Self {
+      file_type: FileType::Unknown,
+      size: 0,
+      permissions: 0,
+      mode: 0,
+      nlink: 0,
+      uid: 0,
+      gid: 0,
+    }
+  }
+
+  pub fn is_file(&self) -> bool {
+    matches!(self.file_type, FileType::File)
+  }
+
+  pub fn is_dir(&self) -> bool {
+    matches!(self.file_type, FileType::Directory)
+  }
+
+  pub fn is_symlink(&self) -> bool {
+    matches!(self.file_type, FileType::Symlink)
+  }
+
+  pub fn len(&self) -> u64 {
+    self.size
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.size == 0
+  }
+}
+
+#[cfg(all(feature = "backend_impls", unix))]
+pub(crate) fn file_stat_from_raw(stat: &libc::stat) -> FileStat {
+  let file_type = match stat.st_mode & libc::S_IFMT {
+    libc::S_IFREG => FileType::File,
+    libc::S_IFDIR => FileType::Directory,
+    libc::S_IFLNK => FileType::Symlink,
+    libc::S_IFBLK => FileType::BlockDevice,
+    libc::S_IFCHR => FileType::CharDevice,
+    libc::S_IFIFO => FileType::Fifo,
+    libc::S_IFSOCK => FileType::Socket,
+    _ => FileType::Unknown,
+  };
+
+  FileStat {
+    file_type,
+    size: stat.st_size as u64,
+    permissions: (stat.st_mode & 0o7777) as u32,
+    mode: stat.st_mode as u32,
+    nlink: stat.st_nlink as u64,
+    uid: stat.st_uid,
+    gid: stat.st_gid,
+  }
+}
+
+#[cfg(unix)]
+pub(crate) fn file_type_from_dirent_dtype(dtype: u8) -> Option<FileType> {
+  match dtype {
+    libc::DT_BLK => Some(FileType::BlockDevice),
+    libc::DT_CHR => Some(FileType::CharDevice),
+    libc::DT_DIR => Some(FileType::Directory),
+    libc::DT_FIFO => Some(FileType::Fifo),
+    libc::DT_LNK => Some(FileType::Symlink),
+    libc::DT_REG => Some(FileType::File),
+    libc::DT_SOCK => Some(FileType::Socket),
+    libc::DT_UNKNOWN => None,
+    _ => None,
+  }
+}
 
 // pub struct IoSlice(libc::iovec);
 
@@ -378,8 +750,8 @@ pub enum Op {
   Read {
     /// File descriptor to read from
     fd: Resource,
-    /// Scatter buffers (null if using single buf)
-    iovecs: *mut RawBuf,
+    /// Scatter buffers
+    iovecs: NonNull<RawBuf>,
     /// Number of iovecs
     iov_count: usize,
     /// File offset (-1 for current position)
@@ -401,8 +773,8 @@ pub enum Op {
   Write {
     /// File descriptor to write to
     fd: Resource,
-    /// Gather buffers (null if using single buf)
-    iovecs: *const RawBuf,
+    /// Gather buffers
+    iovecs: NonNull<RawBuf>,
     /// Number of iovecs
     iov_count: usize,
     /// File offset (-1 for current position)
@@ -447,6 +819,49 @@ pub enum Op {
     flags: i32,
   },
 
+  /// Read metadata for a path relative to a directory file descriptor.
+  ///
+  /// This variant generalizes `stat(2)`, `lstat(2)`, and `fstatat(2)`:
+  /// - `follow_symlinks = true` behaves like `stat`
+  /// - `follow_symlinks = false` behaves like `lstat`
+  /// - `dir_fd` provides the base for relative lookups, like `fstatat`
+  Stat {
+    /// Directory file descriptor used as the base for relative paths.
+    dir_fd: Resource,
+    /// Null-terminated pathname pointer.
+    path: NonNull<c_char>,
+    /// Whether symlinks should be followed when resolving the path.
+    follow_symlinks: bool,
+    /// Portable metadata output storage.
+    out: NonNull<FileStat>,
+  },
+  /// Read directory entries from an open directory resource.
+  ///
+  /// The backend fills `raw_buf` with opaque raw directory data, writes parsed
+  /// portable entry refs into `entries`, and stores batch metadata in `out`.
+  /// Entries for `"."` and `".."` are omitted.
+  ///
+  /// Repeated calls on the same directory fd continue from that fd's native
+  /// directory-stream position.
+  ReadDir {
+    /// Open directory resource.
+    fd: Resource,
+    /// Caller-owned opaque scratch memory.
+    raw_buf: NonNull<u8>,
+    /// Size of `raw_buf`.
+    raw_cap: usize,
+    /// Caller-owned parsed entry refs.
+    entries: NonNull<DirEntryRef>,
+    /// Max number of entry refs the backend may write.
+    entries_cap: usize,
+    /// Caller-owned opaque backend state slot used across repeated calls.
+    opaque: NonNull<*mut ()>,
+    /// Caller-owned opaque destructor slot for backend state.
+    opaque_drop: NonNull<Option<OpaqueDropFn>>,
+    /// Batch result metadata.
+    out: NonNull<ReadDirResult>,
+  },
+
   //
   // // ═══════════════════════════════════════════════════════════════════════════════
   // // Socket operations
@@ -467,9 +882,7 @@ pub enum Op {
     /// Listening socket to accept from.
     fd: Resource,
     /// Peer address output storage.
-    addr: *mut libc::sockaddr_storage,
-    /// In/out length pointer for `addr`.
-    len: *mut libc::socklen_t,
+    addr: NonNull<SocketAddrBuf>,
   },
   /// Initiate a connection on a socket.
   ///
@@ -484,9 +897,7 @@ pub enum Op {
     /// Socket to connect.
     fd: Resource,
     /// Destination socket address.
-    addr: *const libc::sockaddr_storage,
-    /// Length of `addr` in bytes.
-    len: libc::socklen_t,
+    addr: SocketAddrBuf,
   },
   /// Open a path relative to a directory file descriptor.
   ///
@@ -496,7 +907,7 @@ pub enum Op {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
     /// Null-terminated pathname pointer.
-    path: *const c_char,
+    path: NonNull<c_char>,
     /// Open flags passed to `openat(2)`.
     flags: i32,
     /// File creation mode used when `O_CREAT` is set.
@@ -510,7 +921,7 @@ pub enum Op {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
     /// Null-terminated pathname pointer.
-    path: *const c_char,
+    path: NonNull<c_char>,
     /// Flags passed to `unlinkat(2)`.
     flags: i32,
   },
@@ -522,11 +933,11 @@ pub enum Op {
     /// Directory file descriptor used as the base for the old path.
     old_dir_fd: Resource,
     /// Null-terminated old pathname pointer.
-    old_path: *const c_char,
+    old_path: NonNull<c_char>,
     /// Directory file descriptor used as the base for the new path.
     new_dir_fd: Resource,
     /// Null-terminated new pathname pointer.
-    new_path: *const c_char,
+    new_path: NonNull<c_char>,
   },
   /// Create a directory relative to a directory file descriptor.
   ///
@@ -536,7 +947,7 @@ pub enum Op {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
     /// Null-terminated pathname pointer.
-    path: *const c_char,
+    path: NonNull<c_char>,
     /// Mode passed to `mkdirat(2)`.
     mode: u32,
   },
@@ -550,11 +961,11 @@ pub enum Op {
     /// Directory file descriptor used as the base for the source path.
     source_dir_fd: Resource,
     /// Null-terminated source pathname pointer or symlink target string.
-    source_path: *const c_char,
+    source_path: NonNull<c_char>,
     /// Directory file descriptor used as the base for the new path.
     new_dir_fd: Resource,
     /// Null-terminated new pathname pointer.
-    new_path: *const c_char,
+    new_path: NonNull<c_char>,
   },
   /// Read the target of a symbolic link relative to a directory file descriptor.
   ///
@@ -565,11 +976,35 @@ pub enum Op {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
     /// Null-terminated pathname pointer.
-    path: *const c_char,
+    path: NonNull<c_char>,
     /// Output buffer pointer.
-    buf: *mut u8,
+    buf: NonNull<u8>,
     /// Output buffer length.
     buf_len: usize,
+  },
+  /// Read the current working directory into a caller-provided buffer.
+  ///
+  /// This is an immediate operation on readiness backends. On io_uring it is
+  /// completed through a userspace immediate syscall path because there is no
+  /// native opcode for `getcwd(3)`.
+  GetCwd {
+    /// Output buffer pointer.
+    buf: NonNull<u8>,
+    /// Output buffer length.
+    buf_len: usize,
+  },
+  /// Spawn a new process.
+  ///
+  /// Uses `posix_spawn()` on Unix and completes immediately with the child PID
+  /// as the positive result.
+  Spawn {
+    /// Path to executable (C string, owned by TypedOp).
+    path: NonNull<c_char>,
+    /// Argument vector (null-terminated array, owned by TypedOp).
+    argv: NonNull<*mut c_char>,
+    /// Environment vector (null-terminated array, owned by TypedOp).
+    /// Null means inherit the parent environment.
+    envp: Option<NonNull<*mut c_char>>,
   },
   /// Create a new socket descriptor.
   ///
@@ -583,6 +1018,24 @@ pub enum Op {
     /// Cross-platform semantic socket protocol.
     proto: SockProto,
   },
+  Bind {
+    /// Socket resource to bind.
+    fd: Resource,
+    /// Socket address to bind to.
+    addr: SocketAddr,
+  },
+  Listen {
+    /// Socket resource to mark listening.
+    fd: Resource,
+    /// Backlog depth passed to listen(2).
+    backlog: i32,
+  },
+  Shutdown {
+    /// Socket resource to shut down.
+    fd: Resource,
+    /// Shutdown mode passed to shutdown(2).
+    how: i32,
+  },
   Nop,
 }
 
@@ -592,19 +1045,6 @@ pub enum Op {
 // /// On pollingv2: Auto-resubmits after each accept.
 // AcceptStream {
 //   fd: Resource,
-// },
-// Bind {
-//   fd: Resource,
-//   addr: *const libc::sockaddr_storage,
-//   addrlen: libc::socklen_t,
-// },
-// Listen {
-//   fd: Resource,
-//   backlog: i32,
-// },
-// Shutdown {
-//   fd: Resource,
-//   how: i32,
 // },
 // // ═══════════════════════════════════════════════════════════════════════════════
 // // File operations

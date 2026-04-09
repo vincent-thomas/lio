@@ -53,8 +53,8 @@ pub mod buf;
 // #[cfg(feature = "high")]
 // pub mod fs;
 // pub mod io;
-// #[cfg(feature = "high")]
-// pub mod net;
+#[cfg(feature = "high")]
+pub mod net;
 // #[cfg(feature = "high")]
 // pub mod process;
 pub mod time;

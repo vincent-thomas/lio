@@ -345,6 +345,18 @@ impl Iocp {
         Self::error_result(windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED)
       }
 
+      Op::GetCwd { .. } => {
+        Self::error_result(windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED)
+      }
+
+      Op::Stat { .. } => {
+        Self::error_result(windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED)
+      }
+
+      Op::ReadDir { .. } => {
+        Self::error_result(windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED)
+      }
+
       Op::Flock { fd, operation } => {
         use crate::api::ops::lock;
         let handle = fd.as_raw_handle() as HANDLE;
@@ -561,21 +573,34 @@ impl Iocp {
   /// Note: AcceptEx requires loading the function pointer via WSAIoctl.
   /// For simplicity, this implementation uses a blocking accept for now.
   fn start_accept(&mut self, id: u64, op: Op) -> io::Result<()> {
-    let (fd, addr, len) = match &op {
-      Op::Accept { fd, addr, len } => (fd.as_raw_handle(), *addr, *len),
+    let (fd, out_addr) = match &op {
+      Op::Accept { fd, addr } => (fd.as_raw_handle(), *addr),
       _ => unreachable!(),
     };
 
     let socket = fd as SOCKET;
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as i32;
 
     // Use blocking accept for now (AcceptEx requires more setup)
     let result = unsafe {
       windows_sys::Win32::Networking::WinSock::accept(
         socket,
-        addr as *mut SOCKADDR,
-        len as *mut i32,
+        (&mut storage as *mut libc::sockaddr_storage).cast(),
+        &mut len,
       )
     };
+
+    if result != INVALID_SOCKET {
+      if let Ok(addr) = crate::backend::op::socket_addr_buf_from_storage(
+        &storage,
+        len as libc::socklen_t,
+      ) {
+        unsafe {
+          *out_addr = addr;
+        }
+      }
+    }
 
     let completion_result = if result == INVALID_SOCKET {
       Self::error_result(unsafe { WSAGetLastError() } as u32)
@@ -595,15 +620,14 @@ impl Iocp {
   /// Note: ConnectEx requires loading the function pointer and pre-binding.
   /// For simplicity, this implementation uses blocking connect for now.
   fn start_connect(&mut self, id: u64, op: Op) -> io::Result<()> {
-    let (fd, addr, len, _connect_called) = match &op {
-      Op::Connect { fd, addr, len, connect_called } => {
-        (fd.as_raw_handle(), addr, *len, *connect_called)
-      }
+    let (fd, addr) = match &op {
+      Op::Connect { fd, addr } => (fd.as_raw_handle(), addr),
       _ => unreachable!(),
     };
 
     let socket = fd as SOCKET;
-    let (addr_ptr, _) = sockaddr_storage_to_ptr(addr);
+    let (storage, len) = crate::backend::op::socket_addr_buf_to_storage(addr)?;
+    let (addr_ptr, _) = sockaddr_storage_to_ptr(&storage);
 
     let result = unsafe { connect(socket, addr_ptr, len as i32) };
 
@@ -968,6 +992,9 @@ impl IoBackend for Iocp {
       | Op::MkdirAt { .. }
       | Op::LinkAt { .. }
       | Op::ReadlinkAt { .. }
+      | Op::GetCwd { .. }
+      | Op::Stat { .. }
+      | Op::ReadDir { .. }
       | Op::Flock { .. }
       | Op::Nop => {
         let result = Self::run_blocking(&op);

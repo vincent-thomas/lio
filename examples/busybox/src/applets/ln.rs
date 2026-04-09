@@ -1,12 +1,19 @@
 use std::{
   ffi::CString,
-  fs, io,
+  io,
   path::{Path, PathBuf},
 };
 
 use lio::{api, api::ops::LinkKind};
 
-use crate::{app::AppContext, command::Command, util::io as io_util};
+use crate::{
+  app::AppContext,
+  command::Command,
+  util::{
+    flags::{FlagParser, FlagSpec},
+    fs as fs_util, io as io_util,
+  },
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct LnCommand {
@@ -35,66 +42,77 @@ impl Command for LnCommand {
   }
 
   fn parse(args: &[String]) -> io::Result<Self> {
-    let mut command = Self { backup_suffix: "~".into(), ..Self::default() };
-    let mut index = 0;
-
-    while let Some(arg) = args.get(index) {
-      match arg.as_str() {
-        "-s" => {
-          command.symbolic = true;
-          index += 1;
-        }
-        "-f" => {
-          command.force = true;
-          index += 1;
-        }
-        "-n" => {
-          command.no_dereference = true;
-          index += 1;
-        }
-        "-b" => {
-          command.backup = true;
-          index += 1;
-        }
-        "-T" => {
-          command.no_target_directory = true;
-          index += 1;
-        }
-        "-v" => {
-          command.verbose = true;
-          index += 1;
-        }
-        "-S" => {
-          let Some(suffix) = args.get(index + 1) else {
-            return Err(io::Error::new(
-              io::ErrorKind::InvalidInput,
-              "ln: option requires an argument -- 'S'",
-            ));
-          };
-          command.backup_suffix = suffix.clone();
-          index += 2;
-        }
-        "-t" => {
-          let Some(dir) = args.get(index + 1) else {
-            return Err(io::Error::new(
-              io::ErrorKind::InvalidInput,
-              "ln: option requires an argument -- 't'",
-            ));
-          };
-          command.target_directory = Some(dir.clone());
-          index += 2;
-        }
-        _ if arg.starts_with('-') => {
-          return Err(io::Error::new(
+    const SPECS: &[FlagSpec<'static>] = &[
+      FlagSpec {
+        name: "symbolic",
+        short: &['s'],
+        long: &[],
+        takes_value: false,
+      },
+      FlagSpec { name: "force", short: &['f'], long: &[], takes_value: false },
+      FlagSpec {
+        name: "no_dereference",
+        short: &['n'],
+        long: &[],
+        takes_value: false,
+      },
+      FlagSpec { name: "backup", short: &['b'], long: &[], takes_value: false },
+      FlagSpec {
+        name: "backup_suffix",
+        short: &['S'],
+        long: &[],
+        takes_value: true,
+      },
+      FlagSpec {
+        name: "no_target_directory",
+        short: &['T'],
+        long: &[],
+        takes_value: false,
+      },
+      FlagSpec {
+        name: "target_directory",
+        short: &['t'],
+        long: &[],
+        takes_value: true,
+      },
+      FlagSpec {
+        name: "verbose",
+        short: &['v'],
+        long: &[],
+        takes_value: false,
+      },
+    ];
+    let parsed = FlagParser::new("ln", SPECS).parse(args).map_err(|err| {
+      if err.kind() == io::ErrorKind::InvalidInput {
+        let message = err.to_string();
+        if message.contains("missing value for '-S'") {
+          return io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("ln: unrecognized option '{arg}'"),
-          ));
+            "ln: option requires an argument -- 'S'",
+          );
         }
-        _ => break,
+        if message.contains("missing value for '-t'") {
+          return io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ln: option requires an argument -- 't'",
+          );
+        }
       }
-    }
+      err
+    })?;
 
-    command.paths = args[index..].to_vec();
+    let mut command = Self { backup_suffix: "~".into(), ..Self::default() };
+    command.symbolic = parsed.get_flag_exists("symbolic");
+    command.force = parsed.get_flag_exists("force");
+    command.no_dereference = parsed.get_flag_exists("no_dereference");
+    command.backup = parsed.get_flag_exists("backup");
+    command.backup_suffix =
+      parsed.get_flag_value("backup_suffix").unwrap_or("~").to_string();
+    command.no_target_directory = parsed.get_flag_exists("no_target_directory");
+    command.target_directory =
+      parsed.get_flag_value("target_directory").map(str::to_string);
+    command.verbose = parsed.get_flag_exists("verbose");
+    command.paths = parsed.positional().to_vec();
     if command.paths.is_empty() {
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -107,7 +125,7 @@ impl Command for LnCommand {
   }
 
   fn execute(&self, ctx: &AppContext) -> io::Result<()> {
-    let plans = build_link_plan(self)?;
+    let plans = build_link_plan(ctx, self)?;
     for (source, dest) in plans {
       create_link(ctx, &source, &dest, self)?;
     }
@@ -140,25 +158,17 @@ fn validate_operands(command: &LnCommand) -> io::Result<()> {
     ));
   }
 
-  if command.paths.len() > 1 {
-    let dest =
-      Path::new(command.paths.last().expect("validated operand count"));
-    if command.no_target_directory
-      || !destination_is_directory(dest, command.no_dereference)
-    {
-      if command.paths.len() != 2 {
-        return Err(io::Error::new(
-          io::ErrorKind::InvalidInput,
-          format!("ln: target '{}' is not a directory", dest.display()),
-        ));
-      }
-    }
+  if command.paths.len() > 2 && !command.no_target_directory {
+    return Ok(());
   }
 
   Ok(())
 }
 
-fn build_link_plan(command: &LnCommand) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+fn build_link_plan(
+  ctx: &AppContext,
+  command: &LnCommand,
+) -> io::Result<Vec<(PathBuf, PathBuf)>> {
   if let Some(dir) = &command.target_directory {
     let dir_path = PathBuf::from(dir);
     return command
@@ -194,7 +204,7 @@ fn build_link_plan(command: &LnCommand) -> io::Result<Vec<(PathBuf, PathBuf)>> {
     let source = PathBuf::from(&command.paths[0]);
     let dest = PathBuf::from(&command.paths[1]);
     if !command.no_target_directory
-      && destination_is_directory(&dest, command.no_dereference)
+      && destination_is_directory(ctx, &dest, command.no_dereference)?
     {
       let Some(name) = source.file_name().map(|name| name.to_os_string())
       else {
@@ -210,6 +220,14 @@ fn build_link_plan(command: &LnCommand) -> io::Result<Vec<(PathBuf, PathBuf)>> {
 
   let dest_dir =
     PathBuf::from(command.paths.last().expect("validated operand count"));
+  if command.no_target_directory
+    || !destination_is_directory(ctx, &dest_dir, command.no_dereference)?
+  {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidInput,
+      format!("ln: target '{}' is not a directory", dest_dir.display()),
+    ));
+  }
   command.paths[..command.paths.len() - 1]
     .iter()
     .map(|source| {
@@ -226,13 +244,15 @@ fn build_link_plan(command: &LnCommand) -> io::Result<Vec<(PathBuf, PathBuf)>> {
     .collect()
 }
 
-fn destination_is_directory(path: &Path, no_dereference: bool) -> bool {
-  let metadata = if no_dereference {
-    fs::symlink_metadata(path)
-  } else {
-    fs::metadata(path)
-  };
-  metadata.map(|item| item.is_dir()).unwrap_or(false)
+fn destination_is_directory(
+  ctx: &AppContext,
+  path: &Path,
+  no_dereference: bool,
+) -> io::Result<bool> {
+  Ok(
+    fs_util::stat_path(ctx, path, !no_dereference)?
+      .is_some_and(|item| item.is_dir()),
+  )
 }
 
 fn create_link(
@@ -269,7 +289,7 @@ fn prepare_destination(
   dest: &Path,
   command: &LnCommand,
 ) -> io::Result<()> {
-  let exists = fs::symlink_metadata(dest).is_ok();
+  let exists = fs_util::stat_path(ctx, dest, false)?.is_some();
   if !exists {
     return Ok(());
   }
@@ -277,10 +297,10 @@ fn prepare_destination(
   if command.backup {
     let backup =
       PathBuf::from(format!("{}{}", dest.display(), command.backup_suffix));
-    if fs::symlink_metadata(&backup).is_ok() {
+    if fs_util::stat_path(ctx, &backup, false)?.is_some() {
       remove_path(ctx, &backup)?;
     }
-    fs::rename(dest, &backup)?;
+    rename_path(ctx, dest, &backup)?;
     return Ok(());
   }
 
@@ -295,12 +315,22 @@ fn prepare_destination(
 }
 
 fn remove_path(ctx: &AppContext, path: &Path) -> io::Result<()> {
-  let metadata = fs::symlink_metadata(path)?;
-  let flags =
-    if metadata.file_type().is_dir() { libc::AT_REMOVEDIR } else { 0 };
+  let metadata = fs_util::stat_path(ctx, path, false)?
+    .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+  let flags = if metadata.is_dir() { libc::AT_REMOVEDIR } else { 0 };
   let cpath = path_to_cstring(path, "ln")?;
   let mut receiver =
     api::unlinkat(&ctx.cwd(), cpath, flags).with_lio(ctx.lio()).send();
+  io_util::run_recv(ctx.lio(), &mut receiver)
+}
+
+fn rename_path(ctx: &AppContext, source: &Path, dest: &Path) -> io::Result<()> {
+  let source_cpath = path_to_cstring(source, "ln")?;
+  let dest_cpath = path_to_cstring(dest, "ln")?;
+  let mut receiver =
+    api::renameat(&ctx.cwd(), source_cpath, &ctx.cwd(), dest_cpath)
+      .with_lio(ctx.lio())
+      .send();
   io_util::run_recv(ctx.lio(), &mut receiver)
 }
 
@@ -316,6 +346,7 @@ fn path_to_cstring(path: &Path, command: &str) -> io::Result<CString> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::fs;
   use std::os::unix::fs::MetadataExt;
 
   #[test]
