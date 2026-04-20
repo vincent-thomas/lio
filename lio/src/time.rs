@@ -1,8 +1,8 @@
 //! Time management for lio.
 //!
 //! This module provides efficient timer management using a hashed hierarchical
-//! timing wheel. The pure wheel logic lives in [`clock`], while [`TimeManager`]
-//! adapts it to wall-clock time for runtime use.
+//! timing wheel. The pure wheel logic lives in the internal `clock` module, while
+//! the runtime uses an internal time manager to adapt it to wall-clock time.
 
 mod clock;
 

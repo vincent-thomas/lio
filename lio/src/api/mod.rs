@@ -15,7 +15,8 @@
 //! ## Synchronisation
 //!
 //! Lio is compatible with any synchronisation method, through the [`Io`] type:
-//! - [async](io::IoFuture) (runtime-independent).
+//! - Async/await through [`IntoFuture`] on [`Io`]
+//!   (runtime-independent).
 //! - [Callbacks](io::Io::when_done).
 //! - Channels: [get receiver](io::Io::send) *or* [send with your own](io::Io::send_with).
 //!

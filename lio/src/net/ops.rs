@@ -2,7 +2,7 @@
 //!
 //! This module contains specialized operation types that adapt low-level I/O operations
 //! to work with the high-level [`Socket`] type. These types implement
-//! the [`TypedOp`] trait and are used internally by the networking API.
+//! [`OpModel`] and are used internally by the networking API.
 //!
 //! Most users will not need to use these types directly, as they are returned by methods
 //! on [`Socket`], [`TcpListener`], and [`TcpSocket`].

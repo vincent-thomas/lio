@@ -10,7 +10,6 @@
 //! provides various methods to consume its result:
 //!
 //! - **Async/await**: Implements `IntoFuture`, allowing direct `.await` syntax
-//! - **Blocking**: [`wait()`](Io::wait) blocks until completion
 //! - **Callbacks**: [`when_done()`](Io::when_done) executes a closure on completion
 //! - **Channels**: [`send()`](Io::send) and [`send_with()`](Io::send_with)
 //!   deliver results via channels
@@ -20,7 +19,6 @@
 //! ```text
 //! Io<T>
 //!   ├─> IntoFuture ──> IoFuture<T> (async/await)
-//!   ├─> wait()        (blocking)
 //!   ├─> when_done(F)  (callback)
 //!   ├─> send()    ──> Receiver<T>        (channel-based blocking)
 //!   └─> send_with(Sender<T>)             (custom channel)

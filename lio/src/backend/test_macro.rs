@@ -1,4 +1,5 @@
-/// Shared contract tests for [`IoBackend`] implementations.
+/// Shared contract tests for [`IoBackend`](crate::backend::IoBackend)
+/// implementations.
 ///
 /// Backends that pass `test_io_backend!` conform to the standard observable
 /// contract for the deterministic scenarios covered here.

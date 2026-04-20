@@ -4,7 +4,7 @@
 //! that work across different resource types (files, sockets, pipes, etc.).
 //!
 //! For file-specific helpers like `read_to_string` and `write_all`,
-//! see the methods on [`File`](crate::fs::File).
+//! see the file APIs exposed by lio's higher-level resource types.
 //!
 //! # Examples
 //!
@@ -24,7 +24,12 @@
 
 use std::io;
 
-use crate::api::{self, resource::AsResource};
+use crate::api::{
+  io::Io,
+  op::{Action, Completion, OneshotOpModel, OpModel, OpResult},
+  ops,
+  resource::{AsResource, Resource},
+};
 
 /// Default buffer size for I/O operations (64 KB).
 const DEFAULT_BUF_SIZE: usize = 64 * 1024;
@@ -46,43 +51,11 @@ const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 ///     Ok(())
 /// }
 /// ```
-pub async fn copy(
-  reader: &impl AsResource,
-  writer: &impl AsResource,
-) -> io::Result<u64> {
-  let mut total: u64 = 0;
-
-  loop {
-    let buf = vec![0u8; DEFAULT_BUF_SIZE];
-    let (read_result, buf) = api::read(reader, buf).await;
-    let n = read_result? as usize;
-
-    if n == 0 {
-      break;
-    }
-
-    let to_write = buf[..n].to_vec();
-    let mut written = 0;
-
-    while written < n {
-      let remaining = to_write[written..].to_vec();
-      let (write_result, _) = api::write(writer, remaining).await;
-      let w = write_result? as usize;
-
-      if w == 0 {
-        return Err(io::Error::new(
-          io::ErrorKind::WriteZero,
-          "write returned 0",
-        ));
-      }
-
-      written += w;
-    }
-
-    total += n as u64;
-  }
-
-  Ok(total)
+pub fn copy(reader: &impl AsResource, writer: &impl AsResource) -> Io<Copy> {
+  Io::from_op(Copy::new(
+    reader.as_resource().clone(),
+    writer.as_resource().clone(),
+  ))
 }
 
 /// Copies up to `limit` bytes from reader to writer.
@@ -102,54 +75,133 @@ pub async fn copy(
 ///     Ok(())
 /// }
 /// ```
-pub async fn copy_n(
+pub fn copy_n(
   reader: &impl AsResource,
   writer: &impl AsResource,
   limit: u64,
-) -> io::Result<u64> {
-  let mut total: u64 = 0;
-
-  while total < limit {
-    let to_read =
-      std::cmp::min(DEFAULT_BUF_SIZE as u64, limit - total) as usize;
-    let buf = vec![0u8; to_read];
-    let (read_result, buf) = api::read(reader, buf).await;
-    let n = read_result? as usize;
-
-    if n == 0 {
-      break;
-    }
-
-    let to_write = buf[..n].to_vec();
-    let mut written = 0;
-
-    while written < n {
-      let remaining = to_write[written..].to_vec();
-      let (write_result, _) = api::write(writer, remaining).await;
-      let w = write_result? as usize;
-
-      if w == 0 {
-        return Err(io::Error::new(
-          io::ErrorKind::WriteZero,
-          "write returned 0",
-        ));
-      }
-
-      written += w;
-    }
-
-    total += n as u64;
-  }
-
-  Ok(total)
+) -> Io<CopyN> {
+  Io::from_op(CopyN::new(
+    reader.as_resource().clone(),
+    writer.as_resource().clone(),
+    limit,
+  ))
 }
 
-#[cfg(test)]
-mod tests {
-  use super::*;
+pub struct Copy {
+  inner: CopyN,
+}
 
-  #[test]
-  fn test_default_buf_size() {
-    assert_eq!(DEFAULT_BUF_SIZE, 64 * 1024);
+impl Copy {
+  fn new(reader: Resource, writer: Resource) -> Self {
+    Self { inner: CopyN::new(reader, writer, u64::MAX) }
   }
 }
+
+impl OpModel for Copy {
+  type Item = io::Result<u64>;
+
+  fn action(&mut self) -> Action {
+    self.inner.action()
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    self.inner.complete(completion)
+  }
+}
+
+impl OneshotOpModel for Copy {}
+
+pub struct CopyN {
+  reader: Resource,
+  writer: Resource,
+  total: u64,
+  limit: u64,
+  state: CopyState,
+}
+
+enum CopyState {
+  Reading(ops::Read<Vec<u8>>),
+  Writing(ops::Write<Vec<u8>>),
+  Done,
+}
+
+impl CopyN {
+  fn new(reader: Resource, writer: Resource, limit: u64) -> Self {
+    let initial = limit.min(DEFAULT_BUF_SIZE as u64) as usize;
+    Self {
+      reader: reader.clone(),
+      writer: writer.clone(),
+      total: 0,
+      limit,
+      state: CopyState::Reading(ops::Read::new(reader, vec![0u8; initial])),
+    }
+  }
+
+  fn write_zero() -> io::Error {
+    io::Error::new(io::ErrorKind::WriteZero, "write returned 0")
+  }
+
+  fn next_read_len(&self) -> usize {
+    (self.limit - self.total).min(DEFAULT_BUF_SIZE as u64) as usize
+  }
+}
+
+impl OpModel for CopyN {
+  type Item = io::Result<u64>;
+
+  fn action(&mut self) -> Action {
+    match &mut self.state {
+      CopyState::Reading(read) => read.action(),
+      CopyState::Writing(write) => write.action(),
+      CopyState::Done => panic!("CopyN polled after completion"),
+    }
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    match std::mem::replace(&mut self.state, CopyState::Done) {
+      CopyState::Reading(mut read) => match read.complete(completion) {
+        OpResult::Done((Ok(0), _buf)) => OpResult::Done(Ok(self.total)),
+        OpResult::Done((Ok(n), mut buf)) => {
+          let n = n as usize;
+          self.total += n as u64;
+          buf.truncate(n);
+          self.state =
+            CopyState::Writing(ops::Write::new(self.writer.clone(), buf));
+          OpResult::Again
+        }
+        OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
+        OpResult::Again | OpResult::Yield(_) => unreachable!(),
+      },
+      CopyState::Writing(mut write) => match write.complete(completion) {
+        OpResult::Done((Ok(0), _buf)) => {
+          OpResult::Done(Err(Self::write_zero()))
+        }
+        OpResult::Done((Ok(n), mut buf)) => {
+          let written = n as usize;
+          if written < buf.len() {
+            let remaining = buf.len() - written;
+            buf.copy_within(written.., 0);
+            buf.truncate(remaining);
+            self.state =
+              CopyState::Writing(ops::Write::new(self.writer.clone(), buf));
+            return OpResult::Again;
+          }
+
+          if self.total >= self.limit {
+            OpResult::Done(Ok(self.total))
+          } else {
+            buf.resize(self.next_read_len(), 0);
+            self.state =
+              CopyState::Reading(ops::Read::new(self.reader.clone(), buf));
+            OpResult::Again
+          }
+        }
+        OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
+        OpResult::Again | OpResult::Yield(_) => unreachable!(),
+      },
+      CopyState::Done => panic!("CopyN completed after terminal state"),
+    }
+  }
+}
+
+impl OneshotOpModel for CopyN {}

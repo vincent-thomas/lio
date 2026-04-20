@@ -255,12 +255,14 @@ pub trait OpModel: Send + Sync + 'static {
 
 /// Marker trait for logical operations that produce exactly one final item.
 ///
-/// Types implementing this trait are suitable for the [`Io`] wrapper and can be
+/// Types implementing this trait are suitable for the [`Io`](crate::api::Io)
+/// wrapper and can be
 /// consumed with `.await`.
 pub trait OneshotOpModel: OpModel {}
 
 /// Marker trait for logical operations that may yield multiple items over time.
 ///
-/// Types implementing this trait are suitable for the [`IoStream`] wrapper and
+/// Types implementing this trait are suitable for the
+/// [`IoStream`](crate::api::IoStream) wrapper and
 /// are consumed through `.next().await`.
 pub trait StreamOpModel: OpModel {}

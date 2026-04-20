@@ -52,7 +52,7 @@ pub mod ffi;
 pub mod buf;
 // #[cfg(feature = "high")]
 // pub mod fs;
-// pub mod io;
+pub mod io;
 #[cfg(feature = "high")]
 pub mod net;
 // #[cfg(feature = "high")]
