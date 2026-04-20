@@ -130,6 +130,8 @@ macro_rules! test_io_backend {
       use super::*;
       use bumpalo::Bump;
       use std::{
+        cell::RefCell,
+        collections::HashMap,
         time::{Duration, SystemTime, Instant},
         env, fs, mem, path::PathBuf, thread,
         os::{
@@ -147,9 +149,20 @@ macro_rules! test_io_backend {
       };
       use std::ptr::NonNull;
 
+      thread_local! {
+        static STEP_BUMPS: RefCell<HashMap<(usize, u64), Bump>> =
+          RefCell::new(HashMap::new());
+      }
+
       fn push_op(backend: &mut impl IoBackend, id: u64, op: Op) {
-        let mut step_bump = Bump::new();
-        IoBackend::push(backend, id, op, &mut step_bump);
+        let backend_key = (backend as *mut _ as *mut ()) as usize;
+        STEP_BUMPS.with(|step_bumps| {
+          let mut step_bumps = step_bumps.borrow_mut();
+          let step_bump =
+            step_bumps.entry((backend_key, id)).or_insert_with(Bump::new);
+          step_bump.reset();
+          IoBackend::push(backend, id, op, step_bump);
+        });
       }
 
       fn nonnull<T>(ptr: *mut T) -> NonNull<T> {

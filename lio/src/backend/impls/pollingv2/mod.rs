@@ -208,6 +208,30 @@ pub struct PendingOp {
 const EAGAIN_NEG: isize = -(libc::EAGAIN as isize);
 const EWOULDBLOCK_NEG: isize = -(libc::EWOULDBLOCK as isize);
 impl Poller {
+  #[inline]
+  fn dirent_ino(entry: *const libc::dirent) -> u64 {
+    #[cfg(any(
+      target_os = "linux",
+      target_os = "macos",
+      target_os = "ios",
+      target_os = "tvos",
+      target_os = "watchos"
+    ))]
+    unsafe {
+      (*entry).d_ino as u64
+    }
+
+    #[cfg(any(
+      target_os = "freebsd",
+      target_os = "dragonfly",
+      target_os = "openbsd",
+      target_os = "netbsd"
+    ))]
+    unsafe {
+      (*entry).d_fileno as u64
+    }
+  }
+
   unsafe fn drop_readdir_state(state: *mut ()) {
     if !state.is_null() {
       // SAFETY: `state` was created by `fdopendir` and is owned by the
@@ -311,8 +335,7 @@ impl Poller {
           name_len: name.len() as u16,
           // SAFETY: `entry` is valid for this iteration.
           file_type: file_type_from_dirent_dtype(unsafe { (*entry).d_type }),
-          // SAFETY: `entry` is valid for this iteration.
-          ino: Some(unsafe { (*entry).d_ino as u64 }),
+          ino: Some(Self::dirent_ino(entry)),
         };
         raw_written += name.len();
         written += 1;

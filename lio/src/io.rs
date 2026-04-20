@@ -11,11 +11,11 @@
 //! ## Copy between resources
 //!
 //! ```rust,no_run
-//! use lio::{io, fs::File};
+//! use lio::{io, api::resource::Resource};
 //!
 //! async fn example() -> std::io::Result<()> {
-//!     let src = File::open("/tmp/source.txt").await?;
-//!     let dst = File::create("/tmp/dest.txt").await?;
+//!     let src = Resource::stdin();
+//!     let dst = Resource::stdout();
 //!     let bytes_copied = io::copy(&src, &dst).await?;
 //!     println!("Copied {} bytes", bytes_copied);
 //!     Ok(())
@@ -41,11 +41,11 @@ const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 /// # Examples
 ///
 /// ```rust,no_run
-/// use lio::{io, fs::File};
+/// use lio::{io, api::resource::Resource};
 ///
 /// async fn example() -> std::io::Result<()> {
-///     let src = File::open("/tmp/source.txt").await?;
-///     let dst = File::create("/tmp/dest.txt").await?;
+///     let src = Resource::stdin();
+///     let dst = Resource::stdout();
 ///     let bytes = io::copy(&src, &dst).await?;
 ///     println!("Copied {} bytes", bytes);
 ///     Ok(())
@@ -65,11 +65,11 @@ pub fn copy(reader: &impl AsResource, writer: &impl AsResource) -> Io<Copy> {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use lio::{io, fs::File};
+/// use lio::{io, api::resource::Resource};
 ///
 /// async fn example() -> std::io::Result<()> {
-///     let src = File::open("/tmp/large_file.bin").await?;
-///     let dst = File::create("/tmp/first_1mb.bin").await?;
+///     let src = Resource::stdin();
+///     let dst = Resource::stdout();
 ///     let bytes = io::copy_n(&src, &dst, 1024 * 1024).await?;
 ///     println!("Copied {} bytes", bytes);
 ///     Ok(())
