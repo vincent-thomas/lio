@@ -360,11 +360,16 @@ dependencies = [
  "bumpalo",
  "cbindgen",
  "libc",
+ "lio-test",
  "lio-uring",
  "pastey 0.1.1",
  "proptest",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "lio-test"
+version = "0.1.0"
 
 [[package]]
 name = "lio-uring"

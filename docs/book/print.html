@@ -1,0 +1,1284 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>lio</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-7765c02b.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-e2249002.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">lio</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="lio"><a class="header" href="#lio">lio</a></h1>
+<p><code>lio</code> is a manually driven asynchronous I/O engine.</p>
+<p>The codebase exposes one central object, <a href="https://docs.rs/lio/latest/lio/struct.Lio.html"><code>Lio</code></a>, and a set of typed operations in <code>lio::api</code>. You create a driver, submit operations to it, decide how completions are consumed, and decide when progress is driven. Nothing in <code>lio</code> assumes Tokio, async-std, or a custom executor. The library gives you a portable way to talk to platform I/O backends while keeping scheduling decisions in your own code.</p>
+<p>This book is intentionally <strong>explaining documentation</strong>.</p>
+<p>It is organized around the questions a new user actually has:</p>
+<ol>
+<li>what <code>lio</code> gives you direct control over</li>
+<li>what one complete operation looks like in real code</li>
+<li>why the low-level API is shaped the way it is</li>
+<li>where platform boundaries and repository structure matter</li>
+</ol>
+<p>It does <strong>not</strong> try to duplicate API reference material. The exact signatures, trait impls, and item-level details belong in rustdoc on docs.rs.</p>
+<p>If you are reading this book, use it to answer questions like:</p>
+<ul>
+<li>Why is there a <code>Lio</code> value at all?</li>
+<li>What does <code>.with_lio(&amp;lio)</code> actually mean?</li>
+<li>Why do buffers move into operations and come back out?</li>
+<li>When should I use <code>.await</code>, callbacks, or channels?</li>
+<li>Which parts of the crate are stable concepts, and which are thin wrappers?</li>
+</ul>
+<p>Use the API reference when you need:</p>
+<ul>
+<li>the exact signature of <code>api::openat</code></li>
+<li>the return type of <code>api::recv</code></li>
+<li>every method on <code>api::io::Receiver</code></li>
+<li>the trait bounds for a buffer type</li>
+</ul>
+<p>The next chapter names the control surface. After that, Getting Started follows one operation all the way through so the rest of the book has something concrete to build on.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="what-lio-lets-you-control"><a class="header" href="#what-lio-lets-you-control">What lio Lets You Control</a></h1>
+<p>The source code shows <code>lio</code> as a library for controlling <strong>submission and completion of operating-system I/O operations</strong>.</p>
+<p>At the user level, that means <code>lio</code> gives you control over the boundary between your program and the OS. The point of this chapter is breadth, not depth. It names that control surface before later chapters show how to structure code around it.</p>
+<h2 id="1-operation-scheduling"><a class="header" href="#1-operation-scheduling">1. Operation scheduling</a></h2>
+<p><code>Lio</code> is the driver. It owns the backend, tracks in-flight work, tracks timers, and turns kernel completions into typed Rust results.</p>
+<p>You decide when to drive it:</p>
+<ul>
+<li><code>try_run()</code> for a non-blocking poll</li>
+<li><code>run()</code> to wait until something completes</li>
+<li><code>run_timeout()</code> to block for at most a chosen duration</li>
+</ul>
+<p>That choice is one of the defining properties of <code>lio</code>: it does not hide the event loop from you.</p>
+<p>If you want one sentence that separates <code>lio</code> from a typical async runtime, it is this: your code decides when I/O progress is driven.</p>
+<h2 id="2-file-descriptor-and-handle-lifetime"><a class="header" href="#2-file-descriptor-and-handle-lifetime">2. File descriptor and handle lifetime</a></h2>
+<p>The <code>api::resource::Resource</code> type is the shared handle abstraction in the library.</p>
+<p>It lets you:</p>
+<ul>
+<li>hold files, sockets, and standard streams</li>
+<li>clone references cheaply</li>
+<li>move resources across operations</li>
+<li>let cleanup happen automatically when the last owner drops</li>
+</ul>
+<p>Most of the public API is phrased in terms of <code>&amp;impl AsResource</code>, which means operations work against any wrapper that can expose an underlying resource.</p>
+<p>That is the first sign that <code>lio</code> treats ownership as part of the API surface, not as an internal implementation detail.</p>
+<h2 id="3-low-level-io-operations"><a class="header" href="#3-low-level-io-operations">3. Low-level I/O operations</a></h2>
+<p>The low-level <code>lio::api</code> module is the real control surface of the crate.</p>
+<p>From source code, the active operation families are:</p>
+<ul>
+<li>timing: <code>nop</code>, <code>sleep</code>, <code>interval</code></li>
+<li>socket lifecycle: <code>socket</code>, <code>bind</code>, <code>listen</code>, <code>accept</code>, <code>connect</code>, <code>shutdown</code></li>
+<li>byte movement: <code>read</code>, <code>read_at</code>, <code>write</code>, <code>write_at</code>, <code>recv</code>, <code>send</code></li>
+<li>path-relative filesystem work: <code>openat</code>, <code>statat</code>, <code>readdir</code>, <code>unlinkat</code>, <code>renameat</code>, <code>mkdirat</code>, <code>linkat</code>, <code>readlinkat</code>, <code>getcwd</code></li>
+<li>process launch on Unix: <code>spawn</code></li>
+</ul>
+<p>These are deliberately close to OS operations. <code>lio</code> is not trying to erase the syscall model. It is trying to make that model typed, portable where possible, and asynchronous.</p>
+<p>That syscall-shaped surface is one of the library’s strongest design decisions. It keeps capability, cost, and sequencing visible.</p>
+<h2 id="4-completion-style"><a class="header" href="#4-completion-style">4. Completion style</a></h2>
+<p>The same operation can be consumed in different ways.</p>
+<p>From <code>api::io::Io</code>, the code supports:</p>
+<ul>
+<li><code>.await</code></li>
+<li><code>.when_done(...)</code></li>
+<li><code>.send()</code> and <code>.send_with(...)</code></li>
+</ul>
+<p>This is not three different APIs. It is one operation model with three completion strategies.</p>
+<p>That separation matters because application structure varies more than operation structure does.</p>
+<h2 id="5-buffer-ownership"><a class="header" href="#5-buffer-ownership">5. Buffer ownership</a></h2>
+<p>For reads, writes, sends, and receives, <code>lio</code> moves the buffer into the operation and returns it when the operation completes.</p>
+<p>That gives the library control over:</p>
+<ul>
+<li>memory lifetime while the kernel may still access the buffer</li>
+<li>zero-copy ownership transfer at the Rust level</li>
+<li>buffer reuse by the caller after completion</li>
+</ul>
+<p>This design is central to <code>lio</code>. If you treat buffer ownership as an implementation detail, the library will feel strange. If you treat ownership as part of the API contract, the design becomes straightforward.</p>
+<h2 id="6-backend-choice-without-backend-shaped-application-code"><a class="header" href="#6-backend-choice-without-backend-shaped-application-code">6. Backend choice without backend-shaped application code</a></h2>
+<p><code>Lio::new()</code> picks a backend for the current platform:</p>
+<ul>
+<li>Linux: <code>io_uring</code></li>
+<li>BSD/macOS family: polling/kqueue-based backend</li>
+</ul>
+<p>The code is structured so application code talks to <code>Lio</code>, <code>Io&lt;T&gt;</code>, and <code>Resource</code>, not to backend-specific details. The backend matters for performance and capabilities, but it is not supposed to leak into normal application structure.</p>
+<h2 id="higher-level-wrappers"><a class="header" href="#higher-level-wrappers">Higher-level wrappers</a></h2>
+<p>There are two distinct layers in the repository.</p>
+<p>The first is the low-level API in <code>lio::api</code>. That is the foundation.</p>
+<p>The second is a thinner convenience layer:</p>
+<ul>
+<li><code>lio::io</code> adds higher-level composed operations like <code>copy</code> and <code>copy_n</code></li>
+<li><code>lio::net</code> adds typed socket wrappers such as <code>Socket</code>, <code>TcpListener</code>, and <code>TcpSocket</code> behind the <code>high</code> feature</li>
+</ul>
+<p>One detail from the source tree matters here: there is filesystem and process wrapper code in the repository, but those modules are not re-exported from the crate root. That means the low-level API remains the primary public way to control filesystem and process operations.</p>
+<h2 id="what-to-carry-forward"><a class="header" href="#what-to-carry-forward">What to carry forward</a></h2>
+<p>If you only keep four ideas from this chapter, keep these:</p>
+<ul>
+<li><code>Lio</code> is an explicit driver</li>
+<li><code>lio::api</code> is the main control surface</li>
+<li>ownership of resources and buffers is part of the API, not an implementation detail</li>
+<li>higher-level wrappers exist, but they sit on top of the low-level model</li>
+</ul>
+<p>The next chapter stops listing capabilities and follows one operation from submission to completion. That is where these abstract control points become concrete.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="getting-started"><a class="header" href="#getting-started">Getting Started</a></h1>
+<p>The fastest way to understand <code>lio</code> is to follow one operation all the way through.</p>
+<p>The previous chapter described the control surface broadly. This chapter narrows the focus to one operation so the mechanics become concrete.</p>
+<h2 id="a-minimal-example"><a class="header" href="#a-minimal-example">A minimal example</a></h2>
+<pre class="playground"><code class="language-rust no_run">use lio::{Lio, api};
+use std::time::Duration;
+
+fn main() -&gt; std::io::Result&lt;()&gt; {
+    let lio = Lio::new(64)?;
+
+    let mut rx = api::sleep(Duration::from_millis(100))
+        .with_lio(&amp;lio)
+        .send();
+
+    loop {
+        if let Some(result) = rx.try_recv() {
+            result?;
+            break;
+        }
+
+        if lio.try_run()? == 0 {
+            lio.run()?;
+        }
+    }
+
+    Ok(())
+}</code></pre>
+<p>This example contains the whole user-level model:</p>
+<ol>
+<li>Create a driver.</li>
+<li>Build an operation.</li>
+<li>Bind it to that driver with <code>.with_lio(&amp;lio)</code>.</li>
+<li>Choose a completion strategy.</li>
+<li>Drive the event loop until the result arrives.</li>
+</ol>
+<h2 id="what-each-step-means"><a class="header" href="#what-each-step-means">What each step means</a></h2>
+<h3 id="create-a-driver"><a class="header" href="#create-a-driver">Create a driver</a></h3>
+<p><code>Lio::new(64)</code> creates a driver with capacity for in-flight operations.</p>
+<p>That value is not just configuration. It is the object that owns backend state, in-flight registrations, and timers.</p>
+<h3 id="build-an-operation"><a class="header" href="#build-an-operation">Build an operation</a></h3>
+<p><code>api::sleep(...)</code> returns an <code>Io&lt;T&gt;</code>, not a completed result.</p>
+<p>That value is a typed description of work that can be submitted.</p>
+<h3 id="bind-the-operation-to-a-driver"><a class="header" href="#bind-the-operation-to-a-driver">Bind the operation to a driver</a></h3>
+<p>Operations are not self-executing. <code>.with_lio(&amp;lio)</code> associates the operation with the driver that should own its lifecycle.</p>
+<p>You can avoid calling <code>.with_lio(...)</code> by installing a thread-local global <code>Lio</code> with <code>install_global(lio)</code>. That function now returns a guard, and dropping the guard uninstalls the global driver automatically.</p>
+<p>That scoped installation model is convenient, but the explicit <code>.with_lio(&amp;lio)</code> form is still the clearest way to learn the library.</p>
+<p>For example:</p>
+<pre class="playground"><code class="language-rust no_run">use lio::{Lio, api, install_global};
+use std::time::Duration;
+
+fn main() -&gt; std::io::Result&lt;()&gt; {
+    let lio = Lio::new(64)?;
+    let _guard = install_global(lio.clone());
+
+    let mut rx = api::sleep(Duration::from_millis(10)).send();
+
+    loop {
+        if let Some(result) = rx.try_recv() {
+            result?;
+            break;
+        }
+
+        if lio.try_run()? == 0 {
+            lio.run()?;
+        }
+    }
+
+    Ok(())
+}</code></pre>
+<p>The guard is what keeps the installation alive. If it is dropped immediately, the global installation ends immediately too.</p>
+<h3 id="choose-a-completion-strategy"><a class="header" href="#choose-a-completion-strategy">Choose a completion strategy</a></h3>
+<p>Here we used <code>.send()</code> to get a receiver.</p>
+<p>That is convenient for a first example because it makes completion state explicit. In other situations, <code>.await</code> or <code>.when_done(...)</code> may be a better fit.</p>
+<h3 id="drive-the-loop"><a class="header" href="#drive-the-loop">Drive the loop</a></h3>
+<p>Many async libraries hide this part. <code>lio</code> does not.</p>
+<p>The pattern:</p>
+<pre class="playground"><code class="language-rust no_run"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span><span class="boring">use lio::{Lio, api};
+</span><span class="boring">fn run_one&lt;T&gt;(lio: &amp;Lio, mut rx: api::Receiver&lt;T&gt;) -&gt; T {
+</span>loop {
+    if let Some(result) = rx.try_recv() {
+        break result;
+    }
+
+    if lio.try_run().expect("poll") == 0 {
+        lio.run().expect("wait");
+    }
+}
+<span class="boring">}
+</span><span class="boring">}</span></code></pre>
+<p>appears throughout the repository, including examples and the BusyBox-style sample application.</p>
+<h2 id="a-real-io-example"><a class="header" href="#a-real-io-example">A real I/O example</a></h2>
+<p>The same model works for normal byte I/O:</p>
+<pre class="playground"><code class="language-rust no_run">use lio::{Lio, api};
+use lio::api::resource::Resource;
+
+fn main() -&gt; std::io::Result&lt;()&gt; {
+    let lio = Lio::new(64)?;
+    let stdout = Resource::stdout();
+
+    let mut rx = api::write(&amp;stdout, b"hello\n".to_vec())
+        .with_lio(&amp;lio)
+        .send();
+
+    loop {
+        if let Some((result, _buf)) = rx.try_recv() {
+            result?;
+            break;
+        }
+
+        if lio.try_run()? == 0 {
+            lio.run()?;
+        }
+    }
+
+    Ok(())
+}</code></pre>
+<p>Notice that the buffer comes back out of the operation. That is expected and intentional.</p>
+<h2 id="what-to-learn-first"><a class="header" href="#what-to-learn-first">What to learn first</a></h2>
+<p>If you are new to <code>lio</code>, learn these ideas in order:</p>
+<ol>
+<li><code>Lio</code> is a driver, not a task runtime.</li>
+<li><code>Io&lt;T&gt;</code> is an operation handle, not a future by itself.</li>
+<li>operations become live when you consume them</li>
+<li>you must keep driving the loop until completions are processed</li>
+<li>buffers and resources are part of the API contract</li>
+</ol>
+<p>The next section makes that model explicit and then unpacks driving, ownership, and completion in more detail.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="the-core-model"><a class="header" href="#the-core-model">The Core Model</a></h1>
+<p>The low-level API is the heart of <code>lio</code>.</p>
+<p>Even when you use a convenience wrapper like <code>TcpListener</code>, you are still using the same underlying design:</p>
+<ul>
+<li>an operation type describes work</li>
+<li><code>Lio</code> owns the execution of that work</li>
+<li>completion is translated back into typed Rust data</li>
+</ul>
+<p>This section explains the model in the order most readers need it:</p>
+<ol>
+<li>how operations are driven</li>
+<li>how resources and buffers are owned</li>
+<li>how completions are delivered</li>
+<li>how the lower-level <code>OpModel</code> machinery is shaped underneath that surface</li>
+</ol>
+<p>That order matters. If you start with internal machinery before understanding explicit progress, ownership, and completion flow, <code>lio</code> looks harder than it is.</p>
+<h2 id="why-the-low-level-api-matters"><a class="header" href="#why-the-low-level-api-matters">Why the low-level API matters</a></h2>
+<p>The current source tree makes one thing clear: the low-level API is not a fallback layer. It is the main public abstraction.</p>
+<p>That is where you find control over:</p>
+<ul>
+<li>files and directories</li>
+<li>sockets</li>
+<li>timers</li>
+<li>process creation</li>
+<li>buffer-based byte transfer</li>
+</ul>
+<p>The higher-level modules are intentionally thinner and build on top of this layer.</p>
+<p>That point is easy to miss if you come to the repository expecting the interesting part to be higher-level wrappers. In <code>lio</code>, the low-level layer is the thing to understand first because it already contains the real execution model.</p>
+<h2 id="the-shape-of-an-operation"><a class="header" href="#the-shape-of-an-operation">The shape of an operation</a></h2>
+<p>Most user-facing work starts with a constructor in <code>lio::api</code>, such as:</p>
+<ul>
+<li><code>api::read</code></li>
+<li><code>api::write</code></li>
+<li><code>api::openat</code></li>
+<li><code>api::connect</code></li>
+<li><code>api::sleep</code></li>
+</ul>
+<p>Each constructor returns an <code>Io&lt;T&gt;</code> or <code>IoStream&lt;T&gt;</code>.</p>
+<p>That immediately tells you three things:</p>
+<ul>
+<li>the operation has a type</li>
+<li>its result shape is known</li>
+<li>it has not necessarily been consumed yet</li>
+</ul>
+<p>The library is careful about typed completion. A read does not complete as an unstructured event. It completes as a value whose shape is tied to the operation you started.</p>
+<p>That is the core move the crate makes over raw backend events: it preserves the OS-facing shape of the operation while turning completion back into typed Rust data.</p>
+<h2 id="why-this-layer-feels-syscall-oriented"><a class="header" href="#why-this-layer-feels-syscall-oriented">Why this layer feels syscall-oriented</a></h2>
+<p>The source code closely mirrors the operating system:</p>
+<ul>
+<li>path-relative filesystem calls use directory resources and <code>CString</code> paths</li>
+<li>networking starts with socket creation and then bind/listen/connect/accept</li>
+<li>read and write operations own their buffers</li>
+</ul>
+<p>That is deliberate. <code>lio</code> is not trying to invent a new storage or networking model. It is trying to make the existing one composable and asynchronous without losing control over the underlying mechanics.</p>
+<h2 id="what-this-buys-you"><a class="header" href="#what-this-buys-you">What this buys you</a></h2>
+<p>Using a syscall-shaped API gives <code>lio</code> three properties that matter when you build real programs on top of it.</p>
+<h3 id="it-stays-honest-about-capability"><a class="header" href="#it-stays-honest-about-capability">It stays honest about capability</a></h3>
+<p>You can usually tell what the library does by reading the operation name. There is very little magic.</p>
+<h3 id="it-keeps-cost-visible"><a class="header" href="#it-keeps-cost-visible">It keeps cost visible</a></h3>
+<p>Because the model stays close to the OS, resource ownership, buffer lifetime, and completion handling remain visible in user code.</p>
+<h3 id="it-supports-thin-higher-level-wrappers"><a class="header" href="#it-supports-thin-higher-level-wrappers">It supports thin higher-level wrappers</a></h3>
+<p>The <code>net</code> layer works because the lower layer is already expressive enough. <code>TcpSocket</code> is useful precisely because it does not need a hidden runtime or a second execution model.</p>
+<p>Keep one sentence in mind as you read the rest of this section: an operation is a typed description of work, and <code>Lio</code> is the thing that drives it.</p>
+<p>The next chapters build outward from that sentence. First they explain how an operation becomes active and makes progress. Then they explain ownership and completion. Only after that do they drop down to <code>OpModel</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="driving-operations"><a class="header" href="#driving-operations">Driving Operations</a></h1>
+<p>The central fact to understand about <code>lio</code> is this:</p>
+<p><strong>submitting work and driving progress are separate responsibilities.</strong></p>
+<h2 id="what-driving-means"><a class="header" href="#what-driving-means">What “driving” means</a></h2>
+<p>When an operation is consumed, <code>lio</code> registers it and dispatches backend work. But completions are processed only when the driver runs.</p>
+<p>That is why the public API on <code>Lio</code> is so small:</p>
+<ul>
+<li><code>try_run()</code> polls without blocking</li>
+<li><code>run()</code> blocks until progress is made</li>
+<li><code>run_timeout()</code> blocks for a bounded amount of time</li>
+</ul>
+<p>Everything else in the crate assumes you understand when those methods are called. If progress feels mysterious in a piece of <code>lio</code> code, this is usually the missing concept.</p>
+<h2 id="the-common-loop"><a class="header" href="#the-common-loop">The common loop</a></h2>
+<pre class="playground"><code class="language-rust no_run"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span><span class="boring">use lio::{Lio, api};
+</span><span class="boring">fn drive_until_done&lt;T&gt;(lio: &amp;Lio, mut rx: api::Receiver&lt;T&gt;) -&gt; T {
+</span>loop {
+    if let Some(result) = rx.try_recv() {
+        break result;
+    }
+
+    if lio.try_run().expect("poll") == 0 {
+        lio.run().expect("wait");
+    }
+}
+<span class="boring">}
+</span><span class="boring">}</span></code></pre>
+<p>This loop expresses the intended control flow:</p>
+<ul>
+<li>first, consume anything already ready</li>
+<li>then poll the backend without blocking</li>
+<li>if nothing happened, block until something does</li>
+</ul>
+<p>The BusyBox example in the repository uses this pattern repeatedly because it matches a library that exposes the event loop directly instead of hiding it in a runtime.</p>
+<h2 id="why-lio-works-this-way"><a class="header" href="#why-lio-works-this-way">Why <code>lio</code> works this way</a></h2>
+<p>Many async libraries hide the driver inside a runtime. <code>lio</code> keeps it explicit because it is designed as an I/O engine, not as a full task scheduler.</p>
+<p>That gives the caller direct control over:</p>
+<ul>
+<li>when blocking is allowed</li>
+<li>how much work to batch</li>
+<li>where integration points exist with other loops or schedulers</li>
+</ul>
+<p>That explicit progress model comes first because the rest of the crate is built around it. Once you know who drives <code>Lio</code>, the ownership and completion APIs stop looking arbitrary.</p>
+<h2 id="consuming-an-operation-starts-it"><a class="header" href="#consuming-an-operation-starts-it">Consuming an operation starts it</a></h2>
+<p>Creating <code>api::read(...)</code> does not do I/O by itself.</p>
+<p>The operation becomes active when you consume the <code>Io&lt;T&gt;</code>:</p>
+<ul>
+<li>by awaiting it</li>
+<li>by registering a callback</li>
+<li>by converting it into a receiver</li>
+</ul>
+<p>That detail explains why <code>Io&lt;T&gt;</code> is marked <code>#[must_use]</code> in the source. A constructed operation that is never consumed never becomes live.</p>
+<h2 id="global-versus-explicit-binding"><a class="header" href="#global-versus-explicit-binding">Global versus explicit binding</a></h2>
+<p>There are two ways for an operation to know which driver should own it:</p>
+<ul>
+<li>call <code>.with_lio(&amp;lio)</code></li>
+<li>install a thread-local global driver and hold the returned guard</li>
+</ul>
+<p>The explicit form is easier to reason about because the binding is visible at the call site. The global form fits code that already has a one-driver-per-thread architecture and wants less call-site noise.</p>
+<h2 id="driving-more-than-one-operation"><a class="header" href="#driving-more-than-one-operation">Driving more than one operation</a></h2>
+<p>The design becomes more interesting when you have several operations in flight, because the driver loop becomes the place where coordination happens.</p>
+<p>You can:</p>
+<ul>
+<li>keep several receivers and poll them between <code>try_run()</code> calls</li>
+<li>send many completions into a shared channel</li>
+<li>mix callbacks and channel consumers</li>
+</ul>
+<p>The driver does not care which completion style you choose. Its job is to move registered work forward and deliver typed results when they are ready.</p>
+<h2 id="the-habit-to-build"><a class="header" href="#the-habit-to-build">The habit to build</a></h2>
+<p>When working in <code>lio</code>, always ask two questions:</p>
+<ol>
+<li>How is this operation being consumed?</li>
+<li>Who is responsible for calling <code>Lio::run</code> or <code>Lio::try_run</code>?</li>
+</ol>
+<p>If those answers are clear, the code is usually sound in structure. If they are vague, the code usually has a design problem.</p>
+<p>The next chapter turns to the second major part of the model: ownership. <code>lio</code> makes resource and buffer lifetime visible on purpose.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="resources-and-buffers"><a class="header" href="#resources-and-buffers">Resources and Buffers</a></h1>
+<p>If you want <code>lio</code> code to feel straightforward, learn the ownership model early.</p>
+<p>Once you already understand that <code>Lio</code> must be driven explicitly, this is the next thing to internalize. Most of the surface-level strangeness in <code>lio</code> is really ownership made visible.</p>
+<h2 id="resources-are-shared-ownership-of-os-objects"><a class="header" href="#resources-are-shared-ownership-of-os-objects">Resources are shared ownership of OS objects</a></h2>
+<p><code>api::resource::Resource</code> is the library’s wrapper around a file descriptor or platform handle.</p>
+<p>The practical consequence is:</p>
+<ul>
+<li>the underlying OS object has shared ownership</li>
+<li>cloning is cheap</li>
+<li>cleanup happens when the last owner goes away</li>
+</ul>
+<p>That is why so much of the API takes <code>&amp;impl AsResource</code>. An operation needs access to a file, socket, or directory handle, but the caller often wants to keep using the wrapper after submission.</p>
+<h2 id="buffers-move-into-operations"><a class="header" href="#buffers-move-into-operations">Buffers move into operations</a></h2>
+<p>For byte-oriented operations such as <code>read</code>, <code>write</code>, <code>recv</code>, and <code>send</code>, the buffer is moved into the operation and returned on completion.</p>
+<p>That pattern can look unusual if you expect borrow-based async I/O. In <code>lio</code>, buffer ownership is part of the contract rather than an implementation detail hidden behind a future.</p>
+<p>It means:</p>
+<ul>
+<li>the kernel never outlives the buffer</li>
+<li>the operation can hold ownership for as long as needed</li>
+<li>the caller gets the same allocation back for reuse</li>
+</ul>
+<p>A typical read looks like this:</p>
+<pre class="playground"><code class="language-rust no_run">extern crate lio;
+use lio::{Lio, api};
+use lio::api::resource::Resource;
+
+fn main() -&gt; std::io::Result&lt;()&gt; {
+    let lio = Lio::new(64)?;
+    let stdin = Resource::stdin();
+    let mut rx = api::read(&amp;stdin, vec![0u8; 4096]).with_lio(&amp;lio).send();
+
+    loop {
+        if let Some((result, buf)) = rx.try_recv() {
+            let n = result? as usize;
+            let _bytes = &amp;buf[..n];
+            break;
+        }
+
+        if lio.try_run()? == 0 {
+            lio.run()?;
+        }
+    }
+
+    Ok(())
+}</code></pre>
+<p>The return type tells you two things at once:</p>
+<ul>
+<li>whether the operation succeeded</li>
+<li>which buffer is safe to use again</li>
+</ul>
+<p>That second point is the one to internalize. Completion does not only report status. It also hands ownership back at the exact point where reuse becomes safe.</p>
+<h2 id="why-this-matters-for-filesystem-and-networking-code"><a class="header" href="#why-this-matters-for-filesystem-and-networking-code">Why this matters for filesystem and networking code</a></h2>
+<p>Because the operation layer is close to the syscall layer, <code>lio</code> often asks you to be explicit about:</p>
+<ul>
+<li>which directory a path is relative to</li>
+<li>which socket or file a transfer targets</li>
+<li>which exact buffer is participating in an operation</li>
+</ul>
+<p>That explicitness is not noise around the real API. It is part of how the crate keeps ownership and lifecycle rules visible in user code instead of burying them in runtime internals.</p>
+<h2 id="reusing-channels-versus-reusing-buffers"><a class="header" href="#reusing-channels-versus-reusing-buffers">Reusing channels versus reusing buffers</a></h2>
+<p>The old chapter title in this slot focused on channel reuse. Channel reuse exists, but it is not the first thing most readers need to understand.</p>
+<p>The deeper pattern is:</p>
+<ul>
+<li>resources are reference-counted wrappers around OS objects</li>
+<li>buffers are owned by operations while in flight</li>
+<li>results often return both status and ownership</li>
+</ul>
+<p>Once those ideas are clear, channel reuse becomes an ordinary coordination technique rather than a design center.</p>
+<p>After ownership is clear, the next question is how those completed operations should be delivered back into your program. That is where the completion models fit.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="completion-models"><a class="header" href="#completion-models">Completion Models</a></h1>
+<p>Once progress and ownership are clear, the next layer is completion style.</p>
+<p>One of <code>lio</code>’s stronger design choices is that completing an operation is a separate concern from defining the operation itself.</p>
+<p>The same <code>api::read</code>, <code>api::connect</code>, or <code>api::sleep</code> can be written once and then consumed in different ways. That matters because application structure varies more than syscall structure does. Some programs want straight-line async code. Some already have a manual event loop. Some want to route completions through shared coordination code.</p>
+<h2 id="one-operation-three-ways-to-receive-the-result"><a class="header" href="#one-operation-three-ways-to-receive-the-result">One operation, three ways to receive the result</a></h2>
+<p>From <code>api::io::Io&lt;T&gt;</code>, the source exposes three primary completion styles:</p>
+<ul>
+<li><code>await</code></li>
+<li>callback with <code>.when_done(...)</code></li>
+<li>channel delivery with <code>.send()</code> or <code>.send_with(...)</code></li>
+</ul>
+<p>These are not separate subsystems with different semantics. They are different front ends over the same operation model, which means you can often change completion style without changing the operation itself.</p>
+<h2 id="1-await"><a class="header" href="#1-await">1. <code>await</code></a></h2>
+<p>Use <code>.await</code> when you already have an async context and want the clearest linear code.</p>
+<pre class="playground"><code class="language-rust no_run"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use lio::{Lio, api};
+use lio::api::resource::Resource;
+
+async fn write_once(lio: &amp;Lio) -&gt; std::io::Result&lt;()&gt; {
+    let stdout = Resource::stdout();
+    let (result, _buf) = api::write(&amp;stdout, b"hello\n".to_vec())
+        .with_lio(lio)
+        .await;
+    result?;
+    Ok(())
+}
+<span class="boring">}</span></code></pre>
+<p>The key constraint is that <code>await</code> changes syntax, not who drives progress. A <code>lio</code> operation can implement <code>IntoFuture</code> and still depend on <code>Lio</code> being driven somewhere else. The library does not stop being manually driven just because one caller chooses async syntax.</p>
+<h2 id="2-callbacks"><a class="header" href="#2-callbacks">2. Callbacks</a></h2>
+<p>Use <code>.when_done(...)</code> when completion should trigger follow-up work directly.</p>
+<p>This style fits code that already has explicit state and wants to keep that state in one place. It is often the most natural choice when:</p>
+<ul>
+<li>you are already building a manual event loop</li>
+<li>you want to fan many operations into one shared state machine</li>
+<li>completion should be pushed, not polled</li>
+</ul>
+<p>Callbacks are less about convenience than about shape. They let you keep control flow in the same evented style as the rest of the program.</p>
+<h2 id="3-channels"><a class="header" href="#3-channels">3. Channels</a></h2>
+<p>Use <code>.send()</code> or <code>.send_with(...)</code> when you want explicit result ownership and flexible coordination.</p>
+<p>This is often the easiest style to integrate with a hand-written driver loop because the control flow stays explicit:</p>
+<ul>
+<li>start operations</li>
+<li>drive <code>Lio</code></li>
+<li>receive results from channels</li>
+</ul>
+<p>The repository uses this style heavily in tests and examples for exactly that reason. It keeps progress, waiting, and result handling visible instead of spreading them across tasks or callbacks.</p>
+<h2 id="choosing-between-them"><a class="header" href="#choosing-between-them">Choosing between them</a></h2>
+<p>A reasonable default is:</p>
+<ul>
+<li><code>await</code> for straight-line async code</li>
+<li>callbacks for highly evented code</li>
+<li>channels for manual loops, batching, and cross-component coordination</li>
+</ul>
+<p>The better question is not which style is most modern. It is which style matches the structure you already have. In <code>lio</code>, operation definitions stay mostly the same while completion style adapts to the surrounding program.</p>
+<h2 id="streaming-completions"><a class="header" href="#streaming-completions">Streaming completions</a></h2>
+<p><code>lio</code> also has <code>IoStream&lt;T&gt;</code> for operations that conceptually yield more than one item over time.</p>
+<p>That reinforces an important part of the design. <code>lio</code> distinguishes between:</p>
+<ul>
+<li>one completion for one registration</li>
+<li>repeated completions for one logical operation</li>
+</ul>
+<p>Even if you do not use streaming operations directly, it helps to see that the crate has a separate shape for them. It shows that <code>lio</code> treats long-lived registrations as a first-class case rather than forcing every operation into a oneshot mold.</p>
+<h2 id="what-explanatory-docs-should-say-here"><a class="header" href="#what-explanatory-docs-should-say-here">What explanatory docs should say here</a></h2>
+<p>Rustdoc should list every method on <code>Io&lt;T&gt;</code>, <code>Receiver&lt;T&gt;</code>, <code>IoStream&lt;T&gt;</code>, and <code>StreamReceiver&lt;T&gt;</code>.</p>
+<p>This chapter should answer different questions:</p>
+<ul>
+<li>Why are there multiple completion styles?</li>
+<li>Which style fits which program structure?</li>
+<li>What stays the same underneath them?</li>
+</ul>
+<p>That is why it talks about tradeoffs and program shape instead of walking method by method through the API surface.</p>
+<p>The next chapter goes one layer lower and explains the <code>OpModel</code> trait that makes these operation shapes composable inside the library.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="opmodel"><a class="header" href="#opmodel">OpModel</a></h1>
+<p>This chapter comes after driving, ownership, and completion style on purpose.</p>
+<p>Most users can work productively with <code>lio</code> without thinking about <code>OpModel</code> immediately. It becomes useful once you want to understand how operations are implemented, how composed operations are built, or how to design new operation shapes as explicit state machines.</p>
+<p><code>OpModel</code> is the abstraction that turns raw completions into a logical operation.</p>
+<p>It is the per-operation state machine that describes:</p>
+<ul>
+<li>what to do next</li>
+<li>how to interpret a completion</li>
+<li>whether the logical operation should continue, yield, or finish</li>
+</ul>
+<p>This is one of the key design ideas in <code>lio</code>, but it is easier to understand once the user-facing model is already clear. At the surface, users see typed operations. Underneath, <code>OpModel</code> is the reason those operations can represent one step, many steps, or a stream without changing the overall programming model.</p>
+<h2 id="core-contract"><a class="header" href="#core-contract">Core contract</a></h2>
+<p>The trait in <code>lio/src/api/op.rs</code> is intentionally small.</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub trait OpModel: Send + 'static {
+    type Item: Send;
+
+    fn action(&amp;mut self) -&gt; Action;
+    fn complete(&amp;mut self, completion: Completion) -&gt; OpResult&lt;Self::Item&gt;;
+}
+<span class="boring">}</span></code></pre>
+<p>That small surface is deliberate. <code>OpModel</code> is not trying to be a full framework trait. It only answers two questions:</p>
+<ul>
+<li>what is the next step?</li>
+<li>what does this completion mean?</li>
+</ul>
+<p>Everything else in the operation lifecycle is built on top of those two methods. That narrow interface is what lets the trait stay composable instead of becoming a mini-runtime API of its own.</p>
+<h2 id="the-return-types-matter"><a class="header" href="#the-return-types-matter">The return types matter</a></h2>
+<p><code>action()</code> does not return a user value. It returns an <code>Action</code>, which is a description of the next step the model wants.</p>
+<p>Today, that means one of:</p>
+<ul>
+<li><code>Action::Io(Op)</code> for a backend I/O step</li>
+<li><code>Action::Sleep(Duration)</code> for a timer step</li>
+</ul>
+<p><code>complete()</code> returns an <code>OpResult&lt;Self::Item&gt;</code>, which expresses the model’s interpretation of one completion:</p>
+<ul>
+<li><code>Again</code>: the logical operation is still in progress and has more work to describe</li>
+<li><code>Yield(item)</code>: the model produced one item but remains live</li>
+<li><code>Done(item)</code>: the model reached its terminal state</li>
+</ul>
+<p>That is the entire contract. A model does not need any additional hooks to express one-shot, multi-step, or streaming behavior. The rest of the chapter is mostly different consequences of that small interface.</p>
+<h2 id="two-kinds-of-models"><a class="header" href="#two-kinds-of-models">Two kinds of models</a></h2>
+<p>The marker traits split models into two broad categories.</p>
+<h3 id="oneshotopmodel"><a class="header" href="#oneshotopmodel"><code>OneshotOpModel</code></a></h3>
+<p>These produce exactly one terminal value.</p>
+<p>These are consumed through <code>Io&lt;T&gt;</code>.</p>
+<h3 id="streamopmodel"><a class="header" href="#streamopmodel"><code>StreamOpModel</code></a></h3>
+<p>These may produce multiple items over time.</p>
+<p>The clearest current example is <code>ops::Interval</code>, which yields on every timer firing.</p>
+<p>These are consumed through <code>IoStream&lt;T&gt;</code>.</p>
+<p>The distinction is useful because it separates two user-visible operation shapes without widening the core contract itself.</p>
+<h2 id="the-simplest-possible-model"><a class="header" href="#the-simplest-possible-model">The simplest possible model</a></h2>
+<p><code>Sleep</code> is a good minimal example.</p>
+<p>Its <code>action()</code> always returns:</p>
+<pre><code class="language-rust ignore">Action::Sleep(self.duration)</code></pre>
+<p>and its <code>complete()</code> interprets the timer completion and immediately returns:</p>
+<pre><code class="language-rust ignore">OpResult::Done(result)</code></pre>
+<p>That is a one-step state machine with no internal transition beyond “not done” to “done”.</p>
+<p>That makes <code>Sleep</code> a useful baseline when you are writing your own model. If your first draft feels much more complicated than this kind of single-step operation requires, you are probably mixing policy and mechanism too early.</p>
+<h2 id="a-streaming-model"><a class="header" href="#a-streaming-model">A streaming model</a></h2>
+<p><code>Interval</code> is almost identical to <code>Sleep</code>, except for one critical difference:</p>
+<pre><code class="language-rust ignore">OpResult::Yield(result)</code></pre>
+<p>instead of <code>Done</code>.</p>
+<p>That means the model remains live after each timer completion. Since <code>action()</code> still returns the same <code>Action::Sleep(period)</code>, the model becomes a repeating timer.</p>
+<p>This is an important design point:</p>
+<ul>
+<li>a stream model does not need a different trait</li>
+<li>it only needs to return <code>Yield</code> instead of <code>Done</code></li>
+</ul>
+<p>That is one of the stronger properties of <code>OpModel</code>: one contract is enough for both “exactly once” and “many times over time.”</p>
+<h2 id="a-sequential-multi-step-state-machine"><a class="header" href="#a-sequential-multi-step-state-machine">A sequential multi-step state machine</a></h2>
+<p><code>net::ops::TcpBindListener</code> is the clearest real example of a composed logical operation.</p>
+<p>Binding a TCP listener is not one kernel action. It is a sequence:</p>
+<ol>
+<li>create a socket</li>
+<li>bind it</li>
+<li>listen on it</li>
+</ol>
+<p>The model encodes that with an internal enum:</p>
+<pre><code class="language-rust ignore">enum TcpBindState {
+    Socket(ops::Socket),
+    Bind { resource: Resource },
+    Listen { resource: Resource },
+    Done,
+}</code></pre>
+<p>Then:</p>
+<ul>
+<li><code>action()</code> matches on the current state and returns the corresponding next step</li>
+<li><code>complete()</code> interprets the completion for that state and mutates the state machine forward</li>
+</ul>
+<p>The transitions are:</p>
+<ul>
+<li><code>Socket</code> success -&gt; <code>Bind</code></li>
+<li><code>Bind</code> success -&gt; <code>Listen</code></li>
+<li><code>Listen</code> success -&gt; <code>Done(Ok(TcpListener))</code></li>
+<li>any failure -&gt; <code>Done(Err(...))</code></li>
+</ul>
+<p>This is the pattern to copy when one logical operation requires several low-level actions.</p>
+<p>The lesson is not the exact TCP sequence. It is that state names should reflect logical steps. Good state names make <code>action()</code> and <code>complete()</code> read like a transition table instead of a pile of conditionals.</p>
+<h2 id="composition-patterns-in-this-repository"><a class="header" href="#composition-patterns-in-this-repository">Composition patterns in this repository</a></h2>
+<p>The codebase already uses several distinct kinds of composition. Seeing them side by side helps because they solve different problems and should not be collapsed into one pattern.</p>
+<h3 id="1-wrapper-composition"><a class="header" href="#1-wrapper-composition">1. Wrapper composition</a></h3>
+<p>Some models simply wrap another model and adapt its output type.</p>
+<p>Examples:</p>
+<ul>
+<li><code>io::Copy</code> wraps <code>CopyN</code></li>
+<li><code>net::ops::SocketAccept</code> wraps <code>ops::Accept</code></li>
+<li><code>net::ops::TcpAccept</code> wraps <code>ops::Accept</code></li>
+</ul>
+<p>This is the lightest form of composition. The wrapper delegates the state machine to another model and only changes the user-facing result.</p>
+<p>Use this when:</p>
+<ul>
+<li>the underlying step structure is already correct</li>
+<li>you only need to map result types</li>
+<li>you want a more specialized public abstraction</li>
+</ul>
+<h3 id="2-sequential-state-composition"><a class="header" href="#2-sequential-state-composition">2. Sequential state composition</a></h3>
+<p>Some models compose several low-level operations into one higher-level logical unit.</p>
+<p>Examples:</p>
+<ul>
+<li><code>TcpBindListener</code></li>
+<li><code>TcpConnectSocket</code></li>
+<li><code>CopyN</code></li>
+</ul>
+<p>These models own explicit state and move from one step to the next as completions arrive.</p>
+<p>Use this when:</p>
+<ul>
+<li>one user operation requires multiple backend submissions</li>
+<li>later steps depend on results from earlier steps</li>
+<li>you need to carry owned state across steps</li>
+</ul>
+<h3 id="3-streaming-composition"><a class="header" href="#3-streaming-composition">3. Streaming composition</a></h3>
+<p>Some models are designed to stay alive across many completions.</p>
+<p>Examples:</p>
+<ul>
+<li><code>Interval</code></li>
+<li>any future multishot or repeating operation</li>
+</ul>
+<p>Use this when:</p>
+<ul>
+<li>the logical operation is open-ended or long-lived</li>
+<li>one registration should produce several values</li>
+</ul>
+<h2 id="designing-an-opmodel-as-a-state-machine"><a class="header" href="#designing-an-opmodel-as-a-state-machine">Designing an OpModel as a state machine</a></h2>
+<p>The best way to design an <code>OpModel</code> in this codebase is to start by writing the states down explicitly.</p>
+<p>Do not start with code. Start with a transition table. If the transitions are vague on paper, they will be vague in <code>complete()</code> too.</p>
+<p>For a oneshot model, ask:</p>
+<ul>
+<li>what is the first action?</li>
+<li>what completion shapes can arrive?</li>
+<li>on success, what is the next state?</li>
+<li>on error, do we terminate immediately?</li>
+<li>what value do we return at the end?</li>
+</ul>
+<p>For a stream model, add:</p>
+<ul>
+<li>when do we yield?</li>
+<li>what keeps the model alive after yielding?</li>
+<li>what condition ends the stream?</li>
+</ul>
+<h2 id="a-practical-recipe"><a class="header" href="#a-practical-recipe">A practical recipe</a></h2>
+<h3 id="1-define-the-logical-steps"><a class="header" href="#1-define-the-logical-steps">1. Define the logical steps</a></h3>
+<p>If the operation is more than one backend action, make the steps explicit.</p>
+<p>For example:</p>
+<pre><code class="language-rust ignore">enum State {
+    Open,
+    ReadHeader { fd: Resource, buf: Vec&lt;u8&gt; },
+    ReadBody { fd: Resource, buf: Vec&lt;u8&gt;, expected: usize },
+    Done,
+}</code></pre>
+<p>This is better than sprinkling booleans through the struct. Explicit states make invalid transitions harder to express.</p>
+<h3 id="2-put-the-carried-data-in-the-states-or-the-model"><a class="header" href="#2-put-the-carried-data-in-the-states-or-the-model">2. Put the carried data in the states or the model</a></h3>
+<p>The model must own whatever survives across completions:</p>
+<ul>
+<li>resources</li>
+<li>buffers</li>
+<li>counters</li>
+<li>offsets</li>
+<li>addresses</li>
+<li>parsed intermediate values</li>
+</ul>
+<p>The rule is simple: if the next step needs it, the model must own it somewhere.</p>
+<h3 id="3-make-action-a-pure-projection-of-state"><a class="header" href="#3-make-action-a-pure-projection-of-state">3. Make <code>action()</code> a pure projection of state</a></h3>
+<p>In a well-structured model, <code>action()</code> should mostly be “given the current state, what is the next runtime action?”</p>
+<p>That keeps it easy to reason about and easy to test.</p>
+<h3 id="4-make-complete-perform-the-transition"><a class="header" href="#4-make-complete-perform-the-transition">4. Make <code>complete()</code> perform the transition</a></h3>
+<p><code>complete()</code> should:</p>
+<ul>
+<li>inspect the current state</li>
+<li>interpret the completion for that state</li>
+<li>move to the next state</li>
+<li>return <code>Again</code>, <code>Yield</code>, or <code>Done</code></li>
+</ul>
+<p>If <code>action()</code> starts mutating state heavily, the model is usually getting harder to understand than necessary.</p>
+<h3 id="5-reserve-panic-for-impossible-usage"><a class="header" href="#5-reserve-panic-for-impossible-usage">5. Reserve panic for impossible usage</a></h3>
+<p>The current codebase commonly uses panics for programmer errors such as:</p>
+<ul>
+<li>polling after <code>Done</code></li>
+<li>receiving impossible <code>Yield</code> from a wrapped oneshot inner model</li>
+</ul>
+<p>That is a reasonable pattern here. Kernel or I/O failures should become <code>Err(...)</code> results. Broken internal protocol assumptions should fail loudly.</p>
+<h2 id="designing-for-composition"><a class="header" href="#designing-for-composition">Designing for composition</a></h2>
+<p>If you want a model that composes well with other code, keep the boundaries clean.</p>
+<h3 id="prefer-wrapping-over-rewriting"><a class="header" href="#prefer-wrapping-over-rewriting">Prefer wrapping over rewriting</a></h3>
+<p>If an existing model already owns the tricky low-level semantics, wrap it and map the result rather than duplicating its logic.</p>
+<p>The socket wrappers in <code>lio/src/net/ops.rs</code> are good examples of this.</p>
+<h3 id="keep-step-boundaries-explicit"><a class="header" href="#keep-step-boundaries-explicit">Keep step boundaries explicit</a></h3>
+<p>If a model does several things, represent those as states instead of blending them into one giant <code>complete()</code> branch.</p>
+<h3 id="return-ownership-deliberately"><a class="header" href="#return-ownership-deliberately">Return ownership deliberately</a></h3>
+<p>If buffers or resources need to survive across steps, ensure the model returns or reuses them intentionally. <code>CopyN</code> is a good example: it carries one buffer through alternating read/write phases and resubmits partial writes correctly.</p>
+<h2 id="copyn-as-a-richer-example"><a class="header" href="#copyn-as-a-richer-example"><code>CopyN</code> as a richer example</a></h2>
+<p><code>CopyN</code> is a good model to study because it shows several design techniques at once.</p>
+<p>Its states are:</p>
+<ul>
+<li><code>Reading(ops::Read&lt;Vec&lt;u8&gt;&gt;)</code></li>
+<li><code>Writing(ops::Write&lt;Vec&lt;u8&gt;&gt;)</code></li>
+<li><code>Done</code></li>
+</ul>
+<p>Its transitions are:</p>
+<ul>
+<li>read returns EOF -&gt; <code>Done(Ok(total))</code></li>
+<li>read returns bytes -&gt; truncate buffer to actual length, move to <code>Writing</code></li>
+<li>write returns partial progress -&gt; keep remaining bytes, stay in <code>Writing</code></li>
+<li>write completes full buffer -&gt; resize buffer and go back to <code>Reading</code></li>
+</ul>
+<p>That is a real state machine, not just a thin wrapper around a syscall.</p>
+<p>It also shows a recurring design pattern in <code>lio</code>:</p>
+<ul>
+<li>reuse inner <code>ops::*</code> models when they already encode a low-level contract correctly</li>
+<li>build higher-level sequencing around them</li>
+</ul>
+<h2 id="testing-the-contract"><a class="header" href="#testing-the-contract">Testing the contract</a></h2>
+<p>The repository includes <code>OpModelContract</code> support in the <code>lio-test</code> crate, and <code>lio</code> uses that support to script contract tests for concrete models.</p>
+<p>That contract machinery tests the logical protocol:</p>
+<ul>
+<li>does <code>action()</code> request the expected action?</li>
+<li>does <code>complete()</code> return the expected <code>OpResult</code>?</li>
+<li>does a oneshot terminate correctly?</li>
+<li>does a stream yield or remain live correctly?</li>
+</ul>
+<p>This is the right kind of test for <code>OpModel</code>.</p>
+<p>It does not try to test the kernel. It tests the state machine.</p>
+<p>For model-level tests, prefer checking:</p>
+<ul>
+<li>the sequence of actions</li>
+<li>the sequence of state transitions</li>
+<li>final output values</li>
+<li>correct handling of error paths</li>
+</ul>
+<p>This is a good fit for <code>OpModel</code> because the abstraction is already a state machine contract. The most important tests are usually not “did the kernel work?” but “did this model interpret each step correctly?”</p>
+<p>That is also why contract tests are worth separating from ordinary integration tests. Integration tests tell you whether a backend and the operating system produced the expected behavior. Contract tests tell you whether the model itself is well-formed.</p>
+<h2 id="a-minimal-skeleton"><a class="header" href="#a-minimal-skeleton">A minimal skeleton</a></h2>
+<p>This is the right shape for many composed models:</p>
+<pre><code class="language-rust ignore">use std::io;
+use lio::api::op::{Action, Completion, OpModel, OpResult};
+
+struct MyModel {
+    state: State,
+}
+
+enum State {
+    Step1,
+    Step2 { value: usize },
+    Done,
+}
+
+impl OpModel for MyModel {
+    type Item = io::Result&lt;usize&gt;;
+
+    fn action(&amp;mut self) -&gt; Action {
+        match self.state {
+            State::Step1 =&gt; { /* return first action */ }
+            State::Step2 { value } =&gt; { /* return second action using value */ }
+            State::Done =&gt; panic!("MyModel polled after completion"),
+        }
+    }
+
+    fn complete(&amp;mut self, completion: Completion) -&gt; OpResult&lt;Self::Item&gt; {
+        match self.state {
+            State::Step1 =&gt; {
+                if completion.result &lt; 0 {
+                    self.state = State::Done;
+                    OpResult::Done(Err(io::Error::from_raw_os_error(
+                        (-completion.result) as i32,
+                    )))
+                } else {
+                    let value = completion.result as usize;
+                    self.state = State::Step2 { value };
+                    OpResult::Again
+                }
+            }
+            State::Step2 { .. } =&gt; {
+                self.state = State::Done;
+                if completion.result &lt; 0 {
+                    OpResult::Done(Err(io::Error::from_raw_os_error(
+                        (-completion.result) as i32,
+                    )))
+                } else {
+                    OpResult::Done(Ok(completion.result as usize))
+                }
+            }
+            State::Done =&gt; panic!("MyModel completed after terminal state"),
+        }
+    }
+}</code></pre>
+<p>The exact details will vary, but the structure should look familiar after reading the real models in the repository.</p>
+<h2 id="the-main-idea"><a class="header" href="#the-main-idea">The main idea</a></h2>
+<p><code>OpModel</code> is where <code>lio</code> turns “one or more backend actions” into “one logical operation”.</p>
+<p>That is why it is so central.</p>
+<p>It gives the library:</p>
+<ul>
+<li>typed results</li>
+<li>explicit step sequencing</li>
+<li>reusable wrappers</li>
+<li>streaming support</li>
+<li>testable state-machine behavior</li>
+</ul>
+<p>And it gives you, as an implementor, a clear design rule:</p>
+<p>build the operation as a state machine, let <code>action()</code> describe the next step, and let <code>complete()</code> own the transition.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="api-reference-vs-explaining-documentation"><a class="header" href="#api-reference-vs-explaining-documentation">API Reference vs Explaining Documentation</a></h1>
+<p>This repository needs both kinds of documentation, but they should do different jobs.</p>
+<h2 id="api-reference"><a class="header" href="#api-reference">API reference</a></h2>
+<p>API reference answers item-level questions:</p>
+<ul>
+<li>What is the exact signature of <code>api::readdir</code>?</li>
+<li>What does <code>Receiver::recv_timeout</code> return?</li>
+<li>Which traits does <code>Resource</code> implement?</li>
+<li>Is <code>TcpListener::bind</code> gated behind a feature?</li>
+</ul>
+<p>Rustdoc is the right home for that material because it is generated from the public code and stays anchored to real items. It answers “what exists?” and “what is the exact contract of this item?”</p>
+<h2 id="explaining-documentation"><a class="header" href="#explaining-documentation">Explaining documentation</a></h2>
+<p>Explaining documentation answers different questions:</p>
+<ul>
+<li>What kind of library is <code>lio</code>?</li>
+<li>Why does it expose a manually driven driver?</li>
+<li>Why do operations own buffers?</li>
+<li>When should I pick channels, callbacks, or <code>await</code>?</li>
+<li>Why is the low-level API the real center of the crate?</li>
+</ul>
+<p>Those are design and workflow questions. They are about how to think with the library, not how to look up a symbol.</p>
+<h2 id="what-went-wrong-with-the-old-shape"><a class="header" href="#what-went-wrong-with-the-old-shape">What went wrong with the old shape</a></h2>
+<p>The earlier book structure leaned too far toward mechanism before model.</p>
+<p>That makes readers reconstruct too much for themselves:</p>
+<ul>
+<li>they see mechanisms before they see purpose</li>
+<li>they see method families before they see control boundaries</li>
+<li>they have to infer which parts are reference and which parts are explanation</li>
+</ul>
+<p>The source code suggests a clearer split.</p>
+<h2 id="a-better-split-for-lio"><a class="header" href="#a-better-split-for-lio">A better split for <code>lio</code></a></h2>
+<p>For this project, the documentation split should be:</p>
+<ul>
+<li><strong>Book</strong>: explain the architecture, the mental model, the operation families, and how to structure code around <code>Lio</code></li>
+<li><strong>Rustdoc</strong>: describe every public item precisely</li>
+</ul>
+<p>That is why this book talks in terms of:</p>
+<ul>
+<li>drivers</li>
+<li>resources</li>
+<li>buffers</li>
+<li>completion styles</li>
+<li>backend portability</li>
+<li>public layers</li>
+</ul>
+<p>instead of trying to restate every signature already present in rustdoc.</p>
+<h2 id="how-to-use-both-together"><a class="header" href="#how-to-use-both-together">How to use both together</a></h2>
+<p>The intended reading flow is:</p>
+<ol>
+<li>read this book to understand the design</li>
+<li>go to rustdoc when you need exact item-level detail</li>
+<li>come back to the book when you need to re-evaluate structure or tradeoffs</li>
+</ol>
+<p>If a reader understands the model but cannot remember a signature, rustdoc solves that. If a reader can find every item but still cannot explain why the crate is shaped this way, the book has not done its job.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="platform-support"><a class="header" href="#platform-support">Platform Support</a></h1>
+<p><code>lio</code> aims for a portable programming model, not identical kernel features on every target.</p>
+<p>The user-facing model does not change from target to target. Operations are still typed, progress is still explicit, and ownership is still part of the API. What changes is the backend work needed to make that model real on a given platform.</p>
+<p>At the design level, <code>lio</code> is compatible with any target platform or operating system. The requirement is not that the crate must ship a backend for every target. The requirement is that some <code>IoBackend</code> implementation must exist for that target. If the workspace does not already provide one, a custom backend has to be built.</p>
+<h2 id="backends"><a class="header" href="#backends">Backends</a></h2>
+<p>The code selects backends this way:</p>
+<ul>
+<li>on Linux, <code>Lio::new()</code> uses the <code>io_uring</code> backend from the <code>lio-uring</code> crate</li>
+<li>on macOS and the BSD family, <code>Lio::new()</code> uses the polling backend built around platform event facilities</li>
+</ul>
+<p>That split matters for implementation, but application structure stays the same:</p>
+<ul>
+<li>submit typed operations</li>
+<li>drive <code>Lio</code></li>
+<li>receive typed completions</li>
+</ul>
+<p>On a target without a built-in backend, the same model still applies. The missing piece is backend implementation, not a different way of writing <code>lio</code> code.</p>
+<h2 id="what-portability-means-here"><a class="header" href="#what-portability-means-here">What portability means here</a></h2>
+<p>Portability in <code>lio</code> means:</p>
+<ul>
+<li>the same high-level control flow across platforms</li>
+<li>the same operation types where the crate exposes them</li>
+<li>backend-specific machinery hidden behind <code>Lio</code></li>
+</ul>
+<p>It does <strong>not</strong> mean every OS exposes identical primitives or identical behavior at the kernel level. <code>lio</code> gives you a portable control model, not a guarantee that kernels behave identically.</p>
+<h2 id="features-and-surface-area"><a class="header" href="#features-and-surface-area">Features and surface area</a></h2>
+<p>A second portability question is about <strong>surface area</strong>.</p>
+<p>Some parts of the repository are always central:</p>
+<ul>
+<li><code>Lio</code></li>
+<li><code>lio::api</code></li>
+<li><code>lio::api::io</code></li>
+<li><code>lio::api::resource</code></li>
+<li><code>lio::time</code></li>
+</ul>
+<p>Some parts are conditional or narrower:</p>
+<ul>
+<li><code>lio::net</code> is behind the <code>high</code> feature</li>
+<li>the crate root does not re-export the higher-level <code>fs</code> and <code>process</code> modules even though related code exists in the repository</li>
+<li>the C FFI is behind the <code>unstable_ffi</code> feature</li>
+</ul>
+<p>When reading examples or designing documentation, distinguish:</p>
+<ul>
+<li>what the repository contains</li>
+<li>what the public crate root exposes</li>
+</ul>
+<p>This book is written around the public crate surface.</p>
+<h2 id="threading-model"><a class="header" href="#threading-model">Threading model</a></h2>
+<p><code>Lio</code> is intentionally single-thread-oriented.</p>
+<p>The implementation uses <code>Rc&lt;RefCell&lt;...&gt;&gt;</code> internally and supports a thread-local global installation model. That points to the intended usage model:</p>
+<ul>
+<li>one <code>Lio</code> per thread or event loop context</li>
+<li>explicit ownership of where completions are driven</li>
+<li>scoped global installation when you want thread-local lookup</li>
+<li>no hidden cross-thread scheduler</li>
+</ul>
+<p>If you need multi-threaded designs, compose them above <code>lio</code> rather than expecting <code>lio</code> itself to be the scheduler.</p>
+<p>That does not mean you cannot use <code>lio</code> in a larger concurrent program. It means <code>lio</code> should usually be one component inside that program rather than the thing that defines the whole scheduling model.</p>
+<h2 id="practical-guidance"><a class="header" href="#practical-guidance">Practical guidance</a></h2>
+<p>When you want code that survives backend differences, write to these concepts:</p>
+<ul>
+<li><code>Resource</code> instead of raw descriptors where possible</li>
+<li><code>api::*</code> operations instead of backend calls</li>
+<li>explicit driver loops</li>
+<li>capability checks in your application layer when behavior truly differs by platform</li>
+</ul>
+<p>That keeps the portable part of your program in the <code>lio</code> layer that is meant to stay stable across backend implementations.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="project-layout"><a class="header" href="#project-layout">Project Layout</a></h1>
+<p>Once the public model is clear, the repository layout becomes much easier to read. The source tree separates the public operation surface, the driver and backend machinery, and the shared test infrastructure in a fairly direct way.</p>
+<h2 id="lio-1"><a class="header" href="#lio-1"><code>lio</code></a></h2>
+<p>This is the main crate and the only crate most users need to care about.</p>
+<p>Its public center is:</p>
+<ul>
+<li><code>Lio</code></li>
+<li><code>lio::api</code></li>
+<li><code>lio::api::io</code></li>
+<li><code>lio::api::resource</code></li>
+<li><code>lio::io</code></li>
+<li><code>lio::time</code></li>
+<li><code>lio::net</code> behind the <code>high</code> feature</li>
+</ul>
+<p>Internally, this crate is split between:</p>
+<ul>
+<li>operation models in <code>src/api</code></li>
+<li>runtime/driver machinery in <code>src/lio.rs</code>, <code>src/registration.rs</code>, and <code>src/backend</code></li>
+<li>time management in <code>src/time</code></li>
+<li>utility ownership types such as buffers and slabs</li>
+</ul>
+<p>That tells you how the crate is designed: the public API is typed operations, while the internal engine is registration, backend dispatch, and completion processing.</p>
+<p>A productive reading order is from the outside in:</p>
+<ul>
+<li>the crate root shows what users are meant to touch</li>
+<li><code>src/api</code> shows the typed operation surface</li>
+<li><code>src/backend</code> shows the execution substrate</li>
+<li><code>src/lio.rs</code> shows how the driver ties registration, backend work, and timers together</li>
+</ul>
+<h2 id="lio-uring"><a class="header" href="#lio-uring"><code>lio-uring</code></a></h2>
+<p>This crate is the Linux backend layer.</p>
+<p>It wraps <code>liburing</code> and exposes the lower-level machinery needed for the Linux implementation of <code>Lio</code>. Unless you are working on backend behavior, it is best treated as implementation detail.</p>
+<h2 id="examplesbusybox"><a class="header" href="#examplesbusybox"><code>examples/busybox</code></a></h2>
+<p>This example matters because it shows the library at application scale.</p>
+<p>It is not a demo of isolated calls. It is a larger application that uses:</p>
+<ul>
+<li>a long-lived <code>Lio</code></li>
+<li>manual driver loops</li>
+<li>low-level filesystem operations</li>
+<li>path-relative handling</li>
+<li>callback and channel-based completion styles</li>
+</ul>
+<p>If you want to see how the explicit driver model feels in a larger codebase, this directory is more revealing than a collection of tiny examples.</p>
+<h2 id="examples"><a class="header" href="#examples"><code>examples</code></a></h2>
+<p>The smaller examples show focused usage patterns:</p>
+<ul>
+<li>a minimal HTTP client</li>
+<li>sleep timing behavior</li>
+<li>C FFI integration</li>
+</ul>
+<p>They are a good place to confirm one idea at a time: a sleep loop, an I/O submission pattern, or an FFI boundary.</p>
+<h2 id="lio-test"><a class="header" href="#lio-test"><code>lio-test</code></a></h2>
+<p>This crate holds shared testing support used across the workspace.</p>
+<p>Its role is narrow:</p>
+<ul>
+<li>backend contract macros live there</li>
+<li><code>OpModel</code> contract-test support lives there</li>
+<li>test infrastructure stays separate from the runtime crate’s core API surface</li>
+</ul>
+<p>That separation keeps reusable test machinery from looking like part of the public runtime model.</p>
+<h2 id="what-this-means-for-documentation"><a class="header" href="#what-this-means-for-documentation">What this means for documentation</a></h2>
+<p>The project layout suggests a documentation strategy:</p>
+<ul>
+<li>explain the main crate first</li>
+<li>treat the backend crate as implementation detail unless the reader is extending <code>lio</code></li>
+<li>use examples to illustrate control flow</li>
+<li>keep API reference attached to public items, not duplicated in the book</li>
+</ul>
+<p>That structure matches the code better than a book organized around isolated mechanism names. It also gives readers a practical way to navigate the repo once the conceptual model is in place.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+
+    </div>
+    </body>
+</html>

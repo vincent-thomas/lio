@@ -10,6 +10,7 @@ keywords = ["async", "io", "networking", "filesystem"]
 categories = ["asynchronous", "network-programming", "filesystem"]
 authors = ["Vincent Thomas <vincent@v-thomas.com>"]
 build = "build.rs"
+readme = "../README.md"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -48,3 +49,4 @@ cbindgen = { version = "0.29", default-features = false, optional = true }
 [dev-dependencies]
 pastey = { version = "0.1" }
 proptest = { version = "1.4", default-features = false, features = ["std"] }
+lio-test = { path = "../lio-test" }

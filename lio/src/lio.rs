@@ -37,22 +37,43 @@ thread_local! {
   static GLOBAL_LIO: RefCell<Option<Lio>> = const { RefCell::new(None) };
 }
 
+/// Guard returned by [`install_global`].
+///
+/// Dropping the guard uninstalls the thread-local global [`Lio`].
+#[must_use = "Dropping the guard immediately uninstalls the global Lio"]
+pub struct GlobalLioGuard {
+  installed: bool,
+}
+
+impl Drop for GlobalLioGuard {
+  fn drop(&mut self) {
+    if self.installed {
+      let _ = uninstall_global();
+    }
+  }
+}
+
 /// Installs a global Lio instance for the current thread.
 ///
 /// After calling this, operations can be used without explicitly calling `.with_lio()`.
 /// This is useful for thread-per-core designs where each thread has its own Lio instance.
 ///
+/// Returns a guard that uninstalls the global driver when dropped.
+///
 /// # Panics
 ///
 /// Panics if a global Lio is already installed on this thread.
-pub fn install_global(lio: Lio) {
+pub fn install_global(lio: Lio) -> GlobalLioGuard {
   GLOBAL_LIO.with(|global| {
     let mut global = global.borrow_mut();
     if global.is_some() {
-      panic!("Global Lio already installed on this thread. Call uninstall_global() first.");
+      panic!(
+        "Global Lio already installed on this thread. Drop the existing GlobalLioGuard or call uninstall_global() first."
+      );
     }
     *global = Some(lio);
   });
+  GlobalLioGuard { installed: true }
 }
 
 /// Uninstalls the global Lio instance for the current thread.
@@ -538,5 +559,32 @@ mod tests {
     let items = received.lock().unwrap();
     assert_eq!(items.len(), 1);
     assert!(matches!(items[0], Ok(())));
+  }
+
+  #[test]
+  fn install_global_guard_uninstalls_on_drop() {
+    assert!(uninstall_global().is_none());
+
+    let lio = Lio::new_with_backend(TestBackend::default(), 8).unwrap();
+    {
+      let _guard = install_global(lio.clone());
+      let global = get_global().expect("global lio should be installed");
+      assert!(Rc::ptr_eq(&global.inner, &lio.inner));
+    }
+
+    assert!(get_global().is_none());
+  }
+
+  #[test]
+  fn manual_uninstall_before_guard_drop_is_harmless() {
+    assert!(uninstall_global().is_none());
+
+    let lio = Lio::new_with_backend(TestBackend::default(), 8).unwrap();
+    let _guard = install_global(lio.clone());
+
+    let removed = uninstall_global().expect("global lio should be installed");
+    assert!(Rc::ptr_eq(&removed.inner, &lio.inner));
+
+    assert!(get_global().is_none());
   }
 }

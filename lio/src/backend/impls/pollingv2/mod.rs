@@ -217,8 +217,10 @@ impl Poller {
       target_os = "tvos",
       target_os = "watchos"
     ))]
+    // SAFETY: `entry` is a live `libc::dirent` pointer returned by `readdir`
+    // for the duration of the current iteration.
     unsafe {
-      (*entry).d_ino as u64
+      (*entry).d_ino
     }
 
     #[cfg(any(
@@ -227,8 +229,10 @@ impl Poller {
       target_os = "openbsd",
       target_os = "netbsd"
     ))]
+    // SAFETY: `entry` is a live `libc::dirent` pointer returned by `readdir`
+    // for the duration of the current iteration.
     unsafe {
-      (*entry).d_fileno as u64
+      (*entry).d_fileno
     }
   }
 
@@ -1152,4 +1156,4 @@ impl IoBackend for Poller {
 }
 
 #[cfg(test)]
-crate::test_io_backend!(Poller::new());
+lio_test::test_io_backend!(lio::backend::impls::Poller::new());

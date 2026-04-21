@@ -49,7 +49,11 @@
 //! threads than where operations were initiated. This is particularly useful for
 //! delegating I/O completion handling to dedicated threads.
 
-use crate::{api::op::OpModel, lio, lio::Lio, registration::Registration};
+use crate::{
+  api::op::OpModel,
+  driver, driver::Lio,
+  registration::Registration,
+};
 
 use std::{
   future::Future,
@@ -218,7 +222,7 @@ enum LioHandle {
 impl LioHandle {
   fn into_lio(self) -> Lio {
     match self {
-      LioHandle::GloballyInstalled => lio::get_global().expect(
+      LioHandle::GloballyInstalled => driver::get_global().expect(
         "No Lio instance available. Either call install_global(lio) or use .with_lio(&lio) before consuming the operation.",
       ),
       LioHandle::Custom(lio) => lio,

@@ -1080,7 +1080,7 @@ mod tests {
   use super::*;
 
   // Run the standard IoBackend test suite
-  crate::test_io_backend!(Iocp::new());
+  lio_test::test_io_backend!(Iocp::new());
 
   // IOCP-specific tests
   #[test]

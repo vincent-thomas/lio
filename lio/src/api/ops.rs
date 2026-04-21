@@ -20,8 +20,8 @@ use crate::{
   api::{
     Pid,
     op::{
-      Action, Completion, CompletionFlags, ContractKind, ContractStep,
-      OneshotOpModel, OpModel, OpModelContract, OpResult, StreamOpModel,
+      Action, Completion, CompletionFlags, OneshotOpModel, OpModel, OpResult,
+      StreamOpModel,
     },
     resource::Resource,
   },
@@ -32,6 +32,36 @@ use crate::{
   },
   buf::MAX_IOV_COUNT,
 };
+#[cfg(test)]
+use lio_test::{ContractKind, ContractStep, OpModelContract};
+#[cfg(test)]
+macro_rules! impl_op_model_contract_runtime {
+  () => {
+    type Action = Action;
+    type Completion = Completion;
+    type Result = OpResult<<Self as OpModel>::Item>;
+
+    fn action(&mut self) -> Self::Action {
+      <Self as OpModel>::action(self)
+    }
+
+    fn complete(&mut self, completion: Self::Completion) -> Self::Result {
+      <Self as OpModel>::complete(self, completion)
+    }
+
+    fn is_again(result: &Self::Result) -> bool {
+      matches!(result, OpResult::Again)
+    }
+
+    fn is_yield(result: &Self::Result) -> bool {
+      matches!(result, OpResult::Yield(_))
+    }
+
+    fn is_done(result: &Self::Result) -> bool {
+      matches!(result, OpResult::Done(_))
+    }
+  };
+}
 
 pub use crate::backend::op::LinkKind;
 
@@ -246,7 +276,9 @@ impl OpModel for Socket {
 impl OneshotOpModel for Socket {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Socket {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -330,7 +362,9 @@ impl OpModel for Accept {
 impl OneshotOpModel for Accept {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Accept {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -391,7 +425,9 @@ impl OpModel for Connect {
 impl OneshotOpModel for Connect {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Connect {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -529,7 +565,9 @@ impl OpModel for Nop {
 
 impl OneshotOpModel for Nop {}
 
+#[cfg(test)]
 impl OpModelContract for Nop {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -649,7 +687,9 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Read<B> {
 impl<B: IoBufMutVec + std::marker::Send + Sync> OneshotOpModel for Read<B> {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Read<Vec<u8>> {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -679,7 +719,9 @@ impl OpModelContract for Read<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Read<(Vec<u8>, Vec<u8>)> {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -775,7 +817,9 @@ impl<B: IoBufVec + std::marker::Send + Sync> OpModel for Write<B> {
 impl<B: IoBufVec + std::marker::Send + Sync> OneshotOpModel for Write<B> {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Write<Vec<u8>> {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -802,7 +846,9 @@ impl OpModelContract for Write<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Write<(Vec<u8>, Vec<u8>)> {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -950,7 +996,9 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Recv<B> {
 impl<B: IoBufMutVec + std::marker::Send + Sync> OneshotOpModel for Recv<B> {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Recv<Vec<u8>> {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -975,7 +1023,9 @@ impl OpModelContract for Recv<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Recv<(Vec<u8>, Vec<u8>)> {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -1091,7 +1141,9 @@ impl<B: IoBufVec + std::marker::Send + Sync> OpModel for Send<B> {
 impl<B: IoBufVec + std::marker::Send + Sync> OneshotOpModel for Send<B> {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Send<Vec<u8>> {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -1115,7 +1167,9 @@ impl OpModelContract for Send<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Send<(Vec<u8>, Vec<u8>)> {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -1188,7 +1242,9 @@ impl OpModel for Sleep {
 impl OneshotOpModel for Sleep {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Sleep {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -1250,7 +1306,9 @@ impl OpModel for Interval {
 impl StreamOpModel for Interval {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Interval {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Stream
   }
@@ -1403,7 +1461,9 @@ impl OpModel for ReadDir {
 impl OneshotOpModel for ReadDir {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for ReadDir {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -1443,7 +1503,9 @@ impl OpModelContract for ReadDir {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for Stat {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -1517,7 +1579,9 @@ impl OpModel for UnlinkAt {
 impl OneshotOpModel for UnlinkAt {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for UnlinkAt {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -1589,7 +1653,9 @@ impl OpModel for RenameAt {
 impl OneshotOpModel for RenameAt {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for RenameAt {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -1649,7 +1715,9 @@ impl OpModel for MkdirAt {
 impl OneshotOpModel for MkdirAt {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for MkdirAt {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -1715,7 +1783,9 @@ impl OpModel for LinkAt {
 impl OneshotOpModel for LinkAt {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for LinkAt {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -1846,7 +1916,9 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
 impl<B: IoBufMutVec + std::marker::Send + Sync> OneshotOpModel for GetCwd<B> {}
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for GetCwd<Vec<u8>> {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -1945,7 +2017,9 @@ unsafe impl std::marker::Send for Spawn {}
 unsafe impl std::marker::Sync for Spawn {}
 
 #[cfg(all(test, unix))]
+#[cfg(test)]
 impl OpModelContract for Spawn {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -1968,7 +2042,9 @@ impl OpModelContract for Spawn {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 impl OpModelContract for ReadlinkAt<Vec<u8>> {
+  impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
   }
@@ -2004,139 +2080,139 @@ mod tests {
   mod nop_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Nop);
+    lio_test::test_op_model_contract!(Nop);
   }
 
   mod socket_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Socket);
+    lio_test::test_op_model_contract!(Socket);
   }
 
   mod getcwd_contract {
     use super::*;
 
-    crate::test_op_model_contract!(GetCwd<Vec<u8>>);
+    lio_test::test_op_model_contract!(GetCwd<Vec<u8>>);
   }
 
   mod stat_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Stat);
+    lio_test::test_op_model_contract!(Stat);
   }
 
   mod readdir_contract {
     use super::*;
 
-    crate::test_op_model_contract!(ReadDir);
+    lio_test::test_op_model_contract!(ReadDir);
   }
 
   #[cfg(unix)]
   mod spawn_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Spawn);
+    lio_test::test_op_model_contract!(Spawn);
   }
 
   mod read_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Read<Vec<u8>>);
+    lio_test::test_op_model_contract!(Read<Vec<u8>>);
   }
 
   mod read_vectored_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Read<(Vec<u8>, Vec<u8>)>);
+    lio_test::test_op_model_contract!(Read<(Vec<u8>, Vec<u8>)>);
   }
 
   mod write_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Write<Vec<u8>>);
+    lio_test::test_op_model_contract!(Write<Vec<u8>>);
   }
 
   mod write_vectored_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Write<(Vec<u8>, Vec<u8>)>);
+    lio_test::test_op_model_contract!(Write<(Vec<u8>, Vec<u8>)>);
   }
 
   mod unlinkat_contract {
     use super::*;
 
-    crate::test_op_model_contract!(UnlinkAt);
+    lio_test::test_op_model_contract!(UnlinkAt);
   }
 
   mod renameat_contract {
     use super::*;
 
-    crate::test_op_model_contract!(RenameAt);
+    lio_test::test_op_model_contract!(RenameAt);
   }
 
   mod mkdirat_contract {
     use super::*;
 
-    crate::test_op_model_contract!(MkdirAt);
+    lio_test::test_op_model_contract!(MkdirAt);
   }
 
   mod linkat_contract {
     use super::*;
 
-    crate::test_op_model_contract!(LinkAt);
+    lio_test::test_op_model_contract!(LinkAt);
   }
 
   mod readlinkat_contract {
     use super::*;
 
-    crate::test_op_model_contract!(ReadlinkAt<Vec<u8>>);
+    lio_test::test_op_model_contract!(ReadlinkAt<Vec<u8>>);
   }
 
   mod accept_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Accept);
+    lio_test::test_op_model_contract!(Accept);
   }
 
   mod connect_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Connect);
+    lio_test::test_op_model_contract!(Connect);
   }
 
   mod sleep_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Sleep);
+    lio_test::test_op_model_contract!(Sleep);
   }
 
   mod interval_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Interval);
+    lio_test::test_op_model_contract!(Interval);
   }
 
   mod recv_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Recv<Vec<u8>>);
+    lio_test::test_op_model_contract!(Recv<Vec<u8>>);
   }
 
   mod recv_vectored_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Recv<(Vec<u8>, Vec<u8>)>);
+    lio_test::test_op_model_contract!(Recv<(Vec<u8>, Vec<u8>)>);
   }
 
   mod send_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Send<Vec<u8>>);
+    lio_test::test_op_model_contract!(Send<Vec<u8>>);
   }
 
   mod send_vectored_contract {
     use super::*;
 
-    crate::test_op_model_contract!(Send<(Vec<u8>, Vec<u8>)>);
+    lio_test::test_op_model_contract!(Send<(Vec<u8>, Vec<u8>)>);
   }
 }

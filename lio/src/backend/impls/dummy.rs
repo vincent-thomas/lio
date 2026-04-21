@@ -89,7 +89,7 @@ mod tests {
   use super::*;
 
   // Run the standard IoBackend test suite
-  crate::test_io_backend!(DummyBackend::new());
+  lio_test::test_io_backend!(DummyBackend::new());
 
   // Additional DummyBackend-specific tests
   #[test]

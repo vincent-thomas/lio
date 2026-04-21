@@ -1160,4 +1160,4 @@ impl IoBackend for IoUring {
 }
 
 #[cfg(test)]
-crate::test_io_backend!(IoUring::new());
+lio_test::test_io_backend!(IoUring::new());

@@ -1,4 +1,4 @@
-.PHONY: lint lint-full doc cbuild test test-debug test-release test-lio-uring test-doc test-lib test-integration test-nix vm-linux vm-windows vm-freebsd vm-all
+.PHONY: lint lint-full doc book book-serve cbuild test test-debug test-release test-lio-uring test-doc test-lib test-integration test-nix vm-linux vm-windows vm-freebsd vm-all
 
 lint:
 	nix run .#lint
@@ -11,6 +11,12 @@ fmt-fix:
 
 doc: test-doc
 	RUSTDOCFLAGS="--cfg docsrs" nix develop -c cargo doc --no-deps --all-features
+
+book:
+	mdbook build
+
+book-serve:
+	mdbook serve
 
 cbuild:
 	cargo rustc -p lio --crate-type dylib,staticlib --features unstable_ffi --release

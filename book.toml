@@ -1,0 +1,8 @@
+[book]
+authors = ["Vincent Thomas"]
+language = "en"
+src = "docs/src"
+title = "lio"
+
+[build]
+build-dir = "docs/book"
