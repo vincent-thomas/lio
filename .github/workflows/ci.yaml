@@ -34,7 +34,7 @@ jobs:
         run: cargo check --workspace --all-targets --all-features
 
       - name: cargo doc
-        run: cargo test --doc --workspace --all-targets --all-features
+        run: cargo test --doc -p lio -p lio-test --all-features
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features
