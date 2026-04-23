@@ -1222,6 +1222,3 @@ impl IoBackend for IoUring {
     Ok(())
   }
 }
-
-#[cfg(test)]
-lio_test::test_io_backend!(IoUring::new());

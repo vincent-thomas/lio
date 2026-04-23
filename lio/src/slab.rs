@@ -43,17 +43,14 @@ impl SlabKey {
 }
 
 /// Slot storage with generation tracking.
-struct Slot<T> {
+pub(crate) struct Slot<T> {
   generation: u32,
-  value: MaybeUninit<T>,
+  state: T,
   occupied: bool,
 }
 
-/// Generic slab allocator with generational indices.
-///
-/// Allocates items of type `T` in contiguous memory with O(1) insert/remove.
-/// Uses bump allocation for new slots and a free list for reuse.
-pub struct Slab<T> {
+/// Generic generational slot pool with stable per-slot state.
+pub(crate) struct SlotPool<T> {
   slots: Vec<Slot<T>>,
   /// Free slot indices available for reuse (LIFO for cache locality)
   free_list: Vec<u32>,
@@ -65,19 +62,96 @@ pub struct Slab<T> {
   len: u32,
 }
 
+impl<T> SlotPool<T> {
+  pub(crate) fn with_capacity(
+    capacity: usize,
+    mut init_slot: impl FnMut() -> T,
+  ) -> Self {
+    let capacity = capacity.min(u32::MAX as usize) as u32;
+    let mut slots = Vec::with_capacity(capacity as usize);
+    for _ in 0..capacity {
+      slots.push(Slot { generation: 0, state: init_slot(), occupied: false });
+    }
+    Self {
+      slots,
+      free_list: Vec::with_capacity(capacity as usize),
+      next_slot: 0,
+      capacity,
+      len: 0,
+    }
+  }
+
+  #[inline]
+  pub(crate) fn allocate(&mut self) -> Option<(SlabKey, &mut T)> {
+    let slot_idx = match self.free_list.pop() {
+      Some(slot_idx) => slot_idx,
+      None => {
+        if self.next_slot >= self.capacity {
+          return None;
+        }
+        let slot_idx = self.next_slot;
+        self.next_slot += 1;
+        slot_idx
+      }
+    };
+
+    let slot = &mut self.slots[slot_idx as usize];
+    debug_assert!(!slot.occupied);
+    slot.occupied = true;
+    self.len += 1;
+    let key = SlabKey { slot: slot_idx, generation: slot.generation };
+    Some((key, &mut slot.state))
+  }
+
+  #[inline]
+  pub(crate) fn get_mut(&mut self, key: SlabKey) -> Option<&mut T> {
+    let slot = self.slots.get_mut(key.slot() as usize)?;
+    if slot.generation == key.generation() && slot.occupied {
+      Some(&mut slot.state)
+    } else {
+      None
+    }
+  }
+
+  #[inline]
+  pub(crate) fn remove_with<R>(
+    &mut self,
+    key: SlabKey,
+    on_remove: impl FnOnce(&mut T) -> R,
+  ) -> Option<R> {
+    let slot = self.slots.get_mut(key.slot() as usize)?;
+    if slot.generation != key.generation() || !slot.occupied {
+      return None;
+    }
+
+    let removed = on_remove(&mut slot.state);
+    slot.occupied = false;
+    self.len -= 1;
+    slot.generation = slot.generation.wrapping_add(1);
+    self.free_list.push(key.slot());
+    Some(removed)
+  }
+
+  #[inline]
+  pub(crate) fn len(&self) -> usize {
+    self.len as usize
+  }
+}
+
+/// Generic slab allocator with generational indices.
+///
+/// Allocates items of type `T` in contiguous memory with O(1) insert/remove.
+/// Uses bump allocation for new slots and a free list for reuse.
+pub struct Slab<T> {
+  pool: SlotPool<MaybeUninit<T>>,
+}
+
 impl<T> Slab<T> {
   /// Creates a new slab with the given capacity.
   ///
   /// Memory is allocated lazily as slots are used.
   pub fn new(capacity: usize) -> Self {
-    let capacity = capacity.min(u32::MAX as usize) as u32;
-    Self {
-      slots: Vec::with_capacity(capacity as usize),
-      free_list: Vec::new(),
-      next_slot: 0,
-      capacity,
-      len: 0,
-    }
+    Self { pool: SlotPool::with_capacity(capacity, MaybeUninit::uninit) }
   }
 
   /// Insert a value, returning its key.
@@ -85,39 +159,9 @@ impl<T> Slab<T> {
   /// Returns `None` if at capacity.
   #[inline]
   pub fn insert(&mut self, value: T) -> Option<SlabKey> {
-    // Try free list first (reuse)
-    if let Some(slot_idx) = self.free_list.pop() {
-      let slot = &mut self.slots[slot_idx as usize];
-      debug_assert!(!slot.occupied);
-      slot.value = MaybeUninit::new(value);
-      slot.occupied = true;
-      self.len += 1;
-      return Some(SlabKey { slot: slot_idx, generation: slot.generation });
-    }
-
-    // Bump allocate
-    if self.next_slot < self.capacity {
-      let slot_idx = self.next_slot;
-      self.next_slot += 1;
-
-      // Grow slots vector if needed (lazy allocation)
-      if self.slots.len() <= slot_idx as usize {
-        self.slots.push(Slot {
-          generation: 0,
-          value: MaybeUninit::new(value),
-          occupied: true,
-        });
-      } else {
-        let slot = &mut self.slots[slot_idx as usize];
-        slot.value = MaybeUninit::new(value);
-        slot.occupied = true;
-      }
-
-      self.len += 1;
-      return Some(SlabKey { slot: slot_idx, generation: 0 });
-    }
-
-    None // At capacity
+    let (key, slot) = self.pool.allocate()?;
+    slot.write(value);
+    Some(key)
   }
 
   /// Insert a value and return both its key and a mutable reference to it.
@@ -136,25 +180,13 @@ impl<T> Slab<T> {
   /// Returns `true` if removed, `false` if key was invalid or stale.
   #[inline]
   pub fn remove(&mut self, key: SlabKey) -> bool {
-    let slot = match self.slots.get_mut(key.slot as usize) {
-      Some(s) => s,
-      None => return false,
-    };
-
-    if slot.generation != key.generation || !slot.occupied {
-      return false;
-    }
-
-    // SAFETY: slot.occupied is true, so value was initialized via insert()
-    unsafe { slot.value.assume_init_drop() };
-    slot.occupied = false;
-    self.len -= 1;
-    // Increment generation for ABA protection
-    slot.generation = slot.generation.wrapping_add(1);
-    // Return to free list
-    self.free_list.push(key.slot);
-
-    true
+    self
+      .pool
+      .remove_with(key, |slot| {
+        // SAFETY: occupied slots always contain an initialized value.
+        unsafe { slot.assume_init_drop() };
+      })
+      .is_some()
   }
 
   /// Remove a value by key and return it.
@@ -162,45 +194,32 @@ impl<T> Slab<T> {
   /// Returns `None` if the key was invalid or stale.
   #[inline]
   pub fn remove_value(&mut self, key: SlabKey) -> Option<T> {
-    let slot = self.slots.get_mut(key.slot as usize)?;
-
-    if slot.generation != key.generation || !slot.occupied {
-      return None;
-    }
-
-    slot.occupied = false;
-    self.len -= 1;
-    slot.generation = slot.generation.wrapping_add(1);
-    self.free_list.push(key.slot);
-
-    // SAFETY: slot.occupied was true, so value was initialized via insert().
-    Some(unsafe { slot.value.assume_init_read() })
+    self.pool.remove_with(key, |slot| {
+      // SAFETY: occupied slots always contain an initialized value.
+      unsafe { slot.assume_init_read() }
+    })
   }
 
   /// Get a mutable reference to a value by key.
   #[inline]
   pub fn get_mut(&mut self, key: SlabKey) -> Option<&mut T> {
-    let slot = self.slots.get_mut(key.slot as usize)?;
-    if slot.generation == key.generation && slot.occupied {
-      // SAFETY: slot.occupied is true, so value was initialized via insert()
-      Some(unsafe { slot.value.assume_init_mut() })
-    } else {
-      None
-    }
+    let slot = self.pool.get_mut(key)?;
+    // SAFETY: occupied slots always contain an initialized value.
+    Some(unsafe { slot.assume_init_mut() })
   }
 
   #[inline]
   pub fn len(&self) -> usize {
-    self.len as usize
+    self.pool.len()
   }
 }
 
 impl<T> Drop for Slab<T> {
   fn drop(&mut self) {
-    for slot in &mut self.slots {
+    for slot in &mut self.pool.slots {
       if slot.occupied {
-        // SAFETY: slot.occupied is true, so value was initialized via insert()
-        unsafe { slot.value.assume_init_drop() };
+        // SAFETY: occupied slots always contain an initialized value.
+        unsafe { slot.state.assume_init_drop() };
       }
     }
   }

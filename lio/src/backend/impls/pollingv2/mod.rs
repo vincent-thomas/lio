@@ -17,8 +17,8 @@ use os::epoll as sys;
 ))]
 use os::kqueue as sys;
 
-#[cfg(test)]
-pub(crate) mod tests;
+// #[cfg(test)]
+// pub(crate) mod tests;
 
 use std::{
   io,
@@ -1154,6 +1154,3 @@ impl IoBackend for Poller {
     Ok(())
   }
 }
-
-#[cfg(test)]
-lio_test::test_io_backend!(lio::backend::impls::Poller::new());

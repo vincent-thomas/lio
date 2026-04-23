@@ -10,11 +10,9 @@ use std::mem::MaybeUninit;
 use bumpalo::Bump;
 
 use crate::registration::Registration;
-use crate::slab::SlabKey;
+use crate::slab::{SlabKey, SlotPool};
 
 struct StoreSlot {
-  generation: u32,
-  occupied: bool,
   registration: MaybeUninit<Registration>,
   model_bump: Bump,
   step_bump: Bump,
@@ -27,9 +25,7 @@ struct StoreSlot {
 /// - a persistent model-lifetime bump reset before slot reuse
 /// - a step-lifetime bump reserved for backend-lowered state
 pub(crate) struct OpStore {
-  slots: Vec<StoreSlot>,
-  free_list: Vec<u32>,
-  next_slot: u32,
+  slots: SlotPool<StoreSlot>,
 }
 
 #[derive(Debug)]
@@ -52,21 +48,12 @@ impl OpStore {
 
   /// Creates a new OpStore with the specified capacity.
   pub fn with_capacity(cap: usize) -> OpStore {
-    let capacity = cap.min(u32::MAX as usize) as u32;
-    let mut slots = Vec::with_capacity(capacity as usize);
-    for _ in 0..capacity {
-      slots.push(StoreSlot {
-        generation: 0,
-        occupied: false,
+    OpStore {
+      slots: SlotPool::with_capacity(cap, || StoreSlot {
         registration: MaybeUninit::uninit(),
         model_bump: Bump::new(),
         step_bump: Bump::new(),
-      });
-    }
-    OpStore {
-      slots,
-      free_list: Vec::with_capacity(capacity as usize),
-      next_slot: 0,
+      }),
     }
   }
 
@@ -83,53 +70,34 @@ impl OpStore {
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> Result<u64, StoreAtCapacity> {
-    let slot_idx = match self.free_list.pop() {
-      Some(slot) => slot,
-      None => self.next_slot,
-    };
-
-    let Some(slot) = self.slots.get_mut(slot_idx as usize) else {
+    let Some((key, slot)) = self.slots.allocate() else {
       return Err(StoreAtCapacity);
     };
-    if slot_idx == self.next_slot {
-      self.next_slot += 1;
-    }
 
-    assert!(!slot.occupied);
     slot.model_bump.reset();
     slot.step_bump.reset();
     slot.registration.write(init(&mut slot.model_bump));
-    slot.occupied = true;
-    Ok(((slot.generation as u64) << 32) | slot_idx as u64)
+    Ok(key.as_u64())
   }
 
   /// Removes an operation from the store.
   pub fn remove(&mut self, id: u64) -> bool {
     let key = SlabKey::from_u64(id);
-    let Some(slot) = self.slots.get_mut(key.slot() as usize) else {
-      return false;
-    };
-    if slot.generation != key.generation() || !slot.occupied {
-      return false;
-    }
-
-    // SAFETY: occupied slots always contain an initialized registration.
-    unsafe { slot.registration.assume_init_drop() };
-    slot.model_bump.reset();
-    slot.step_bump.reset();
-    slot.occupied = false;
-    slot.generation = slot.generation.wrapping_add(1);
-    self.free_list.push(key.slot());
-    true
+    self
+      .slots
+      .remove_with(key, |slot| {
+        // SAFETY: occupied slots always contain an initialized registration.
+        unsafe { slot.registration.assume_init_drop() };
+        slot.model_bump.reset();
+        slot.step_bump.reset();
+      })
+      .is_some()
   }
 
   /// Gets mutable access to an operation's registration.
   pub fn get_mut(&mut self, id: u64) -> Option<&mut Registration> {
     let key = SlabKey::from_u64(id);
-    let slot = self.slots.get_mut(key.slot() as usize)?;
-    if slot.generation != key.generation() || !slot.occupied {
-      return None;
-    }
+    let slot = self.slots.get_mut(key)?;
     // SAFETY: occupied slots always contain an initialized registration.
     Some(unsafe { slot.registration.assume_init_mut() })
   }
@@ -137,10 +105,7 @@ impl OpStore {
   /// Gets mutable access to an operation's per-step lowering arena.
   pub fn step_bump_mut(&mut self, id: u64) -> Option<&mut Bump> {
     let key = SlabKey::from_u64(id);
-    let slot = self.slots.get_mut(key.slot() as usize)?;
-    if slot.generation != key.generation() || !slot.occupied {
-      return None;
-    }
+    let slot = self.slots.get_mut(key)?;
     Some(&mut slot.step_bump)
   }
 }
