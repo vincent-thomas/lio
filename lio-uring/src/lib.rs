@@ -40,6 +40,7 @@
 //! - Buffers are not accessed mutably while operations are in flight
 //! - File descriptors remain valid until operations complete
 
+#![allow(clippy::new_without_default, clippy::module_inception)]
 extern crate alloc;
 extern crate core;
 

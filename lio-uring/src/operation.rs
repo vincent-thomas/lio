@@ -572,17 +572,18 @@ pub struct TimeoutFlags(u32);
 /// request normally would. To keep the links untouched include [`TimeoutFlags::ETIME_SUCCESS`].
 /// CQE will still contain -libc::ETIME in the res field
 impl TimeoutFlags {
-  const ABS: Self = Self(bindings::IORING_TIMEOUT_ABS);
+  pub const ABS: Self = Self(bindings::IORING_TIMEOUT_ABS);
 
-  const BOOTTIME: Self = Self(bindings::IORING_TIMEOUT_BOOTTIME);
+  pub const BOOTTIME: Self = Self(bindings::IORING_TIMEOUT_BOOTTIME);
 
-  const REALTIME: Self = Self(bindings::IORING_TIMEOUT_REALTIME);
+  pub const REALTIME: Self = Self(bindings::IORING_TIMEOUT_REALTIME);
 
-  const LINK_TIMEOUT_UPDATE: Self = Self(bindings::IORING_LINK_TIMEOUT_UPDATE);
+  pub const LINK_TIMEOUT_UPDATE: Self =
+    Self(bindings::IORING_LINK_TIMEOUT_UPDATE);
 
-  const ETIME_SUCCESS: Self = Self(bindings::IORING_TIMEOUT_ETIME_SUCCESS);
+  pub const ETIME_SUCCESS: Self = Self(bindings::IORING_TIMEOUT_ETIME_SUCCESS);
 
-  const MULTISHOT: Self = Self(bindings::IORING_TIMEOUT_MULTISHOT);
+  pub const MULTISHOT: Self = Self(bindings::IORING_TIMEOUT_MULTISHOT);
 
   pub fn empty() -> Self {
     Self(0)
