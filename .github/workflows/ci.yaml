@@ -55,28 +55,21 @@ jobs:
       - name: bookkeeping tests
         run: cargo test -p lio --lib
 
-  test-backend-io_uring:
-    name: test-backend-io_uring
-    runs-on: ubuntu-latest
-    needs: [check]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.94.1
-
-      - name: test backend
-        run: cargo test -p lio --test backends io_uring
-
-  test-backend-poller:
-    name: test-backend-poller
+  test-backend:
+    name: test-backend-${{ matrix.backend }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - backend: io_uring
+            os: ubuntu-latest
+            test_filter: io_uring
+          - backend: poller
+            os: ubuntu-latest
+            test_filter: poller
+          - backend: poller
+            os: macos-latest
+            test_filter: poller
 
     needs: [check]
     steps:
@@ -89,6 +82,6 @@ jobs:
           toolchain: 1.94.1
 
       - name: test backend
-        run: cargo test -p lio --test backends poller
+        run: cargo test -p lio --test backends ${{ matrix.test_filter }}
 
   # TODO: test-backend-windows
