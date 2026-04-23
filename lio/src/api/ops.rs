@@ -276,7 +276,6 @@ impl OpModel for Socket {
 impl OneshotOpModel for Socket {}
 
 #[cfg(test)]
-#[cfg(test)]
 impl OpModelContract for Socket {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
@@ -362,7 +361,6 @@ impl OpModel for Accept {
 impl OneshotOpModel for Accept {}
 
 #[cfg(test)]
-#[cfg(test)]
 impl OpModelContract for Accept {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
@@ -424,7 +422,6 @@ impl OpModel for Connect {
 
 impl OneshotOpModel for Connect {}
 
-#[cfg(test)]
 #[cfg(test)]
 impl OpModelContract for Connect {
   impl_op_model_contract_runtime!();
@@ -687,7 +684,6 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Read<B> {
 impl<B: IoBufMutVec + std::marker::Send + Sync> OneshotOpModel for Read<B> {}
 
 #[cfg(test)]
-#[cfg(test)]
 impl OpModelContract for Read<Vec<u8>> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
@@ -718,7 +714,6 @@ impl OpModelContract for Read<Vec<u8>> {
   }
 }
 
-#[cfg(test)]
 #[cfg(test)]
 impl OpModelContract for Read<(Vec<u8>, Vec<u8>)> {
   impl_op_model_contract_runtime!();
@@ -817,7 +812,6 @@ impl<B: IoBufVec + std::marker::Send + Sync> OpModel for Write<B> {
 impl<B: IoBufVec + std::marker::Send + Sync> OneshotOpModel for Write<B> {}
 
 #[cfg(test)]
-#[cfg(test)]
 impl OpModelContract for Write<Vec<u8>> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
@@ -845,7 +839,6 @@ impl OpModelContract for Write<Vec<u8>> {
   }
 }
 
-#[cfg(test)]
 #[cfg(test)]
 impl OpModelContract for Write<(Vec<u8>, Vec<u8>)> {
   impl_op_model_contract_runtime!();
@@ -996,7 +989,6 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Recv<B> {
 impl<B: IoBufMutVec + std::marker::Send + Sync> OneshotOpModel for Recv<B> {}
 
 #[cfg(test)]
-#[cfg(test)]
 impl OpModelContract for Recv<Vec<u8>> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
@@ -1022,7 +1014,6 @@ impl OpModelContract for Recv<Vec<u8>> {
   }
 }
 
-#[cfg(test)]
 #[cfg(test)]
 impl OpModelContract for Recv<(Vec<u8>, Vec<u8>)> {
   impl_op_model_contract_runtime!();
@@ -1141,7 +1132,6 @@ impl<B: IoBufVec + std::marker::Send + Sync> OpModel for Send<B> {
 impl<B: IoBufVec + std::marker::Send + Sync> OneshotOpModel for Send<B> {}
 
 #[cfg(test)]
-#[cfg(test)]
 impl OpModelContract for Send<Vec<u8>> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
@@ -1166,7 +1156,6 @@ impl OpModelContract for Send<Vec<u8>> {
   }
 }
 
-#[cfg(test)]
 #[cfg(test)]
 impl OpModelContract for Send<(Vec<u8>, Vec<u8>)> {
   impl_op_model_contract_runtime!();
@@ -1242,7 +1231,6 @@ impl OpModel for Sleep {
 impl OneshotOpModel for Sleep {}
 
 #[cfg(test)]
-#[cfg(test)]
 impl OpModelContract for Sleep {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
@@ -1305,7 +1293,6 @@ impl OpModel for Interval {
 
 impl StreamOpModel for Interval {}
 
-#[cfg(test)]
 #[cfg(test)]
 impl OpModelContract for Interval {
   impl_op_model_contract_runtime!();
@@ -1461,7 +1448,6 @@ impl OpModel for ReadDir {
 impl OneshotOpModel for ReadDir {}
 
 #[cfg(test)]
-#[cfg(test)]
 impl OpModelContract for ReadDir {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
@@ -1503,7 +1489,6 @@ impl OpModelContract for ReadDir {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 impl OpModelContract for Stat {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
@@ -1520,11 +1505,13 @@ impl OpModelContract for Stat {
         matches!(action, Action::Io(Op::Stat { follow_symlinks: true, .. }))
       },
       |model| {
+        #[allow(clippy::unnecessary_cast)]
+        let mode = (libc::S_IFREG as u32) | 0o644;
         model.out = FileStat {
           file_type: crate::backend::op::FileType::File,
           size: 7,
           permissions: 0o644,
-          mode: (libc::S_IFREG as u32) | 0o644,
+          mode,
           nlink: 1,
           uid: 1000,
           gid: 1000,
@@ -1578,7 +1565,6 @@ impl OpModel for UnlinkAt {
 
 impl OneshotOpModel for UnlinkAt {}
 
-#[cfg(test)]
 #[cfg(test)]
 impl OpModelContract for UnlinkAt {
   impl_op_model_contract_runtime!();
@@ -1653,7 +1639,6 @@ impl OpModel for RenameAt {
 impl OneshotOpModel for RenameAt {}
 
 #[cfg(test)]
-#[cfg(test)]
 impl OpModelContract for RenameAt {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
@@ -1714,7 +1699,6 @@ impl OpModel for MkdirAt {
 
 impl OneshotOpModel for MkdirAt {}
 
-#[cfg(test)]
 #[cfg(test)]
 impl OpModelContract for MkdirAt {
   impl_op_model_contract_runtime!();
@@ -1782,7 +1766,6 @@ impl OpModel for LinkAt {
 
 impl OneshotOpModel for LinkAt {}
 
-#[cfg(test)]
 #[cfg(test)]
 impl OpModelContract for LinkAt {
   impl_op_model_contract_runtime!();
@@ -1916,7 +1899,6 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
 impl<B: IoBufMutVec + std::marker::Send + Sync> OneshotOpModel for GetCwd<B> {}
 
 #[cfg(test)]
-#[cfg(test)]
 impl OpModelContract for GetCwd<Vec<u8>> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
@@ -2017,7 +1999,6 @@ unsafe impl std::marker::Send for Spawn {}
 unsafe impl std::marker::Sync for Spawn {}
 
 #[cfg(all(test, unix))]
-#[cfg(test)]
 impl OpModelContract for Spawn {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
@@ -2041,7 +2022,6 @@ impl OpModelContract for Spawn {
   }
 }
 
-#[cfg(test)]
 #[cfg(test)]
 impl OpModelContract for ReadlinkAt<Vec<u8>> {
   impl_op_model_contract_runtime!();

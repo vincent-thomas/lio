@@ -686,8 +686,7 @@ fn test_concurrent_writes() {
   let mut ring = LioUring::new(32).unwrap();
   let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
 
-  let buffers: Vec<Vec<u8>> =
-    (0..8).map(|i| vec![(i + b'A') as u8; 128]).collect();
+  let buffers: Vec<Vec<u8>> = (0..8).map(|i| vec![i + b'A'; 128]).collect();
 
   // Submit 8 writes at different offsets
   for (i, buf) in buffers.iter().enumerate() {
@@ -709,7 +708,7 @@ fn test_concurrent_writes() {
   // Verify file contents
   let contents = fs::read(&path).unwrap();
   for i in 0usize..8 {
-    let expected = (b'A' + i as u8) as u8;
+    let expected = b'A' + i as u8;
     for j in 0usize..128 {
       assert_eq!(contents[i * 128 + j], expected);
     }

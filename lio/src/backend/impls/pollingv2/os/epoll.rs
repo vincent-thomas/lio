@@ -15,6 +15,8 @@ fn epoll_pwait2_raw(
   timeout: *const libc::timespec,
   sigmask: *const libc::sigset_t,
 ) -> io::Result<i32> {
+  // SAFETY: arguments are forwarded directly to the kernel syscall with the
+  // exact ABI expected by `epoll_pwait2`.
   let res = unsafe {
     libc::syscall(
       libc::SYS_epoll_pwait2,
@@ -30,6 +32,8 @@ fn epoll_pwait2_raw(
   if res >= 0 {
     Ok(res as i32)
   } else {
+    // SAFETY: on Linux, `__errno_location` returns a thread-local pointer to
+    // the current `errno` value set by the failed syscall above.
     let errno = unsafe { *libc::__errno_location() };
     Err(io::Error::from_raw_os_error(errno))
   }
@@ -360,6 +364,7 @@ enum Notifier {
     read_pipe: OwnedFd,
 
     /// The write end of the pipe.
+    #[allow(dead_code)]
     write_pipe: OwnedFd,
   },
 }
@@ -423,6 +428,7 @@ impl Notifier {
     Ok(Notifier::Pipe { read_pipe: read, write_pipe: write })
   }
 
+  #[allow(dead_code)]
   pub fn notify(&self) {
     match self {
       #[cfg(not(target_os = "redox"))]

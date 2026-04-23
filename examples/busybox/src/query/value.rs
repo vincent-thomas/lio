@@ -76,9 +76,10 @@ impl From<f64> for Number {
   }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Value {
+  #[default]
   Null,
   Bool(bool),
   Number(Number),
@@ -175,12 +176,6 @@ impl Value {
 
   pub fn as_f64(&self) -> Option<f64> {
     self.as_number().map(Number::as_f64)
-  }
-}
-
-impl Default for Value {
-  fn default() -> Self {
-    Self::Null
   }
 }
 

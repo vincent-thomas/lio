@@ -712,7 +712,6 @@ fn search_path_parallel(
     let options = options.clone();
     let stop = Arc::clone(&stop);
     let remaining_budget = remaining_budget.as_ref().map(Arc::clone);
-    let full_traversal = full_traversal;
     let outstanding_tasks = Arc::clone(&outstanding_tasks);
     let wake_state = Arc::clone(&wake_state);
     let global_tasks = Arc::clone(&global_tasks);
@@ -1278,6 +1277,7 @@ fn colorize_entry_path(
   rendered
 }
 
+#[allow(dead_code)]
 fn append_colorized_entry_path_lio(
   output: &mut OutputBuffer,
   path: &str,
@@ -1514,11 +1514,13 @@ impl OutputBuffer {
     self.active_style = style;
   }
 
+  #[allow(dead_code)]
   fn push_unstyled_bytes(&mut self, bytes: &[u8]) {
     self.set_style(None);
     self.bytes.extend_from_slice(bytes);
   }
 
+  #[allow(dead_code)]
   fn push_styled_bytes(&mut self, style: &'static str, bytes: &[u8]) {
     self.set_style(Some(style));
     self.bytes.extend_from_slice(bytes);
@@ -1992,7 +1994,7 @@ mod tests {
       ..FdCommand::default()
     };
     let matcher = PatternMatcher::new(&cmd).unwrap();
-    let entries = vec![
+    let entries = [
       StreamWalkEntry {
         path: Path::new("src/doc.rs"),
         depth: 2,

@@ -800,8 +800,10 @@ pub unsafe extern "C" fn lio_openat(
 
   // SAFETY: caller guarantees dir_fd is valid per fn contract
   let dir_resource = unsafe { fd_to_borrowed_resource(dir_fd) };
+  #[allow(clippy::unnecessary_cast)]
+  let mode = mode as u32;
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::openat(&dir_resource, path_owned, flags, mode as u32)
+  api::openat(&dir_resource, path_owned, flags, mode)
     .with_lio(&unsafe { handle(lio) }.inner)
     .when_done(move |res| {
       callback(match res {
@@ -1058,7 +1060,9 @@ pub unsafe extern "C" fn lio_mkdirat(
   }
   let path_cstr = unsafe { std::ffi::CStr::from_ptr(path) }.to_owned();
   let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
-  api::mkdirat(&dir_res, path_cstr, mode.into())
+  #[allow(clippy::unnecessary_cast)]
+  let mode = mode as u32;
+  api::mkdirat(&dir_res, path_cstr, mode)
     .with_lio(&unsafe { handle(lio) }.inner)
     .when_done(move |res| {
       callback(match res {

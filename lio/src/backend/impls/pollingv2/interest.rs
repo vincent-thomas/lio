@@ -17,10 +17,13 @@ impl Interest {
   #[allow(dead_code)]
   pub const READ_AND_WRITE: Self =
     Self { bits: Self::READ.bits | Self::WRITE.bits };
+  #[allow(dead_code)]
   pub const TIMER: Self = Self { bits: 1 << 2 };
   /// File/directory change notification (kqueue EVFILT_VNODE, inotify on Linux)
+  #[allow(dead_code)]
   pub const VNODE: Self = Self { bits: 1 << 3 };
   /// Signal notification (kqueue EVFILT_SIGNAL, signalfd on Linux)
+  #[allow(dead_code)]
   pub const SIGNAL: Self = Self { bits: 1 << 4 };
 
   pub const fn is_readable(self) -> bool {
@@ -31,6 +34,7 @@ impl Interest {
     self.bits & Self::WRITE.bits != 0
   }
 
+  #[allow(dead_code)]
   pub const fn is_timer(self) -> bool {
     self.bits & Self::TIMER.bits != 0
   }
