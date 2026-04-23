@@ -6,6 +6,3 @@ description = "Shared contract-test helpers for lio backends and op models"
 license = "MIT"
 repository = "https://github.com/vincent-thomas/lio"
 documentation = "https://docs.rs/lio-test"
-
-[dependencies]
-lio = {path = "../lio"}

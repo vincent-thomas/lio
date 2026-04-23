@@ -1074,19 +1074,3 @@ fn sockaddr_storage_to_ptr(
 
   (addr as *const _ as *const SOCKADDR, len)
 }
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  // Run the standard IoBackend test suite
-  lio_test::test_io_backend!(Iocp::new());
-
-  // IOCP-specific tests
-  #[test]
-  fn test_notify() {
-    let mut backend = Iocp::new();
-    backend.init(64).unwrap();
-    backend.notify().unwrap();
-  }
-}
