@@ -333,7 +333,9 @@ pub unsafe extern "C" fn lio_read_at(
   offset: i64,
   callback: extern "C" fn(libc::c_int, *mut u8, usize),
 ) {
-  // SAFETY: C caller transfers malloc ownership of buf with size buf_len
+  // SAFETY: caller transfers ownership of a buffer allocated by
+  // `lio_buf_alloc(buf_len)`, which matches the `Vec<u8>` layout reconstructed
+  // here.
   let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
@@ -501,8 +503,8 @@ pub unsafe extern "C" fn lio_accept(
 /// - `callback(result, buf, len)`: bytes sent (or negative errno), buffer
 ///
 /// # Safety
-/// `lio` must be valid; `buf` must be at least `buf_len` bytes allocated with
-/// `malloc`.
+/// `lio` must be valid; `buf` must point to at least `buf_len` bytes allocated
+/// with `malloc`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_send(
   lio: *mut lio_handle_t,
@@ -539,8 +541,8 @@ pub unsafe extern "C" fn lio_send(
 /// - `callback(result, buf, len)`: bytes received (or negative errno), buffer
 ///
 /// # Safety
-/// `lio` must be valid; `buf` must be at least `buf_len` bytes allocated with
-/// `malloc`.
+/// `lio` must be valid; `buf` must be a live buffer previously allocated by
+/// [`lio_buf_alloc(buf_len)`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_recv(
   lio: *mut lio_handle_t,
@@ -550,7 +552,9 @@ pub unsafe extern "C" fn lio_recv(
   flags: libc::c_int,
   callback: extern "C" fn(libc::c_int, *mut u8, usize),
 ) {
-  // SAFETY: C caller transfers malloc ownership of buf with size buf_len
+  // SAFETY: caller transfers ownership of a buffer allocated by
+  // `lio_buf_alloc(buf_len)`, which matches the `Vec<u8>` layout reconstructed
+  // here.
   let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };

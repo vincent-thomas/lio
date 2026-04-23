@@ -347,20 +347,22 @@ impl File {
   /// ```
   #[cfg(unix)]
   pub fn metadata(&self) -> io::Result<Metadata> {
+    use std::mem::MaybeUninit;
     use std::os::fd::AsRawFd;
     let fd = self.0.as_raw_fd();
 
-    // SAFETY: stat struct can be safely zero-initialized
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
 
-    // SAFETY: fd is valid, stat is a valid mutable pointer
-    let ret = unsafe { libc::fstat(fd, &mut stat) };
+    // SAFETY: fd is valid and `stat` points to writable output storage for the
+    // duration of the call.
+    let ret = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
 
     if ret < 0 {
       return Err(io::Error::last_os_error());
     }
 
-    Ok(Metadata { stat })
+    // SAFETY: successful `fstat` initialized `stat`.
+    Ok(Metadata { stat: unsafe { stat.assume_init() } })
   }
 }
 
