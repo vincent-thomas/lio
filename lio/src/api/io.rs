@@ -50,9 +50,7 @@
 //! delegating I/O completion handling to dedicated threads.
 
 use crate::{
-  api::op::OpModel,
-  driver, driver::Lio,
-  registration::Registration,
+  api::op::OpModel, driver, driver::Lio, registration::Registration,
 };
 
 use std::{
