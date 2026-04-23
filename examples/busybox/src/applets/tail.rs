@@ -588,6 +588,7 @@ fn tail_lines_from_start_stream(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn tail_bytes_from_start_fd(
   ctx: &AppContext,
   fd: &lio::api::resource::Resource,

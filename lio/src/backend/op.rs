@@ -688,6 +688,7 @@ impl FileStat {
 }
 
 #[cfg(all(feature = "backend_impls", unix))]
+#[allow(clippy::useless_conversion)]
 pub(crate) fn file_stat_from_raw(stat: &libc::stat) -> FileStat {
   let file_type = match stat.st_mode & libc::S_IFMT {
     libc::S_IFREG => FileType::File,
@@ -703,9 +704,9 @@ pub(crate) fn file_stat_from_raw(stat: &libc::stat) -> FileStat {
   FileStat {
     file_type,
     size: stat.st_size as u64,
-    permissions: (stat.st_mode & 0o7777) as u32,
-    mode: stat.st_mode as u32,
-    nlink: stat.st_nlink as u64,
+    permissions: (stat.st_mode & 0o7777).into(),
+    mode: stat.st_mode.into(),
+    nlink: stat.st_nlink.into(),
     uid: stat.st_uid,
     gid: stat.st_gid,
   }

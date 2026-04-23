@@ -1246,7 +1246,11 @@ fn device_id(path: &Path) -> io::Result<u64> {
   }
 
   let stat = unsafe { stat.assume_init() };
-  Ok(stat.st_dev as u64)
+  // `st_dev` is target-dependent: on some targets it is already `u64`, while
+  // on others it is narrower. Keep a single conversion here and silence the
+  // targets where Clippy sees it as redundant.
+  #[allow(clippy::useless_conversion)]
+  Ok(stat.st_dev.into())
 }
 
 #[cfg(unix)]

@@ -2174,18 +2174,16 @@ impl SearchEngine {
           &exact_span,
         )?;
       }
+    } else if spans.is_empty() {
+      sink.emit_plain_match(path, line_number, absolute_offset, line)?;
     } else {
-      if spans.is_empty() {
-        sink.emit_plain_match(path, line_number, absolute_offset, line)?;
-      } else {
-        sink.emit_match_line(
-          path,
-          line_number,
-          absolute_offset,
-          line,
-          if plan.config.search.invert_match { &[] } else { spans },
-        )?;
-      }
+      sink.emit_match_line(
+        path,
+        line_number,
+        absolute_offset,
+        line,
+        if plan.config.search.invert_match { &[] } else { spans },
+      )?;
     }
 
     Ok(())

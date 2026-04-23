@@ -3,7 +3,7 @@
 use lio_uring::LioUring;
 use lio_uring::operation::*;
 use std::io::{Read as IoRead, Write as IoWrite};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::thread;
 use std::time::Duration;
@@ -212,8 +212,8 @@ fn test_send_recv() {
   let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
 
   // Connect client
-  let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-  let (mut server_stream, _) = listener.accept().unwrap();
+  let client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+  let (server_stream, _) = listener.accept().unwrap();
 
   let mut ring = LioUring::new(8).unwrap();
 
@@ -480,7 +480,7 @@ fn test_echo_server_pattern() {
   });
 
   // Server using io_uring
-  let (mut server_stream, _) = listener.accept().unwrap();
+  let (server_stream, _) = listener.accept().unwrap();
   let mut ring = LioUring::new(8).unwrap();
 
   // Recv

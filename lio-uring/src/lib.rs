@@ -158,10 +158,6 @@ impl std::ops::BitOr for SqeFlags {
 pub struct Entry(pub(crate) bindings::io_uring_sqe);
 
 impl Entry {
-  pub(crate) fn from_sqe(sqe: bindings::io_uring_sqe) -> Self {
-    Self(sqe)
-  }
-
   pub(crate) fn into_sqe(self) -> bindings::io_uring_sqe {
     self.0
   }

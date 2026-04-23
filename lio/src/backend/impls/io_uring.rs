@@ -25,6 +25,8 @@ use crate::slab::{Slab, SlabKey};
 
 const STATX_BASIC_STATS: u32 = 0x0000_07ff;
 const LINUX_DIRENT64_NAME_OFFSET: usize = 19;
+type CurrentDirent<'a> = (u64, u8, usize, &'a [u8]);
+
 #[derive(Debug)]
 struct PendingOp {
   registration_id: u64,
@@ -42,6 +44,8 @@ struct NativeMsgState {
 
 impl NativeMsgState {
   fn from_recv(msg: &crate::backend::op::MsgRecv) -> Option<Self> {
+    // SAFETY: `MsgRecv` validation guarantees `bufs` points to `buf_count`
+    // live `RawBuf` entries for the duration of lowering.
     let bufs = unsafe {
       std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
     };
@@ -50,6 +54,8 @@ impl NativeMsgState {
         crate::buf::MAX_IOV_COUNT],
       iov_count: bufs.len(),
       addr: None,
+      // SAFETY: `libc::msghdr` is a plain C struct and zero is a valid
+      // sentinel initialization before we fill its pointer fields.
       hdr: unsafe { mem::zeroed() },
     };
 
@@ -60,6 +66,8 @@ impl NativeMsgState {
 
     if msg.from {
       state.addr = Some((
+        // SAFETY: zeroed `sockaddr_storage` is valid scratch storage before a
+        // socket syscall writes an address into it.
         unsafe { mem::zeroed::<libc::sockaddr_storage>() },
         mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
       ));
@@ -69,6 +77,8 @@ impl NativeMsgState {
   }
 
   fn from_send(msg: &crate::backend::op::MsgSend) -> Option<Self> {
+    // SAFETY: `MsgSend` validation guarantees `bufs` points to `buf_count`
+    // live `RawBuf` entries for the duration of lowering.
     let bufs = unsafe {
       std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
     };
@@ -77,6 +87,8 @@ impl NativeMsgState {
         crate::buf::MAX_IOV_COUNT],
       iov_count: bufs.len(),
       addr: msg.to.map(crate::backend::op::socket_addr_to_storage),
+      // SAFETY: `libc::msghdr` is a plain C struct and zero is a valid
+      // sentinel initialization before we fill its pointer fields.
       hdr: unsafe { mem::zeroed() },
     };
 
@@ -134,6 +146,8 @@ impl NativeRwState {
     iovecs: std::ptr::NonNull<crate::backend::op::RawBuf>,
     iov_count: usize,
   ) -> Option<Self> {
+    // SAFETY: op validation guarantees `iovecs` references `iov_count`
+    // contiguous `RawBuf` entries that stay live through lowering.
     let raws =
       unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) };
     let mut state = Self {
@@ -169,6 +183,8 @@ struct NativeStatState {
 
 impl NativeStatState {
   fn new(out: std::ptr::NonNull<crate::backend::op::FileStat>) -> Self {
+    // SAFETY: `statx` is a POD output struct written by the kernel before
+    // being read during finalize.
     Self { statx: unsafe { mem::zeroed() }, out }
   }
 
@@ -188,10 +204,12 @@ impl NativeStatState {
       _ => crate::backend::op::FileType::Unknown,
     };
 
+    // SAFETY: `out` was provided by the caller as writable output storage and
+    // remains valid until the operation is finalized.
     unsafe {
       *self.out.as_ptr() = crate::backend::op::FileStat {
         file_type,
-        size: self.statx.stx_size as u64,
+        size: self.statx.stx_size,
         permissions: (self.statx.stx_mode as u32) & 0o7777,
         mode: self.statx.stx_mode as u32,
         nlink: self.statx.stx_nlink as u64,
@@ -207,6 +225,8 @@ impl NativeSocketState {
     out: std::ptr::NonNull<crate::backend::op::SocketAddrBuf>,
   ) -> Self {
     Self {
+      // SAFETY: zeroed `sockaddr_storage` is valid scratch storage before
+      // `accept` writes the peer address into it.
       storage: unsafe { mem::zeroed() },
       len: mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
       kind: NativeSocketKind::Accept { out },
@@ -270,15 +290,23 @@ impl LoweredState {
     match self {
       Self::Plain => IoUring::create_plain_entry(op),
       Self::Rw(state) => {
+        // SAFETY: `state` points into the bump arena backing this lowered op
+        // and remains valid until submission finishes.
         IoUring::create_rw_entry(op, unsafe { state.as_ref() })
       }
       Self::Msg(state) => {
+        // SAFETY: `state` points into the bump arena backing this lowered op
+        // and remains valid until submission finishes.
         IoUring::create_msg_entry(op, unsafe { state.as_ref() })
       }
       Self::Socket(state) => {
+        // SAFETY: `state` points into the bump arena backing this lowered op
+        // and remains valid until submission finishes.
         IoUring::create_socket_entry(op, unsafe { state.as_ref() })
       }
       Self::Stat(state) => {
+        // SAFETY: `state` points into the bump arena backing this lowered op
+        // and remains valid until submission finishes.
         IoUring::create_stat_entry(op, unsafe { state.as_ref() })
       }
     }
@@ -290,6 +318,8 @@ impl LoweredState {
     }
     match self {
       Self::Socket(state) => {
+        // SAFETY: `state` points to the still-live lowered socket state for
+        // this completion.
         let state = unsafe { state.as_ref() };
         let NativeSocketKind::Accept { out } = state.kind else {
           return;
@@ -298,18 +328,26 @@ impl LoweredState {
           &state.storage,
           state.len,
         ) {
+          // SAFETY: `out` is caller-provided writable output storage that
+          // remains valid until completion processing.
           unsafe {
             *out.as_ptr() = addr;
           }
         }
       }
-      Self::Stat(state) => unsafe { state.as_ref() }.finalize(),
+      Self::Stat(state) => {
+        // SAFETY: `state` points to the still-live lowered stat state for this
+        // completion.
+        unsafe { state.as_ref() }.finalize()
+      }
       _ => {}
     }
   }
 
   fn prepare(self) {
     if let Self::Msg(mut state) = self {
+      // SAFETY: `state` points into the bump arena backing this lowered op and
+      // is uniquely borrowed during preparation.
       unsafe { state.as_mut() }.refresh_pointers();
     }
   }
@@ -442,7 +480,7 @@ impl IoUring {
 
   fn current_dirent(
     state: &ReadDirState,
-  ) -> io::Result<Option<(u64, u8, usize, &[u8])>> {
+  ) -> io::Result<Option<CurrentDirent<'_>>> {
     if state.cursor == state.filled {
       return Ok(None);
     }
@@ -459,6 +497,8 @@ impl IoUring {
     // these unaligned field loads are within bounds of the current dirent.
     let ino =
       unsafe { std::ptr::read_unaligned(remaining.as_ptr().cast::<u64>()) };
+    // SAFETY: `remaining` still points at the current dirent and byte 16 is
+    // within bounds for a valid `linux_dirent64` header.
     let reclen = unsafe {
       std::ptr::read_unaligned(remaining.as_ptr().add(16).cast::<u16>())
     } as usize;
@@ -472,6 +512,8 @@ impl IoUring {
     }
 
     let name_field = &remaining[LINUX_DIRENT64_NAME_OFFSET..reclen];
+    // SAFETY: `name_field` is a valid byte slice; `memchr` reads at most its
+    // length and returns either null or a pointer inside the slice.
     let name_len = unsafe {
       let nul = libc::memchr(name_field.as_ptr().cast(), 0, name_field.len());
       if nul.is_null() {
@@ -829,6 +871,8 @@ impl IoUring {
       *sq_space_left = self.ring().sq_space_left();
     }
     let io_uring_entry = pending.lowered.create_entry(&pending.op);
+    // SAFETY: `io_uring_entry` references buffers owned by `pending`, which
+    // stays in the slab until completion processing removes it.
     unsafe { self.ring().push(io_uring_entry, id) }?;
     *sq_space_left = sq_space_left.saturating_sub(1);
     Ok(())
@@ -837,6 +881,8 @@ impl IoUring {
   fn execute_immediate(op: &Op) -> Option<io::Result<isize>> {
     match op {
       Op::ReadlinkAt { dir_fd, path, buf, buf_len } => {
+        // SAFETY: pointers come directly from validated op arguments and remain
+        // valid for the duration of this synchronous syscall.
         let result = unsafe {
           libc::readlinkat(
             dir_fd.as_raw_fd(),
@@ -852,12 +898,16 @@ impl IoUring {
         })
       }
       Op::GetCwd { buf, buf_len } => {
+        // SAFETY: `buf` is caller-provided writable storage of length
+        // `buf_len`, valid for this synchronous libc call.
         let result = unsafe {
           libc::getcwd(buf.as_ptr().cast::<libc::c_char>(), *buf_len)
         };
         Some(if result.is_null() {
           Err(io::Error::last_os_error())
         } else {
+          // SAFETY: `getcwd` returned a valid NUL-terminated pointer into
+          // `buf`, so `strlen` may read until the first terminator.
           Ok(unsafe { libc::strlen(result) as isize })
         })
       }
@@ -871,12 +921,20 @@ impl IoUring {
         opaque_drop,
         out,
       } => {
+        // SAFETY: `raw_buf` points to `raw_cap` writable bytes owned by the
+        // caller for the duration of this synchronous immediate operation.
         let raw =
           unsafe { std::slice::from_raw_parts_mut(raw_buf.as_ptr(), *raw_cap) };
+        // SAFETY: `entries` points to `entries_cap` writable `DirEntryRef`
+        // slots owned by the caller for the duration of this call.
         let entries = unsafe {
           std::slice::from_raw_parts_mut(entries.as_ptr(), *entries_cap)
         };
+        // SAFETY: `opaque` is an out-parameter pointing to caller-owned state
+        // storage used to persist `ReadDirState` across calls.
         let opaque = unsafe { &mut *opaque.as_ptr() };
+        // SAFETY: `opaque_drop` is an out-parameter paired with `opaque` and
+        // points to caller-owned storage for the drop hook.
         let opaque_drop = unsafe { &mut *opaque_drop.as_ptr() };
         Some(
           match Self::read_dir_entries(
@@ -887,6 +945,8 @@ impl IoUring {
             entries,
           ) {
             Ok(result) => {
+              // SAFETY: `out` points to caller-provided writable output
+              // storage for the immediate result.
               unsafe {
                 *out.as_ptr() = result;
               }
@@ -905,8 +965,12 @@ impl IoUring {
         let envp = if let Some(envp) = envp {
           envp.as_ptr().cast_const()
         } else {
+          // SAFETY: `environ` is the process-global environment pointer
+          // provided by libc and is valid to read here.
           unsafe { environ as *const *mut libc::c_char }
         };
+        // SAFETY: all pointers are passed directly from validated op inputs and
+        // remain valid for this synchronous `posix_spawn` call.
         let result = unsafe {
           libc::posix_spawn(
             &mut pid,
