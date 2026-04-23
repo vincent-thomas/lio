@@ -565,7 +565,7 @@ fn collect_matched_entry_modes(
     })
     .collect();
   let stats = io_util::run_all(ctx.lio(), receivers?);
-  for (index, result) in file_indices.into_iter().zip(stats.into_iter()) {
+  for (index, result) in file_indices.into_iter().zip(stats) {
     entries[index].mode = Some(result?.mode);
   }
   Ok(())
@@ -1416,7 +1416,7 @@ fn collect_file_modes(
     })
     .collect();
   let stats = io_util::run_all(ctx.lio(), receivers?);
-  for (index, result) in stat_indices.into_iter().zip(stats.into_iter()) {
+  for (index, result) in stat_indices.into_iter().zip(stats) {
     entries[index].mode = Some(result?.mode);
   }
   Ok(())
