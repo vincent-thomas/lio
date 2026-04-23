@@ -211,11 +211,6 @@ impl ReadinessPoll for OsPoller {
     self.add_inner(fd, key, interest, true)
   }
 
-  #[cfg(test)]
-  fn modify(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
-    self.modify_interest(fd, key, interest)
-  }
-
   fn delete(&self, fd: RawFd) -> io::Result<()> {
     // For EPOLL_CTL_DEL, event pointer can be NULL in Linux 2.6.9+
     match syscall!(epoll_ctl(
@@ -318,12 +313,6 @@ impl ReadinessPoll for OsPoller {
     }
 
     Ok(write_idx)
-  }
-
-  #[cfg(test)]
-  fn notify(&self) -> io::Result<()> {
-    self.notifier.notify();
-    Ok(())
   }
 
   fn event_key(event: &Self::NativeEvent) -> u64 {
@@ -429,7 +418,7 @@ impl Notifier {
   }
 
   #[allow(dead_code)]
-  pub fn notify(&self) {
+  fn notify(&self) {
     match self {
       #[cfg(not(target_os = "redox"))]
       Self::EventFd(fd) => {
@@ -484,5 +473,6 @@ impl Notifier {
 // #[cfg(test)]
 // mod tests {
 //   use super::*;
+//
 //   crate::test_readiness_poll_contract!(OsPoller::new().unwrap());
 // }
