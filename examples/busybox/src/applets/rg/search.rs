@@ -737,7 +737,7 @@ impl SearchEngine {
     let profiling_enabled = env::var_os("BUSYBOX_RG_PROFILE").is_some();
     let mut handles = Vec::with_capacity(assignments.len());
     for (worker_index, (assignment, local_queue)) in
-      assignments.into_iter().zip(local_queues.into_iter()).enumerate()
+      assignments.into_iter().zip(local_queues).enumerate()
     {
       let outstanding_tasks = Arc::clone(&outstanding_tasks);
       let global_tasks = Arc::clone(&global_tasks);
@@ -1656,10 +1656,8 @@ impl SearchEngine {
           usize::from(matched),
         )?;
       }
-      MatchMode::FilesWithMatches if matched => {
-        if include_path {
-          sink.emit_file_match(display_path.to_owned())?;
-        }
+      MatchMode::FilesWithMatches if matched && include_path => {
+        sink.emit_file_match(display_path.to_owned())?;
       }
       MatchMode::FilesWithoutMatch if !matched => {
         sink.emit_file_without_match(display_path.to_owned())?;

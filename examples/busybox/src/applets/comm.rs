@@ -183,13 +183,8 @@ impl Command for CommCommand {
 fn comm_prefix(options: &CommOptions, column: u8) -> &'static str {
   match column {
     1 => "",
-    2 => {
-      if options.show_left {
-        "\t"
-      } else {
-        ""
-      }
-    }
+    2 if options.show_left => "\t",
+    2 => "",
     3 => match (options.show_left, options.show_right) {
       (true, true) => "\t\t",
       (true, false) | (false, true) => "\t",

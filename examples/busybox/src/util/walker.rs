@@ -667,17 +667,13 @@ impl FileWalker {
       let paths: Vec<_> =
         read_indices.iter().map(|&index| shards[index].path.clone()).collect();
       let read_results = fs_util::read_dir_paths(ctx, &paths)?;
-      for (index, entries) in
-        read_indices.into_iter().zip(read_results.into_iter())
-      {
+      for (index, entries) in read_indices.into_iter().zip(read_results) {
         prefetched_entries[index] = Some(entries);
       }
     }
     let mut results = Vec::with_capacity(shards.len());
 
-    for (shard, dir_entries) in
-      shards.into_iter().zip(prefetched_entries.into_iter())
-    {
+    for (shard, dir_entries) in shards.into_iter().zip(prefetched_entries) {
       let mut state = WalkState::default();
       let root_device = if self.options.one_file_system {
         Some(self.device_id_cached(&mut state, &shard.path)?)
@@ -996,10 +992,8 @@ impl FileWalker {
         self.walk_io_error(failed_path.unwrap_or(parent_path), err)
       })?;
     let mut prefetched = HashMap::with_capacity(child_indices.len());
-    for ((idx, child_path), dir_entries) in child_indices
-      .into_iter()
-      .zip(child_paths.into_iter())
-      .zip(child_entries.into_iter())
+    for ((idx, child_path), dir_entries) in
+      child_indices.into_iter().zip(child_paths).zip(child_entries)
     {
       let frame = self
         .prepare_directory_frame_from_entries(
