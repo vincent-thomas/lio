@@ -172,27 +172,22 @@ macro_rules! syscall {
       }
       else {
         // Return negative errno - this will cause early return from function
+        //
         #[cfg(target_os = "linux")]
-        {
-          // SAFETY: This exists on the platform in cfg.
-          let errno = unsafe { *libc::__errno_location() };
-          -(errno as isize)
-        }
+        // SAFETY: This exists on the platform in cfg.
+        let err = unsafe { *libc::__errno_location() };
         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-        {
-          // SAFETY: This exists on the platform in cfg.
-          let errno = unsafe { *libc::__error() };
-          -(errno as isize)
-        }
+        // SAFETY: This exists on the platform in cfg.
+        let err = unsafe { *libc::__error() };
         #[cfg(windows)]
-        {
-          // SAFETY: This exists on the platform in cfg.
-          let last_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-          -(last_error as isize)
-        }
+        // SAFETY: This exists on the platform in cfg.
+        let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+
+        -(err as isize)
       }
     }
   }};
+
   ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
       let result = syscall!(raw $fn($($arg),*));
       if result >= 0 {

@@ -300,7 +300,7 @@ impl ChildStdout {
       resource: self.inner.clone(),
       accumulated: Vec::new(),
       buffer: vec![0u8; 8192],
-      iovec: unsafe { std::mem::zeroed() },
+      iovec: libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 },
       done: false,
     })
   }
@@ -381,7 +381,7 @@ impl ChildStderr {
       resource: self.inner.clone(),
       accumulated: Vec::new(),
       buffer: vec![0u8; 8192],
-      iovec: unsafe { std::mem::zeroed() },
+      iovec: libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 },
       done: false,
     })
   }
@@ -709,15 +709,16 @@ impl SpawnChild {
       return Ok(());
     }
 
-    // Initialize file actions
-    // SAFETY: posix_spawn_file_actions_t is safe to zero-initialize
-    let mut file_actions: libc::posix_spawn_file_actions_t =
-      unsafe { std::mem::zeroed() };
-    // SAFETY: file_actions is a valid pointer to uninitialized posix_spawn_file_actions_t
-    let ret = unsafe { libc::posix_spawn_file_actions_init(&mut file_actions) };
+    let mut file_actions =
+      std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
+    // SAFETY: `file_actions` points to writable storage that
+    // `posix_spawn_file_actions_init` initializes on success.
+    let ret = unsafe { libc::posix_spawn_file_actions_init(file_actions.as_mut_ptr()) };
     if ret != 0 {
       return Err(io::Error::from_raw_os_error(ret));
     }
+    // SAFETY: successful `posix_spawn_file_actions_init` initialized the value.
+    let mut file_actions = unsafe { file_actions.assume_init() };
 
     // Open /dev/null if needed
     let needs_null = self.stdin_cfg == Stdio::Null

@@ -235,10 +235,7 @@ impl ReadinessPoll for OsPoller {
   ) -> io::Result<usize> {
     /// `timespec` value that equals zero.
     #[cfg(not(target_os = "redox"))]
-    // SAFETY: All-zeros is a valid representation of timespec (all integer fields)
-    const TS_ZERO: libc::timespec = unsafe {
-      std::mem::transmute([0u8; std::mem::size_of::<libc::timespec>()])
-    };
+    const TS_ZERO: libc::timespec = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     #[cfg(not(target_os = "redox"))]
     if let Some(ref timer_fd) = self.timer_fd {
       // Configure the timeout using timerfd.

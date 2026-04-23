@@ -71,7 +71,7 @@ struct IocpOpState {
 
 impl IocpOpState {
   fn new(op_id: u64) -> Box<Self> {
-    Box::new(Self { overlapped: unsafe { std::mem::zeroed() }, op_id })
+    Box::new(Self { overlapped: OVERLAPPED::default(), op_id })
   }
 
   /// Get the OVERLAPPED pointer for this state.
@@ -156,7 +156,7 @@ impl Iocp {
   /// Ensure WSA is initialized (for socket operations).
   fn ensure_wsa(&mut self) -> io::Result<()> {
     if !self.wsa_initialized {
-      let mut wsa_data: WSADATA = unsafe { std::mem::zeroed() };
+      let mut wsa_data = WSADATA::default();
       let result = unsafe { WSAStartup(0x0202, &mut wsa_data) };
       if result != 0 {
         return Err(io::Error::from_raw_os_error(result));
@@ -362,8 +362,7 @@ impl Iocp {
         let handle = fd.as_raw_handle() as HANDLE;
 
         // Lock the entire file (0 to u64::MAX)
-        // SAFETY: Creating a zeroed OVERLAPPED is valid for LockFileEx
-        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        let mut overlapped = OVERLAPPED::default();
 
         if *operation & lock::LOCK_UN != 0 {
           // Unlock

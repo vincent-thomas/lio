@@ -246,19 +246,13 @@ impl Poller {
   ) -> io::Result<ReadDirResult> {
     let mut created_here = false;
     let dir = if opaque.is_null() {
-      // SAFETY: `fd` is a live directory file descriptor supplied by the caller.
-      let dup_fd = unsafe { libc::dup(fd) };
-      if dup_fd < 0 {
-        return Err(io::Error::last_os_error());
-      }
+      let dup_fd = syscall!(dup(fd))?;
+
       // SAFETY: `dup_fd` is a valid duplicated directory descriptor.
       let dir = unsafe { libc::fdopendir(dup_fd) };
       if dir.is_null() {
         let err = io::Error::last_os_error();
-        // SAFETY: `dup_fd` is still locally owned on this error path.
-        unsafe {
-          libc::close(dup_fd);
-        }
+        let _ = syscall!(close(dup_fd));
         return Err(err);
       }
       *opaque = dir.cast();
@@ -341,23 +335,19 @@ impl Poller {
     match result {
       Ok(entries) => {
         if entries.eof {
-          // SAFETY: `dir` is an owned directory stream being closed exactly once.
-          let close_result = unsafe { libc::closedir(dir) };
+          let close_result = syscall!(closedir(dir));
           *opaque = std::ptr::null_mut();
           *opaque_drop = None;
-          if close_result < 0 {
-            Err(io::Error::last_os_error())
-          } else {
-            Ok(entries)
-          }
+
+          let _ = close_result?;
+          Ok(entries)
         } else {
           Ok(entries)
         }
       }
       Err(err) => {
         if !created_here || !dir.is_null() {
-          // SAFETY: `dir` is an owned directory stream being closed on error.
-          let _ = unsafe { libc::closedir(dir) };
+          let _ = syscall!(raw closedir(dir));
           *opaque = std::ptr::null_mut();
           *opaque_drop = None;
         }
@@ -430,8 +420,15 @@ impl Poller {
       None
     };
 
-    // SAFETY: `msghdr` is POD and may be zero-initialized before field assignment.
-    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    let mut hdr = libc::msghdr {
+      msg_name: std::ptr::null_mut(),
+      msg_namelen: 0,
+      msg_iov: std::ptr::null_mut(),
+      msg_iovlen: 0,
+      msg_control: std::ptr::null_mut(),
+      msg_controllen: 0,
+      msg_flags: 0,
+    };
     hdr.msg_iov = iovecs.as_mut_ptr();
     hdr.msg_iovlen = bufs.len() as _;
     if let Some((storage, len)) = addr.as_mut() {
@@ -457,8 +454,15 @@ impl Poller {
     }
 
     let mut addr = msg.to.map(crate::backend::op::socket_addr_to_storage);
-    // SAFETY: `msghdr` is POD and may be zero-initialized before field assignment.
-    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    let mut hdr = libc::msghdr {
+      msg_name: std::ptr::null_mut(),
+      msg_namelen: 0,
+      msg_iov: std::ptr::null_mut(),
+      msg_iovlen: 0,
+      msg_control: std::ptr::null_mut(),
+      msg_controllen: 0,
+      msg_flags: 0,
+    };
     hdr.msg_iov = iovecs.as_mut_ptr();
     hdr.msg_iovlen = bufs.len() as _;
     if let Some((storage, len)) = addr.as_mut() {
@@ -557,11 +561,11 @@ impl Poller {
 
       // Emulate RWF_APPEND: write at end of file
       let write_offset = if has_append {
-        // SAFETY: `libc::stat` is POD and may be zero-initialized.
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        let result = syscall!(raw fstat(fd, &mut stat)?);
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let result = syscall!(raw fstat(fd, stat.as_mut_ptr())?);
         assert_eq!(result, 0);
-        stat.st_size as i64
+        // SAFETY: successful `fstat` initialized `stat`.
+        unsafe { stat.assume_init() }.st_size
       } else {
         offset
       };
@@ -651,11 +655,12 @@ impl Poller {
       _ => return false,
     };
 
-    // SAFETY: `libc::stat` is POD and may be zero-initialized.
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    if syscall!(raw fstat(fd, &mut stat)) < 0 {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if syscall!(raw fstat(fd, stat.as_mut_ptr())) < 0 {
       return false;
     }
+    // SAFETY: successful `fstat` initialized `stat`.
+    let stat = unsafe { stat.assume_init() };
 
     (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
   }
@@ -803,17 +808,18 @@ impl Poller {
         *mode,
       )),
       Op::Stat { dir_fd, path, follow_symlinks, out } => {
-        // SAFETY: `libc::stat` is POD and may be zero-initialized.
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         let flags =
           if *follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
         let result = syscall!(raw fstatat(
           dir_fd.as_raw_fd(),
           path.as_ptr(),
-          &mut stat,
+          stat.as_mut_ptr(),
           flags,
         ));
         if result >= 0 {
+          // SAFETY: successful `fstatat` initialized `stat`.
+          let stat = unsafe { stat.assume_init() };
           // SAFETY: `out` points to caller-provided writable result storage.
           unsafe {
             *out.as_ptr() = crate::backend::op::file_stat_from_raw(&stat);
