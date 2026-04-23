@@ -10,8 +10,8 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
-  check:
-    name: check
+  nix-check:
+    name: nix-check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -22,6 +22,16 @@ jobs:
       - uses: DeterminateSystems/flake-checker-action@main
       - name: nix flake check
         run: nix flake check '.?submodules=1&shallow=0'
+
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: DeterminateSystems/nix-installer-action@main
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -42,7 +52,7 @@ jobs:
   test-bookkeeping:
     name: test-bookkeeping
     runs-on: ubuntu-latest
-    needs: [check]
+    needs: [check, nix-check]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -71,7 +81,7 @@ jobs:
             os: macos-latest
             test_filter: poller
 
-    needs: [check]
+    needs: [check, nix-check]
     steps:
       - uses: actions/checkout@v6
         with:
