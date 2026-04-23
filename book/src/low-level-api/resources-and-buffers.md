@@ -73,16 +73,14 @@ Because the operation layer is close to the syscall layer, `lio` often asks you 
 
 That explicitness is not noise around the real API. It is part of how the crate keeps ownership and lifecycle rules visible in user code instead of burying them in runtime internals.
 
-## Reusing channels versus reusing buffers
+## The core ownership pattern
 
-The old chapter title in this slot focused on channel reuse. Channel reuse exists, but it is not the first thing most readers need to understand.
-
-The deeper pattern is:
+The most important pattern to understand is:
 
 - resources are reference-counted wrappers around OS objects
 - buffers are owned by operations while in flight
 - results often return both status and ownership
 
-Once those ideas are clear, channel reuse becomes an ordinary coordination technique rather than a design center.
+Once those ideas are clear, techniques like channel reuse become ordinary coordination patterns rather than mysterious magic.
 
 After ownership is clear, the next question is how those completed operations should be delivered back into your program. That is where the completion models fit.

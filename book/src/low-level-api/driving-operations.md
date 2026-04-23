@@ -4,6 +4,8 @@ The central fact to understand about `lio` is this:
 
 **submitting work and driving progress are separate responsibilities.**
 
+If you only absorb one idea from this chapter, absorb that one. The rest is mainly an explanation of what follows from it.
+
 ## What “driving” means
 
 When an operation is consumed, `lio` registers it and dispatches backend work. But completions are processed only when the driver runs.
@@ -18,7 +20,8 @@ Everything else in the crate assumes you understand when those methods are calle
 
 ## The common loop
 
-```rust,no_run
+```rust,no_run,edition2024
+# extern crate lio;
 # use lio::{Lio, api};
 # fn drive_until_done<T>(lio: &Lio, mut rx: api::Receiver<T>) -> T {
 loop {
@@ -40,6 +43,8 @@ This loop expresses the intended control flow:
 - if nothing happened, block until something does
 
 The BusyBox example in the repository uses this pattern repeatedly because it matches a library that exposes the event loop directly instead of hiding it in a runtime.
+
+That loop is not a workaround. It is the model in plain form.
 
 ## Why `lio` works this way
 
@@ -64,6 +69,8 @@ The operation becomes active when you consume the `Io<T>`:
 - by converting it into a receiver
 
 That detail explains why `Io<T>` is marked `#[must_use]` in the source. A constructed operation that is never consumed never becomes live.
+
+This is another point where `lio` stays explicit. Building an operation and starting an operation are distinct acts.
 
 ## Global versus explicit binding
 

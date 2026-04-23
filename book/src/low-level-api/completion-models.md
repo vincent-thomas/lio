@@ -6,6 +6,8 @@ One of `lio`'s stronger design choices is that completing an operation is a sepa
 
 The same `api::read`, `api::connect`, or `api::sleep` can be written once and then consumed in different ways. That matters because application structure varies more than syscall structure does. Some programs want straight-line async code. Some already have a manual event loop. Some want to route completions through shared coordination code.
 
+That separation is one of the cleanest parts of the crate's design. The operation says what work should happen. The completion model says how your program wants to receive the result.
+
 ## One operation, three ways to receive the result
 
 From `api::io::Io<T>`, the source exposes three primary completion styles:
@@ -20,7 +22,8 @@ These are not separate subsystems with different semantics. They are different f
 
 Use `.await` when you already have an async context and want the clearest linear code.
 
-```rust,no_run
+```rust,no_run,edition2024
+# extern crate lio;
 use lio::{Lio, api};
 use lio::api::resource::Resource;
 
@@ -69,6 +72,8 @@ A reasonable default is:
 - channels for manual loops, batching, and cross-component coordination
 
 The better question is not which style is most modern. It is which style matches the structure you already have. In `lio`, operation definitions stay mostly the same while completion style adapts to the surrounding program.
+
+That is the right way to think about this layer: completion style is a structural choice for your program, not a different I/O subsystem.
 
 ## Streaming completions
 

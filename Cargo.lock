@@ -370,6 +370,9 @@ dependencies = [
 [[package]]
 name = "lio-test"
 version = "0.1.0"
+dependencies = [
+ "lio",
+]
 
 [[package]]
 name = "lio-uring"

@@ -74,76 +74,6 @@ pub trait OpModel: Send + 'static {
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Output>;
 }
 
-/// One scripted contract step for a serial `OpModel`.
-pub struct ContractStep<M: OpModel> {
-  pub assert_op: fn(&Op) -> bool,
-  pub before_complete: fn(&mut M),
-  pub completion: Completion,
-  pub assert_result: fn(&OpResult<M::Output>) -> bool,
-}
-
-impl<M: OpModel> ContractStep<M> {
-  pub fn new(
-    assert_op: fn(&Op) -> bool,
-    completion: Completion,
-    assert_result: fn(&OpResult<M::Output>) -> bool,
-  ) -> Self {
-    Self { assert_op, before_complete: |_| {}, completion, assert_result }
-  }
-
-  pub fn with_setup(
-    assert_op: fn(&Op) -> bool,
-    before_complete: fn(&mut M),
-    completion: Completion,
-    assert_result: fn(&OpResult<M::Output>) -> bool,
-  ) -> Self {
-    Self { assert_op, before_complete, completion, assert_result }
-  }
-}
-
-/// Test harness implemented by the model type itself.
-pub trait OpModelContract: OpModel + Sized {
-  fn contract_model() -> Self;
-  fn contract_steps() -> Vec<ContractStep<Self>>;
-}
-
-/// Contract test helper for serial `OpModel` implementations.
-///
-/// The model type under test provides its own fixture by implementing
-/// [`OpModelContract`]. The macro only needs the type.
-#[macro_export]
-macro_rules! test_serial_op_model_contract {
-  ($model_ty:ty) => {
-    mod op_model_contract {
-      use super::*;
-
-      #[test]
-      fn scripted_contract() {
-        let mut model =
-          <$model_ty as $crate::api::op_contract::OpModelContract>::contract_model();
-        let steps =
-          <$model_ty as $crate::api::op_contract::OpModelContract>::contract_steps();
-        assert!(!steps.is_empty(), "contract script must not be empty");
-
-        for step in steps {
-          let op = model.op();
-          assert!(
-            (step.assert_op)(&op),
-            "op() did not satisfy the model contract: {:?}",
-            op
-          );
-          (step.before_complete)(&mut model);
-          let result = model.complete(step.completion);
-          assert!(
-            (step.assert_result)(&result),
-            "complete() did not satisfy the model contract"
-          );
-        }
-      }
-    }
-  };
-}
-
 fn completion_to_io_error(completion: Completion) -> io::Result<isize> {
   if completion.result < 0 {
     Err(io::Error::from_raw_os_error((-completion.result) as i32))
@@ -232,14 +162,19 @@ impl OpModel for TcpBindModel {
   }
 }
 
-impl OpModelContract for TcpBindModel {
+#[cfg(test)]
+impl lio_test::serial_op_contract::OpModelContract for TcpBindModel {
+  type Op = Op;
+  type Completion = Completion;
+  type Result = OpResult<<Self as OpModel>::Output>;
+
   fn contract_model() -> Self {
     Self::new("127.0.0.1:8080".parse().unwrap(), 128)
   }
 
-  fn contract_steps() -> Vec<ContractStep<Self>> {
+  fn contract_steps() -> Vec<lio_test::serial_op_contract::ContractStep<Self>> {
     vec![
-      ContractStep::new(
+      lio_test::serial_op_contract::ContractStep::new(
         |op| {
           matches!(
             op,
@@ -253,12 +188,12 @@ impl OpModelContract for TcpBindModel {
         Completion::ok(7),
         |result| matches!(result, OpResult::Again),
       ),
-      ContractStep::new(
+      lio_test::serial_op_contract::ContractStep::new(
         |op| matches!(op, Op::Bind { fd: 7, addr: _ }),
         Completion::ok(0),
         |result| matches!(result, OpResult::Again),
       ),
-      ContractStep::new(
+      lio_test::serial_op_contract::ContractStep::new(
         |op| matches!(op, Op::Listen { fd: 7, backlog: 128 }),
         Completion::ok(0),
         |result| {
@@ -346,26 +281,31 @@ impl OpModel for ReadToStringModel {
   }
 }
 
-impl OpModelContract for ReadToStringModel {
+#[cfg(test)]
+impl lio_test::serial_op_contract::OpModelContract for ReadToStringModel {
+  type Op = Op;
+  type Completion = Completion;
+  type Result = OpResult<<Self as OpModel>::Output>;
+
   fn contract_model() -> Self {
     Self::new(11, 8)
   }
 
-  fn contract_steps() -> Vec<ContractStep<Self>> {
+  fn contract_steps() -> Vec<lio_test::serial_op_contract::ContractStep<Self>> {
     vec![
-      ContractStep::with_setup(
+      lio_test::serial_op_contract::ContractStep::with_setup(
         |op| matches!(op, Op::Read { fd: 11, len: 8 }),
         |model| model.push_read_data(b"hello "),
         Completion::ok(6),
         |result| matches!(result, OpResult::Again),
       ),
-      ContractStep::with_setup(
+      lio_test::serial_op_contract::ContractStep::with_setup(
         |op| matches!(op, Op::Read { fd: 11, len: 8 }),
         |model| model.push_read_data(b"world"),
         Completion::ok(5),
         |result| matches!(result, OpResult::Again),
       ),
-      ContractStep::new(
+      lio_test::serial_op_contract::ContractStep::new(
         |op| matches!(op, Op::Read { fd: 11, len: 8 }),
         Completion::ok(0),
         |result| matches!(result, OpResult::Done(Ok(_))),
@@ -381,13 +321,13 @@ mod tests {
   mod tcp_bind_contract {
     use super::*;
 
-    crate::test_serial_op_model_contract!(TcpBindModel);
+    lio_test::test_serial_op_model_contract!(TcpBindModel);
   }
 
   mod read_to_string_contract {
     use super::*;
 
-    crate::test_serial_op_model_contract!(ReadToStringModel);
+    lio_test::test_serial_op_model_contract!(ReadToStringModel);
   }
 
   #[test]

@@ -1115,7 +1115,7 @@ impl IoBackend for IoUring {
         if self.needs_submit {
           self.ring().submit_and_wait(1)?;
           self.needs_submit = false;
-          self.ring().try_wait()?
+          Some(self.ring().wait()?)
         } else {
           Some(self.ring().wait()?)
         }

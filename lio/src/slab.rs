@@ -193,11 +193,6 @@ impl<T> Slab<T> {
   pub fn len(&self) -> usize {
     self.len as usize
   }
-
-  #[inline]
-  pub fn is_empty(&self) -> bool {
-    self.len == 0
-  }
 }
 
 impl<T> Drop for Slab<T> {

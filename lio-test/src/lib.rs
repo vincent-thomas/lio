@@ -1,3 +1,39 @@
+//! Test support crate for `lio` and crates that implement compatible
+//! low-level I/O contracts.
+//!
+//! `lio-test` packages the reusable contract-test macros and fixture traits
+//! used across the workspace:
+//!
+//! - [`test_io_backend!`] validates a backend against the deterministic
+//!   `IoBackend` contract.
+//! - [`test_op_model_contract!`] validates generic `OpModel`-style state
+//!   machines that implement [`OpModelContract`].
+//! - [`test_serial_op_model_contract!`] validates the serial illustration
+//!   models described through [`serial_op_contract::OpModelContract`].
+//!
+//! Typical usage from a consumer crate:
+//!
+//! ```ignore
+//! #[cfg(test)]
+//! mod tests {
+//!   use super::*;
+//!
+//!   mod my_model_contract {
+//!     use super::*;
+//!
+//!     lio_test::test_serial_op_model_contract!(MyModel);
+//!   }
+//! }
+//! ```
+//!
+//! The single-argument `test_serial_op_model_contract!` form assumes the
+//! calling crate exposes itself as `lio` with `extern crate self as lio;`.
+//! Other crates can use the two-argument form and pass their crate identifier:
+//!
+//! ```ignore
+//! lio_test::test_serial_op_model_contract!(my_crate, MyModel);
+//! ```
+//!
 /// Shared contract tests for [`IoBackend`](crate::backend::IoBackend)
 /// implementations.
 ///
@@ -125,9 +161,13 @@
 #[macro_export]
 macro_rules! test_io_backend {
   ($backend_ctor:expr) => {
+    lio_test::test_io_backend!(lio, $backend_ctor);
+  };
+  ($lio:ident, $backend_ctor:expr) => {
     #[cfg(test)]
     mod io_backend_backend {
       use super::*;
+      use $lio as __lio_test_lio;
       use bumpalo::Bump;
       use std::{
         cell::RefCell,
@@ -140,8 +180,8 @@ macro_rules! test_io_backend {
         },
       };
 
-      use ::lio::api::resource::Resource;
-      use ::lio::backend::{
+      use __lio_test_lio::api::resource::Resource;
+      use __lio_test_lio::backend::{
         IoBackend,
         op::{
           FileStat, LinkKind, MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, RawBuf,
@@ -191,7 +231,7 @@ macro_rules! test_io_backend {
       }
 
       fn assert_exact_result(
-        completed: &::lio::backend::OpCompleted,
+        completed: &__lio_test_lio::backend::OpCompleted,
         id: u64,
         expected: isize,
       ) {
@@ -207,7 +247,7 @@ macro_rules! test_io_backend {
       fn wait_completions(
         backend: &mut impl IoBackend,
         timeout: Option<Duration>,
-      ) -> Vec<::lio::backend::OpCompleted> {
+      ) -> Vec<__lio_test_lio::backend::OpCompleted> {
         let mut completed = Vec::new();
         backend.wait(timeout, &mut completed).unwrap();
         completed
@@ -356,8 +396,8 @@ macro_rules! test_io_backend {
 
       #[cfg(unix)]
       fn socket_pair() -> (
-        ::lio::api::resource::Resource,
-        ::lio::api::resource::Resource,
+        __lio_test_lio::api::resource::Resource,
+        __lio_test_lio::api::resource::Resource,
       ) {
         let mut fds = [0; 2];
         // SAFETY: `fds` points to two writable integers for `socketpair` to fill.
@@ -397,11 +437,11 @@ macro_rules! test_io_backend {
 
         // SAFETY: both fds were just returned by `pipe` and are uniquely owned here.
         let read = unsafe {
-          <::lio::api::resource::Resource as std::os::fd::FromRawFd>::from_raw_fd(fds[0])
+          <__lio_test_lio::api::resource::Resource as std::os::fd::FromRawFd>::from_raw_fd(fds[0])
         };
         // SAFETY: both fds were just returned by `pipe` and are uniquely owned here.
         let write = unsafe {
-          <::lio::api::resource::Resource as std::os::fd::FromRawFd>::from_raw_fd(fds[1])
+          <__lio_test_lio::api::resource::Resource as std::os::fd::FromRawFd>::from_raw_fd(fds[1])
         };
 
         (read, write)
@@ -478,20 +518,20 @@ macro_rules! test_io_backend {
       #[cfg(unix)]
       fn unix_sockaddr_un(
         path: &std::path::Path,
-      ) -> ::lio::backend::op::SocketAddrBuf {
-        ::lio::backend::op::unix_socket_addr_buf(path.as_os_str().as_bytes())
+      ) -> __lio_test_lio::backend::op::SocketAddrBuf {
+        __lio_test_lio::backend::op::unix_socket_addr_buf(path.as_os_str().as_bytes())
           .expect("path too long for unix socket test")
       }
 
       #[cfg(unix)]
       fn wait_for_single_completion(
         backend: &mut impl IoBackend,
-      ) -> ::lio::backend::OpCompleted {
+      ) -> __lio_test_lio::backend::OpCompleted {
         for _ in 0..20 {
           let completed =
             wait_completions(backend, Some(Duration::from_millis(10)));
           if let Some(first) = completed.first() {
-            return ::lio::backend::OpCompleted::new(
+            return __lio_test_lio::backend::OpCompleted::new(
               first.registration_id(),
               first.result(),
             );
@@ -510,7 +550,7 @@ macro_rules! test_io_backend {
       #[cfg(unix)]
       fn wait_for_positive_completion(
         backend: &mut impl IoBackend,
-      ) -> ::lio::backend::OpCompleted {
+      ) -> __lio_test_lio::backend::OpCompleted {
         let completed = wait_for_single_completion(backend);
         assert!(
           completed.result() > 0,
@@ -1485,7 +1525,7 @@ macro_rules! test_io_backend {
           // transferred to `Resource`.
           let listener_res = unsafe { Resource::from_raw_fd(listener_fd) };
 
-          let mut storage = ::lio::backend::op::SocketAddrBuf::unspecified();
+          let mut storage = __lio_test_lio::backend::op::SocketAddrBuf::unspecified();
 
           push_op(&mut backend,
             52,
@@ -1533,7 +1573,7 @@ macro_rules! test_io_backend {
           // transferred to `Resource`.
           let listener_res = unsafe { Resource::from_raw_fd(listener_fd) };
 
-          let mut storage = ::lio::backend::op::SocketAddrBuf::unspecified();
+          let mut storage = __lio_test_lio::backend::op::SocketAddrBuf::unspecified();
 
           push_op(&mut backend,
             58,
@@ -1578,7 +1618,7 @@ macro_rules! test_io_backend {
           let mut backend = new_backend();
           backend.init(64).unwrap();
 
-          let mut storage = ::lio::backend::op::SocketAddrBuf::unspecified();
+          let mut storage = __lio_test_lio::backend::op::SocketAddrBuf::unspecified();
 
           push_op(&mut backend,
             51,
@@ -1742,9 +1782,9 @@ macro_rules! test_io_backend {
           push_op(&mut backend,
             69,
             Op::Socket {
-              domain: ::lio::backend::op::SockDomain::IPV4,
-              ty: ::lio::backend::op::SockType::STREAM,
-              proto: ::lio::backend::op::SockProto::DEFAULT,
+              domain: __lio_test_lio::backend::op::SockDomain::IPV4,
+              ty: __lio_test_lio::backend::op::SockType::STREAM,
+              proto: __lio_test_lio::backend::op::SockProto::DEFAULT,
             },
           );
           backend.flush().unwrap();
@@ -1771,9 +1811,9 @@ macro_rules! test_io_backend {
           push_op(&mut backend,
             79,
             Op::Socket {
-              domain: ::lio::backend::op::SockDomain::UNIX,
-              ty: ::lio::backend::op::SockType::STREAM,
-              proto: ::lio::backend::op::SockProto::TCP,
+              domain: __lio_test_lio::backend::op::SockDomain::UNIX,
+              ty: __lio_test_lio::backend::op::SockType::STREAM,
+              proto: __lio_test_lio::backend::op::SockProto::TCP,
             },
           );
           backend.flush().unwrap();
@@ -1966,10 +2006,10 @@ macro_rules! test_io_backend {
           };
           let mut raw = vec![0u8; 4096];
           let mut out =
-            vec![::lio::backend::op::DirEntryRef::default(); 32];
-          let mut result = ::lio::backend::op::ReadDirResult::default();
+            vec![__lio_test_lio::backend::op::DirEntryRef::default(); 32];
+          let mut result = __lio_test_lio::backend::op::ReadDirResult::default();
           let mut opaque: *mut () = std::ptr::null_mut();
-          let mut opaque_drop: Option<::lio::backend::op::OpaqueDropFn> =
+          let mut opaque_drop: Option<__lio_test_lio::backend::op::OpaqueDropFn> =
             None;
 
           push_op(&mut backend,
@@ -2745,8 +2785,7 @@ macro_rules! test_op_model_contract {
       fn scripted_contract() {
         let mut model =
           <$model_ty as ::lio_test::OpModelContract>::contract_model();
-        let kind =
-          <$model_ty as ::lio_test::OpModelContract>::contract_kind();
+        let kind = <$model_ty as ::lio_test::OpModelContract>::contract_kind();
         let steps =
           <$model_ty as ::lio_test::OpModelContract>::contract_steps();
         assert!(!steps.is_empty(), "contract script must not be empty");
@@ -2762,14 +2801,17 @@ macro_rules! test_op_model_contract {
             !saw_terminal,
             "contract script continued after terminal completion"
           );
-          let action = <$model_ty as ::lio_test::OpModelContract>::action(&mut model);
+          let action =
+            <$model_ty as ::lio_test::OpModelContract>::action(&mut model);
           assert!(
             (step.assert_action)(&action),
             "action() did not satisfy the model contract"
           );
           (step.before_complete)(&mut model);
-          let result =
-            <$model_ty as ::lio_test::OpModelContract>::complete(&mut model, step.completion);
+          let result = <$model_ty as ::lio_test::OpModelContract>::complete(
+            &mut model,
+            step.completion,
+          );
           assert!(
             (step.assert_result)(&result),
             "complete() did not satisfy the model contract"
@@ -2777,14 +2819,17 @@ macro_rules! test_op_model_contract {
 
           if <$model_ty as ::lio_test::OpModelContract>::is_again(&result) {
             must_remain_live_after_script = index == last_index;
-          } else if <$model_ty as ::lio_test::OpModelContract>::is_yield(&result) {
+          } else if <$model_ty as ::lio_test::OpModelContract>::is_yield(
+            &result,
+          ) {
             saw_yield = true;
             must_remain_live_after_script = index == last_index;
             assert!(
               kind != ::lio_test::ContractKind::Oneshot,
               "oneshot models must not yield"
             );
-          } else if <$model_ty as ::lio_test::OpModelContract>::is_done(&result) {
+          } else if <$model_ty as ::lio_test::OpModelContract>::is_done(&result)
+          {
             saw_done = true;
             saw_terminal = true;
             assert_eq!(
@@ -2797,7 +2842,8 @@ macro_rules! test_op_model_contract {
         }
 
         if must_remain_live_after_script {
-          let _ = <$model_ty as ::lio_test::OpModelContract>::action(&mut model);
+          let _ =
+            <$model_ty as ::lio_test::OpModelContract>::action(&mut model);
         }
 
         match kind {
@@ -2817,6 +2863,86 @@ macro_rules! test_op_model_contract {
               "stream model contract must produce at least one Yield or Done"
             );
           }
+        }
+      }
+    }
+  };
+}
+
+pub mod serial_op_contract {
+  /// One scripted contract step for a serial `OpModel`.
+  pub struct ContractStep<M: OpModelContract> {
+    pub assert_op: fn(&M::Op) -> bool,
+    pub before_complete: fn(&mut M),
+    pub completion: M::Completion,
+    pub assert_result: fn(&M::Result) -> bool,
+  }
+
+  impl<M: OpModelContract> ContractStep<M> {
+    pub fn new(
+      assert_op: fn(&M::Op) -> bool,
+      completion: M::Completion,
+      assert_result: fn(&M::Result) -> bool,
+    ) -> Self {
+      Self { assert_op, before_complete: |_| {}, completion, assert_result }
+    }
+
+    pub fn with_setup(
+      assert_op: fn(&M::Op) -> bool,
+      before_complete: fn(&mut M),
+      completion: M::Completion,
+      assert_result: fn(&M::Result) -> bool,
+    ) -> Self {
+      Self { assert_op, before_complete, completion, assert_result }
+    }
+  }
+
+  /// Test fixture for generating serial `OpModel` contract tests per type.
+  pub trait OpModelContract: Sized {
+    type Op;
+    type Completion;
+    type Result;
+
+    fn contract_model() -> Self;
+    fn contract_steps() -> Vec<ContractStep<Self>>;
+  }
+}
+
+/// Shared contract tests for serial `OpModel` illustrations described through
+/// [`lio_test::serial_op_contract::OpModelContract`].
+#[macro_export]
+macro_rules! test_serial_op_model_contract {
+  ($model_ty:ty) => {
+    lio_test::test_serial_op_model_contract!(lio, $model_ty);
+  };
+  ($lio:ident, $model_ty:ty) => {
+    mod op_model_contract {
+      use super::*;
+      use lio_test::serial_op_contract::OpModelContract;
+      use $lio::api::op_contract::OpModel as LioTestOpModel;
+
+      #[test]
+      fn scripted_contract() {
+        let mut model = <$model_ty as OpModelContract>::contract_model();
+        let steps = <$model_ty as OpModelContract>::contract_steps();
+        assert!(!steps.is_empty(), "contract script must not be empty");
+
+        for step in steps {
+          let op = <$model_ty as LioTestOpModel>::op(&mut model);
+          assert!(
+            (step.assert_op)(&op),
+            "op() did not satisfy the model contract: {:?}",
+            op
+          );
+          (step.before_complete)(&mut model);
+          let result = <$model_ty as LioTestOpModel>::complete(
+            &mut model,
+            step.completion,
+          );
+          assert!(
+            (step.assert_result)(&result),
+            "complete() did not satisfy the model contract"
+          );
         }
       }
     }
