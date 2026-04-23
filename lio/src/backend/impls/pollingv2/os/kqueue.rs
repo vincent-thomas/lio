@@ -303,34 +303,6 @@ impl OsPoller {
       }
     }
   }
-
-  #[cfg(test)]
-  fn modify_interest(
-    &self,
-    fd: RawFd,
-    key: u64,
-    interest: Interest,
-  ) -> io::Result<()> {
-    if interest.is_timer() {
-      if !self.registered_timers.borrow().contains(&key) {
-        return Err(io::Error::from_raw_os_error(libc::ENOENT));
-      }
-      self.change_interests_batched(fd, key as usize, interest)
-    } else {
-      if !self.registered_fds.borrow().contains(&fd) {
-        return Err(io::Error::from_raw_os_error(libc::ENOENT));
-      }
-
-      let result = self.change_interests_batched(fd, key as usize, interest);
-
-      assert!(
-        self.registered_fds.borrow().contains(&fd),
-        "fd should still be in registered_fds after modify"
-      );
-
-      result
-    }
-  }
 }
 
 impl ReadinessPoll for OsPoller {
@@ -338,11 +310,6 @@ impl ReadinessPoll for OsPoller {
 
   fn add(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
     self.add_inner(fd, key, interest)
-  }
-
-  #[cfg(test)]
-  fn modify(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
-    self.modify_interest(fd, key, interest)
   }
 
   fn delete(&self, fd: RawFd) -> io::Result<()> {
@@ -409,33 +376,6 @@ impl ReadinessPoll for OsPoller {
     );
 
     Ok(n)
-  }
-
-  #[cfg(test)]
-  fn notify(&self) -> io::Result<()> {
-    // Use kqueue-native EVFILT_USER notification
-
-    use crate::backend::impls::pollingv2::os::NOTIFY_KEY;
-    let mut kev = make_kevent(
-      NOTIFY_KEY as libc::uintptr_t,
-      libc::EVFILT_USER,
-      0,
-      0,
-      0,
-      NOTIFY_KEY as *mut libc::c_void,
-    );
-    kev.fflags = libc::NOTE_TRIGGER; // Trigger the user event
-
-    syscall!(kevent(
-      self.kq_fd.as_raw_fd(),
-      &kev as *const libc::kevent,
-      1,
-      ptr::null_mut(),
-      0,
-      ptr::null(),
-    ))?;
-
-    Ok(())
   }
 
   fn event_key(event: &Self::NativeEvent) -> u64 {

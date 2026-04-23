@@ -63,11 +63,6 @@ pub(crate) trait ReadinessPoll {
   /// This is not idempotent.
   fn add(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()>;
 
-  /// Modify existing interest for a file descriptor
-  /// This is idempotent, but fails if not added before.
-  #[cfg(test)]
-  fn modify(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()>;
-
   /// Remove all interest for a file descriptor
   /// This fails if 'fd' hasn't previously been added.
   fn delete(&self, fd: RawFd) -> io::Result<()>;
@@ -79,10 +74,6 @@ pub(crate) trait ReadinessPoll {
     events: &mut [Self::NativeEvent],
     timeout: Option<Duration>,
   ) -> io::Result<usize>;
-
-  /// Wake up a potentially blocking wait call.
-  #[cfg(test)]
-  fn notify(&self) -> io::Result<()>;
 
   /// Extract the key from a native event
   fn event_key(event: &Self::NativeEvent) -> u64;
