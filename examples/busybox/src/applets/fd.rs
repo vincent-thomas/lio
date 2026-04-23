@@ -1276,48 +1276,6 @@ fn colorize_entry_path(
 
   rendered
 }
-
-#[allow(dead_code)]
-fn append_colorized_entry_path_lio(
-  output: &mut OutputBuffer,
-  path: &str,
-  file_type: LioFileType,
-  mode: Option<u32>,
-) {
-  let trimmed = path.strip_suffix('/').unwrap_or(path);
-  if trimmed.is_empty() {
-    output.push_unstyled_bytes(path.as_bytes());
-    return;
-  }
-
-  let trailing_separator = path.ends_with('/');
-  if file_type == LioFileType::Directory {
-    output.push_styled_bytes(COLOR_DIRECTORY, trimmed.as_bytes());
-    if trailing_separator {
-      output.push_byte(b'/');
-    }
-    return;
-  }
-
-  let (parent, basename) = match trimmed.rfind('/') {
-    Some(index) => {
-      let split = index + 1;
-      (&trimmed[..split], &trimmed[split..])
-    }
-    None => ("", trimmed),
-  };
-
-  if !parent.is_empty() {
-    output.push_styled_bytes(COLOR_DIRECTORY, parent.as_bytes());
-  }
-
-  if let Some(color) = classify_file_color_lio(file_type, mode) {
-    output.push_styled_bytes(color, basename.as_bytes());
-  } else {
-    output.push_unstyled_bytes(basename.as_bytes());
-  }
-}
-
 fn append_colorized_path_bytes_lio(
   output: &mut OutputBuffer,
   path: &str,
@@ -1512,18 +1470,6 @@ impl OutputBuffer {
       self.bytes.extend_from_slice(style.as_bytes());
     }
     self.active_style = style;
-  }
-
-  #[allow(dead_code)]
-  fn push_unstyled_bytes(&mut self, bytes: &[u8]) {
-    self.set_style(None);
-    self.bytes.extend_from_slice(bytes);
-  }
-
-  #[allow(dead_code)]
-  fn push_styled_bytes(&mut self, style: &'static str, bytes: &[u8]) {
-    self.set_style(Some(style));
-    self.bytes.extend_from_slice(bytes);
   }
 
   fn push_raw_bytes(&mut self, bytes: &[u8]) {

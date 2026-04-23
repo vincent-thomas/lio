@@ -587,42 +587,6 @@ fn tail_lines_from_start_stream(
   Ok(())
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-fn tail_bytes_from_start_fd(
-  ctx: &AppContext,
-  fd: &lio::api::resource::Resource,
-  start_byte: usize,
-) -> io::Result<Vec<u8>> {
-  if start_byte <= 1 {
-    return read_all_fd(ctx, fd);
-  }
-
-  let mut out = Vec::new();
-  let mut buf = vec![0u8; 8192];
-  let mut seen = 0usize;
-
-  loop {
-    let rx = api::read(fd, buf).with_lio(ctx.lio()).send();
-    let (result, returned_buf) = io_util::run(ctx.lio(), rx);
-    buf = returned_buf;
-
-    let n = result? as usize;
-    if n == 0 {
-      break;
-    }
-
-    for &byte in &buf[..n] {
-      seen += 1;
-      if seen >= start_byte {
-        out.push(byte);
-      }
-    }
-  }
-
-  Ok(out)
-}
-
 fn tail_bytes_from_start_stream(
   ctx: &AppContext,
   fd: &lio::api::resource::Resource,
