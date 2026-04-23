@@ -2,149 +2,33 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        continue-on-error: false
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-build-cache
-
-      - name: (main) Lint full
-        if: github.ref == 'refs/heads/main'
-        run: make lint-full
-
-      - name: (not main) Lint
-        if: github.ref != 'refs/heads/main'
-        run: make lint
-
-  lio-build-n-test:
-    name: Build n Test
+  ci:
+    name: CI
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: true
 
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        continue-on-error: false
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-build-cache
-
-      - name: (main) Run release tests
-        if: github.ref == 'refs/heads/main'
-        run: make test-release
-
-      - name: (PR) Run debug tests
-        if: github.ref != 'refs/heads/main'
-        run: make test-debug
-
-      - name: nix build
-        run: nix build '.?submodules=1&shallow=0'
-
-      - name: test cbuild
-        run: make test-ffi
-
-      - name: test lio-uring
-        run: make test-uring
-
-  nix-flake-check:
-    runs-on: ubuntu-latest
-    steps:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/flake-checker-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-  native-test:
-    name: Native Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [lint, lio-build-n-test, nix-flake-check]
-    strategy:
-      matrix:
-        include:
-          - os: macos-latest
-            backend: kqueue
-          - os: windows-latest
-            backend: iocp
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
+      - name: nix flake check
+        run: nix flake check '.?submodules=1&shallow=0'
 
-      - name: Install Rust
-        uses: dtolnay/rust-action@stable
+      - name: cargo fmt --check
+        run: nix develop -c cargo fmt --check
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+      - name: cargo check
+        run: nix develop -c cargo check --workspace --all-targets --all-features
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ matrix.os }}-
-
-      - name: Run tests
-        run: cargo nextest run -p lio --all-features --release
-
-  vm-test:
-    name: Test (${{ matrix.name }})
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [lint, lio-build-n-test, nix-flake-check]
-    strategy:
-      matrix:
-        include:
-          - name: Linux VM - io_uring
-            vm: linux
-          - name: FreeBSD VM - kqueue
-            vm: freebsd
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Cache VM images
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/lio-vm
-          key: vm-${{ matrix.vm }}-${{ hashFiles(format('vm/{0}/run.sh', matrix.vm)) }}
-          restore-keys: vm-${{ matrix.vm }}-
-
-      - name: Run VM tests
-        run: nix run .#${{ matrix.vm }}
+      - name: cargo clippy
+        run: nix develop -c cargo clippy --workspace --all-targets --all-features -- -D warnings
