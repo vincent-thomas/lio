@@ -7,10 +7,13 @@
   clippy::undocumented_unsafe_blocks
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![doc = include_str!("../../docs/src/crate.md")]
+#![doc = include_str!("../../book/src/crate.md")]
+
 extern crate self as lio;
+
 #[macro_use]
 mod macros;
+
 #[cfg(feature = "unstable_ffi")]
 pub mod ffi;
 

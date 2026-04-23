@@ -4,6 +4,8 @@ This chapter comes after driving, ownership, and completion style on purpose.
 
 Most users can work productively with `lio` without thinking about `OpModel` immediately. It becomes useful once you want to understand how operations are implemented, how composed operations are built, or how to design new operation shapes as explicit state machines.
 
+That is why this chapter is late in the book. It is deeper than the earlier material, not more fundamental.
+
 `OpModel` is the abstraction that turns raw completions into a logical operation.
 
 It is the per-operation state machine that describes:
@@ -14,11 +16,22 @@ It is the per-operation state machine that describes:
 
 This is one of the key design ideas in `lio`, but it is easier to understand once the user-facing model is already clear. At the surface, users see typed operations. Underneath, `OpModel` is the reason those operations can represent one step, many steps, or a stream without changing the overall programming model.
 
+If the earlier chapters taught the user-facing sentence:
+
+- an operation is a typed description of work
+- `Lio` is the thing that drives it
+
+then this chapter adds the implementation-facing sentence:
+
+- `OpModel` is the state machine that decides what the next step is and what each completion means
+
+If you are only using `lio`, you can treat `OpModel` as background machinery at first. If you are trying to understand how `lio` is built, this is the chapter where the internal design starts to become visible.
+
 ## Core contract
 
 The trait in `lio/src/api/op.rs` is intentionally small.
 
-```rust
+```rust,ignore
 pub trait OpModel: Send + 'static {
     type Item: Send;
 
@@ -33,6 +46,8 @@ That small surface is deliberate. `OpModel` is not trying to be a full framework
 - what does this completion mean?
 
 Everything else in the operation lifecycle is built on top of those two methods. That narrow interface is what lets the trait stay composable instead of becoming a mini-runtime API of its own.
+
+That is the trait's main design strength. It stays small enough that simple operations stay simple, but expressive enough that composed operations do not need a second abstraction.
 
 ## The return types matter
 
@@ -71,9 +86,11 @@ These are consumed through `IoStream<T>`.
 
 The distinction is useful because it separates two user-visible operation shapes without widening the core contract itself.
 
+That is another recurring design theme in `lio`: keep the core abstraction small, and express variation through return values and composition rather than by adding more top-level machinery.
+
 ## The simplest possible model
 
-`Sleep` is a good minimal example.
+`Sleep` is a good minimal example because it strips the idea down to one step and one completion.
 
 Its `action()` always returns:
 
@@ -147,9 +164,13 @@ This is the pattern to copy when one logical operation requires several low-leve
 
 The lesson is not the exact TCP sequence. It is that state names should reflect logical steps. Good state names make `action()` and `complete()` read like a transition table instead of a pile of conditionals.
 
+That is the point where `OpModel` stops being abstract. Once you see a model like this, the trait reads less like "an internal callback interface" and more like "a small, explicit state-machine contract."
+
 ## Composition patterns in this repository
 
 The codebase already uses several distinct kinds of composition. Seeing them side by side helps because they solve different problems and should not be collapsed into one pattern.
+
+This section is where the chapter gets more detailed on purpose. After the basic contract and a few concrete examples, it becomes useful to categorize the patterns the repository already uses.
 
 ### 1. Wrapper composition
 
@@ -206,6 +227,8 @@ Use this when:
 The best way to design an `OpModel` in this codebase is to start by writing the states down explicitly.
 
 Do not start with code. Start with a transition table. If the transitions are vague on paper, they will be vague in `complete()` too.
+
+That advice matters more than any individual example in this chapter. The quality of an `OpModel` usually depends on whether the states and transitions were clear before implementation started.
 
 For a oneshot model, ask:
 
@@ -335,6 +358,8 @@ That contract machinery tests the logical protocol:
 This is the right kind of test for `OpModel`.
 
 It does not try to test the kernel. It tests the state machine.
+
+That separation is especially valuable in a library like `lio`, where backend behavior and model behavior are related but not identical concerns.
 
 For model-level tests, prefer checking:
 
