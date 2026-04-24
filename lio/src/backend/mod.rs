@@ -133,6 +133,15 @@ impl OpCompleted {
 /// Designed for single-thread ownership (`&mut self`), dyn-compatible for
 /// runtime backend selection via `Box<dyn IoBackend>`.
 ///
+/// Contract:
+/// - `init()` must be called before `push()`, `flush()`, or `wait()`
+/// - `push()` only queues work locally; queued operations are not observable
+///   until `flush()` submits them
+/// - `flush()` submits all currently queued operations and may also make
+///   immediate completions observable on the next `wait()`
+/// - `wait()` writes zero or more completions into the caller-provided
+///   `completed` vector for that call only
+///
 /// # Usage
 ///
 /// ```ignore
@@ -162,8 +171,8 @@ pub trait IoBackend {
   /// - `None` = block until at least one completion
   /// - `Some(ZERO)` = non-blocking poll
   /// - `Some(duration)` = wait up to duration
-  ///
-  /// Slice valid until next `wait()` or `push()`.
+  /// - `completed` is caller-owned output storage; implementations may clear
+  ///   and rewrite it on each call
   fn wait(
     &mut self,
     timeout: Option<Duration>,
