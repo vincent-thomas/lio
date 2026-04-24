@@ -343,6 +343,36 @@ macro_rules! test_io_backend {
 
     #[cfg(unix)]
     #[test]
+    fn pushed_work_is_not_observable_until_flush() {
+      let mut backend = new_backend();
+      backend.init(64).unwrap();
+
+      let path = unix_socket_path("not-flushed");
+      let storage = unix_sockaddr_un(&path);
+
+      push_op(&mut backend,
+        90,
+        Op::Connect {
+          fd: invalid_fd_resource(),
+          addr: storage,
+        },
+      );
+
+      let completed = wait_completions(&mut backend, Some(Duration::ZERO));
+      assert!(
+        completed.is_empty(),
+        "queued work must not become observable before flush()"
+      );
+
+      backend.flush().unwrap();
+
+      let completed = wait_completions(&mut backend, Some(Duration::ZERO));
+      assert_eq!(completed.len(), 1);
+      assert_exact_result(&completed[0], 90, -(libc::EBADF as isize));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn flush_can_produce_immediate_completions_without_pending_work() {
       let mut backend = new_backend();
       backend.init(64).unwrap();
@@ -2582,6 +2612,35 @@ macro_rules! test_io_backend {
         assert!(
           completed.is_empty(),
           "completed wait buffer must not retain stale completions"
+        );
+      }
+
+      #[test]
+      fn second_flush_does_not_replay_already_submitted_work() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let path = unix_socket_path("flush-idempotent");
+        let storage = unix_sockaddr_un(&path);
+
+        push_op(&mut backend,
+          63,
+          Op::Connect {
+            fd: invalid_fd_resource(),
+            addr: storage,
+          },
+        );
+        backend.flush().unwrap();
+        backend.flush().unwrap();
+
+        let completed = wait_completions(&mut backend, Some(Duration::ZERO));
+        assert_eq!(completed.len(), 1);
+        assert_exact_result(&completed[0], 63, -(libc::EBADF as isize));
+
+        let completed = wait_completions(&mut backend, Some(Duration::ZERO));
+        assert!(
+          completed.is_empty(),
+          "a second flush() must not replay already-submitted work"
         );
       }
 
