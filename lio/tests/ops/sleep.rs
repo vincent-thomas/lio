@@ -4,11 +4,57 @@
   clippy::expect_fun_call
 )]
 
-use std::os::fd::FromRawFd;
+use super::common;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use lio::{Lio, api};
+use lio::{
+  Lio, api,
+  api::resource::Resource,
+  backend::ds::{DSBackend, DSConfig},
+};
+
+fn new_ds_lio() -> Lio {
+  Lio::new_with_backend(
+    DSBackend::with_config(DSConfig { fault_every: 0, ..DSConfig::default() }),
+    64,
+  )
+  .unwrap()
+}
+
+fn open_rw_file(lio: &mut Lio, path: std::ffi::CString) -> Resource {
+  let mut receiver = api::openat(
+    &Resource::cwd(),
+    path,
+    libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+    0o644,
+  )
+  .with_lio(lio)
+  .send();
+  common::poll_recv(lio, &mut receiver).unwrap()
+}
+
+fn write_all_at(lio: &mut Lio, fd: &Resource, bytes: &[u8], offset: u32) {
+  let mut written_total = 0usize;
+  while written_total < bytes.len() {
+    let chunk = bytes[written_total..].to_vec();
+    let mut receiver =
+      api::write_at(fd, chunk.clone(), offset + written_total as u32)
+        .with_lio(lio)
+        .send();
+    let (result, returned_buf) = common::poll_recv(lio, &mut receiver);
+    let bytes_written = result.unwrap() as usize;
+    assert!(bytes_written > 0);
+    assert!(bytes_written <= returned_buf.len());
+    written_total += bytes_written;
+  }
+}
+
+fn unlink_file(lio: &mut Lio, path: std::ffi::CString) {
+  let mut receiver =
+    api::unlinkat(&Resource::cwd(), path, 0).with_lio(lio).send();
+  common::poll_recv(lio, &mut receiver).unwrap();
+}
 
 /// Helper to poll until we receive a result with timeout
 fn poll_recv_timeout<T>(
@@ -42,7 +88,7 @@ fn run_sleep_and_measure(lio: &mut Lio, duration: Duration) -> Duration {
 
 #[test]
 fn basic() {
-  let mut lio = Lio::new(64).unwrap();
+  let mut lio = new_ds_lio();
 
   let start = Instant::now();
   let timeout_duration = Duration::from_millis(500);
@@ -73,7 +119,7 @@ fn basic() {
 
 #[test]
 fn multiple() {
-  let mut lio = Lio::new(64).unwrap();
+  let mut lio = new_ds_lio();
 
   let start = Instant::now();
 
@@ -133,7 +179,7 @@ fn multiple() {
 
 #[test]
 fn zero_duration() {
-  let mut lio = Lio::new(64).unwrap();
+  let mut lio = new_ds_lio();
 
   let start = Instant::now();
 
@@ -155,7 +201,7 @@ fn zero_duration() {
 
 #[test]
 fn short_duration() {
-  let mut lio = Lio::new(64).unwrap();
+  let mut lio = new_ds_lio();
 
   let start = Instant::now();
   let timeout_duration = Duration::from_millis(10);
@@ -178,7 +224,7 @@ fn short_duration() {
 
 #[test]
 fn concurrent_same_duration() {
-  let mut lio = Lio::new(64).unwrap();
+  let mut lio = new_ds_lio();
 
   let (sender, receiver) = mpsc::channel();
   let timeout_duration = Duration::from_millis(100);
@@ -221,28 +267,12 @@ fn concurrent_same_duration() {
 
 #[test]
 fn interleaved_with_io() {
-  let mut lio = Lio::new(64).unwrap();
+  let mut lio = new_ds_lio();
 
   let path =
     std::ffi::CString::new("/tmp/lio_sleep_interleaved_with_io.txt").unwrap();
-  unsafe {
-    let fd = libc::open(
-      path.as_ptr(),
-      libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-      0o644,
-    );
-    assert!(fd >= 0, "Failed to create temp file");
-    let payload = b"abc";
-    let written = libc::write(fd, payload.as_ptr().cast(), payload.len());
-    assert_eq!(written, payload.len() as isize, "Failed to seed temp file");
-    libc::close(fd);
-  }
-  let file = unsafe {
-    lio::api::resource::Resource::from_raw_fd(libc::open(
-      path.as_ptr(),
-      libc::O_RDONLY,
-    ))
-  };
+  let file = open_rw_file(&mut lio, path.clone());
+  write_all_at(&mut lio, &file, b"abc", 0);
 
   // Start a timeout
   let start = Instant::now();
@@ -279,14 +309,12 @@ fn interleaved_with_io() {
   );
 
   drop(file);
-  unsafe {
-    libc::unlink(path.as_ptr());
-  }
+  unlink_file(&mut lio, path);
 }
 
 #[test]
 fn ordering() {
-  let mut lio = Lio::new(64).unwrap();
+  let mut lio = new_ds_lio();
 
   // Start timeouts in reverse order of duration
   let mut recv_long =
@@ -326,7 +354,11 @@ fn ordering() {
 
 #[test]
 fn many_concurrent() {
-  let mut lio = Lio::new(256).unwrap();
+  let mut lio = Lio::new_with_backend(
+    DSBackend::with_config(DSConfig { fault_every: 0, ..DSConfig::default() }),
+    256,
+  )
+  .unwrap();
 
   let (sender, receiver) = mpsc::channel();
 
@@ -366,7 +398,7 @@ fn many_concurrent() {
 
 #[test]
 fn pause_resume_preserves_remaining_duration() {
-  let mut lio = Lio::new(64).unwrap();
+  let mut lio = new_ds_lio();
   let mut recv =
     api::sleep(Duration::from_millis(200)).with_lio(&mut lio).send();
 
@@ -394,7 +426,7 @@ fn pause_resume_preserves_remaining_duration() {
 
 #[test]
 fn accuracy_within_five_milliseconds() {
-  let mut lio = Lio::new(64).unwrap();
+  let mut lio = new_ds_lio();
   let sleep_duration = Duration::from_millis(100);
   let threshold = Duration::from_millis(5);
 

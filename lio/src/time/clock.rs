@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 /// Unique identifier for a timer (matches operation ID).
@@ -44,7 +44,7 @@ impl<const SIZE: usize> Wheel<SIZE> {
 }
 
 /// Timer metadata for O(1) lookup.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct TimerEntry {
   deadline_ticks: u64,
   state: TimerState,
@@ -67,6 +67,7 @@ pub struct Clock {
   /// Current logical tick count.
   current_tick: u64,
   timers: HashMap<TimerId, TimerEntry>,
+  active_deadline_counts: BTreeMap<u64, usize>,
   pending_fire: Vec<TimerId>,
   pending_index: usize,
 }
@@ -94,6 +95,7 @@ impl Clock {
       level3: Wheel::new(),
       current_tick: 0,
       timers: HashMap::with_capacity(capacity),
+      active_deadline_counts: BTreeMap::new(),
       pending_fire: Vec::with_capacity(32),
       pending_index: 0,
     }
@@ -108,10 +110,23 @@ impl Clock {
     let duration_ticks = Self::duration_to_ticks(duration);
     let deadline_ticks = self.current_tick + duration_ticks.max(1);
 
+    self.schedule_at(id, deadline_ticks);
+  }
+
+  pub(crate) fn schedule_at(&mut self, id: TimerId, deadline_ticks: u64) {
+    let deadline_ticks =
+      deadline_ticks.max(self.current_tick.saturating_add(1));
+
+    if let Some(previous) = self.timers.get(&id).copied()
+      && previous.state == TimerState::Active
+    {
+      self.decrement_active_deadline(previous.deadline_ticks);
+    }
     self.insert_timer(id, deadline_ticks);
     self
       .timers
       .insert(id, TimerEntry { deadline_ticks, state: TimerState::Active });
+    self.increment_active_deadline(deadline_ticks);
   }
 
   pub fn next_deadline(&self) -> Option<Duration> {
@@ -139,7 +154,13 @@ impl Clock {
   }
 
   pub fn remove(&mut self, id: TimerId) -> bool {
-    self.timers.remove(&id).is_some()
+    let removed = self.timers.remove(&id);
+    if let Some(entry) = removed
+      && entry.state == TimerState::Active
+    {
+      self.decrement_active_deadline(entry.deadline_ticks);
+    }
+    removed.is_some()
   }
 
   pub(crate) fn current_tick(&self) -> u64 {
@@ -147,12 +168,7 @@ impl Clock {
   }
 
   pub(crate) fn earliest_active_deadline(&self) -> Option<u64> {
-    self
-      .timers
-      .values()
-      .filter(|entry| entry.state == TimerState::Active)
-      .map(|entry| entry.deadline_ticks)
-      .min()
+    self.active_deadline_counts.first_key_value().map(|(&deadline, _)| deadline)
   }
 
   fn insert_timer(&mut self, id: TimerId, deadline_ticks: u64) {
@@ -171,6 +187,24 @@ impl Clock {
     } else {
       let slot = ((deadline_ticks >> (LEVEL_BITS * 3)) & LEVEL_MASK) as usize;
       self.level3.insert(slot, entry);
+    }
+  }
+
+  fn increment_active_deadline(&mut self, deadline_ticks: u64) {
+    *self.active_deadline_counts.entry(deadline_ticks).or_insert(0) += 1;
+  }
+
+  fn decrement_active_deadline(&mut self, deadline_ticks: u64) {
+    let remove = match self.active_deadline_counts.get_mut(&deadline_ticks) {
+      Some(count) if *count > 1 => {
+        *count -= 1;
+        false
+      }
+      Some(_) => true,
+      None => false,
+    };
+    if remove {
+      self.active_deadline_counts.remove(&deadline_ticks);
     }
   }
 
@@ -203,10 +237,10 @@ impl Clock {
 
   fn process_entries(&mut self, entries: Vec<WheelEntry>) {
     for entry in entries {
-      let is_active = self
-        .timers
-        .get(&entry.id)
-        .is_some_and(|timer| timer.state == TimerState::Active);
+      let is_active = self.timers.get(&entry.id).is_some_and(|timer| {
+        timer.state == TimerState::Active
+          && timer.deadline_ticks == entry.deadline_ticks
+      });
 
       if !is_active {
         continue;
@@ -216,6 +250,7 @@ impl Clock {
         if let Some(timer) = self.timers.get_mut(&entry.id) {
           timer.state = TimerState::Fired;
         }
+        self.decrement_active_deadline(entry.deadline_ticks);
         self.pending_fire.push(entry.id);
       } else {
         self.insert_timer(entry.id, entry.deadline_ticks);
@@ -225,10 +260,10 @@ impl Clock {
 
   fn cascade_entries(&mut self, entries: Vec<WheelEntry>) {
     for entry in entries {
-      let is_active = self
-        .timers
-        .get(&entry.id)
-        .is_some_and(|timer| timer.state == TimerState::Active);
+      let is_active = self.timers.get(&entry.id).is_some_and(|timer| {
+        timer.state == TimerState::Active
+          && timer.deadline_ticks == entry.deadline_ticks
+      });
 
       if !is_active {
         continue;
@@ -238,6 +273,7 @@ impl Clock {
         if let Some(timer) = self.timers.get_mut(&entry.id) {
           timer.state = TimerState::Fired;
         }
+        self.decrement_active_deadline(entry.deadline_ticks);
         self.pending_fire.push(entry.id);
       } else {
         self.insert_timer(entry.id, entry.deadline_ticks);

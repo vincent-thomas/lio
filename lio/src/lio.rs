@@ -165,6 +165,10 @@ impl Lio {
     self.inner.borrow_mut().time.resume();
   }
 
+  pub(crate) fn advance_time_by_ticks(&self, ticks: u64) {
+    self.inner.borrow_mut().time.advance_by_ticks(ticks);
+  }
+
   fn dispatch_action(inner: &mut LioInner, id: u64, action: Action) {
     let (store, io, time) = (&mut inner.store, &mut inner.io, &mut inner.time);
     match action {
@@ -491,100 +495,5 @@ impl Lio {
     let mut inner = self.inner.borrow_mut();
     inner.time.remove(id);
     inner.store.remove(id);
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use crate::{
-    api::ops::Nop,
-    backend::{IoBackend, OpCompleted, op::Op},
-  };
-  use std::sync::{Arc, Mutex};
-
-  #[derive(Default)]
-  struct TestBackend {
-    queued: Vec<(u64, Op)>,
-    completed: Vec<OpCompleted>,
-  }
-
-  impl IoBackend for TestBackend {
-    fn init(&mut self, _cap: usize) -> io::Result<()> {
-      Ok(())
-    }
-
-    fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
-      self.queued.push((id, op));
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-      for (id, op) in self.queued.drain(..) {
-        match op {
-          Op::Nop => self.completed.push(OpCompleted::new(id, 0)),
-          _ => unreachable!("test backend only supports Nop"),
-        }
-      }
-      Ok(())
-    }
-
-    fn wait(
-      &mut self,
-      _timeout: Option<Duration>,
-      completed: &mut Vec<OpCompleted>,
-    ) -> io::Result<()> {
-      completed.append(&mut self.completed);
-      Ok(())
-    }
-  }
-
-  #[test]
-  fn schedule_and_run_completes_nop_callback() {
-    let lio = Lio::new_with_backend(TestBackend::default(), 8).unwrap();
-    let received = Arc::new(Mutex::new(Vec::new()));
-    let out = Arc::clone(&received);
-    let _id = lio
-      .schedule_with(|arena| {
-        Registration::new_callback_in(
-          arena,
-          move |item| out.lock().unwrap().push(item),
-          Nop,
-        )
-      })
-      .unwrap();
-
-    let processed = lio.try_run().unwrap();
-    assert_eq!(processed, 1);
-
-    let items = received.lock().unwrap();
-    assert_eq!(items.len(), 1);
-    assert!(matches!(items[0], Ok(())));
-  }
-
-  #[test]
-  fn install_global_guard_uninstalls_on_drop() {
-    assert!(uninstall_global().is_none());
-
-    let lio = Lio::new_with_backend(TestBackend::default(), 8).unwrap();
-    {
-      let _guard = install_global(lio.clone());
-      let global = get_global().expect("global lio should be installed");
-      assert!(Rc::ptr_eq(&global.inner, &lio.inner));
-    }
-
-    assert!(get_global().is_none());
-  }
-
-  #[test]
-  fn manual_uninstall_before_guard_drop_is_harmless() {
-    assert!(uninstall_global().is_none());
-
-    let lio = Lio::new_with_backend(TestBackend::default(), 8).unwrap();
-    let _guard = install_global(lio.clone());
-
-    let removed = uninstall_global().expect("global lio should be installed");
-    assert!(Rc::ptr_eq(&removed.inner, &lio.inner));
-
-    assert!(get_global().is_none());
   }
 }

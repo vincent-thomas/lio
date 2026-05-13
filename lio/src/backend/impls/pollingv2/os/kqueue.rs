@@ -399,12 +399,12 @@ impl ReadinessPoll for OsPoller {
   }
 }
 
-// #[cfg(test)]
-// mod tests {
-//   use super::*;
-//
-//   crate::test_readiness_poll_contract!(OsPoller::new().unwrap());
-// }
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  crate::test_readiness_poll_contract!(OsPoller::new().unwrap());
+}
 
 mod utils {
   use std::io;

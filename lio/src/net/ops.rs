@@ -13,6 +13,8 @@
 //! - [`SocketNew`]: Socket creation operation that returns a [`Socket`]
 //! - [`TcpBindListener`]: Socket-create/bind/listen operation that returns a [`TcpListener`]
 //! - [`TcpConnectSocket`]: Socket-create/connect operation that returns a [`TcpSocket`]
+//! - [`UdpBindSocket`]: Socket-create/bind operation that returns a [`UdpSocket`]
+//! - [`UdpConnectSocket`]: Socket-create/connect operation that returns a [`UdpSocket`]
 
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
@@ -26,7 +28,7 @@ use crate::{
     resource::FromResource,
   },
   backend::op::{SockDomain, SockProto, SockType},
-  net::{Socket, TcpListener, TcpSocket},
+  net::{Socket, TcpListener, TcpSocket, UdpSocket},
 };
 
 /// Accept operation specialized for [`Socket`].
@@ -335,3 +337,161 @@ impl OpModel for TcpConnectSocket {
 }
 
 impl OneshotOpModel for TcpConnectSocket {}
+
+pub struct UdpBindSocket {
+  state: UdpBindState,
+  addr: SocketAddr,
+}
+
+enum UdpBindState {
+  Socket(ops::Socket),
+  Bind { resource: crate::api::resource::Resource },
+  Done,
+}
+
+impl UdpBindSocket {
+  pub(crate) fn new(addr: SocketAddr) -> Self {
+    let domain =
+      if addr.is_ipv4() { SockDomain::IPV4 } else { SockDomain::IPV6 };
+    Self {
+      state: UdpBindState::Socket(ops::Socket::new(
+        domain,
+        SockType::DGRAM,
+        SockProto::DEFAULT,
+      )),
+      addr,
+    }
+  }
+}
+
+impl OpModel for UdpBindSocket {
+  type Item = io::Result<UdpSocket>;
+
+  fn action(&mut self) -> Action {
+    match &mut self.state {
+      UdpBindState::Socket(inner) => inner.action(),
+      UdpBindState::Bind { resource } => {
+        Action::Io(crate::backend::op::Op::Bind {
+          fd: resource.clone(),
+          addr: self.addr,
+        })
+      }
+      UdpBindState::Done => panic!("UdpBindSocket polled after completion"),
+    }
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    match &mut self.state {
+      UdpBindState::Socket(inner) => match inner.complete(completion) {
+        OpResult::Done(Ok(resource)) => {
+          self.state = UdpBindState::Bind { resource };
+          OpResult::Again
+        }
+        OpResult::Done(Err(err)) => {
+          self.state = UdpBindState::Done;
+          OpResult::Done(Err(err))
+        }
+        OpResult::Again => {
+          panic!("socket creation unexpectedly requested Again")
+        }
+        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
+      },
+      UdpBindState::Bind { resource } => {
+        let resource = resource.clone();
+        self.state = UdpBindState::Done;
+        if completion.result < 0 {
+          OpResult::Done(Err(io::Error::from_raw_os_error(
+            (-completion.result) as i32,
+          )))
+        } else {
+          OpResult::Done(Ok(UdpSocket::from_resource(resource)))
+        }
+      }
+      UdpBindState::Done => {
+        panic!("UdpBindSocket received completion after finish")
+      }
+    }
+  }
+}
+
+impl OneshotOpModel for UdpBindSocket {}
+
+pub struct UdpConnectSocket {
+  state: UdpConnectState,
+  addr: SocketAddr,
+}
+
+enum UdpConnectState {
+  Socket(ops::Socket),
+  Connect { resource: crate::api::resource::Resource },
+  Done,
+}
+
+impl UdpConnectSocket {
+  pub(crate) fn new(addr: SocketAddr) -> Self {
+    let domain =
+      if addr.is_ipv4() { SockDomain::IPV4 } else { SockDomain::IPV6 };
+    Self {
+      state: UdpConnectState::Socket(ops::Socket::new(
+        domain,
+        SockType::DGRAM,
+        SockProto::DEFAULT,
+      )),
+      addr,
+    }
+  }
+}
+
+impl OpModel for UdpConnectSocket {
+  type Item = io::Result<UdpSocket>;
+
+  fn action(&mut self) -> Action {
+    match &mut self.state {
+      UdpConnectState::Socket(inner) => inner.action(),
+      UdpConnectState::Connect { resource } => {
+        Action::Io(crate::backend::op::Op::Connect {
+          fd: resource.clone(),
+          addr: crate::backend::op::socket_addr_into_buf(self.addr),
+        })
+      }
+      UdpConnectState::Done => {
+        panic!("UdpConnectSocket polled after completion")
+      }
+    }
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    match &mut self.state {
+      UdpConnectState::Socket(inner) => match inner.complete(completion) {
+        OpResult::Done(Ok(resource)) => {
+          self.state = UdpConnectState::Connect { resource };
+          OpResult::Again
+        }
+        OpResult::Done(Err(err)) => {
+          self.state = UdpConnectState::Done;
+          OpResult::Done(Err(err))
+        }
+        OpResult::Again => {
+          panic!("socket creation unexpectedly requested Again")
+        }
+        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
+      },
+      UdpConnectState::Connect { resource } => {
+        let resource = resource.clone();
+        self.state = UdpConnectState::Done;
+        if completion.result < 0 {
+          OpResult::Done(Err(io::Error::from_raw_os_error(
+            (-completion.result) as i32,
+          )))
+        } else {
+          OpResult::Done(Ok(UdpSocket::from_resource(resource)))
+        }
+      }
+      UdpConnectState::Done => {
+        panic!("UdpConnectSocket received completion after finish")
+      }
+    }
+  }
+}
+
+impl OneshotOpModel for UdpConnectSocket {}

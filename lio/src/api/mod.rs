@@ -122,6 +122,15 @@ doc_op! {
 }
 
 doc_op! {
+    short: "Synchronizes a resource to stable storage.",
+    syscall: "fsync(2)",
+
+    pub fn fsync(res: &impl AsResource) -> Io<ops::Fsync> {
+        Io::from_op(ops::Fsync::new(res.as_resource().clone()))
+    }
+}
+
+doc_op! {
     short: "Writes one or more owned buffers.",
     syscall: "write(2)",
     doc_link: "https://man7.org/linux/man-pages/man2/write.2.html",

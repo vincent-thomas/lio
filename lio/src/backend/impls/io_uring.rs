@@ -11,7 +11,7 @@ use bumpalo::Bump;
 use lio_uring::{
   Entry, LioUring,
   operation::{
-    Accept, Bind, Connect, LinkAt, Listen, MkDirAt, Nop, OpenAt, Readv,
+    Accept, Bind, Connect, Fsync, LinkAt, Listen, MkDirAt, Nop, OpenAt, Readv,
     RecvMsg, RenameAt, SendMsg, Shutdown, Socket, Statx, SymlinkAt, UnlinkAt,
     Writev,
   },
@@ -774,6 +774,7 @@ impl IoUring {
         Listen::new(fd.as_raw_fd(), *backlog).build()
       }
       Op::Shutdown { fd, how } => Shutdown::new(fd.as_raw_fd(), *how).build(),
+      Op::Fsync { fd } => Fsync::new(fd.as_raw_fd()).build(),
       Op::Read { .. }
       | Op::Write { .. }
       | Op::Recv { .. }

@@ -6,7 +6,18 @@
 
 use std::time::{Duration, Instant};
 
-use lio::{Lio, api};
+use lio::{
+  Lio, api,
+  backend::ds::{DSBackend, DSConfig},
+};
+
+fn new_ds_lio() -> Lio {
+  Lio::new_with_backend(
+    DSBackend::with_config(DSConfig { fault_every: 0, ..DSConfig::default() }),
+    64,
+  )
+  .unwrap()
+}
 
 fn run_until_recv<T>(
   lio: &mut Lio,
@@ -32,7 +43,7 @@ fn run_until_recv<T>(
 
 #[test]
 fn basic() {
-  let mut lio = Lio::new(64).unwrap();
+  let mut lio = new_ds_lio();
   let recv = api::interval(Duration::from_millis(20)).with_lio(&lio).send();
 
   let first = run_until_recv(&mut lio, &recv, Duration::from_secs(1));
@@ -44,7 +55,7 @@ fn basic() {
 
 #[test]
 fn spacing_is_roughly_periodic() {
-  let mut lio = Lio::new(64).unwrap();
+  let mut lio = new_ds_lio();
   let period = Duration::from_millis(30);
   let recv = api::interval(period).with_lio(&lio).send();
 
@@ -73,7 +84,7 @@ fn spacing_is_roughly_periodic() {
 
 #[test]
 fn drop_stream_stops_delivery() {
-  let mut lio = Lio::new(64).unwrap();
+  let mut lio = new_ds_lio();
   let recv = {
     let stream = api::interval(Duration::from_millis(10)).with_lio(&lio);
     stream.send()
@@ -82,10 +93,6 @@ fn drop_stream_stops_delivery() {
   let first = run_until_recv(&mut lio, &recv, Duration::from_secs(1));
   assert!(first.is_ok(), "first interval tick should succeed: {first:?}");
 
-  // Stream is owned by `send()` and remains active through the registration.
-  // Once the sender side is dropped by cancelling the stream operation, the
-  // receiver should stop getting new ticks. Trigger cancellation by dropping
-  // the receiver after a successful smoke tick to ensure the op was live.
   drop(recv);
 
   for _ in 0..3 {
@@ -95,7 +102,7 @@ fn drop_stream_stops_delivery() {
 
 #[test]
 fn pause_resume_stops_and_restores_ticks() {
-  let mut lio = Lio::new(64).unwrap();
+  let mut lio = new_ds_lio();
   let recv = api::interval(Duration::from_millis(40)).with_lio(&lio).send();
 
   let first = run_until_recv(&mut lio, &recv, Duration::from_secs(1));

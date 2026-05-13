@@ -151,13 +151,17 @@ impl Drop for TempFile {
 /// Poll the lio event loop until a result is received on the channel.
 /// Blocks in kqueue/epoll for up to 5ms per iteration — no busy-spin, no attempt cap.
 pub fn poll_until_recv<T>(lio: &mut Lio, receiver: &mpsc::Receiver<T>) -> T {
-  loop {
-    lio.run_timeout(Duration::from_millis(5)).unwrap();
-    match receiver.try_recv() {
-      Ok(result) => return result,
-      Err(mpsc::TryRecvError::Empty) => {}
-      Err(mpsc::TryRecvError::Disconnected) => panic!("Channel disconnected"),
+  {
+    for _ in 0..1_000 {
+      match receiver.try_recv() {
+        Ok(result) => return result,
+        Err(mpsc::TryRecvError::Empty) => {
+          let _ = lio.run_timeout(Duration::from_millis(5));
+        }
+        Err(mpsc::TryRecvError::Disconnected) => panic!("Channel disconnected"),
+      }
     }
+    panic!("poll_until_recv exceeded 1000 waits under Miri");
   }
 }
 
@@ -180,9 +184,23 @@ pub fn poll_until_recv<T>(lio: &mut Lio, receiver: &mpsc::Receiver<T>) -> T {
 /// - Panics if the sender is dropped without sending (internal lio error).
 #[allow(dead_code)]
 pub fn poll_recv<T>(lio: &mut Lio, receiver: &mut Receiver<T>) -> T {
+  #[cfg(miri)]
+  {
+    for _ in 0..1_000 {
+      if let Some(result) = receiver.try_recv() {
+        return result;
+      }
+      let _ = lio.run().unwrap();
+    }
+    panic!("poll_recv exceeded 1000 waits under Miri");
+  }
+
+  #[cfg(not(miri))]
   let start = std::time::Instant::now();
+  #[cfg(not(miri))]
   let timeout = Duration::from_secs(5);
 
+  #[cfg(not(miri))]
   loop {
     if let Some(result) = receiver.try_recv() {
       return result;

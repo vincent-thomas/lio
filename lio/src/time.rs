@@ -61,6 +61,27 @@ impl TimeManager {
     }
   }
 
+  fn deadline_ticks_after(&self, duration: Duration) -> u64 {
+    match self.state {
+      TimeState::Running { epoch } => {
+        const TICK_NS: u128 = TICK_MS as u128 * 1_000_000;
+        let elapsed_ns = epoch.elapsed().as_nanos();
+        let deadline_ticks = elapsed_ns
+          .saturating_add(duration.as_nanos())
+          .div_ceil(TICK_NS)
+          .min(u64::MAX as u128) as u64;
+        deadline_ticks.max(self.clock.current_tick().saturating_add(1))
+      }
+      TimeState::Paused => self.clock.current_tick().saturating_add(
+        duration
+          .as_nanos()
+          .div_ceil(TICK_MS as u128 * 1_000_000)
+          .max(1)
+          .min(u64::MAX as u128) as u64,
+      ),
+    }
+  }
+
   fn sync_to_now(&mut self) {
     self.clock.advance_to(self.now_ticks());
   }
@@ -68,7 +89,7 @@ impl TimeManager {
   /// Schedules a timer with the given ID and duration.
   pub fn schedule(&mut self, id: TimerId, duration: Duration) {
     self.sync_to_now();
-    self.clock.schedule(id, duration);
+    self.clock.schedule_at(id, self.deadline_ticks_after(duration));
   }
 
   /// Returns the duration until the next timer fires, if any.
@@ -92,6 +113,22 @@ impl TimeManager {
   /// Removes a timer from tracking.
   pub fn remove(&mut self, id: TimerId) -> bool {
     self.clock.remove(id)
+  }
+
+  pub fn advance_by_ticks(&mut self, ticks: u64) {
+    if ticks == 0 {
+      return;
+    }
+    match self.state {
+      TimeState::Paused => self.clock.advance_by(ticks),
+      TimeState::Running { .. } => {
+        self.sync_to_now();
+        self.clock.advance_by(ticks);
+        let elapsed =
+          Duration::from_millis(self.clock.current_tick() * TICK_MS);
+        self.state = TimeState::Running { epoch: Instant::now() - elapsed };
+      }
+    }
   }
 
   pub fn pause(&mut self) {

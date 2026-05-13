@@ -467,9 +467,9 @@ impl Notifier {
   }
 }
 
-// #[cfg(test)]
-// mod tests {
-//   use super::*;
-//
-//   crate::test_readiness_poll_contract!(OsPoller::new().unwrap());
-// }
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  crate::test_readiness_poll_contract!(OsPoller::new().unwrap());
+}

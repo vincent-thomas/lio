@@ -1037,6 +1037,14 @@ pub enum Op {
     /// Shutdown mode passed to shutdown(2).
     how: i32,
   },
+  /// Synchronize a file's in-core state with stable storage.
+  ///
+  /// This is an immediate operation on readiness backends and a plain submit
+  /// on completion-based backends.
+  Fsync {
+    /// Resource to synchronize.
+    fd: Resource,
+  },
   Nop,
 }
 
@@ -1060,9 +1068,6 @@ pub enum Op {
 //   /// Whether this is a socket (use closesocket()) or a file handle (use CloseHandle())
 //   #[cfg(windows)]
 //   is_socket: bool,
-// },
-// Fsync {
-//   fd: Resource,
 // },
 // Truncate {
 //   fd: Resource,

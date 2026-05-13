@@ -542,6 +542,58 @@ impl OpModel for Shutdown {
 impl OneshotOpModel for Shutdown {}
 
 // ============================================================================
+// Fsync
+// ============================================================================
+
+pub struct Fsync {
+  res: Resource,
+}
+
+impl Fsync {
+  pub(crate) fn new(res: Resource) -> Self {
+    Self { res }
+  }
+}
+
+impl OpModel for Fsync {
+  type Item = io::Result<()>;
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::Fsync { fd: self.res.clone() })
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    OpResult::Done(if completion.result < 0 {
+      Err(io::Error::from_raw_os_error((-completion.result) as i32))
+    } else {
+      Ok(())
+    })
+  }
+}
+
+impl OneshotOpModel for Fsync {}
+
+#[cfg(test)]
+impl OpModelContract for Fsync {
+  impl_op_model_contract_runtime!();
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::stdout())
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action| matches!(action, Action::Io(Op::Fsync { .. })),
+      Completion::new(0),
+      |result| matches!(result, OpResult::Done(Ok(()))),
+    )]
+  }
+}
+
+// ============================================================================
 // Nop
 // ============================================================================
 
@@ -2116,6 +2168,12 @@ mod tests {
     use super::*;
 
     lio_test::test_op_model_contract!(Write<(Vec<u8>, Vec<u8>)>);
+  }
+
+  mod fsync_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Fsync);
   }
 
   mod unlinkat_contract {

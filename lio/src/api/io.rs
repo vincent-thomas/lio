@@ -54,8 +54,10 @@ use crate::{
 };
 
 use std::{
+  cell::RefCell,
   future::Future,
   pin::Pin,
+  rc::Rc,
   sync::mpsc as std_mpsc,
   task::{Context, Poll},
   time::Duration,
@@ -429,6 +431,11 @@ where
   lio: Lio,
 }
 
+struct LocalFutureSlot<T> {
+  item: Option<T>,
+  waker: Option<std::task::Waker>,
+}
+
 enum IoStreamFutureState<T>
 where
   T: OpModel,
@@ -436,7 +443,7 @@ where
   /// Not yet submitted.
   Pending(T),
   /// Submitted and awaiting completion.
-  Inflight { id: u64, receiver: std::sync::mpsc::Receiver<T::Item> },
+  Inflight { id: u64, slot: Rc<RefCell<LocalFutureSlot<T::Item>>> },
   /// Done.
   Done,
 }
@@ -455,42 +462,62 @@ where
 
     match std::mem::replace(&mut this.state, IoStreamFutureState::Done) {
       IoStreamFutureState::Pending(stream_op) => {
-        // First poll - create channel and schedule operation
-        let (tx, rx) = std::sync::mpsc::channel();
+        let slot = Rc::new(RefCell::new(LocalFutureSlot {
+          item: None,
+          waker: Some(cx.waker().clone()),
+        }));
+        let callback_slot = Rc::clone(&slot);
 
         let id = this
           .lio
           .schedule_with(move |arena| {
-            Registration::new_waker_in(arena, cx.waker().clone(), tx, stream_op)
+            Registration::new_callback_in(
+              arena,
+              move |item| {
+                let mut slot = callback_slot.borrow_mut();
+                slot.item = Some(item);
+                if let Some(waker) = slot.waker.take() {
+                  waker.wake();
+                }
+              },
+              stream_op,
+            )
           })
           .expect("lio error: failed to schedule operation");
 
-        this.state = IoStreamFutureState::Inflight { id, receiver: rx };
+        this.state = IoStreamFutureState::Inflight { id, slot };
         Poll::Pending
       }
 
-      IoStreamFutureState::Inflight { id, receiver } => {
-        // Try to receive typed result from channel
-        match receiver.try_recv() {
-          Ok(item) => {
-            // Got the result!
-            Poll::Ready(item)
+      IoStreamFutureState::Inflight { id, slot } => {
+        let mut slot_ref = slot.borrow_mut();
+        if let Some(item) = slot_ref.item.take() {
+          Poll::Ready(item)
+        } else {
+          match &slot_ref.waker {
+            Some(waker) if waker.will_wake(cx.waker()) => {}
+            _ => slot_ref.waker = Some(cx.waker().clone()),
           }
-          Err(std::sync::mpsc::TryRecvError::Empty) => {
-            // No result yet, update waker and stay in Inflight
-            this.lio.set_waker(id, cx.waker().clone());
-            this.state = IoStreamFutureState::Inflight { id, receiver };
-            Poll::Pending
-          }
-          Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-            panic!("Channel disconnected - sender dropped prematurely");
-          }
+          drop(slot_ref);
+          this.state = IoStreamFutureState::Inflight { id, slot };
+          Poll::Pending
         }
       }
 
       IoStreamFutureState::Done => {
         panic!("IoStreamFuture polled after completion");
       }
+    }
+  }
+}
+
+impl<T> Drop for IoStreamFuture<T>
+where
+  T: OpModel,
+{
+  fn drop(&mut self) {
+    if let IoStreamFutureState::Inflight { id, .. } = self.state {
+      self.lio.cancel_stream(id);
     }
   }
 }

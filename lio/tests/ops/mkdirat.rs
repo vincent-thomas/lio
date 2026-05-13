@@ -7,65 +7,71 @@
 #[path = "../common.rs"]
 mod common;
 
-use lio::api::resource::Resource;
-use lio::{Lio, api};
+use lio::{
+  Lio,
+  api::{self, resource::Resource},
+  backend::ds::{DSBackend, DSConfig},
+};
 use std::ffi::CString;
-use std::os::fd::FromRawFd;
-use std::sync::mpsc;
 
-use common::poll_until_recv;
+fn new_ds_lio() -> Lio {
+  Lio::new_with_backend(
+    DSBackend::with_config(DSConfig { fault_every: 0, ..DSConfig::default() }),
+    64,
+  )
+  .unwrap()
+}
+
+fn stat_path(
+  lio: &mut Lio,
+  path: CString,
+) -> Result<lio::api::FileStat, std::io::Error> {
+  let mut receiver =
+    api::statat(&Resource::cwd(), path, true).with_lio(lio).send();
+  common::poll_recv(lio, &mut receiver)
+}
+
+fn mkdir(lio: &mut Lio, path: CString) -> Result<(), std::io::Error> {
+  let mut receiver =
+    api::mkdirat(&Resource::cwd(), path, 0o755).with_lio(lio).send();
+  common::poll_recv(lio, &mut receiver)
+}
+
+fn unlink_dir(lio: &mut Lio, path: CString) {
+  let mut receiver = api::unlinkat(&Resource::cwd(), path, libc::AT_REMOVEDIR)
+    .with_lio(lio)
+    .send();
+  common::poll_recv(lio, &mut receiver).unwrap();
+}
 
 #[test]
 fn test_mkdirat_basic() {
-  let mut lio = Lio::new(64).unwrap();
-  let cwd = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+  let mut lio = new_ds_lio();
   let path =
     CString::new(format!("/tmp/lio_test_mkdirat_{}", std::process::id()))
       .unwrap();
 
-  unsafe {
-    libc::rmdir(path.as_ptr());
-  }
+  mkdir(&mut lio, path.clone()).expect("mkdirat should succeed");
 
-  let (sender, receiver) = mpsc::channel();
-  api::mkdirat(&cwd, path.clone(), 0o755).with_lio(&mut lio).send_with(sender);
+  let stat = stat_path(&mut lio, path.clone()).expect("directory should exist");
+  assert!(stat.is_dir());
 
-  poll_until_recv(&mut lio, &receiver).expect("mkdirat should succeed");
-
-  let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-  let stat_result = unsafe { libc::stat(path.as_ptr(), st.as_mut_ptr()) };
-  assert_eq!(stat_result, 0, "directory should exist");
-  let st = unsafe { st.assume_init() };
-  assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFDIR);
-
-  unsafe {
-    libc::rmdir(path.as_ptr());
-  }
-  std::mem::forget(cwd);
+  unlink_dir(&mut lio, path);
 }
 
 #[test]
 fn test_mkdirat_existing_path_fails() {
-  let mut lio = Lio::new(64).unwrap();
-  let cwd = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+  let mut lio = new_ds_lio();
   let path = CString::new(format!(
     "/tmp/lio_test_mkdirat_existing_{}",
     std::process::id()
   ))
   .unwrap();
 
-  unsafe {
-    libc::mkdir(path.as_ptr(), 0o755);
-  }
+  mkdir(&mut lio, path.clone()).unwrap();
 
-  let (sender, receiver) = mpsc::channel();
-  api::mkdirat(&cwd, path.clone(), 0o755).with_lio(&mut lio).send_with(sender);
+  let result = mkdir(&mut lio, path.clone());
+  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EEXIST));
 
-  let result = poll_until_recv(&mut lio, &receiver);
-  assert!(result.is_err(), "mkdirat should fail for existing path");
-
-  unsafe {
-    libc::rmdir(path.as_ptr());
-  }
-  std::mem::forget(cwd);
+  unlink_dir(&mut lio, path);
 }

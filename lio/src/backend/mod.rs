@@ -37,6 +37,7 @@
 //! backend.wait(Some(Duration::ZERO), &mut completions).unwrap();
 //! ```
 
+pub mod ds;
 pub mod op;
 
 /// Test utilities for IoBackend implementations.

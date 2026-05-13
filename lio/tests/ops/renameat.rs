@@ -7,18 +7,45 @@
 #[path = "../common.rs"]
 mod common;
 
-use lio::api::resource::Resource;
-use lio::{Lio, api};
+use lio::{
+  Lio,
+  api::{self, resource::Resource},
+  backend::ds::{DSBackend, DSConfig},
+};
 use std::ffi::CString;
-use std::os::fd::FromRawFd;
-use std::sync::mpsc;
 
-use common::poll_until_recv;
+fn new_ds_lio() -> Lio {
+  Lio::new_with_backend(
+    DSBackend::with_config(DSConfig { fault_every: 0, ..DSConfig::default() }),
+    64,
+  )
+  .unwrap()
+}
+
+fn open_file(lio: &mut Lio, path: CString, flags: i32, mode: u32) -> Resource {
+  let mut receiver =
+    api::openat(&Resource::cwd(), path, flags, mode).with_lio(lio).send();
+  common::poll_recv(lio, &mut receiver).unwrap()
+}
+
+fn stat_path(
+  lio: &mut Lio,
+  path: CString,
+) -> Result<lio::api::FileStat, std::io::Error> {
+  let mut receiver =
+    api::statat(&Resource::cwd(), path, true).with_lio(lio).send();
+  common::poll_recv(lio, &mut receiver)
+}
+
+fn unlink_file(lio: &mut Lio, path: CString) {
+  let mut receiver =
+    api::unlinkat(&Resource::cwd(), path, 0).with_lio(lio).send();
+  common::poll_recv(lio, &mut receiver).unwrap();
+}
 
 #[test]
 fn test_renameat_basic() {
-  let mut lio = Lio::new(64).unwrap();
-  let cwd = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+  let mut lio = new_ds_lio();
   let old_path = CString::new(format!(
     "/tmp/lio_test_renameat_old_{}.txt",
     std::process::id()
@@ -30,39 +57,36 @@ fn test_renameat_basic() {
   ))
   .unwrap();
 
-  unsafe {
-    let fd = libc::open(
-      old_path.as_ptr(),
-      libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
-      0o644,
-    );
-    assert!(fd >= 0, "failed to create old file");
-    libc::close(fd);
-    libc::unlink(new_path.as_ptr());
-  }
+  let _file = open_file(
+    &mut lio,
+    old_path.clone(),
+    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+    0o644,
+  );
 
-  let (sender, receiver) = mpsc::channel();
-  api::renameat(&cwd, old_path.clone(), &cwd, new_path.clone())
-    .with_lio(&mut lio)
-    .send_with(sender);
+  let mut receiver = api::renameat(
+    &Resource::cwd(),
+    old_path.clone(),
+    &Resource::cwd(),
+    new_path.clone(),
+  )
+  .with_lio(&mut lio)
+  .send();
+  common::poll_recv(&mut lio, &mut receiver).expect("renameat should succeed");
 
-  poll_until_recv(&mut lio, &receiver).expect("renameat should succeed");
+  let old_result = stat_path(&mut lio, old_path);
+  assert_eq!(old_result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
 
-  let old_exists = unsafe { libc::access(old_path.as_ptr(), libc::F_OK) == 0 };
-  let new_exists = unsafe { libc::access(new_path.as_ptr(), libc::F_OK) == 0 };
-  assert!(!old_exists, "old path should be gone");
-  assert!(new_exists, "new path should exist");
+  let new_stat =
+    stat_path(&mut lio, new_path.clone()).expect("new path should exist");
+  assert!(new_stat.is_file());
 
-  unsafe {
-    libc::unlink(new_path.as_ptr());
-  }
-  std::mem::forget(cwd);
+  unlink_file(&mut lio, new_path);
 }
 
 #[test]
 fn test_renameat_missing_source_fails() {
-  let mut lio = Lio::new(64).unwrap();
-  let cwd = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+  let mut lio = new_ds_lio();
   let old_path = CString::new(format!(
     "/tmp/lio_test_renameat_missing_{}.txt",
     std::process::id()
@@ -74,18 +98,10 @@ fn test_renameat_missing_source_fails() {
   ))
   .unwrap();
 
-  unsafe {
-    libc::unlink(old_path.as_ptr());
-    libc::unlink(new_path.as_ptr());
-  }
-
-  let (sender, receiver) = mpsc::channel();
-  api::renameat(&cwd, old_path, &cwd, new_path)
-    .with_lio(&mut lio)
-    .send_with(sender);
-
-  let result = poll_until_recv(&mut lio, &receiver);
-  assert!(result.is_err(), "renameat should fail for missing source");
-
-  std::mem::forget(cwd);
+  let mut receiver =
+    api::renameat(&Resource::cwd(), old_path, &Resource::cwd(), new_path)
+      .with_lio(&mut lio)
+      .send();
+  let result = common::poll_recv(&mut lio, &mut receiver);
+  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
 }

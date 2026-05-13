@@ -9,6 +9,7 @@
 //! - [`Socket`]: Low-level async socket wrapper that provides direct access to socket operations
 //! - [`TcpListener`]: High-level TCP server for accepting incoming connections
 //! - [`TcpSocket`]: High-level TCP client/server connection for sending and receiving data
+//! - [`UdpSocket`]: High-level UDP socket for datagram send/receive
 //!
 //! # Features
 //!
@@ -116,9 +117,11 @@
 
 mod socket;
 mod tcp;
+mod udp;
 // #[cfg(unix)]
 // pub mod unix;
 
 pub use socket::*;
 pub use tcp::*;
+pub use udp::*;
 pub mod ops;

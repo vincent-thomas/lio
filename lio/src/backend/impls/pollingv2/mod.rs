@@ -17,8 +17,8 @@ use os::epoll as sys;
 ))]
 use os::kqueue as sys;
 
-// #[cfg(test)]
-// pub(crate) mod tests;
+#[cfg(test)]
+pub(crate) mod tests;
 
 use std::{
   io,
@@ -199,6 +199,24 @@ pub struct PendingOp {
 const EAGAIN_NEG: isize = -(libc::EAGAIN as isize);
 const EWOULDBLOCK_NEG: isize = -(libc::EWOULDBLOCK as isize);
 impl Poller {
+  fn set_fd_cloexec(fd: RawFd) -> io::Result<()> {
+    let flags = syscall!(fcntl(fd, libc::F_GETFD))?;
+    syscall!(fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC))?;
+    Ok(())
+  }
+
+  fn set_fd_nonblocking(fd: RawFd) -> io::Result<()> {
+    let flags = syscall!(fcntl(fd, libc::F_GETFL))?;
+    syscall!(fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK))?;
+    Ok(())
+  }
+
+  fn configure_socket_fd(fd: RawFd) -> io::Result<()> {
+    Self::set_fd_cloexec(fd)?;
+    Self::set_fd_nonblocking(fd)?;
+    Ok(())
+  }
+
   #[inline]
   fn dirent_ino(entry: *const libc::dirent) -> u64 {
     #[cfg(any(
@@ -410,7 +428,7 @@ impl Poller {
       dst.iov_len = src.len;
     }
 
-    let mut addr = if msg.from {
+    let addr = if msg.from {
       Some((
         // SAFETY: `sockaddr_storage` is POD and may be zero-initialized.
         unsafe { std::mem::zeroed::<libc::sockaddr_storage>() },
@@ -420,7 +438,7 @@ impl Poller {
       None
     };
 
-    let mut hdr = libc::msghdr {
+    let hdr = libc::msghdr {
       msg_name: std::ptr::null_mut(),
       msg_namelen: 0,
       msg_iov: std::ptr::null_mut(),
@@ -429,13 +447,6 @@ impl Poller {
       msg_controllen: 0,
       msg_flags: 0,
     };
-    hdr.msg_iov = iovecs.as_mut_ptr();
-    hdr.msg_iovlen = bufs.len() as _;
-    if let Some((storage, len)) = addr.as_mut() {
-      hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
-      hdr.msg_namelen = *len;
-    }
-
     Some((iovecs, hdr, addr))
   }
 
@@ -453,8 +464,8 @@ impl Poller {
       dst.iov_len = src.len;
     }
 
-    let mut addr = msg.to.map(crate::backend::op::socket_addr_to_storage);
-    let mut hdr = libc::msghdr {
+    let addr = msg.to.map(crate::backend::op::socket_addr_to_storage);
+    let hdr = libc::msghdr {
       msg_name: std::ptr::null_mut(),
       msg_namelen: 0,
       msg_iov: std::ptr::null_mut(),
@@ -463,14 +474,52 @@ impl Poller {
       msg_controllen: 0,
       msg_flags: 0,
     };
-    hdr.msg_iov = iovecs.as_mut_ptr();
-    hdr.msg_iovlen = bufs.len() as _;
-    if let Some((storage, len)) = addr.as_mut() {
-      hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
-      hdr.msg_namelen = *len;
-    }
-
     Some((iovecs, hdr, addr))
+  }
+
+  fn debug_sendmsg_zero(fd: RawFd, hdr: &libc::msghdr) {
+    let mut so_error: i32 = 0;
+    let mut so_error_len = std::mem::size_of::<i32>() as libc::socklen_t;
+    let so_error_ret = syscall!(raw getsockopt(
+      fd,
+      libc::SOL_SOCKET,
+      libc::SO_ERROR,
+      (&mut so_error as *mut i32).cast(),
+      &mut so_error_len,
+    ));
+
+    let mut peer = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
+    let mut peer_len =
+      std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let peer_ret = syscall!(raw getpeername(
+      fd,
+      (&mut peer as *mut libc::sockaddr_storage).cast(),
+      &mut peer_len,
+    ));
+
+    let peer = if peer_ret >= 0 {
+      Self::raise_socket_addr(&peer, peer_len)
+        .and_then(|addr| crate::backend::op::socket_addr_from_buf(&addr))
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|err| format!("<decode-error:{err}>"))
+    } else {
+      format!("<getpeername:{}>", -peer_ret)
+    };
+
+    eprintln!(
+      "lio-debug sendmsg returned 0 fd={} msg_iovlen={} first_iov_len={} so_error_ret={} so_error={} peer={}",
+      fd,
+      hdr.msg_iovlen,
+      if hdr.msg_iovlen > 0 {
+        // SAFETY: msg_iovlen > 0 means msg_iov points to at least one iovec.
+        unsafe { (*hdr.msg_iov).iov_len }
+      } else {
+        0
+      },
+      so_error_ret,
+      so_error,
+      peer,
+    );
   }
 
   pub fn new() -> Self {
@@ -619,6 +668,7 @@ impl Poller {
       crate::backend::op::Op::Bind { .. } => (0, Interest::NONE),
       crate::backend::op::Op::Listen { .. } => (0, Interest::NONE),
       crate::backend::op::Op::Shutdown { .. } => (0, Interest::NONE),
+      crate::backend::op::Op::Fsync { .. } => (0, Interest::NONE),
       crate::backend::op::Op::OpenAt { .. } => (0, Interest::NONE),
       crate::backend::op::Op::Stat { .. } => (0, Interest::NONE),
       crate::backend::op::Op::ReadDir { .. } => (0, Interest::NONE),
@@ -641,6 +691,7 @@ impl Poller {
       Op::Bind { .. } => return true,
       Op::Listen { .. } => return true,
       Op::Shutdown { .. } => return true,
+      Op::Fsync { .. } => return true,
       Op::OpenAt { .. } => return true,
       Op::Stat { .. } => return true,
       Op::ReadDir { .. } => return true,
@@ -744,18 +795,36 @@ impl Poller {
 
       Op::Recv { fd, msg, flags } => {
         let fd = fd.as_raw_fd();
-        let Some((_iovecs, mut hdr, _addr)) = Self::lower_recv_msg(msg) else {
+        let Some((mut iovecs, mut hdr, mut addr)) = Self::lower_recv_msg(msg)
+        else {
           return -(libc::EINVAL as isize);
         };
+        hdr.msg_iov = iovecs.as_mut_ptr();
+        hdr.msg_iovlen = msg.buf_count.get() as _;
+        if let Some((storage, len)) = addr.as_mut() {
+          hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
+          hdr.msg_namelen = *len;
+        }
         syscall!(raw recvmsg(fd, &mut hdr, *flags))
       }
 
       Op::Send { fd, msg, flags } => {
         let fd = fd.as_raw_fd();
-        let Some((_iovecs, mut hdr, _addr)) = Self::lower_send_msg(msg) else {
+        let Some((mut iovecs, mut hdr, mut addr)) = Self::lower_send_msg(msg)
+        else {
           return -(libc::EINVAL as isize);
         };
-        syscall!(raw sendmsg(fd, &mut hdr, *flags))
+        hdr.msg_iov = iovecs.as_mut_ptr();
+        hdr.msg_iovlen = msg.buf_count.get() as _;
+        if let Some((storage, len)) = addr.as_mut() {
+          hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
+          hdr.msg_namelen = *len;
+        }
+        let result = syscall!(raw sendmsg(fd, &mut hdr, *flags));
+        if result == 0 && hdr.msg_iovlen > 0 {
+          Self::debug_sendmsg_zero(fd, &hdr);
+        }
+        result
       }
 
       Op::Accept { fd, addr } => {
@@ -767,12 +836,18 @@ impl Poller {
           std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         let result = syscall!(raw accept(fd, (&mut storage as *mut libc::sockaddr_storage).cast(), &mut len));
         if result >= 0 {
+          let accepted_fd = result as RawFd;
+          if let Err(err) = Self::configure_socket_fd(accepted_fd) {
+            let _ = syscall!(raw close(accepted_fd));
+            return -(err.raw_os_error().unwrap_or(libc::EINVAL) as isize);
+          }
           match Self::raise_socket_addr(&storage, len) {
             Ok(peer) => {
               // SAFETY: `addr` points to caller-provided writable peer storage.
               unsafe { *addr.as_ptr() = peer }
             }
             Err(err) => {
+              let _ = syscall!(raw close(accepted_fd));
               return -(err.raw_os_error().unwrap_or(libc::EINVAL) as isize);
             }
           }
@@ -949,7 +1024,20 @@ impl Poller {
 
       Op::Socket { domain, ty, proto } => {
         match crate::backend::op::socket_to_raw(*domain, *ty, *proto) {
-          Ok((domain, ty, proto)) => syscall!(raw socket(domain, ty, proto)),
+          Ok((domain, ty, proto)) => {
+            let result = syscall!(raw socket(domain, ty, proto));
+            if result < 0 {
+              result
+            } else {
+              let fd = result as RawFd;
+              if let Err(err) = Self::configure_socket_fd(fd) {
+                let _ = syscall!(raw close(fd));
+                -(err.raw_os_error().unwrap_or(libc::EINVAL) as isize)
+              } else {
+                result
+              }
+            }
+          }
           Err(errno) => -(errno as isize),
         }
       }
@@ -970,6 +1058,9 @@ impl Poller {
       }
       Op::Shutdown { fd, how } => {
         syscall!(raw shutdown(fd.as_raw_fd(), *how))
+      }
+      Op::Fsync { fd } => {
+        syscall!(raw fsync(fd.as_raw_fd()))
       }
 
       Op::Nop => 0,
