@@ -1,3 +1,5 @@
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::net::SocketAddr;
 
 use crate::{

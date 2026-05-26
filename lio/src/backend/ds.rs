@@ -1,3 +1,12 @@
+#![allow(
+  clippy::large_enum_variant,
+  clippy::question_mark,
+  clippy::undocumented_unsafe_blocks,
+  clippy::unnecessary_cast,
+  clippy::unnecessary_map_or,
+  clippy::collapsible_if
+)]
+
 //! Deterministic simulation backend for higher-level tests.
 //!
 //! `DSBackend` never calls into the operating system. Instead it executes

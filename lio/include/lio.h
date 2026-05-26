@@ -177,8 +177,8 @@ void lio_accept(struct lio_handle_t *lio, intptr_t fd, void (*callback)(intptr_t
  * - `callback(result, buf, len)`: bytes sent (or negative errno), buffer
  *
  * # Safety
- * `lio` must be valid; `buf` must be at least `buf_len` bytes allocated with
- * `malloc`.
+ * `lio` must be valid; `buf` must point to at least `buf_len` bytes allocated
+ * with `malloc`.
  */
 void lio_send(struct lio_handle_t *lio,
               intptr_t fd,
@@ -195,8 +195,8 @@ void lio_send(struct lio_handle_t *lio,
  * - `callback(result, buf, len)`: bytes received (or negative errno), buffer
  *
  * # Safety
- * `lio` must be valid; `buf` must be at least `buf_len` bytes allocated with
- * `malloc`.
+ * `lio` must be valid; `buf` must be a live buffer previously allocated by
+ * [`lio_buf_alloc(buf_len)`].
  */
 void lio_recv(struct lio_handle_t *lio,
               intptr_t fd,

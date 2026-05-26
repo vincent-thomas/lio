@@ -1,3 +1,5 @@
+#![allow(clippy::unnecessary_lazy_evaluations)]
+
 //! I/O operation definitions.
 //!
 //! This module contains all the typed operation structs that implement `TypedOp`.

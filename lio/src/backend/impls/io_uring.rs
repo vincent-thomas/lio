@@ -1,3 +1,5 @@
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 //! `lio`-provided [`IoBackend`] impl for `io_uring`.
 
 use std::io;
