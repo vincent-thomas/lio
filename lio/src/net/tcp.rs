@@ -299,7 +299,7 @@ impl TcpSocket {
   /// ```
   pub fn recv<V>(&self, vec: V) -> Io<Recv<V>>
   where
-    V: buf::IoBufMutVec,
+    V: buf::IoBufMutVec + std::marker::Send + Sync + 'static,
   {
     self.0.recv(vec)
   }
@@ -337,7 +337,7 @@ impl TcpSocket {
   /// ```
   pub fn send<V>(&self, vec: V) -> Io<ops::Send<V>>
   where
-    V: buf::IoBufVec,
+    V: buf::IoBufVec + std::marker::Send + Sync + 'static,
   {
     self.0.send(vec)
   }

@@ -39,6 +39,7 @@ struct NativeMsgState {
   iovecs: [libc::iovec; crate::buf::MAX_IOV_COUNT],
   iov_count: usize,
   addr: Option<(libc::sockaddr_storage, libc::socklen_t)>,
+  from_out: Option<std::ptr::NonNull<crate::backend::op::SocketAddrBuf>>,
   hdr: libc::msghdr,
 }
 
@@ -54,6 +55,7 @@ impl NativeMsgState {
         crate::buf::MAX_IOV_COUNT],
       iov_count: bufs.len(),
       addr: None,
+      from_out: msg.from,
       // SAFETY: `libc::msghdr` is a plain C struct and zero is a valid
       // sentinel initialization before we fill its pointer fields.
       hdr: unsafe { mem::zeroed() },
@@ -64,7 +66,7 @@ impl NativeMsgState {
       dst.iov_len = src.len;
     }
 
-    if msg.from {
+    if msg.from.is_some() {
       state.addr = Some((
         // SAFETY: zeroed `sockaddr_storage` is valid scratch storage before a
         // socket syscall writes an address into it.
@@ -87,6 +89,7 @@ impl NativeMsgState {
         crate::buf::MAX_IOV_COUNT],
       iov_count: bufs.len(),
       addr: msg.to.map(crate::backend::op::socket_addr_to_storage),
+      from_out: None,
       // SAFETY: `libc::msghdr` is a plain C struct and zero is a valid
       // sentinel initialization before we fill its pointer fields.
       hdr: unsafe { mem::zeroed() },
@@ -330,6 +333,20 @@ impl LoweredState {
         ) {
           // SAFETY: `out` is caller-provided writable output storage that
           // remains valid until completion processing.
+          unsafe {
+            *out.as_ptr() = addr;
+          }
+        }
+      }
+      Self::Msg(state) => {
+        let state = unsafe { state.as_ref() };
+        if let (Some(out), Some((storage, len))) =
+          (state.from_out, state.addr.as_ref())
+          && let Ok(addr) = crate::backend::op::socket_addr_buf_from_storage(
+            storage,
+            *len,
+          )
+        {
           unsafe {
             *out.as_ptr() = addr;
           }
@@ -845,18 +862,32 @@ impl IoUring {
 
   fn create_stat_entry(op: &Op, native_stat: &NativeStatState) -> Entry {
     match op {
-      Op::Stat { dir_fd, path, follow_symlinks, .. } => {
-        let flags =
-          if *follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
-        Statx::new(
-          dir_fd.as_raw_fd(),
-          path.as_ptr().cast_const(),
+      Op::Stat { target, .. } => match target {
+        crate::backend::op::StatTarget::Path {
+          dir_fd,
+          path,
+          follow_symlinks,
+        } => {
+          let flags =
+            if *follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+          Statx::new(
+            dir_fd.as_raw_fd(),
+            path.as_ptr().cast_const(),
+            (&native_stat.statx as *const lio_uring::statx).cast_mut(),
+          )
+          .flags(flags)
+          .mask(STATX_BASIC_STATS)
+          .build()
+        }
+        crate::backend::op::StatTarget::Fd { fd } => Statx::new(
+          fd.as_raw_fd(),
+          c"".as_ptr(),
           (&native_stat.statx as *const lio_uring::statx).cast_mut(),
         )
-        .flags(flags)
+        .flags(libc::AT_EMPTY_PATH)
         .mask(STATX_BASIC_STATS)
-        .build()
-      }
+        .build(),
+      },
       _ => unreachable!("stat entry requires stat op"),
     }
   }

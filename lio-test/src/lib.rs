@@ -1191,7 +1191,7 @@ macro_rules! test_io_backend {
             id,
             Op::Recv {
               fd: read_res.clone(),
-              msg: MsgRecv::new(&bufs, false),
+              msg: MsgRecv::new(&bufs),
               flags: 0,
             },
           );
@@ -1222,7 +1222,7 @@ macro_rules! test_io_backend {
           56,
           Op::Recv {
             fd: read_res.clone(),
-            msg: MsgRecv::new(&bufs, false),
+            msg: MsgRecv::new(&bufs),
             flags: 0,
           },
         );
@@ -1255,7 +1255,7 @@ macro_rules! test_io_backend {
             id,
             Op::Recv {
               fd: read_res.clone(),
-              msg: MsgRecv::new(&bufs, false),
+              msg: MsgRecv::new(&bufs),
               flags: 0,
             },
           );
@@ -1287,7 +1287,7 @@ macro_rules! test_io_backend {
           561,
           Op::Recv {
             fd: read_res.clone(),
-            msg: MsgRecv::new(&bufs, false),
+            msg: MsgRecv::new(&bufs),
             flags: 0,
           },
         );
@@ -1340,7 +1340,7 @@ macro_rules! test_io_backend {
             id,
             Op::Recv {
               fd: read_res.clone(),
-              msg: MsgRecv::new(&bufs, false),
+              msg: MsgRecv::new(&bufs),
               flags: 0,
             },
           );
@@ -1372,7 +1372,7 @@ macro_rules! test_io_backend {
           57,
           Op::Recv {
             fd: read_res.clone(),
-            msg: MsgRecv::new(&bufs, false),
+            msg: MsgRecv::new(&bufs),
             flags: 0,
           },
         );
@@ -1395,7 +1395,7 @@ macro_rules! test_io_backend {
           49,
           Op::Recv {
             fd: invalid_fd_resource(),
-            msg: MsgRecv::new(&bufs, false),
+            msg: MsgRecv::new(&bufs),
             flags: 0,
           },
         );
@@ -1933,9 +1933,11 @@ macro_rules! test_io_backend {
         push_op(&mut backend,
           82,
           Op::Stat {
-            dir_fd: Resource::cwd(),
-            path: nonnull_const(c_path.as_ptr()),
-            follow_symlinks: true,
+            target: __lio_test_lio::backend::op::StatTarget::Path {
+              dir_fd: Resource::cwd(),
+              path: nonnull_const(c_path.as_ptr()),
+              follow_symlinks: true,
+            },
             out: nonnull(&mut out),
           },
         );
@@ -1961,9 +1963,11 @@ macro_rules! test_io_backend {
         push_op(&mut backend,
           83,
           Op::Stat {
-            dir_fd: Resource::cwd(),
-            path: nonnull_const(c_path.as_ptr()),
-            follow_symlinks: true,
+            target: __lio_test_lio::backend::op::StatTarget::Path {
+              dir_fd: Resource::cwd(),
+              path: nonnull_const(c_path.as_ptr()),
+              follow_symlinks: true,
+            },
             out: nonnull(&mut out),
           },
         );
@@ -1989,9 +1993,11 @@ macro_rules! test_io_backend {
         push_op(&mut backend,
           84,
           Op::Stat {
-            dir_fd: Resource::cwd(),
-            path: nonnull_const(c_path.as_ptr()),
-            follow_symlinks: false,
+            target: __lio_test_lio::backend::op::StatTarget::Path {
+              dir_fd: Resource::cwd(),
+              path: nonnull_const(c_path.as_ptr()),
+              follow_symlinks: false,
+            },
             out: nonnull(&mut out),
           },
         );

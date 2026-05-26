@@ -131,7 +131,7 @@ impl IoBuf for Box<[u8]> {
 /// A collection of buffers for vectored writes (`writev`).
 ///
 /// Implemented for tuples, arrays, and `Vec<B>`.
-pub trait IoBufVec: Send + Sync + 'static {
+pub trait IoBufVec {
   /// Returns the number of buffers in the collection.
   fn buf_count(&self) -> usize;
 
@@ -261,6 +261,16 @@ impl_io_buf_vec_array!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
 // ═══════════════════════════════════════════════════════════════════════════════
 
 impl<B: IoBuf> IoBufVec for Vec<B> {
+  fn buf_count(&self) -> usize {
+    self.len()
+  }
+
+  fn buf(&self, i: usize) -> (*const u8, usize) {
+    (self[i].as_ptr(), self[i].len())
+  }
+}
+
+impl<B: IoBuf> IoBufVec for &'static mut Vec<B> {
   fn buf_count(&self) -> usize {
     self.len()
   }

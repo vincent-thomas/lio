@@ -428,7 +428,7 @@ impl Poller {
       dst.iov_len = src.len;
     }
 
-    let addr = if msg.from {
+    let addr = if msg.from.is_some() {
       Some((
         // SAFETY: `sockaddr_storage` is POD and may be zero-initialized.
         unsafe { std::mem::zeroed::<libc::sockaddr_storage>() },
@@ -805,7 +805,16 @@ impl Poller {
           hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
           hdr.msg_namelen = *len;
         }
-        syscall!(raw recvmsg(fd, &mut hdr, *flags))
+        let result = syscall!(raw recvmsg(fd, &mut hdr, *flags));
+        if result >= 0
+          && let (Some(out), Some((storage, len))) = (msg.from, addr.as_ref())
+          && let Ok(addr) = Self::raise_socket_addr(storage, *len)
+        {
+          unsafe {
+            *out.as_ptr() = addr;
+          }
+        }
+        result
       }
 
       Op::Send { fd, msg, flags } => {
@@ -882,18 +891,29 @@ impl Poller {
         *flags,
         *mode,
       )),
-      Op::Stat { dir_fd, path, follow_symlinks, out } => {
+      Op::Stat { target, out } => {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        let flags =
-          if *follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
-        let result = syscall!(raw fstatat(
-          dir_fd.as_raw_fd(),
-          path.as_ptr(),
-          stat.as_mut_ptr(),
-          flags,
-        ));
+        let result = match target {
+          crate::backend::op::StatTarget::Path {
+            dir_fd,
+            path,
+            follow_symlinks,
+          } => {
+            let flags =
+              if *follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+            syscall!(raw fstatat(
+              dir_fd.as_raw_fd(),
+              path.as_ptr(),
+              stat.as_mut_ptr(),
+              flags,
+            ))
+          }
+          crate::backend::op::StatTarget::Fd { fd } => {
+            syscall!(raw fstat(fd.as_raw_fd(), stat.as_mut_ptr()))
+          }
+        };
         if result >= 0 {
-          // SAFETY: successful `fstatat` initialized `stat`.
+          // SAFETY: successful `fstatat`/`fstat` initialized `stat`.
           let stat = unsafe { stat.assume_init() };
           // SAFETY: `out` points to caller-provided writable result storage.
           unsafe {

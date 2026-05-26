@@ -414,6 +414,7 @@ enum DSTEvent {
     source_node: DSTNodeId,
     source_seq: u64,
     from: DSTSocketRef,
+    from_addr: SocketAddrBuf,
     to: DSTSocketRef,
     packet: Vec<u8>,
   },
@@ -1372,7 +1373,10 @@ impl DSBackend {
       Op::Listen { .. } => &[libc::EINVAL, libc::ENOTSOCK],
       Op::Shutdown { .. } => &[libc::ENOTSOCK, libc::EINVAL],
       Op::Fsync { .. } => &[libc::EBADF, libc::EINVAL, libc::EIO],
-      Op::Stat { .. } => &[libc::ENOENT, libc::EACCES],
+      Op::Stat { target, .. } => match target {
+        op::StatTarget::Path { .. } => &[libc::ENOENT, libc::EACCES],
+        op::StatTarget::Fd { .. } => &[libc::EBADF],
+      },
       Op::ReadDir { .. } => &[libc::EBADF, libc::EINVAL],
       Op::Nop => &[libc::EIO],
     };
@@ -1811,6 +1815,20 @@ impl DSBackend {
         .iter()
         .map(|buf| buf.len)
         .sum();
+        if let Some(out) = msg.from {
+          let addr = self
+            .world
+            .resources
+            .get(&raw)
+            .and_then(|resource| match resource {
+              SimResource::Socket(socket) => socket.peer_addr,
+              SimResource::File(_) => None,
+            })
+            .unwrap_or_else(SocketAddrBuf::unspecified);
+          unsafe {
+            out.as_ptr().write(addr);
+          }
+        }
         match self.try_read_socket_bytes(raw, total, true) {
           Ok(PendingResult::Ready(bytes)) => {
             PendingAction::Complete(self.write_to_msg_recv(msg, &bytes) as isize)
@@ -2070,6 +2088,20 @@ impl DSBackend {
             .map(|buf| buf.len)
             .sum();
         let raw = Self::resource_key(&fd);
+        if let Some(out) = msg.from {
+          let addr = self
+            .world
+            .resources
+            .get(&raw)
+            .and_then(|resource| match resource {
+              SimResource::Socket(socket) => socket.peer_addr,
+              SimResource::File(_) => None,
+            })
+            .unwrap_or_else(SocketAddrBuf::unspecified);
+          unsafe {
+            out.as_ptr().write(addr);
+          }
+        }
         match self.try_read_socket_bytes(raw, total, true) {
           Ok(PendingResult::Ready(bytes)) => {
             OpAction::Complete(self.write_to_msg_recv(msg, &bytes) as isize)
@@ -2355,12 +2387,38 @@ impl DSBackend {
           None => OpAction::Complete(-(libc::EBADF as isize)),
         }
       }
-      Op::Stat { path, follow_symlinks, out, .. } => {
-        let path = Self::cstr_path(path);
-        let Some(node) = self.resolve_path_node(&path, follow_symlinks) else {
-          return OpAction::Complete(-(libc::ENOENT as isize));
+      Op::Stat { target, out } => {
+        let stat = match target {
+          op::StatTarget::Path { path, follow_symlinks, .. } => {
+            let path = Self::cstr_path(path);
+            let Some(node) = self.resolve_path_node(&path, follow_symlinks)
+            else {
+              return OpAction::Complete(-(libc::ENOENT as isize));
+            };
+            Self::file_stat_for_node(node)
+          }
+          op::StatTarget::Fd { fd } => {
+            let raw = Self::resource_key(&fd);
+            match self.world.resources.get(&raw) {
+              Some(SimResource::File(handle)) => {
+                let Some(node) = self.world.fs.get(&handle.path) else {
+                  return OpAction::Complete(-(libc::EBADF as isize));
+                };
+                Self::file_stat_for_node(node)
+              }
+              Some(SimResource::Socket(_)) => FileStat {
+                file_type: crate::backend::op::FileType::Socket,
+                size: 0,
+                permissions: 0,
+                mode: libc::S_IFSOCK as u32,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+              },
+              None => return OpAction::Complete(-(libc::EBADF as isize)),
+            }
+          }
         };
-        let stat = Self::file_stat_for_node(node);
         // SAFETY: `out` points to caller-owned output storage.
         unsafe {
           out.as_ptr().write(stat);
@@ -2715,7 +2773,7 @@ impl DST {
             }
             self.poll_pending_node(to.node_id);
           }
-          DSTEvent::DatagramDelivered { from, to, packet, .. } => {
+          DSTEvent::DatagramDelivered { from, from_addr, to, packet, .. } => {
             if !self
               .inner
               .borrow_mut()
@@ -2728,6 +2786,7 @@ impl DST {
               let mut node = node.borrow_mut();
               if let Some(socket) = node.sockets.get_mut(&to.fd) {
                 if let DSTRecvQueue::Datagram(queue) = &mut socket.recv_queue {
+                  socket.peer_addr = Some(from_addr);
                   queue.push_back(packet);
                 }
               }
@@ -3144,6 +3203,12 @@ impl DSTBackend {
     let Some(socket) = node.sockets.get_mut(&raw) else {
       return PendingAction::Complete(-(libc::EBADF as isize));
     };
+    if let Some(out) = msg.from {
+      let addr = socket.peer_addr.unwrap_or_else(SocketAddrBuf::unspecified);
+      unsafe {
+        out.as_ptr().write(addr);
+      }
+    }
     let total = unsafe {
       std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
     }
@@ -3233,7 +3298,7 @@ impl DSTBackend {
       return Err(-(libc::ESPIPE as isize));
     }
 
-    let (peer, ty, state) = {
+    let (peer, ty, state, domain, bound) = {
       let mut node = self.node.borrow_mut();
       let Some(socket) = node.sockets.get_mut(&raw) else {
         return Err(-(libc::EBADF as isize));
@@ -3244,7 +3309,7 @@ impl DSTBackend {
       if socket.local_shutdown_write {
         return Err(-(libc::EPIPE as isize));
       }
-      (socket.peer, socket.ty, socket.state)
+      (socket.peer, socket.ty, socket.state, socket.domain, socket.bound)
     };
 
     let source_seq = {
@@ -3318,11 +3383,14 @@ impl DSTBackend {
         let mut inner = self.inner.borrow_mut();
         let ready_at_tick =
           inner.tick + inner.event_delay_ticks_for(self.node_id, source_seq, 2);
+        let from_addr = bound
+          .unwrap_or_else(|| Self::synthetic_peer_addr(domain, self.node_id, raw));
         inner.enqueue_event(DSTEvent::DatagramDelivered {
           ready_at_tick,
           source_node: self.node_id,
           source_seq,
           from: DSTSocketRef { node_id: self.node_id, fd: raw },
+          from_addr,
           to: peer_fd,
           packet: bytes.to_vec(),
         });
@@ -4001,7 +4069,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
-    let msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf), false);
+    let msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     let mut step_bump = Bump::new();
     backend.push(
       1,
@@ -4035,7 +4103,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
-    let msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf), false);
+    let msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     let mut step_bump = Bump::new();
     backend.push(1, Op::Recv { fd: socket, msg, flags: 0 }, &mut step_bump);
     backend.flush().unwrap();
@@ -4104,7 +4172,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf), false);
+    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
     let mut recv_bump = Bump::new();
     backend.push(
       2,
@@ -4163,7 +4231,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf), false);
+    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
     let mut recv_bump = Bump::new();
     backend.push(
       1,
@@ -4321,7 +4389,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf), false);
+    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
     let before = backend.progress_snapshot();
 
     let mut recv_bump = Bump::new();
@@ -4380,7 +4448,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf), false);
+    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
     let mut recv_bump = Bump::new();
     backend.push(
       1,
@@ -4533,7 +4601,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf), false);
+    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       10,
       Op::Recv {
@@ -4549,7 +4617,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf), false);
+    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       11,
       Op::Recv {
@@ -4591,7 +4659,7 @@ mod tests {
 
     let mut buf = [0_u8; 8];
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf), false);
+    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       1,
       Op::Recv {
@@ -4651,7 +4719,7 @@ mod tests {
 
     let mut recv_buf = [0_u8; 8];
     let mut msg_buf = MsgBufMut::from_slice(&mut recv_buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf), false);
+    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       1,
       Op::Recv {
@@ -4834,7 +4902,7 @@ mod tests {
 
     let mut recv_buf = [0_u8; 8];
     let mut msg_buf = MsgBufMut::from_slice(&mut recv_buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf), false);
+    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     backend.network_complete_op(
       6,
       Op::Accept {

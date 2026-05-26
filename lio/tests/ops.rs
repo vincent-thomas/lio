@@ -10,9 +10,11 @@ mod ops {
   mod readdir;
   mod readlinkat;
   mod recv;
+  mod recvfrom;
   mod renameat;
   mod rw;
   mod send;
+  mod sendto;
   mod sleep;
   mod socket;
   #[cfg(unix)]

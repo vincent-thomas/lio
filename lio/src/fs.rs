@@ -58,6 +58,11 @@ impl File {
   pub fn sync_all(&self) -> Io<ops::Fsync> {
     crate::api::fsync(self)
   }
+
+  /// Reads metadata for this open file.
+  pub fn metadata(&self) -> Io<ops::Stat> {
+    crate::api::fstat(self)
+  }
 }
 
 /// An opened directory handle.
@@ -534,7 +539,11 @@ impl RemoveDirAll {
           }
           None => {
             self.state = RemoveDirAllState::Stating {
-              op: ops::Stat::new(frame.fd.clone(), entry.name.clone(), false),
+              op: ops::Stat::new_at(
+                frame.fd.clone(),
+                entry.name.clone(),
+                false,
+              ),
               parent: frame.fd.clone(),
               name: entry.name,
             };

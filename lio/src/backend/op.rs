@@ -511,17 +511,27 @@ unsafe impl Sync for MsgSend {}
 pub struct MsgRecv {
   pub bufs: NonNull<MsgBufMut>,
   pub buf_count: NonZeroUsize,
-  pub from: bool,
+  pub from: Option<NonNull<SocketAddrBuf>>,
 }
 
 impl MsgRecv {
   #[inline]
-  pub fn new(bufs: &[MsgBufMut], from: bool) -> Self {
+  pub fn new(bufs: &[MsgBufMut]) -> Self {
     let buf_count = NonZeroUsize::new(bufs.len())
       .expect("MsgRecv must contain at least one buffer");
     let bufs = NonNull::new(bufs.as_ptr().cast_mut())
       .expect("buffer slice pointer must be non-null");
-    Self { bufs, buf_count, from }
+    Self { bufs, buf_count, from: None }
+  }
+
+  #[inline]
+  pub fn with_from(
+    bufs: &[MsgBufMut],
+    from: NonNull<SocketAddrBuf>,
+  ) -> Self {
+    let mut msg = Self::new(bufs);
+    msg.from = Some(from);
+    msg
   }
 }
 
@@ -687,6 +697,18 @@ impl FileStat {
   }
 }
 
+#[derive(Clone, Debug)]
+pub enum StatTarget {
+  Path {
+    dir_fd: Resource,
+    path: NonNull<c_char>,
+    follow_symlinks: bool,
+  },
+  Fd {
+    fd: Resource,
+  },
+}
+
 #[cfg(all(feature = "backend_impls", unix))]
 #[allow(clippy::useless_conversion)]
 pub(crate) fn file_stat_from_raw(stat: &libc::stat) -> FileStat {
@@ -820,19 +842,10 @@ pub enum Op {
     flags: i32,
   },
 
-  /// Read metadata for a path relative to a directory file descriptor.
-  ///
-  /// This variant generalizes `stat(2)`, `lstat(2)`, and `fstatat(2)`:
-  /// - `follow_symlinks = true` behaves like `stat`
-  /// - `follow_symlinks = false` behaves like `lstat`
-  /// - `dir_fd` provides the base for relative lookups, like `fstatat`
+  /// Read metadata for either a path lookup or an already-open file descriptor.
   Stat {
-    /// Directory file descriptor used as the base for relative paths.
-    dir_fd: Resource,
-    /// Null-terminated pathname pointer.
-    path: NonNull<c_char>,
-    /// Whether symlinks should be followed when resolving the path.
-    follow_symlinks: bool,
+    /// Stat target, either a path-based lookup or direct fd query.
+    target: StatTarget,
     /// Portable metadata output storage.
     out: NonNull<FileStat>,
   },
