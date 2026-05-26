@@ -89,6 +89,7 @@ fn send_all(fd: &Resource, data: &[u8]) {
   }
 }
 
+#[allow(dead_code)]
 fn get_peer_addr(sock: &Resource) -> SocketAddr {
   unsafe {
     let mut addr_storage = std::mem::MaybeUninit::<libc::sockaddr_in>::zeroed();
