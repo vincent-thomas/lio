@@ -1,8 +1,10 @@
-#![allow(clippy::duplicate_mod, clippy::unnecessary_mut_passed, clippy::expect_fun_call)]
+#![allow(
+  clippy::duplicate_mod,
+  clippy::unnecessary_mut_passed,
+  clippy::expect_fun_call
+)]
 
-mod common;
-
-use common::poll_recv;
+use super::common::{self, poll_recv};
 use lio::api::resource::Resource;
 use lio::{Lio, api};
 use std::mem::MaybeUninit;
@@ -14,11 +16,7 @@ fn test_shutdown_write() {
   let mut lio = Lio::new(64).unwrap();
 
   // Create server socket
-  let server_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let server_sock = server_sock.recv().unwrap();
+  let server_sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
   let bind_recv = api::bind(&server_sock, addr).with_lio(&mut lio).send();
@@ -48,11 +46,7 @@ fn test_shutdown_write() {
   listen_recv.recv().expect("Failed to listen");
 
   // Create client socket
-  let client_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let client_sock = client_sock.recv().unwrap();
+  let client_sock = common::tcp_socket();
 
   // Connect client to server
   let mut connect_recv =
@@ -104,11 +98,7 @@ fn test_shutdown_write() {
 fn test_shutdown_read() {
   let mut lio = Lio::new(64).unwrap();
 
-  let server_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let server_sock = server_sock.recv().unwrap();
+  let server_sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
   let bind_recv = api::bind(&server_sock, addr).with_lio(&mut lio).send();
@@ -138,11 +128,7 @@ fn test_shutdown_read() {
   listen_recv.recv().expect("Failed to listen");
 
   // Create client socket
-  let client_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let client_sock = client_sock.recv().unwrap();
+  let client_sock = common::tcp_socket();
 
   // Connect client to server
   let mut connect_recv =
@@ -186,9 +172,7 @@ fn test_shutdown_read() {
 fn test_shutdown_both() {
   let mut lio = Lio::new(64).unwrap();
 
-  let mut server_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  let server_sock = poll_recv(&mut lio, &mut server_sock).unwrap();
+  let server_sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
   let mut bind_recv = api::bind(&server_sock, addr).with_lio(&mut lio).send();
@@ -215,9 +199,7 @@ fn test_shutdown_both() {
   poll_recv(&mut lio, &mut listen_recv).expect("Failed to listen");
 
   // Create client socket
-  let mut client_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  let client_sock = poll_recv(&mut lio, &mut client_sock).unwrap();
+  let client_sock = common::tcp_socket();
 
   // Connect client to server
   let mut connect_recv =
@@ -280,11 +262,7 @@ fn test_shutdown_invalid_fd() {
 fn test_shutdown_after_close() {
   let mut lio = Lio::new(64).unwrap();
 
-  let server_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let server_sock = server_sock.recv().expect("Failed to create server socket");
+  let server_sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
   let bind_recv = api::bind(&server_sock, addr).with_lio(&mut lio).send();
@@ -313,9 +291,7 @@ fn test_shutdown_after_close() {
 
   listen_recv.recv().expect("Failed to listen");
 
-  let mut client_sock_recv = common::tcp_socket().with_lio(&mut lio).send();
-
-  let client_sock = poll_recv(&mut lio, &mut client_sock_recv).unwrap();
+  let client_sock = common::tcp_socket();
 
   let mut connect_recv =
     api::connect(&client_sock, bound_addr).with_lio(&mut lio).send();
@@ -345,11 +321,7 @@ fn test_shutdown_after_close() {
 fn test_shutdown_twice() {
   let mut lio = Lio::new(64).unwrap();
 
-  let server_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let server_sock = server_sock.recv().expect("Failed to create server socket");
+  let server_sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
   let bind_recv = api::bind(&server_sock, addr).with_lio(&mut lio).send();
@@ -379,11 +351,7 @@ fn test_shutdown_twice() {
   listen_recv.recv().expect("Failed to listen");
 
   // Create client socket
-  let client_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let client_sock = client_sock.recv().unwrap();
+  let client_sock = common::tcp_socket();
 
   // Connect client to server
   let mut connect_recv =
@@ -418,11 +386,7 @@ fn test_shutdown_twice() {
 fn test_shutdown_sequential_directions() {
   let mut lio = Lio::new(64).unwrap();
 
-  let server_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let server_sock = server_sock.recv().unwrap();
+  let server_sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
   let bind_recv = api::bind(&server_sock, addr).with_lio(&mut lio).send();
@@ -452,11 +416,7 @@ fn test_shutdown_sequential_directions() {
   listen_recv.recv().expect("Failed to listen");
 
   // Create client socket
-  let client_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let client_sock = client_sock.recv().unwrap();
+  let client_sock = common::tcp_socket();
 
   // Connect client to server
   let mut connect_recv =
@@ -506,11 +466,7 @@ fn test_shutdown_before_data_sent() {
   let mut lio = Lio::new(64).unwrap();
 
   // Create server socket
-  let server_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let server_sock = server_sock.recv().expect("Failed to create server socket");
+  let server_sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
   let bind_recv = api::bind(&server_sock, addr).with_lio(&mut lio).send();
@@ -540,11 +496,7 @@ fn test_shutdown_before_data_sent() {
   listen_recv.recv().expect("Failed to listen");
 
   // Create client socket
-  let client_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let client_sock = client_sock.recv().unwrap();
+  let client_sock = common::tcp_socket();
 
   // Connect client to server
   let mut connect_recv =
@@ -579,12 +531,7 @@ fn test_shutdown_before_data_sent() {
 fn test_shutdown_ipv6() {
   let mut lio = Lio::new(64).unwrap();
 
-  let server_sock = common::tcp6_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let server_sock =
-    server_sock.recv().expect("Failed to create IPv6 server socket");
+  let server_sock = common::tcp6_socket();
 
   let addr: SocketAddr = "[::1]:0".parse().unwrap();
   let bind_recv = api::bind(&server_sock, addr).with_lio(&mut lio).send();
@@ -614,12 +561,7 @@ fn test_shutdown_ipv6() {
   listen_recv.recv().expect("Failed to listen");
 
   // Create client socket
-  let client_sock = common::tcp6_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let client_sock =
-    client_sock.recv().expect("Failed to create IPv6 client socket");
+  let client_sock = common::tcp6_socket();
 
   // Connect client to server
   let mut connect_recv =
@@ -656,10 +598,7 @@ fn test_shutdown_concurrent() {
 
   // Test shutting down multiple connections (sequentially)
   for _ in 0..5 {
-    let mut server_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-    let server_sock = poll_recv(&mut lio, &mut server_sock)
-      .expect("Failed to create server socket");
+    let server_sock = common::tcp_socket();
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut bind_recv = api::bind(&server_sock, addr).with_lio(&mut lio).send();
@@ -686,9 +625,7 @@ fn test_shutdown_concurrent() {
     poll_recv(&mut lio, &mut listen_recv).expect("Failed to listen");
 
     // Create and connect client
-    let mut client_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-    let client_sock = poll_recv(&mut lio, &mut client_sock).unwrap();
+    let client_sock = common::tcp_socket();
 
     let mut connect_recv =
       api::connect(&client_sock, bound_addr).with_lio(&mut lio).send();
@@ -715,11 +652,7 @@ fn test_shutdown_concurrent() {
 fn test_shutdown_with_pending_data() {
   let mut lio = Lio::new(64).unwrap();
 
-  let server_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let server_sock = server_sock.recv().unwrap();
+  let server_sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
   let bind_recv = api::bind(&server_sock, addr).with_lio(&mut lio).send();
@@ -749,11 +682,7 @@ fn test_shutdown_with_pending_data() {
   listen_recv.recv().expect("Failed to listen");
 
   // Create client socket
-  let client_sock = common::tcp_socket().with_lio(&mut lio).send();
-
-  lio.try_run().unwrap();
-
-  let client_sock = client_sock.recv().unwrap();
+  let client_sock = common::tcp_socket();
 
   // Connect client to server
   let mut connect_recv =
