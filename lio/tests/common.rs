@@ -150,6 +150,7 @@ impl Drop for TempFile {
 
 /// Poll the lio event loop until a result is received on the channel.
 /// Blocks in kqueue/epoll for up to 5ms per iteration — no busy-spin, no attempt cap.
+#[allow(dead_code)]
 pub fn poll_until_recv<T>(lio: &mut Lio, receiver: &mpsc::Receiver<T>) -> T {
   {
     for _ in 0..1_000 {

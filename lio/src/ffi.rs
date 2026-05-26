@@ -711,7 +711,7 @@ pub unsafe extern "C" fn lio_sendto(
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  crate::api::io::Io::from_op(api::Send::new(
+  crate::api::io::Io::from_op(api::ops::Send::new(
     resource.clone(),
     vec,
     Some(socket_addr),
