@@ -2773,7 +2773,9 @@ impl DST {
             }
             self.poll_pending_node(to.node_id);
           }
-          DSTEvent::DatagramDelivered { from, from_addr, to, packet, .. } => {
+          DSTEvent::DatagramDelivered {
+            from, from_addr, to, packet, ..
+          } => {
             if !self
               .inner
               .borrow_mut()
@@ -3383,8 +3385,9 @@ impl DSTBackend {
         let mut inner = self.inner.borrow_mut();
         let ready_at_tick =
           inner.tick + inner.event_delay_ticks_for(self.node_id, source_seq, 2);
-        let from_addr = bound
-          .unwrap_or_else(|| Self::synthetic_peer_addr(domain, self.node_id, raw));
+        let from_addr = bound.unwrap_or_else(|| {
+          Self::synthetic_peer_addr(domain, self.node_id, raw)
+        });
         inner.enqueue_event(DSTEvent::DatagramDelivered {
           ready_at_tick,
           source_node: self.node_id,

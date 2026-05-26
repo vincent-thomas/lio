@@ -342,10 +342,8 @@ impl LoweredState {
         let state = unsafe { state.as_ref() };
         if let (Some(out), Some((storage, len))) =
           (state.from_out, state.addr.as_ref())
-          && let Ok(addr) = crate::backend::op::socket_addr_buf_from_storage(
-            storage,
-            *len,
-          )
+          && let Ok(addr) =
+            crate::backend::op::socket_addr_buf_from_storage(storage, *len)
         {
           unsafe {
             *out.as_ptr() = addr;

@@ -53,7 +53,8 @@ impl ReceiverNode {
 struct DatagramReceiverNode {
   socket_rx: Option<Receiver<std::io::Result<UdpSocket>>>,
   socket: Option<UdpSocket>,
-  recv_rx: Option<Receiver<(std::io::Result<i32>, Vec<u8>, Option<SocketAddr>)>>,
+  recv_rx:
+    Option<Receiver<(std::io::Result<i32>, Vec<u8>, Option<SocketAddr>)>>,
   recv_done: Rc<RefCell<Option<(Vec<u8>, Option<SocketAddr>)>>>,
 }
 
