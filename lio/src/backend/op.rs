@@ -525,10 +525,7 @@ impl MsgRecv {
   }
 
   #[inline]
-  pub fn with_from(
-    bufs: &[MsgBufMut],
-    from: NonNull<SocketAddrBuf>,
-  ) -> Self {
+  pub fn with_from(bufs: &[MsgBufMut], from: NonNull<SocketAddrBuf>) -> Self {
     let mut msg = Self::new(bufs);
     msg.from = Some(from);
     msg
@@ -699,14 +696,8 @@ impl FileStat {
 
 #[derive(Clone, Debug)]
 pub enum StatTarget {
-  Path {
-    dir_fd: Resource,
-    path: NonNull<c_char>,
-    follow_symlinks: bool,
-  },
-  Fd {
-    fd: Resource,
-  },
+  Path { dir_fd: Resource, path: NonNull<c_char>, follow_symlinks: bool },
+  Fd { fd: Resource },
 }
 
 #[cfg(all(feature = "backend_impls", unix))]

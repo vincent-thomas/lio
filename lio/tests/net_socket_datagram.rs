@@ -13,7 +13,8 @@ struct ReceiverNode {
   socket_rx: Option<Receiver<std::io::Result<Socket>>>,
   socket: Option<Socket>,
   bind_rx: Option<Receiver<std::io::Result<()>>>,
-  recv_rx: Option<Receiver<(std::io::Result<i32>, Vec<u8>, Option<SocketAddr>)>>,
+  recv_rx:
+    Option<Receiver<(std::io::Result<i32>, Vec<u8>, Option<SocketAddr>)>>,
   recv_done: Rc<RefCell<Option<(Vec<u8>, Option<SocketAddr>)>>>,
 }
 
@@ -21,7 +22,13 @@ impl ReceiverNode {
   fn new(
     recv_done: Rc<RefCell<Option<(Vec<u8>, Option<SocketAddr>)>>>,
   ) -> Self {
-    Self { socket_rx: None, socket: None, bind_rx: None, recv_rx: None, recv_done }
+    Self {
+      socket_rx: None,
+      socket: None,
+      bind_rx: None,
+      recv_rx: None,
+      recv_done,
+    }
   }
 
   fn drive(&mut self, bind_addr: SocketAddr) {
@@ -80,7 +87,13 @@ struct SenderNode {
 
 impl SenderNode {
   fn new(send_done: Rc<RefCell<bool>>) -> Self {
-    Self { socket_rx: None, socket: None, bind_rx: None, send_rx: None, send_done }
+    Self {
+      socket_rx: None,
+      socket: None,
+      bind_rx: None,
+      send_rx: None,
+      send_done,
+    }
   }
 
   fn drive(&mut self, bind_addr: SocketAddr, peer_addr: SocketAddr) {
@@ -119,7 +132,8 @@ impl SenderNode {
       self.send_rx = Some(socket.sendto(b"ping".to_vec(), peer_addr).send());
     }
 
-    if let Some((result, buf)) = self.send_rx.as_mut().and_then(Receiver::try_recv)
+    if let Some((result, buf)) =
+      self.send_rx.as_mut().and_then(Receiver::try_recv)
     {
       assert_eq!(result.unwrap(), buf.len() as i32);
       *self.send_done.borrow_mut() = true;

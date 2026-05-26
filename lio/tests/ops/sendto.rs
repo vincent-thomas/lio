@@ -13,8 +13,8 @@ use super::common::{
 use lio::Lio;
 use lio::api;
 use lio::api::resource::Resource;
-use std::os::fd::{AsFd, AsRawFd};
 use std::net::{SocketAddr, UdpSocket};
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::mpsc;
 
 struct UdpPair {
@@ -25,7 +25,8 @@ struct UdpPair {
 
 fn setup_udp_pair() -> UdpPair {
   let sender = udp_socket();
-  let receiver = UdpSocket::bind("127.0.0.1:0").expect("failed to bind receiver socket");
+  let receiver =
+    UdpSocket::bind("127.0.0.1:0").expect("failed to bind receiver socket");
   let receiver_addr =
     receiver.local_addr().expect("failed to query receiver address");
 
@@ -46,7 +47,8 @@ fn setup_udp_pair() -> UdpPair {
       }
       sockaddr.sin_family = libc::AF_INET as libc::sa_family_t;
       sockaddr.sin_port = addr.port().to_be();
-      sockaddr.sin_addr = libc::in_addr { s_addr: u32::from(*addr.ip()).to_be() };
+      sockaddr.sin_addr =
+        libc::in_addr { s_addr: u32::from(*addr.ip()).to_be() };
       sockaddr
     }
     SocketAddr::V6(_) => unreachable!("IPv4-only test helper"),
@@ -128,8 +130,9 @@ fn basic() {
   let UdpPair { sender, receiver, receiver_addr } = setup_udp_pair();
 
   let data = b"Hello, Receiver!".to_vec();
-  let mut sender_op =
-    api::sendto(&sender, data.clone(), receiver_addr, None).with_lio(&mut lio).send();
+  let mut sender_op = api::sendto(&sender, data.clone(), receiver_addr, None)
+    .with_lio(&mut lio)
+    .send();
 
   let (bytes_sent, returned_buf) = poll_recv(&mut lio, &mut sender_op);
   let bytes_sent = bytes_sent.expect("sendto failed") as usize;
@@ -214,12 +217,14 @@ fn large_data() {
 #[test]
 fn tcp_stream() {
   let mut lio = Lio::new(64).unwrap();
-  let TcpPair { server_sock: _, client_sock, accepted_fd } = setup_tcp_pair(&mut lio);
+  let TcpPair { server_sock: _, client_sock, accepted_fd } =
+    setup_tcp_pair(&mut lio);
 
   let data = b"tcp sendto".to_vec();
   let peer_addr = get_peer_addr(&client_sock);
-  let mut sender_op =
-    api::sendto(&client_sock, data.clone(), peer_addr, None).with_lio(&mut lio).send();
+  let mut sender_op = api::sendto(&client_sock, data.clone(), peer_addr, None)
+    .with_lio(&mut lio)
+    .send();
 
   let (bytes_sent, returned_buf) = poll_recv(&mut lio, &mut sender_op);
   assert_eq!(returned_buf, data);
