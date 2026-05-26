@@ -1,8 +1,10 @@
-#![allow(clippy::duplicate_mod, clippy::unnecessary_mut_passed, clippy::expect_fun_call)]
+#![allow(
+  clippy::duplicate_mod,
+  clippy::unnecessary_mut_passed,
+  clippy::expect_fun_call
+)]
 
-mod common;
-
-use common::poll_until_recv;
+use super::common::{self, poll_until_recv};
 use lio::Lio;
 use lio::api::bind;
 use std::{
@@ -15,13 +17,8 @@ use std::{
 fn test_bind_ipv4_any_port() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
+  let sock = common::tcp_socket();
 
   // Bind to 0.0.0.0:0 (any available port)
   let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
@@ -49,13 +46,8 @@ fn test_bind_ipv4_any_port() {
 fn test_bind_ipv4_specific_port() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
+  let sock = common::tcp_socket();
 
   // Bind to a high port number
   let addr: SocketAddr = "127.0.0.1:19999".parse().unwrap();
@@ -84,13 +76,8 @@ fn test_bind_ipv4_specific_port() {
 fn test_bind_ipv6() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
-
-  common::tcp6_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock = poll_until_recv(&mut lio, &receiver_sock)
-    .expect("Failed to create IPv6 socket");
+  let sock = common::tcp6_socket();
 
   // Bind to IPv6 any address
   let addr: SocketAddr = "[::]:0".parse().unwrap();
@@ -119,13 +106,8 @@ fn test_bind_ipv6() {
 fn test_bind_udp() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
-
-  common::udp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock = poll_until_recv(&mut lio, &receiver_sock)
-    .expect("Failed to create UDP socket");
+  let sock = common::udp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -156,13 +138,8 @@ fn test_bind_udp() {
 fn test_bind_already_bound() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock1 = poll_until_recv(&mut lio, &receiver_sock)
-    .expect("Failed to create first socket");
+  let sock1 = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -190,10 +167,7 @@ fn test_bind_already_bound() {
   };
 
   // Try to bind another socket to the same address
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock2 = poll_until_recv(&mut lio, &receiver_sock)
-    .expect("Failed to create second socket");
+  let sock2 = common::tcp_socket();
 
   let port = u16::from_be(bound_addr.sin_port);
   let addr2: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -211,13 +185,8 @@ fn test_bind_already_bound() {
 fn test_bind_double_bind() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
+  let sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -239,13 +208,8 @@ fn test_bind_double_bind() {
 fn test_bind_with_reuseaddr() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock1 = poll_until_recv(&mut lio, &receiver_sock)
-    .expect("Failed to create first socket");
+  let sock1 = common::tcp_socket();
 
   // Enable SO_REUSEADDR on first socket
   unsafe {
@@ -270,10 +234,7 @@ fn test_bind_with_reuseaddr() {
   drop(sock1);
 
   // Immediately bind another socket to the same address with SO_REUSEADDR
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock2 = poll_until_recv(&mut lio, &receiver_sock)
-    .expect("Failed to create second socket");
+  let sock2 = common::tcp_socket();
 
   unsafe {
     let reuse: i32 = 1;
@@ -298,13 +259,8 @@ fn test_bind_with_reuseaddr() {
 fn test_bind_localhost() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
+  let sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -333,25 +289,14 @@ fn test_bind_localhost() {
 fn test_bind_concurrent() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_bind, receiver_bind) = mpsc::channel();
 
   // Test binding multiple sockets concurrently to different ports
-  for _ in 20000..20010 {
-    common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-  }
-
-  let mut socks = Vec::new();
-  for _ in 0..10 {
-    let sock = poll_until_recv(&mut lio, &receiver_sock)
-      .expect("Failed to create socket");
-    socks.push(sock);
-  }
+  let socks: Vec<_> = (0..10).map(|_| common::tcp_socket()).collect();
 
   // Set SO_REUSEADDR and bind each socket
-  for (i, sock) in socks.iter().enumerate() {
-    let port = 20000 + i;
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+  for sock in socks.iter() {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     bind(sock, addr).with_lio(&mut lio).send_with(sender_bind.clone());
   }
 

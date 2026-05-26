@@ -1,8 +1,10 @@
-#![allow(clippy::duplicate_mod, clippy::unnecessary_mut_passed, clippy::expect_fun_call)]
+#![allow(
+  clippy::duplicate_mod,
+  clippy::unnecessary_mut_passed,
+  clippy::expect_fun_call
+)]
 
-mod common;
-
-use common::poll_until_recv;
+use super::common::{self, poll_until_recv};
 use lio::Lio;
 use lio::api;
 use std::{
@@ -16,13 +18,8 @@ use std::{
 fn test_listen_basic() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
+  let sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -61,13 +58,8 @@ fn test_listen_basic() {
 fn test_listen_with_backlog() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
+  let sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -101,13 +93,8 @@ fn test_listen_with_backlog() {
 fn test_listen_large_backlog() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
+  let sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -140,12 +127,7 @@ fn test_listen_large_backlog() {
 fn test_listen_without_bind() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
+  let sock = common::tcp_socket();
 
   let (sender_l, receiver_l) = mpsc::channel::<std::io::Result<()>>();
 
@@ -163,13 +145,8 @@ fn test_listen_without_bind() {
 fn test_listen_ipv6() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
-
-  common::tcp6_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock = poll_until_recv(&mut lio, &receiver_sock)
-    .expect("Failed to create IPv6 socket");
+  let sock = common::tcp6_socket();
 
   let addr: SocketAddr = "[::1]:0".parse().unwrap();
 
@@ -202,13 +179,8 @@ fn test_listen_ipv6() {
 fn test_listen_on_udp() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
-
-  common::udp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock = poll_until_recv(&mut lio, &receiver_sock)
-    .expect("Failed to create UDP socket");
+  let sock = common::udp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -230,13 +202,8 @@ fn test_listen_on_udp() {
 fn test_listen_twice() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
+  let sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -264,13 +231,8 @@ fn test_listen_twice() {
 fn test_listen_zero_backlog() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
+  let sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -303,12 +265,7 @@ fn test_listen_zero_backlog() {
 fn test_listen_after_close() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
+  let sock = common::tcp_socket();
 
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -339,19 +296,8 @@ fn test_listen_after_close() {
 fn test_listen_concurrent() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender, receiver) = mpsc::channel();
-
   // Test listening on multiple sockets concurrently
-  for _ in 0..10 {
-    common::tcp_socket().with_lio(&mut lio).send_with(sender.clone());
-  }
-
-  let mut sockets = Vec::new();
-  for _ in 0..10 {
-    let sock =
-      poll_until_recv(&mut lio, &receiver).expect("Socket creation failed");
-    sockets.push(sock);
-  }
+  let sockets: Vec<_> = (0..10).map(|_| common::tcp_socket()).collect();
 
   let (sender_bind, receiver_bind) = mpsc::channel::<std::io::Result<()>>();
 
@@ -395,13 +341,8 @@ fn test_listen_concurrent() {
 fn test_listen_on_all_interfaces() {
   let mut lio = Lio::new(64).unwrap();
 
-  let (sender_sock, receiver_sock) = mpsc::channel();
   let (sender_unit, receiver_unit) = mpsc::channel::<std::io::Result<()>>();
-
-  common::tcp_socket().with_lio(&mut lio).send_with(sender_sock.clone());
-
-  let sock =
-    poll_until_recv(&mut lio, &receiver_sock).expect("Failed to create socket");
+  let sock = common::tcp_socket();
 
   // Bind to 0.0.0.0 (all interfaces)
   let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
