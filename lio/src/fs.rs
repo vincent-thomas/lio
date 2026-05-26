@@ -1,5 +1,3 @@
-#![allow(clippy::never_loop)]
-
 //! Filesystem resource types.
 
 use std::{
@@ -514,57 +512,51 @@ impl RemoveDirAll {
   }
 
   fn advance(&mut self) -> OpResult<io::Result<()>> {
-    loop {
-      let Some(frame) = self.stack.last_mut() else {
-        self.state = RemoveDirAllState::Done;
-        return OpResult::Done(Ok(()));
-      };
+    let Some(frame) = self.stack.last_mut() else {
+      self.state = RemoveDirAllState::Done;
+      return OpResult::Done(Ok(()));
+    };
 
-      if let Some(entry) = frame.entries.pop() {
-        match entry.file_type {
-          Some(FileType::Directory) => {
-            self.state = RemoveDirAllState::Opening {
-              op: ops::OpenAt::new(
-                frame.fd.clone(),
-                entry.name.clone(),
-                libc::O_RDONLY | libc::O_DIRECTORY,
-                0,
-              ),
-              parent: frame.fd.clone(),
-              name: entry.name,
-            };
-          }
-          Some(_) => {
-            self.state = RemoveDirAllState::RemovingEntry {
-              op: ops::UnlinkAt::new(frame.fd.clone(), entry.name, 0),
-            };
-          }
-          None => {
-            self.state = RemoveDirAllState::Stating {
-              op: ops::Stat::new_at(
-                frame.fd.clone(),
-                entry.name.clone(),
-                false,
-              ),
-              parent: frame.fd.clone(),
-              name: entry.name,
-            };
-          }
+    if let Some(entry) = frame.entries.pop() {
+      match entry.file_type {
+        Some(FileType::Directory) => {
+          self.state = RemoveDirAllState::Opening {
+            op: ops::OpenAt::new(
+              frame.fd.clone(),
+              entry.name.clone(),
+              libc::O_RDONLY | libc::O_DIRECTORY,
+              0,
+            ),
+            parent: frame.fd.clone(),
+            name: entry.name,
+          };
         }
-        return OpResult::Again;
+        Some(_) => {
+          self.state = RemoveDirAllState::RemovingEntry {
+            op: ops::UnlinkAt::new(frame.fd.clone(), entry.name, 0),
+          };
+        }
+        None => {
+          self.state = RemoveDirAllState::Stating {
+            op: ops::Stat::new_at(frame.fd.clone(), entry.name.clone(), false),
+            parent: frame.fd.clone(),
+            name: entry.name,
+          };
+        }
       }
-
-      if !frame.eof {
-        self.state = RemoveDirAllState::Reading { op: frame.next_read() };
-        return OpResult::Again;
-      }
-
-      let frame = self.stack.pop().expect("remove_dir_all stack missing frame");
-      self.state = RemoveDirAllState::RemovingDir {
-        op: ops::UnlinkAt::new(frame.parent, frame.name, libc::AT_REMOVEDIR),
-      };
       return OpResult::Again;
     }
+
+    if !frame.eof {
+      self.state = RemoveDirAllState::Reading { op: frame.next_read() };
+      return OpResult::Again;
+    }
+
+    let frame = self.stack.pop().expect("remove_dir_all stack missing frame");
+    self.state = RemoveDirAllState::RemovingDir {
+      op: ops::UnlinkAt::new(frame.parent, frame.name, libc::AT_REMOVEDIR),
+    };
+    OpResult::Again
   }
 }
 
