@@ -1,3 +1,5 @@
+#![allow(clippy::never_loop)]
+
 //! Filesystem resource types.
 
 use std::{

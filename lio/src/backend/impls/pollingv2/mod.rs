@@ -1,3 +1,5 @@
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 //! `lio`-provided [`IoBackend`] impl for `epoll`/`kqueue` (platform-specific).
 
 mod os;

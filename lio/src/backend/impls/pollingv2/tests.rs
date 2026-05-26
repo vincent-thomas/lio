@@ -1,3 +1,5 @@
+#![allow(clippy::unnecessary_safety_comment)]
+
 use super::{Interest, ReadinessPoll};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};

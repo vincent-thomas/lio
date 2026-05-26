@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 #![cfg(feature = "high")]
 
 use std::{cell::RefCell, net::SocketAddr, rc::Rc};
