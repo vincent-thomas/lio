@@ -1,0 +1,12 @@
+[package]
+name = "lio-tls"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lio = { path = "../lio", features = ["high"] }
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+
+[dev-dependencies]
+rcgen = "0.13"
+rustls-pemfile = "2"

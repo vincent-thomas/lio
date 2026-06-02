@@ -7,7 +7,7 @@ use crate::{
     resource::{AsResource, FromResource, IntoResource, Resource},
   },
   buf,
-  net::ops::{TcpAccept, TcpBindListener, TcpConnectSocket},
+  net::ops::{TcpAccept, TcpBindListener, TcpStreamConnect},
 };
 
 use super::socket::Socket;
@@ -183,27 +183,27 @@ impl TcpListener {
 ///     Ok(())
 /// }
 /// ```
-pub struct TcpSocket(Socket);
+pub struct TcpStream(Socket);
 
-impl IntoResource for TcpSocket {
+impl IntoResource for TcpStream {
   fn into_resource(self) -> Resource {
     self.0.into_resource()
   }
 }
 
-impl AsResource for TcpSocket {
+impl AsResource for TcpStream {
   fn as_resource(&self) -> &Resource {
     self.0.as_resource()
   }
 }
 
-impl FromResource for TcpSocket {
+impl FromResource for TcpStream {
   fn from_resource(resource: Resource) -> Self {
     Self(Socket::from_resource(resource))
   }
 }
 
-impl TcpSocket {
+impl TcpStream {
   /// Opens a TCP connection to a remote host.
   ///
   /// This method creates a new TCP socket and connects it to the specified remote address.
@@ -214,56 +214,20 @@ impl TcpSocket {
   ///
   /// ```rust,no_run
   /// use std::net::SocketAddr;
-  /// use lio::net::TcpSocket;
+  /// use lio::net::TcpStream;
   ///
   /// async fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-  ///     let socket = TcpSocket::connect(addr).await?;
+  ///     let socket = TcpStream::connect(addr).await?;
   ///
   ///     println!("Connected to server");
   ///
   ///     Ok(())
   /// }
   /// ```
-  pub fn connect(addr: SocketAddr) -> Io<TcpConnectSocket> {
-    Io::from_op(TcpConnectSocket::new(addr))
+  pub fn connect(addr: SocketAddr) -> Io<TcpStreamConnect> {
+    Io::from_op(TcpStreamConnect::new(addr))
   }
-
-  // DEPRECATED: connect_host_sync removed - depends on connect_sync which was removed.
-  // Use a hostname-resolving helper plus connect() instead.
-  //
-  // /// Opens a TCP connection to a remote host by hostname synchronously.
-  // ///
-  // /// Both DNS resolution and connection are performed synchronously.
-  // ///
-  // /// # Examples
-  // ///
-  // /// ```rust,no_run
-  // /// use lio::net::TcpSocket;
-  // ///
-  // /// fn example() -> std::io::Result<()> {
-  // ///     // This will block until connected
-  // ///     let socket = TcpSocket::connect_host_sync("example.com:80")?;
-  // ///
-  // ///     Ok(())
-  // /// }
-  // /// ```
-  // #[allow(deprecated)]
-  // pub fn connect_host_sync(addr: impl ToSocketAddrs) -> io::Result<Self> {
-  //   let addrs = addr.to_socket_addrs()?;
-  //
-  //   let mut last_err = None;
-  //   for addr in addrs {
-  //     match Self::connect_sync(addr) {
-  //       Ok(socket) => return Ok(socket),
-  //       Err(e) => last_err = Some(e),
-  //     }
-  //   }
-  //
-  //   Err(last_err.unwrap_or_else(|| {
-  //     io::Error::new(io::ErrorKind::NotFound, "no addresses resolved")
-  //   }))
-  // }
 
   /// Receives data from the socket into the provided buffer.
   ///

@@ -28,7 +28,7 @@ use crate::{
     resource::FromResource,
   },
   backend::op::{SockDomain, SockProto, SockType},
-  net::{Socket, TcpListener, TcpSocket, UdpSocket},
+  net::{Socket, TcpListener, TcpStream, UdpSocket},
 };
 
 /// Accept operation specialized for [`Socket`].
@@ -141,7 +141,7 @@ impl TcpAccept {
 // LEGACY `OpModel` impl parked during the serial-contract migration.
 //
 impl OpModel for TcpAccept {
-  type Item = io::Result<(TcpSocket, SocketAddr)>;
+  type Item = io::Result<(TcpStream, SocketAddr)>;
 
   fn action(&mut self) -> Action {
     self.inner.action()
@@ -150,12 +150,12 @@ impl OpModel for TcpAccept {
   fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
     match self.inner.complete(res) {
       OpResult::Done(Ok((resource, addr))) => {
-        OpResult::Done(Ok((TcpSocket::from_resource(resource), addr)))
+        OpResult::Done(Ok((TcpStream::from_resource(resource), addr)))
       }
       OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
       OpResult::Again => OpResult::Again,
       OpResult::Yield(item) => OpResult::Yield(
-        item.map(|(resource, addr)| (TcpSocket::from_resource(resource), addr)),
+        item.map(|(resource, addr)| (TcpStream::from_resource(resource), addr)),
       ),
     }
   }
@@ -258,7 +258,7 @@ impl OpModel for TcpBindListener {
 
 impl OneshotOpModel for TcpBindListener {}
 
-pub struct TcpConnectSocket {
+pub struct TcpStreamConnect {
   state: TcpConnectState,
   addr: SocketAddr,
 }
@@ -269,7 +269,7 @@ enum TcpConnectState {
   Done,
 }
 
-impl TcpConnectSocket {
+impl TcpStreamConnect {
   pub(crate) fn new(addr: SocketAddr) -> Self {
     let domain =
       if addr.is_ipv4() { SockDomain::IPV4 } else { SockDomain::IPV6 };
@@ -284,8 +284,8 @@ impl TcpConnectSocket {
   }
 }
 
-impl OpModel for TcpConnectSocket {
-  type Item = io::Result<TcpSocket>;
+impl OpModel for TcpStreamConnect {
+  type Item = io::Result<TcpStream>;
 
   fn action(&mut self) -> Action {
     match &mut self.state {
@@ -326,7 +326,7 @@ impl OpModel for TcpConnectSocket {
             (-completion.result) as i32,
           )))
         } else {
-          OpResult::Done(Ok(TcpSocket::from_resource(resource)))
+          OpResult::Done(Ok(TcpStream::from_resource(resource)))
         }
       }
       TcpConnectState::Done => {
@@ -336,7 +336,7 @@ impl OpModel for TcpConnectSocket {
   }
 }
 
-impl OneshotOpModel for TcpConnectSocket {}
+impl OneshotOpModel for TcpStreamConnect {}
 
 pub struct UdpBindSocket {
   state: UdpBindState,

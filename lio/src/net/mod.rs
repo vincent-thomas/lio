@@ -2,126 +2,89 @@
 //!
 //! This module provides high-level abstractions for network I/O operations using lio's
 //! async runtime. It includes both low-level socket primitives and higher-level TCP
-//! abstractions.
+//! and UDP abstractions.
 //!
-//! # Main Types
+//! # Overview
 //!
-//! - [`Socket`]: Low-level async socket wrapper that provides direct access to socket operations
+//! lio provides a unified async networking API that works with `io_uring` on Linux,
+//! `kqueue` on BSD/macOS, and similar mechanisms on other platforms. This module
+//! exposes:
+//!
+//! - [`Socket`]: Low-level async socket wrapper for socket-level operations
 //! - [`TcpListener`]: High-level TCP server for accepting incoming connections
-//! - [`TcpSocket`]: High-level TCP client/server connection for sending and receiving data
+//! - [`TcpSocket`]: High-level TCP client/server connection
 //! - [`UdpSocket`]: High-level UDP socket for datagram send/receive
+//! - [`ops`]: Low-level async operations (advanced users only)
 //!
-//! # Features
+//! # Async Design
 //!
-//! - **Async-first design**: All I/O operations return [`Io<T>`](crate::api::io::Io)
-//!   which can be awaited
-//! - **Efficient buffer management**: Operations take ownership of buffers and return them,
-//!   avoiding unnecessary copies
-//! - **Zero-cost abstractions**: High-level types like `TcpListener` and `TcpSocket` are
-//!   thin wrappers around `Socket` with no runtime overhead
-//! - **Platform-native**: Uses the most efficient I/O mechanism available on the platform
-//!   (io_uring on Linux, kqueue on BSD/macOS, etc.)
-//!
-//! # Examples
-//!
-//! ## TCP Echo Server
+//! All I/O operations return [`Io<T>`](crate::api::io::Io) which can be awaited.
+//! For example:
 //!
 //! ```rust,ignore
-//! use lio::net::TcpListener;
+//! use lio::net::{TcpSocket, TcpListener};
 //!
-//! async fn echo_server() -> std::io::Result<()> {
-//!     let listener = TcpListener::bind("127.0.0.1:8080".parse().unwrap()).await?;
-//!     println!("Server listening on 127.0.0.1:8080");
+//! async fn example() -> std::io::Result<()> {
+//!     let addr: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
 //!
-//!     loop {
-//!         let (socket, addr) = listener.accept().await?;
-//!         println!("New connection from: {}", addr);
-//!
-//!         // Echo data back to the client
-//!         let buffer = vec![0u8; 1024];
-//!         let (result, buffer) = socket.recv(buffer).await;
-//!     let bytes_read = result? as usize;
-//!
-//!         if bytes_read > 0 {
-//!             let (result, _) = socket.send(buffer[..bytes_read].to_vec()).await;
-//!             let bytes_sent = result? as usize;
-//!             println!("Echoed {} bytes", bytes_sent);
-//!         }
-//!     }
-//! }
-//! ```
-//!
-//! ## TCP Client
-//!
-//! ```rust,ignore
-//! use lio::net::TcpSocket;
-//! use std::net::SocketAddr;
-//!
-//! async fn send_message() -> std::io::Result<()> {
-//!     // Connect to server
-//!     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 //!     let socket = TcpSocket::connect(addr).await?;
+//!     let data = b"Hello, world!".to_vec();
+//!     let (result, data) = socket.send(data).await;
+//!     result?;
 //!
-//!     // Send a message
-//!     let message = b"Hello, server!".to_vec();
-//!     let (result, message) = socket.send(message).await;
-//!     let bytes_sent = result? as usize;
-//!     println!("Sent {} bytes", bytes_sent);
-//!
-//!     // Receive response
 //!     let buffer = vec![0u8; 1024];
 //!     let (result, buffer) = socket.recv(buffer).await;
-//!     let bytes_read = result? as usize;
-//!     println!("Received: {:?}", &buffer[..bytes_read]);
-//!
-//!     // Gracefully shutdown
-//!     socket.shutdown(libc::SHUT_RDWR).await?;
+//!     result?;
 //!
 //!     Ok(())
 //! }
 //! ```
 //!
-//! ## Low-Level Socket Operations
+//! # Efficient Buffer Management
 //!
-//! For advanced use cases, you can use [`Socket`] directly:
+//! Operations take ownership of buffers and return them on completion,
+//! avoiding unnecessary copies:
 //!
 //! ```rust,ignore
-//! use lio::net::Socket;
-//! use std::net::SocketAddr;
+//! let buffer = vec![0u8; 1024];
 //!
-//! async fn custom_socket() -> std::io::Result<()> {
-//!     // Create a raw TCP socket
-//!     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+//! // Send data (buffer is consumed and returned)
+//! let (result, buffer) = socket.send(buffer).await;
+//! let bytes_sent = result? as usize;
 //!
-//!     // Bind to an address
-//!     let addr: SocketAddr = "0.0.0.0:9000".parse().unwrap();
-//!     socket.bind(addr).await?;
-//!
-//!     // Listen for connections
-//!     socket.listen().await?;
-//!
-//!     // Accept a connection (returns Socket and address)
-//!     let (client_socket, client_addr) = socket.accept().await?;
-//!     println!("Client connected: {}", client_addr);
-//!
-//!     Ok(())
-//! }
+//! // Buffer can be reused for another operation
+//! let buffer2 = b"Another message!".to_vec();
+//! let (result2, buffer2) = socket.send(buffer2).await;
 //! ```
 //!
-//! # Synchronous vs Asynchronous
+//! # High-Performance I/O
+//!
+//! Uses the most efficient I/O mechanism available on the platform:
+//! - **Linux**: Uses `io_uring` for non-blocking I/O
+//! - **BSD/macOS**: Uses `kqueue` for event-driven I/O
+//! - **Windows**: Uses overlapped I/O
+//!
+//! # Socket Address Types
+//!
+//! All socket-related types work with [`std::net::SocketAddr`], supporting both:
+//! - IPv4 addresses (`std::net::Ipv4Addr`)
+//! - IPv6 addresses (`std::net::Ipv6Addr`)
+//!
+//! # Unix Domain Sockets
+//!
+//! Unix domain sockets are supported on Unix-like platforms via the `unix`
+//! feature. See the [`unix`](unix) module for details.
 //!
 //! # See Also
 //!
 //! - [`crate::api::resource`]: Resource management for file descriptors
 //! - [`crate::api::io`]: Io type for async operations
 
+mod ops;
 mod socket;
 mod tcp;
 mod udp;
-// #[cfg(unix)]
-// pub mod unix;
 
 pub use socket::*;
 pub use tcp::*;
 pub use udp::*;
-pub mod ops;
