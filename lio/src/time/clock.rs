@@ -77,7 +77,6 @@ impl TimerSlot {
 #[derive(Debug, Clone, Copy)]
 struct PendingTimer {
   id: TimerId,
-  cancelled: bool,
 }
 
 /// Number of bits per wheel level (256 slots).
@@ -171,8 +170,6 @@ impl Clock {
     if previous.is_occupied() {
       if previous.entry.pending_index == ACTIVE_TIMER {
         self.decrement_active_deadline(previous.entry.deadline_ticks);
-      } else if previous.entry.pending_index != DELIVERED_TIMER {
-        self.cancel_pending(previous.id, previous.entry.pending_index);
       }
     } else {
       self.timer_count += 1;
@@ -220,18 +217,8 @@ impl Clock {
     self.timer_count -= 1;
     if timer.entry.pending_index == ACTIVE_TIMER {
       self.decrement_active_deadline(timer.entry.deadline_ticks);
-    } else if timer.entry.pending_index != DELIVERED_TIMER {
-      self.cancel_pending(id, timer.entry.pending_index);
     }
     true
-  }
-
-  fn cancel_pending(&mut self, id: TimerId, pending_index: usize) {
-    if let Some(pending) = self.pending_fire.get_mut(pending_index)
-      && pending.id == id
-    {
-      pending.cancelled = true;
-    }
   }
 
   pub(crate) fn current_tick(&self) -> u64 {
@@ -361,10 +348,7 @@ impl Clock {
       if entry.deadline_ticks <= self.current_tick {
         timer.entry.pending_index = self.pending_fire.len();
         expired_count += 1;
-        self.pending_fire.push(PendingTimer {
-          id: entry.id,
-          cancelled: false,
-        });
+        self.pending_fire.push(PendingTimer { id: entry.id });
       } else {
         self.insert_timer(entry.id, entry.deadline_ticks);
       }
@@ -382,15 +366,13 @@ impl Clock {
       let pending = self.pending_fire[self.pending_index];
       self.pending_index += 1;
 
-      if !pending.cancelled {
-        let slot_index = pending.id as u32 as usize;
-        if let Some(timer) = self.timers.get_mut(slot_index)
-          && timer.id == pending.id
-          && timer.entry.pending_index == self.pending_index - 1
-        {
-          timer.entry.pending_index = DELIVERED_TIMER;
-          return Some(pending.id);
-        }
+      let slot_index = pending.id as u32 as usize;
+      if let Some(timer) = self.timers.get_mut(slot_index)
+        && timer.id == pending.id
+        && timer.entry.pending_index == self.pending_index - 1
+      {
+        timer.entry.pending_index = DELIVERED_TIMER;
+        return Some(pending.id);
       }
     }
 

@@ -252,11 +252,13 @@ impl Lio {
   /// Non-blocking poll for completed operations.
   ///
   /// Returns immediately, processing any completions that are ready.
+  #[inline]
   pub fn try_run(&self) -> io::Result<usize> {
     self.run_inner(Some(Duration::ZERO))
   }
 
   /// Block until at least one operation completes.
+  #[inline]
   pub fn run(&self) -> io::Result<usize> {
     self.run_inner(None)
   }
@@ -266,13 +268,27 @@ impl Lio {
   /// Waits for at least one operation to complete or until the timeout expires,
   /// whichever comes first. Returns `Ok(true)` if completions were processed,
   /// `Ok(false)` if the timeout expired with no completions.
+  #[inline]
   pub fn run_timeout(&self, timeout: Duration) -> io::Result<usize> {
     self.run_inner(Some(timeout))
   }
 
+  #[inline]
   fn run_inner(&self, timeout: Option<Duration>) -> io::Result<usize> {
     let mut inner = self.inner.borrow_mut();
-    let profiling_enabled = inner.profile.is_some();
+    if inner.profile.is_some() {
+      Self::run_inner_impl::<true>(&mut inner, timeout)
+    } else {
+      Self::run_inner_impl::<false>(&mut inner, timeout)
+    }
+  }
+
+  #[inline]
+  fn run_inner_impl<const PROFILE: bool>(
+    inner: &mut LioInner,
+    timeout: Option<Duration>,
+  ) -> io::Result<usize> {
+    let profiling_enabled = PROFILE;
     let mut flush_time = Duration::ZERO;
     let mut next_deadline_time = Duration::ZERO;
     let mut wait_time = Duration::ZERO;
@@ -318,7 +334,11 @@ impl Lio {
     };
 
     let mut completed = std::mem::take(&mut inner.completed);
-    let mut expired_timers = std::mem::take(&mut inner.expired_timers);
+    let mut expired_timers = if has_timers {
+      std::mem::take(&mut inner.expired_timers)
+    } else {
+      Vec::new()
+    };
 
     completed.clear();
     expired_timers.clear();
@@ -366,7 +386,7 @@ impl Lio {
       if let Some(next_action) = completion_result.next_action {
         let started =
           if profiling_enabled { Some(Instant::now()) } else { None };
-        Self::dispatch_action(&mut inner, id, next_action);
+        Self::dispatch_action(inner, id, next_action);
         if let Some(started) = started {
           dispatch_time += started.elapsed();
         }
@@ -419,7 +439,7 @@ impl Lio {
       if let Some(action) = next_action {
         let started =
           if profiling_enabled { Some(Instant::now()) } else { None };
-        Self::dispatch_action(&mut inner, timer_id, action);
+        Self::dispatch_action(inner, timer_id, action);
         if let Some(started) = started {
           dispatch_time += started.elapsed();
         }
@@ -443,7 +463,9 @@ impl Lio {
     completed.clear();
     expired_timers.clear();
     inner.completed = completed;
-    inner.expired_timers = expired_timers;
+    if has_timers {
+      inner.expired_timers = expired_timers;
+    }
 
     if let Some(profile) = inner.profile.as_mut() {
       profile.run_inner_calls += 1;
