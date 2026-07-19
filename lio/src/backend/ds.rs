@@ -24,7 +24,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
-use std::ffi::CStr;
 use std::fmt;
 use std::io;
 use std::mem;
@@ -35,10 +34,12 @@ use std::time::Duration;
 use bumpalo::Bump;
 
 use crate::api::resource::Resource;
+#[cfg(test)]
+use crate::backend::op::SendFlags;
 use crate::backend::op::{
   self, DirEntryRef, FileStat, FileType, MsgRecv, MsgSend, Op, OpaqueDropFn,
-  RawBuf, ReadDirResult, SockDomain, SockProto, SockType, SocketAddrBuf,
-  SocketAddrFamily,
+  RawBuf, ReadDirResult, ReadFlags, RecvFlags, ShutdownHow, SockDomain,
+  SockProto, SockType, SocketAddrBuf, SocketAddrFamily, UnlinkKind,
 };
 use crate::backend::{IoBackend, OpCompleted};
 use crate::{Lio, install_global};
@@ -1432,10 +1433,16 @@ impl DSBackend {
     1 + self.payload_rng.range_usize(total)
   }
 
-  fn cstr_path(path: NonNull<libc::c_char>) -> Vec<u8> {
-    // SAFETY: op models provide stable nul-terminated C strings.
-    let bytes = unsafe { CStr::from_ptr(path.as_ptr()) }.to_bytes();
-    Self::normalize_path(bytes)
+  fn os_path(path: &std::ffi::OsString) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+      use std::os::unix::ffi::OsStrExt;
+      Self::normalize_path(path.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+      Self::normalize_path(path.to_string_lossy().as_bytes())
+    }
   }
 
   fn normalize_path_from(dir: &[u8], path: &[u8]) -> Vec<u8> {
@@ -1495,10 +1502,15 @@ impl DSBackend {
   fn resolve_open_path(
     &self,
     dir_fd: &Resource,
-    path: NonNull<libc::c_char>,
+    path: &std::ffi::OsString,
   ) -> Result<Vec<u8>, isize> {
-    // SAFETY: op models provide stable nul-terminated C strings.
-    let bytes = unsafe { CStr::from_ptr(path.as_ptr()) }.to_bytes();
+    #[cfg(unix)]
+    let bytes = {
+      use std::os::unix::ffi::OsStrExt;
+      path.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().as_bytes();
     if bytes.first() == Some(&b'/') {
       return Ok(Self::normalize_path(bytes));
     }
@@ -1640,7 +1652,7 @@ impl DSBackend {
         file_type: FileType::Directory,
         size: 0,
         permissions: mode & 0o7777,
-        mode: (libc::S_IFDIR as u32) | *mode,
+        mode: (libc::S_IFDIR as u32) | mode,
         nlink: 1,
         uid: 0,
         gid: 0,
@@ -1649,7 +1661,7 @@ impl DSBackend {
         file_type: FileType::File,
         size: bytes.len() as u64,
         permissions: mode & 0o7777,
-        mode: (libc::S_IFREG as u32) | *mode,
+        mode: (libc::S_IFREG as u32) | mode,
         nlink: 1,
         uid: 0,
         gid: 0,
@@ -1658,7 +1670,7 @@ impl DSBackend {
         file_type: FileType::Symlink,
         size: target.len() as u64,
         permissions: mode & 0o7777,
-        mode: (libc::S_IFLNK as u32) | *mode,
+        mode: (libc::S_IFLNK as u32) | mode,
         nlink: 1,
         uid: 0,
         gid: 0,
@@ -1790,7 +1802,7 @@ impl DSBackend {
   fn process_pending_op(&mut self, _id: u64, op: Op) -> PendingAction {
     match op {
       Op::Read { fd, iovecs, iov_count, offset, flags } => {
-        if offset < -1 || flags < 0 || offset >= 0 {
+        if offset < -1 || flags.bits() < 0 || offset >= 0 {
           return PendingAction::Complete(-(libc::EINVAL as isize));
         }
         let raw = Self::resource_key(&fd);
@@ -1814,7 +1826,7 @@ impl DSBackend {
         }
       }
       Op::Recv { fd, msg, flags } => {
-        if flags < 0 {
+        if flags.bits() < 0 {
           return PendingAction::Complete(-(libc::EINVAL as isize));
         }
         let raw = Self::resource_key(&fd);
@@ -2025,7 +2037,7 @@ impl DSBackend {
         if offset < -1 {
           return OpAction::Complete(-(libc::EINVAL as isize));
         }
-        if flags < 0 {
+        if flags.bits() < 0 {
           return OpAction::Complete(-(libc::ENOTSUP as isize));
         }
         let total: usize =
@@ -2073,7 +2085,7 @@ impl DSBackend {
         if offset < -1 {
           return OpAction::Complete(-(libc::EINVAL as isize));
         }
-        if flags < 0 {
+        if flags.bits() < 0 {
           return OpAction::Complete(-(libc::ENOTSUP as isize));
         }
         let bytes = Self::extract_iovec_bytes(iovecs, iov_count);
@@ -2087,7 +2099,7 @@ impl DSBackend {
         }
       }
       Op::Recv { fd, msg, flags } => {
-        if flags < 0 {
+        if flags.bits() < 0 {
           return OpAction::Complete(-(libc::EINVAL as isize));
         }
         let total =
@@ -2127,7 +2139,7 @@ impl DSBackend {
         }
       }
       Op::Send { fd, msg, flags } => {
-        if flags < 0 {
+        if flags.bits() < 0 {
           return OpAction::Complete(-(libc::EINVAL as isize));
         }
         let bytes = Self::read_msg_send(msg);
@@ -2180,16 +2192,19 @@ impl DSBackend {
         OpAction::StartConnect { accepted_fd, listener_fd, ready_at_tick }
       }
       Op::OpenAt { dir_fd, path, flags, .. } => {
-        let path = match self.resolve_open_path(&dir_fd, path) {
+        let path = match self.resolve_open_path(&dir_fd, &path) {
           Ok(path) => path,
           Err(err) => return OpAction::Complete(err),
         };
         let exists = self.world.fs.contains_key(&path);
-        if exists && flags & libc::O_CREAT != 0 && flags & libc::O_EXCL != 0 {
+        if exists
+          && flags.bits() & libc::O_CREAT != 0
+          && flags.bits() & libc::O_EXCL != 0
+        {
           return OpAction::Complete(-(libc::EEXIST as isize));
         }
         if !exists {
-          if flags & libc::O_CREAT == 0 {
+          if flags.bits() & libc::O_CREAT == 0 {
             return OpAction::Complete(-(libc::ENOENT as isize));
           }
           self.world.fs.insert(
@@ -2197,28 +2212,28 @@ impl DSBackend {
             SimNode::File { bytes: Vec::new(), mode: 0o644 },
           );
         }
-        if flags & libc::O_DIRECTORY != 0 {
+        if flags.bits() & libc::O_DIRECTORY != 0 {
           let Some(SimNode::Directory { .. }) = self.world.fs.get(&path) else {
             return OpAction::Complete(-(libc::ENOTDIR as isize));
           };
         }
-        if flags & libc::O_TRUNC != 0
+        if flags.bits() & libc::O_TRUNC != 0
           && let Some(SimNode::File { bytes, .. }) =
             self.world.fs.get_mut(&path)
         {
           bytes.clear();
         }
         let fd = self.allocate_resource_id();
-        let handle = self.make_file_handle(path, flags);
+        let handle = self.make_file_handle(path, flags.bits());
         self.world.resources.insert(fd, SimResource::File(handle));
         OpAction::Complete(fd as isize)
       }
-      Op::UnlinkAt { path, flags, .. } => {
-        let path = Self::cstr_path(path);
+      Op::UnlinkAt { path, kind, .. } => {
+        let path = Self::os_path(&path);
         let Some(node) = self.world.fs.get(&path) else {
           return OpAction::Complete(-(libc::ENOENT as isize));
         };
-        if flags == libc::AT_REMOVEDIR
+        if matches!(kind, UnlinkKind::Directory)
           && !matches!(node, SimNode::Directory { .. })
         {
           return OpAction::Complete(-(libc::ENOENT as isize));
@@ -2227,8 +2242,8 @@ impl DSBackend {
         OpAction::Complete(0)
       }
       Op::RenameAt { old_path, new_path, .. } => {
-        let old_path = Self::cstr_path(old_path);
-        let new_path = Self::cstr_path(new_path);
+        let old_path = Self::os_path(&old_path);
+        let new_path = Self::os_path(&new_path);
         let Some(node) = self.world.fs.remove(&old_path) else {
           return OpAction::Complete(-(libc::ENOENT as isize));
         };
@@ -2236,7 +2251,7 @@ impl DSBackend {
         OpAction::Complete(0)
       }
       Op::MkdirAt { path, .. } => {
-        let path = Self::cstr_path(path);
+        let path = Self::os_path(&path);
         if self.world.fs.contains_key(&path) {
           return OpAction::Complete(-(libc::EEXIST as isize));
         }
@@ -2244,8 +2259,8 @@ impl DSBackend {
         OpAction::Complete(0)
       }
       Op::LinkAt { source_path, new_path, kind, .. } => {
-        let source_path = Self::cstr_path(source_path);
-        let new_path = Self::cstr_path(new_path);
+        let source_path = Self::os_path(&source_path);
+        let new_path = Self::os_path(&new_path);
         match kind {
           op::LinkKind::Hard => {
             let Some(node) = self.world.fs.get(&source_path).cloned() else {
@@ -2263,19 +2278,36 @@ impl DSBackend {
         OpAction::Complete(0)
       }
       Op::ReadlinkAt { path, buf, buf_len, .. } => {
-        let path = Self::cstr_path(path);
+        let path = Self::os_path(&path);
         let Some(SimNode::Symlink { target, .. }) = self.world.fs.get(&path)
         else {
           return OpAction::Complete(-(libc::ENOENT as isize));
         };
         OpAction::Complete(Self::write_c_string_bytes(buf, buf_len, target))
       }
-      Op::GetCwd { buf, buf_len } => {
+      Op::GetCwd { out } => {
         let payload = self.fake_cwd();
-        OpAction::Complete(Self::write_c_string_bytes(buf, buf_len, payload))
+        #[cfg(unix)]
+        let cwd = {
+          use std::os::unix::ffi::OsStringExt;
+          std::ffi::OsString::from_vec(payload.to_vec())
+        };
+        #[cfg(not(unix))]
+        let cwd =
+          std::ffi::OsString::from(String::from_utf8_lossy(payload).as_ref());
+        unsafe { out.as_ptr().write(cwd) };
+        OpAction::Complete(0)
       }
-      Op::Spawn { path, .. } => {
-        let path = Self::cstr_path(path);
+      Op::Spawn { spec } => {
+        #[cfg(unix)]
+        let path = {
+          use std::os::unix::ffi::OsStrExt;
+          Self::normalize_path(spec.program.as_bytes())
+        };
+        #[cfg(not(unix))]
+        let path =
+          Self::normalize_path(spec.program.to_string_lossy().as_bytes());
+
         if path.is_empty() || !self.world.fs.contains_key(&path) {
           return OpAction::Complete(-(libc::ENOENT as isize));
         }
@@ -2351,19 +2383,15 @@ impl DSBackend {
         };
         let peer = socket.peer;
         match how {
-          libc::SHUT_RD => socket.shutdown_read = true,
-          libc::SHUT_WR => socket.shutdown_write = true,
-          libc::SHUT_RDWR => {
+          ShutdownHow::Read => socket.shutdown_read = true,
+          ShutdownHow::Write => socket.shutdown_write = true,
+          ShutdownHow::Both => {
             socket.shutdown_read = true;
             socket.shutdown_write = true;
           }
-          _ => {
-            self.world.resources.insert(raw, SimResource::Socket(socket));
-            return OpAction::Complete(-(libc::EINVAL as isize));
-          }
         }
         self.world.resources.insert(raw, SimResource::Socket(socket));
-        if matches!(how, libc::SHUT_WR | libc::SHUT_RDWR)
+        if matches!(how, ShutdownHow::Write | ShutdownHow::Both)
           && let Some(peer_fd) = peer
         {
           let ready_at_tick = self.world.tick + self.event_delay_ticks();
@@ -2399,7 +2427,7 @@ impl DSBackend {
       Op::Stat { target, out } => {
         let stat = match target {
           op::StatTarget::Path { path, follow_symlinks, .. } => {
-            let path = Self::cstr_path(path);
+            let path = Self::os_path(&path);
             let Some(node) = self.resolve_path_node(&path, follow_symlinks)
             else {
               return OpAction::Complete(-(libc::ENOENT as isize));
@@ -3165,12 +3193,12 @@ impl DSTBackend {
     iovecs: NonNull<RawBuf>,
     iov_count: usize,
     offset: i64,
-    flags: i32,
+    flags: ReadFlags,
   ) -> PendingAction {
     if offset < -1 {
       return PendingAction::Complete(-(libc::EINVAL as isize));
     }
-    if flags < 0 {
+    if flags.bits() < 0 {
       return PendingAction::Complete(-(libc::ENOTSUP as isize));
     }
     if offset >= 0 {
@@ -3205,9 +3233,9 @@ impl DSTBackend {
     node: &mut DSTNodeState,
     fd: &Resource,
     msg: MsgRecv,
-    flags: i32,
+    flags: RecvFlags,
   ) -> PendingAction {
-    if flags < 0 {
+    if flags.bits() < 0 {
       return PendingAction::Complete(-(libc::EINVAL as isize));
     }
     let raw = DSBackend::resource_key(fd);
@@ -3654,7 +3682,7 @@ impl DSTBackend {
         }
       }
       Op::Send { fd, msg, flags } => {
-        if flags < 0 {
+        if flags.bits() < 0 {
           self
             .node
             .borrow_mut()
@@ -3679,7 +3707,7 @@ impl DSTBackend {
             .push(OpCompleted::new(id, -(libc::EINVAL as isize)));
           return;
         }
-        if flags < 0 {
+        if flags.bits() < 0 {
           self
             .node
             .borrow_mut()
@@ -3740,22 +3768,18 @@ impl DSTBackend {
             return;
           };
           match how {
-            libc::SHUT_RD => socket.local_shutdown_read = true,
-            libc::SHUT_WR => socket.local_shutdown_write = true,
-            libc::SHUT_RDWR => {
+            ShutdownHow::Read => socket.local_shutdown_read = true,
+            ShutdownHow::Write => socket.local_shutdown_write = true,
+            ShutdownHow::Both => {
               socket.local_shutdown_read = true;
               socket.local_shutdown_write = true;
               socket.state = DSTSocketState::Closed;
-            }
-            _ => {
-              node.ready.push(OpCompleted::new(id, -(libc::EINVAL as isize)));
-              return;
             }
           }
           socket.peer
         };
 
-        if matches!(how, libc::SHUT_WR | libc::SHUT_RDWR)
+        if matches!(how, ShutdownHow::Write | ShutdownHow::Both)
           && let Some(peer) = peer
           && self
             .node
@@ -3894,8 +3918,6 @@ mod tests {
   use super::*;
   use crate::backend::op::{MsgBufMut, MsgRecv};
   use std::net::SocketAddr;
-  #[cfg(unix)]
-  use std::os::fd::FromRawFd;
 
   fn dst_test_socket(node: &Rc<RefCell<DSTNodeState>>, fd: i32) {
     let mut socket =
@@ -3914,6 +3936,13 @@ mod tests {
   fn dst_take_ready(node: &Rc<RefCell<DSTNodeState>>) -> Vec<OpCompleted> {
     let mut node = node.borrow_mut();
     std::mem::take(&mut node.ready)
+  }
+
+  fn dst_resource(fd: i32) -> Resource {
+    // DS tests use simulated descriptor numbers managed by DSBackend, not the
+    // process fd table. Borrow them so dropping Resource never closes an
+    // unrelated real fd owned by a concurrently running test.
+    unsafe { Resource::borrow(fd) }
   }
 
   fn dst_connect_completion_tick(seed: u64) -> u64 {
@@ -3935,7 +3964,7 @@ mod tests {
       },
     );
     let listener_fd = dst_take_ready(&listener_backend.node)[0].result() as i32;
-    let listener = unsafe { Resource::from_raw_fd(listener_fd) };
+    let listener = dst_resource(listener_fd);
     let addr: SocketAddr = "127.0.0.1:7020".parse().unwrap();
     listener_backend
       .network_complete_op(2, Op::Bind { fd: listener.clone(), addr });
@@ -3956,7 +3985,7 @@ mod tests {
     client_backend.network_complete_op(
       5,
       Op::Connect {
-        fd: unsafe { Resource::from_raw_fd(client_fd) },
+        fd: dst_resource(client_fd),
         addr: op::socket_addr_into_buf(addr),
       },
     );
@@ -4050,14 +4079,11 @@ mod tests {
     });
     backend.init(8).unwrap();
 
-    let mut out = [0_u8; 64];
+    let mut out = std::ffi::OsString::new();
     let mut step_bump = Bump::new();
     backend.push(
       1,
-      Op::GetCwd {
-        buf: NonNull::new(out.as_mut_ptr()).unwrap(),
-        buf_len: out.len(),
-      },
+      Op::GetCwd { out: NonNull::from(&mut out) },
       &mut step_bump,
     );
     backend.flush().unwrap();
@@ -4065,8 +4091,12 @@ mod tests {
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
-    let len = completed[0].result() as usize;
-    assert_eq!(&out[..len], backend.scenario.cwd.as_slice());
+    assert_eq!(completed[0].result(), 0);
+    #[cfg(unix)]
+    {
+      use std::os::unix::ffi::OsStrExt;
+      assert_eq!(out.as_os_str().as_bytes(), backend.scenario.cwd.as_slice());
+    }
   }
 
   #[test]
@@ -4085,7 +4115,7 @@ mod tests {
     let mut step_bump = Bump::new();
     backend.push(
       1,
-      Op::Recv { fd: Resource::stdin(), msg, flags: 0 },
+      Op::Recv { fd: Resource::stdin(), msg, flags: RecvFlags::EMPTY },
       &mut step_bump,
     );
     backend.flush().unwrap();
@@ -4111,13 +4141,17 @@ mod tests {
       SockType::STREAM,
       SockProto::TCP,
     );
-    let socket = unsafe { Resource::from_raw_fd(socket_fd) };
+    let socket = dst_resource(socket_fd);
 
     let mut buf = [0_u8; 16];
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
     let msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     let mut step_bump = Bump::new();
-    backend.push(1, Op::Recv { fd: socket, msg, flags: 0 }, &mut step_bump);
+    backend.push(
+      1,
+      Op::Recv { fd: socket, msg, flags: RecvFlags::EMPTY },
+      &mut step_bump,
+    );
     backend.flush().unwrap();
 
     let mut completed = Vec::new();
@@ -4162,8 +4196,8 @@ mod tests {
       panic!("receiver socket resource missing");
     }
 
-    let sender = unsafe { Resource::from_raw_fd(sender_fd) };
-    let receiver = unsafe { Resource::from_raw_fd(receiver_fd) };
+    let sender = dst_resource(sender_fd);
+    let receiver = dst_resource(receiver_fd);
 
     let payload = b"ping".to_vec();
     let send_buf = crate::backend::op::MsgBuf::from_slice(&payload);
@@ -4171,7 +4205,7 @@ mod tests {
     let mut send_bump = Bump::new();
     backend.push(
       1,
-      Op::Send { fd: sender, msg: send_msg, flags: 0 },
+      Op::Send { fd: sender, msg: send_msg, flags: SendFlags::EMPTY },
       &mut send_bump,
     );
     backend.flush().unwrap();
@@ -4188,7 +4222,7 @@ mod tests {
     let mut recv_bump = Bump::new();
     backend.push(
       2,
-      Op::Recv { fd: receiver, msg: recv_msg, flags: 0 },
+      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
       &mut recv_bump,
     );
     backend.flush().unwrap();
@@ -4238,8 +4272,8 @@ mod tests {
       panic!("receiver socket resource missing");
     }
 
-    let sender = unsafe { Resource::from_raw_fd(sender_fd) };
-    let receiver = unsafe { Resource::from_raw_fd(receiver_fd) };
+    let sender = dst_resource(sender_fd);
+    let receiver = dst_resource(receiver_fd);
 
     let mut buf = [0_u8; 16];
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
@@ -4247,7 +4281,7 @@ mod tests {
     let mut recv_bump = Bump::new();
     backend.push(
       1,
-      Op::Recv { fd: receiver, msg: recv_msg, flags: 0 },
+      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
       &mut recv_bump,
     );
     backend.flush().unwrap();
@@ -4265,7 +4299,7 @@ mod tests {
     let mut send_bump = Bump::new();
     backend.push(
       2,
-      Op::Send { fd: sender, msg: send_msg, flags: 0 },
+      Op::Send { fd: sender, msg: send_msg, flags: SendFlags::EMPTY },
       &mut send_bump,
     );
     backend.flush().unwrap();
@@ -4317,8 +4351,8 @@ mod tests {
     ));
     backend.world.bound_listeners.insert(listener_key, listener_fd);
 
-    let listener = unsafe { Resource::from_raw_fd(listener_fd) };
-    let client = unsafe { Resource::from_raw_fd(client_fd) };
+    let listener = dst_resource(listener_fd);
+    let client = dst_resource(client_fd);
 
     let mut accepted_addr = SocketAddrBuf::unspecified();
     let mut accept_bump = Bump::new();
@@ -4397,7 +4431,7 @@ mod tests {
       panic!("receiver socket resource missing");
     }
 
-    let receiver = unsafe { Resource::from_raw_fd(receiver_fd) };
+    let receiver = dst_resource(receiver_fd);
 
     let mut buf = [0_u8; 16];
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
@@ -4407,7 +4441,7 @@ mod tests {
     let mut recv_bump = Bump::new();
     backend.push(
       1,
-      Op::Recv { fd: receiver, msg: recv_msg, flags: 0 },
+      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
       &mut recv_bump,
     );
     backend.flush().unwrap();
@@ -4455,8 +4489,8 @@ mod tests {
       panic!("receiver socket resource missing");
     }
 
-    let sender = unsafe { Resource::from_raw_fd(sender_fd) };
-    let receiver = unsafe { Resource::from_raw_fd(receiver_fd) };
+    let sender = dst_resource(sender_fd);
+    let receiver = dst_resource(receiver_fd);
 
     let mut buf = [0_u8; 16];
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
@@ -4464,7 +4498,7 @@ mod tests {
     let mut recv_bump = Bump::new();
     backend.push(
       1,
-      Op::Recv { fd: receiver, msg: recv_msg, flags: 0 },
+      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
       &mut recv_bump,
     );
 
@@ -4474,7 +4508,7 @@ mod tests {
     let mut send_bump = Bump::new();
     backend.push(
       2,
-      Op::Send { fd: sender, msg: send_msg, flags: 0 },
+      Op::Send { fd: sender, msg: send_msg, flags: SendFlags::EMPTY },
       &mut send_bump,
     );
     backend.flush().unwrap();
@@ -4539,9 +4573,9 @@ mod tests {
         sender.network_complete_op(
           id as u64 + 1,
           Op::Send {
-            fd: unsafe { Resource::from_raw_fd(11) },
+            fd: dst_resource(11),
             msg: send_msg,
-            flags: 0,
+            flags: SendFlags::EMPTY,
           },
         );
       }
@@ -4598,9 +4632,9 @@ mod tests {
       sender.network_complete_op(
         id as u64 + 1,
         Op::Send {
-          fd: unsafe { Resource::from_raw_fd(11) },
+          fd: dst_resource(11),
           msg: send_msg,
-          flags: 0,
+          flags: SendFlags::EMPTY,
         },
       );
     }
@@ -4616,11 +4650,7 @@ mod tests {
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       10,
-      Op::Recv {
-        fd: unsafe { Resource::from_raw_fd(22) },
-        msg: recv_msg,
-        flags: 0,
-      },
+      Op::Recv { fd: dst_resource(22), msg: recv_msg, flags: RecvFlags::EMPTY },
     );
     let first = dst_take_ready(&receiver.node);
     assert_eq!(first.len(), 1);
@@ -4632,11 +4662,7 @@ mod tests {
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       11,
-      Op::Recv {
-        fd: unsafe { Resource::from_raw_fd(22) },
-        msg: recv_msg,
-        flags: 0,
-      },
+      Op::Recv { fd: dst_resource(22), msg: recv_msg, flags: RecvFlags::EMPTY },
     );
     let second = dst_take_ready(&receiver.node);
     assert_eq!(second.len(), 1);
@@ -4674,20 +4700,13 @@ mod tests {
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       1,
-      Op::Recv {
-        fd: unsafe { Resource::from_raw_fd(22) },
-        msg: recv_msg,
-        flags: 0,
-      },
+      Op::Recv { fd: dst_resource(22), msg: recv_msg, flags: RecvFlags::EMPTY },
     );
     assert!(dst_take_ready(&receiver.node).is_empty());
 
     sender.network_complete_op(
       2,
-      Op::Shutdown {
-        fd: unsafe { Resource::from_raw_fd(11) },
-        how: libc::SHUT_WR,
-      },
+      Op::Shutdown { fd: dst_resource(11), how: ShutdownHow::Write },
     );
     let sender_ready = dst_take_ready(&sender.node);
     assert_eq!(sender_ready.len(), 1);
@@ -4734,11 +4753,7 @@ mod tests {
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       1,
-      Op::Recv {
-        fd: unsafe { Resource::from_raw_fd(22) },
-        msg: recv_msg,
-        flags: 0,
-      },
+      Op::Recv { fd: dst_resource(22), msg: recv_msg, flags: RecvFlags::EMPTY },
     );
     assert!(dst_take_ready(&receiver.node).is_empty());
 
@@ -4761,11 +4776,7 @@ mod tests {
     let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
     receiver.network_complete_op(
       2,
-      Op::Send {
-        fd: unsafe { Resource::from_raw_fd(22) },
-        msg: send_msg,
-        flags: 0,
-      },
+      Op::Send { fd: dst_resource(22), msg: send_msg, flags: SendFlags::EMPTY },
     );
     let receiver_ready = dst_take_ready(&receiver.node);
     assert_eq!(receiver_ready.len(), 1);
@@ -4793,7 +4804,7 @@ mod tests {
       },
     );
     let listener_fd = dst_take_ready(&listener_backend.node)[0].result() as i32;
-    let listener = unsafe { Resource::from_raw_fd(listener_fd) };
+    let listener = dst_resource(listener_fd);
     let addr: SocketAddr = "127.0.0.1:7010".parse().unwrap();
     listener_backend
       .network_complete_op(2, Op::Bind { fd: listener.clone(), addr });
@@ -4818,7 +4829,7 @@ mod tests {
     client_a.network_complete_op(
       11,
       Op::Connect {
-        fd: unsafe { Resource::from_raw_fd(client_a_fd) },
+        fd: dst_resource(client_a_fd),
         addr: op::socket_addr_into_buf(addr),
       },
     );
@@ -4827,7 +4838,7 @@ mod tests {
     client_b.network_complete_op(
       12,
       Op::Connect {
-        fd: unsafe { Resource::from_raw_fd(client_b_fd) },
+        fd: dst_resource(client_b_fd),
         addr: op::socket_addr_into_buf(addr),
       },
     );
@@ -4877,7 +4888,7 @@ mod tests {
       },
     );
     let stream_fd = dst_take_ready(&backend.node)[0].result() as i32;
-    let stream = unsafe { Resource::from_raw_fd(stream_fd) };
+    let stream = dst_resource(stream_fd);
 
     backend
       .network_complete_op(2, Op::Listen { fd: stream.clone(), backlog: 1 });
@@ -4889,7 +4900,7 @@ mod tests {
     let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
     backend.network_complete_op(
       3,
-      Op::Send { fd: stream.clone(), msg: send_msg, flags: 0 },
+      Op::Send { fd: stream.clone(), msg: send_msg, flags: SendFlags::EMPTY },
     );
     let ready = dst_take_ready(&backend.node);
     assert_eq!(ready.len(), 1);
@@ -4904,7 +4915,7 @@ mod tests {
       },
     );
     let dgram_fd = dst_take_ready(&backend.node)[0].result() as i32;
-    let dgram = unsafe { Resource::from_raw_fd(dgram_fd) };
+    let dgram = dst_resource(dgram_fd);
 
     backend
       .network_complete_op(5, Op::Listen { fd: dgram.clone(), backlog: 1 });
@@ -4927,8 +4938,10 @@ mod tests {
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].result(), -(libc::EINVAL as isize));
 
-    backend
-      .network_complete_op(7, Op::Recv { fd: stream, msg: recv_msg, flags: 0 });
+    backend.network_complete_op(
+      7,
+      Op::Recv { fd: stream, msg: recv_msg, flags: RecvFlags::EMPTY },
+    );
     let ready = dst_take_ready(&backend.node);
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].result(), -(libc::ENOTCONN as isize));
@@ -5005,15 +5018,15 @@ mod tests {
       SimNode::File { bytes: b"demo-bytes".to_vec(), mode: 0o644 },
     );
 
-    let path = std::ffi::CString::new("/tmp/demo").unwrap();
+    let path = std::ffi::OsString::from("/tmp/demo");
     let mut step_bump = Bump::new();
     backend.push(
       1,
       Op::OpenAt {
         dir_fd: Resource::cwd(),
-        path: NonNull::new(path.as_ptr().cast_mut()).unwrap(),
-        flags: libc::O_RDONLY,
-        mode: 0,
+        path,
+        flags: crate::backend::op::OpenFlags::from_bits(libc::O_RDONLY),
+        mode: crate::backend::op::FileMode::from_bits(0),
       },
       &mut step_bump,
     );
@@ -5041,7 +5054,7 @@ mod tests {
         backend.make_file_handle(b"/tmp/file".to_vec(), libc::O_RDWR),
       ),
     );
-    let file_resource = unsafe { Resource::from_raw_fd(file_fd) };
+    let file_resource = dst_resource(file_fd);
     let file_result = backend.complete_op(Op::Fsync { fd: file_resource });
     assert!(matches!(file_result, OpAction::Complete(0)));
 
@@ -5063,7 +5076,7 @@ mod tests {
         peer: None,
       }),
     );
-    let socket_resource = unsafe { Resource::from_raw_fd(socket_fd) };
+    let socket_resource = dst_resource(socket_fd);
     let socket_result = backend.complete_op(Op::Fsync { fd: socket_resource });
     assert!(matches!(
       socket_result,
@@ -5083,7 +5096,7 @@ mod tests {
     backend.init(8).unwrap();
     dst_test_socket(&backend.node, 91);
 
-    let fd = unsafe { Resource::from_raw_fd(91) };
+    let fd = dst_resource(91);
     backend.push(1, Op::Fsync { fd }, &mut Bump::new());
     backend.flush().unwrap();
     assert!(dst.step());

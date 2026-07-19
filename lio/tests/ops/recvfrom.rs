@@ -212,7 +212,7 @@ fn with_flags() {
   sender.send(&data).expect("peer send failed");
 
   let (sender_recv, receiver_recv) = mpsc::channel();
-  api::recvfrom(&receiver, vec![0u8; 64], Some(0))
+  api::recvfrom(&receiver, vec![0u8; 64], None)
     .with_lio(&mut lio)
     .send_with(sender_recv);
 

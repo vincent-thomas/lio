@@ -57,6 +57,8 @@ typedef struct CompletionFlags CompletionFlags;
  */
 typedef struct Interest Interest;
 
+typedef struct OpenFlags OpenFlags;
+
 typedef struct SockDomain SockDomain;
 
 typedef struct SockProto SockProto;
@@ -69,9 +71,59 @@ typedef struct SockType SockType;
  */
 typedef struct lio_handle_t lio_handle_t;
 
+typedef struct lio_dir_entry_t {
+  uint32_t name_offset;
+  uint16_t name_len;
+  int file_type;
+  int has_ino;
+  uint64_t ino;
+} lio_dir_entry_t;
+
+typedef struct lio_file_stat_t {
+  int file_type;
+  uint64_t size;
+  uint32_t permissions;
+  uint32_t mode;
+  uint64_t nlink;
+  uint32_t uid;
+  uint32_t gid;
+} lio_file_stat_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+/**
+ * Allocate a buffer suitable for lio FFI read/write operations.
+ *
+ * Buffers passed to lio read/write/send/recv functions must come from this
+ * function and must eventually be released with [`lio_buf_free`].
+ */
+uint8_t *lio_buf_alloc(uintptr_t len);
+
+/**
+ * Free a buffer allocated by [`lio_buf_alloc`] or returned by an FFI callback.
+ *
+ * # Safety
+ * `buf` must have been allocated by [`lio_buf_alloc`] with capacity `len` and
+ * must not be used after this call.
+ */
+void lio_buf_free(uint8_t *buf, uintptr_t len);
+
+/**
+ * Free a socket address allocated by lio, such as the address returned by
+ * [`lio_accept`] or [`lio_recvfrom`].
+ *
+ * # Safety
+ * `addr` must be a pointer returned by lio and must not be used after this
+ * call.
+ */
+void lio_sockaddr_free(sockaddr_storage *addr);
+
+/**
+ * Free a directory entry array returned by [`lio_readdir`].
+ */
+void lio_dir_entries_free(struct lio_dir_entry_t *entries, uintptr_t len);
 
 /**
  * Create a new lio driver with the given operation capacity.
@@ -102,6 +154,30 @@ void lio_destroy(struct lio_handle_t *lio);
  * `lio` must be a valid handle.
  */
 int lio_tick(struct lio_handle_t *lio);
+
+/**
+ * Shut down part of a full-duplex connection.
+ */
+void lio_shutdown(struct lio_handle_t *lio, intptr_t fd, int how, void (*callback)(int));
+
+/**
+ * Synchronize a file's in-core state with the storage device.
+ */
+void lio_fsync(struct lio_handle_t *lio, intptr_t fd, void (*callback)(int));
+
+/**
+ * Bind a socket to an address.
+ */
+void lio_bind(struct lio_handle_t *lio,
+              intptr_t fd,
+              const sockaddr *sock,
+              socklen_t sock_len,
+              void (*callback)(int));
+
+/**
+ * Listen for connections on a socket.
+ */
+void lio_listen(struct lio_handle_t *lio, intptr_t fd, int backlog, void (*callback)(int));
 
 /**
  * Write data to `fd` at `offset`.  Pass `offset = -1` for current position.
@@ -206,6 +282,16 @@ void lio_recv(struct lio_handle_t *lio,
               void (*callback)(int, uint8_t*, uintptr_t));
 
 /**
+ * Receive data and sender address from a socket.
+ */
+void lio_recvfrom(struct lio_handle_t *lio,
+                  intptr_t fd,
+                  uint8_t *buf,
+                  uintptr_t buf_len,
+                  int flags,
+                  void (*callback)(int, uint8_t*, uintptr_t, const sockaddr_storage*));
+
+/**
  * Wait for `millis` milliseconds.
  *
  * - `callback(result)`: 0 on success
@@ -214,6 +300,11 @@ void lio_recv(struct lio_handle_t *lio,
  * `lio` must be a valid handle.
  */
 void lio_sleep(struct lio_handle_t *lio, unsigned int millis, void (*callback)(int));
+
+/**
+ * Runs an interval and invokes `callback` for every tick until the lio handle is destroyed.
+ */
+void lio_interval(struct lio_handle_t *lio, unsigned int millis, void (*callback)(int));
 
 /**
  * A no-op that completes immediately.
@@ -386,6 +477,55 @@ void lio_mkdirat(struct lio_handle_t *lio,
                  const char *path,
                  mode_t mode,
                  void (*callback)(int));
+
+/**
+ * Reads metadata for a path relative to a directory file descriptor.
+ */
+void lio_statat(struct lio_handle_t *lio,
+                intptr_t dir_fd,
+                const char *path,
+                int follow_symlinks,
+                void (*callback)(int, struct lio_file_stat_t));
+
+/**
+ * Reads metadata for an open file descriptor.
+ */
+void lio_fstat(struct lio_handle_t *lio,
+               intptr_t fd,
+               void (*callback)(int, struct lio_file_stat_t));
+
+/**
+ * Reads the target of a symbolic link relative to a directory file descriptor.
+ */
+void lio_readlinkat(struct lio_handle_t *lio,
+                    intptr_t dir_fd,
+                    const char *path,
+                    uint8_t *buf,
+                    uintptr_t buf_len,
+                    void (*callback)(int, uint8_t*, uintptr_t));
+
+/**
+ * Reads the current working directory into a caller-provided buffer.
+ */
+void lio_getcwd(struct lio_handle_t *lio,
+                uint8_t *buf,
+                uintptr_t buf_len,
+                void (*callback)(int, uint8_t*, uintptr_t));
+
+/**
+ * Reads one batch of directory entries from an open directory descriptor.
+ */
+void lio_readdir(struct lio_handle_t *lio,
+                 intptr_t fd,
+                 uintptr_t raw_capacity,
+                 uintptr_t entries_capacity,
+                 void (*callback)(int, uint8_t*, uintptr_t, struct lio_dir_entry_t*, uintptr_t, int));
+
+void lio_spawn(struct lio_handle_t *lio,
+               const char *path,
+               const char *const *argv,
+               const char *const *envp,
+               void (*callback)(intptr_t));
 
 #ifdef __cplusplus
 }  // extern "C"

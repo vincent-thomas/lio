@@ -5,7 +5,7 @@
 use std::{
   ffi::{CString, OsStr, OsString},
   io,
-  path::PathBuf,
+  path::{Path, PathBuf},
 };
 
 #[cfg(unix)]
@@ -21,6 +21,8 @@ use crate::api::{
 
 const DEFAULT_READ_DIR_SCRATCH_BYTES: usize = 4096;
 const DEFAULT_READ_DIR_ENTRIES_CAP: usize = 32;
+const DEFAULT_READ_LINK_BYTES: usize = 256;
+const DEFAULT_READ_TO_STRING_BYTES: usize = 64 * 1024;
 const DEFAULT_REMOVE_DIR_ALL_SCRATCH_BYTES: usize = 4096;
 const DEFAULT_REMOVE_DIR_ALL_ENTRIES_CAP: usize = 32;
 
@@ -686,20 +688,200 @@ impl OpModel for RemoveDirAll {
 
 impl OneshotOpModel for RemoveDirAll {}
 
+/// High-level symbolic-link target reader.
+pub struct ReadLink {
+  path: CString,
+  state: ReadLinkState,
+}
+
+enum ReadLinkState {
+  Reading(ops::ReadlinkAt<Vec<u8>>),
+  Done,
+}
+
+impl ReadLink {
+  fn new(path: CString) -> Self {
+    Self {
+      path: path.clone(),
+      state: ReadLinkState::Reading(ops::ReadlinkAt::new(
+        Resource::cwd(),
+        path,
+        vec![0u8; DEFAULT_READ_LINK_BYTES],
+      )),
+    }
+  }
+}
+
+impl OpModel for ReadLink {
+  type Item = io::Result<PathBuf>;
+
+  fn action(&mut self) -> Action {
+    match &mut self.state {
+      ReadLinkState::Reading(op) => op.action(),
+      ReadLinkState::Done => panic!("ReadLink polled after completion"),
+    }
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    match std::mem::replace(&mut self.state, ReadLinkState::Done) {
+      ReadLinkState::Reading(mut op) => match op.complete(completion) {
+        OpResult::Done((Ok(n), buf)) if n as usize == buf.capacity() => {
+          let next_len = buf.capacity().saturating_mul(2).max(1);
+          self.state = ReadLinkState::Reading(ops::ReadlinkAt::new(
+            Resource::cwd(),
+            self.path.clone(),
+            vec![0u8; next_len],
+          ));
+          OpResult::Again
+        }
+        OpResult::Done((Ok(_), buf)) => {
+          OpResult::Done(Ok(PathBuf::from(os_string_from_bytes(&buf))))
+        }
+        OpResult::Done((Err(err), _)) => OpResult::Done(Err(err)),
+        OpResult::Again => {
+          self.state = ReadLinkState::Reading(op);
+          OpResult::Again
+        }
+        OpResult::Yield(_) => unreachable!("readlinkat is a oneshot operation"),
+      },
+      ReadLinkState::Done => panic!("ReadLink completed after terminal state"),
+    }
+  }
+}
+
+impl OneshotOpModel for ReadLink {}
+
+/// High-level UTF-8 file reader.
+pub struct ReadToString {
+  state: ReadToStringState,
+  bytes: Vec<u8>,
+}
+
+enum ReadToStringState {
+  Opening(ops::OpenAt),
+  Reading { fd: Resource, op: ops::Read<Vec<u8>> },
+  Done,
+}
+
+impl ReadToString {
+  fn new(path: CString) -> Self {
+    Self {
+      state: ReadToStringState::Opening(ops::OpenAt::new(
+        Resource::cwd(),
+        path,
+        libc::O_RDONLY,
+        0,
+      )),
+      bytes: Vec::new(),
+    }
+  }
+}
+
+impl OpModel for ReadToString {
+  type Item = io::Result<String>;
+
+  fn action(&mut self) -> Action {
+    match &mut self.state {
+      ReadToStringState::Opening(op) => op.action(),
+      ReadToStringState::Reading { op, .. } => op.action(),
+      ReadToStringState::Done => panic!("ReadToString polled after completion"),
+    }
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    match std::mem::replace(&mut self.state, ReadToStringState::Done) {
+      ReadToStringState::Opening(mut op) => match op.complete(completion) {
+        OpResult::Done(Ok(fd)) => {
+          self.state = ReadToStringState::Reading {
+            fd: fd.clone(),
+            op: ops::Read::new(fd, vec![0u8; DEFAULT_READ_TO_STRING_BYTES], -1),
+          };
+          OpResult::Again
+        }
+        OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
+        OpResult::Again => {
+          self.state = ReadToStringState::Opening(op);
+          OpResult::Again
+        }
+        OpResult::Yield(_) => unreachable!("openat is a oneshot operation"),
+      },
+      ReadToStringState::Reading { fd, mut op } => {
+        match op.complete(completion) {
+          OpResult::Done((Ok(0), _buf)) => {
+            let bytes = std::mem::take(&mut self.bytes);
+            OpResult::Done(
+              String::from_utf8(bytes)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err)),
+            )
+          }
+          OpResult::Done((Ok(n), buf)) => {
+            self.bytes.extend_from_slice(&buf[..n as usize]);
+            self.state = ReadToStringState::Reading {
+              fd: fd.clone(),
+              op: ops::Read::new(fd, buf, -1),
+            };
+            OpResult::Again
+          }
+          OpResult::Done((Err(err), _)) => OpResult::Done(Err(err)),
+          OpResult::Again => {
+            self.state = ReadToStringState::Reading { fd, op };
+            OpResult::Again
+          }
+          OpResult::Yield(_) => unreachable!("read is a oneshot operation"),
+        }
+      }
+      ReadToStringState::Done => {
+        panic!("ReadToString completed after terminal state")
+      }
+    }
+  }
+}
+
+impl OneshotOpModel for ReadToString {}
+
 /// Opens a directory reader relative to the current working directory.
-pub fn read_dir<P: AsRef<std::path::Path>>(path: P) -> Io<OpenReadDir> {
+pub fn read_dir<P: AsRef<Path>>(path: P) -> Io<OpenReadDir> {
   let parent = path.as_ref().to_path_buf();
   let path = path_to_cstring(path.as_ref())
     .expect("lio::fs::read_dir path must not contain interior NUL bytes");
   Io::from_op(OpenReadDir::new(path, parent))
 }
 
-/// Reads metadata for a path relative to the current working directory.
-pub fn metadata(
+/// Reads metadata for a path relative to the current working directory, following symlinks.
+pub fn metadata<P: AsRef<Path>>(path: P) -> Io<ops::Stat> {
+  let path = path_to_cstring(path.as_ref())
+    .expect("lio::fs::metadata path must not contain interior NUL bytes");
+  metadata_cstring(path, true)
+}
+
+/// Reads metadata for a path relative to the current working directory, without following symlinks.
+pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> Io<ops::Stat> {
+  let path = path_to_cstring(path.as_ref()).expect(
+    "lio::fs::symlink_metadata path must not contain interior NUL bytes",
+  );
+  metadata_cstring(path, false)
+}
+
+/// Reads metadata for a C string path relative to the current working directory.
+pub fn metadata_cstring(
   path: std::ffi::CString,
   follow_symlinks: bool,
 ) -> Io<ops::Stat> {
   crate::api::statat(&Resource::cwd(), path, follow_symlinks)
+}
+
+/// Reads the target of a symbolic link relative to the current working directory.
+pub fn read_link<P: AsRef<Path>>(path: P) -> Io<ReadLink> {
+  let path = path_to_cstring(path.as_ref())
+    .expect("lio::fs::read_link path must not contain interior NUL bytes");
+  Io::from_op(ReadLink::new(path))
+}
+
+/// Reads a UTF-8 file into a string relative to the current working directory.
+pub fn read_to_string<P: AsRef<Path>>(path: P) -> Io<ReadToString> {
+  let path = path_to_cstring(path.as_ref())
+    .expect("lio::fs::read_to_string path must not contain interior NUL bytes");
+  Io::from_op(ReadToString::new(path))
 }
 
 /// Creates a directory relative to the current working directory.

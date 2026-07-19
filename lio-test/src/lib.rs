@@ -148,8 +148,7 @@
 /// - missing path returns exact raw `-ENOENT`
 ///
 /// `Op::GetCwd`:
-/// - success returns the exact cwd byte count
-/// - too-small buffer returns exact raw `-ERANGE`
+/// - success returns exact `0` and fills the platform-native cwd output
 ///
 /// `Op::Spawn`:
 /// - success returns a positive child pid
@@ -170,7 +169,7 @@ macro_rules! test_io_backend {
       cell::RefCell,
       collections::HashMap,
       time::{Duration, SystemTime, Instant},
-      env, fs, mem, path::PathBuf, thread,
+      env, ffi::OsString, fs, mem, path::PathBuf, thread,
       os::{
         unix::{ffi::OsStrExt, net::{UnixListener, UnixStream}},
         fd::{FromRawFd, IntoRawFd, RawFd}
@@ -181,7 +180,9 @@ macro_rules! test_io_backend {
     use __lio_test_lio::backend::{
       IoBackend,
       op::{
-        FileStat, LinkKind, MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, RawBuf,
+        FileMode, FileStat, LinkKind, MsgBuf, MsgBufMut, MsgRecv, MsgSend,
+        Op, OpenFlags, RawBuf, ReadFlags, RecvFlags, SendFlags, SpawnSpec,
+        UnlinkKind, WriteFlags,
       },
     };
     use std::ptr::NonNull;
@@ -214,6 +215,22 @@ macro_rules! test_io_backend {
       // SAFETY: the returned `RawBuf` borrows the caller-provided slice, and
       // every test only submits it while that slice remains alive.
       unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) }
+    }
+
+    fn read_flags(bits: i32) -> ReadFlags {
+      ReadFlags::from_bits(bits).expect("read flags must be nonnegative")
+    }
+
+    fn write_flags(bits: i32) -> WriteFlags {
+      WriteFlags::from_bits(bits).expect("write flags must be nonnegative")
+    }
+
+    fn recv_flags(bits: i32) -> RecvFlags {
+      RecvFlags::from_bits(bits).expect("recv flags must be nonnegative")
+    }
+
+    fn send_flags(bits: i32) -> SendFlags {
+      SendFlags::from_bits(bits).expect("send flags must be nonnegative")
     }
 
     #[cfg(unix)]
@@ -300,7 +317,7 @@ macro_rules! test_io_backend {
           iovecs: nonnull(&mut raw_buf),
           iov_count: 1,
           offset: -1,
-          flags: 0,
+          flags: read_flags(0),
         },
       );
       backend.flush().unwrap();
@@ -390,7 +407,7 @@ macro_rules! test_io_backend {
           iovecs: nonnull(&mut raw_buf),
           iov_count: 1,
           offset: -2,
-          flags: 0,
+          flags: read_flags(0),
         },
       );
 
@@ -645,7 +662,7 @@ macro_rules! test_io_backend {
               iovecs: nonnull(&mut raw_buf),
               iov_count: 1,
               offset: -1,
-              flags: 0,
+              flags: read_flags(0),
             },
           );
           backend.flush().unwrap();
@@ -684,7 +701,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
             offset: -1,
-            flags: 0,
+            flags: read_flags(0),
           },
         );
         backend.flush().unwrap();
@@ -725,7 +742,7 @@ macro_rules! test_io_backend {
               iovecs: nonnull(&mut raw_buf),
               iov_count: 1,
               offset: -1,
-              flags: 0,
+              flags: read_flags(0),
             },
           );
           backend.flush().unwrap();
@@ -764,7 +781,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
             offset: -1,
-            flags: 0,
+            flags: read_flags(0),
           },
         );
         backend.flush().unwrap();
@@ -832,7 +849,7 @@ macro_rules! test_io_backend {
               iovecs: nonnull(bufs.as_mut_ptr()),
               iov_count: bufs.len(),
               offset: -1,
-              flags: 0,
+              flags: read_flags(0),
             },
           );
           backend.flush().unwrap();
@@ -871,7 +888,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
             offset: -1,
-            flags: 0,
+            flags: read_flags(0),
           },
         );
         backend.flush().unwrap();
@@ -896,7 +913,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
             offset: -1,
-            flags: 0,
+            flags: read_flags(0),
           },
         );
         backend.flush().unwrap();
@@ -921,7 +938,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
             offset: -2,
-            flags: 0,
+            flags: read_flags(0),
           },
         );
         backend.flush().unwrap();
@@ -947,7 +964,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
             offset: -1,
-            flags: i32::MIN,
+            flags: read_flags(1 << 30),
           },
         );
         backend.flush().unwrap();
@@ -990,7 +1007,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull_const(&raw_buf),
               iov_count: 1,
               offset: -1,
-              flags: 0,
+              flags: write_flags(0),
             },
           );
           backend.flush().unwrap();
@@ -1052,7 +1069,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull_const(bufs.as_ptr()),
               iov_count: bufs.len(),
               offset: -1,
-              flags: 0,
+              flags: write_flags(0),
             },
           );
           backend.flush().unwrap();
@@ -1101,7 +1118,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull_const(&raw_buf),
             iov_count: 1,
             offset: -1,
-            flags: 0,
+            flags: write_flags(0),
           },
         );
         backend.flush().unwrap();
@@ -1128,7 +1145,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull_const(&raw_buf),
             iov_count: 1,
             offset: -2,
-            flags: 0,
+            flags: write_flags(0),
           },
         );
         backend.flush().unwrap();
@@ -1155,7 +1172,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull_const(&raw_buf),
             iov_count: 1,
             offset: -1,
-            flags: i32::MIN,
+            flags: write_flags(1 << 30),
           },
         );
         backend.flush().unwrap();
@@ -1192,7 +1209,7 @@ macro_rules! test_io_backend {
             Op::Recv {
               fd: read_res.clone(),
               msg: MsgRecv::new(&bufs),
-              flags: 0,
+              flags: recv_flags(0),
             },
           );
           backend.flush().unwrap();
@@ -1223,7 +1240,7 @@ macro_rules! test_io_backend {
           Op::Recv {
             fd: read_res.clone(),
             msg: MsgRecv::new(&bufs),
-            flags: 0,
+            flags: recv_flags(0),
           },
         );
         backend.flush().unwrap();
@@ -1256,7 +1273,7 @@ macro_rules! test_io_backend {
             Op::Recv {
               fd: read_res.clone(),
               msg: MsgRecv::new(&bufs),
-              flags: 0,
+              flags: recv_flags(0),
             },
           );
           backend.flush().unwrap();
@@ -1288,7 +1305,7 @@ macro_rules! test_io_backend {
           Op::Recv {
             fd: read_res.clone(),
             msg: MsgRecv::new(&bufs),
-            flags: 0,
+            flags: recv_flags(0),
           },
         );
         backend.flush().unwrap();
@@ -1341,7 +1358,7 @@ macro_rules! test_io_backend {
             Op::Recv {
               fd: read_res.clone(),
               msg: MsgRecv::new(&bufs),
-              flags: 0,
+              flags: recv_flags(0),
             },
           );
           backend.flush().unwrap();
@@ -1373,7 +1390,7 @@ macro_rules! test_io_backend {
           Op::Recv {
             fd: read_res.clone(),
             msg: MsgRecv::new(&bufs),
-            flags: 0,
+            flags: recv_flags(0),
           },
         );
         backend.flush().unwrap();
@@ -1396,7 +1413,7 @@ macro_rules! test_io_backend {
           Op::Recv {
             fd: invalid_fd_resource(),
             msg: MsgRecv::new(&bufs),
-            flags: 0,
+            flags: recv_flags(0),
           },
         );
         backend.flush().unwrap();
@@ -1428,7 +1445,7 @@ macro_rules! test_io_backend {
             Op::Send {
               fd: write_res.clone(),
               msg: MsgSend::new(&bufs, None),
-              flags: 0,
+              flags: send_flags(0),
             },
           );
           backend.flush().unwrap();
@@ -1481,7 +1498,7 @@ macro_rules! test_io_backend {
             Op::Send {
               fd: write_res.clone(),
               msg: MsgSend::new(&bufs, None),
-              flags: 0,
+              flags: send_flags(0),
             },
           );
           backend.flush().unwrap();
@@ -1524,7 +1541,7 @@ macro_rules! test_io_backend {
           Op::Send {
             fd: invalid_fd_resource(),
             msg: MsgSend::new(&bufs, None),
-            flags: 0,
+            flags: send_flags(0),
           },
         );
         backend.flush().unwrap();
@@ -1868,9 +1885,9 @@ macro_rules! test_io_backend {
           80,
           Op::OpenAt {
             dir_fd: Resource::cwd(),
-            path: nonnull_const(c_path.as_ptr()),
-            flags: libc::O_RDONLY,
-            mode: 0,
+            path: path.as_os_str().to_os_string(),
+            flags: OpenFlags::from_bits(libc::O_RDONLY),
+            mode: FileMode::from_bits(0),
           },
         );
         backend.flush().unwrap();
@@ -1903,9 +1920,9 @@ macro_rules! test_io_backend {
           81,
           Op::OpenAt {
             dir_fd: Resource::cwd(),
-            path: nonnull_const(c_path.as_ptr()),
-            flags: libc::O_RDONLY,
-            mode: 0,
+            path: path.as_os_str().to_os_string(),
+            flags: OpenFlags::from_bits(libc::O_RDONLY),
+            mode: FileMode::from_bits(0),
           },
         );
         backend.flush().unwrap();
@@ -1935,7 +1952,7 @@ macro_rules! test_io_backend {
           Op::Stat {
             target: __lio_test_lio::backend::op::StatTarget::Path {
               dir_fd: Resource::cwd(),
-              path: nonnull_const(c_path.as_ptr()),
+              path: path.as_os_str().to_os_string(),
               follow_symlinks: true,
             },
             out: nonnull(&mut out),
@@ -1965,7 +1982,7 @@ macro_rules! test_io_backend {
           Op::Stat {
             target: __lio_test_lio::backend::op::StatTarget::Path {
               dir_fd: Resource::cwd(),
-              path: nonnull_const(c_path.as_ptr()),
+              path: path.as_os_str().to_os_string(),
               follow_symlinks: true,
             },
             out: nonnull(&mut out),
@@ -1995,7 +2012,7 @@ macro_rules! test_io_backend {
           Op::Stat {
             target: __lio_test_lio::backend::op::StatTarget::Path {
               dir_fd: Resource::cwd(),
-              path: nonnull_const(c_path.as_ptr()),
+              path: link.as_os_str().to_os_string(),
               follow_symlinks: false,
             },
             out: nonnull(&mut out),
@@ -2111,8 +2128,8 @@ macro_rules! test_io_backend {
           70,
           Op::UnlinkAt {
             dir_fd: Resource::cwd(),
-            path: nonnull_const(c_path.as_ptr()),
-            flags: 0,
+            path: path.as_os_str().to_os_string(),
+            kind: UnlinkKind::File,
           },
         );
         backend.flush().unwrap();
@@ -2135,8 +2152,8 @@ macro_rules! test_io_backend {
           71,
           Op::UnlinkAt {
             dir_fd: Resource::cwd(),
-            path: nonnull_const(c_path.as_ptr()),
-            flags: 0,
+            path: path.as_os_str().to_os_string(),
+            kind: UnlinkKind::File,
           },
         );
         backend.flush().unwrap();
@@ -2168,9 +2185,9 @@ macro_rules! test_io_backend {
           72,
           Op::RenameAt {
             old_dir_fd: Resource::cwd(),
-            old_path: nonnull_const(c_source.as_ptr()),
+            old_path: source.as_os_str().to_os_string(),
             new_dir_fd: Resource::cwd(),
-            new_path: nonnull_const(c_dest.as_ptr()),
+            new_path: dest.as_os_str().to_os_string(),
           },
         );
         backend.flush().unwrap();
@@ -2199,9 +2216,9 @@ macro_rules! test_io_backend {
           73,
           Op::RenameAt {
             old_dir_fd: Resource::cwd(),
-            old_path: nonnull_const(c_source.as_ptr()),
+            old_path: source.as_os_str().to_os_string(),
             new_dir_fd: Resource::cwd(),
-            new_path: nonnull_const(c_dest.as_ptr()),
+            new_path: dest.as_os_str().to_os_string(),
           },
         );
         backend.flush().unwrap();
@@ -2229,8 +2246,8 @@ macro_rules! test_io_backend {
           74,
           Op::MkdirAt {
             dir_fd: Resource::cwd(),
-            path: nonnull_const(c_path.as_ptr()),
-            mode: 0o755,
+            path: path.as_os_str().to_os_string(),
+            mode: FileMode::from_bits(0o755),
           },
         );
         backend.flush().unwrap();
@@ -2255,8 +2272,8 @@ macro_rules! test_io_backend {
           75,
           Op::MkdirAt {
             dir_fd: Resource::cwd(),
-            path: nonnull_const(c_path.as_ptr()),
-            mode: 0o755,
+            path: path.as_os_str().to_os_string(),
+            mode: FileMode::from_bits(0o755),
           },
         );
         backend.flush().unwrap();
@@ -2290,9 +2307,9 @@ macro_rules! test_io_backend {
           Op::LinkAt {
             kind: LinkKind::Hard,
             source_dir_fd: Resource::cwd(),
-            source_path: nonnull_const(c_source.as_ptr()),
+            source_path: source.as_os_str().to_os_string(),
             new_dir_fd: Resource::cwd(),
-            new_path: nonnull_const(c_dest.as_ptr()),
+            new_path: dest.as_os_str().to_os_string(),
           },
         );
         backend.flush().unwrap();
@@ -2323,9 +2340,9 @@ macro_rules! test_io_backend {
           Op::LinkAt {
             kind: LinkKind::Soft,
             source_dir_fd: Resource::cwd(),
-            source_path: nonnull_const(c_source.as_ptr()),
+            source_path: source.as_os_str().to_os_string(),
             new_dir_fd: Resource::cwd(),
-            new_path: nonnull_const(c_dest.as_ptr()),
+            new_path: dest.as_os_str().to_os_string(),
           },
         );
         backend.flush().unwrap();
@@ -2358,9 +2375,9 @@ macro_rules! test_io_backend {
           Op::LinkAt {
             kind: LinkKind::Hard,
             source_dir_fd: Resource::cwd(),
-            source_path: nonnull_const(c_source.as_ptr()),
+            source_path: source.as_os_str().to_os_string(),
             new_dir_fd: Resource::cwd(),
-            new_path: nonnull_const(c_dest.as_ptr()),
+            new_path: dest.as_os_str().to_os_string(),
           },
         );
         backend.flush().unwrap();
@@ -2391,7 +2408,7 @@ macro_rules! test_io_backend {
           79,
           Op::ReadlinkAt {
             dir_fd: Resource::cwd(),
-            path: nonnull_const(c_link.as_ptr()),
+            path: link.as_os_str().to_os_string(),
             buf: nonnull(buf.as_mut_ptr()),
             buf_len: buf.len(),
           },
@@ -2423,7 +2440,7 @@ macro_rules! test_io_backend {
           80,
           Op::ReadlinkAt {
             dir_fd: Resource::cwd(),
-            path: nonnull_const(c_link.as_ptr()),
+            path: link.as_os_str().to_os_string(),
             buf: nonnull(buf.as_mut_ptr()),
             buf_len: buf.len(),
           },
@@ -2444,42 +2461,31 @@ macro_rules! test_io_backend {
         let mut backend = new_backend();
         backend.init(64).unwrap();
 
-        let expected = std::env::current_dir().unwrap();
-        let expected = expected.as_os_str().as_bytes();
-        let mut buf = [0_u8; 512];
+        let expected = std::env::current_dir().unwrap().into_os_string();
+        let mut out = OsString::new();
 
-        push_op(&mut backend,
-          81,
-          Op::GetCwd {
-            buf: nonnull(buf.as_mut_ptr()),
-            buf_len: buf.len(),
-          },
-        );
+        push_op(&mut backend, 81, Op::GetCwd { out: nonnull(&mut out) });
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 81, expected.len() as isize);
-        assert_eq!(&buf[..expected.len()], expected);
+        assert_exact_result(&completed, 81, 0);
+        assert_eq!(out, expected);
       }
 
       #[test]
-      fn small_buffer_reports_erange() {
+      fn replaces_existing_output() {
         let mut backend = new_backend();
         backend.init(64).unwrap();
 
-        let mut buf = [0_u8; 1];
+        let expected = std::env::current_dir().unwrap().into_os_string();
+        let mut out = OsString::from("stale");
 
-        push_op(&mut backend,
-          82,
-          Op::GetCwd {
-            buf: nonnull(buf.as_mut_ptr()),
-            buf_len: buf.len(),
-          },
-        );
+        push_op(&mut backend, 82, Op::GetCwd { out: nonnull(&mut out) });
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 82, -(libc::ERANGE as isize));
+        assert_exact_result(&completed, 82, 0);
+        assert_eq!(out, expected);
       }
     }
 
@@ -2492,25 +2498,18 @@ macro_rules! test_io_backend {
         let mut backend = new_backend();
         backend.init(64).unwrap();
 
-        let path = std::ffi::CString::new("/bin/sh").unwrap();
-        let argv = [
-          std::ffi::CString::new("sh").unwrap(),
-          std::ffi::CString::new("-c").unwrap(),
-          std::ffi::CString::new("exit 0").unwrap(),
-        ];
-        let mut argv_ptrs = [
-          argv[0].as_ptr().cast_mut(),
-          argv[1].as_ptr().cast_mut(),
-          argv[2].as_ptr().cast_mut(),
-          std::ptr::null_mut(),
-        ];
-
         push_op(&mut backend,
           83,
           Op::Spawn {
-            path: nonnull_const(path.as_ptr()),
-            argv: nonnull(argv_ptrs.as_mut_ptr()),
-            envp: None,
+            spec: SpawnSpec {
+              program: OsString::from("/bin/sh"),
+              args: vec![
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from("exit 0"),
+              ],
+              env: None,
+            },
           },
         );
         backend.flush().unwrap();
@@ -2530,17 +2529,14 @@ macro_rules! test_io_backend {
         let mut backend = new_backend();
         backend.init(64).unwrap();
 
-        let path = std::ffi::CString::new("/definitely/missing/spawn-binary").unwrap();
-        let argv = [std::ffi::CString::new("spawn-binary").unwrap()];
-        let mut argv_ptrs =
-          [argv[0].as_ptr().cast_mut(), std::ptr::null_mut()];
-
         push_op(&mut backend,
           84,
           Op::Spawn {
-            path: nonnull_const(path.as_ptr()),
-            argv: nonnull(argv_ptrs.as_mut_ptr()),
-            envp: None,
+            spec: SpawnSpec {
+              program: OsString::from("/definitely/missing/spawn-binary"),
+              args: vec![OsString::from("spawn-binary")],
+              env: None,
+            },
           },
         );
         backend.flush().unwrap();
@@ -2579,7 +2575,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
             offset: -1,
-            flags: 0,
+            flags: read_flags(0),
           },
         );
         backend.flush().unwrap();
@@ -2705,7 +2701,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_a),
             iov_count: 1,
             offset: -1,
-            flags: 0,
+            flags: read_flags(0),
           },
         );
         push_op(&mut backend,
@@ -2715,7 +2711,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_b),
             iov_count: 1,
             offset: -1,
-            flags: 0,
+            flags: read_flags(0),
           },
         );
         backend.flush().unwrap();

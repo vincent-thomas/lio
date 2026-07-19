@@ -1076,12 +1076,25 @@ impl SedCommand {
   }
 
   pub fn parse_plan(&self) -> io::Result<SedRunPlan> {
+    self.parse_plan_with_reader(|path| fs::read_to_string(path))
+  }
+
+  fn parse_plan_with_ctx(&self, ctx: &AppContext) -> io::Result<SedRunPlan> {
+    self.parse_plan_with_reader(|path| {
+      io_util::read_to_string(ctx.lio(), Some(path))
+    })
+  }
+
+  fn parse_plan_with_reader(
+    &self,
+    mut read_script: impl FnMut(&str) -> io::Result<String>,
+  ) -> io::Result<SedRunPlan> {
     let mut sources = Vec::with_capacity(self.scripts.len());
     for source in &self.scripts {
       match source {
         SedScriptSource::Expression(text) => sources.push(text.to_string()),
         SedScriptSource::File(path) => {
-          sources.push(fs::read_to_string(path.as_str())?)
+          sources.push(read_script(&path.as_str())?)
         }
       }
     }
@@ -1100,7 +1113,7 @@ impl SedCommand {
   ) -> io::Result<Vec<u8>> {
     let inputs = load_runtime_inputs(ctx, &plan.files)?;
     let program = SedCompiledProgram::compile(&plan.script)?;
-    SedRuntime::default().run_program(&program, &inputs, plan.quiet)
+    SedRuntime::default().run_program(ctx, &program, &inputs, plan.quiet)
   }
 }
 
@@ -1219,6 +1232,7 @@ impl SedCompiler {
 impl SedRuntime {
   fn run_program(
     mut self,
+    ctx: &AppContext,
     program: &SedCompiledProgram,
     inputs: &[SedRuntimeInput],
     quiet: bool,
@@ -1252,6 +1266,7 @@ impl SedRuntime {
         }
 
         let flow = self.execute_statement(
+          ctx,
           statement,
           &mut cycle,
           &mut output,
@@ -1429,6 +1444,7 @@ impl SedRuntime {
   #[allow(clippy::too_many_arguments)]
   fn execute_statement(
     &mut self,
+    ctx: &AppContext,
     statement: &SedCompiledStatement,
     cycle: &mut SedCycleState,
     output: &mut String,
@@ -1443,6 +1459,7 @@ impl SedRuntime {
       SedCompiledOp::Statement(kind) => match kind {
         SedStatementKind::Substitute(substitute) => {
           let changed = apply_substitute(
+            ctx,
             &mut cycle.pattern_space,
             substitute,
             self.resolve_regex(&SedRegex {
@@ -1549,7 +1566,9 @@ impl SedRuntime {
           Ok(SedFlow::Quit)
         }
         SedStatementKind::ReadFile { path } => {
-          cycle.append_queue.push(fs::read_to_string(path.as_str())?);
+          cycle
+            .append_queue
+            .push(io_util::read_to_string(ctx.lio(), Some(&path.as_str()))?);
           Ok(SedFlow::Continue)
         }
         SedStatementKind::ReadLineFromFile { path } => {
@@ -1557,8 +1576,9 @@ impl SedRuntime {
             self.read_line_states.insert(
               *pc,
               SedQueuedLines {
-                lines: split_preserving_lines(&fs::read_to_string(
-                  path.as_str(),
+                lines: split_preserving_lines(&io_util::read_to_string(
+                  ctx.lio(),
+                  Some(&path.as_str()),
                 )?),
                 offset: 0,
               },
@@ -1575,11 +1595,11 @@ impl SedRuntime {
           Ok(SedFlow::Continue)
         }
         SedStatementKind::WriteFile { path } => {
-          append_to_path(path, &cycle.pattern_space)?;
+          append_to_path(ctx, path, &cycle.pattern_space)?;
           Ok(SedFlow::Continue)
         }
         SedStatementKind::WriteFirstLine { path } => {
-          append_to_path(path, first_line(&cycle.pattern_space))?;
+          append_to_path(ctx, path, first_line(&cycle.pattern_space))?;
           Ok(SedFlow::Continue)
         }
         SedStatementKind::PrintCurrentFile => {
@@ -1730,7 +1750,7 @@ fn load_runtime_inputs(
     let content = if file == "-" {
       io_util::read_to_string_fd(ctx.lio(), &ctx.stdin())?
     } else {
-      fs::read_to_string(&file)?
+      io_util::read_to_string(ctx.lio(), Some(&file))?
     };
     for line in split_preserving_lines(&content) {
       inputs.push(SedRuntimeInput {
@@ -1872,6 +1892,7 @@ fn transliterate_pattern(
 }
 
 fn apply_substitute(
+  ctx: &AppContext,
   pattern: &mut String,
   substitute: &SedSubstitute,
   resolved_regex: SedRegex,
@@ -1917,7 +1938,7 @@ fn apply_substitute(
       // Print flag is handled by execution caller via changed status if needed later.
     }
     if let Some(path) = &substitute.flags.write {
-      append_to_path(path, pattern)?;
+      append_to_path(ctx, path, pattern)?;
     }
     Ok(changed)
   } else {
@@ -2038,13 +2059,24 @@ fn render_replacement(replacement: &str, caps: &regex::Captures<'_>) -> String {
   out
 }
 
-fn append_to_path(path: &SedPath, contents: &str) -> io::Result<()> {
-  use std::io::Write;
-  let mut file = std::fs::OpenOptions::new()
-    .create(true)
-    .append(true)
-    .open(path.as_str())?;
-  file.write_all(contents.as_bytes())
+fn append_to_path(
+  ctx: &AppContext,
+  path: &SedPath,
+  contents: &str,
+) -> io::Result<()> {
+  let cpath = std::ffi::CString::new(path.as_str())?;
+  let fd = io_util::run(
+    ctx.lio(),
+    lio::api::openat(
+      &ctx.cwd(),
+      cpath,
+      libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+      0o666,
+    )
+    .with_lio(ctx.lio())
+    .send(),
+  )?;
+  io_util::write_all(ctx.lio(), &fd, contents.as_bytes().to_vec())
 }
 
 fn execute_shell_command(
@@ -2078,7 +2110,7 @@ impl Command for SedCommand {
   }
 
   fn execute(&self, ctx: &AppContext) -> io::Result<()> {
-    let plan = self.parse_plan()?;
+    let plan = self.parse_plan_with_ctx(ctx)?;
     let output = self.execute_plan(ctx, &plan)?;
     io_util::write_all(ctx.lio(), &ctx.stdout(), output)
   }
@@ -2124,7 +2156,10 @@ mod tests {
     let script = SedScript::parse(script).unwrap();
     let program = SedCompiledProgram::compile(&script).unwrap();
     let inputs = build_runtime_inputs(input);
-    SedRuntime::default().run_program(&program, &inputs, quiet).unwrap_err()
+    let ctx = AppContext::new().unwrap();
+    SedRuntime::default()
+      .run_program(&ctx, &program, &inputs, quiet)
+      .unwrap_err()
   }
 
   fn run_program_on_inputs(
@@ -2132,8 +2167,9 @@ mod tests {
     inputs: &[SedRuntimeInput],
     quiet: bool,
   ) -> String {
+    let ctx = AppContext::new().unwrap();
     String::from_utf8(
-      SedRuntime::default().run_program(program, inputs, quiet).unwrap(),
+      SedRuntime::default().run_program(&ctx, program, inputs, quiet).unwrap(),
     )
     .unwrap()
   }
@@ -2358,7 +2394,9 @@ mod tests {
       SedScript::parse(&format!("N\nW {}", out_path.display())).unwrap();
     let program = SedCompiledProgram::compile(&script).unwrap();
     let inputs = build_runtime_inputs("one\ntwo\n");
-    let _ = SedRuntime::default().run_program(&program, &inputs, true).unwrap();
+    let ctx = AppContext::new().unwrap();
+    let _ =
+      SedRuntime::default().run_program(&ctx, &program, &inputs, true).unwrap();
     let written = fs::read_to_string(&out_path).unwrap();
     let _ = fs::remove_file(&out_path);
     assert_eq!(written, "one\n");

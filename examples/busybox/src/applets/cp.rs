@@ -298,7 +298,7 @@ fn should_skip_copy(
 }
 
 fn copy_regular_file(
-  _ctx: &AppContext,
+  ctx: &AppContext,
   source: &Path,
   dest: &Path,
   command: &CpCommand,
@@ -311,12 +311,58 @@ fn copy_regular_file(
     return Ok(());
   }
   maybe_remove_existing(dest, command)?;
-  fs::copy(source, dest)?;
+  copy_file_lio(ctx, source, dest, mode)?;
   if command.preserve {
     fs::set_permissions(dest, fs::Permissions::from_mode(mode & 0o7777))?;
     preserve_file_times(dest, atime, mtime, false)?;
   }
-  write_verbose(_ctx, command.verbose, source, dest)
+  write_verbose(ctx, command.verbose, source, dest)
+}
+
+fn copy_file_lio(
+  ctx: &AppContext,
+  source: &Path,
+  dest: &Path,
+  mode: u32,
+) -> io::Result<()> {
+  let source_fd = io_util::run(
+    ctx.lio(),
+    lio::api::openat(
+      &ctx.cwd(),
+      fs_util::path_to_cstring(source)?,
+      libc::O_RDONLY,
+      0,
+    )
+    .with_lio(ctx.lio())
+    .send(),
+  )?;
+  let dest_fd = io_util::run(
+    ctx.lio(),
+    lio::api::openat(
+      &ctx.cwd(),
+      fs_util::path_to_cstring(dest)?,
+      libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+      mode & 0o7777,
+    )
+    .with_lio(ctx.lio())
+    .send(),
+  )?;
+
+  let mut buf = vec![0u8; 64 * 1024];
+  loop {
+    let (read_result, returned_buf) = io_util::run(
+      ctx.lio(),
+      lio::api::read(&source_fd, buf).with_lio(ctx.lio()).send(),
+    );
+    buf = returned_buf;
+    let n = read_result? as usize;
+    if n == 0 {
+      break;
+    }
+    io_util::write_all(ctx.lio(), &dest_fd, buf[..n].to_vec())?;
+  }
+
+  Ok(())
 }
 
 fn copy_symlink(

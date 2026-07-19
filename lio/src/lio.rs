@@ -16,21 +16,8 @@ use std::{
 use bumpalo::Bump;
 
 /// Result code returned to userspace when a sleep timer fires.
-/// Matches the expected error codes in TypedOp::extract_result for Sleep.
-#[cfg(target_os = "linux")]
-const SLEEP_RESULT: isize = -(libc::ETIME as isize);
-#[cfg(any(
-  target_os = "macos",
-  target_os = "freebsd",
-  target_os = "dragonfly"
-))]
-const SLEEP_RESULT: isize = -(libc::ETIMEDOUT as isize);
-#[cfg(not(any(
-  target_os = "linux",
-  target_os = "macos",
-  target_os = "freebsd",
-  target_os = "dragonfly"
-)))]
+/// Always `0` — the driver normalizes timer expiry before routing
+/// to models, so models never need to interpret OS-specific errno values.
 const SLEEP_RESULT: isize = 0;
 
 thread_local! {

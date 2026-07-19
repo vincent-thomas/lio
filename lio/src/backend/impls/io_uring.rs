@@ -90,7 +90,7 @@ impl NativeMsgState {
       iovecs: [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
         crate::buf::MAX_IOV_COUNT],
       iov_count: bufs.len(),
-      addr: msg.to.map(crate::backend::op::socket_addr_to_storage),
+      addr: msg.to.map(crate::backend::impls::sockaddr::socket_addr_to_storage),
       from_out: None,
       // SAFETY: `libc::msghdr` is a plain C struct and zero is a valid
       // sentinel initialization before we fill its pointer fields.
@@ -241,7 +241,7 @@ impl NativeSocketState {
   fn from_connect(
     addr: &crate::backend::op::SocketAddrBuf,
   ) -> io::Result<Self> {
-    let (storage, len) = crate::backend::op::socket_addr_buf_to_storage(addr)?;
+    let (storage, len) = crate::backend::impls::sockaddr::socket_addr_buf_to_storage(addr)?;
     Ok(Self { storage, len, kind: NativeSocketKind::Connect })
   }
 }
@@ -329,7 +329,7 @@ impl LoweredState {
         let NativeSocketKind::Accept { out } = state.kind else {
           return;
         };
-        if let Ok(addr) = crate::backend::op::socket_addr_buf_from_storage(
+        if let Ok(addr) = crate::backend::impls::sockaddr::socket_addr_buf_from_storage(
           &state.storage,
           state.len,
         ) {
@@ -345,7 +345,7 @@ impl LoweredState {
         if let (Some(out), Some((storage, len))) =
           (state.from_out, state.addr.as_ref())
           && let Ok(addr) =
-            crate::backend::op::socket_addr_buf_from_storage(storage, *len)
+            crate::backend::impls::sockaddr::socket_addr_buf_from_storage(storage, *len)
         {
           unsafe {
             *out.as_ptr() = addr;
@@ -676,7 +676,7 @@ impl IoUring {
         const ALL_KNOWN_FLAGS: i32 =
           RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
 
-        if flags & !ALL_KNOWN_FLAGS != 0 {
+        if flags.bits() & !ALL_KNOWN_FLAGS != 0 {
           return Some(-(libc::ENOTSUP as isize));
         }
 
@@ -694,14 +694,14 @@ impl IoUring {
         const ALL_KNOWN_FLAGS: i32 =
           RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
 
-        if flags & !ALL_KNOWN_FLAGS != 0 {
+        if flags.bits() & !ALL_KNOWN_FLAGS != 0 {
           return Some(-(libc::ENOTSUP as isize));
         }
 
         None
       }
       Op::Connect { addr, .. } => {
-        crate::backend::op::socket_addr_buf_to_storage(addr)
+        crate::backend::impls::sockaddr::socket_addr_buf_to_storage(addr)
           .err()
           .and_then(|err| err.raw_os_error())
           .map(|errno| -(errno as isize))
@@ -720,12 +720,16 @@ impl IoUring {
       Op::Nop => Nop::new().build(),
       Op::OpenAt { dir_fd, path, flags, mode } => {
         OpenAt::new(dir_fd.as_raw_fd(), path.as_ptr())
-          .flags(*flags)
-          .mode(*mode as libc::mode_t)
+          .flags(flags.bits())
+          .mode(mode.bits() as libc::mode_t)
           .build()
       }
-      Op::UnlinkAt { dir_fd, path, flags } => {
-        UnlinkAt::new(dir_fd.as_raw_fd(), path.as_ptr()).flags(*flags).build()
+      Op::UnlinkAt { dir_fd, path, kind } => {
+        let flags = match kind {
+          crate::backend::op::UnlinkKind::File => 0,
+          crate::backend::op::UnlinkKind::Directory => libc::AT_REMOVEDIR,
+        };
+        UnlinkAt::new(dir_fd.as_raw_fd(), path.as_ptr()).flags(flags).build()
       }
       Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
         RenameAt::new(
@@ -738,7 +742,7 @@ impl IoUring {
       }
       Op::MkdirAt { dir_fd, path, mode } => {
         MkDirAt::new(dir_fd.as_raw_fd(), path.as_ptr())
-          .mode(*mode as libc::mode_t)
+          .mode(mode.bits() as libc::mode_t)
           .build()
       }
       Op::LinkAt { kind, source_dir_fd, source_path, new_dir_fd, new_path } => {
@@ -790,7 +794,14 @@ impl IoUring {
       Op::Listen { fd, backlog } => {
         Listen::new(fd.as_raw_fd(), *backlog).build()
       }
-      Op::Shutdown { fd, how } => Shutdown::new(fd.as_raw_fd(), *how).build(),
+      Op::Shutdown { fd, how } => {
+        let how = match how {
+          crate::backend::op::ShutdownHow::Read => libc::SHUT_RD,
+          crate::backend::op::ShutdownHow::Write => libc::SHUT_WR,
+          crate::backend::op::ShutdownHow::Both => libc::SHUT_RDWR,
+        };
+        Shutdown::new(fd.as_raw_fd(), how).build()
+      }
       Op::Fsync { fd } => Fsync::new(fd.as_raw_fd()).build(),
       Op::Read { .. }
       | Op::Write { .. }
@@ -808,7 +819,7 @@ impl IoUring {
       Op::Read { fd, iov_count, offset, flags, .. } => {
         Readv::new(fd.as_raw_fd(), native_rw.iovecs.as_ptr(), *iov_count as u32)
           .offset(Self::io_offset(*offset))
-          .rw_flags(*flags)
+          .rw_flags(flags.bits())
           .build()
       }
       Op::Write { fd, iov_count, offset, flags, .. } => Writev::new(
@@ -817,7 +828,7 @@ impl IoUring {
         *iov_count as u32,
       )
       .offset(Self::io_offset(*offset))
-      .rw_flags(*flags)
+      .rw_flags(flags.bits())
       .build(),
       _ => unreachable!("rw entry requires read/write op"),
     }
@@ -829,11 +840,11 @@ impl IoUring {
         fd.as_raw_fd(),
         (&native_msg.hdr as *const libc::msghdr).cast_mut(),
       )
-      .flags(*flags as u32)
+      .flags(flags.bits() as u32)
       .build(),
       Op::Send { fd, flags, .. } => {
         SendMsg::new(fd.as_raw_fd(), &native_msg.hdr)
-          .flags(*flags as u32)
+          .flags(flags.bits() as u32)
           .build()
       }
       _ => unreachable!("msg entry requires recv/send op"),
@@ -929,20 +940,14 @@ impl IoUring {
           Ok(result as isize)
         })
       }
-      Op::GetCwd { buf, buf_len } => {
-        // SAFETY: `buf` is caller-provided writable storage of length
-        // `buf_len`, valid for this synchronous libc call.
-        let result = unsafe {
-          libc::getcwd(buf.as_ptr().cast::<libc::c_char>(), *buf_len)
-        };
-        Some(if result.is_null() {
-          Err(io::Error::last_os_error())
-        } else {
-          // SAFETY: `getcwd` returned a valid NUL-terminated pointer into
-          // `buf`, so `strlen` may read until the first terminator.
-          Ok(unsafe { libc::strlen(result) as isize })
-        })
-      }
+      Op::GetCwd { out } => Some(match std::env::current_dir() {
+        Ok(cwd) => {
+          // SAFETY: `out` points to operation-owned output storage.
+          unsafe { out.as_ptr().write(cwd.into_os_string()) };
+          Ok(0)
+        }
+        Err(err) => Err(err),
+      }),
       Op::ReadDir {
         fd,
         raw_buf,
@@ -989,27 +994,72 @@ impl IoUring {
         )
       }
       #[cfg(unix)]
-      Op::Spawn { path, argv, envp } => {
+      Op::Spawn { spec } => {
+        use std::os::unix::ffi::OsStrExt;
+
         unsafe extern "C" {
           static mut environ: *mut *mut libc::c_char;
         }
-        let mut pid: libc::pid_t = 0;
-        let envp = if let Some(envp) = envp {
-          envp.as_ptr().cast_const()
-        } else {
-          // SAFETY: `environ` is the process-global environment pointer
-          // provided by libc and is valid to read here.
-          unsafe { environ as *const *mut libc::c_char }
+
+        let path = match std::ffi::CString::new(spec.program.as_bytes()) {
+          Ok(path) => path,
+          Err(_) => {
+            return Some(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+          }
         };
-        // SAFETY: all pointers are passed directly from validated op inputs and
-        // remain valid for this synchronous `posix_spawn` call.
+        let argv = match spec
+          .args
+          .iter()
+          .map(|arg| std::ffi::CString::new(arg.as_bytes()))
+          .collect::<Result<Vec<_>, _>>()
+        {
+          Ok(argv) => argv,
+          Err(_) => {
+            return Some(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+          }
+        };
+        let mut argv_ptrs: Vec<*mut libc::c_char> = argv
+          .iter()
+          .map(|arg| arg.as_ptr().cast_mut())
+          .chain(std::iter::once(std::ptr::null_mut()))
+          .collect();
+        let env = match spec.env.as_ref().map(|env| {
+          env
+            .iter()
+            .map(|var| std::ffi::CString::new(var.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+        }) {
+          Some(Ok(env)) => Some(env),
+          Some(Err(_)) => {
+            return Some(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+          }
+          None => None,
+        };
+        let mut env_ptrs = env.as_ref().map(|env| {
+          env
+            .iter()
+            .map(|var| var.as_ptr().cast_mut())
+            .chain(std::iter::once(std::ptr::null_mut()))
+            .collect::<Vec<_>>()
+        });
+
+        let mut pid: libc::pid_t = 0;
+        let envp = env_ptrs
+          .as_mut()
+          .map(|vars| vars.as_mut_ptr().cast_const())
+          .unwrap_or_else(|| {
+            // SAFETY: `environ` is the process-global environment pointer
+            // provided by libc and is valid to read here.
+            unsafe { environ as *const *mut libc::c_char }
+          });
+        // SAFETY: native C strings and pointer arrays remain alive for this call.
         let result = unsafe {
           libc::posix_spawn(
             &mut pid,
             path.as_ptr(),
             std::ptr::null(),
             std::ptr::null(),
-            argv.as_ptr().cast_const(),
+            argv_ptrs.as_mut_ptr().cast_const(),
             envp,
           )
         };

@@ -16,7 +16,7 @@ use lio::{
   api::resource::Resource,
   backend::{
     ds::{DSBackend, DSConfig, DSNetworkFaults, last_ds_trace_snapshot},
-    op::{FileStat, LinkKind, SockDomain, SockProto, SockType},
+    op::{FileStat, LinkKind, ShutdownHow, SockDomain, SockProto, SockType},
   },
 };
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -85,8 +85,8 @@ enum ScriptOp {
   BindOn { res: Resource, addr: SocketAddr },
   Listen { backlog: i32 },
   ListenOn { res: Resource, backlog: i32 },
-  Shutdown { how: i32 },
-  ShutdownOn { res: Resource, how: i32 },
+  Shutdown { how: ShutdownHow },
+  ShutdownOn { res: Resource, how: ShutdownHow },
   OpenAt { path: CString, flags: i32, mode: u32 },
   StatAt { path: CString, follow_symlinks: bool },
   ReadlinkAt { path: CString, len: usize },
@@ -283,7 +283,7 @@ fn build_script(
       7 => ScriptOp::Bind { addr: random_addr(rng) },
       8 => ScriptOp::Listen { backlog: 1 + rng.range_usize(32) as i32 },
       9 => ScriptOp::Shutdown {
-        how: [libc::SHUT_RD, libc::SHUT_WR, libc::SHUT_RDWR]
+        how: [ShutdownHow::Read, ShutdownHow::Write, ShutdownHow::Both]
           [rng.range_usize(3)],
       },
       10 => ScriptOp::OpenAt {
@@ -633,7 +633,7 @@ fn maybe_schedule_followups(
       },
       _ => ScriptOp::ShutdownOn {
         res: resource.clone(),
-        how: [libc::SHUT_RD, libc::SHUT_WR, libc::SHUT_RDWR]
+        how: [ShutdownHow::Read, ShutdownHow::Write, ShutdownHow::Both]
           [rng.range_usize(3)],
       },
     };
