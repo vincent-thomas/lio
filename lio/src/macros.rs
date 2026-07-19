@@ -98,6 +98,7 @@ macro_rules! doc_op {
     ) => {
         #[doc = $short]
         #[doc = concat!("\n\nEquivalent to the [`", $syscall, "`](", $url, ") syscall.\n")]
+        #[inline]
         $($rest)*
     };
 
@@ -110,6 +111,7 @@ macro_rules! doc_op {
     ) => {
         #[doc = $short]
         #[doc = concat!("\n\nEquivalent to the `", $syscall, "` syscall.\n")]
+        #[inline]
         $($rest)*
     };
 
@@ -120,6 +122,7 @@ macro_rules! doc_op {
         $($rest:tt)*
     ) => {
         #[doc = $short]
+        #[inline]
         $($rest)*
     };
 

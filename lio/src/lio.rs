@@ -228,6 +228,7 @@ impl Lio {
   }
 
   /// Schedule a registration built inside the store slot's persistent bump arena.
+  #[inline]
   pub(crate) fn schedule_with(
     &self,
     init: impl FnOnce(&mut Bump) -> Registration,
