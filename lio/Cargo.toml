@@ -50,3 +50,7 @@ cbindgen = { version = "0.29", default-features = false, optional = true }
 pastey = { version = "0.1" }
 proptest = { version = "1.4", default-features = false, features = ["std"] }
 lio-test = { path = "../lio-test" }
+
+[[bench]]
+name = "bookkeeping"
+harness = false
