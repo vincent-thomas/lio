@@ -262,6 +262,7 @@ enum State {
 
 impl Registration {
   /// Create a waker-based registration with payload storage in a bump arena.
+  #[inline]
   pub fn new_waker_in<T>(
     arena: &mut Bump,
     waker: Waker,
@@ -280,6 +281,7 @@ impl Registration {
   }
 
   /// Create a callback registration with payload storage in a bump arena.
+  #[inline]
   pub fn new_callback_in<T, F>(
     arena: &mut Bump,
     callback: F,
