@@ -304,9 +304,7 @@ impl Clock {
     self.current_tick += 1;
 
     let slot0 = (self.current_tick & LEVEL_MASK) as usize;
-    let mut entries = self.level0.take_slot(slot0);
-    self.process_entries(&mut entries);
-    self.level0.restore_slot(slot0, entries);
+    self.expire_level0_slot(slot0);
 
     if slot0 == 0 {
       let slot1 =
@@ -330,6 +328,36 @@ impl Clock {
           self.level3.restore_slot(slot3, entries);
         }
       }
+    }
+  }
+
+  fn expire_level0_slot(&mut self, slot: usize) {
+    let mut expired_count = 0;
+    let current_tick = self.current_tick;
+    let entries = &mut self.level0.slots[slot];
+    let timers = &mut self.timers;
+    let pending_fire = &mut self.pending_fire;
+
+    for entry in entries.drain(..) {
+      let slot_index = entry.id as u32 as usize;
+      let Some(timer) = timers.get_mut(slot_index) else {
+        continue;
+      };
+      if timer.id != entry.id
+        || timer.entry.pending_index != ACTIVE_TIMER
+        || timer.entry.deadline_ticks != entry.deadline_ticks
+      {
+        continue;
+      }
+
+      debug_assert!(entry.deadline_ticks <= current_tick);
+      timer.entry.pending_index = pending_fire.len();
+      expired_count += 1;
+      pending_fire.push(PendingTimer { id: entry.id });
+    }
+
+    if expired_count != 0 {
+      self.decrement_active_deadline_by(current_tick, expired_count);
     }
   }
 
@@ -531,6 +559,17 @@ mod tests {
 
     clock.advance_by(1);
     assert_eq!(collect_expired(&mut clock), vec![1]);
+  }
+
+  #[test]
+  fn timers_expire_across_level0_boundary() {
+    let mut clock = Clock::new();
+    clock.schedule(1, Duration::from_millis(255));
+    clock.schedule(2, Duration::from_millis(256));
+    clock.schedule(3, Duration::from_millis(257));
+
+    clock.advance_by(257);
+    assert_eq!(collect_expired(&mut clock), vec![1, 2, 3]);
   }
 
   #[test]
