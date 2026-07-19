@@ -1150,7 +1150,8 @@ impl Poller {
         }
       }
       Op::Bind { fd, addr } => {
-        let storage = crate::api::ops::std_socketaddr_into_libc(*addr);
+        let storage =
+          crate::backend::impls::sockaddr::std_socketaddr_into_libc(*addr);
         let len = match addr {
           SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>(),
           SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>(),

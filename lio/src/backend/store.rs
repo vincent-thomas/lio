@@ -9,6 +9,7 @@ use std::mem::MaybeUninit;
 
 use bumpalo::Bump;
 
+use crate::api::op::Action;
 use crate::registration::Registration;
 use crate::slab::{SlabKey, SlotPool};
 
@@ -28,15 +29,18 @@ pub(crate) struct OpStore {
   slots: SlotPool<StoreSlot>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct StoreAtCapacity;
 
+#[cfg(test)]
 impl std::fmt::Display for StoreAtCapacity {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.write_str("StoreAtCapacity")
   }
 }
 
+#[cfg(test)]
 impl std::error::Error for StoreAtCapacity {}
 
 impl OpStore {
@@ -58,6 +62,7 @@ impl OpStore {
   }
 
   /// Inserts an operation built using the slot's model-lifetime bump arena.
+  #[cfg(test)]
   pub fn insert_with(
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
@@ -66,6 +71,7 @@ impl OpStore {
   }
 
   /// Inserts an operation built using the slot's model-lifetime bump arena.
+  #[cfg(test)]
   pub fn try_insert_with(
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
@@ -74,10 +80,24 @@ impl OpStore {
       return Err(StoreAtCapacity);
     };
 
-    slot.model_bump.reset();
-    slot.step_bump.reset();
+    // Fresh slots are empty, and reused slots were reset by `remove`.
     slot.registration.write(init(&mut slot.model_bump));
     Ok(key.as_u64())
+  }
+
+  /// Inserts an operation and returns everything needed for its initial dispatch.
+  ///
+  /// Keeping the just-allocated slot borrowed avoids looking it up again by its
+  /// generational ID. Fresh slots are empty, and reused slots were reset by
+  /// `remove`, so initial dispatch does not need another arena reset.
+  pub fn insert_with_action(
+    &mut self,
+    init: impl FnOnce(&mut Bump) -> Registration,
+  ) -> (u64, Option<Action>, &mut Bump) {
+    let (key, slot) = self.slots.allocate().expect("at capacity");
+    let registration = slot.registration.write(init(&mut slot.model_bump));
+    let action = registration.action();
+    (key.as_u64(), action, &mut slot.step_bump)
   }
 
   /// Removes an operation from the store.

@@ -6,12 +6,13 @@
 
 use std::ffi::{CString, OsString};
 use std::io;
+use std::mem;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::RawHandle;
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
 use std::time::Duration;
 
 use crate::{

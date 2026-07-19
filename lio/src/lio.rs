@@ -237,17 +237,19 @@ impl Lio {
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> io::Result<u64> {
     let mut inner = self.inner.borrow_mut();
-    let id = inner.store.insert_with(init);
-    let action =
-      inner.store.get_mut(id).and_then(Registration::action).ok_or_else(
-        || {
-          io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "OpModel returned no action on first call",
-          )
-        },
-      )?;
-    Self::dispatch_action(&mut inner, id, action);
+    let inner = &mut *inner;
+    let (store, io, time) = (&mut inner.store, &mut inner.io, &mut inner.time);
+    let (id, action, step_bump) = store.insert_with_action(init);
+    let action = action.ok_or_else(|| {
+      io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "OpModel returned no action on first call",
+      )
+    })?;
+    match action {
+      Action::Io(op) => io.push(id, op, step_bump),
+      Action::Sleep(duration) => time.schedule(id, duration),
+    }
     Ok(id)
   }
 
