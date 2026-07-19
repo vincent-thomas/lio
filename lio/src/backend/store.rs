@@ -90,6 +90,7 @@ impl OpStore {
   /// Keeping the just-allocated slot borrowed avoids looking it up again by its
   /// generational ID. Fresh slots are empty, and reused slots were reset by
   /// `remove`, so initial dispatch does not need another arena reset.
+  #[inline]
   pub fn insert_with_action(
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
@@ -101,6 +102,7 @@ impl OpStore {
   }
 
   /// Removes an operation from the store.
+  #[inline]
   pub fn remove(&mut self, id: u64) -> bool {
     let key = SlabKey::from_u64(id);
     self
@@ -115,6 +117,7 @@ impl OpStore {
   }
 
   /// Gets mutable access to an operation's registration.
+  #[inline]
   pub fn get_mut(&mut self, id: u64) -> Option<&mut Registration> {
     let key = SlabKey::from_u64(id);
     let slot = self.slots.get_mut(key)?;
@@ -123,6 +126,7 @@ impl OpStore {
   }
 
   /// Gets mutable access to an operation's per-step lowering arena.
+  #[inline]
   pub fn step_bump_mut(&mut self, id: u64) -> Option<&mut Bump> {
     let key = SlabKey::from_u64(id);
     let slot = self.slots.get_mut(key)?;

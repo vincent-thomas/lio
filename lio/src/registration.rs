@@ -9,18 +9,22 @@ use crate::api::op::{Action, Completion, OpModel, OpResult};
 /// Result of processing a completion.
 pub(crate) struct ProcessResult {
   pub(crate) next_action: Option<Action>,
-  pub(crate) done: bool,
 }
 
 impl ProcessResult {
   #[inline]
   fn continue_with(action: Action) -> Self {
-    Self { next_action: Some(action), done: false }
+    Self { next_action: Some(action) }
   }
 
   #[inline]
   fn done() -> Self {
-    Self { next_action: None, done: true }
+    Self { next_action: None }
+  }
+
+  #[inline]
+  pub(crate) fn is_done(&self) -> bool {
+    self.next_action.is_none()
   }
 }
 
@@ -250,7 +254,9 @@ enum State {
   Waker { waker: Option<Waker>, handler: WakerResultHandler },
   /// Callback-based operation (calls user callback with typed results).
   Callback(OpCallback),
-  /// Finished.
+  /// Finished state used by standalone registration tests. Driver-owned
+  /// terminal registrations are removed immediately.
+  #[cfg(test)]
   Done,
 }
 
@@ -291,10 +297,12 @@ impl Registration {
   /// Get the initial action to perform.
   ///
   /// This should be called once when the registration is first created.
+  #[inline]
   pub fn action(&mut self) -> Option<Action> {
     match &mut self.state {
       State::Waker { handler, .. } => Some(handler.action()),
       State::Callback(cb) => Some(cb.action()),
+      #[cfg(test)]
       State::Done => None,
     }
   }
@@ -305,6 +313,7 @@ impl Registration {
       State::Waker { waker: w, .. } => {
         *w = Some(waker);
       }
+      #[cfg(test)]
       State::Done => {
         waker.wake(); // Already done
       }
@@ -315,8 +324,28 @@ impl Registration {
   /// Called when an operation completes.
   ///
   /// Returns Some(action) if the model should continue, None otherwise.
+  #[cfg(test)]
   pub fn on_completion(&mut self, completion: Completion) -> ProcessResult {
-    let result = match &mut self.state {
+    let result = self.process_completion(completion);
+    if result.is_done() {
+      self.state = State::Done;
+    }
+    result
+  }
+
+  /// Processes a driver-owned completion without materializing the terminal
+  /// state, because the driver immediately removes terminal registrations.
+  #[inline]
+  pub(crate) fn on_driver_completion(
+    &mut self,
+    completion: Completion,
+  ) -> ProcessResult {
+    self.process_completion(completion)
+  }
+
+  #[inline]
+  fn process_completion(&mut self, completion: Completion) -> ProcessResult {
+    match &mut self.state {
       State::Waker { waker, handler } => {
         let result = handler.on_completion(completion);
 
@@ -327,14 +356,9 @@ impl Registration {
         result
       }
       State::Callback(cb) => cb.on_completion(completion),
+      #[cfg(test)]
       State::Done => ProcessResult::done(),
-    };
-
-    if result.done {
-      self.state = State::Done;
     }
-
-    result
   }
 
   #[cfg(test)]
