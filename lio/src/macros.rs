@@ -171,17 +171,8 @@ macro_rules! syscall {
         res as isize
       }
       else {
-        // Return negative errno - this will cause early return from function
-        //
-        #[cfg(target_os = "linux")]
-        // SAFETY: This exists on the platform in cfg.
-        let err = unsafe { *libc::__errno_location() };
-        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-        // SAFETY: This exists on the platform in cfg.
-        let err = unsafe { *libc::__error() };
-        #[cfg(windows)]
-        // SAFETY: This exists on the platform in cfg.
-        let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        // Return negative errno - this will cause early return from function.
+        let err = $crate::platform::errno::last_os_error_code();
 
         -(err as isize)
       }

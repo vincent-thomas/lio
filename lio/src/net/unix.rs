@@ -61,6 +61,7 @@ use std::path::Path;
 use crate::api::{
   self,
   io::Io,
+  ShutdownHow,
   ops::{Accept, Recv, Shutdown},
   resource::{AsResource, FromResource, IntoResource, Resource},
 };
@@ -316,7 +317,7 @@ impl UnixStream {
   }
 
   /// Shuts down the read, write, or both halves of this connection.
-  pub fn shutdown(&self, how: i32) -> Io<Shutdown> {
+  pub fn shutdown(&self, how: ShutdownHow) -> Io<Shutdown> {
     api::shutdown(&self.socket, how)
   }
 }

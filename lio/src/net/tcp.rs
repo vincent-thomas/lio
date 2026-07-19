@@ -2,6 +2,7 @@ use std::{io, net::SocketAddr};
 
 use crate::{
   api::{
+    ShutdownHow,
     io::Io,
     ops::{self, Recv, Shutdown},
     resource::{AsResource, FromResource, IntoResource, Resource},
@@ -89,13 +90,13 @@ impl TcpListener {
   /// Accepts a new incoming connection from this listener.
   ///
   /// This function will await until a new TCP connection is established. When a connection
-  /// is established, the corresponding [`TcpSocket`] and the remote peer's address will be
+  /// is established, the corresponding [`TcpStream`] and the remote peer's address will be
   /// returned.
   ///
   /// # Returns
   ///
   /// A tuple containing:
-  /// - A [`TcpSocket`] representing the accepted client connection
+  /// - A [`TcpStream`] representing the accepted client connection
   /// - The [`SocketAddr`] of the connected client
   ///
   /// # Examples
@@ -128,11 +129,11 @@ impl TcpListener {
 
 /// A TCP socket connection.
 ///
-/// `TcpSocket` represents an established TCP connection between a local and a remote socket.
+/// `TcpStream` represents an established TCP connection between a local and a remote socket.
 /// It can be created by connecting to a remote address or by accepting a connection from a
 /// [`TcpListener`].
 ///
-/// `TcpSocket` provides methods for reading and writing data over the connection, as well
+/// `TcpStream` provides methods for reading and writing data over the connection, as well
 /// as shutting down the connection gracefully.
 ///
 /// # Examples
@@ -141,12 +142,12 @@ impl TcpListener {
 ///
 /// ```rust,no_run
 /// use std::net::SocketAddr;
-/// use lio::net::TcpSocket;
+/// use lio::net::TcpStream;
 ///
 /// async fn example() -> std::io::Result<()> {
 ///     // Connect to a server
 ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-///     let socket = TcpSocket::connect(addr).await?;
+///     let socket = TcpStream::connect(addr).await?;
 ///
 ///     // Send data
 ///     let data = b"Hello, server!".to_vec();
@@ -244,12 +245,12 @@ impl TcpStream {
   /// # Examples
   ///
   /// ```rust,no_run
-  /// use lio::net::TcpSocket;
+  /// use lio::net::TcpStream;
   /// use std::net::SocketAddr;
   ///
   /// async fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-  ///     let socket = TcpSocket::connect(addr).await?;
+  ///     let socket = TcpStream::connect(addr).await?;
   ///
   ///     let buffer = vec![0u8; 1024];
   ///     let (result, buffer) = socket.recv(buffer).await;
@@ -283,12 +284,12 @@ impl TcpStream {
   /// # Examples
   ///
   /// ```rust,no_run
-  /// use lio::net::TcpSocket;
+  /// use lio::net::TcpStream;
   /// use std::net::SocketAddr;
   ///
   /// async fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-  ///     let socket = TcpSocket::connect(addr).await?;
+  ///     let socket = TcpStream::connect(addr).await?;
   ///
   ///     let data = b"Hello, server!".to_vec();
   ///     let (result, data) = socket.send(data).await;
@@ -322,12 +323,12 @@ impl TcpStream {
   /// # Examples
   ///
   /// ```rust,no_run
-  /// use lio::net::TcpSocket;
+  /// use lio::net::TcpStream;
   /// use std::net::SocketAddr;
   ///
   /// async fn example() -> std::io::Result<()> {
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-  ///     let socket = TcpSocket::connect(addr).await?;
+  ///     let socket = TcpStream::connect(addr).await?;
   ///
   ///     // Send request
   ///     let data = b"GET / HTTP/1.1\r\n\r\n".to_vec();
@@ -345,7 +346,7 @@ impl TcpStream {
   ///     Ok(())
   /// }
   /// ```
-  pub fn shutdown(&self, how: i32) -> Io<Shutdown> {
+  pub fn shutdown(&self, how: ShutdownHow) -> Io<Shutdown> {
     self.0.shutdown(how)
   }
 }

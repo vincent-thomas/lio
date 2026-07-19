@@ -389,14 +389,14 @@ impl Poller {
   fn lower_socket_addr(
     addr: &crate::backend::op::SocketAddrBuf,
   ) -> io::Result<(libc::sockaddr_storage, libc::socklen_t)> {
-    crate::backend::op::socket_addr_buf_to_storage(addr)
+    crate::backend::impls::sockaddr::socket_addr_buf_to_storage(addr)
   }
 
   fn raise_socket_addr(
     storage: &libc::sockaddr_storage,
     len: libc::socklen_t,
   ) -> io::Result<crate::backend::op::SocketAddrBuf> {
-    crate::backend::op::socket_addr_buf_from_storage(storage, len)
+    crate::backend::impls::sockaddr::socket_addr_buf_from_storage(storage, len)
   }
 
   fn lower_raw_iovecs(
@@ -466,7 +466,7 @@ impl Poller {
       dst.iov_len = src.len;
     }
 
-    let addr = msg.to.map(crate::backend::op::socket_addr_to_storage);
+    let addr = msg.to.map(crate::backend::impls::sockaddr::socket_addr_to_storage);
     let hdr = libc::msghdr {
       msg_name: std::ptr::null_mut(),
       msg_namelen: 0,
@@ -531,6 +531,15 @@ impl Poller {
   #[inline]
   fn sys(&self) -> &sys::OsPoller {
     self.sys.as_ref().expect("Poller not initialized")
+  }
+
+  #[cfg(unix)]
+  fn os_path_to_cstring(
+    path: &std::ffi::OsString,
+  ) -> Result<std::ffi::CString, isize> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+      .map_err(|_| -(libc::EINVAL as isize))
   }
 
   /// Perform vectored read, choosing the appropriate syscall based on offset and flags
@@ -733,7 +742,7 @@ impl Poller {
         const ALL_KNOWN_FLAGS: i32 =
           RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
 
-        if flags & !ALL_KNOWN_FLAGS != 0 {
+        if flags.bits() & !ALL_KNOWN_FLAGS != 0 {
           return Some(-(libc::ENOTSUP as isize));
         }
 
@@ -751,7 +760,7 @@ impl Poller {
         const ALL_KNOWN_FLAGS: i32 =
           RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
 
-        if flags & !ALL_KNOWN_FLAGS != 0 {
+        if flags.bits() & !ALL_KNOWN_FLAGS != 0 {
           return Some(-(libc::ENOTSUP as isize));
         }
 
@@ -777,7 +786,7 @@ impl Poller {
           native_iovecs.as_ptr(),
           *iov_count,
           *offset,
-          *flags,
+          flags.bits(),
         )
       }
 
@@ -791,7 +800,7 @@ impl Poller {
           native_iovecs.as_ptr(),
           *iov_count,
           *offset,
-          *flags,
+          flags.bits(),
         )
       }
 
@@ -807,7 +816,7 @@ impl Poller {
           hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
           hdr.msg_namelen = *len;
         }
-        let result = syscall!(raw recvmsg(fd, &mut hdr, *flags));
+        let result = syscall!(raw recvmsg(fd, &mut hdr, flags.bits()));
         if result >= 0
           && let (Some(out), Some((storage, len))) = (msg.from, addr.as_ref())
           && let Ok(addr) = Self::raise_socket_addr(storage, *len)
@@ -831,7 +840,7 @@ impl Poller {
           hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
           hdr.msg_namelen = *len;
         }
-        let result = syscall!(raw sendmsg(fd, &mut hdr, *flags));
+        let result = syscall!(raw sendmsg(fd, &mut hdr, flags.bits()));
         if result == 0 && hdr.msg_iovlen > 0 {
           Self::debug_sendmsg_zero(fd, &hdr);
         }
@@ -887,12 +896,17 @@ impl Poller {
         }
       }
 
-      Op::OpenAt { dir_fd, path, flags, mode } => syscall!(raw openat(
-        dir_fd.as_raw_fd(),
-        path.as_ptr(),
-        *flags,
-        *mode,
-      )),
+      Op::OpenAt { dir_fd, path, flags, mode } => {
+        let Ok(path) = Self::os_path_to_cstring(path) else {
+          return -(libc::EINVAL as isize);
+        };
+        syscall!(raw openat(
+          dir_fd.as_raw_fd(),
+          path.as_ptr(),
+          flags.bits(),
+          mode.bits(),
+        ))
+      }
       Op::Stat { target, out } => {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         let result = match target {
@@ -903,6 +917,9 @@ impl Poller {
           } => {
             let flags =
               if *follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+            let Ok(path) = Self::os_path_to_cstring(path) else {
+              return -(libc::EINVAL as isize);
+            };
             syscall!(raw fstatat(
               dir_fd.as_raw_fd(),
               path.as_ptr(),
@@ -962,12 +979,23 @@ impl Poller {
           Err(err) => -(err.raw_os_error().unwrap_or(libc::EINVAL) as isize),
         }
       }
-      Op::UnlinkAt { dir_fd, path, flags } => syscall!(raw unlinkat(
-        dir_fd.as_raw_fd(),
-        path.as_ptr(),
-        *flags,
-      )),
+      Op::UnlinkAt { dir_fd, path, kind } => {
+        let Ok(path) = Self::os_path_to_cstring(path) else {
+          return -(libc::EINVAL as isize);
+        };
+        let flags = match kind {
+          crate::backend::op::UnlinkKind::File => 0,
+          crate::backend::op::UnlinkKind::Directory => libc::AT_REMOVEDIR,
+        };
+        syscall!(raw unlinkat(dir_fd.as_raw_fd(), path.as_ptr(), flags))
+      }
       Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
+        let Ok(old_path) = Self::os_path_to_cstring(old_path) else {
+          return -(libc::EINVAL as isize);
+        };
+        let Ok(new_path) = Self::os_path_to_cstring(new_path) else {
+          return -(libc::EINVAL as isize);
+        };
         syscall!(raw renameat(
           old_dir_fd.as_raw_fd(),
           old_path.as_ptr(),
@@ -976,68 +1004,126 @@ impl Poller {
         ))
       }
       Op::MkdirAt { dir_fd, path, mode } => {
+        let Ok(path) = Self::os_path_to_cstring(path) else {
+          return -(libc::EINVAL as isize);
+        };
         syscall!(raw mkdirat(
           dir_fd.as_raw_fd(),
           path.as_ptr(),
-          *mode as libc::mode_t,
+          mode.bits() as libc::mode_t,
         ))
       }
       Op::LinkAt { kind, source_dir_fd, source_path, new_dir_fd, new_path } => {
         match kind {
-          crate::backend::op::LinkKind::Hard => syscall!(raw linkat(
-            source_dir_fd.as_raw_fd(),
-            source_path.as_ptr(),
-            new_dir_fd.as_raw_fd(),
-            new_path.as_ptr(),
-            0,
-          )),
-          crate::backend::op::LinkKind::Soft => syscall!(raw symlinkat(
-            source_path.as_ptr(),
-            new_dir_fd.as_raw_fd(),
-            new_path.as_ptr(),
-          )),
+          crate::backend::op::LinkKind::Hard => {
+            let Ok(source_path) = Self::os_path_to_cstring(source_path) else {
+              return -(libc::EINVAL as isize);
+            };
+            let Ok(new_path) = Self::os_path_to_cstring(new_path) else {
+              return -(libc::EINVAL as isize);
+            };
+            syscall!(raw linkat(
+              source_dir_fd.as_raw_fd(),
+              source_path.as_ptr(),
+              new_dir_fd.as_raw_fd(),
+              new_path.as_ptr(),
+              0,
+            ))
+          }
+          crate::backend::op::LinkKind::Soft => {
+            let Ok(source_path) = Self::os_path_to_cstring(source_path) else {
+              return -(libc::EINVAL as isize);
+            };
+            let Ok(new_path) = Self::os_path_to_cstring(new_path) else {
+              return -(libc::EINVAL as isize);
+            };
+            syscall!(raw symlinkat(
+              source_path.as_ptr(),
+              new_dir_fd.as_raw_fd(),
+              new_path.as_ptr(),
+            ))
+          }
         }
       }
-      Op::ReadlinkAt { dir_fd, path, buf, buf_len } => syscall!(raw readlinkat(
-        dir_fd.as_raw_fd(),
-        path.as_ptr(),
-        buf.as_ptr().cast::<libc::c_char>(),
-        *buf_len,
-      )),
-      Op::GetCwd { buf, buf_len } => {
-        // SAFETY: `buf` points to a writable caller-provided buffer.
-        let result = unsafe {
-          libc::getcwd(buf.as_ptr().cast::<libc::c_char>(), *buf_len)
+      Op::ReadlinkAt { dir_fd, path, buf, buf_len } => {
+        let Ok(path) = Self::os_path_to_cstring(path) else {
+          return -(libc::EINVAL as isize);
         };
-        if result.is_null() {
-          -(std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EINVAL) as isize)
-        } else {
-          // SAFETY: successful `getcwd` returns a NUL-terminated string.
-          unsafe { libc::strlen(result) as isize }
-        }
+        syscall!(raw readlinkat(
+          dir_fd.as_raw_fd(),
+          path.as_ptr(),
+          buf.as_ptr().cast::<libc::c_char>(),
+          *buf_len,
+        ))
       }
+      Op::GetCwd { out } => match std::env::current_dir() {
+        Ok(cwd) => {
+          // SAFETY: `out` points to operation-owned output storage.
+          unsafe { out.as_ptr().write(cwd.into_os_string()) };
+          0
+        }
+        Err(err) => -(err.raw_os_error().unwrap_or(libc::EINVAL) as isize),
+      },
       #[cfg(unix)]
-      Op::Spawn { path, argv, envp } => {
+      Op::Spawn { spec } => {
+        use std::os::unix::ffi::OsStrExt;
+
         unsafe extern "C" {
           static mut environ: *mut *mut libc::c_char;
         }
-        let mut pid: libc::pid_t = 0;
-        let envp = if let Some(envp) = envp {
-          envp.as_ptr().cast_const()
-        } else {
-          // SAFETY: `environ` is the process-global environment vector.
-          unsafe { environ as *const *mut libc::c_char }
+
+        let path = match std::ffi::CString::new(spec.program.as_bytes()) {
+          Ok(path) => path,
+          Err(_) => return -(libc::EINVAL as isize),
         };
-        // SAFETY: all pointers passed to `posix_spawn` remain valid for the call.
+        let argv = match spec
+          .args
+          .iter()
+          .map(|arg| std::ffi::CString::new(arg.as_bytes()))
+          .collect::<Result<Vec<_>, _>>()
+        {
+          Ok(argv) => argv,
+          Err(_) => return -(libc::EINVAL as isize),
+        };
+        let mut argv_ptrs: Vec<*mut libc::c_char> = argv
+          .iter()
+          .map(|arg| arg.as_ptr().cast_mut())
+          .chain(std::iter::once(std::ptr::null_mut()))
+          .collect();
+        let env = match spec.env.as_ref().map(|env| {
+          env
+            .iter()
+            .map(|var| std::ffi::CString::new(var.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+        }) {
+          Some(Ok(env)) => Some(env),
+          Some(Err(_)) => return -(libc::EINVAL as isize),
+          None => None,
+        };
+        let mut env_ptrs = env.as_ref().map(|env| {
+          env
+            .iter()
+            .map(|var| var.as_ptr().cast_mut())
+            .chain(std::iter::once(std::ptr::null_mut()))
+            .collect::<Vec<_>>()
+        });
+
+        let mut pid: libc::pid_t = 0;
+        let envp = env_ptrs
+          .as_mut()
+          .map(|vars| vars.as_mut_ptr().cast_const())
+          .unwrap_or_else(|| {
+            // SAFETY: `environ` is the process-global environment vector.
+            unsafe { environ as *const *mut libc::c_char }
+          });
+        // SAFETY: native C strings and pointer arrays remain alive for this call.
         let result = unsafe {
           libc::posix_spawn(
             &mut pid,
             path.as_ptr(),
             std::ptr::null(),
             std::ptr::null(),
-            argv.as_ptr().cast_const(),
+            argv_ptrs.as_mut_ptr().cast_const(),
             envp,
           )
         };
@@ -1079,7 +1165,12 @@ impl Poller {
         syscall!(raw listen(fd.as_raw_fd(), *backlog))
       }
       Op::Shutdown { fd, how } => {
-        syscall!(raw shutdown(fd.as_raw_fd(), *how))
+        let how = match how {
+          crate::backend::op::ShutdownHow::Read => libc::SHUT_RD,
+          crate::backend::op::ShutdownHow::Write => libc::SHUT_WR,
+          crate::backend::op::ShutdownHow::Both => libc::SHUT_RDWR,
+        };
+        syscall!(raw shutdown(fd.as_raw_fd(), how))
       }
       Op::Fsync { fd } => {
         syscall!(raw fsync(fd.as_raw_fd()))

@@ -88,6 +88,8 @@ pub mod impls {
   mod iocp;
   #[cfg(windows)]
   pub use iocp::*;
+
+  pub(crate) mod sockaddr;
 }
 
 pub(crate) mod store;

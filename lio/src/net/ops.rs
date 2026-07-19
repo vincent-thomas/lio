@@ -75,13 +75,17 @@ impl OpModel for SocketAccept {
 ///
 /// You typically won't create this directly; it's returned by [`Socket::new()`](crate::net::Socket::new).
 pub struct SocketNew {
-  domain: i32,
-  ty: i32,
-  proto: i32,
+  domain: SockDomain,
+  ty: SockType,
+  proto: SockProto,
 }
 
 impl SocketNew {
-  pub(crate) fn new(domain: i32, ty: i32, proto: i32) -> Self {
+  pub(crate) fn new(
+    domain: SockDomain,
+    ty: SockType,
+    proto: SockProto,
+  ) -> Self {
     Self { domain, ty, proto }
   }
 }
@@ -91,12 +95,9 @@ impl OpModel for SocketNew {
 
   fn action(&mut self) -> Action {
     Action::Io(crate::backend::op::Op::Socket {
-      domain: SockDomain::from_raw(self.domain)
-        .expect("SocketNew must be constructed with a valid socket domain"),
-      ty: SockType::from_raw(self.ty)
-        .expect("SocketNew must be constructed with a valid socket type"),
-      proto: SockProto::from_raw(self.proto)
-        .expect("SocketNew must be constructed with a valid socket protocol"),
+      domain: self.domain,
+      ty: self.ty,
+      proto: self.proto,
     })
   }
 
