@@ -32,15 +32,15 @@ impl<const SIZE: usize> Wheel<SIZE> {
   }
 
   fn insert(&mut self, slot: usize, entry: WheelEntry) {
-    self.slots[slot % SIZE].push(entry);
+    self.slots[slot].push(entry);
   }
 
   fn take_slot(&mut self, slot: usize) -> Vec<WheelEntry> {
-    std::mem::take(&mut self.slots[slot % SIZE])
+    std::mem::take(&mut self.slots[slot])
   }
 
   fn restore_slot(&mut self, slot: usize, entries: Vec<WheelEntry>) {
-    let slot = &mut self.slots[slot % SIZE];
+    let slot = &mut self.slots[slot];
     if slot.is_empty() {
       *slot = entries;
     }
@@ -304,25 +304,27 @@ impl Clock {
     self.current_tick += 1;
 
     let slot0 = (self.current_tick & LEVEL_MASK) as usize;
-    let slot1 = ((self.current_tick >> LEVEL_BITS) & LEVEL_MASK) as usize;
-    let slot2 = ((self.current_tick >> (LEVEL_BITS * 2)) & LEVEL_MASK) as usize;
-    let slot3 = ((self.current_tick >> (LEVEL_BITS * 3)) & LEVEL_MASK) as usize;
-
     let mut entries = self.level0.take_slot(slot0);
     self.process_entries(&mut entries);
     self.level0.restore_slot(slot0, entries);
 
     if slot0 == 0 {
+      let slot1 =
+        ((self.current_tick >> LEVEL_BITS) & LEVEL_MASK) as usize;
       let mut entries = self.level1.take_slot(slot1);
       self.process_entries(&mut entries);
       self.level1.restore_slot(slot1, entries);
 
       if slot1 == 0 {
+        let slot2 =
+          ((self.current_tick >> (LEVEL_BITS * 2)) & LEVEL_MASK) as usize;
         let mut entries = self.level2.take_slot(slot2);
         self.process_entries(&mut entries);
         self.level2.restore_slot(slot2, entries);
 
         if slot2 == 0 {
+          let slot3 =
+            ((self.current_tick >> (LEVEL_BITS * 3)) & LEVEL_MASK) as usize;
           let mut entries = self.level3.take_slot(slot3);
           self.process_entries(&mut entries);
           self.level3.restore_slot(slot3, entries);
