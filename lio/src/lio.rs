@@ -333,31 +333,31 @@ impl Lio {
       (None, None) => None,
     };
 
-    let mut completed = std::mem::take(&mut inner.completed);
     let mut expired_timers = if has_timers {
       std::mem::take(&mut inner.expired_timers)
     } else {
       Vec::new()
     };
 
-    completed.clear();
+    inner.completed.clear();
     expired_timers.clear();
 
-    // Copy completion data to release borrow on inner.io
-    // inner.completed.clear();
     if profiling_enabled {
       let started = Instant::now();
-      inner.io.wait(effective_timeout, &mut completed)?;
+      let (io, completed) = (&mut inner.io, &mut inner.completed);
+      io.wait(effective_timeout, completed)?;
       wait_time += started.elapsed();
     } else {
-      inner.io.wait(effective_timeout, &mut completed)?;
+      let (io, completed) = (&mut inner.io, &mut inner.completed);
+      io.wait(effective_timeout, completed)?;
     }
 
     let mut num_completed = 0;
 
     let completion_loop_started =
       if profiling_enabled { Some(Instant::now()) } else { None };
-    for c in &completed {
+    for index in 0..inner.completed.len() {
+      let c = inner.completed[index];
       let id = c.registration_id();
       let result = c.result();
 
@@ -460,9 +460,7 @@ impl Lio {
       timer_loop_time += started.elapsed();
     }
 
-    completed.clear();
     expired_timers.clear();
-    inner.completed = completed;
     if has_timers {
       inner.expired_timers = expired_timers;
     }
