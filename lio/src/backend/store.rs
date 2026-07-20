@@ -26,7 +26,7 @@ struct StoreSlot {
 /// - a persistent model-lifetime bump reset before slot reuse
 /// - a step-lifetime bump reserved for backend-lowered state
 pub(crate) struct OpStore {
-  slots: SlotPool<StoreSlot>,
+  slots: SlotPool<StoreSlot, false>,
 }
 
 #[cfg(test)]
@@ -96,6 +96,7 @@ impl OpStore {
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> (u64, Option<Action>, &mut Bump) {
     let (key, slot) = self.slots.allocate().expect("at capacity");
+    slot.step_bump.reset();
     let registration = slot.registration.write(init(&mut slot.model_bump));
     let action = registration.action();
     (key.as_u64(), action, &mut slot.step_bump)
@@ -114,6 +115,18 @@ impl OpStore {
         slot.step_bump.reset();
       })
       .is_some()
+  }
+
+  /// Removes an operation whose ID was already validated by `get_mut` under
+  /// the same exclusive store borrow.
+  #[inline]
+  pub fn remove_known(&mut self, id: u64) {
+    let key = SlabKey::from_u64(id);
+    self.slots.remove_known_with(key, |slot| {
+      // SAFETY: occupied slots always contain an initialized registration.
+      unsafe { slot.registration.assume_init_drop() };
+      slot.model_bump.reset();
+    });
   }
 
   /// Gets mutable access to an operation's registration.
