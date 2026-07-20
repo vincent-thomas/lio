@@ -96,6 +96,7 @@ impl OpStore {
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> (u64, Option<Action>, &mut Bump) {
     let (key, slot) = self.slots.allocate().expect("at capacity");
+    slot.model_bump.reset();
     slot.step_bump.reset();
     let registration = slot.registration.write(init(&mut slot.model_bump));
     let action = registration.action();
@@ -125,7 +126,6 @@ impl OpStore {
     self.slots.remove_known_with(key, |slot| {
       // SAFETY: occupied slots always contain an initialized registration.
       unsafe { slot.registration.assume_init_drop() };
-      slot.model_bump.reset();
     });
   }
 

@@ -277,15 +277,18 @@ impl Lio {
   #[inline]
   fn run_inner(&self, timeout: Option<Duration>) -> io::Result<usize> {
     let mut inner = self.inner.borrow_mut();
-    if inner.profile.is_some() {
-      Self::run_inner_impl::<true>(&mut inner, timeout)
-    } else {
-      Self::run_inner_impl::<false>(&mut inner, timeout)
+    match (inner.profile.is_some(), !inner.time.is_empty()) {
+      (true, true) => Self::run_inner_impl::<true, true>(&mut inner, timeout),
+      (true, false) => Self::run_inner_impl::<true, false>(&mut inner, timeout),
+      (false, true) => Self::run_inner_impl::<false, true>(&mut inner, timeout),
+      (false, false) => {
+        Self::run_inner_impl::<false, false>(&mut inner, timeout)
+      }
     }
   }
 
   #[inline]
-  fn run_inner_impl<const PROFILE: bool>(
+  fn run_inner_impl<const PROFILE: bool, const HAS_TIMERS: bool>(
     inner: &mut LioInner,
     timeout: Option<Duration>,
   ) -> io::Result<usize> {
@@ -316,7 +319,7 @@ impl Lio {
 
     // Compute effective timeout: min of user timeout and next timer deadline.
     // Avoid touching the clock on the common pure-I/O path.
-    let has_timers = !inner.time.is_empty();
+    let has_timers = HAS_TIMERS;
     let next_deadline = if !has_timers {
       None
     } else if profiling_enabled {
@@ -334,14 +337,7 @@ impl Lio {
       (None, None) => None,
     };
 
-    let mut expired_timers = if has_timers {
-      std::mem::take(&mut inner.expired_timers)
-    } else {
-      Vec::new()
-    };
-
     inner.completed.clear();
-    expired_timers.clear();
 
     if profiling_enabled {
       let started = Instant::now();
@@ -411,62 +407,68 @@ impl Lio {
 
     // Process expired timers. `has_timers` also includes fired timers waiting
     // to be drained, so an empty clock is safe to skip entirely.
-    if has_timers && profiling_enabled {
-      let started = Instant::now();
-      expired_timers.extend(inner.time.poll_expired());
-      timer_poll_time += started.elapsed();
-      timer_expirations += expired_timers.len();
-    } else if has_timers {
-      expired_timers.extend(inner.time.poll_expired());
-    }
-    let expired_timer_count = expired_timers.len();
-    let timer_loop_started =
-      if profiling_enabled { Some(Instant::now()) } else { None };
-    for &timer_id in &expired_timers {
-      let mut next_action = None;
-      let mut finished = false;
-
-      if let Some(reg) = inner.store.get_mut(timer_id) {
-        let result = reg.on_driver_completion(Completion::with_flags(
-          SLEEP_RESULT,
-          crate::api::op::CompletionFlags::TIMER,
-        ));
-        finished = result.is_done();
-        next_action = result.next_action;
-      }
-
-      inner.time.remove(timer_id);
-
-      if let Some(action) = next_action {
-        let started =
-          if profiling_enabled { Some(Instant::now()) } else { None };
-        Self::dispatch_action(inner, timer_id, action);
-        if let Some(started) = started {
-          dispatch_time += started.elapsed();
-        }
-        dispatch_count += 1;
-      }
-
-      if finished {
-        let remove_started =
-          if profiling_enabled { Some(Instant::now()) } else { None };
-        inner.store.remove_known(timer_id);
-        if let Some(started) = remove_started {
-          remove_time += started.elapsed();
-        }
-        remove_count += 1;
-      }
-    }
-    if let Some(started) = timer_loop_started {
-      timer_loop_time += started.elapsed();
-    }
-
-    expired_timers.clear();
+    let mut expired_timer_count = 0;
     if has_timers {
+      let mut expired_timers = std::mem::take(&mut inner.expired_timers);
+      expired_timers.clear();
+
+      if profiling_enabled {
+        let started = Instant::now();
+        expired_timers.extend(inner.time.poll_expired());
+        timer_poll_time += started.elapsed();
+        timer_expirations += expired_timers.len();
+      } else {
+        expired_timers.extend(inner.time.poll_expired());
+      }
+      expired_timer_count = expired_timers.len();
+      let timer_loop_started =
+        if profiling_enabled { Some(Instant::now()) } else { None };
+      for &timer_id in &expired_timers {
+        let mut next_action = None;
+        let mut finished = false;
+
+        if let Some(reg) = inner.store.get_mut(timer_id) {
+          let result = reg.on_driver_completion(Completion::with_flags(
+            SLEEP_RESULT,
+            crate::api::op::CompletionFlags::TIMER,
+          ));
+          finished = result.is_done();
+          next_action = result.next_action;
+        }
+
+        inner.time.remove(timer_id);
+
+        if let Some(action) = next_action {
+          let started =
+            if profiling_enabled { Some(Instant::now()) } else { None };
+          Self::dispatch_action(inner, timer_id, action);
+          if let Some(started) = started {
+            dispatch_time += started.elapsed();
+          }
+          dispatch_count += 1;
+        }
+
+        if finished {
+          let remove_started =
+            if profiling_enabled { Some(Instant::now()) } else { None };
+          inner.store.remove_known(timer_id);
+          if let Some(started) = remove_started {
+            remove_time += started.elapsed();
+          }
+          remove_count += 1;
+        }
+      }
+      if let Some(started) = timer_loop_started {
+        timer_loop_time += started.elapsed();
+      }
+
+      expired_timers.clear();
       inner.expired_timers = expired_timers;
     }
 
-    if let Some(profile) = inner.profile.as_mut() {
+    if PROFILE
+      && let Some(profile) = inner.profile.as_mut()
+    {
       profile.run_inner_calls += 1;
       profile.completions_returned += num_completed;
       profile.stale_completions += stale_completions;
