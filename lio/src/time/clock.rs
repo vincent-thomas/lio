@@ -142,6 +142,12 @@ impl Clock {
     if nanos <= TICK_NS {
       return 1;
     }
+    Self::long_duration_to_ticks(nanos)
+  }
+
+  #[cold]
+  #[inline(never)]
+  fn long_duration_to_ticks(nanos: u128) -> u64 {
     nanos.div_ceil(TICK_NS).min(u64::MAX as u128) as u64
   }
 
@@ -160,22 +166,41 @@ impl Clock {
 
     let slot_index = id as u32 as usize;
     if slot_index >= self.timers.len() {
-      self.timers.resize(slot_index + 1, TimerSlot::EMPTY);
+      self.grow_timer_slots(slot_index + 1);
     }
     let entry =
       TimerEntry { deadline_ticks, pending_index: ACTIVE_TIMER };
     let previous =
       std::mem::replace(&mut self.timers[slot_index], TimerSlot { id, entry });
 
-    if previous.is_occupied() {
-      if previous.entry.pending_index == ACTIVE_TIMER {
-        self.decrement_active_deadline(previous.entry.deadline_ticks);
+    let previous_state = previous.entry.pending_index;
+    if previous_state >= EMPTY_TIMER {
+      if previous_state == EMPTY_TIMER {
+        self.activate_timer_slot();
+      } else {
+        self.replace_active_timer(previous.entry.deadline_ticks);
       }
-    } else {
-      self.timer_count += 1;
     }
     self.insert_timer(id, deadline_ticks);
     self.increment_active_deadline(deadline_ticks);
+  }
+
+  #[cold]
+  #[inline(never)]
+  fn grow_timer_slots(&mut self, required_len: usize) {
+    self.timers.resize(required_len, TimerSlot::EMPTY);
+  }
+
+  #[cold]
+  #[inline(never)]
+  fn replace_active_timer(&mut self, previous_deadline: u64) {
+    self.decrement_active_deadline(previous_deadline);
+  }
+
+  #[cold]
+  #[inline(never)]
+  fn activate_timer_slot(&mut self) {
+    self.timer_count += 1;
   }
 
   pub fn next_deadline(&self) -> Option<Duration> {
@@ -241,14 +266,24 @@ impl Clock {
     if delta < Self::LEVEL0_RANGE {
       let slot = (deadline_ticks & LEVEL_MASK) as usize;
       self.level0.insert(slot, entry);
-    } else if delta < Self::LEVEL1_RANGE {
-      let slot = ((deadline_ticks >> LEVEL_BITS) & LEVEL_MASK) as usize;
+    } else {
+      self.insert_higher_timer(delta, entry);
+    }
+  }
+
+  #[cold]
+  #[inline(never)]
+  fn insert_higher_timer(&mut self, delta: u64, entry: WheelEntry) {
+    if delta < Self::LEVEL1_RANGE {
+      let slot = ((entry.deadline_ticks >> LEVEL_BITS) & LEVEL_MASK) as usize;
       self.level1.insert(slot, entry);
     } else if delta < Self::LEVEL2_RANGE {
-      let slot = ((deadline_ticks >> (LEVEL_BITS * 2)) & LEVEL_MASK) as usize;
+      let slot =
+        ((entry.deadline_ticks >> (LEVEL_BITS * 2)) & LEVEL_MASK) as usize;
       self.level2.insert(slot, entry);
     } else {
-      let slot = ((deadline_ticks >> (LEVEL_BITS * 3)) & LEVEL_MASK) as usize;
+      let slot =
+        ((entry.deadline_ticks >> (LEVEL_BITS * 3)) & LEVEL_MASK) as usize;
       self.level3.insert(slot, entry);
     }
   }
