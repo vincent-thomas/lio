@@ -246,7 +246,7 @@ pub(crate) fn socket_addr_buf_from_storage(
     let bytes = unsafe {
       std::slice::from_raw_parts(unix.sun_path.as_ptr().cast::<u8>(), path_len)
     };
-    return unix_socket_addr_buf(bytes);
+    return crate::backend::op::unix_socket_addr_buf(bytes);
   }
 
   Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
@@ -262,22 +262,4 @@ pub(crate) fn socket_addr_to_storage(
     SocketAddr::V6(_) => mem::size_of::<libc::sockaddr_in6>(),
   } as libc::socklen_t;
   (storage, len)
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SocketAddrBuf helpers
-// ═══════════════════════════════════════════════════════════════════════════════
-
-pub(crate) fn unix_socket_addr_buf(
-  path: &[u8],
-) -> io::Result<SocketAddrBuf> {
-  if path.len() >= 108 {
-    return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
-  }
-  let mut buf = SocketAddrBuf::unspecified();
-  buf.family = SocketAddrFamily::Unix;
-  buf.unix_path_len = path.len() as u16;
-  buf.unix_path[..path.len()].copy_from_slice(path);
-  Ok(buf)
 }

@@ -165,6 +165,20 @@ impl SocketAddrBuf {
   }
 }
 
+pub fn unix_socket_addr_buf(path: &[u8]) -> io::Result<SocketAddrBuf> {
+  if path.len() >= 108 {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidInput,
+      "Unix socket path exceeds 107 bytes",
+    ));
+  }
+  let mut buf = SocketAddrBuf::unspecified();
+  buf.family = SocketAddrFamily::Unix;
+  buf.unix_path_len = path.len() as u16;
+  buf.unix_path[..path.len()].copy_from_slice(path);
+  Ok(buf)
+}
+
 pub fn socket_addr_into_buf(addr: SocketAddr) -> SocketAddrBuf {
   match addr {
     SocketAddr::V4(addr) => {
