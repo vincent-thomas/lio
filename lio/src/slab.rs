@@ -45,15 +45,16 @@ impl SlabKey {
 /// Slot storage with generation tracking.
 pub(crate) struct Slot<T> {
   generation: u32,
+  next_free: u32,
   state: T,
   occupied: bool,
 }
 
 /// Generic generational slot pool with stable per-slot state.
-pub(crate) struct SlotPool<T> {
+pub(crate) struct SlotPool<T, const TRACK_LEN: bool = true> {
   slots: Vec<Slot<T>>,
-  /// Free slot indices available for reuse (LIFO for cache locality)
-  free_list: Vec<u32>,
+  /// Head of the intrusive free list, or `u32::MAX` when empty.
+  free_head: u32,
   /// Next slot to bump-allocate
   next_slot: u32,
   /// Maximum capacity
@@ -62,7 +63,7 @@ pub(crate) struct SlotPool<T> {
   len: u32,
 }
 
-impl<T> SlotPool<T> {
+impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
   pub(crate) fn with_capacity(
     capacity: usize,
     mut init_slot: impl FnMut() -> T,
@@ -70,11 +71,16 @@ impl<T> SlotPool<T> {
     let capacity = capacity.min(u32::MAX as usize) as u32;
     let mut slots = Vec::with_capacity(capacity as usize);
     for _ in 0..capacity {
-      slots.push(Slot { generation: 0, state: init_slot(), occupied: false });
+      slots.push(Slot {
+        generation: 0,
+        next_free: u32::MAX,
+        state: init_slot(),
+        occupied: false,
+      });
     }
     Self {
       slots,
-      free_list: Vec::with_capacity(capacity as usize),
+      free_head: u32::MAX,
       next_slot: 0,
       capacity,
       len: 0,
@@ -83,22 +89,25 @@ impl<T> SlotPool<T> {
 
   #[inline]
   pub(crate) fn allocate(&mut self) -> Option<(SlabKey, &mut T)> {
-    let slot_idx = match self.free_list.pop() {
-      Some(slot_idx) => slot_idx,
-      None => {
-        if self.next_slot >= self.capacity {
-          return None;
-        }
-        let slot_idx = self.next_slot;
-        self.next_slot += 1;
-        slot_idx
+    let slot_idx = if self.free_head != u32::MAX {
+      let slot_idx = self.free_head;
+      self.free_head = self.slots[slot_idx as usize].next_free;
+      slot_idx
+    } else {
+      if self.next_slot >= self.capacity {
+        return None;
       }
+      let slot_idx = self.next_slot;
+      self.next_slot += 1;
+      slot_idx
     };
 
     let slot = &mut self.slots[slot_idx as usize];
     debug_assert!(!slot.occupied);
     slot.occupied = true;
-    self.len += 1;
+    if TRACK_LEN {
+      self.len += 1;
+    }
     let key = SlabKey { slot: slot_idx, generation: slot.generation };
     Some((key, &mut slot.state))
   }
@@ -126,10 +135,35 @@ impl<T> SlotPool<T> {
 
     let removed = on_remove(&mut slot.state);
     slot.occupied = false;
-    self.len -= 1;
+    if TRACK_LEN {
+      self.len -= 1;
+    }
     slot.generation = slot.generation.wrapping_add(1);
-    self.free_list.push(key.slot());
+    slot.next_free = self.free_head;
+    self.free_head = key.slot();
     Some(removed)
+  }
+
+  /// Removes a slot whose generational key was already validated under the
+  /// same exclusive pool borrow.
+  #[inline]
+  pub(crate) fn remove_known_with<R>(
+    &mut self,
+    key: SlabKey,
+    on_remove: impl FnOnce(&mut T) -> R,
+  ) -> R {
+    let slot = &mut self.slots[key.slot() as usize];
+    debug_assert!(slot.generation == key.generation() && slot.occupied);
+
+    let removed = on_remove(&mut slot.state);
+    slot.occupied = false;
+    if TRACK_LEN {
+      self.len -= 1;
+    }
+    slot.generation = slot.generation.wrapping_add(1);
+    slot.next_free = self.free_head;
+    self.free_head = key.slot();
+    removed
   }
 
   #[inline]

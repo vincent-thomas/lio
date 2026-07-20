@@ -396,7 +396,7 @@ impl Lio {
       if finished {
         let remove_started =
           if profiling_enabled { Some(Instant::now()) } else { None };
-        inner.store.remove(id);
+        inner.store.remove_known(id);
         if let Some(started) = remove_started {
           remove_time += started.elapsed();
         }
@@ -450,7 +450,7 @@ impl Lio {
       if finished {
         let remove_started =
           if profiling_enabled { Some(Instant::now()) } else { None };
-        inner.store.remove(timer_id);
+        inner.store.remove_known(timer_id);
         if let Some(started) = remove_started {
           remove_time += started.elapsed();
         }
