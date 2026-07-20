@@ -233,6 +233,7 @@ impl Clock {
     self.earliest_deadline.map(|(deadline, _)| deadline)
   }
 
+  #[inline]
   fn insert_timer(&mut self, id: TimerId, deadline_ticks: u64) {
     let delta = deadline_ticks.saturating_sub(self.current_tick);
     let entry = WheelEntry { id, deadline_ticks };
@@ -252,6 +253,7 @@ impl Clock {
     }
   }
 
+  #[inline]
   fn increment_active_deadline(&mut self, deadline_ticks: u64) {
     match self.earliest_deadline {
       None => self.earliest_deadline = Some((deadline_ticks, 1)),
