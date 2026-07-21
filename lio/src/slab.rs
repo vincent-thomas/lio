@@ -78,13 +78,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
         occupied: false,
       });
     }
-    Self {
-      slots,
-      free_head: u32::MAX,
-      next_slot: 0,
-      capacity,
-      len: 0,
-    }
+    Self { slots, free_head: u32::MAX, next_slot: 0, capacity, len: 0 }
   }
 
   #[inline]

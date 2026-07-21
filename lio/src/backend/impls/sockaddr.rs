@@ -47,8 +47,6 @@ const fn raw_af_unix() -> Result<i32, i32> {
 }
 
 #[cfg(unix)]
-
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Socket addr ↔ libc::sockaddr_*  conversion
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -146,8 +144,7 @@ fn into_addr(addr: SocketAddrV4) -> libc::sockaddr_in {
   }
   _addr.sin_family = raw_af_inet() as libc::sa_family_t;
   _addr.sin_port = addr.port().to_be();
-  _addr.sin_addr =
-    libc::in_addr { s_addr: u32::from(*addr.ip()).to_be() };
+  _addr.sin_addr = libc::in_addr { s_addr: u32::from(*addr.ip()).to_be() };
 
   _addr
 }
@@ -170,8 +167,7 @@ fn into_addr6(addr: SocketAddrV6) -> libc::sockaddr_in6 {
   }
   _addr.sin6_family = raw_af_inet6() as libc::sa_family_t;
   _addr.sin6_port = addr.port().to_be();
-  _addr.sin6_addr =
-    libc::in6_addr { s6_addr: addr.ip().octets() };
+  _addr.sin6_addr = libc::in6_addr { s6_addr: addr.ip().octets() };
 
   _addr
 }
@@ -228,8 +224,7 @@ pub(crate) fn socket_addr_buf_from_storage(
   {
     // SAFETY: `storage` points to a valid initialized sockaddr storage value
     // received from the OS, and the helper only reads from it.
-    let std_addr =
-      unsafe { libc_socketaddr_into_std_raw(storage) }?;
+    let std_addr = unsafe { libc_socketaddr_into_std_raw(storage) }?;
     return Ok(crate::backend::op::socket_addr_into_buf(std_addr));
   }
 

@@ -590,10 +590,12 @@ impl Iocp {
     };
 
     if result != INVALID_SOCKET {
-      if let Ok(addr) = crate::backend::impls::sockaddr::socket_addr_buf_from_storage(
-        &storage,
-        len as libc::socklen_t,
-      ) {
+      if let Ok(addr) =
+        crate::backend::impls::sockaddr::socket_addr_buf_from_storage(
+          &storage,
+          len as libc::socklen_t,
+        )
+      {
         unsafe {
           *out_addr = addr;
         }
@@ -624,7 +626,8 @@ impl Iocp {
     };
 
     let socket = fd as SOCKET;
-    let (storage, len) = crate::backend::impls::sockaddr::socket_addr_buf_to_storage(addr)?;
+    let (storage, len) =
+      crate::backend::impls::sockaddr::socket_addr_buf_to_storage(addr)?;
     let (addr_ptr, _) = sockaddr_storage_to_ptr(&storage);
 
     let result = unsafe { connect(socket, addr_ptr, len as i32) };

@@ -373,8 +373,7 @@ impl Lio {
 
       let on_completion_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
-      let completion_result =
-        op.on_driver_completion(Completion::new(result));
+      let completion_result = op.on_driver_completion(Completion::new(result));
       if let Some(started) = on_completion_started {
         completion_on_completion_time += started.elapsed();
       }
@@ -466,9 +465,7 @@ impl Lio {
       inner.expired_timers = expired_timers;
     }
 
-    if PROFILE
-      && let Some(profile) = inner.profile.as_mut()
-    {
+    if PROFILE && let Some(profile) = inner.profile.as_mut() {
       profile.run_inner_calls += 1;
       profile.completions_returned += num_completed;
       profile.stale_completions += stale_completions;

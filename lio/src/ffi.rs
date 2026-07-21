@@ -48,8 +48,7 @@ use crate::{
   Lio,
   api::{
     self, FileStat, FileType, ReadDirBuf, RecvFlags, SendFlags, ShutdownHow,
-    SockDomain, SockProto, SockType,
-    resource::Resource,
+    SockDomain, SockProto, SockType, resource::Resource,
   },
   backend::impls::sockaddr::std_socketaddr_into_libc,
 };

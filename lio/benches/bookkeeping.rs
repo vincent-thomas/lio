@@ -88,7 +88,8 @@ fn direct_backend(harness: &Harness) {
 
 fn driver_callback(harness: &Harness) {
   for depth in QUEUE_DEPTHS {
-    let lio = Lio::new_with_backend(ImmediateBackend::default(), depth).unwrap();
+    let lio =
+      Lio::new_with_backend(ImmediateBackend::default(), depth).unwrap();
     let completed = Rc::new(Cell::new(0usize));
 
     harness.bench(
@@ -112,7 +113,8 @@ fn driver_callback(harness: &Harness) {
 
 fn driver_channel(harness: &Harness) {
   for depth in [1, 256] {
-    let lio = Lio::new_with_backend(ImmediateBackend::default(), depth).unwrap();
+    let lio =
+      Lio::new_with_backend(ImmediateBackend::default(), depth).unwrap();
     let (sender, receiver) = mpsc::channel();
 
     harness.bench(

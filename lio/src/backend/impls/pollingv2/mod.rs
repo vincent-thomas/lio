@@ -466,7 +466,8 @@ impl Poller {
       dst.iov_len = src.len;
     }
 
-    let addr = msg.to.map(crate::backend::impls::sockaddr::socket_addr_to_storage);
+    let addr =
+      msg.to.map(crate::backend::impls::sockaddr::socket_addr_to_storage);
     let hdr = libc::msghdr {
       msg_name: std::ptr::null_mut(),
       msg_namelen: 0,
