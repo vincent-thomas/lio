@@ -964,7 +964,7 @@ impl IoUring {
             if *follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
           Statx::new(
             dir_fd.as_raw_fd(),
-            path_ptr.cast_const(),
+            path_ptr,
             (&native_stat.statx as *const lio_uring::statx).cast_mut(),
           )
           .flags(flags)
