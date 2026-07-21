@@ -1266,9 +1266,7 @@ impl OpModel for Sleep {
     let result = if completion.result == 0 {
       Ok(())
     } else {
-      Err(io::Error::from_raw_os_error(
-        completion.result.abs() as i32,
-      ))
+      Err(io::Error::from_raw_os_error(completion.result.abs() as i32))
     };
 
     OpResult::Done(result)
@@ -1328,9 +1326,7 @@ impl OpModel for Interval {
     let result = if completion.result == 0 {
       Ok(())
     } else {
-      Err(io::Error::from_raw_os_error(
-        completion.result.abs() as i32,
-      ))
+      Err(io::Error::from_raw_os_error(completion.result.abs() as i32))
     };
 
     OpResult::Yield(result)

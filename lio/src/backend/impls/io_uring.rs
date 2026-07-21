@@ -241,7 +241,8 @@ impl NativeSocketState {
   fn from_connect(
     addr: &crate::backend::op::SocketAddrBuf,
   ) -> io::Result<Self> {
-    let (storage, len) = crate::backend::impls::sockaddr::socket_addr_buf_to_storage(addr)?;
+    let (storage, len) =
+      crate::backend::impls::sockaddr::socket_addr_buf_to_storage(addr)?;
     Ok(Self { storage, len, kind: NativeSocketKind::Connect })
   }
 }
@@ -329,10 +330,12 @@ impl LoweredState {
         let NativeSocketKind::Accept { out } = state.kind else {
           return;
         };
-        if let Ok(addr) = crate::backend::impls::sockaddr::socket_addr_buf_from_storage(
-          &state.storage,
-          state.len,
-        ) {
+        if let Ok(addr) =
+          crate::backend::impls::sockaddr::socket_addr_buf_from_storage(
+            &state.storage,
+            state.len,
+          )
+        {
           // SAFETY: `out` is caller-provided writable output storage that
           // remains valid until completion processing.
           unsafe {
@@ -345,7 +348,9 @@ impl LoweredState {
         if let (Some(out), Some((storage, len))) =
           (state.from_out, state.addr.as_ref())
           && let Ok(addr) =
-            crate::backend::impls::sockaddr::socket_addr_buf_from_storage(storage, *len)
+            crate::backend::impls::sockaddr::socket_addr_buf_from_storage(
+              storage, *len,
+            )
         {
           unsafe {
             *out.as_ptr() = addr;

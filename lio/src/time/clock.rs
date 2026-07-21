@@ -168,8 +168,7 @@ impl Clock {
     if slot_index >= self.timers.len() {
       self.grow_timer_slots(slot_index + 1);
     }
-    let entry =
-      TimerEntry { deadline_ticks, pending_index: ACTIVE_TIMER };
+    let entry = TimerEntry { deadline_ticks, pending_index: ACTIVE_TIMER };
     let previous =
       std::mem::replace(&mut self.timers[slot_index], TimerSlot { id, entry });
 
@@ -315,7 +314,9 @@ impl Clock {
     amount: usize,
   ) {
     match self.earliest_deadline {
-      Some((earliest, count)) if deadline_ticks == earliest && count > amount => {
+      Some((earliest, count))
+        if deadline_ticks == earliest && count > amount =>
+      {
         self.earliest_deadline = Some((earliest, count - amount));
       }
       Some((earliest, _)) if deadline_ticks == earliest => {
@@ -344,8 +345,7 @@ impl Clock {
     self.expire_level0_slot(slot0);
 
     if slot0 == 0 {
-      let slot1 =
-        ((self.current_tick >> LEVEL_BITS) & LEVEL_MASK) as usize;
+      let slot1 = ((self.current_tick >> LEVEL_BITS) & LEVEL_MASK) as usize;
       let mut entries = self.level1.take_slot(slot1);
       self.process_entries(&mut entries);
       self.level1.restore_slot(slot1, entries);
