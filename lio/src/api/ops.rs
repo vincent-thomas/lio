@@ -1954,10 +1954,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
 
       let (ptr, cap) = buf.buf_mut(0);
       if bytes.len() > cap {
-        Err(std::io::Error::new(
-          std::io::ErrorKind::Other,
-          "buffer too small for path",
-        ))
+        Err(std::io::Error::from_raw_os_error(libc::ERANGE))
       } else {
         // SAFETY: `ptr` points to writable storage of at least `cap` bytes.
         unsafe {
