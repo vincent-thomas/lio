@@ -377,9 +377,9 @@ impl Clock {
 
     for entry in entries.drain(..) {
       let slot_index = entry.id as u32 as usize;
-      let Some(timer) = timers.get_mut(slot_index) else {
-        continue;
-      };
+      // SAFETY: wheel entries are only created after their timer slot exists,
+      // and the timer-slot vector never shrinks.
+      let timer = unsafe { timers.get_unchecked_mut(slot_index) };
       if timer.id != entry.id
         || timer.entry.pending_index != ACTIVE_TIMER
         || timer.entry.deadline_ticks != entry.deadline_ticks
@@ -387,7 +387,7 @@ impl Clock {
         continue;
       }
 
-      debug_assert!(entry.deadline_ticks <= current_tick);
+      assert!(entry.deadline_ticks <= current_tick);
       timer.entry.pending_index = pending_fire.len();
       expired_count += 1;
       pending_fire.push(PendingTimer { id: entry.id });
@@ -402,9 +402,9 @@ impl Clock {
     let mut expired_count = 0;
     for entry in entries.drain(..) {
       let slot_index = entry.id as u32 as usize;
-      let Some(timer) = self.timers.get_mut(slot_index) else {
-        continue;
-      };
+      // SAFETY: wheel entries are only created after their timer slot exists,
+      // and the timer-slot vector never shrinks.
+      let timer = unsafe { self.timers.get_unchecked_mut(slot_index) };
       if timer.id != entry.id
         || timer.entry.pending_index != ACTIVE_TIMER
         || timer.entry.deadline_ticks != entry.deadline_ticks
@@ -434,8 +434,10 @@ impl Clock {
       self.pending_index += 1;
 
       let slot_index = pending.id as u32 as usize;
-      if let Some(timer) = self.timers.get_mut(slot_index)
-        && timer.id == pending.id
+      // SAFETY: pending entries are only created from wheel entries after
+      // their timer slot exists, and the timer-slot vector never shrinks.
+      let timer = unsafe { self.timers.get_unchecked_mut(slot_index) };
+      if timer.id == pending.id
         && timer.entry.pending_index == self.pending_index - 1
       {
         timer.entry.pending_index = DELIVERED_TIMER;
