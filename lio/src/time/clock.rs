@@ -103,6 +103,7 @@ pub struct Clock {
   later_deadline_counts: BTreeMap<u64, usize>,
   pending_fire: Vec<PendingTimer>,
   pending_index: usize,
+  pending_has_stale: bool,
 }
 
 impl Default for Clock {
@@ -133,6 +134,7 @@ impl Clock {
       later_deadline_counts: BTreeMap::new(),
       pending_fire: Vec::with_capacity(32),
       pending_index: 0,
+      pending_has_stale: false,
     }
   }
 
@@ -179,6 +181,8 @@ impl Clock {
       } else {
         self.replace_active_timer(previous.entry.deadline_ticks);
       }
+    } else if previous_state < DELIVERED_TIMER {
+      self.pending_has_stale = true;
     }
     self.insert_timer(id, deadline_ticks);
     self.increment_active_deadline(deadline_ticks);
@@ -241,6 +245,8 @@ impl Clock {
     self.timer_count -= 1;
     if timer.entry.pending_index == ACTIVE_TIMER {
       self.decrement_active_deadline(timer.entry.deadline_ticks);
+    } else if timer.entry.pending_index < DELIVERED_TIMER {
+      self.pending_has_stale = true;
     }
     true
   }
@@ -375,7 +381,7 @@ impl Clock {
     let timers = &mut self.timers;
     let pending_fire = &mut self.pending_fire;
 
-    for entry in entries.drain(..) {
+    for &entry in entries.iter() {
       let slot_index = entry.id as u32 as usize;
       // SAFETY: wheel entries are only created after their timer slot exists,
       // and the timer-slot vector never shrinks.
@@ -392,6 +398,7 @@ impl Clock {
       expired_count += 1;
       pending_fire.push(PendingTimer { id: entry.id });
     }
+    entries.clear();
 
     if expired_count != 0 {
       self.decrement_active_deadline_by(current_tick, expired_count);
@@ -431,14 +438,15 @@ impl Clock {
   fn pop_expired(&mut self) -> Option<TimerId> {
     while self.pending_index < self.pending_fire.len() {
       let pending = self.pending_fire[self.pending_index];
+      let index = self.pending_index;
       self.pending_index += 1;
 
       let slot_index = pending.id as u32 as usize;
       // SAFETY: pending entries are only created from wheel entries after
       // their timer slot exists, and the timer-slot vector never shrinks.
       let timer = unsafe { self.timers.get_unchecked_mut(slot_index) };
-      if timer.id == pending.id
-        && timer.entry.pending_index == self.pending_index - 1
+      if !self.pending_has_stale
+        || (timer.id == pending.id && timer.entry.pending_index == index)
       {
         timer.entry.pending_index = DELIVERED_TIMER;
         return Some(pending.id);
@@ -447,6 +455,7 @@ impl Clock {
 
     self.pending_fire.clear();
     self.pending_index = 0;
+    self.pending_has_stale = false;
     None
   }
 }
