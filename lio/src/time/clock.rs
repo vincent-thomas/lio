@@ -10,7 +10,6 @@ const TICK_NS: u128 = TICK_MS as u128 * 1_000_000;
 
 const ACTIVE_TIMER: usize = usize::MAX;
 const EMPTY_TIMER: usize = usize::MAX - 1;
-const DELIVERED_TIMER: usize = usize::MAX - 2;
 
 /// Entry stored in a wheel slot.
 #[derive(Debug, Clone, Copy)]
@@ -51,7 +50,8 @@ impl<const SIZE: usize> Wheel<SIZE> {
 #[derive(Debug, Clone, Copy)]
 struct TimerEntry {
   deadline_ticks: u64,
-  /// Index in `pending_fire`, or `ACTIVE_TIMER` before expiration.
+  /// Index assigned in `pending_fire`, or `ACTIVE_TIMER` before expiration.
+  /// Whether that index is still pending is determined by the drain cursor.
   pending_index: usize,
 }
 
@@ -181,7 +181,7 @@ impl Clock {
       } else {
         self.replace_active_timer(previous.entry.deadline_ticks);
       }
-    } else if previous_state < DELIVERED_TIMER {
+    } else if self.pending_is_undelivered(previous.id, previous_state) {
       self.pending_has_stale = true;
     }
     self.insert_timer(id, deadline_ticks);
@@ -245,7 +245,7 @@ impl Clock {
     self.timer_count -= 1;
     if timer.entry.pending_index == ACTIVE_TIMER {
       self.decrement_active_deadline(timer.entry.deadline_ticks);
-    } else if timer.entry.pending_index < DELIVERED_TIMER {
+    } else if self.pending_is_undelivered(timer.id, timer.entry.pending_index) {
       self.pending_has_stale = true;
     }
     true
@@ -435,20 +435,27 @@ impl Clock {
   }
 
   #[inline]
+  fn pending_is_undelivered(&self, id: TimerId, index: usize) -> bool {
+    index >= self.pending_index
+      && self.pending_fire.get(index).is_some_and(|timer| timer.id == id)
+  }
+
+  #[inline]
   fn pop_expired(&mut self) -> Option<TimerId> {
     while self.pending_index < self.pending_fire.len() {
       let pending = self.pending_fire[self.pending_index];
       let index = self.pending_index;
       self.pending_index += 1;
 
+      if !self.pending_has_stale {
+        return Some(pending.id);
+      }
+
       let slot_index = pending.id as u32 as usize;
-      // SAFETY: pending entries are only created from wheel entries after
-      // their timer slot exists, and the timer-slot vector never shrinks.
-      let timer = unsafe { self.timers.get_unchecked_mut(slot_index) };
-      if !self.pending_has_stale
-        || (timer.id == pending.id && timer.entry.pending_index == index)
-      {
-        timer.entry.pending_index = DELIVERED_TIMER;
+      // SAFETY: pending entries are only created after their timer slot exists,
+      // and the timer-slot vector never shrinks.
+      let timer = unsafe { self.timers.get_unchecked(slot_index) };
+      if timer.id == pending.id && timer.entry.pending_index == index {
         return Some(pending.id);
       }
     }
@@ -470,6 +477,30 @@ impl Iterator for ExpiredIterator<'_> {
   #[inline]
   fn next(&mut self) -> Option<Self::Item> {
     self.clock.pop_expired()
+  }
+
+  #[inline]
+  fn fold<B, F>(mut self, mut accum: B, mut f: F) -> B
+  where
+    F: FnMut(B, Self::Item) -> B,
+  {
+    if self.clock.pending_has_stale {
+      while let Some(id) = self.next() {
+        accum = f(accum, id);
+      }
+      return accum;
+    }
+
+    while self.clock.pending_index < self.clock.pending_fire.len() {
+      let pending = self.clock.pending_fire[self.clock.pending_index];
+      self.clock.pending_index += 1;
+
+      accum = f(accum, pending.id);
+    }
+
+    self.clock.pending_fire.clear();
+    self.clock.pending_index = 0;
+    accum
   }
 }
 
@@ -540,6 +571,25 @@ mod tests {
     clock.advance_by(1);
     assert!(clock.remove(1));
     assert!(collect_expired(&mut clock).is_empty());
+  }
+
+  #[test]
+  fn partial_drain_distinguishes_consumed_and_pending_timers() {
+    let mut clock = Clock::new();
+    clock.schedule(1, Duration::from_millis(1));
+    clock.schedule(2, Duration::from_millis(1));
+    clock.advance_by(1);
+
+    let mut expired = clock.poll_expired();
+    assert_eq!(expired.next(), Some(1));
+    drop(expired);
+
+    clock.schedule(1, Duration::from_millis(1));
+    assert!(clock.remove(2));
+    assert!(collect_expired(&mut clock).is_empty());
+
+    clock.advance_by(1);
+    assert_eq!(collect_expired(&mut clock), vec![1]);
   }
 
   #[test]
