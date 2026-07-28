@@ -757,6 +757,7 @@ pub struct ReadToString {
   bytes: Vec<u8>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ReadToStringState {
   Opening(ops::OpenAt),
   Reading { fd: Resource, op: ops::Read<Vec<u8>> },
