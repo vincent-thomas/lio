@@ -485,7 +485,7 @@ impl Iterator for ExpiredIterator<'_> {
     F: FnMut(B, Self::Item) -> B,
   {
     if self.clock.pending_has_stale {
-      while let Some(id) = self.next() {
+      for id in self.by_ref() {
         accum = f(accum, id);
       }
       return accum;
