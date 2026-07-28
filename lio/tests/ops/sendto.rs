@@ -185,8 +185,8 @@ fn with_flags() {
     receiver_addr,
     Some(api::SendFlags::from_bits(libc::MSG_NOSIGNAL).unwrap()),
   )
-    .with_lio(&mut lio)
-    .send_with(sender_send);
+  .with_lio(&mut lio)
+  .send_with(sender_send);
 
   let (bytes_sent, returned_buf) = poll_until_recv(&mut lio, &receiver_send);
   let bytes_sent = bytes_sent.expect("sendto with flags failed") as usize;
