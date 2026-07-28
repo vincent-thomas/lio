@@ -50,7 +50,6 @@ const fn raw_af_unix() -> Result<i32, i32> {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Socket addr ↔ libc::sockaddr_*  conversion
 // ═══════════════════════════════════════════════════════════════════════════════
-
 /// # Safety
 /// `storage` must point to a valid, initialized `sockaddr_storage`.
 pub(crate) unsafe fn libc_socketaddr_into_std_raw(
