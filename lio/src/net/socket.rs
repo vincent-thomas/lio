@@ -69,7 +69,7 @@ use crate::{
 ///     let bytes_sent = result? as usize;
 ///
 ///     // Shutdown the write side
-///     socket.shutdown(libc::SHUT_WR).await?;
+///     socket.shutdown(lio::api::ShutdownHow::Write).await?;
 ///
 ///     Ok(())
 /// }
@@ -389,7 +389,7 @@ impl Socket {
   ///     // Send all data...
   ///
   ///     // Shutdown the write side to signal EOF to the peer
-  ///     socket.shutdown(libc::SHUT_WR).await?;
+  ///     socket.shutdown(lio::api::ShutdownHow::Write).await?;
   ///
   ///     // Can still receive data...
   ///
