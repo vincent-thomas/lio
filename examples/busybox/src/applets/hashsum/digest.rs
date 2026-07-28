@@ -789,10 +789,8 @@ impl Sha3_256State {
 }
 
 fn keccak_absorb_block(state: &mut [u64; 25], block: &[u8]) {
-  for (lane, chunk) in block.chunks_exact(8).enumerate() {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(chunk);
-    state[lane] ^= u64::from_le_bytes(bytes);
+  for (lane, chunk) in block.as_chunks::<8>().0.iter().enumerate() {
+    state[lane] ^= u64::from_le_bytes(*chunk);
   }
 }
 
