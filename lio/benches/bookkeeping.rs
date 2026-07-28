@@ -131,7 +131,7 @@ fn driver_channel(criterion: &mut Criterion) {
           }
           assert_eq!(lio.try_run().unwrap(), depth);
           for _ in 0..depth {
-            black_box(receiver.recv().unwrap().unwrap());
+            receiver.recv().unwrap().unwrap();
           }
         });
       },
