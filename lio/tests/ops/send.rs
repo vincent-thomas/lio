@@ -114,8 +114,8 @@ fn with_flags() {
     data,
     Some(api::SendFlags::from_bits(libc::MSG_NOSIGNAL).unwrap()),
   )
-    .with_lio(&mut lio)
-    .send_with(sender_send);
+  .with_lio(&mut lio)
+  .send_with(sender_send);
 
   let (bytes_sent, returned_buf) = poll_until_recv(&mut lio, &receiver_send);
   let bytes_sent = bytes_sent.expect("Failed to send with flags") as usize;
