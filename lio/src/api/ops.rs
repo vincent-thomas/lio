@@ -6,12 +6,13 @@
 
 use std::ffi::{CString, OsString};
 use std::io;
+use std::mem;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::RawHandle;
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
 use std::time::Duration;
 
 use crate::{
@@ -1265,9 +1266,7 @@ impl OpModel for Sleep {
     let result = if completion.result == 0 {
       Ok(())
     } else {
-      Err(io::Error::from_raw_os_error(
-        completion.result.abs() as i32,
-      ))
+      Err(io::Error::from_raw_os_error(completion.result.abs() as i32))
     };
 
     OpResult::Done(result)
@@ -1327,9 +1326,7 @@ impl OpModel for Interval {
     let result = if completion.result == 0 {
       Ok(())
     } else {
-      Err(io::Error::from_raw_os_error(
-        completion.result.abs() as i32,
-      ))
+      Err(io::Error::from_raw_os_error(completion.result.abs() as i32))
     };
 
     OpResult::Yield(result)
@@ -1953,10 +1950,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
 
       let (ptr, cap) = buf.buf_mut(0);
       if bytes.len() > cap {
-        Err(std::io::Error::new(
-          std::io::ErrorKind::Other,
-          "buffer too small for path",
-        ))
+        Err(std::io::Error::from_raw_os_error(libc::ERANGE))
       } else {
         // SAFETY: `ptr` points to writable storage of at least `cap` bytes.
         unsafe {

@@ -179,9 +179,14 @@ fn with_flags() {
   let expected = data.clone();
 
   let (sender_send, receiver_send) = mpsc::channel();
-  api::sendto(&sender, data, receiver_addr, Some(libc::MSG_NOSIGNAL))
-    .with_lio(&mut lio)
-    .send_with(sender_send);
+  api::sendto(
+    &sender,
+    data,
+    receiver_addr,
+    Some(api::SendFlags::from_bits(libc::MSG_NOSIGNAL).unwrap()),
+  )
+  .with_lio(&mut lio)
+  .send_with(sender_send);
 
   let (bytes_sent, returned_buf) = poll_until_recv(&mut lio, &receiver_send);
   let bytes_sent = bytes_sent.expect("sendto with flags failed") as usize;

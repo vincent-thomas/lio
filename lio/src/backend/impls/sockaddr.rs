@@ -48,11 +48,9 @@ const fn raw_af_unix() -> Result<i32, i32> {
 
 #[cfg(unix)]
 
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Socket addr ↔ libc::sockaddr_*  conversion
 // ═══════════════════════════════════════════════════════════════════════════════
-
 /// # Safety
 /// `storage` must point to a valid, initialized `sockaddr_storage`.
 pub(crate) unsafe fn libc_socketaddr_into_std_raw(
@@ -146,8 +144,7 @@ fn into_addr(addr: SocketAddrV4) -> libc::sockaddr_in {
   }
   _addr.sin_family = raw_af_inet() as libc::sa_family_t;
   _addr.sin_port = addr.port().to_be();
-  _addr.sin_addr =
-    libc::in_addr { s_addr: u32::from(*addr.ip()).to_be() };
+  _addr.sin_addr = libc::in_addr { s_addr: u32::from(*addr.ip()).to_be() };
 
   _addr
 }
@@ -170,8 +167,7 @@ fn into_addr6(addr: SocketAddrV6) -> libc::sockaddr_in6 {
   }
   _addr.sin6_family = raw_af_inet6() as libc::sa_family_t;
   _addr.sin6_port = addr.port().to_be();
-  _addr.sin6_addr =
-    libc::in6_addr { s6_addr: addr.ip().octets() };
+  _addr.sin6_addr = libc::in6_addr { s6_addr: addr.ip().octets() };
 
   _addr
 }
@@ -228,8 +224,7 @@ pub(crate) fn socket_addr_buf_from_storage(
   {
     // SAFETY: `storage` points to a valid initialized sockaddr storage value
     // received from the OS, and the helper only reads from it.
-    let std_addr =
-      unsafe { libc_socketaddr_into_std_raw(storage) }?;
+    let std_addr = unsafe { libc_socketaddr_into_std_raw(storage) }?;
     return Ok(crate::backend::op::socket_addr_into_buf(std_addr));
   }
 
@@ -246,7 +241,7 @@ pub(crate) fn socket_addr_buf_from_storage(
     let bytes = unsafe {
       std::slice::from_raw_parts(unix.sun_path.as_ptr().cast::<u8>(), path_len)
     };
-    return unix_socket_addr_buf(bytes);
+    return crate::backend::op::unix_socket_addr_buf(bytes);
   }
 
   Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
@@ -262,22 +257,4 @@ pub(crate) fn socket_addr_to_storage(
     SocketAddr::V6(_) => mem::size_of::<libc::sockaddr_in6>(),
   } as libc::socklen_t;
   (storage, len)
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SocketAddrBuf helpers
-// ═══════════════════════════════════════════════════════════════════════════════
-
-pub(crate) fn unix_socket_addr_buf(
-  path: &[u8],
-) -> io::Result<SocketAddrBuf> {
-  if path.len() >= 108 {
-    return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
-  }
-  let mut buf = SocketAddrBuf::unspecified();
-  buf.family = SocketAddrFamily::Unix;
-  buf.unix_path_len = path.len() as u16;
-  buf.unix_path[..path.len()].copy_from_slice(path);
-  Ok(buf)
 }

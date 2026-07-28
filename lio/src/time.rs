@@ -92,6 +92,11 @@ impl TimeManager {
     self.clock.schedule_at(id, self.deadline_ticks_after(duration));
   }
 
+  /// Returns whether no active or pending timers are tracked.
+  pub fn is_empty(&self) -> bool {
+    self.clock.is_empty()
+  }
+
   /// Returns the duration until the next timer fires, if any.
   pub fn next_deadline(&self) -> Option<Duration> {
     self.clock.earliest_active_deadline().map(|deadline_ticks| {

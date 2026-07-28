@@ -48,8 +48,7 @@ use crate::{
   Lio,
   api::{
     self, FileStat, FileType, ReadDirBuf, RecvFlags, SendFlags, ShutdownHow,
-    SockDomain, SockProto, SockType,
-    resource::Resource,
+    SockDomain, SockProto, SockType, resource::Resource,
   },
   backend::impls::sockaddr::std_socketaddr_into_libc,
 };
@@ -172,6 +171,11 @@ pub unsafe extern "C" fn lio_sockaddr_free(addr: *mut libc::sockaddr_storage) {
 }
 
 /// Free a directory entry array returned by [`lio_readdir`].
+///
+/// # Safety
+/// `entries` must be null or the pointer returned by [`lio_readdir`], and
+/// `len` must be the length returned with that pointer. The entries must not be
+/// used after this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_dir_entries_free(
   entries: *mut lio_dir_entry_t,
@@ -361,6 +365,10 @@ fn socket_parts_from_ffi(
 }
 
 /// Shut down part of a full-duplex connection.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `fd` must be a valid open socket that
+/// remains open until the operation completes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_shutdown(
   lio: *mut lio_handle_t,
@@ -384,6 +392,10 @@ pub unsafe extern "C" fn lio_shutdown(
 }
 
 /// Synchronize a file's in-core state with the storage device.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `fd` must be a valid open file descriptor
+/// that remains open until the operation completes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_fsync(
   lio: *mut lio_handle_t,
@@ -397,6 +409,11 @@ pub unsafe extern "C" fn lio_fsync(
 }
 
 /// Bind a socket to an address.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `fd` must be a valid open socket. If
+/// `sock` is non-null, it must point to a readable socket address of at least
+/// `sock_len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_bind(
   lio: *mut lio_handle_t,
@@ -419,6 +436,10 @@ pub unsafe extern "C" fn lio_bind(
 }
 
 /// Listen for connections on a socket.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `fd` must be a valid open socket that
+/// remains open until the operation completes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_listen(
   lio: *mut lio_handle_t,
@@ -828,6 +849,12 @@ pub unsafe extern "C" fn lio_recv(
 }
 
 /// Receive data and sender address from a socket.
+///
+/// Ownership of `buf` transfers to lio and is returned through `callback`.
+///
+/// # Safety
+/// `lio` must be a valid handle; `fd` must be a valid open socket; and `buf`
+/// must be a live buffer allocated by [`lio_buf_alloc`] with length `buf_len`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_recvfrom(
   lio: *mut lio_handle_t,
@@ -920,6 +947,9 @@ pub unsafe extern "C" fn lio_sleep(
 }
 
 /// Runs an interval and invokes `callback` for every tick until the lio handle is destroyed.
+///
+/// # Safety
+/// `lio` must be a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_interval(
   lio: *mut lio_handle_t,
@@ -1394,6 +1424,11 @@ pub unsafe extern "C" fn lio_mkdirat(
 }
 
 /// Reads metadata for a path relative to a directory file descriptor.
+///
+/// # Safety
+/// `lio` must be a valid handle; `dir_fd` must be a valid open directory file
+/// descriptor; and a non-null `path` must point to a valid NUL-terminated
+/// string. The descriptor must remain open until the operation completes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_statat(
   lio: *mut lio_handle_t,
@@ -1418,6 +1453,10 @@ pub unsafe extern "C" fn lio_statat(
 }
 
 /// Reads metadata for an open file descriptor.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `fd` must be a valid open file descriptor
+/// that remains open until the operation completes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_fstat(
   lio: *mut lio_handle_t,
@@ -1436,6 +1475,14 @@ pub unsafe extern "C" fn lio_fstat(
 }
 
 /// Reads the target of a symbolic link relative to a directory file descriptor.
+///
+/// Ownership of `buf` transfers to lio and is returned through `callback`.
+///
+/// # Safety
+/// `lio` must be a valid handle; `dir_fd` must be a valid open directory file
+/// descriptor; a non-null `path` must point to a valid NUL-terminated string;
+/// and `buf` must be a live buffer allocated by [`lio_buf_alloc`] with length
+/// `buf_len`. The descriptor must remain open until the operation completes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_readlinkat(
   lio: *mut lio_handle_t,
@@ -1466,6 +1513,12 @@ pub unsafe extern "C" fn lio_readlinkat(
 }
 
 /// Reads the current working directory into a caller-provided buffer.
+///
+/// Ownership of `buf` transfers to lio and is returned through `callback`.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `buf` must be a live buffer allocated by
+/// [`lio_buf_alloc`] with length `buf_len`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_getcwd(
   lio: *mut lio_handle_t,
@@ -1489,6 +1542,13 @@ pub unsafe extern "C" fn lio_getcwd(
 }
 
 /// Reads one batch of directory entries from an open directory descriptor.
+///
+/// The buffers returned through `callback` must be released with
+/// [`lio_buf_free`] and [`lio_dir_entries_free`], respectively.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `fd` must be a valid open directory file
+/// descriptor that remains open until the operation completes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_readdir(
   lio: *mut lio_handle_t,
@@ -1546,6 +1606,12 @@ pub unsafe extern "C" fn lio_readdir(
   });
 }
 
+/// Spawn a process.
+///
+/// # Safety
+/// `lio` must be a valid handle. A non-null `path` must point to a valid
+/// NUL-terminated string. `argv` and `envp` must each be null or point to a
+/// null-terminated array of pointers to valid NUL-terminated strings.
 #[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_spawn(

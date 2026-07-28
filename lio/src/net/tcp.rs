@@ -336,7 +336,7 @@ impl TcpStream {
   ///     result?;
   ///
   ///     // Shutdown write side to signal end of request
-  ///     socket.shutdown(libc::SHUT_WR).await?;
+  ///     socket.shutdown(lio::api::ShutdownHow::Write).await?;
   ///
   ///     // Can still receive the response
   ///     let buffer = vec![0u8; 4096];

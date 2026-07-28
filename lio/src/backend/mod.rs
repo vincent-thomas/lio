@@ -105,7 +105,7 @@ use crate::backend::op::Op;
 ///
 /// This type is returned by backend handlers when an operation completes,
 /// containing the operation ID and its result.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct OpCompleted {
   registration_id: u64,
   result: isize,
@@ -118,14 +118,17 @@ impl OpCompleted {
   ///
   /// - `op_id`: The unique ID of the operation
   /// - `result`: The operation result (non-negative for success, negative errno for error)
+  #[inline]
   pub fn new(op_id: u64, result: isize) -> Self {
     Self { registration_id: op_id, result }
   }
 
+  #[inline]
   pub fn result(&self) -> isize {
     self.result
   }
 
+  #[inline]
   pub fn registration_id(&self) -> u64 {
     self.registration_id
   }

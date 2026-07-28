@@ -466,7 +466,8 @@ impl Poller {
       dst.iov_len = src.len;
     }
 
-    let addr = msg.to.map(crate::backend::impls::sockaddr::socket_addr_to_storage);
+    let addr =
+      msg.to.map(crate::backend::impls::sockaddr::socket_addr_to_storage);
     let hdr = libc::msghdr {
       msg_name: std::ptr::null_mut(),
       msg_namelen: 0,
@@ -1150,7 +1151,8 @@ impl Poller {
         }
       }
       Op::Bind { fd, addr } => {
-        let storage = crate::api::ops::std_socketaddr_into_libc(*addr);
+        let storage =
+          crate::backend::impls::sockaddr::std_socketaddr_into_libc(*addr);
         let len = match addr {
           SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>(),
           SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>(),
