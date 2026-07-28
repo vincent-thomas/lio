@@ -5,7 +5,7 @@
 )]
 
 use super::common::{self, poll_recv};
-use lio::api::resource::Resource;
+use lio::api::{ShutdownHow, resource::Resource};
 use lio::{Lio, api};
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
@@ -61,7 +61,7 @@ fn test_shutdown_write() {
 
   // Shutdown write on client
   let mut shutdown_recv =
-    api::shutdown(&client_sock, libc::SHUT_WR).with_lio(&mut lio).send();
+    api::shutdown(&client_sock, ShutdownHow::Write).with_lio(&mut lio).send();
 
   poll_recv(&mut lio, &mut shutdown_recv).unwrap();
 
@@ -143,7 +143,7 @@ fn test_shutdown_read() {
 
   // Shutdown read on client
   let mut shutdown_recv =
-    api::shutdown(&client_sock, libc::SHUT_RD).with_lio(&mut lio).send();
+    api::shutdown(&client_sock, ShutdownHow::Read).with_lio(&mut lio).send();
 
   poll_recv(&mut lio, &mut shutdown_recv).unwrap();
 
@@ -214,7 +214,7 @@ fn test_shutdown_both() {
 
   // Shutdown both directions on client
   let mut shutdown_recv =
-    api::shutdown(&client_sock, libc::SHUT_RDWR).with_lio(&mut lio).send();
+    api::shutdown(&client_sock, ShutdownHow::Both).with_lio(&mut lio).send();
 
   poll_recv(&mut lio, &mut shutdown_recv).expect("Failed to shutdown both");
 
@@ -250,7 +250,7 @@ fn test_shutdown_invalid_fd() {
 
   // Try to shutdown an invalid file descriptor
   let mut shutdown_recv =
-    api::shutdown(&unsafe { Resource::from_raw_fd(-1) }, libc::SHUT_RDWR)
+    api::shutdown(&unsafe { Resource::from_raw_fd(-1) }, ShutdownHow::Both)
       .with_lio(&mut lio)
       .send();
 
@@ -307,7 +307,7 @@ fn test_shutdown_after_close() {
   // Try to shutdown after close (should fail)
   // Note: We create a new Resource with the same (now invalid) fd for testing
   let mut shutdown_recv =
-    api::shutdown(&unsafe { Resource::from_raw_fd(-1) }, libc::SHUT_RDWR)
+    api::shutdown(&unsafe { Resource::from_raw_fd(-1) }, ShutdownHow::Both)
       .with_lio(&mut lio)
       .send();
 
@@ -366,14 +366,14 @@ fn test_shutdown_twice() {
 
   // First shutdown
   let mut shutdown_recv =
-    api::shutdown(&client_sock, libc::SHUT_WR).with_lio(&mut lio).send();
+    api::shutdown(&client_sock, ShutdownHow::Write).with_lio(&mut lio).send();
 
   poll_recv(&mut lio, &mut shutdown_recv)
     .expect("First shutdown should succeed");
 
   // Second shutdown on same direction
   let mut shutdown_recv2 =
-    api::shutdown(&client_sock, libc::SHUT_WR).with_lio(&mut lio).send();
+    api::shutdown(&client_sock, ShutdownHow::Write).with_lio(&mut lio).send();
 
   let result = poll_recv(&mut lio, &mut shutdown_recv2);
   // Some systems allow this, some don't - just verify it doesn't crash
@@ -431,7 +431,7 @@ fn test_shutdown_sequential_directions() {
 
   // Shutdown write first
   let mut shutdown_recv =
-    api::shutdown(&client_sock, libc::SHUT_WR).with_lio(&mut lio).send();
+    api::shutdown(&client_sock, ShutdownHow::Write).with_lio(&mut lio).send();
 
   poll_recv(&mut lio, &mut shutdown_recv).expect("Failed to shutdown write");
 
@@ -454,7 +454,7 @@ fn test_shutdown_sequential_directions() {
 
   // Now shutdown read
   let mut shutdown_recv2 =
-    api::shutdown(&client_sock, libc::SHUT_RD).with_lio(&mut lio).send();
+    api::shutdown(&client_sock, ShutdownHow::Read).with_lio(&mut lio).send();
 
   poll_recv(&mut lio, &mut shutdown_recv2).expect("Failed to shutdown read");
 
@@ -511,7 +511,7 @@ fn test_shutdown_before_data_sent() {
 
   // Shutdown immediately after connection, before any data transfer
   let mut shutdown_recv =
-    api::shutdown(&client_sock, libc::SHUT_RDWR).with_lio(&mut lio).send();
+    api::shutdown(&client_sock, ShutdownHow::Both).with_lio(&mut lio).send();
 
   poll_recv(&mut lio, &mut shutdown_recv)
     .expect("Shutdown should succeed on fresh connection");
@@ -576,7 +576,7 @@ fn test_shutdown_ipv6() {
 
   // Shutdown write on IPv6 socket
   let mut shutdown_recv =
-    api::shutdown(&client_sock, libc::SHUT_WR).with_lio(&mut lio).send();
+    api::shutdown(&client_sock, ShutdownHow::Write).with_lio(&mut lio).send();
 
   poll_recv(&mut lio, &mut shutdown_recv)
     .expect("Failed to shutdown IPv6 socket");
@@ -639,7 +639,7 @@ fn test_shutdown_concurrent() {
 
     // Shutdown
     let mut shutdown_recv =
-      api::shutdown(&client_sock, libc::SHUT_RDWR).with_lio(&mut lio).send();
+      api::shutdown(&client_sock, ShutdownHow::Both).with_lio(&mut lio).send();
 
     poll_recv(&mut lio, &mut shutdown_recv)
       .expect("Concurrent shutdown failed");
@@ -705,7 +705,7 @@ fn test_shutdown_with_pending_data() {
 
   // Shutdown write immediately (data may still be in transit)
   let mut shutdown_recv =
-    api::shutdown(&client_sock, libc::SHUT_WR).with_lio(&mut lio).send();
+    api::shutdown(&client_sock, ShutdownHow::Write).with_lio(&mut lio).send();
 
   poll_recv(&mut lio, &mut shutdown_recv).expect("Shutdown should succeed");
 

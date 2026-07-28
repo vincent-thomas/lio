@@ -114,7 +114,7 @@ fn with_flags() {
   send_all(&client_sock, &data);
 
   let (sender_recv, receiver_recv) = mpsc::channel();
-  api::recv(&accepted_fd, vec![0u8; 64], Some(0))
+  api::recv(&accepted_fd, vec![0u8; 64], None)
     .with_lio(&mut lio)
     .send_with(sender_recv);
 

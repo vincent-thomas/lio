@@ -8,7 +8,7 @@ type DatagramRecvDone = Rc<RefCell<Option<(Vec<u8>, Option<SocketAddr>)>>>;
 
 use lio::{
   Lio,
-  api::Receiver,
+  api::{Receiver, SockDomain, SockProto, SockType},
   backend::ds::{DSConfig, DSNetworkFaults, DST},
   net::Socket,
 };
@@ -34,8 +34,10 @@ impl ReceiverNode {
 
   fn drive(&mut self, bind_addr: SocketAddr) {
     if self.socket_rx.is_none() && self.socket.is_none() {
-      self.socket_rx =
-        Some(Socket::new(libc::AF_INET, libc::SOCK_DGRAM, 0).send());
+      self.socket_rx = Some(
+        Socket::new(SockDomain::IPV4, SockType::DGRAM, SockProto::DEFAULT)
+          .send(),
+      );
     }
 
     if self.socket.is_none()
@@ -99,8 +101,10 @@ impl SenderNode {
 
   fn drive(&mut self, bind_addr: SocketAddr, peer_addr: SocketAddr) {
     if self.socket_rx.is_none() && self.socket.is_none() {
-      self.socket_rx =
-        Some(Socket::new(libc::AF_INET, libc::SOCK_DGRAM, 0).send());
+      self.socket_rx = Some(
+        Socket::new(SockDomain::IPV4, SockType::DGRAM, SockProto::DEFAULT)
+          .send(),
+      );
     }
 
     if self.socket.is_none()

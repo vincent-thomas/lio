@@ -175,7 +175,7 @@ pub struct Resource(Arc<InnerResource>);
 ///     // Use the resource...
 /// }
 ///
-/// let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+/// let socket = Socket::new(lio::api::SockDomain::IPV4, lio::api::SockType::STREAM, lio::api::SockProto::DEFAULT).await?;
 /// take_resource(socket);
 /// ```
 pub trait IntoResource {
@@ -201,7 +201,7 @@ pub trait IntoResource {
 ///     println!("Resource count: {}", resource.count());
 /// }
 ///
-/// let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+/// let socket = Socket::new(lio::api::SockDomain::IPV4, lio::api::SockType::STREAM, lio::api::SockProto::DEFAULT).await?;
 /// inspect_resource(&socket);
 /// // socket is still usable here
 /// ```

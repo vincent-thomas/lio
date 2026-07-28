@@ -197,6 +197,7 @@ where
   ///     Ok(())
   /// }
   /// ```
+  #[inline]
   pub fn when_done<F>(self, f: F)
   where
     F: Fn(T::Item) + 'static,
@@ -220,6 +221,7 @@ enum LioHandle {
 }
 
 impl LioHandle {
+  #[inline]
   fn into_lio(self) -> Lio {
     match self {
       LioHandle::GloballyInstalled => driver::get_global().expect(
@@ -370,6 +372,7 @@ where
   ///
   /// The returned Io has no Lio instance bound. You must call
   /// `.with_lio()` before consuming the operation.
+  #[inline]
   pub fn from_op(op: T) -> Self {
     Self { op, handle: LioHandle::GloballyInstalled }
   }
@@ -390,10 +393,12 @@ where
   ///     .with_lio(&lio)
   ///     .send();
   /// ```
+  #[inline]
   pub fn with_lio(self, lio: &Lio) -> Self {
     Io { op: self.op, handle: LioHandle::Custom(lio.clone()) }
   }
 
+  #[inline]
   fn into_lio(self) -> (Lio, T) {
     let lio = self.handle.into_lio();
     (lio, self.op)

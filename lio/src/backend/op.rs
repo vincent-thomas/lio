@@ -4,7 +4,7 @@
 //! as pure data. Backends match on this enum to execute operations.
 
 use crate::api::resource::Resource;
-use std::ffi::c_char;
+use std::ffi::OsString;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -17,27 +17,6 @@ impl SockDomain {
   pub const IPV4: Self = Self(1);
   pub const IPV6: Self = Self(2);
   pub const UNIX: Self = Self(3);
-
-  pub fn from_raw(raw: i32) -> Result<Self, i32> {
-    if raw == raw_af_inet() {
-      Ok(Self::IPV4)
-    } else if raw == raw_af_inet6() {
-      Ok(Self::IPV6)
-    } else if raw_af_unix().ok() == Some(raw) {
-      Ok(Self::UNIX)
-    } else {
-      Err(libc::EAFNOSUPPORT)
-    }
-  }
-
-  pub fn to_raw(self) -> Result<i32, i32> {
-    match self {
-      Self::IPV4 => Ok(raw_af_inet()),
-      Self::IPV6 => Ok(raw_af_inet6()),
-      Self::UNIX => raw_af_unix(),
-      _ => Err(libc::EAFNOSUPPORT),
-    }
-  }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,24 +25,6 @@ pub struct SockType(u8);
 impl SockType {
   pub const STREAM: Self = Self(1);
   pub const DGRAM: Self = Self(2);
-
-  pub fn from_raw(raw: i32) -> Result<Self, i32> {
-    if raw == raw_sock_stream() {
-      Ok(Self::STREAM)
-    } else if raw == raw_sock_dgram() {
-      Ok(Self::DGRAM)
-    } else {
-      Err(libc::EINVAL)
-    }
-  }
-
-  pub fn to_raw(self) -> Result<i32, i32> {
-    match self {
-      Self::STREAM => Ok(raw_sock_stream()),
-      Self::DGRAM => Ok(raw_sock_dgram()),
-      _ => Err(libc::EINVAL),
-    }
-  }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,24 +34,102 @@ impl SockProto {
   pub const DEFAULT: Self = Self(0);
   pub const TCP: Self = Self(1);
   pub const UDP: Self = Self(2);
+}
 
-  pub fn from_raw(raw: i32) -> Result<Self, i32> {
-    if raw == raw_proto_default() {
-      Ok(Self::DEFAULT)
-    } else if raw == raw_proto_tcp() {
-      Ok(Self::TCP)
-    } else if raw == raw_proto_udp() {
-      Ok(Self::UDP)
-    } else {
-      Err(libc::EPROTONOSUPPORT)
+macro_rules! op_flags {
+  ($name:ident) => {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct $name(i32);
+
+    impl $name {
+      pub const EMPTY: Self = Self(0);
+
+      pub const fn from_bits(bits: i32) -> Option<Self> {
+        if bits < 0 { None } else { Some(Self(bits)) }
+      }
+
+      pub const fn bits(self) -> i32 {
+        self.0
+      }
     }
+  };
+}
+
+op_flags!(ReadFlags);
+op_flags!(WriteFlags);
+op_flags!(RecvFlags);
+op_flags!(SendFlags);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpenFlags(i32);
+
+impl OpenFlags {
+  pub const EMPTY: Self = Self(0);
+
+  pub const fn from_bits(bits: i32) -> Self {
+    Self(bits)
   }
+
+  pub const fn bits(self) -> i32 {
+    self.0
+  }
+}
+
+impl From<i32> for OpenFlags {
+  fn from(bits: i32) -> Self {
+    Self::from_bits(bits)
+  }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileMode(u32);
+
+impl FileMode {
+  pub const fn from_bits(bits: u32) -> Self {
+    Self(bits)
+  }
+
+  pub const fn bits(self) -> u32 {
+    self.0
+  }
+}
+
+impl From<u32> for FileMode {
+  fn from(bits: u32) -> Self {
+    Self::from_bits(bits)
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnlinkKind {
+  File,
+  Directory,
+}
+
+impl From<i32> for UnlinkKind {
+  fn from(flags: i32) -> Self {
+    if flags == libc::AT_REMOVEDIR { Self::Directory } else { Self::File }
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownHow {
+  Read,
+  Write,
+  Both,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkKind {
   Hard,
   Soft,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpawnSpec {
+  pub program: OsString,
+  pub args: Vec<OsString>,
+  pub env: Option<Vec<OsString>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +163,20 @@ impl SocketAddrBuf {
       unix_path: [0; 108],
     }
   }
+}
+
+pub fn unix_socket_addr_buf(path: &[u8]) -> io::Result<SocketAddrBuf> {
+  if path.len() >= 108 {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidInput,
+      "Unix socket path exceeds 107 bytes",
+    ));
+  }
+  let mut buf = SocketAddrBuf::unspecified();
+  buf.family = SocketAddrFamily::Unix;
+  buf.unix_path_len = path.len() as u16;
+  buf.unix_path[..path.len()].copy_from_slice(path);
+  Ok(buf)
 }
 
 pub fn socket_addr_into_buf(addr: SocketAddr) -> SocketAddrBuf {
@@ -174,102 +227,11 @@ pub fn socket_addr_from_buf(buf: &SocketAddrBuf) -> io::Result<SocketAddr> {
   }
 }
 
-#[cfg(unix)]
-pub fn unix_socket_addr_buf(path: &[u8]) -> io::Result<SocketAddrBuf> {
-  if path.len() >= 108 {
-    return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
-  }
-  let mut buf = SocketAddrBuf::unspecified();
-  buf.family = SocketAddrFamily::Unix;
-  buf.unix_path_len = path.len() as u16;
-  buf.unix_path[..path.len()].copy_from_slice(path);
-  Ok(buf)
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+// Abstract type → raw OS constant conversion (platform-independent contract)
+// ═══════════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "backend_impls")]
-pub(crate) fn socket_addr_buf_to_storage(
-  addr: &SocketAddrBuf,
-) -> io::Result<(libc::sockaddr_storage, libc::socklen_t)> {
-  match addr.family {
-    SocketAddrFamily::Ipv4 | SocketAddrFamily::Ipv6 => {
-      let std_addr = socket_addr_from_buf(addr)?;
-      Ok(socket_addr_to_storage(std_addr))
-    }
-    #[cfg(unix)]
-    SocketAddrFamily::Unix => {
-      // SAFETY: `sockaddr_storage` is plain old data and may be zero-initialized.
-      let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-      // SAFETY: a `sockaddr_un` fits inside `sockaddr_storage` and we only
-      // write fields belonging to the Unix socket representation.
-      let unix =
-        unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_un) };
-      unix.sun_family = libc::AF_UNIX as libc::sa_family_t;
-      let len = addr.unix_path_len as usize;
-      for (dst, src) in
-        unix.sun_path[..len].iter_mut().zip(addr.unix_path[..len].iter())
-      {
-        *dst = *src as libc::c_char;
-      }
-      let socklen =
-        (std::mem::size_of::<libc::sa_family_t>() + len + 1) as libc::socklen_t;
-      Ok((storage, socklen))
-    }
-    #[cfg(not(unix))]
-    SocketAddrFamily::Unix => {
-      Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
-    }
-    SocketAddrFamily::Unspecified => {
-      Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
-    }
-  }
-}
-
-#[cfg(feature = "backend_impls")]
-pub(crate) fn socket_addr_buf_from_storage(
-  storage: &libc::sockaddr_storage,
-  len: libc::socklen_t,
-) -> io::Result<SocketAddrBuf> {
-  if storage.ss_family == raw_af_inet() as libc::sa_family_t
-    || storage.ss_family == raw_af_inet6() as libc::sa_family_t
-  {
-    // SAFETY: `storage` points to a valid initialized sockaddr storage value
-    // received from the OS, and the helper only reads from it.
-    let std_addr =
-      unsafe { crate::api::ops::libc_socketaddr_into_std_raw(storage) }?;
-    return Ok(socket_addr_into_buf(std_addr));
-  }
-
-  #[cfg(unix)]
-  if storage.ss_family == raw_af_unix().unwrap_or_default() as libc::sa_family_t
-  {
-    // SAFETY: when `ss_family` is AF_UNIX, the storage bytes are laid out as
-    // a `sockaddr_un`.
-    let unix = unsafe { &*(storage as *const _ as *const libc::sockaddr_un) };
-    let base = std::mem::size_of::<libc::sa_family_t>();
-    let path_len = (len as usize).saturating_sub(base).saturating_sub(1);
-    // SAFETY: `sun_path` is valid for `path_len` bytes as computed from the
-    // sockaddr length returned by the OS.
-    let bytes = unsafe {
-      std::slice::from_raw_parts(unix.sun_path.as_ptr().cast::<u8>(), path_len)
-    };
-    return unix_socket_addr_buf(bytes);
-  }
-
-  Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
-}
-
-pub fn socket_from_raw(
-  domain: i32,
-  ty: i32,
-  proto: i32,
-) -> Result<(SockDomain, SockType, SockProto), i32> {
-  let domain = SockDomain::from_raw(domain)?;
-  let ty = SockType::from_raw(ty)?;
-  let proto = SockProto::from_raw(proto)?;
-  let _ = socket_to_raw(domain, ty, proto)?;
-  Ok((domain, ty, proto))
-}
-
+/// Translates abstract socket domain/type/proto to raw OS constants.
 pub fn socket_to_raw(
   domain: SockDomain,
   ty: SockType,
@@ -280,7 +242,12 @@ pub fn socket_to_raw(
     return Err(libc::EINVAL);
   }
 
-  let domain = domain.to_raw()?;
+  let domain = match domain {
+    SockDomain::IPV4 => raw_af_inet(),
+    SockDomain::IPV6 => raw_af_inet6(),
+    SockDomain::UNIX => raw_af_unix()?,
+    _ => return Err(libc::EAFNOSUPPORT),
+  };
 
   let (ty, proto) = match (ty, proto) {
     (SockType::STREAM, SockProto::DEFAULT) => {
@@ -295,18 +262,6 @@ pub fn socket_to_raw(
   };
 
   Ok((domain, ty, proto))
-}
-
-#[cfg(feature = "backend_impls")]
-pub(crate) fn socket_addr_to_storage(
-  addr: SocketAddr,
-) -> (libc::sockaddr_storage, libc::socklen_t) {
-  let storage = crate::api::ops::std_socketaddr_into_libc(addr);
-  let len = match addr {
-    SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>(),
-    SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>(),
-  } as libc::socklen_t;
-  (storage, len)
 }
 
 #[cfg(unix)]
@@ -696,7 +651,7 @@ impl FileStat {
 
 #[derive(Clone, Debug)]
 pub enum StatTarget {
-  Path { dir_fd: Resource, path: NonNull<c_char>, follow_symlinks: bool },
+  Path { dir_fd: Resource, path: OsString, follow_symlinks: bool },
   Fd { fd: Resource },
 }
 
@@ -770,8 +725,8 @@ pub enum Op {
     iov_count: usize,
     /// File offset (-1 for current position)
     offset: i64,
-    /// Read flags (RWF_HIPRI, RWF_NOWAIT, etc. - 0 if none)
-    flags: i32,
+    /// Backend-interpreted read flags.
+    flags: ReadFlags,
   },
 
   /// Generic write operation supporting all write variants.
@@ -793,8 +748,8 @@ pub enum Op {
     iov_count: usize,
     /// File offset (-1 for current position)
     offset: i64,
-    /// Write flags (RWF_DSYNC, RWF_SYNC, etc. - 0 if none)
-    flags: i32,
+    /// Backend-interpreted write flags.
+    flags: WriteFlags,
   },
 
   /// Generic receive operation supporting all recv variants.
@@ -811,8 +766,8 @@ pub enum Op {
     fd: Resource,
     /// Portable message descriptor lowered by the backend.
     msg: MsgRecv,
-    /// Send flags (MSG_NOSIGNAL, MSG_MORE, MSG_DONTWAIT, etc.)
-    flags: i32,
+    /// Backend-interpreted receive flags.
+    flags: RecvFlags,
   },
 
   /// Generic send operation supporting all send variants.
@@ -829,8 +784,8 @@ pub enum Op {
     fd: Resource,
     /// Portable message descriptor lowered by the backend.
     msg: MsgSend,
-    /// Send flags (MSG_NOSIGNAL, MSG_MORE, MSG_DONTWAIT, etc.)
-    flags: i32,
+    /// Backend-interpreted send flags.
+    flags: SendFlags,
   },
 
   /// Read metadata for either a path lookup or an already-open file descriptor.
@@ -911,12 +866,12 @@ pub enum Op {
   OpenAt {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
-    /// Null-terminated pathname pointer.
-    path: NonNull<c_char>,
-    /// Open flags passed to `openat(2)`.
-    flags: i32,
-    /// File creation mode used when `O_CREAT` is set.
-    mode: u32,
+    /// Platform-native path.
+    path: OsString,
+    /// Semantic open flags.
+    flags: OpenFlags,
+    /// File creation mode used when creating a file.
+    mode: FileMode,
   },
   /// Remove a file or directory relative to a directory file descriptor.
   ///
@@ -925,10 +880,10 @@ pub enum Op {
   UnlinkAt {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
-    /// Null-terminated pathname pointer.
-    path: NonNull<c_char>,
-    /// Flags passed to `unlinkat(2)`.
-    flags: i32,
+    /// Platform-native path.
+    path: OsString,
+    /// Whether to remove a file-like object or directory.
+    kind: UnlinkKind,
   },
   /// Rename a file or directory relative to directory file descriptors.
   ///
@@ -938,11 +893,11 @@ pub enum Op {
     /// Directory file descriptor used as the base for the old path.
     old_dir_fd: Resource,
     /// Null-terminated old pathname pointer.
-    old_path: NonNull<c_char>,
+    old_path: OsString,
     /// Directory file descriptor used as the base for the new path.
     new_dir_fd: Resource,
     /// Null-terminated new pathname pointer.
-    new_path: NonNull<c_char>,
+    new_path: OsString,
   },
   /// Create a directory relative to a directory file descriptor.
   ///
@@ -951,10 +906,10 @@ pub enum Op {
   MkdirAt {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
-    /// Null-terminated pathname pointer.
-    path: NonNull<c_char>,
-    /// Mode passed to `mkdirat(2)`.
-    mode: u32,
+    /// Platform-native path.
+    path: OsString,
+    /// Directory creation mode.
+    mode: FileMode,
   },
   /// Create a hard or symbolic link relative to directory file descriptors.
   ///
@@ -966,11 +921,11 @@ pub enum Op {
     /// Directory file descriptor used as the base for the source path.
     source_dir_fd: Resource,
     /// Null-terminated source pathname pointer or symlink target string.
-    source_path: NonNull<c_char>,
+    source_path: OsString,
     /// Directory file descriptor used as the base for the new path.
     new_dir_fd: Resource,
     /// Null-terminated new pathname pointer.
-    new_path: NonNull<c_char>,
+    new_path: OsString,
   },
   /// Read the target of a symbolic link relative to a directory file descriptor.
   ///
@@ -981,35 +936,23 @@ pub enum Op {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
     /// Null-terminated pathname pointer.
-    path: NonNull<c_char>,
+    path: OsString,
     /// Output buffer pointer.
     buf: NonNull<u8>,
     /// Output buffer length.
     buf_len: usize,
   },
-  /// Read the current working directory into a caller-provided buffer.
-  ///
-  /// This is an immediate operation on readiness backends. On io_uring it is
-  /// completed through a userspace immediate syscall path because there is no
-  /// native opcode for `getcwd(3)`.
+  /// Read the current working directory as a platform-native string.
   GetCwd {
-    /// Output buffer pointer.
-    buf: NonNull<u8>,
-    /// Output buffer length.
-    buf_len: usize,
+    /// Output storage for the platform-native current working directory.
+    out: NonNull<OsString>,
   },
   /// Spawn a new process.
   ///
-  /// Uses `posix_spawn()` on Unix and completes immediately with the child PID
-  /// as the positive result.
+  /// The operation carries platform-neutral process data. Backends are
+  /// responsible for converting it to native process creation arguments.
   Spawn {
-    /// Path to executable (C string, owned by TypedOp).
-    path: NonNull<c_char>,
-    /// Argument vector (null-terminated array, owned by TypedOp).
-    argv: NonNull<*mut c_char>,
-    /// Environment vector (null-terminated array, owned by TypedOp).
-    /// Null means inherit the parent environment.
-    envp: Option<NonNull<*mut c_char>>,
+    spec: SpawnSpec,
   },
   /// Create a new socket descriptor.
   ///
@@ -1038,8 +981,8 @@ pub enum Op {
   Shutdown {
     /// Socket resource to shut down.
     fd: Resource,
-    /// Shutdown mode passed to shutdown(2).
-    how: i32,
+    /// Which side(s) of the socket to shut down.
+    how: ShutdownHow,
   },
   /// Synchronize a file's in-core state with stable storage.
   ///

@@ -40,8 +40,9 @@ pub mod pid;
 pub mod resource;
 
 pub use crate::backend::op::{
-  DirEntryRef, DirEntryView, FileStat, FileType, ReadDirBuf, ReadDirResult,
-  SockDomain, SockProto, SockType,
+  DirEntryRef, DirEntryView, FileMode, FileStat, FileType, OpenFlags,
+  ReadDirBuf, ReadDirResult, ReadFlags, RecvFlags, SendFlags, ShutdownHow,
+  SockDomain, SockProto, SockType, UnlinkKind, WriteFlags,
 };
 pub use io::{Io, IoStream, Receiver, StreamReceiver};
 pub use pid::Pid;
@@ -153,7 +154,7 @@ doc_op! {
     pub fn recv<B>(
         res: &impl AsResource,
         buf: B,
-        flags: Option<i32>,
+        flags: Option<RecvFlags>,
     ) -> Io<ops::Recv<B>>
     where
         B: IoBufMutVec + Send + Sync + 'static,
@@ -168,7 +169,7 @@ doc_op! {
     pub fn send<B>(
         res: &impl AsResource,
         buf: B,
-        flags: Option<i32>,
+        flags: Option<SendFlags>,
     ) -> Io<ops::Send<B>>
     where
         B: IoBufVec + Send + Sync + 'static,
@@ -185,7 +186,7 @@ doc_op! {
     pub fn recvfrom<B>(
         res: &impl AsResource,
         buf: B,
-        flags: Option<i32>,
+        flags: Option<RecvFlags>,
     ) -> Io<ops::RecvFrom<B>>
     where
         B: IoBufMutVec + Send + Sync + 'static,
@@ -242,7 +243,7 @@ doc_op! {
 
     pub fn shutdown(
         res: &impl AsResource,
-        how: i32,
+        how: ShutdownHow,
     ) -> Io<ops::Shutdown> {
         Io::from_op(ops::Shutdown::new(res.as_resource().clone(), how))
     }
@@ -254,14 +255,14 @@ doc_op! {
     pub fn openat(
         dir_res: &impl AsResource,
         path: std::ffi::CString,
-        flags: i32,
-        mode: u32
+        flags: impl Into<OpenFlags>,
+        mode: impl Into<FileMode>
     ) -> Io<ops::OpenAt> {
         Io::from_op(ops::OpenAt::new(
             dir_res.as_resource().clone(),
             path,
-            flags,
-            mode
+            flags.into(),
+            mode.into()
         ))
     }
 }
@@ -312,12 +313,12 @@ doc_op! {
     pub fn unlinkat(
         dir_res: &impl AsResource,
         path: std::ffi::CString,
-        flags: i32,
+        kind: impl Into<UnlinkKind>,
     ) -> Io<ops::UnlinkAt> {
         Io::from_op(ops::UnlinkAt::new(
             dir_res.as_resource().clone(),
             path,
-            flags,
+            kind.into(),
         ))
     }
 }
@@ -346,12 +347,12 @@ doc_op! {
     pub fn mkdirat(
         dir_res: &impl AsResource,
         path: std::ffi::CString,
-        mode: u32,
+        mode: impl Into<FileMode>,
     ) -> Io<ops::MkdirAt> {
         Io::from_op(ops::MkdirAt::new(
             dir_res.as_resource().clone(),
             path,
-            mode,
+            mode.into(),
         ))
     }
 }
@@ -437,7 +438,7 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn sendto<B>(res: &impl AsResource, buf: B, addr: SocketAddr, flags: Option<i32>) -> Io<ops::Send<B>>
+    pub fn sendto<B>(res: &impl AsResource, buf: B, addr: SocketAddr, flags: Option<SendFlags>) -> Io<ops::Send<B>>
     where
         B: IoBufVec + Send + Sync + 'static,
     {

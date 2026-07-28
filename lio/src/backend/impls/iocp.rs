@@ -239,11 +239,10 @@ impl Iocp {
 
       Op::Shutdown { fd, how } => {
         let handle = fd.as_raw_handle() as SOCKET;
-        // Map libc shutdown constants to Windows
-        let win_how = match *how {
-          0 => SD_RECEIVE, // SHUT_RD
-          1 => SD_SEND,    // SHUT_WR
-          _ => SD_BOTH,    // SHUT_RDWR
+        let win_how = match how {
+          crate::backend::op::ShutdownHow::Read => SD_RECEIVE,
+          crate::backend::op::ShutdownHow::Write => SD_SEND,
+          crate::backend::op::ShutdownHow::Both => SD_BOTH,
         };
         let result = unsafe { shutdown(handle, win_how) };
         if result == SOCKET_ERROR {
@@ -591,10 +590,12 @@ impl Iocp {
     };
 
     if result != INVALID_SOCKET {
-      if let Ok(addr) = crate::backend::op::socket_addr_buf_from_storage(
-        &storage,
-        len as libc::socklen_t,
-      ) {
+      if let Ok(addr) =
+        crate::backend::impls::sockaddr::socket_addr_buf_from_storage(
+          &storage,
+          len as libc::socklen_t,
+        )
+      {
         unsafe {
           *out_addr = addr;
         }
@@ -625,7 +626,8 @@ impl Iocp {
     };
 
     let socket = fd as SOCKET;
-    let (storage, len) = crate::backend::op::socket_addr_buf_to_storage(addr)?;
+    let (storage, len) =
+      crate::backend::impls::sockaddr::socket_addr_buf_to_storage(addr)?;
     let (addr_ptr, _) = sockaddr_storage_to_ptr(&storage);
 
     let result = unsafe { connect(socket, addr_ptr, len as i32) };

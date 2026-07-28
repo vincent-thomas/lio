@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Unique identifier for a timer (matches operation ID).
@@ -8,12 +8,8 @@ pub type TimerId = u64;
 pub(crate) const TICK_MS: u64 = 1;
 const TICK_NS: u128 = TICK_MS as u128 * 1_000_000;
 
-/// State of a timer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TimerState {
-  Active,
-  Fired,
-}
+const ACTIVE_TIMER: usize = usize::MAX;
+const EMPTY_TIMER: usize = usize::MAX - 1;
 
 /// Entry stored in a wheel slot.
 #[derive(Debug, Clone, Copy)]
@@ -35,11 +31,18 @@ impl<const SIZE: usize> Wheel<SIZE> {
   }
 
   fn insert(&mut self, slot: usize, entry: WheelEntry) {
-    self.slots[slot % SIZE].push(entry);
+    self.slots[slot].push(entry);
   }
 
   fn take_slot(&mut self, slot: usize) -> Vec<WheelEntry> {
-    std::mem::take(&mut self.slots[slot % SIZE])
+    std::mem::take(&mut self.slots[slot])
+  }
+
+  fn restore_slot(&mut self, slot: usize, entries: Vec<WheelEntry>) {
+    let slot = &mut self.slots[slot];
+    if slot.is_empty() {
+      *slot = entries;
+    }
   }
 }
 
@@ -47,7 +50,33 @@ impl<const SIZE: usize> Wheel<SIZE> {
 #[derive(Debug, Clone, Copy)]
 struct TimerEntry {
   deadline_ticks: u64,
-  state: TimerState,
+  /// Index assigned in `pending_fire`, or `ACTIVE_TIMER` before expiration.
+  /// Whether that index is still pending is determined by the drain cursor.
+  pending_index: usize,
+}
+
+/// Occupant of one operation-store slot. The full generational ID rejects
+/// stale wheel entries after the slot is reused.
+#[derive(Debug, Clone, Copy)]
+struct TimerSlot {
+  id: TimerId,
+  entry: TimerEntry,
+}
+
+impl TimerSlot {
+  const EMPTY: Self = Self {
+    id: 0,
+    entry: TimerEntry { deadline_ticks: 0, pending_index: EMPTY_TIMER },
+  };
+
+  fn is_occupied(&self) -> bool {
+    self.entry.pending_index != EMPTY_TIMER
+  }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingTimer {
+  id: TimerId,
 }
 
 /// Number of bits per wheel level (256 slots).
@@ -66,10 +95,15 @@ pub struct Clock {
   level3: Wheel<LEVEL_SIZE>,
   /// Current logical tick count.
   current_tick: u64,
-  timers: HashMap<TimerId, TimerEntry>,
-  active_deadline_counts: BTreeMap<u64, usize>,
-  pending_fire: Vec<TimerId>,
+  timers: Vec<TimerSlot>,
+  timer_count: usize,
+  /// Earliest active deadline and the number of timers sharing it.
+  earliest_deadline: Option<(u64, usize)>,
+  /// Counts for active deadlines later than `earliest_deadline`.
+  later_deadline_counts: BTreeMap<u64, usize>,
+  pending_fire: Vec<PendingTimer>,
   pending_index: usize,
+  pending_has_stale: bool,
 }
 
 impl Default for Clock {
@@ -94,18 +128,32 @@ impl Clock {
       level2: Wheel::new(),
       level3: Wheel::new(),
       current_tick: 0,
-      timers: HashMap::with_capacity(capacity),
-      active_deadline_counts: BTreeMap::new(),
+      timers: vec![TimerSlot::EMPTY; capacity],
+      timer_count: 0,
+      earliest_deadline: None,
+      later_deadline_counts: BTreeMap::new(),
       pending_fire: Vec::with_capacity(32),
       pending_index: 0,
+      pending_has_stale: false,
     }
   }
 
+  #[inline]
   fn duration_to_ticks(duration: Duration) -> u64 {
-    let ticks = duration.as_nanos().div_ceil(TICK_NS).max(1);
-    ticks.min(u64::MAX as u128) as u64
+    let nanos = duration.as_nanos();
+    if nanos <= TICK_NS {
+      return 1;
+    }
+    Self::long_duration_to_ticks(nanos)
   }
 
+  #[cold]
+  #[inline(never)]
+  fn long_duration_to_ticks(nanos: u128) -> u64 {
+    nanos.div_ceil(TICK_NS).min(u64::MAX as u128) as u64
+  }
+
+  #[inline]
   pub fn schedule(&mut self, id: TimerId, duration: Duration) {
     let duration_ticks = Self::duration_to_ticks(duration);
     let deadline_ticks = self.current_tick + duration_ticks.max(1);
@@ -113,20 +161,49 @@ impl Clock {
     self.schedule_at(id, deadline_ticks);
   }
 
+  #[inline]
   pub(crate) fn schedule_at(&mut self, id: TimerId, deadline_ticks: u64) {
     let deadline_ticks =
       deadline_ticks.max(self.current_tick.saturating_add(1));
 
-    if let Some(previous) = self.timers.get(&id).copied()
-      && previous.state == TimerState::Active
-    {
-      self.decrement_active_deadline(previous.deadline_ticks);
+    let slot_index = id as u32 as usize;
+    if slot_index >= self.timers.len() {
+      self.grow_timer_slots(slot_index + 1);
+    }
+    let entry = TimerEntry { deadline_ticks, pending_index: ACTIVE_TIMER };
+    let previous =
+      std::mem::replace(&mut self.timers[slot_index], TimerSlot { id, entry });
+
+    let previous_state = previous.entry.pending_index;
+    if previous_state >= EMPTY_TIMER {
+      if previous_state == EMPTY_TIMER {
+        self.activate_timer_slot();
+      } else {
+        self.replace_active_timer(previous.entry.deadline_ticks);
+      }
+    } else if self.pending_is_undelivered(previous.id, previous_state) {
+      self.pending_has_stale = true;
     }
     self.insert_timer(id, deadline_ticks);
-    self
-      .timers
-      .insert(id, TimerEntry { deadline_ticks, state: TimerState::Active });
     self.increment_active_deadline(deadline_ticks);
+  }
+
+  #[cold]
+  #[inline(never)]
+  fn grow_timer_slots(&mut self, required_len: usize) {
+    self.timers.resize(required_len, TimerSlot::EMPTY);
+  }
+
+  #[cold]
+  #[inline(never)]
+  fn replace_active_timer(&mut self, previous_deadline: u64) {
+    self.decrement_active_deadline(previous_deadline);
+  }
+
+  #[cold]
+  #[inline(never)]
+  fn activate_timer_slot(&mut self) {
+    self.timer_count += 1;
   }
 
   pub fn next_deadline(&self) -> Option<Duration> {
@@ -139,38 +216,54 @@ impl Clock {
     })
   }
 
+  #[inline]
   pub fn poll_expired(&mut self) -> impl Iterator<Item = TimerId> + '_ {
     ExpiredIterator { clock: self }
   }
 
+  #[inline]
   pub fn advance_to(&mut self, now_ticks: u64) {
     while self.current_tick < now_ticks {
       self.tick();
     }
   }
 
+  #[inline]
   pub fn advance_by(&mut self, ticks: u64) {
     self.advance_to(self.current_tick.saturating_add(ticks));
   }
 
   pub fn remove(&mut self, id: TimerId) -> bool {
-    let removed = self.timers.remove(&id);
-    if let Some(entry) = removed
-      && entry.state == TimerState::Active
-    {
-      self.decrement_active_deadline(entry.deadline_ticks);
+    let slot_index = id as u32 as usize;
+    let Some(slot) = self.timers.get_mut(slot_index) else {
+      return false;
+    };
+    if !slot.is_occupied() || slot.id != id {
+      return false;
     }
-    removed.is_some()
+    let timer = std::mem::replace(slot, TimerSlot::EMPTY);
+    self.timer_count -= 1;
+    if timer.entry.pending_index == ACTIVE_TIMER {
+      self.decrement_active_deadline(timer.entry.deadline_ticks);
+    } else if self.pending_is_undelivered(timer.id, timer.entry.pending_index) {
+      self.pending_has_stale = true;
+    }
+    true
   }
 
   pub(crate) fn current_tick(&self) -> u64 {
     self.current_tick
   }
 
-  pub(crate) fn earliest_active_deadline(&self) -> Option<u64> {
-    self.active_deadline_counts.first_key_value().map(|(&deadline, _)| deadline)
+  pub(crate) fn is_empty(&self) -> bool {
+    self.timer_count == 0
   }
 
+  pub(crate) fn earliest_active_deadline(&self) -> Option<u64> {
+    self.earliest_deadline.map(|(deadline, _)| deadline)
+  }
+
+  #[inline]
   fn insert_timer(&mut self, id: TimerId, deadline_ticks: u64) {
     let delta = deadline_ticks.saturating_sub(self.current_tick);
     let entry = WheelEntry { id, deadline_ticks };
@@ -178,33 +271,76 @@ impl Clock {
     if delta < Self::LEVEL0_RANGE {
       let slot = (deadline_ticks & LEVEL_MASK) as usize;
       self.level0.insert(slot, entry);
-    } else if delta < Self::LEVEL1_RANGE {
-      let slot = ((deadline_ticks >> LEVEL_BITS) & LEVEL_MASK) as usize;
+    } else {
+      self.insert_higher_timer(delta, entry);
+    }
+  }
+
+  #[cold]
+  #[inline(never)]
+  fn insert_higher_timer(&mut self, delta: u64, entry: WheelEntry) {
+    if delta < Self::LEVEL1_RANGE {
+      let slot = ((entry.deadline_ticks >> LEVEL_BITS) & LEVEL_MASK) as usize;
       self.level1.insert(slot, entry);
     } else if delta < Self::LEVEL2_RANGE {
-      let slot = ((deadline_ticks >> (LEVEL_BITS * 2)) & LEVEL_MASK) as usize;
+      let slot =
+        ((entry.deadline_ticks >> (LEVEL_BITS * 2)) & LEVEL_MASK) as usize;
       self.level2.insert(slot, entry);
     } else {
-      let slot = ((deadline_ticks >> (LEVEL_BITS * 3)) & LEVEL_MASK) as usize;
+      let slot =
+        ((entry.deadline_ticks >> (LEVEL_BITS * 3)) & LEVEL_MASK) as usize;
       self.level3.insert(slot, entry);
     }
   }
 
+  #[inline]
   fn increment_active_deadline(&mut self, deadline_ticks: u64) {
-    *self.active_deadline_counts.entry(deadline_ticks).or_insert(0) += 1;
+    match self.earliest_deadline {
+      None => self.earliest_deadline = Some((deadline_ticks, 1)),
+      Some((earliest, count)) if deadline_ticks == earliest => {
+        self.earliest_deadline = Some((earliest, count + 1));
+      }
+      Some((earliest, count)) if deadline_ticks < earliest => {
+        self.later_deadline_counts.insert(earliest, count);
+        self.earliest_deadline = Some((deadline_ticks, 1));
+      }
+      Some(_) => {
+        *self.later_deadline_counts.entry(deadline_ticks).or_insert(0) += 1;
+      }
+    }
   }
 
   fn decrement_active_deadline(&mut self, deadline_ticks: u64) {
-    let remove = match self.active_deadline_counts.get_mut(&deadline_ticks) {
-      Some(count) if *count > 1 => {
-        *count -= 1;
-        false
+    self.decrement_active_deadline_by(deadline_ticks, 1);
+  }
+
+  fn decrement_active_deadline_by(
+    &mut self,
+    deadline_ticks: u64,
+    amount: usize,
+  ) {
+    match self.earliest_deadline {
+      Some((earliest, count))
+        if deadline_ticks == earliest && count > amount =>
+      {
+        self.earliest_deadline = Some((earliest, count - amount));
       }
-      Some(_) => true,
-      None => false,
-    };
-    if remove {
-      self.active_deadline_counts.remove(&deadline_ticks);
+      Some((earliest, _)) if deadline_ticks == earliest => {
+        self.earliest_deadline = self.later_deadline_counts.pop_first();
+      }
+      _ => {
+        let remove = match self.later_deadline_counts.get_mut(&deadline_ticks) {
+          Some(count) if *count > amount => {
+            *count -= amount;
+            false
+          }
+          Some(_) => true,
+          None => false,
+        };
+        if remove {
+          self.later_deadline_counts.remove(&deadline_ticks);
+        }
+      }
     }
   }
 
@@ -212,89 +348,121 @@ impl Clock {
     self.current_tick += 1;
 
     let slot0 = (self.current_tick & LEVEL_MASK) as usize;
-    let slot1 = ((self.current_tick >> LEVEL_BITS) & LEVEL_MASK) as usize;
-    let slot2 = ((self.current_tick >> (LEVEL_BITS * 2)) & LEVEL_MASK) as usize;
-    let slot3 = ((self.current_tick >> (LEVEL_BITS * 3)) & LEVEL_MASK) as usize;
-
-    let entries = self.level0.take_slot(slot0);
-    self.process_entries(entries);
+    self.expire_level0_slot(slot0);
 
     if slot0 == 0 {
-      let entries = self.level1.take_slot(slot1);
-      self.cascade_entries(entries);
+      let slot1 = ((self.current_tick >> LEVEL_BITS) & LEVEL_MASK) as usize;
+      let mut entries = self.level1.take_slot(slot1);
+      self.process_entries(&mut entries);
+      self.level1.restore_slot(slot1, entries);
 
       if slot1 == 0 {
-        let entries = self.level2.take_slot(slot2);
-        self.cascade_entries(entries);
+        let slot2 =
+          ((self.current_tick >> (LEVEL_BITS * 2)) & LEVEL_MASK) as usize;
+        let mut entries = self.level2.take_slot(slot2);
+        self.process_entries(&mut entries);
+        self.level2.restore_slot(slot2, entries);
 
         if slot2 == 0 {
-          let entries = self.level3.take_slot(slot3);
-          self.cascade_entries(entries);
+          let slot3 =
+            ((self.current_tick >> (LEVEL_BITS * 3)) & LEVEL_MASK) as usize;
+          let mut entries = self.level3.take_slot(slot3);
+          self.process_entries(&mut entries);
+          self.level3.restore_slot(slot3, entries);
         }
       }
     }
   }
 
-  fn process_entries(&mut self, entries: Vec<WheelEntry>) {
-    for entry in entries {
-      let is_active = self.timers.get(&entry.id).is_some_and(|timer| {
-        timer.state == TimerState::Active
-          && timer.deadline_ticks == entry.deadline_ticks
-      });
+  fn expire_level0_slot(&mut self, slot: usize) {
+    let mut expired_count = 0;
+    let current_tick = self.current_tick;
+    let entries = &mut self.level0.slots[slot];
+    let timers = &mut self.timers;
+    let pending_fire = &mut self.pending_fire;
 
-      if !is_active {
+    for &entry in entries.iter() {
+      let slot_index = entry.id as u32 as usize;
+      // SAFETY: wheel entries are only created after their timer slot exists,
+      // and the timer-slot vector never shrinks.
+      let timer = unsafe { timers.get_unchecked_mut(slot_index) };
+      if timer.id != entry.id
+        || timer.entry.pending_index != ACTIVE_TIMER
+        || timer.entry.deadline_ticks != entry.deadline_ticks
+      {
+        continue;
+      }
+
+      assert!(entry.deadline_ticks <= current_tick);
+      timer.entry.pending_index = pending_fire.len();
+      expired_count += 1;
+      pending_fire.push(PendingTimer { id: entry.id });
+    }
+    entries.clear();
+
+    if expired_count != 0 {
+      self.decrement_active_deadline_by(current_tick, expired_count);
+    }
+  }
+
+  fn process_entries(&mut self, entries: &mut Vec<WheelEntry>) {
+    let mut expired_count = 0;
+    for entry in entries.drain(..) {
+      let slot_index = entry.id as u32 as usize;
+      // SAFETY: wheel entries are only created after their timer slot exists,
+      // and the timer-slot vector never shrinks.
+      let timer = unsafe { self.timers.get_unchecked_mut(slot_index) };
+      if timer.id != entry.id
+        || timer.entry.pending_index != ACTIVE_TIMER
+        || timer.entry.deadline_ticks != entry.deadline_ticks
+      {
         continue;
       }
 
       if entry.deadline_ticks <= self.current_tick {
-        if let Some(timer) = self.timers.get_mut(&entry.id) {
-          timer.state = TimerState::Fired;
-        }
-        self.decrement_active_deadline(entry.deadline_ticks);
-        self.pending_fire.push(entry.id);
+        timer.entry.pending_index = self.pending_fire.len();
+        expired_count += 1;
+        self.pending_fire.push(PendingTimer { id: entry.id });
       } else {
         self.insert_timer(entry.id, entry.deadline_ticks);
       }
     }
-  }
 
-  fn cascade_entries(&mut self, entries: Vec<WheelEntry>) {
-    for entry in entries {
-      let is_active = self.timers.get(&entry.id).is_some_and(|timer| {
-        timer.state == TimerState::Active
-          && timer.deadline_ticks == entry.deadline_ticks
-      });
-
-      if !is_active {
-        continue;
-      }
-
-      if entry.deadline_ticks <= self.current_tick {
-        if let Some(timer) = self.timers.get_mut(&entry.id) {
-          timer.state = TimerState::Fired;
-        }
-        self.decrement_active_deadline(entry.deadline_ticks);
-        self.pending_fire.push(entry.id);
-      } else {
-        self.insert_timer(entry.id, entry.deadline_ticks);
-      }
+    if expired_count != 0 {
+      // Active entries can only become due in the slot for the current tick.
+      self.decrement_active_deadline_by(self.current_tick, expired_count);
     }
   }
 
+  #[inline]
+  fn pending_is_undelivered(&self, id: TimerId, index: usize) -> bool {
+    index >= self.pending_index
+      && self.pending_fire.get(index).is_some_and(|timer| timer.id == id)
+  }
+
+  #[inline]
   fn pop_expired(&mut self) -> Option<TimerId> {
     while self.pending_index < self.pending_fire.len() {
-      let id = self.pending_fire[self.pending_index];
+      let pending = self.pending_fire[self.pending_index];
+      let index = self.pending_index;
       self.pending_index += 1;
 
-      if let Some(entry) = self.timers.get(&id)
-        && entry.state == TimerState::Fired
-      {
-        return Some(id);
+      if !self.pending_has_stale {
+        return Some(pending.id);
+      }
+
+      let slot_index = pending.id as u32 as usize;
+      // SAFETY: pending entries are only created after their timer slot exists,
+      // and the timer-slot vector never shrinks.
+      let timer = unsafe { self.timers.get_unchecked(slot_index) };
+      if timer.id == pending.id && timer.entry.pending_index == index {
+        return Some(pending.id);
       }
     }
 
     self.pending_fire.clear();
     self.pending_index = 0;
+    self.pending_has_stale = false;
     None
   }
 }
@@ -306,8 +474,33 @@ struct ExpiredIterator<'a> {
 impl Iterator for ExpiredIterator<'_> {
   type Item = TimerId;
 
+  #[inline]
   fn next(&mut self) -> Option<Self::Item> {
     self.clock.pop_expired()
+  }
+
+  #[inline]
+  fn fold<B, F>(mut self, mut accum: B, mut f: F) -> B
+  where
+    F: FnMut(B, Self::Item) -> B,
+  {
+    if self.clock.pending_has_stale {
+      for id in self.by_ref() {
+        accum = f(accum, id);
+      }
+      return accum;
+    }
+
+    while self.clock.pending_index < self.clock.pending_fire.len() {
+      let pending = self.clock.pending_fire[self.clock.pending_index];
+      self.clock.pending_index += 1;
+
+      accum = f(accum, pending.id);
+    }
+
+    self.clock.pending_fire.clear();
+    self.clock.pending_index = 0;
+    accum
   }
 }
 
@@ -381,6 +574,80 @@ mod tests {
   }
 
   #[test]
+  fn partial_drain_distinguishes_consumed_and_pending_timers() {
+    let mut clock = Clock::new();
+    clock.schedule(1, Duration::from_millis(1));
+    clock.schedule(2, Duration::from_millis(1));
+    clock.advance_by(1);
+
+    let mut expired = clock.poll_expired();
+    assert_eq!(expired.next(), Some(1));
+    drop(expired);
+
+    clock.schedule(1, Duration::from_millis(1));
+    assert!(clock.remove(2));
+    assert!(collect_expired(&mut clock).is_empty());
+
+    clock.advance_by(1);
+    assert_eq!(collect_expired(&mut clock), vec![1]);
+  }
+
+  #[test]
+  fn rescheduling_active_timer_replaces_deadline() {
+    let mut clock = Clock::new();
+    clock.schedule(1, Duration::from_millis(2));
+    clock.schedule(1, Duration::from_millis(5));
+
+    clock.advance_by(2);
+    assert!(collect_expired(&mut clock).is_empty());
+
+    clock.advance_by(3);
+    assert_eq!(collect_expired(&mut clock), vec![1]);
+  }
+
+  #[test]
+  fn rescheduling_fired_timer_suppresses_pending_expiration() {
+    let mut clock = Clock::new();
+    clock.schedule(1, Duration::from_millis(1));
+    clock.advance_by(1);
+
+    clock.schedule(1, Duration::from_millis(1));
+    assert!(collect_expired(&mut clock).is_empty());
+
+    clock.advance_by(1);
+    assert_eq!(collect_expired(&mut clock), vec![1]);
+  }
+
+  #[test]
+  fn stale_pending_index_does_not_cancel_another_timer() {
+    let mut clock = Clock::new();
+    clock.schedule(1, Duration::from_millis(1));
+    clock.advance_by(1);
+    assert_eq!(collect_expired(&mut clock), vec![1]);
+
+    clock.schedule(2, Duration::from_millis(1));
+    clock.advance_by(1);
+    assert!(clock.remove(1));
+    assert_eq!(collect_expired(&mut clock), vec![2]);
+  }
+
+  #[test]
+  fn newer_generation_replaces_timer_in_the_same_slot() {
+    let mut clock = Clock::new();
+    let old_id = 7;
+    let new_id = (1_u64 << 32) | 7;
+    clock.schedule(old_id, Duration::from_millis(1));
+    clock.schedule(new_id, Duration::from_millis(2));
+
+    clock.advance_by(1);
+    assert!(collect_expired(&mut clock).is_empty());
+    assert!(!clock.remove(old_id));
+
+    clock.advance_by(1);
+    assert_eq!(collect_expired(&mut clock), vec![new_id]);
+  }
+
+  #[test]
   fn far_timer_does_not_fire_early() {
     let mut clock = Clock::new();
     clock.schedule(1, Duration::from_millis(500));
@@ -390,6 +657,17 @@ mod tests {
 
     clock.advance_by(1);
     assert_eq!(collect_expired(&mut clock), vec![1]);
+  }
+
+  #[test]
+  fn timers_expire_across_level0_boundary() {
+    let mut clock = Clock::new();
+    clock.schedule(1, Duration::from_millis(255));
+    clock.schedule(2, Duration::from_millis(256));
+    clock.schedule(3, Duration::from_millis(257));
+
+    clock.advance_by(257);
+    assert_eq!(collect_expired(&mut clock), vec![1, 2, 3]);
   }
 
   #[test]

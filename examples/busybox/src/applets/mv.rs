@@ -280,10 +280,55 @@ fn copy_regular_file(
   atime: i64,
   mtime: i64,
 ) -> io::Result<()> {
-  let _ = ctx;
-  fs::copy(source, dest)?;
+  copy_file_lio(ctx, source, dest, mode)?;
   fs::set_permissions(dest, fs::Permissions::from_mode(mode & 0o7777))?;
   preserve_file_times(dest, atime, mtime, false)?;
+  Ok(())
+}
+
+fn copy_file_lio(
+  ctx: &AppContext,
+  source: &Path,
+  dest: &Path,
+  mode: u32,
+) -> io::Result<()> {
+  let source_fd = io_util::run(
+    ctx.lio(),
+    api::openat(
+      &ctx.cwd(),
+      fs_util::path_to_cstring(source)?,
+      libc::O_RDONLY,
+      0,
+    )
+    .with_lio(ctx.lio())
+    .send(),
+  )?;
+  let dest_fd = io_util::run(
+    ctx.lio(),
+    api::openat(
+      &ctx.cwd(),
+      fs_util::path_to_cstring(dest)?,
+      libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+      mode & 0o7777,
+    )
+    .with_lio(ctx.lio())
+    .send(),
+  )?;
+
+  let mut buf = vec![0u8; 64 * 1024];
+  loop {
+    let (read_result, returned_buf) = io_util::run(
+      ctx.lio(),
+      api::read(&source_fd, buf).with_lio(ctx.lio()).send(),
+    );
+    buf = returned_buf;
+    let n = read_result? as usize;
+    if n == 0 {
+      break;
+    }
+    io_util::write_all(ctx.lio(), &dest_fd, buf[..n].to_vec())?;
+  }
+
   Ok(())
 }
 

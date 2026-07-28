@@ -20,9 +20,11 @@ pub fn stat_path(
   path: &Path,
   follow_symlinks: bool,
 ) -> io::Result<Option<FileStat>> {
-  let cpath = path_to_cstring(path)?;
-  let mut rx =
-    api::statat(&ctx.cwd(), cpath, follow_symlinks).with_lio(ctx.lio()).send();
+  let mut rx = if follow_symlinks {
+    lio::fs::metadata(path).with_lio(ctx.lio()).send()
+  } else {
+    lio::fs::symlink_metadata(path).with_lio(ctx.lio()).send()
+  };
   match io_util::run_recv(ctx.lio(), &mut rx) {
     Ok(stat) => Ok(Some(stat)),
     Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -34,11 +36,19 @@ pub fn read_dir_path(
   ctx: &AppContext,
   path: &Path,
 ) -> io::Result<Vec<DirEntry>> {
-  read_dir_paths(ctx, &[path.to_path_buf()])?.into_iter().next().ok_or_else(
-    || {
-      io::Error::new(io::ErrorKind::UnexpectedEof, "missing directory listing")
-    },
-  )
+  let read_dir = io_util::run(
+    ctx.lio(),
+    lio::fs::read_dir(path).with_lio(ctx.lio()).send(),
+  )?;
+  read_dir
+    .map(|entry| {
+      let entry = entry?;
+      Ok(DirEntry {
+        name: entry.file_name().to_os_string(),
+        file_type: entry.file_type(),
+      })
+    })
+    .collect()
 }
 
 pub fn read_dir_paths(
