@@ -1,7 +1,10 @@
-#![allow(clippy::type_complexity)]
 #![cfg(feature = "high")]
 
 use std::{cell::RefCell, net::SocketAddr, rc::Rc};
+
+type DatagramRecv = (std::io::Result<i32>, Vec<u8>, Option<SocketAddr>);
+type DatagramRecvRx = Receiver<DatagramRecv>;
+type DatagramRecvDone = Rc<RefCell<Option<(Vec<u8>, Option<SocketAddr>)>>>;
 
 use lio::{
   Lio,
@@ -14,15 +17,12 @@ struct ReceiverNode {
   socket_rx: Option<Receiver<std::io::Result<Socket>>>,
   socket: Option<Socket>,
   bind_rx: Option<Receiver<std::io::Result<()>>>,
-  recv_rx:
-    Option<Receiver<(std::io::Result<i32>, Vec<u8>, Option<SocketAddr>)>>,
-  recv_done: Rc<RefCell<Option<(Vec<u8>, Option<SocketAddr>)>>>,
+  recv_rx: Option<DatagramRecvRx>,
+  recv_done: DatagramRecvDone,
 }
 
 impl ReceiverNode {
-  fn new(
-    recv_done: Rc<RefCell<Option<(Vec<u8>, Option<SocketAddr>)>>>,
-  ) -> Self {
+  fn new(recv_done: DatagramRecvDone) -> Self {
     Self {
       socket_rx: None,
       socket: None,
