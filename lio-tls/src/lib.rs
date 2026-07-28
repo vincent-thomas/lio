@@ -78,8 +78,8 @@ impl TlsAcceptor {
 
   /// Accepts a TLS connection over the given TCP socket.
   pub async fn accept(&self, stream: TcpStream) -> io::Result<ServerTlsStream> {
-    let conn = ServerConnection::new(self.config.clone())
-      .map_err(io::Error::other)?;
+    let conn =
+      ServerConnection::new(self.config.clone()).map_err(io::Error::other)?;
 
     let mut tls = ServerTlsStream { tcp: stream, conn };
 
@@ -130,17 +130,12 @@ macro_rules! impl_tls_stream {
 
         let mut slice = &buf[..n];
         while !slice.is_empty() {
-          let read = self
-            .conn
-            .read_tls(&mut slice)
-            .map_err(io::Error::other)?;
+          let read =
+            self.conn.read_tls(&mut slice).map_err(io::Error::other)?;
           if read == 0 {
             break;
           }
-          self
-            .conn
-            .process_new_packets()
-            .map_err(io::Error::other)?;
+          self.conn.process_new_packets().map_err(io::Error::other)?;
         }
 
         Ok(())
