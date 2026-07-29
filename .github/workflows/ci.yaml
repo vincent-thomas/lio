@@ -14,7 +14,7 @@ jobs:
     name: nix-check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
@@ -27,7 +27,7 @@ jobs:
     name: rust-check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [rust-check, nix-check]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
@@ -83,7 +83,7 @@ jobs:
 
     needs: [rust-check, nix-check]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
