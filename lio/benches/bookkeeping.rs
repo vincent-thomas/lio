@@ -12,7 +12,10 @@ use criterion::{
 use lio::backend::op::Op;
 use lio::backend::{IoBackend, OpCompleted};
 use lio::time::Clock;
-use lio::{Lio, api};
+use lio::{
+  Lio, api,
+  api::op::{Action, Completion, OpModel, OpResult},
+};
 
 const QUEUE_DEPTHS: [usize; 4] = [1, 32, 256, 1024];
 
@@ -140,6 +143,61 @@ fn driver_channel(criterion: &mut Criterion) {
   group.finish();
 }
 
+struct RepeatingNop {
+  remaining: usize,
+}
+
+impl OpModel for RepeatingNop {
+  type Item = ();
+
+  #[inline]
+  fn action(&mut self) -> Action {
+    Action::Io(Op::Nop)
+  }
+
+  #[inline]
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    assert_eq!(completion.result, 0);
+    self.remaining -= 1;
+    if self.remaining == 0 { OpResult::Done(()) } else { OpResult::Again }
+  }
+}
+
+/// Exercises the completion-to-next-action path independently of registration
+/// setup by redispatching each logical operation several times.
+fn driver_redispatch(criterion: &mut Criterion) {
+  const STEPS: usize = 8;
+
+  let mut group = criterion.benchmark_group("bookkeeping/driver_redispatch");
+  for depth in [32, 256] {
+    let lio =
+      Lio::new_with_backend(ImmediateBackend::default(), depth).unwrap();
+    let completed = Rc::new(Cell::new(0usize));
+
+    group.throughput(Throughput::Elements((depth * STEPS) as u64));
+    group.bench_with_input(
+      BenchmarkId::from_parameter(format!("qd_{depth}")),
+      &depth,
+      |bencher, &depth| {
+        bencher.iter(|| {
+          let before = completed.get();
+          for _ in 0..depth {
+            let completed = Rc::clone(&completed);
+            api::Io::from_op(RepeatingNop { remaining: STEPS })
+              .with_lio(&lio)
+              .when_done(move |()| completed.set(completed.get() + 1));
+          }
+          for _ in 0..STEPS {
+            assert_eq!(lio.try_run().unwrap(), depth);
+          }
+          assert_eq!(completed.get() - before, depth);
+        });
+      },
+    );
+  }
+  group.finish();
+}
+
 fn timers(criterion: &mut Criterion) {
   let mut group = criterion.benchmark_group("bookkeeping/timer_wheel");
   for depth in QUEUE_DEPTHS {
@@ -169,6 +227,6 @@ criterion_group! {
     .warm_up_time(Duration::from_millis(500))
     .measurement_time(Duration::from_millis(1500))
     .sample_size(30);
-  targets = direct_backend, driver_callback, driver_channel, timers
+  targets = direct_backend, driver_callback, driver_channel, driver_redispatch, timers
 }
 criterion_main!(benches);

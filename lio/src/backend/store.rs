@@ -138,6 +138,23 @@ impl OpStore {
     Some(unsafe { slot.registration.assume_init_mut() })
   }
 
+  /// Gets a registration and its per-step lowering arena with one key lookup.
+  ///
+  /// Completion processing commonly needs both when an operation requests
+  /// another I/O step. Returning them together avoids validating and indexing
+  /// the same generational key again during redispatch.
+  #[inline]
+  pub fn get_mut_with_step_bump(
+    &mut self,
+    id: u64,
+  ) -> Option<(&mut Registration, &mut Bump)> {
+    let key = SlabKey::from_u64(id);
+    let slot = self.slots.get_mut(key)?;
+    // SAFETY: occupied slots always contain an initialized registration.
+    let registration = unsafe { slot.registration.assume_init_mut() };
+    Some((registration, &mut slot.step_bump))
+  }
+
   /// Gets mutable access to an operation's per-step lowering arena.
   #[inline]
   pub fn step_bump_mut(&mut self, id: u64) -> Option<&mut Bump> {

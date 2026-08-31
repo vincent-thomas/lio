@@ -360,7 +360,7 @@ impl Lio {
 
       let store_lookup_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
-      let Some(op) = inner.store.get_mut(id) else {
+      let Some((op, step_bump)) = inner.store.get_mut_with_step_bump(id) else {
         if let Some(started) = store_lookup_started {
           completion_store_lookup_time += started.elapsed();
           stale_completions += 1;
@@ -382,7 +382,13 @@ impl Lio {
       if let Some(next_action) = completion_result.next_action {
         let started =
           if profiling_enabled { Some(Instant::now()) } else { None };
-        Self::dispatch_action(inner, id, next_action);
+        match next_action {
+          Action::Io(op) => {
+            step_bump.reset();
+            inner.io.push(id, op, step_bump);
+          }
+          Action::Sleep(duration) => inner.time.schedule(id, duration),
+        }
         if let Some(started) = started {
           dispatch_time += started.elapsed();
         }
