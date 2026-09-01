@@ -89,15 +89,14 @@ impl OpStore {
   ///
   /// Keeping the just-allocated slot borrowed avoids looking it up again by its
   /// generational ID. Fresh slots are empty, and reused slots were reset by
-  /// `remove`, so initial dispatch does not need another arena reset.
+  /// removal, so registration does not pay for arena cleanup from the previous
+  /// occupant.
   #[inline]
   pub fn insert_with_action(
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> (u64, Option<Action>, &mut Bump) {
     let (key, slot) = self.slots.allocate().expect("at capacity");
-    slot.model_bump.reset();
-    slot.step_bump.reset();
     let registration = slot.registration.write(init(&mut slot.model_bump));
     let action = registration.action();
     (key.as_u64(), action, &mut slot.step_bump)
@@ -126,6 +125,10 @@ impl OpStore {
     self.slots.remove_known_with(key, |slot| {
       // SAFETY: occupied slots always contain an initialized registration.
       unsafe { slot.registration.assume_init_drop() };
+      // Clean up while the completed slot and its payload are cache-hot. This
+      // keeps arena reset work out of the next registration's dispatch path.
+      slot.model_bump.reset();
+      slot.step_bump.reset();
     });
   }
 
