@@ -132,18 +132,20 @@ impl OpStore {
   /// Gets mutable access to an operation's registration.
   #[inline]
   pub fn get_mut(&mut self, id: u64) -> Option<&mut Registration> {
+    self.get_mut_with_step(id).map(|(registration, _)| registration)
+  }
+
+  /// Borrows the registration and its lowering arena with one ID validation,
+  /// so a completion can resubmit its next step without another slot lookup.
+  #[inline]
+  pub fn get_mut_with_step(
+    &mut self,
+    id: u64,
+  ) -> Option<(&mut Registration, &mut Bump)> {
     let key = SlabKey::from_u64(id);
     let slot = self.slots.get_mut(key)?;
     // SAFETY: occupied slots always contain an initialized registration.
-    Some(unsafe { slot.registration.assume_init_mut() })
-  }
-
-  /// Gets mutable access to an operation's per-step lowering arena.
-  #[inline]
-  pub fn step_bump_mut(&mut self, id: u64) -> Option<&mut Bump> {
-    let key = SlabKey::from_u64(id);
-    let slot = self.slots.get_mut(key)?;
-    Some(&mut slot.step_bump)
+    Some((unsafe { slot.registration.assume_init_mut() }, &mut slot.step_bump))
   }
 }
 
