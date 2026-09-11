@@ -264,6 +264,24 @@ impl LioUring {
 
   // ==================== Submission methods ====================
 
+  /// Whether the kernel supports every requested operation code.
+  /// Returns false if probing is unavailable or fails.
+  pub fn supports_opcodes(&mut self, opcodes: &[u8]) -> bool {
+    // SAFETY: liburing allocates the probe for this initialized ring.
+    let probe =
+      unsafe { bindings::io_uring_get_probe_ring(&raw mut self.ring) };
+    if probe.is_null() {
+      return false;
+    }
+    let supported = opcodes.iter().all(|&opcode| {
+      // SAFETY: the probe remains live throughout these read-only queries.
+      unsafe { bindings::io_uring_opcode_supported(probe, opcode as i32) != 0 }
+    });
+    // SAFETY: free exactly the probe allocated above, after all queries.
+    unsafe { bindings::io_uring_free_probe(probe) };
+    supported
+  }
+
   /// Push an operation to the submission queue.
   ///
   /// # Safety
@@ -655,6 +673,13 @@ impl LioUring {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn test_probe_known_and_unknown_opcodes() {
+    let mut ring = LioUring::new(8).unwrap();
+    assert!(ring.supports_opcodes(&[operation::Nop::CODE]));
+    assert!(!ring.supports_opcodes(&[u8::MAX]));
+  }
 
   // ==========================================================================
   // Completion Tests (unit tests - no kernel needed)
