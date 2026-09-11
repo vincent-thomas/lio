@@ -1,4 +1,5 @@
-//! Real loopback UDP transfers through the polling backend and public I/O API.
+//! Real loopback UDP transfers through the public I/O API.
+//! Uses Poller unless LIO_BENCH_DEFAULT_BACKEND is set (io_uring on Linux).
 use std::cell::{Cell, RefCell};
 use std::net::UdpSocket;
 use std::os::fd::{FromRawFd, IntoRawFd};
@@ -47,7 +48,11 @@ impl Workload {
       })
       .collect();
     Self {
-      lio: Lio::new_with_backend(Poller::new(), depth * 2).unwrap(),
+      lio: if std::env::var_os("LIO_BENCH_DEFAULT_BACKEND").is_some() {
+        Lio::new(depth * 2).unwrap()
+      } else {
+        Lio::new_with_backend(Poller::new(), depth * 2).unwrap()
+      },
       pairs,
       done: Rc::new(Cell::new(0)),
       bytes,
@@ -100,7 +105,13 @@ fn main() {
     .warm_up_time(Duration::from_secs(1))
     .measurement_time(Duration::from_secs(3))
     .configure_from_args();
-  let mut group = criterion.benchmark_group("poller/udp_loopback");
+  let mut group = criterion.benchmark_group(
+    if std::env::var_os("LIO_BENCH_DEFAULT_BACKEND").is_some() {
+      "default/udp_loopback"
+    } else {
+      "poller/udp_loopback"
+    },
+  );
   for bytes in [64, 4096] {
     for depth in [1, 32] {
       let workload = Workload::new(depth, bytes);
