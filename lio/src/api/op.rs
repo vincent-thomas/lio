@@ -94,7 +94,19 @@ pub trait OpModel: Send + 'static {
   fn action(&mut self) -> Action;
 
   /// Interpret the completion of the previously submitted low-level step.
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item>;
+  ///
+  /// # Safety
+  /// The completion must describe the outstanding action of this model, exactly
+  /// once and in order. All memory writes reported by the result must actually
+  /// have initialized the corresponding buffer prefixes, within their writable
+  /// capacities. Returned handles must be valid, newly owned resources suitable
+  /// for adoption by this model; output metadata must likewise be initialized.
+  /// The action must have finished accessing any storage the model may expose,
+  /// mutate, move, or release in response. No conflicting in-flight access may
+  /// remain. Flags and errors must accurately describe that action's outcome.
+  /// A simulated completion must establish the same facts before calling this.
+  unsafe fn complete(&mut self, completion: Completion)
+  -> OpResult<Self::Item>;
 }
 
 /// Marker trait for logical operations that produce exactly one final item.

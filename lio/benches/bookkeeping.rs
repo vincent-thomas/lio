@@ -161,7 +161,7 @@ impl OpModel for SteppedStream {
     Action::Io(Op::Nop)
   }
 
-  fn complete(&mut self, _: Completion) -> OpResult<()> {
+  unsafe fn complete(&mut self, _: Completion) -> OpResult<()> {
     if self.remaining > 0 {
       self.remaining -= 1;
       OpResult::Again
