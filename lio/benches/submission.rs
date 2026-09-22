@@ -1,14 +1,11 @@
 //! Actual default-backend submission batches. On Linux this uses io_uring.
 //! Run with --allocations for counts, or Criterion arguments for timing.
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::{Cell, RefCell};
-use std::ffi::CString;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput};
-use lio::{Lio, api};
+use lio::Lio;
 
 struct CountingAllocator;
 static COUNT: AtomicBool = AtomicBool::new(false);
@@ -56,80 +53,26 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-struct Workload {
-  lio: Lio,
-  file: api::resource::Resource,
-  buffers: Rc<RefCell<Vec<Vec<u8>>>>,
-  done: Rc<Cell<usize>>,
-  depth: usize,
-  read: bool,
-}
-
-impl Workload {
-  fn new(depth: usize, read: bool, path: &std::path::Path) -> Self {
-    let lio = Lio::new(depth).unwrap();
-    let mut receiver = api::openat(
-      &api::resource::Resource::cwd(),
-      CString::new(path.to_str().unwrap()).unwrap(),
-      api::OpenFlags::EMPTY,
-      api::FileMode::default(),
-    )
-    .with_lio(&lio)
-    .send();
-    let file = loop {
-      if let Some(result) = receiver.try_recv() {
-        break result.unwrap();
-      }
-      lio.run().unwrap();
-    };
-    Self {
-      lio,
-      file,
-      depth,
-      read,
-      buffers: Rc::new(RefCell::new(
-        (0..depth).map(|_| vec![0; 4096]).collect(),
-      )),
-      done: Rc::new(Cell::new(0)),
-    }
-  }
-
-  fn batch(&self) {
-    self.done.set(0);
-    for _ in 0..self.depth {
-      let done = Rc::clone(&self.done);
-      if self.read {
-        let buffer = self.buffers.borrow_mut().pop().unwrap();
-        let buffers = Rc::clone(&self.buffers);
-        api::read_at(&self.file, buffer, 0).with_lio(&self.lio).when_done(
-          move |(result, buffer)| {
-            assert_eq!(result.unwrap(), 4096);
-            buffers.borrow_mut().push(buffer);
-            done.set(done.get() + 1);
-          },
-        );
-      } else {
-        api::nop().with_lio(&self.lio).when_done(move |result| {
-          result.unwrap();
-          done.set(done.get() + 1);
-        });
-      }
-    }
-    while self.done.get() < self.depth {
-      self.lio.run().unwrap();
-    }
-  }
-}
+#[path = "support/file_workload.rs"]
+mod file_workload;
+use file_workload::Workload;
 
 fn main() {
   // Cached real-file reads, with the fixture and reusable buffers outside timing.
   let path = std::env::temp_dir()
     .join(format!("lio-submission-{}.bin", std::process::id()));
   std::fs::write(&path, vec![7u8; 4096]).unwrap();
-  if std::env::args().any(|arg| arg == "--allocations") {
+  if std::env::args().any(|arg| arg == "--read-count") {
+    let workload = Workload::new(Lio::new(256).unwrap(), 256, true, &path);
+    for _ in 0..1000 {
+      workload.batch();
+    }
+    println!("256000 real 4 KiB reads completed and payloads verified");
+  } else if std::env::args().any(|arg| arg == "--allocations") {
     for read in [false, true] {
       for depth in [1, 32, 256] {
-        let workload = Workload::new(depth, read, &path);
+        let workload =
+          Workload::new(Lio::new(depth).unwrap(), depth, read, &path);
         for _ in 0..100 {
           workload.batch();
         }
@@ -163,7 +106,8 @@ fn main() {
         "submission/nop"
       });
       for depth in [1, 32, 256] {
-        let workload = Workload::new(depth, read, &path);
+        let workload =
+          Workload::new(Lio::new(depth).unwrap(), depth, read, &path);
         for _ in 0..100 {
           workload.batch();
         }
