@@ -34,7 +34,8 @@ impl ProcessResult {
 /// yielded items to a channel while waking the associated task.
 pub(crate) struct WakerResultHandler {
   payload: *mut (),
-  on_completion_fn: fn(*mut (), Completion) -> ProcessResult,
+  on_completion_fn:
+    fn(*mut (), Completion, &mut Option<Waker>) -> ProcessResult,
   action_fn: fn(*mut ()) -> Action,
   drop_fn: fn(*mut ()),
 }
@@ -75,8 +76,12 @@ impl WakerResultHandler {
   ///
   /// Returns whether the operation is done and optionally an operation to resubmit.
   #[inline]
-  fn on_completion(&self, completion: Completion) -> ProcessResult {
-    (self.on_completion_fn)(self.payload, completion)
+  fn on_completion(
+    &self,
+    completion: Completion,
+    waker: &mut Option<Waker>,
+  ) -> ProcessResult {
+    (self.on_completion_fn)(self.payload, completion, waker)
   }
 
   #[inline]
@@ -91,6 +96,7 @@ impl WakerResultHandler {
   fn on_completion_impl<T: OpModel>(
     payload_ptr: *mut (),
     completion: Completion,
+    waker: &mut Option<Waker>,
   ) -> ProcessResult {
     // SAFETY: `payload_ptr` is created from `WakerPayload<T>` in `new`/`new_in`
     // and remains valid while completions are dispatched.
@@ -98,10 +104,12 @@ impl WakerResultHandler {
     let sender = &payload.sender;
     let op_model = &mut payload.op_model;
 
-    match op_model.complete(completion) {
+    let result = match op_model.complete(completion) {
       OpResult::Again => {
         let next_action = op_model.action();
-        ProcessResult::continue_with(next_action)
+        // The driver resubmits internal steps. Preserve the consumer's waker
+        // until an item is available instead of making it poll an empty channel.
+        return ProcessResult::continue_with(next_action);
       }
       OpResult::Yield(item) => {
         let _ = sender.send(item);
@@ -112,7 +120,11 @@ impl WakerResultHandler {
         let _ = sender.send(item);
         ProcessResult::done()
       }
+    };
+    if let Some(waker) = waker.take() {
+      waker.wake();
     }
+    result
   }
 
   fn drop_bump_impl<T: OpModel>(payload_ptr: *mut ()) {
@@ -349,13 +361,7 @@ impl Registration {
   fn process_completion(&mut self, completion: Completion) -> ProcessResult {
     match &mut self.state {
       State::Waker { waker, handler } => {
-        let result = handler.on_completion(completion);
-
-        if let Some(w) = waker.take() {
-          w.wake();
-        }
-
-        result
+        handler.on_completion(completion, waker)
       }
       State::Callback(cb) => cb.on_completion(completion),
       #[cfg(test)]
@@ -598,7 +604,7 @@ mod tests {
   }
 
   #[test]
-  fn waker_registration_again_then_done_wakes_and_sends_on_terminal_only() {
+  fn waker_registration_again_preserves_waker_until_done() {
     let wake_count = Arc::new(AtomicUsize::new(0));
     let waker = test_waker(Arc::clone(&wake_count));
     let (tx, rx) = mpsc::channel();
@@ -609,7 +615,7 @@ mod tests {
       reg.on_completion(Completion::new(0)).next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
-    assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+    assert_eq!(wake_count.load(Ordering::SeqCst), 0);
     assert!(rx.try_recv().is_err(), "Again must not send a terminal item");
     assert!(!reg.is_finished());
 
@@ -618,6 +624,46 @@ mod tests {
     let item = rx.try_recv().expect("Done result should be sent");
     assert_eq!(item, 7);
     assert!(reg.is_finished());
+  }
+
+  #[test]
+  fn waker_registration_repeated_again_preserves_waker_until_yield() {
+    struct AgainThenYield(usize);
+
+    impl OpModel for AgainThenYield {
+      type Item = i32;
+
+      fn action(&mut self) -> Action {
+        Action::Io(crate::backend::op::Op::Nop)
+      }
+
+      fn complete(&mut self, _: Completion) -> OpResult<i32> {
+        self.0 += 1;
+        match self.0 {
+          1..=8 => OpResult::Again,
+          9 => OpResult::Yield(11),
+          _ => OpResult::Done(17),
+        }
+      }
+    }
+
+    let wake_count = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = mpsc::channel();
+    let (_arena, mut reg) =
+      new_waker_reg(test_waker(Arc::clone(&wake_count)), tx, AgainThenYield(0));
+    for _ in 0..8 {
+      assert!(!reg.on_completion(Completion::new(0)).is_done());
+      assert_eq!(wake_count.load(Ordering::SeqCst), 0);
+      assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+    assert!(!reg.on_completion(Completion::new(0)).is_done());
+    assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+    assert_eq!(rx.try_recv().unwrap(), 11);
+
+    reg.set_waker(test_waker(Arc::clone(&wake_count)));
+    assert!(reg.on_completion(Completion::new(0)).is_done());
+    assert_eq!(wake_count.load(Ordering::SeqCst), 2);
+    assert_eq!(rx.try_recv().unwrap(), 17);
   }
 
   #[test]

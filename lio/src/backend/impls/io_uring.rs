@@ -14,8 +14,8 @@ use lio_uring::{
   Entry, LioUring,
   operation::{
     Accept, Bind, Connect, Fsync, LinkAt, Listen, MkDirAt, Nop, OpenAt, Readv,
-    RecvMsg, RenameAt, SendMsg, Shutdown, Socket, Statx, SymlinkAt, UnlinkAt,
-    Writev,
+    Recv, RecvMsg, RenameAt, Send, SendMsg, Shutdown, Socket, Statx, SymlinkAt,
+    UnlinkAt, Writev,
   },
 };
 
@@ -28,6 +28,11 @@ use crate::slab::{Slab, SlabKey};
 const STATX_BASIC_STATS: u32 = 0x0000_07ff;
 const LINUX_DIRENT64_NAME_OFFSET: usize = 19;
 type CurrentDirent<'a> = (u64, u8, usize, &'a [u8]);
+
+#[cfg(test)]
+mod deferred_tests;
+#[cfg(test)]
+mod single_socket_tests;
 
 #[derive(Debug)]
 struct PendingOp {
@@ -266,6 +271,7 @@ impl NativeSocketState {
 #[derive(Debug, Clone, Copy)]
 enum LoweredState {
   Plain,
+  SingleMsg { ptr: NonNull<u8>, len: u32 },
   Rw(NonNull<NativeRwState>),
   Msg(NonNull<NativeMsgState>),
   Socket(NonNull<NativeSocketState>),
@@ -282,7 +288,7 @@ impl LoweredState {
       .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
   }
 
-  fn lower_in(op: &Op, arena: &Bump) -> io::Result<Self> {
+  fn lower_in(op: &Op, arena: &Bump, single_socket: bool) -> io::Result<Self> {
     Ok(match op {
       Op::Read { iovecs, iov_count, .. } => {
         let state = NativeRwState::from_raws(*iovecs, *iov_count)
@@ -295,11 +301,31 @@ impl LoweredState {
         Self::Rw(NonNull::from(arena.alloc(state)))
       }
       Op::Recv { msg, .. } => {
+        // The non-vectored opcode needs no native msghdr or iovec storage.
+        // SAFETY: validated message descriptors remain live until completion.
+        if single_socket
+          && msg.buf_count.get() == 1
+          && msg.from.is_none()
+          && unsafe { msg.bufs.as_ref() }.len <= u32::MAX as usize
+        {
+          let buf = unsafe { msg.bufs.as_ref() };
+          return Ok(Self::SingleMsg { ptr: buf.ptr, len: buf.len as u32 });
+        }
         let state = NativeMsgState::from_recv(msg)
           .expect("validated recv op must have native message state");
         Self::Msg(NonNull::from(arena.alloc(state)))
       }
       Op::Send { msg, .. } => {
+        // Keep addressed and oversized messages on the general sendmsg path.
+        // SAFETY: validated message descriptors remain live until completion.
+        if single_socket
+          && msg.buf_count.get() == 1
+          && msg.to.is_none()
+          && unsafe { msg.bufs.as_ref() }.len <= u32::MAX as usize
+        {
+          let buf = unsafe { msg.bufs.as_ref() };
+          return Ok(Self::SingleMsg { ptr: buf.ptr, len: buf.len as u32 });
+        }
         let state = NativeMsgState::from_send(msg)
           .expect("validated send op must have native message state");
         Self::Msg(NonNull::from(arena.alloc(state)))
@@ -343,6 +369,19 @@ impl LoweredState {
   fn create_entry(self, op: &Op) -> Entry {
     match self {
       Self::Plain => IoUring::create_plain_entry(op),
+      Self::SingleMsg { ptr, len } => match op {
+        Op::Recv { fd, flags, .. } => {
+          Recv::new(fd.as_raw_fd(), ptr.as_ptr(), len)
+            .flags(flags.bits())
+            .build()
+        }
+        Op::Send { fd, flags, .. } => {
+          Send::new(fd.as_raw_fd(), ptr.as_ptr(), len)
+            .flags(flags.bits())
+            .build()
+        }
+        _ => unreachable!("single message requires send/recv op"),
+      },
       Self::Rw(state) => {
         // SAFETY: `state` points into the bump arena backing this lowered op
         // and remains valid until submission finishes.
@@ -433,6 +472,8 @@ pub struct IoUring {
   capacity: usize,
   in_flight: usize,
   needs_submit: bool,
+  single_socket: bool,
+  deferred_completions: bool,
   backlog: Vec<PendingOp>,
   pending: Slab<PendingOp>,
   queued_completed: Vec<OpCompleted>,
@@ -446,6 +487,8 @@ impl Default for IoUring {
       capacity: 0,
       in_flight: 0,
       needs_submit: false,
+      single_socket: false,
+      deferred_completions: false,
       backlog: Vec::new(),
       pending: Slab::new(0),
       queued_completed: Vec::new(),
@@ -500,6 +543,50 @@ impl Drop for IoUring {
 }
 
 impl IoUring {
+  /// Create a backend optimized for batches of asynchronous completions.
+  ///
+  /// Completion work runs when the thread-local driver checks the ring rather
+  /// than interrupting submissions. This can help high-depth file I/O, but
+  /// may hurt small socket batches; [`Self::new`] retains the kernel default.
+  /// Nonblocking waits still make progress. Kernels older than Linux 6.1 fall
+  /// back to the default behavior. No polling thread or busy-wait is enabled.
+  ///
+  /// ```
+  /// use lio::{Lio, backend::impls::IoUring};
+  /// let lio = Lio::new_with_backend(IoUring::with_deferred_completions(), 256)?;
+  /// # Ok::<(), std::io::Error>(())
+  /// ```
+  ///
+  /// The backend cannot be transferred to another thread:
+  /// ```compile_fail
+  /// use lio::backend::impls::IoUring;
+  /// let backend = IoUring::with_deferred_completions();
+  /// std::thread::spawn(move || drop(backend));
+  /// ```
+  pub fn with_deferred_completions() -> Self {
+    let mut backend = Self::default();
+    backend.deferred_completions = true;
+    backend
+  }
+
+  fn create_ring_with(
+    cap: u32,
+    mut initialize: impl FnMut(lio_uring::Params) -> io::Result<LioUring>,
+  ) -> io::Result<LioUring> {
+    let params = lio_uring::Params { sq_entries: cap, ..Default::default() };
+    // The driver is thread-local. Defer completion work until it explicitly
+    // checks the ring, so a batch submission is not interrupted per completion.
+    initialize(params.clone().deferred_taskrun()).or_else(|err| {
+      // Old kernels reject unsupported setup flags. Preserve their original
+      // behavior, but do not mask resource/permission failures with retries.
+      if err.raw_os_error() == Some(libc::EINVAL) {
+        initialize(params)
+      } else {
+        Err(err)
+      }
+    })
+  }
+
   unsafe fn drop_read_dir_state(state: *mut ()) {
     if !state.is_null() {
       // SAFETY: `state` was allocated with `Box::into_raw` for `ReadDirState`
@@ -1162,7 +1249,13 @@ impl IoUring {
 
 impl IoBackend for IoUring {
   fn init(&mut self, cap: usize) -> io::Result<()> {
-    self.ring = Some(LioUring::new(cap as u32)?);
+    self.ring = Some(if self.deferred_completions {
+      Self::create_ring_with(cap as u32, LioUring::with_params)?
+    } else {
+      LioUring::new(cap as u32)?
+    });
+    self.single_socket =
+      self.ring().supports_opcodes(&[Send::CODE, Recv::CODE]);
     self.capacity = cap;
     self.in_flight = 0;
     self.needs_submit = false;
@@ -1181,16 +1274,17 @@ impl IoBackend for IoUring {
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
-    let lowered = match LoweredState::lower_in(&op, step_bump) {
-      Ok(lowered) => lowered,
-      Err(err) => {
-        self.queued_completed.push(OpCompleted::new(
-          id,
-          -(err.raw_os_error().unwrap_or(libc::EIO) as isize),
-        ));
-        return;
-      }
-    };
+    let lowered =
+      match LoweredState::lower_in(&op, step_bump, self.single_socket) {
+        Ok(lowered) => lowered,
+        Err(err) => {
+          self.queued_completed.push(OpCompleted::new(
+            id,
+            -(err.raw_os_error().unwrap_or(libc::EIO) as isize),
+          ));
+          return;
+        }
+      };
     self.backlog.push(PendingOp { registration_id: id, op, lowered });
   }
 

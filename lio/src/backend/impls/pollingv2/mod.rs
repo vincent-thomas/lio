@@ -774,6 +774,31 @@ impl Poller {
   /// Try to execute an operation (non-blocking syscall)
   /// Returns positive on success (bytes transferred), negative on error (-errno)
   fn exec_op(op: &crate::backend::op::Op) -> isize {
+    Self::exec_op_with_socket_flags(op, 0)
+  }
+
+  /// Try nonblocking sockets before paying for readiness registration. Preserve
+  /// the existing behavior for externally supplied blocking descriptors.
+  fn try_socket_immediately(op: &Op) -> Option<isize> {
+    let fd = match op {
+      Op::Recv { fd, .. } | Op::Send { fd, .. } => fd.as_raw_fd(),
+      _ => return None,
+    };
+    let flags = syscall!(raw fcntl(fd, libc::F_GETFL));
+    if flags < 0 || flags & libc::O_NONBLOCK as isize == 0 {
+      return None;
+    }
+    // Also set the per-call flag so a concurrent change to O_NONBLOCK cannot
+    // turn this speculative attempt into a blocking call.
+    let result = Self::exec_op_with_socket_flags(op, libc::MSG_DONTWAIT);
+    if result == EAGAIN_NEG || result == EWOULDBLOCK_NEG {
+      None
+    } else {
+      Some(result)
+    }
+  }
+
+  fn exec_op_with_socket_flags(op: &Op, socket_flags: i32) -> isize {
     use crate::backend::op::Op;
 
     match op {
@@ -817,7 +842,8 @@ impl Poller {
           hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
           hdr.msg_namelen = *len;
         }
-        let result = syscall!(raw recvmsg(fd, &mut hdr, flags.bits()));
+        let result =
+          syscall!(raw recvmsg(fd, &mut hdr, flags.bits() | socket_flags));
         if result >= 0
           && let (Some(out), Some((storage, len))) = (msg.from, addr.as_ref())
           && let Ok(addr) = Self::raise_socket_addr(storage, *len)
@@ -841,7 +867,8 @@ impl Poller {
           hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
           hdr.msg_namelen = *len;
         }
-        let result = syscall!(raw sendmsg(fd, &mut hdr, flags.bits()));
+        let result =
+          syscall!(raw sendmsg(fd, &mut hdr, flags.bits() | socket_flags));
         if result == 0 && hdr.msg_iovlen > 0 {
           Self::debug_sendmsg_zero(fd, &hdr);
         }
@@ -1232,6 +1259,13 @@ impl IoBackend for Poller {
         continue;
       }
 
+      if let Some(result) = Self::try_socket_immediately(&entry.op) {
+        self
+          .queued_completed
+          .push(OpCompleted::new(entry.registration_id, result));
+        continue;
+      }
+
       if let Op::Connect { fd, addr } = &entry.op {
         let Ok((storage, len)) = Self::lower_socket_addr(addr) else {
           self.queued_completed.push(OpCompleted::new(
@@ -1301,13 +1335,28 @@ impl IoBackend for Poller {
     completed.clear();
     if !self.queued_completed.is_empty() {
       completed.append(&mut self.queued_completed);
-      return Ok(());
+      if self.pending.len() == 0 {
+        return Ok(());
+      }
     }
+
+    // Immediate socket completions must not starve previously registered I/O.
+    // Poll pending readiness too, without blocking delivery of ready results.
+    let timeout =
+      if completed.is_empty() { timeout } else { Some(Duration::ZERO) };
 
     let sys = self.sys.as_ref().unwrap();
 
     {
-      let event_count = sys.wait(self.events.as_buf(), timeout)?;
+      let event_count = match sys.wait(self.events.as_buf(), timeout) {
+        Ok(count) => count,
+        Err(err) => {
+          // The driver cannot consume `completed` on an error. Preserve any
+          // immediate results so its next call can still deliver them.
+          self.queued_completed.append(completed);
+          return Err(err);
+        }
+      };
       // SAFETY: `wait()` initialized exactly `event_count` events in the buffer.
       unsafe { self.events.set_len(event_count) };
     }

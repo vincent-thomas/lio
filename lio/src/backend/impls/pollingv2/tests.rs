@@ -7,6 +7,176 @@ use std::time::Duration;
 
 // Helper utilities
 
+mod immediate_sockets {
+  use super::super::Poller;
+  use crate::api::{
+    self,
+    op::{Action, Completion, OpModel, OpResult},
+    resource::Resource,
+  };
+  use crate::backend::{IoBackend, op::Op};
+  use bumpalo::Bump;
+  use std::io::{Read, Write};
+  use std::os::fd::{FromRawFd, IntoRawFd};
+  use std::os::unix::net::UnixStream;
+  use std::time::Duration;
+
+  fn pair(nonblocking: bool) -> (Resource, UnixStream) {
+    let (socket, peer) = UnixStream::pair().unwrap();
+    socket.set_nonblocking(nonblocking).unwrap();
+    // SAFETY: the UnixStream transfers exclusive ownership of its descriptor.
+    (unsafe { Resource::from_raw_fd(socket.into_raw_fd()) }, peer)
+  }
+
+  fn backend() -> Poller {
+    let mut backend = Poller::new();
+    backend.init(4).unwrap();
+    backend
+  }
+
+  fn queue<T: OpModel>(backend: &mut Poller, id: u64, model: &mut T) {
+    let Action::Io(op) = model.action() else {
+      panic!("expected I/O");
+    };
+    // Poller does not use the step arena. Models are boxed by the caller so
+    // the buffers and message descriptors stay stable until completion.
+    backend.push(id, op, &mut Bump::new());
+  }
+
+  #[test]
+  fn ready_receive_does_not_register_readiness() {
+    let (socket, mut peer) = pair(true);
+    peer.write_all(b"hello").unwrap();
+    let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
+    let mut backend = backend();
+    queue(&mut backend, 11, &mut *model);
+    backend.flush().unwrap();
+    assert_eq!(backend.pending.len(), 0);
+    let mut completed = Vec::new();
+    backend.wait(None, &mut completed).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].registration_id(), 11);
+    let OpResult::Done((result, buf)) =
+      model.complete(Completion::new(completed[0].result()))
+    else {
+      panic!();
+    };
+    assert_eq!(result.unwrap(), 5);
+    assert_eq!(buf, b"hello");
+  }
+
+  #[test]
+  fn unavailable_receive_is_registered_and_completes_later() {
+    let (socket, mut peer) = pair(true);
+    let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
+    let mut backend = backend();
+    queue(&mut backend, 12, &mut *model);
+    backend.flush().unwrap();
+    assert_eq!(backend.pending.len(), 1);
+    let mut completed = Vec::new();
+    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    assert!(completed.is_empty());
+    peer.write_all(b"hello").unwrap();
+    backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].result(), 5);
+    assert_eq!(backend.pending.len(), 0);
+  }
+
+  #[test]
+  fn blocking_socket_keeps_readiness_first_behavior() {
+    let (socket, mut peer) = pair(false);
+    let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
+    let mut backend = backend();
+    queue(&mut backend, 13, &mut *model);
+    backend.flush().unwrap();
+    assert_eq!(backend.pending.len(), 1);
+    assert!(backend.queued_completed.is_empty());
+    peer.write_all(b"hello").unwrap();
+    let mut completed = Vec::new();
+    backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].result(), 5);
+  }
+
+  #[test]
+  fn ready_send_does_not_register_readiness() {
+    let (socket, mut peer) = pair(true);
+    let mut model =
+      Box::new(api::send(&socket, b"hello".to_vec(), None).into_inner());
+    let mut backend = backend();
+    queue(&mut backend, 14, &mut *model);
+    backend.flush().unwrap();
+    assert_eq!(backend.pending.len(), 0);
+    let mut completed = Vec::new();
+    backend.wait(None, &mut completed).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].result(), 5);
+    let mut bytes = [0; 5];
+    peer.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"hello");
+  }
+
+  #[test]
+  fn immediate_completions_do_not_starve_registered_receives() {
+    let (socket, mut peer) = pair(true);
+    let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
+    let mut backend = backend();
+    queue(&mut backend, 15, &mut *model);
+    backend.flush().unwrap();
+    assert_eq!(backend.pending.len(), 1);
+    peer.write_all(b"hello").unwrap();
+    backend.push(16, Op::Nop, &mut Bump::new());
+    backend.flush().unwrap();
+    let mut completed = Vec::new();
+    backend.wait(None, &mut completed).unwrap();
+    let mut ids: Vec<_> =
+      completed.iter().map(|c| c.registration_id()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [15, 16]);
+    assert_eq!(backend.pending.len(), 0);
+  }
+
+  #[test]
+  fn backpressured_send_is_registered_and_retried() {
+    let (mut socket, mut peer) = UnixStream::pair().unwrap();
+    socket.set_nonblocking(true).unwrap();
+    peer.set_nonblocking(true).unwrap();
+    let fill = [1u8; 4096];
+    loop {
+      match socket.write(&fill) {
+        Ok(n) => assert!(n > 0),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+        Err(err) => panic!("{err}"),
+      }
+    }
+    // SAFETY: transfer the socket's owned descriptor to Resource.
+    let socket = unsafe { Resource::from_raw_fd(socket.into_raw_fd()) };
+    let mut model =
+      Box::new(api::send(&socket, b"hello".to_vec(), None).into_inner());
+    let mut backend = backend();
+    queue(&mut backend, 17, &mut *model);
+    backend.flush().unwrap();
+    assert_eq!(backend.pending.len(), 1);
+    assert!(backend.queued_completed.is_empty());
+    let mut drain = [0u8; 8192];
+    loop {
+      match peer.read(&mut drain) {
+        Ok(n) => assert!(n > 0),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+        Err(err) => panic!("{err}"),
+      }
+    }
+    let mut completed = Vec::new();
+    backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].result(), 5);
+    assert_eq!(backend.pending.len(), 0);
+    assert_eq!(peer.read(&mut drain).unwrap(), 5);
+    assert_eq!(&drain[..5], b"hello");
+  }
+}
+
 /// RAII wrapper for a socket file descriptor
 pub struct OwnedSocket(RawFd);
 
