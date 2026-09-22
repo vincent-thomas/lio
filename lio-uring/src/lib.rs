@@ -183,6 +183,21 @@ impl Default for Params {
 }
 
 impl Params {
+  /// Defer completion work to explicit ring entry on the creating thread.
+  ///
+  /// Requires Linux 6.1 or newer. All submissions and completion processing
+  /// must remain on the thread that creates the ring. Call completion methods
+  /// regularly to make progress; this also works with `try_wait` because the
+  /// task-run notification flag makes liburing enter the kernel when needed.
+  /// This does not enable a polling thread or busy-waiting.
+  pub fn deferred_taskrun(mut self) -> Self {
+    self.flags |= bindings::IORING_SETUP_COOP_TASKRUN
+      | bindings::IORING_SETUP_TASKRUN_FLAG
+      | bindings::IORING_SETUP_SINGLE_ISSUER
+      | bindings::IORING_SETUP_DEFER_TASKRUN;
+    self
+  }
+
   /// Enable submission queue polling (kernel thread polls SQ)
   pub fn sqpoll(mut self, idle_ms: u32) -> Self {
     self.flags |= bindings::IORING_SETUP_SQPOLL;
@@ -827,6 +842,19 @@ mod tests {
     assert_eq!(params.flags, 0);
     assert_eq!(params.sq_thread_cpu, 0);
     assert_eq!(params.sq_thread_idle, 0);
+  }
+
+  #[test]
+  fn test_params_deferred_taskrun() {
+    let params = Params::default().deferred_taskrun();
+    assert_eq!(
+      params.flags,
+      bindings::IORING_SETUP_COOP_TASKRUN
+        | bindings::IORING_SETUP_TASKRUN_FLAG
+        | bindings::IORING_SETUP_SINGLE_ISSUER
+        | bindings::IORING_SETUP_DEFER_TASKRUN
+    );
+    assert_eq!(params.flags & bindings::IORING_SETUP_SQPOLL, 0);
   }
 
   #[test]

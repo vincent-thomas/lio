@@ -1,14 +1,21 @@
 use std::cell::Cell;
+use std::future::Future;
 use std::hint::black_box;
 use std::io;
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::sync::{
+  Arc,
+  atomic::{AtomicBool, Ordering},
+};
+use std::task::{Context, Wake, Waker};
 use std::time::Duration;
 
 use bumpalo::Bump;
 use criterion::{
   BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
+use lio::api::op::{Action, Completion, OpModel, OpResult, StreamOpModel};
 use lio::backend::op::Op;
 use lio::backend::{IoBackend, OpCompleted};
 use lio::time::Clock;
@@ -140,6 +147,83 @@ fn driver_channel(criterion: &mut Criterion) {
   group.finish();
 }
 
+/// A stream with internal I/O steps between items. The backend completes one
+/// step per driver turn, allowing the executor to run between completions.
+struct SteppedStream {
+  again: usize,
+  remaining: usize,
+}
+
+impl OpModel for SteppedStream {
+  type Item = ();
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::Nop)
+  }
+
+  fn complete(&mut self, _: Completion) -> OpResult<()> {
+    if self.remaining > 0 {
+      self.remaining -= 1;
+      OpResult::Again
+    } else {
+      self.remaining = self.again;
+      OpResult::Yield(())
+    }
+  }
+}
+
+impl StreamOpModel for SteppedStream {}
+
+#[derive(Default)]
+struct ReadyTask(AtomicBool);
+
+impl Wake for ReadyTask {
+  fn wake(self: Arc<Self>) {
+    self.wake_by_ref();
+  }
+
+  fn wake_by_ref(self: &Arc<Self>) {
+    self.0.store(true, Ordering::Relaxed);
+  }
+}
+
+fn stream_executor(criterion: &mut Criterion) {
+  let mut group = criterion.benchmark_group("bookkeeping/stream_executor");
+  group.warm_up_time(Duration::from_secs(1));
+  group.measurement_time(Duration::from_secs(4));
+  group.sample_size(60);
+  for again in [0, 1, 8] {
+    let lio = Lio::new_with_backend(ImmediateBackend::default(), 1).unwrap();
+    let mut stream =
+      api::io::IoStream::from_op(SteppedStream { again, remaining: again })
+        .with_lio(&lio);
+    let ready = Arc::new(ReadyTask::default());
+    let waker = Waker::from(Arc::clone(&ready));
+    let mut cx = Context::from_waker(&waker);
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function(BenchmarkId::new("again", again), |bencher| {
+      bencher.iter(|| {
+        let mut next = std::pin::pin!(stream.next());
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        let mut polls = 0usize;
+        loop {
+          assert_eq!(lio.try_run().unwrap(), 1);
+          if ready.0.swap(false, Ordering::Relaxed) {
+            polls += 1;
+            if let std::task::Poll::Ready(item) = next.as_mut().poll(&mut cx) {
+              assert_eq!(item, Some(()));
+              break;
+            }
+          }
+        }
+        black_box(polls);
+      });
+    });
+  }
+  group.finish();
+}
+
 fn timers(criterion: &mut Criterion) {
   let mut group = criterion.benchmark_group("bookkeeping/timer_wheel");
   for depth in QUEUE_DEPTHS {
@@ -169,6 +253,6 @@ criterion_group! {
     .warm_up_time(Duration::from_millis(500))
     .measurement_time(Duration::from_millis(1500))
     .sample_size(30);
-  targets = direct_backend, driver_callback, driver_channel, timers
+  targets = direct_backend, driver_callback, driver_channel, stream_executor, timers
 }
 criterion_main!(benches);

@@ -122,6 +122,11 @@ void lio_sockaddr_free(sockaddr_storage *addr);
 
 /**
  * Free a directory entry array returned by [`lio_readdir`].
+ *
+ * # Safety
+ * `entries` must be null or the pointer returned by [`lio_readdir`], and
+ * `len` must be the length returned with that pointer. The entries must not be
+ * used after this call.
  */
 void lio_dir_entries_free(struct lio_dir_entry_t *entries, uintptr_t len);
 
@@ -157,16 +162,29 @@ int lio_tick(struct lio_handle_t *lio);
 
 /**
  * Shut down part of a full-duplex connection.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `fd` must be a valid open socket that
+ * remains open until the operation completes.
  */
 void lio_shutdown(struct lio_handle_t *lio, intptr_t fd, int how, void (*callback)(int));
 
 /**
  * Synchronize a file's in-core state with the storage device.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `fd` must be a valid open file descriptor
+ * that remains open until the operation completes.
  */
 void lio_fsync(struct lio_handle_t *lio, intptr_t fd, void (*callback)(int));
 
 /**
  * Bind a socket to an address.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `fd` must be a valid open socket. If
+ * `sock` is non-null, it must point to a readable socket address of at least
+ * `sock_len` bytes.
  */
 void lio_bind(struct lio_handle_t *lio,
               intptr_t fd,
@@ -176,6 +194,10 @@ void lio_bind(struct lio_handle_t *lio,
 
 /**
  * Listen for connections on a socket.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `fd` must be a valid open socket that
+ * remains open until the operation completes.
  */
 void lio_listen(struct lio_handle_t *lio, intptr_t fd, int backlog, void (*callback)(int));
 
@@ -283,6 +305,12 @@ void lio_recv(struct lio_handle_t *lio,
 
 /**
  * Receive data and sender address from a socket.
+ *
+ * Ownership of `buf` transfers to lio and is returned through `callback`.
+ *
+ * # Safety
+ * `lio` must be a valid handle; `fd` must be a valid open socket; and `buf`
+ * must be a live buffer allocated by [`lio_buf_alloc`] with length `buf_len`.
  */
 void lio_recvfrom(struct lio_handle_t *lio,
                   intptr_t fd,
@@ -303,6 +331,9 @@ void lio_sleep(struct lio_handle_t *lio, unsigned int millis, void (*callback)(i
 
 /**
  * Runs an interval and invokes `callback` for every tick until the lio handle is destroyed.
+ *
+ * # Safety
+ * `lio` must be a valid handle.
  */
 void lio_interval(struct lio_handle_t *lio, unsigned int millis, void (*callback)(int));
 
@@ -480,6 +511,11 @@ void lio_mkdirat(struct lio_handle_t *lio,
 
 /**
  * Reads metadata for a path relative to a directory file descriptor.
+ *
+ * # Safety
+ * `lio` must be a valid handle; `dir_fd` must be a valid open directory file
+ * descriptor; and a non-null `path` must point to a valid NUL-terminated
+ * string. The descriptor must remain open until the operation completes.
  */
 void lio_statat(struct lio_handle_t *lio,
                 intptr_t dir_fd,
@@ -489,6 +525,10 @@ void lio_statat(struct lio_handle_t *lio,
 
 /**
  * Reads metadata for an open file descriptor.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `fd` must be a valid open file descriptor
+ * that remains open until the operation completes.
  */
 void lio_fstat(struct lio_handle_t *lio,
                intptr_t fd,
@@ -496,6 +536,14 @@ void lio_fstat(struct lio_handle_t *lio,
 
 /**
  * Reads the target of a symbolic link relative to a directory file descriptor.
+ *
+ * Ownership of `buf` transfers to lio and is returned through `callback`.
+ *
+ * # Safety
+ * `lio` must be a valid handle; `dir_fd` must be a valid open directory file
+ * descriptor; a non-null `path` must point to a valid NUL-terminated string;
+ * and `buf` must be a live buffer allocated by [`lio_buf_alloc`] with length
+ * `buf_len`. The descriptor must remain open until the operation completes.
  */
 void lio_readlinkat(struct lio_handle_t *lio,
                     intptr_t dir_fd,
@@ -506,6 +554,12 @@ void lio_readlinkat(struct lio_handle_t *lio,
 
 /**
  * Reads the current working directory into a caller-provided buffer.
+ *
+ * Ownership of `buf` transfers to lio and is returned through `callback`.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `buf` must be a live buffer allocated by
+ * [`lio_buf_alloc`] with length `buf_len`.
  */
 void lio_getcwd(struct lio_handle_t *lio,
                 uint8_t *buf,
@@ -514,6 +568,13 @@ void lio_getcwd(struct lio_handle_t *lio,
 
 /**
  * Reads one batch of directory entries from an open directory descriptor.
+ *
+ * The buffers returned through `callback` must be released with
+ * [`lio_buf_free`] and [`lio_dir_entries_free`], respectively.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `fd` must be a valid open directory file
+ * descriptor that remains open until the operation completes.
  */
 void lio_readdir(struct lio_handle_t *lio,
                  intptr_t fd,
@@ -521,6 +582,14 @@ void lio_readdir(struct lio_handle_t *lio,
                  uintptr_t entries_capacity,
                  void (*callback)(int, uint8_t*, uintptr_t, struct lio_dir_entry_t*, uintptr_t, int));
 
+/**
+ * Spawn a process.
+ *
+ * # Safety
+ * `lio` must be a valid handle. A non-null `path` must point to a valid
+ * NUL-terminated string. `argv` and `envp` must each be null or point to a
+ * null-terminated array of pointers to valid NUL-terminated strings.
+ */
 void lio_spawn(struct lio_handle_t *lio,
                const char *path,
                const char *const *argv,

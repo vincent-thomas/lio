@@ -30,6 +30,8 @@ const LINUX_DIRENT64_NAME_OFFSET: usize = 19;
 type CurrentDirent<'a> = (u64, u8, usize, &'a [u8]);
 
 #[cfg(test)]
+mod deferred_tests;
+#[cfg(test)]
 mod single_socket_tests;
 
 #[derive(Debug)]
@@ -471,6 +473,7 @@ pub struct IoUring {
   in_flight: usize,
   needs_submit: bool,
   single_socket: bool,
+  deferred_completions: bool,
   backlog: Vec<PendingOp>,
   pending: Slab<PendingOp>,
   queued_completed: Vec<OpCompleted>,
@@ -485,6 +488,7 @@ impl Default for IoUring {
       in_flight: 0,
       needs_submit: false,
       single_socket: false,
+      deferred_completions: false,
       backlog: Vec::new(),
       pending: Slab::new(0),
       queued_completed: Vec::new(),
@@ -539,6 +543,50 @@ impl Drop for IoUring {
 }
 
 impl IoUring {
+  /// Create a backend optimized for batches of asynchronous completions.
+  ///
+  /// Completion work runs when the thread-local driver checks the ring rather
+  /// than interrupting submissions. This can help high-depth file I/O, but
+  /// may hurt small socket batches; [`Self::new`] retains the kernel default.
+  /// Nonblocking waits still make progress. Kernels older than Linux 6.1 fall
+  /// back to the default behavior. No polling thread or busy-wait is enabled.
+  ///
+  /// ```
+  /// use lio::{Lio, backend::impls::IoUring};
+  /// let lio = Lio::new_with_backend(IoUring::with_deferred_completions(), 256)?;
+  /// # Ok::<(), std::io::Error>(())
+  /// ```
+  ///
+  /// The backend cannot be transferred to another thread:
+  /// ```compile_fail
+  /// use lio::backend::impls::IoUring;
+  /// let backend = IoUring::with_deferred_completions();
+  /// std::thread::spawn(move || drop(backend));
+  /// ```
+  pub fn with_deferred_completions() -> Self {
+    let mut backend = Self::default();
+    backend.deferred_completions = true;
+    backend
+  }
+
+  fn create_ring_with(
+    cap: u32,
+    mut initialize: impl FnMut(lio_uring::Params) -> io::Result<LioUring>,
+  ) -> io::Result<LioUring> {
+    let params = lio_uring::Params { sq_entries: cap, ..Default::default() };
+    // The driver is thread-local. Defer completion work until it explicitly
+    // checks the ring, so a batch submission is not interrupted per completion.
+    initialize(params.clone().deferred_taskrun()).or_else(|err| {
+      // Old kernels reject unsupported setup flags. Preserve their original
+      // behavior, but do not mask resource/permission failures with retries.
+      if err.raw_os_error() == Some(libc::EINVAL) {
+        initialize(params)
+      } else {
+        Err(err)
+      }
+    })
+  }
+
   unsafe fn drop_read_dir_state(state: *mut ()) {
     if !state.is_null() {
       // SAFETY: `state` was allocated with `Box::into_raw` for `ReadDirState`
@@ -1201,7 +1249,11 @@ impl IoUring {
 
 impl IoBackend for IoUring {
   fn init(&mut self, cap: usize) -> io::Result<()> {
-    self.ring = Some(LioUring::new(cap as u32)?);
+    self.ring = Some(if self.deferred_completions {
+      Self::create_ring_with(cap as u32, LioUring::with_params)?
+    } else {
+      LioUring::new(cap as u32)?
+    });
     self.single_socket =
       self.ring().supports_opcodes(&[Send::CODE, Recv::CODE]);
     self.capacity = cap;
