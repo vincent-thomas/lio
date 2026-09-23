@@ -113,6 +113,8 @@ pub unsafe trait IoBufMut: IoBuf {
   unsafe fn set_len(&mut self, len: usize);
 }
 
+// SAFETY: Vec owns contiguous initialized elements; ownership keeps its pointer,
+// length, and contents stable while I/O holds the Vec.
 unsafe impl IoBuf for Vec<u8> {
   fn as_ptr(&self) -> *const u8 {
     Vec::as_ptr(self)
@@ -123,6 +125,8 @@ unsafe impl IoBuf for Vec<u8> {
   }
 }
 
+// SAFETY: Vec owns writable storage up to capacity without safe aliases during
+// I/O ownership; set_len forwards the caller's initialization bound.
 unsafe impl IoBufMut for Vec<u8> {
   fn as_mut_ptr(&mut self) -> *mut u8 {
     Vec::as_mut_ptr(self)
@@ -140,6 +144,8 @@ unsafe impl IoBufMut for Vec<u8> {
 }
 
 #[cfg(feature = "nightly")]
+// SAFETY: Box owns its initialized slice; pointer, length and contents remain
+// stable while the box is owned by I/O.
 unsafe impl IoBuf for Box<[u8]> {
   fn as_ptr(&self) -> *const u8 {
     <[u8]>::as_ptr(self)
@@ -202,6 +208,7 @@ pub unsafe trait IoBufMutVec: Send + Sync + 'static {
 // Single buffer implements vectored traits (a buffer is a 1-element collection)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// SAFETY: The sole segment inherits IoBuf's stable pointer and initialized length.
 unsafe impl<B: IoBuf> IoBufVec for B {
   fn buf_count(&self) -> usize {
     1
@@ -211,6 +218,8 @@ unsafe impl<B: IoBuf> IoBufVec for B {
   }
 }
 
+// SAFETY: The sole segment inherits IoBufMut's exclusive writable storage and
+// stable capacity; set_buf_len delegates the caller's initialization bound.
 unsafe impl<B: IoBufMut> IoBufMutVec for B {
   fn buf_count(&self) -> usize {
     1
@@ -219,6 +228,8 @@ unsafe impl<B: IoBufMut> IoBufMutVec for B {
     (self.as_mut_ptr(), self.capacity())
   }
   unsafe fn set_buf_len(&mut self, _i: usize, len: usize) {
+    // SAFETY: The caller guarantees len initialized bytes within the sole
+    // segment's capacity.
     unsafe { self.set_len(len) };
   }
 }
@@ -229,6 +240,8 @@ unsafe impl<B: IoBufMut> IoBufMutVec for B {
 
 macro_rules! impl_io_buf_vec_tuple {
   ($count:expr, $($idx:tt: $T:ident),+) => {
+    // SAFETY: The fixed count indexes tuple fields, each of which supplies
+    // stable initialized storage under its IoBuf contract.
     unsafe impl<$($T: IoBuf),+> IoBufVec for ($($T,)+) {
       fn buf_count(&self) -> usize { $count }
 
@@ -240,6 +253,8 @@ macro_rules! impl_io_buf_vec_tuple {
       }
     }
 
+    // SAFETY: Distinct tuple fields have disjoint storage; each IoBufMut
+    // supplies stable, exclusively writable capacity while I/O owns the tuple.
     unsafe impl<$($T: IoBufMut),+> IoBufMutVec for ($($T,)+) {
       fn buf_count(&self) -> usize { $count }
 
@@ -252,6 +267,8 @@ macro_rules! impl_io_buf_vec_tuple {
 
       unsafe fn set_buf_len(&mut self, i: usize, len: usize) {
         match i {
+          // SAFETY: The caller guarantees the indexed field has len initialized
+          // bytes within that field's capacity.
           $($idx => unsafe { self.$idx.set_len(len) },)+
           _ => panic!("index out of bounds"),
         }
@@ -276,6 +293,8 @@ impl_io_buf_vec_tuple!(8, 0: B0, 1: B1, 2: B2, 3: B3, 4: B4, 5: B5, 6: B6, 7: B7
 macro_rules! impl_io_buf_vec_array {
   ($($n:expr),+) => {
     $(
+      // SAFETY: Array count is fixed and each indexed IoBuf provides stable,
+      // initialized storage while I/O owns the array.
       unsafe impl<B: IoBuf> IoBufVec for [B; $n] {
         fn buf_count(&self) -> usize { $n }
 
@@ -284,6 +303,8 @@ macro_rules! impl_io_buf_vec_array {
         }
       }
 
+      // SAFETY: Separate array elements have disjoint storage and each
+      // IoBufMut provides stable, exclusively writable capacity.
       unsafe impl<B: IoBufMut> IoBufMutVec for [B; $n] {
         fn buf_count(&self) -> usize { $n }
 
@@ -292,6 +313,8 @@ macro_rules! impl_io_buf_vec_array {
         }
 
         unsafe fn set_buf_len(&mut self, i: usize, len: usize) {
+          // SAFETY: The caller guarantees i is in bounds and len initialized
+          // bytes fit in this element's capacity.
           unsafe { self[i].set_len(len) };
         }
       }
@@ -305,6 +328,8 @@ impl_io_buf_vec_array!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
 // Vec implementations for IoBufVec/IoBufMutVec (dynamic buffer count)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// SAFETY: Ownership prevents safe changes to Vec's element count during I/O;
+// each IoBuf provides stable initialized storage.
 unsafe impl<B: IoBuf> IoBufVec for Vec<B> {
   fn buf_count(&self) -> usize {
     self.len()
@@ -315,6 +340,8 @@ unsafe impl<B: IoBuf> IoBufVec for Vec<B> {
   }
 }
 
+// SAFETY: The exclusive mutable reference prevents safe changes to the Vec
+// during I/O; each IoBuf element supplies stable initialized storage.
 unsafe impl<B: IoBuf> IoBufVec for &'static mut Vec<B> {
   fn buf_count(&self) -> usize {
     self.len()
@@ -325,6 +352,8 @@ unsafe impl<B: IoBuf> IoBufVec for &'static mut Vec<B> {
   }
 }
 
+// SAFETY: Vec ownership fixes the count during I/O, distinct elements have
+// disjoint storage, and each IoBufMut supplies stable writable capacity.
 unsafe impl<B: IoBufMut> IoBufMutVec for Vec<B> {
   fn buf_count(&self) -> usize {
     self.len()
@@ -335,6 +364,8 @@ unsafe impl<B: IoBufMut> IoBufMutVec for Vec<B> {
   }
 
   unsafe fn set_buf_len(&mut self, i: usize, len: usize) {
+    // SAFETY: The caller guarantees i is in bounds and len initialized
+    // bytes fit in this element's capacity.
     unsafe { self[i].set_len(len) };
   }
 }

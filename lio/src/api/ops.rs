@@ -997,6 +997,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Recv<B> {
     &mut self,
     completion: Completion,
   ) -> OpResult<Self::Item> {
+    // SAFETY: RecvCore submitted this receive into its owned iovecs; completion arrives after the backend finishes writing them. complete_buf clamps exposed lengths to initialized capacity.
     OpResult::Done(unsafe { self.core.complete_buf(completion) })
   }
 }
@@ -1024,6 +1025,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for RecvFrom<B> {
     &mut self,
     completion: Completion,
   ) -> OpResult<Self::Item> {
+    // SAFETY: RecvCore submitted this receive into its owned iovecs and optional source address; the backend finished initializing both before this completion. complete_buf clamps exposed lengths to capacity.
     let (result, buf) = unsafe { self.core.complete_buf(completion) };
     let addr = result
       .as_ref()

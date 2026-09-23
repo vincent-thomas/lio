@@ -67,6 +67,7 @@ impl<B: IoBufVec> WriteCursor<B> {
   }
 }
 
+// SAFETY: The inner IoBufVec guarantees stable readable storage. advance only moves to a later chunk or within its reported length, so each exposed suffix remains initialized and valid while I/O owns the cursor.
 unsafe impl<B: IoBufVec> IoBufVec for WriteCursor<B> {
   fn buf_count(&self) -> usize {
     self.inner.buf_count().saturating_sub(self.chunk_idx)
@@ -188,6 +189,7 @@ impl OpModel for Copy {
   ) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, CopyState::Done) {
       CopyState::Reading(mut read) => {
+        // SAFETY: The Reading state owns the submitted read; its completion is delivered once after the backend initializes the reported bytes in its buffer.
         match unsafe { read.complete(completion) } {
           OpResult::Done((Ok(0), _buf)) => OpResult::Done(Ok(self.total)),
           OpResult::Done((Ok(n), mut buf)) => {
@@ -202,6 +204,7 @@ impl OpModel for Copy {
           OpResult::Again | OpResult::Yield(_) => unreachable!(),
         }
       }
+      // SAFETY: The Writing state owns the submitted write; its completion is delivered once after the backend stops accessing its buffer.
       CopyState::Writing(mut write) => match unsafe {
         write.complete(completion)
       } {

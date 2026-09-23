@@ -374,6 +374,7 @@ impl Lio {
       let on_completion_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
       let completion_result =
+        // SAFETY: The completed array contains driver results for submitted registrations; looking up the matching live id and dispatching once after polling ensures the backend is done with its pointers and output writes.
         unsafe { op.on_driver_completion(Completion::new(result)) };
       if let Some(started) = on_completion_started {
         completion_on_completion_time += started.elapsed();
@@ -428,6 +429,7 @@ impl Lio {
         let mut finished = false;
 
         if let Some(reg) = inner.store.get_mut(timer_id) {
+          // SAFETY: This id came from expired timers for a live registration; its pending Sleep action owns no backend pointers or writable output, and the timer is removed after this single delivery.
           let result = unsafe {
             reg.on_driver_completion(Completion::with_flags(
               SLEEP_RESULT,

@@ -289,6 +289,7 @@ impl OpModel for OpenFile {
     &mut self,
     completion: Completion,
   ) -> OpResult<Self::Item> {
+    // SAFETY: OpenFile forwards the completed open action from its inner model; the backend has finished using the path and handed off any returned descriptor.
     match unsafe { self.inner.complete(completion) } {
       OpResult::Done(Ok(resource)) => {
         OpResult::Done(Ok(File::from_resource(resource)))
@@ -318,6 +319,7 @@ impl OpModel for OpenDirectory {
     &mut self,
     completion: Completion,
   ) -> OpResult<Self::Item> {
+    // SAFETY: OpenDirectory forwards the completed open action from its inner model; the backend has finished using the path and handed off any returned descriptor.
     match unsafe { self.inner.complete(completion) } {
       OpResult::Done(Ok(resource)) => {
         OpResult::Done(Ok(Directory::from_resource(resource)))
@@ -385,6 +387,7 @@ impl OpModel for OpenReadDir {
   ) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, OpenReadDirState::Done) {
       OpenReadDirState::Opening(mut op) => {
+        // SAFETY: The Opening state owns the submitted open action; the backend finished using its path and handed off any returned descriptor before this completion.
         match unsafe { op.complete(completion) } {
           OpResult::Done(Ok(fd)) => {
             let buf = self.buf.take().expect("read_dir buffer missing");
@@ -403,6 +406,7 @@ impl OpModel for OpenReadDir {
         }
       }
       OpenReadDirState::Reading { fd, mut op } => {
+        // SAFETY: The Reading state owns the submitted read-dir action; the backend finished writing its entry buffer before forwarding this completion.
         match unsafe { op.complete(completion) } {
           OpResult::Done(Ok(buf)) => {
             let eof = buf.result.eof;
@@ -604,6 +608,7 @@ impl OpModel for RemoveDirAll {
   ) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, RemoveDirAllState::Done) {
       RemoveDirAllState::Opening { parent, name, mut op } => {
+        // SAFETY: The Opening state owns the submitted open action; the backend finished using its path and handed off any returned descriptor before this completion.
         match unsafe { op.complete(completion) } {
           OpResult::Done(Ok(fd)) => {
             let mut frame = RemoveDirFrame::new(parent, name, fd);
@@ -621,6 +626,7 @@ impl OpModel for RemoveDirAll {
         }
       }
       RemoveDirAllState::Reading { mut op } => {
+        // SAFETY: The Reading state owns the submitted read-dir action; the backend finished writing its entry buffer before forwarding this completion.
         match unsafe { op.complete(completion) } {
           OpResult::Done(Ok(buf)) => {
             if !buf.result.eof && buf.result.entries == 0 {
@@ -646,6 +652,7 @@ impl OpModel for RemoveDirAll {
         }
       }
       RemoveDirAllState::Stating { parent, name, mut op } => {
+        // SAFETY: The Stating state owns the submitted stat action; the backend initialized its stat output before forwarding this completion.
         match unsafe { op.complete(completion) } {
           OpResult::Done(Ok(stat)) => {
             self.state = if stat.is_dir() {
@@ -675,6 +682,7 @@ impl OpModel for RemoveDirAll {
         }
       }
       RemoveDirAllState::RemovingEntry { mut op } => {
+        // SAFETY: The RemovingEntry state owns the submitted unlink action; its completion is delivered once after the backend finishes using the path.
         match unsafe { op.complete(completion) } {
           OpResult::Done(Ok(())) => self.advance(),
           OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
@@ -686,6 +694,7 @@ impl OpModel for RemoveDirAll {
         }
       }
       RemoveDirAllState::RemovingDir { mut op } => {
+        // SAFETY: The RemovingDir state owns the submitted directory-removal action; its completion is delivered once after the backend finishes using the path.
         match unsafe { op.complete(completion) } {
           OpResult::Done(Ok(())) => self.advance(),
           OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
@@ -745,6 +754,7 @@ impl OpModel for ReadLink {
   ) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, ReadLinkState::Done) {
       ReadLinkState::Reading(mut op) => {
+        // SAFETY: The Reading state owns the submitted readlink action; the backend finished writing its target buffer before forwarding this completion.
         match unsafe { op.complete(completion) } {
           OpResult::Done((Ok(n), buf)) if n as usize == buf.capacity() => {
             let next_len = buf.capacity().saturating_mul(2).max(1);
@@ -818,6 +828,7 @@ impl OpModel for ReadToString {
     completion: Completion,
   ) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, ReadToStringState::Done) {
+      // SAFETY: The Opening state owns the submitted open action; its completion is forwarded once after the backend finishes using its path.
       ReadToStringState::Opening(mut op) => match unsafe {
         op.complete(completion)
       } {
@@ -836,6 +847,7 @@ impl OpModel for ReadToString {
         OpResult::Yield(_) => unreachable!("openat is a oneshot operation"),
       },
       ReadToStringState::Reading { fd, mut op } => {
+        // SAFETY: The Reading state owns the submitted read action; the backend finished initializing the reported byte prefix before forwarding its completion.
         match unsafe { op.complete(completion) } {
           OpResult::Done((Ok(0), _buf)) => {
             let bytes = std::mem::take(&mut self.bytes);

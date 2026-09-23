@@ -55,6 +55,7 @@ impl OpModel for SocketAccept {
   }
 
   unsafe fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
+    // SAFETY: SocketAccept forwards the completed accept action it submitted through inner; the backend initialized the address and handed off the accepted descriptor.
     match unsafe { self.inner.complete(res) } {
       OpResult::Done(Ok((resource, addr))) => {
         OpResult::Done(Ok((Socket::from_resource(resource), addr)))
@@ -152,6 +153,7 @@ impl OpModel for TcpAccept {
   }
 
   unsafe fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
+    // SAFETY: TcpAccept forwards the completed accept action it submitted through inner; the backend initialized the address and handed off the accepted descriptor.
     match unsafe { self.inner.complete(res) } {
       OpResult::Done(Ok((resource, addr))) => {
         OpResult::Done(Ok((TcpStream::from_resource(resource), addr)))
@@ -220,6 +222,7 @@ impl OpModel for TcpBindListener {
   ) -> OpResult<Self::Item> {
     match &mut self.state {
       TcpBindState::Socket(inner) => {
+        // SAFETY: The Socket state owns the submitted socket-creation action; its completed descriptor is handed off once by the backend before forwarding the result.
         match unsafe { inner.complete(completion) } {
           OpResult::Done(Ok(resource)) => {
             self.state = TcpBindState::Bind { resource };
@@ -317,6 +320,7 @@ impl OpModel for TcpStreamConnect {
   ) -> OpResult<Self::Item> {
     match &mut self.state {
       TcpConnectState::Socket(inner) => {
+        // SAFETY: The Socket state owns the submitted socket-creation action; its completed descriptor is handed off once by the backend before forwarding the result.
         match unsafe { inner.complete(completion) } {
           OpResult::Done(Ok(resource)) => {
             self.state = TcpConnectState::Connect { resource };
@@ -400,6 +404,7 @@ impl OpModel for UdpBindSocket {
   ) -> OpResult<Self::Item> {
     match &mut self.state {
       UdpBindState::Socket(inner) => {
+        // SAFETY: The Socket state owns the submitted socket-creation action; its completed descriptor is handed off once by the backend before forwarding the result.
         match unsafe { inner.complete(completion) } {
           OpResult::Done(Ok(resource)) => {
             self.state = UdpBindState::Bind { resource };
@@ -485,6 +490,7 @@ impl OpModel for UdpConnectSocket {
   ) -> OpResult<Self::Item> {
     match &mut self.state {
       UdpConnectState::Socket(inner) => {
+        // SAFETY: The Socket state owns the submitted socket-creation action; its completed descriptor is handed off once by the backend before forwarding the result.
         match unsafe { inner.complete(completion) } {
           OpResult::Done(Ok(resource)) => {
             self.state = UdpConnectState::Connect { resource };
