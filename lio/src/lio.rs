@@ -154,13 +154,15 @@ impl Lio {
     self.inner.borrow_mut().time.advance_by_ticks(ticks);
   }
 
-  fn dispatch_action(inner: &mut LioInner, id: u64, action: Action) {
-    let (store, io, time) = (&mut inner.store, &mut inner.io, &mut inner.time);
+  fn dispatch_action(
+    io: &mut dyn IoBackend,
+    time: &mut TimeManager,
+    step_bump: &mut Bump,
+    id: u64,
+    action: Action,
+  ) {
     match action {
       Action::Io(op) => {
-        let step_bump = store
-          .step_bump_mut(id)
-          .expect("dispatching action for unknown registration");
         step_bump.reset();
         io.push(id, op, step_bump);
       }
@@ -360,7 +362,7 @@ impl Lio {
 
       let store_lookup_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
-      let Some(op) = inner.store.get_mut(id) else {
+      let Some((op, step_bump)) = inner.store.get_mut_with_step(id) else {
         if let Some(started) = store_lookup_started {
           completion_store_lookup_time += started.elapsed();
           stale_completions += 1;
@@ -382,7 +384,13 @@ impl Lio {
       if let Some(next_action) = completion_result.next_action {
         let started =
           if profiling_enabled { Some(Instant::now()) } else { None };
-        Self::dispatch_action(inner, id, next_action);
+        Self::dispatch_action(
+          &mut *inner.io,
+          &mut inner.time,
+          step_bump,
+          id,
+          next_action,
+        );
         if let Some(started) = started {
           dispatch_time += started.elapsed();
         }
@@ -423,24 +431,29 @@ impl Lio {
       let timer_loop_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
       for &timer_id in &expired_timers {
-        let mut next_action = None;
-        let mut finished = false;
-
-        if let Some(reg) = inner.store.get_mut(timer_id) {
-          let result = reg.on_driver_completion(Completion::with_flags(
-            SLEEP_RESULT,
-            crate::api::op::CompletionFlags::TIMER,
-          ));
-          finished = result.is_done();
-          next_action = result.next_action;
-        }
+        let Some((reg, step_bump)) = inner.store.get_mut_with_step(timer_id)
+        else {
+          inner.time.remove(timer_id);
+          continue;
+        };
+        let result = reg.on_driver_completion(Completion::with_flags(
+          SLEEP_RESULT,
+          crate::api::op::CompletionFlags::TIMER,
+        ));
+        let finished = result.is_done();
 
         inner.time.remove(timer_id);
 
-        if let Some(action) = next_action {
+        if let Some(action) = result.next_action {
           let started =
             if profiling_enabled { Some(Instant::now()) } else { None };
-          Self::dispatch_action(inner, timer_id, action);
+          Self::dispatch_action(
+            &mut *inner.io,
+            &mut inner.time,
+            step_bump,
+            timer_id,
+            action,
+          );
           if let Some(started) = started {
             dispatch_time += started.elapsed();
           }
@@ -505,5 +518,141 @@ impl Lio {
     let mut inner = self.inner.borrow_mut();
     inner.time.remove(id);
     inner.store.remove(id);
+  }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+  use super::*;
+  use crate::api::op::{CompletionFlags, OpModel, OpResult};
+  use crate::backend::op::Op;
+  use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  };
+
+  #[derive(Default)]
+  struct Backend {
+    queued: Vec<u64>,
+    stale: Rc<RefCell<Vec<u64>>>,
+    last_id: Rc<std::cell::Cell<u64>>,
+  }
+
+  impl IoBackend for Backend {
+    fn init(&mut self, _: usize) -> io::Result<()> {
+      Ok(())
+    }
+
+    fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump) {
+      assert!(matches!(op, Op::Nop));
+      // Each submission must receive reset lowering storage, including when
+      // continuing after a timer or reusing a completed registration's slot.
+      assert!(step_bump.iter_allocated_chunks().all(|chunk| chunk.is_empty()));
+      step_bump.alloc([42u8; 128]);
+      self.queued.push(id);
+      self.last_id.set(id);
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+      Ok(())
+    }
+
+    fn wait(
+      &mut self,
+      _: Option<Duration>,
+      completed: &mut Vec<OpCompleted>,
+    ) -> io::Result<()> {
+      completed
+        .extend(self.stale.borrow().iter().map(|&id| OpCompleted::new(id, -1)));
+      completed.extend(self.queued.drain(..).map(|id| OpCompleted::new(id, 0)));
+      Ok(())
+    }
+  }
+
+  struct Steps {
+    step: usize,
+    timer: bool,
+    token: Box<usize>,
+    drops: Arc<AtomicUsize>,
+  }
+
+  impl OpModel for Steps {
+    type Item = usize;
+
+    fn action(&mut self) -> Action {
+      if self.timer && self.step == 1 {
+        Action::Sleep(Duration::ZERO)
+      } else {
+        Action::Io(Op::Nop)
+      }
+    }
+
+    fn complete(&mut self, completion: Completion) -> OpResult<usize> {
+      assert_eq!(completion.result, 0);
+      assert_eq!(
+        completion.flags.contains(CompletionFlags::TIMER),
+        self.timer && self.step == 1,
+      );
+      self.step += 1;
+      match self.step {
+        1 => OpResult::Again,
+        2 => OpResult::Yield(*self.token),
+        3 => OpResult::Done(*self.token),
+        _ => panic!("completed a finished model"),
+      }
+    }
+  }
+
+  impl crate::api::op::StreamOpModel for Steps {}
+
+  impl Drop for Steps {
+    fn drop(&mut self) {
+      self.drops.fetch_add(1, Ordering::Relaxed);
+    }
+  }
+
+  #[test]
+  fn continuations_reset_storage_and_reject_stale_generations() {
+    for timer in [false, true] {
+      for profile in [false, true] {
+        let backend = Backend::default();
+        let stale = backend.stale.clone();
+        let last_id = backend.last_id.clone();
+        let lio = Lio::new_with_backend(backend, 1).unwrap();
+        lio.inner.borrow_mut().profile = profile.then(LioProfile::default);
+        lio.pause_time();
+        let drops = Arc::new(AtomicUsize::new(0));
+        for token in 0..8 {
+          let items = Rc::new(RefCell::new(Vec::new()));
+          let output = items.clone();
+          let model = Steps {
+            step: 0,
+            timer,
+            token: Box::new(token),
+            drops: drops.clone(),
+          };
+          lio
+            .schedule_with(|arena| {
+              Registration::new_callback_in(
+                arena,
+                move |item| output.borrow_mut().push(item),
+                model,
+              )
+            })
+            .unwrap();
+          assert_eq!(lio.try_run().unwrap(), 1);
+          assert!(items.borrow().is_empty());
+          lio.advance_time_by_ticks(1);
+          assert_eq!(lio.try_run().unwrap(), 1);
+          assert_eq!(*items.borrow(), [token]);
+          assert_eq!(drops.load(Ordering::Relaxed), token);
+          assert_eq!(lio.try_run().unwrap(), 1);
+          assert_eq!(*items.borrow(), [token, token]);
+          assert_eq!(drops.load(Ordering::Relaxed), token + 1);
+          stale.borrow_mut().push(last_id.get());
+          assert_eq!(lio.try_run().unwrap(), 0);
+        }
+      }
+    }
   }
 }
