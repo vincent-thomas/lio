@@ -182,8 +182,30 @@ pub unsafe extern "C" fn lio_dir_entries_free(
   len: usize,
 ) {
   if !entries.is_null() {
-    drop(unsafe { Vec::from_raw_parts(entries, 0, len) });
+    // The returned boxed slice has exactly `len` elements.
+    drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(entries, len)) });
   }
+}
+
+/// Export an exactly sized allocation for `lio_dir_entries_free`.
+fn readdir_entries_into_ffi(
+  entries: Vec<lio_dir_entry_t>,
+) -> (*mut lio_dir_entry_t, usize) {
+  let mut entries = entries.into_boxed_slice();
+  let len = entries.len();
+  let ptr = entries.as_mut_ptr();
+  mem::forget(entries);
+  (ptr, len)
+}
+
+/// Export an exactly sized allocation for `lio_buf_free(buf, len)`.
+/// The boxed slice has the same allocation layout as a Vec with capacity `len`.
+fn readdir_raw_into_ffi(raw: Vec<u8>) -> (*mut u8, usize) {
+  let mut raw = raw.into_boxed_slice();
+  let len = raw.len();
+  let ptr = raw.as_mut_ptr();
+  mem::forget(raw);
+  (ptr, len)
 }
 
 fn file_type_to_ffi(file_type: FileType) -> libc::c_int {
@@ -1583,7 +1605,7 @@ pub unsafe extern "C" fn lio_readdir(
   .with_lio(&unsafe { handle(lio) }.inner)
   .when_done(move |res| match res {
     Ok(buf) => {
-      let mut entries: Vec<lio_dir_entry_t> = buf
+      let entries: Vec<lio_dir_entry_t> = buf
         .entries
         .iter()
         .take(buf.result.entries)
@@ -1595,16 +1617,12 @@ pub unsafe extern "C" fn lio_readdir(
           ino: entry.ino.unwrap_or(0),
         })
         .collect();
-      let entries_len = entries.len();
-      let entries_ptr = entries.as_mut_ptr();
-      std::mem::forget(entries);
+      let (entries_ptr, entries_len) = readdir_entries_into_ffi(entries);
 
-      let raw_written = buf.result.raw_written;
       let eof = i32::from(buf.result.eof);
-      let mut raw = buf.raw[..raw_written].to_vec();
-      let raw_ptr = raw.as_mut_ptr();
-      std::mem::forget(raw);
-      callback(0, raw_ptr, raw_written, entries_ptr, entries_len, eof);
+      let (raw_ptr, raw_len) =
+        readdir_raw_into_ffi(buf.raw[..buf.result.raw_written].to_vec());
+      callback(0, raw_ptr, raw_len, entries_ptr, entries_len, eof);
     }
     Err(e) => callback(
       -e.raw_os_error().unwrap_or(1),
@@ -2228,6 +2246,49 @@ mod sockaddr_tests {
     unsafe {
       lio_destroy(lio);
       libc::close(fd);
+    }
+  }
+}
+
+#[cfg(test)]
+mod readdir_ownership_tests {
+  use super::*;
+
+  #[test]
+  fn ffi_readdir_allocations_round_trip_for_multiple_lengths() {
+    // Spare Vec capacity must not affect deallocation by the reported length.
+    for len in [0, 1, 2, 3, 7, 32, 100, 1024] {
+      for _ in 0..16 {
+        let mut raw = Vec::with_capacity(len + 17);
+        raw.extend((0..len).map(|i| i as u8));
+        let (raw_ptr, raw_len) = readdir_raw_into_ffi(raw);
+        assert_eq!(raw_len, len);
+        assert_eq!(
+          unsafe { std::slice::from_raw_parts(raw_ptr, raw_len) },
+          (0..len).map(|i| i as u8).collect::<Vec<_>>()
+        );
+        unsafe { lio_buf_free(raw_ptr, raw_len) };
+
+        let mut entries = Vec::with_capacity(len + 17);
+        entries.resize(len, lio_dir_entry_t::default());
+        for (i, entry) in entries.iter_mut().enumerate() {
+          entry.name_offset = i as u32;
+        }
+        let (entries_ptr, entries_len) = readdir_entries_into_ffi(entries);
+        assert_eq!(entries_len, len);
+        for (i, entry) in
+          unsafe { std::slice::from_raw_parts(entries_ptr, entries_len) }
+            .iter()
+            .enumerate()
+        {
+          assert_eq!(entry.name_offset, i as u32);
+        }
+        unsafe { lio_dir_entries_free(entries_ptr, entries_len) };
+      }
+    }
+    unsafe {
+      lio_buf_free(ptr::null_mut(), 0);
+      lio_dir_entries_free(ptr::null_mut(), 0);
     }
   }
 }
