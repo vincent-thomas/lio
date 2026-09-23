@@ -101,7 +101,10 @@ impl OpModel for SocketNew {
     })
   }
 
-  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     if completion.result < 0 {
       return OpResult::Done(Err(io::Error::from_raw_os_error(
         (-completion.result) as i32,
@@ -211,22 +214,27 @@ impl OpModel for TcpBindListener {
     }
   }
 
-  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match &mut self.state {
-      TcpBindState::Socket(inner) => match unsafe { inner.complete(completion) } {
-        OpResult::Done(Ok(resource)) => {
-          self.state = TcpBindState::Bind { resource };
-          OpResult::Again
+      TcpBindState::Socket(inner) => {
+        match unsafe { inner.complete(completion) } {
+          OpResult::Done(Ok(resource)) => {
+            self.state = TcpBindState::Bind { resource };
+            OpResult::Again
+          }
+          OpResult::Done(Err(err)) => {
+            self.state = TcpBindState::Done;
+            OpResult::Done(Err(err))
+          }
+          OpResult::Again => {
+            panic!("socket creation unexpectedly requested Again")
+          }
+          OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
         }
-        OpResult::Done(Err(err)) => {
-          self.state = TcpBindState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
+      }
       TcpBindState::Bind { resource } => {
         if completion.result < 0 {
           self.state = TcpBindState::Done;
@@ -303,22 +311,27 @@ impl OpModel for TcpStreamConnect {
     }
   }
 
-  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match &mut self.state {
-      TcpConnectState::Socket(inner) => match unsafe { inner.complete(completion) } {
-        OpResult::Done(Ok(resource)) => {
-          self.state = TcpConnectState::Connect { resource };
-          OpResult::Again
+      TcpConnectState::Socket(inner) => {
+        match unsafe { inner.complete(completion) } {
+          OpResult::Done(Ok(resource)) => {
+            self.state = TcpConnectState::Connect { resource };
+            OpResult::Again
+          }
+          OpResult::Done(Err(err)) => {
+            self.state = TcpConnectState::Done;
+            OpResult::Done(Err(err))
+          }
+          OpResult::Again => {
+            panic!("socket creation unexpectedly requested Again")
+          }
+          OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
         }
-        OpResult::Done(Err(err)) => {
-          self.state = TcpConnectState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
+      }
       TcpConnectState::Connect { resource } => {
         let resource = resource.clone();
         self.state = TcpConnectState::Done;
@@ -381,22 +394,27 @@ impl OpModel for UdpBindSocket {
     }
   }
 
-  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match &mut self.state {
-      UdpBindState::Socket(inner) => match unsafe { inner.complete(completion) } {
-        OpResult::Done(Ok(resource)) => {
-          self.state = UdpBindState::Bind { resource };
-          OpResult::Again
+      UdpBindState::Socket(inner) => {
+        match unsafe { inner.complete(completion) } {
+          OpResult::Done(Ok(resource)) => {
+            self.state = UdpBindState::Bind { resource };
+            OpResult::Again
+          }
+          OpResult::Done(Err(err)) => {
+            self.state = UdpBindState::Done;
+            OpResult::Done(Err(err))
+          }
+          OpResult::Again => {
+            panic!("socket creation unexpectedly requested Again")
+          }
+          OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
         }
-        OpResult::Done(Err(err)) => {
-          self.state = UdpBindState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
+      }
       UdpBindState::Bind { resource } => {
         let resource = resource.clone();
         self.state = UdpBindState::Done;
@@ -461,22 +479,27 @@ impl OpModel for UdpConnectSocket {
     }
   }
 
-  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match &mut self.state {
-      UdpConnectState::Socket(inner) => match unsafe { inner.complete(completion) } {
-        OpResult::Done(Ok(resource)) => {
-          self.state = UdpConnectState::Connect { resource };
-          OpResult::Again
+      UdpConnectState::Socket(inner) => {
+        match unsafe { inner.complete(completion) } {
+          OpResult::Done(Ok(resource)) => {
+            self.state = UdpConnectState::Connect { resource };
+            OpResult::Again
+          }
+          OpResult::Done(Err(err)) => {
+            self.state = UdpConnectState::Done;
+            OpResult::Done(Err(err))
+          }
+          OpResult::Again => {
+            panic!("socket creation unexpectedly requested Again")
+          }
+          OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
         }
-        OpResult::Done(Err(err)) => {
-          self.state = UdpConnectState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
+      }
       UdpConnectState::Connect { resource } => {
         let resource = resource.clone();
         self.state = UdpConnectState::Done;

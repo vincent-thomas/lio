@@ -285,7 +285,10 @@ impl OpModel for OpenFile {
     self.inner.action()
   }
 
-  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match unsafe { self.inner.complete(completion) } {
       OpResult::Done(Ok(resource)) => {
         OpResult::Done(Ok(File::from_resource(resource)))
@@ -311,7 +314,10 @@ impl OpModel for OpenDirectory {
     self.inner.action()
   }
 
-  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match unsafe { self.inner.complete(completion) } {
       OpResult::Done(Ok(resource)) => {
         OpResult::Done(Ok(Directory::from_resource(resource)))
@@ -373,42 +379,14 @@ impl OpModel for OpenReadDir {
     }
   }
 
-  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, OpenReadDirState::Done) {
-      OpenReadDirState::Opening(mut op) => match unsafe { op.complete(completion) } {
-        OpResult::Done(Ok(fd)) => {
-          let buf = self.buf.take().expect("read_dir buffer missing");
-          self.state = OpenReadDirState::Reading {
-            fd: fd.clone(),
-            op: ops::ReadDir::new(fd, buf),
-          };
-          OpResult::Again
-        }
-        OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-        OpResult::Again => {
-          self.state = OpenReadDirState::Opening(op);
-          OpResult::Again
-        }
-        OpResult::Yield(_) => unreachable!("OpenAt is a oneshot operation"),
-      },
-      OpenReadDirState::Reading { fd, mut op } => match unsafe { op.complete(completion) }
-      {
-        OpResult::Done(Ok(buf)) => {
-          let eof = buf.result.eof;
-          if !eof && buf.result.entries == 0 {
-            panic!(
-              "lio::fs::read_dir made no progress: low-level readdir returned zero entries before EOF; internal buffer is too small"
-            );
-          }
-          self.entries.extend(
-            buf
-              .iter()
-              .map(|entry| Ok(DirEntry::from_view(self.parent.clone(), entry))),
-          );
-          self.buf = Some(buf);
-          if eof {
-            OpResult::Done(Ok(ReadDir::new(std::mem::take(&mut self.entries))))
-          } else {
+      OpenReadDirState::Opening(mut op) => {
+        match unsafe { op.complete(completion) } {
+          OpResult::Done(Ok(fd)) => {
             let buf = self.buf.take().expect("read_dir buffer missing");
             self.state = OpenReadDirState::Reading {
               fd: fd.clone(),
@@ -416,14 +394,48 @@ impl OpModel for OpenReadDir {
             };
             OpResult::Again
           }
+          OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
+          OpResult::Again => {
+            self.state = OpenReadDirState::Opening(op);
+            OpResult::Again
+          }
+          OpResult::Yield(_) => unreachable!("OpenAt is a oneshot operation"),
         }
-        OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-        OpResult::Again => {
-          self.state = OpenReadDirState::Reading { fd, op };
-          OpResult::Again
+      }
+      OpenReadDirState::Reading { fd, mut op } => {
+        match unsafe { op.complete(completion) } {
+          OpResult::Done(Ok(buf)) => {
+            let eof = buf.result.eof;
+            if !eof && buf.result.entries == 0 {
+              panic!(
+                "lio::fs::read_dir made no progress: low-level readdir returned zero entries before EOF; internal buffer is too small"
+              );
+            }
+            self.entries.extend(buf.iter().map(|entry| {
+              Ok(DirEntry::from_view(self.parent.clone(), entry))
+            }));
+            self.buf = Some(buf);
+            if eof {
+              OpResult::Done(Ok(ReadDir::new(std::mem::take(
+                &mut self.entries,
+              ))))
+            } else {
+              let buf = self.buf.take().expect("read_dir buffer missing");
+              self.state = OpenReadDirState::Reading {
+                fd: fd.clone(),
+                op: ops::ReadDir::new(fd, buf),
+              };
+              OpResult::Again
+            }
+          }
+          OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
+          OpResult::Again => {
+            self.state = OpenReadDirState::Reading { fd, op };
+            OpResult::Again
+          }
+          OpResult::Yield(_) => unreachable!("readdir is a oneshot operation"),
         }
-        OpResult::Yield(_) => unreachable!("readdir is a oneshot operation"),
-      },
+      }
       OpenReadDirState::Done => {
         panic!("OpenReadDir completed after reaching terminal state")
       }
@@ -586,7 +598,10 @@ impl OpModel for RemoveDirAll {
     }
   }
 
-  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, RemoveDirAllState::Done) {
       RemoveDirAllState::Opening { parent, name, mut op } => {
         match unsafe { op.complete(completion) } {
@@ -605,29 +620,31 @@ impl OpModel for RemoveDirAll {
           OpResult::Yield(_) => unreachable!("openat is a oneshot operation"),
         }
       }
-      RemoveDirAllState::Reading { mut op } => match unsafe { op.complete(completion) } {
-        OpResult::Done(Ok(buf)) => {
-          if !buf.result.eof && buf.result.entries == 0 {
-            panic!(
-              "lio::fs::remove_dir_all made no progress: low-level readdir returned zero entries before EOF; internal buffer is too small"
-            );
-          }
+      RemoveDirAllState::Reading { mut op } => {
+        match unsafe { op.complete(completion) } {
+          OpResult::Done(Ok(buf)) => {
+            if !buf.result.eof && buf.result.entries == 0 {
+              panic!(
+                "lio::fs::remove_dir_all made no progress: low-level readdir returned zero entries before EOF; internal buffer is too small"
+              );
+            }
 
-          let frame = self
-            .stack
-            .last_mut()
-            .expect("remove_dir_all missing frame for directory read");
-          frame.eof = buf.result.eof;
-          frame.push_entries(buf);
-          self.advance()
+            let frame = self
+              .stack
+              .last_mut()
+              .expect("remove_dir_all missing frame for directory read");
+            frame.eof = buf.result.eof;
+            frame.push_entries(buf);
+            self.advance()
+          }
+          OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
+          OpResult::Again => {
+            self.state = RemoveDirAllState::Reading { op };
+            OpResult::Again
+          }
+          OpResult::Yield(_) => unreachable!("readdir is a oneshot operation"),
         }
-        OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-        OpResult::Again => {
-          self.state = RemoveDirAllState::Reading { op };
-          OpResult::Again
-        }
-        OpResult::Yield(_) => unreachable!("readdir is a oneshot operation"),
-      },
+      }
       RemoveDirAllState::Stating { parent, name, mut op } => {
         match unsafe { op.complete(completion) } {
           OpResult::Done(Ok(stat)) => {
@@ -722,28 +739,35 @@ impl OpModel for ReadLink {
     }
   }
 
-  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, ReadLinkState::Done) {
-      ReadLinkState::Reading(mut op) => match unsafe { op.complete(completion) } {
-        OpResult::Done((Ok(n), buf)) if n as usize == buf.capacity() => {
-          let next_len = buf.capacity().saturating_mul(2).max(1);
-          self.state = ReadLinkState::Reading(ops::ReadlinkAt::new(
-            Resource::cwd(),
-            self.path.clone(),
-            vec![0u8; next_len],
-          ));
-          OpResult::Again
+      ReadLinkState::Reading(mut op) => {
+        match unsafe { op.complete(completion) } {
+          OpResult::Done((Ok(n), buf)) if n as usize == buf.capacity() => {
+            let next_len = buf.capacity().saturating_mul(2).max(1);
+            self.state = ReadLinkState::Reading(ops::ReadlinkAt::new(
+              Resource::cwd(),
+              self.path.clone(),
+              vec![0u8; next_len],
+            ));
+            OpResult::Again
+          }
+          OpResult::Done((Ok(_), buf)) => {
+            OpResult::Done(Ok(PathBuf::from(os_string_from_bytes(&buf))))
+          }
+          OpResult::Done((Err(err), _)) => OpResult::Done(Err(err)),
+          OpResult::Again => {
+            self.state = ReadLinkState::Reading(op);
+            OpResult::Again
+          }
+          OpResult::Yield(_) => {
+            unreachable!("readlinkat is a oneshot operation")
+          }
         }
-        OpResult::Done((Ok(_), buf)) => {
-          OpResult::Done(Ok(PathBuf::from(os_string_from_bytes(&buf))))
-        }
-        OpResult::Done((Err(err), _)) => OpResult::Done(Err(err)),
-        OpResult::Again => {
-          self.state = ReadLinkState::Reading(op);
-          OpResult::Again
-        }
-        OpResult::Yield(_) => unreachable!("readlinkat is a oneshot operation"),
-      },
+      }
       ReadLinkState::Done => panic!("ReadLink completed after terminal state"),
     }
   }
@@ -789,9 +813,14 @@ impl OpModel for ReadToString {
     }
   }
 
-  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, ReadToStringState::Done) {
-      ReadToStringState::Opening(mut op) => match unsafe { op.complete(completion) } {
+      ReadToStringState::Opening(mut op) => match unsafe {
+        op.complete(completion)
+      } {
         OpResult::Done(Ok(fd)) => {
           self.state = ReadToStringState::Reading {
             fd: fd.clone(),

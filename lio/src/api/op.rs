@@ -108,7 +108,8 @@ pub trait OpModel: Send + 'static {
   /// backend must have initialized the entire submitted writable capacity,
   /// and the model may expose only that capacity. Constructing a Completion
   /// alone does not initialize memory.
-  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item>;
+  unsafe fn complete(&mut self, completion: Completion)
+  -> OpResult<Self::Item>;
 }
 
 /// Marker trait for logical operations that produce exactly one final item.

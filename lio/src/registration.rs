@@ -427,7 +427,10 @@ mod tests {
       Action::Io(crate::backend::op::Op::Nop)
     }
 
-    unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    unsafe fn complete(
+      &mut self,
+      completion: Completion,
+    ) -> OpResult<Self::Item> {
       assert_eq!(completion.result, self.stage as isize);
       match self.stage {
         0 => {
@@ -454,7 +457,10 @@ mod tests {
       Action::Io(crate::backend::op::Op::Nop)
     }
 
-    unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    unsafe fn complete(
+      &mut self,
+      completion: Completion,
+    ) -> OpResult<Self::Item> {
       assert_eq!(completion.result, self.stage as isize);
       match self.stage {
         0 => {

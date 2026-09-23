@@ -182,22 +182,29 @@ impl OpModel for Copy {
     }
   }
 
-  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, CopyState::Done) {
-      CopyState::Reading(mut read) => match unsafe { read.complete(completion) } {
-        OpResult::Done((Ok(0), _buf)) => OpResult::Done(Ok(self.total)),
-        OpResult::Done((Ok(n), mut buf)) => {
-          let n = n as usize;
-          self.total += n as u64;
-          buf.truncate(n);
-          self.state =
-            CopyState::Writing(ops::Write::new(self.writer.clone(), buf, -1));
-          OpResult::Again
+      CopyState::Reading(mut read) => {
+        match unsafe { read.complete(completion) } {
+          OpResult::Done((Ok(0), _buf)) => OpResult::Done(Ok(self.total)),
+          OpResult::Done((Ok(n), mut buf)) => {
+            let n = n as usize;
+            self.total += n as u64;
+            buf.truncate(n);
+            self.state =
+              CopyState::Writing(ops::Write::new(self.writer.clone(), buf, -1));
+            OpResult::Again
+          }
+          OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
+          OpResult::Again | OpResult::Yield(_) => unreachable!(),
         }
-        OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
-        OpResult::Again | OpResult::Yield(_) => unreachable!(),
-      },
-      CopyState::Writing(mut write) => match unsafe { write.complete(completion) } {
+      }
+      CopyState::Writing(mut write) => match unsafe {
+        write.complete(completion)
+      } {
         OpResult::Done((Ok(0), _buf)) => {
           OpResult::Done(Err(Self::write_zero()))
         }

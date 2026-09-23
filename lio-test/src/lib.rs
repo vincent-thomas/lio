@@ -2869,10 +2869,12 @@ macro_rules! test_op_model_contract {
           );
           (step.before_complete)(&mut model);
           // SAFETY: the fixture staged the backend output for this action.
-          let result = unsafe { <$model_ty as ::lio_test::OpModelContract>::complete(
-            &mut model,
-            step.completion,
-          ) };
+          let result = unsafe {
+            <$model_ty as ::lio_test::OpModelContract>::complete(
+              &mut model,
+              step.completion,
+            )
+          };
           assert!(
             (step.assert_result)(&result),
             "complete() did not satisfy the model contract"
