@@ -41,6 +41,7 @@ pub(super) struct ParallelWalkTask {
 pub(super) struct ParallelWalkWork {
   pub immediate_files: Vec<WalkFile>,
   pub shard_tasks: Vec<ParallelWalkTask>,
+  pub explicit_single_file: bool,
 }
 
 impl WalkFile {
@@ -336,8 +337,11 @@ impl FileWalker {
     let search_path_bufs: Vec<PathBuf> =
       search_paths.iter().map(|path| self.cwd().join(path)).collect();
     let stats = self.stat_paths(ctx, &search_path_bufs)?;
+    let explicit_single_file = paths.len() == 1
+      && matches!(stats.as_slice(), [Some(metadata)] if metadata.is_file());
 
-    let mut work = ParallelWalkWork::default();
+    let mut work =
+      ParallelWalkWork { explicit_single_file, ..ParallelWalkWork::default() };
     for (path, metadata) in search_paths.into_iter().zip(stats) {
       let absolute_path = self.cwd().join(&path);
       let normalized_input: Arc<str> = normalize_input_path(&path).into();

@@ -47,33 +47,50 @@ impl SearchPlan {
     MatchMode::effective(&self.config.output, self.config.match_mode)
   }
 
+  pub(crate) fn classify_explicit_auto_filename(
+    &self,
+    ctx: &crate::app::AppContext,
+    runtime: &SearchRuntime,
+  ) -> io::Result<bool> {
+    if !self.supports_explicit_auto_filename_suppression() {
+      return Ok(false);
+    }
+    let [SearchTarget::File(path)] = self.targets.as_slice() else {
+      return Ok(false);
+    };
+    self.has_default_auto_filename_target(ctx, runtime, path)
+  }
+
+  pub(crate) fn supports_explicit_auto_filename_suppression(&self) -> bool {
+    self.has_default_auto_filename_output()
+      && self.has_default_auto_filename_pattern()
+      && self.has_default_auto_filename_search()
+      && self.has_default_auto_filename_traversal()
+      && self.has_default_auto_filename_context_and_sort()
+  }
+
   pub(crate) fn should_suppress_auto_filename(
     &self,
-    runtime: &SearchRuntime,
+    explicit_auto_filename: bool,
     outcomes: &[SearchOutcome],
   ) -> bool {
-    let [SearchTarget::File(path)] = self.targets.as_slice() else {
-      return false;
-    };
+    explicit_auto_filename
+      && matches!(
+        outcomes,
+        [SearchOutcome::MatchedLine(MatchRecord { spans, .. })]
+          if spans.len() == 1
+      )
+  }
 
-    if !self.has_default_auto_filename_target(runtime, path)
-      || !self.has_default_auto_filename_output()
-      || !self.has_default_auto_filename_pattern()
-      || !self.has_default_auto_filename_search()
-      || !self.has_default_auto_filename_traversal()
-      || !self.has_default_auto_filename_context_and_sort()
-    {
-      return false;
-    }
-
-    matches!(
-      outcomes,
-      [SearchOutcome::MatchedLine(MatchRecord { spans, .. })] if spans.len() == 1
-    )
+  pub(crate) fn supports_streaming_file_search(&self) -> bool {
+    !self.config.search.null_data
+      && !self.config.search.passthru
+      && !matches!(self.config.search.binary_mode, SearchBinaryMode::Report)
   }
 
   pub(crate) fn supports_core_unordered_execute(&self) -> bool {
-    self.effective_match_mode() == MatchMode::Standard
+    self.supports_streaming_file_search()
+      && self.effective_match_mode() == MatchMode::Standard
       && !self.config.search.files_mode
       && !self.config.search.invert_match
       && !self.config.search.passthru
@@ -119,14 +136,16 @@ impl SearchPlan {
       ),
     })
   }
-
   fn has_default_auto_filename_target(
     &self,
+    ctx: &crate::app::AppContext,
     runtime: &SearchRuntime,
     path: &str,
-  ) -> bool {
-    self.config.output.filename_mode == FilenameMode::Auto
-      && super::util::path_is_explicit_file(&runtime.cwd, path)
+  ) -> io::Result<bool> {
+    if self.config.output.filename_mode != FilenameMode::Auto {
+      return Ok(false);
+    }
+    super::util::path_is_explicit_file(ctx, &runtime.cwd, path)
   }
 
   fn has_default_auto_filename_output(&self) -> bool {
