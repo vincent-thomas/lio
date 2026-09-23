@@ -1,12 +1,24 @@
-use std::{io, path::Path};
+use std::{ffi::CString, io, os::unix::ffi::OsStrExt, path::Path};
 
 use lio::{Lio, api, api::resource::Resource};
 
 use super::SearchBinaryMode;
 use crate::util::{fs as fs_util, io as io_util};
 
-pub(super) fn path_is_explicit_file(cwd: &Path, value: &str) -> bool {
-  cwd.join(value).is_file()
+pub(super) fn path_is_explicit_file(
+  ctx: &crate::app::AppContext,
+  cwd: &Path,
+  value: &str,
+) -> io::Result<bool> {
+  let path = cwd.join(value);
+  let path = CString::new(path.as_os_str().as_bytes())
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
+  let mut rx = api::statat(&ctx.cwd(), path, true).with_lio(ctx.lio()).send();
+  match io_util::run_recv(ctx.lio(), &mut rx) {
+    Ok(stat) => Ok(stat.is_file()),
+    Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+    Err(err) => Err(err),
+  }
 }
 
 pub(super) fn split_records_with_numbers(
