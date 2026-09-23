@@ -96,3 +96,86 @@ jobs:
         run: cargo test -p lio --test backends ${{ matrix.test_filter }}
 
   # TODO: test-backend-windows
+
+  # Focused Linux Poller and bookkeeping leak checks; not full backend coverage.
+  # The occupied-store case is intentionally excluded until #25 lands.
+  valgrind-leaks:
+    name: valgrind-selected-leaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+
+      - name: Build and locate the three test executables
+        id: test-bin
+        shell: bash
+        run: |
+          set -euo pipefail
+          messages=$(mktemp)
+          trap 'rm -f "$messages"' EXIT
+          cargo test --locked -p lio --features unstable_ffi --lib --test backends --test valgrind_poller --no-run --message-format=json > "$messages"
+          python3 - "$messages" <<'PY'
+          import json
+          import os
+          import sys
+
+          targets = {'lio': 'lib', 'backends': 'test', 'valgrind_poller': 'test'}
+          artifacts = {name: [] for name in targets}
+          with open(sys.argv[1], encoding='utf-8') as stream:
+              for line in stream:
+                  message = json.loads(line)
+                  if message.get('reason') != 'compiler-artifact':
+                      continue
+                  target = message['target']
+                  name = target['name']
+                  if name in targets and targets[name] in target['kind'] and message.get('executable'):
+                      artifacts[name].append(message['executable'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              for name, paths in artifacts.items():
+                  if len(paths) != 1 or not os.path.isfile(paths[0]) or not os.access(paths[0], os.X_OK):
+                      sys.exit(f'Expected exactly one executable {name} artifact, got {paths!r}')
+                  print(f'{name}={paths[0]}', file=output)
+          PY
+
+      - name: Check selected tests for definite and indirect leaks
+        shell: bash
+        env:
+          LIB_BIN: ${{ steps.test-bin.outputs.lio }}
+          BACKEND_BIN: ${{ steps.test-bin.outputs.backends }}
+          LEAK_BIN: ${{ steps.test-bin.outputs.valgrind_poller }}
+        run: |
+          set -euo pipefail
+          run_leak_test() {
+            local binary="$1" test_name="$2"
+            # Exact listing catches missing or cfg-disabled tests before execution.
+            "$binary" --list | grep -Fx -- "$test_name: test"
+            timeout --signal=TERM --kill-after=5s 90s \
+              valgrind --leak-check=full --errors-for-leak-kinds=definite,indirect --error-exitcode=1 \
+              "$binary" --exact "$test_name" --nocapture
+          }
+          for name in \
+            backend::store::tests::test_basic_insert_and_remove \
+            backend::store::tests::test_stale_id_rejected_on_remove \
+            ffi::readdir_ownership_tests::ffi_readdir_allocations_round_trip_for_multiple_lengths; do
+            run_leak_test "$LIB_BIN" "$name"
+          done
+          for name in \
+            backends::poller::read::pending_then_success \
+            backends::poller::write::success_reports_raw_result_and_id \
+            backends::poller::recv::pending_then_success \
+            backends::poller::batching::multiple_immediate_completions_are_returned_together \
+            backends::poller::batching::mixed_pending_batch_completes_each_registration_exactly_once; do
+            run_leak_test "$BACKEND_BIN" "$name"
+          done
+          run_leak_test "$LEAK_BIN" leak_poller_roundtrip
