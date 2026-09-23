@@ -81,23 +81,30 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     Self { slots, free_head: u32::MAX, next_slot: 0, capacity, len: 0 }
   }
 
+  /// Initialize before publishing occupancy; unwind leaves the slot available.
   #[inline]
-  pub(crate) fn allocate(&mut self) -> Option<(SlabKey, &mut T)> {
-    let slot_idx = if self.free_head != u32::MAX {
-      let slot_idx = self.free_head;
-      self.free_head = self.slots[slot_idx as usize].next_free;
-      slot_idx
+  pub(crate) fn allocate_with(
+    &mut self,
+    init: impl FnOnce(&mut T),
+  ) -> Option<(SlabKey, &mut T)> {
+    let from_free = self.free_head != u32::MAX;
+    let slot_idx = if from_free {
+      self.free_head
     } else {
       if self.next_slot >= self.capacity {
         return None;
       }
-      let slot_idx = self.next_slot;
-      self.next_slot += 1;
-      slot_idx
+      self.next_slot
     };
 
     let slot = &mut self.slots[slot_idx as usize];
     debug_assert!(!slot.occupied);
+    init(&mut slot.state);
+    if from_free {
+      self.free_head = slot.next_free;
+    } else {
+      self.next_slot += 1;
+    }
     slot.occupied = true;
     if TRACK_LEN {
       self.len += 1;
@@ -127,7 +134,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
       return None;
     }
 
-    let removed = on_remove(&mut slot.state);
+    // Invalidate before user code can unwind.
     slot.occupied = false;
     if TRACK_LEN {
       self.len -= 1;
@@ -135,7 +142,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     slot.generation = slot.generation.wrapping_add(1);
     slot.next_free = self.free_head;
     self.free_head = key.slot();
-    Some(removed)
+    Some(on_remove(&mut slot.state))
   }
 
   /// Removes a slot whose generational key was already validated under the
@@ -149,7 +156,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     let slot = &mut self.slots[key.slot() as usize];
     debug_assert!(slot.generation == key.generation() && slot.occupied);
 
-    let removed = on_remove(&mut slot.state);
+    // Invalidate before user code can unwind.
     slot.occupied = false;
     if TRACK_LEN {
       self.len -= 1;
@@ -157,7 +164,16 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     slot.generation = slot.generation.wrapping_add(1);
     slot.next_free = self.free_head;
     self.free_head = key.slot();
-    removed
+    on_remove(&mut slot.state)
+  }
+
+  /// Visit only live slot states before the pool and their arenas are freed.
+  pub(crate) fn for_each_occupied_mut(&mut self, mut f: impl FnMut(&mut T)) {
+    for slot in &mut self.slots {
+      if slot.occupied {
+        f(&mut slot.state);
+      }
+    }
   }
 
   #[inline]
@@ -187,8 +203,9 @@ impl<T> Slab<T> {
   /// Returns `None` if at capacity.
   #[inline]
   pub fn insert(&mut self, value: T) -> Option<SlabKey> {
-    let (key, slot) = self.pool.allocate()?;
-    slot.write(value);
+    let (key, _) = self.pool.allocate_with(|slot| {
+      slot.write(value);
+    })?;
     Some(key)
   }
 
@@ -256,6 +273,31 @@ impl<T> Drop for Slab<T> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn panicking_drop_vacates_slab_slot() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::{
+      Arc,
+      atomic::{AtomicUsize, Ordering},
+    };
+    struct Panicky(Arc<AtomicUsize>, bool);
+    impl Drop for Panicky {
+      fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        assert!(!self.1, "drop panic");
+      }
+    }
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut slab = Slab::new(1);
+    let first = slab.insert(Panicky(drops.clone(), true)).unwrap();
+    assert!(catch_unwind(AssertUnwindSafe(|| slab.remove(first))).is_err());
+    assert!(slab.get_mut(first).is_none());
+    let second = slab.insert(Panicky(drops.clone(), false)).unwrap();
+    assert_ne!(first, second);
+    drop(slab);
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+  }
 
   #[test]
   fn test_insert_and_get_mut() {

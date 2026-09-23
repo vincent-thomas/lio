@@ -76,29 +76,38 @@ impl OpStore {
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> Result<u64, StoreAtCapacity> {
-    let Some((key, slot)) = self.slots.allocate() else {
+    let Some((key, _)) = self.slots.allocate_with(|slot| {
+      slot.model_bump.reset();
+      slot.step_bump.reset();
+      slot.registration.write(init(&mut slot.model_bump));
+    }) else {
       return Err(StoreAtCapacity);
     };
 
-    // Fresh slots are empty, and reused slots were reset by `remove`.
-    slot.registration.write(init(&mut slot.model_bump));
     Ok(key.as_u64())
   }
 
   /// Inserts an operation and returns everything needed for its initial dispatch.
   ///
   /// Keeping the just-allocated slot borrowed avoids looking it up again by its
-  /// generational ID. Fresh slots are empty, and reused slots were reset by
-  /// `remove`, so initial dispatch does not need another arena reset.
+  /// generational ID. Arenas are reset before initialization, including after
+  /// a previous initialization unwound.
   #[inline]
   pub fn insert_with_action(
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> (u64, Option<Action>, &mut Bump) {
-    let (key, slot) = self.slots.allocate().expect("at capacity");
-    slot.model_bump.reset();
-    slot.step_bump.reset();
-    let registration = slot.registration.write(init(&mut slot.model_bump));
+    let (key, slot) = self
+      .slots
+      .allocate_with(|slot| {
+        slot.model_bump.reset();
+        slot.step_bump.reset();
+        slot.registration.write(init(&mut slot.model_bump));
+      })
+      .expect("at capacity");
+    // SAFETY: allocate_with commits only after writing the registration.
+    // Unwinding in action() leaves this registration live for store cleanup.
+    let registration = unsafe { slot.registration.assume_init_mut() };
     let action = registration.action();
     (key.as_u64(), action, &mut slot.step_bump)
   }
@@ -147,6 +156,19 @@ impl OpStore {
   }
 }
 
+impl Drop for OpStore {
+  fn drop(&mut self) {
+    // Only occupied slots own initialized registrations. Drop handlers while
+    // their model bumps are still alive; free slots were already dropped by
+    // remove/remove_known and must not be dropped twice.
+    self.slots.for_each_occupied_mut(|slot| {
+      // SAFETY: occupied slots contain an initialized registration, and
+      // each is visited exactly once before the slot arenas are torn down.
+      unsafe { slot.registration.assume_init_drop() };
+    });
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -174,6 +196,227 @@ mod tests {
   fn dummy_stored_op(arena: &mut Bump) -> Registration {
     let (tx, _rx) = mpsc::channel();
     Registration::new_waker_in(arena, dummy_waker(), tx, Nop)
+  }
+
+  use crate::api::op::{Completion, OpModel, OpResult};
+  use crate::backend::op::Op;
+  use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  };
+  use std::task::Wake;
+
+  struct DropCount(Arc<AtomicUsize>);
+  impl Drop for DropCount {
+    fn drop(&mut self) {
+      self.0.fetch_add(1, Ordering::SeqCst);
+    }
+  }
+  struct CountedModel(DropCount);
+  impl OpModel for CountedModel {
+    type Item = ();
+    fn action(&mut self) -> Action {
+      let _ = &self.0;
+      Action::Io(Op::Nop)
+    }
+    fn complete(&mut self, _: Completion) -> OpResult<()> {
+      OpResult::Done(())
+    }
+  }
+  struct CountedWake(DropCount);
+  impl Wake for CountedWake {
+    fn wake(self: Arc<Self>) {
+      let _ = &self.0;
+    }
+  }
+
+  // Separate model and handler counters detect both a leaked bump payload and
+  // an undropped registration (callback closure or stored waker).
+  fn counted_registration(
+    arena: &mut Bump,
+    callback: bool,
+    model_drops: &Arc<AtomicUsize>,
+    handler_drops: &Arc<AtomicUsize>,
+  ) -> Registration {
+    let model = CountedModel(DropCount(Arc::clone(model_drops)));
+    let guard = DropCount(Arc::clone(handler_drops));
+    if callback {
+      Registration::new_callback_in(
+        arena,
+        move |()| {
+          let _ = &guard;
+        },
+        model,
+      )
+    } else {
+      let (tx, _rx) = mpsc::channel();
+      Registration::new_waker_in(
+        arena,
+        Waker::from(Arc::new(CountedWake(guard))),
+        tx,
+        model,
+      )
+    }
+  }
+  fn drops(count: &Arc<AtomicUsize>) -> usize {
+    count.load(Ordering::SeqCst)
+  }
+
+  struct PanicModel {
+    drops: Arc<AtomicUsize>,
+    panic_on_drop: bool,
+  }
+  impl OpModel for PanicModel {
+    type Item = ();
+    fn action(&mut self) -> Action {
+      Action::Io(Op::Nop)
+    }
+    fn complete(&mut self, _: Completion) -> OpResult<()> {
+      OpResult::Done(())
+    }
+  }
+  impl Drop for PanicModel {
+    fn drop(&mut self) {
+      self.drops.fetch_add(1, Ordering::SeqCst);
+      assert!(!self.panic_on_drop, "model drop panic");
+    }
+  }
+  fn panic_registration(
+    arena: &mut Bump,
+    drops: &Arc<AtomicUsize>,
+    panic_on_drop: bool,
+  ) -> Registration {
+    Registration::new_callback_in(
+      arena,
+      |()| {},
+      PanicModel { drops: drops.clone(), panic_on_drop },
+    )
+  }
+
+  #[test]
+  fn init_panic_does_not_publish_registration() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let panic_drops = Arc::new(AtomicUsize::new(0));
+    let mut store = OpStore::with_capacity(1);
+    assert!(
+      catch_unwind(AssertUnwindSafe(|| store.insert_with(|_| panic!("init"))))
+        .is_err()
+    );
+    assert_eq!(drops(&panic_drops), 0);
+    let first =
+      store.insert_with(|arena| panic_registration(arena, &panic_drops, false));
+    assert!(store.remove(first));
+    assert!(
+      catch_unwind(AssertUnwindSafe(|| {
+        store.insert_with_action(|_| panic!("init"));
+      }))
+      .is_err()
+    );
+    assert_eq!(drops(&panic_drops), 1);
+    let second =
+      store.insert_with(|arena| panic_registration(arena, &panic_drops, false));
+    assert_eq!(
+      SlabKey::from_u64(second).generation(),
+      SlabKey::from_u64(first).generation() + 1
+    );
+    drop(store);
+    assert_eq!(drops(&panic_drops), 2);
+  }
+
+  #[test]
+  fn panicking_destructor_vacates_slot() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    for known in [false, true] {
+      let panic_drops = Arc::new(AtomicUsize::new(0));
+      let mut store = OpStore::with_capacity(1);
+      let first = store
+        .insert_with(|arena| panic_registration(arena, &panic_drops, true));
+      assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+          if known {
+            store.remove_known(first)
+          } else {
+            store.remove(first);
+          }
+        }))
+        .is_err()
+      );
+      assert!(store.get_mut(first).is_none());
+      assert!(!store.remove(first));
+      let second = store
+        .insert_with(|arena| panic_registration(arena, &panic_drops, false));
+      assert_ne!(first, second);
+      drop(store);
+      assert_eq!(drops(&panic_drops), 2);
+    }
+  }
+
+  #[test]
+  fn occupied_store_drops_only_live_registrations() {
+    for callback in [false, true] {
+      let models = Arc::new(AtomicUsize::new(0));
+      let handlers = Arc::new(AtomicUsize::new(0));
+      {
+        let mut store = OpStore::with_capacity(3);
+        for _ in 0..3 {
+          store.insert_with(|arena| {
+            counted_registration(arena, callback, &models, &handlers)
+          });
+        }
+        assert_eq!((drops(&models), drops(&handlers)), (0, 0));
+      }
+      assert_eq!((drops(&models), drops(&handlers)), (3, 3));
+    }
+  }
+
+  #[test]
+  fn remove_and_stale_id_reuse_drop_once() {
+    for callback in [false, true] {
+      let models = Arc::new(AtomicUsize::new(0));
+      let handlers = Arc::new(AtomicUsize::new(0));
+      let mut store = OpStore::with_capacity(1);
+      let first = store.insert_with(|arena| {
+        counted_registration(arena, callback, &models, &handlers)
+      });
+      assert!(store.remove(first));
+      assert_eq!((drops(&models), drops(&handlers)), (1, 1));
+      let second = store.insert_with(|arena| {
+        counted_registration(arena, callback, &models, &handlers)
+      });
+      assert_ne!(first, second);
+      assert!(!store.remove(first));
+      assert!(store.get_mut(first).is_none());
+      assert_eq!((drops(&models), drops(&handlers)), (1, 1));
+      drop(store);
+      assert_eq!((drops(&models), drops(&handlers)), (2, 2));
+    }
+  }
+
+  #[test]
+  fn completed_registration_remove_known_drops_once() {
+    for callback in [false, true] {
+      let models = Arc::new(AtomicUsize::new(0));
+      let handlers = Arc::new(AtomicUsize::new(0));
+      let mut store = OpStore::with_capacity(1);
+      let id = store.insert_with(|arena| {
+        counted_registration(arena, callback, &models, &handlers)
+      });
+      assert!(
+        store
+          .get_mut(id)
+          .unwrap()
+          .on_driver_completion(Completion::new(0))
+          .is_done()
+      );
+      assert_eq!(
+        (drops(&models), drops(&handlers)),
+        (0, if callback { 0 } else { 1 })
+      );
+      store.remove_known(id);
+      assert_eq!((drops(&models), drops(&handlers)), (1, 1));
+      drop(store);
+      assert_eq!((drops(&models), drops(&handlers)), (1, 1));
+    }
   }
 
   #[test]
