@@ -3346,7 +3346,7 @@ mod tests {
   #[test]
   fn whole_file_batches_remain_conservative() {
     assert_eq!(LIO_WHOLE_FILE_BATCH_SIZE, 2);
-    assert!(LIO_WHOLE_FILE_BATCH_SIZE < LIO_MAX_FILES_PER_WORKER);
+    const { assert!(LIO_WHOLE_FILE_BATCH_SIZE < LIO_MAX_FILES_PER_WORKER) };
   }
 
   #[test]
