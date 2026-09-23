@@ -186,7 +186,6 @@ pub unsafe extern "C" fn lio_dir_entries_free(
   }
 }
 
-/// Converts a raw libc::sockaddr pointer and length into a safe std::net::SocketAddr.
 fn file_type_to_ffi(file_type: FileType) -> libc::c_int {
   match file_type {
     FileType::Unknown => 0,
@@ -219,6 +218,8 @@ unsafe fn cstr_to_owned(ptr: *const libc::c_char) -> Option<std::ffi::CString> {
   Some(unsafe { std::ffi::CStr::from_ptr(ptr) }.to_owned())
 }
 
+/// Decode a C address. Non-null pointers must be readable for addr_len bytes,
+/// but need not be aligned.
 fn sockaddr_to_socketaddr(
   raw_addr_ptr: *const libc::sockaddr,
   addr_len: libc::socklen_t,
@@ -227,8 +228,18 @@ fn sockaddr_to_socketaddr(
     return None;
   }
 
-  // SAFETY: Caller guarantees raw_addr_ptr is valid and non-null (checked above).
-  let family = unsafe { *raw_addr_ptr }.sa_family as i32;
+  // On some platforms sa_family is not the first byte (sa_len precedes it).
+  // Check the field's complete byte range before reading even the family.
+  let family_offset = mem::offset_of!(libc::sockaddr, sa_family);
+  if (addr_len as usize) < family_offset + mem::size_of::<libc::sa_family_t>() {
+    return None;
+  }
+  // SAFETY: The field lies within the caller-provided readable range. The
+  // address may be unaligned, so do not dereference a sockaddr reference.
+  let family = unsafe {
+    (raw_addr_ptr.cast::<u8>().add(family_offset) as *const libc::sa_family_t)
+      .read_unaligned()
+  } as i32;
 
   match family {
     libc::AF_INET => {
@@ -236,8 +247,8 @@ fn sockaddr_to_socketaddr(
         return None;
       }
       let raw_v4 = raw_addr_ptr as *const libc::sockaddr_in;
-      // SAFETY: We verified family == AF_INET and addr_len >= sizeof(sockaddr_in).
-      let sockaddr_v4 = unsafe { *raw_v4 };
+      // SAFETY: The full structure is readable, but alignment is not guaranteed.
+      let sockaddr_v4 = unsafe { raw_v4.read_unaligned() };
       let port = u16::from_be(sockaddr_v4.sin_port);
       let ipv4_addr = Ipv4Addr::from(u32::from_be(sockaddr_v4.sin_addr.s_addr));
       Some(SocketAddr::V4(SocketAddrV4::new(ipv4_addr, port)))
@@ -247,8 +258,8 @@ fn sockaddr_to_socketaddr(
         return None;
       }
       let raw_v6 = raw_addr_ptr as *const libc::sockaddr_in6;
-      // SAFETY: We verified family == AF_INET6 and addr_len >= sizeof(sockaddr_in6).
-      let sockaddr_v6 = unsafe { *raw_v6 };
+      // SAFETY: The full structure is readable, but alignment is not guaranteed.
+      let sockaddr_v6 = unsafe { raw_v6.read_unaligned() };
       let port = u16::from_be(sockaddr_v6.sin6_port);
       let ipv6_addr = Ipv6Addr::from(sockaddr_v6.sin6_addr.s6_addr);
       Some(SocketAddr::V6(SocketAddrV6::new(
@@ -2083,5 +2094,140 @@ fn link_kind_from_ffi(kind: libc::c_int) -> Result<api::ops::LinkKind, ()> {
     0 => Ok(api::ops::LinkKind::Hard),
     1 => Ok(api::ops::LinkKind::Soft),
     _ => Err(()),
+  }
+}
+
+#[cfg(all(test, unix))]
+mod sockaddr_tests {
+  use super::*;
+  use std::sync::atomic::{AtomicI32, Ordering};
+
+  // Separate callback slots: these tests run concurrently by default.
+  const PENDING: libc::c_int = 12345;
+  static INVALID_ADDR_RESULT: AtomicI32 = AtomicI32::new(PENDING);
+  static BIND_ROUTE_RESULT: AtomicI32 = AtomicI32::new(PENDING);
+  extern "C" fn invalid_addr_callback(code: libc::c_int) {
+    INVALID_ADDR_RESULT.store(code, Ordering::SeqCst);
+  }
+  extern "C" fn invalid_sendto_callback(
+    code: libc::c_int,
+    buf: *mut u8,
+    len: usize,
+  ) {
+    assert!(buf.is_null());
+    assert_eq!(len, 0);
+    INVALID_ADDR_RESULT.store(code, Ordering::SeqCst);
+  }
+  extern "C" fn bind_route_callback(code: libc::c_int) {
+    BIND_ROUTE_RESULT.store(code, Ordering::SeqCst);
+  }
+
+  #[test]
+  fn short_and_unaligned_addresses() {
+    for addr in [
+      SocketAddr::from(([127, 0, 0, 1], 4321)),
+      SocketAddr::from((Ipv6Addr::LOCALHOST, 4321)),
+    ] {
+      let len = match addr {
+        SocketAddr::V4(_) => mem::size_of::<libc::sockaddr_in>(),
+        SocketAddr::V6(_) => mem::size_of::<libc::sockaddr_in6>(),
+      };
+      let storage = std_socketaddr_into_libc(addr);
+      let mut bytes = vec![0u8; len + 1];
+      // SAFETY: Both byte ranges are valid and do not overlap.
+      unsafe {
+        ptr::copy_nonoverlapping(
+          (&raw const storage).cast::<u8>(),
+          bytes.as_mut_ptr().add(1),
+          len,
+        );
+      }
+      let raw = unsafe { bytes.as_ptr().add(1) }.cast::<libc::sockaddr>();
+      assert_eq!(
+        sockaddr_to_socketaddr(raw, len as libc::socklen_t),
+        Some(addr)
+      );
+      let family_end = mem::offset_of!(libc::sockaddr, sa_family)
+        + mem::size_of::<libc::sa_family_t>();
+      for short in [0, family_end - 1, family_end, len - 1] {
+        assert_eq!(sockaddr_to_socketaddr(raw, short as libc::socklen_t), None);
+      }
+      assert_eq!(
+        sockaddr_to_socketaddr(ptr::null(), len as libc::socklen_t),
+        None
+      );
+
+      // The bind FFI path must reject truncated addresses before accessing the
+      // handle or fd, and preserve its EINVAL callback contract.
+      INVALID_ADDR_RESULT.store(PENDING, Ordering::SeqCst);
+      unsafe {
+        lio_bind(
+          ptr::null_mut(),
+          -1,
+          raw,
+          (len - 1) as _,
+          invalid_addr_callback,
+        )
+      };
+      assert_eq!(INVALID_ADDR_RESULT.load(Ordering::SeqCst), -libc::EINVAL);
+      INVALID_ADDR_RESULT.store(PENDING, Ordering::SeqCst);
+      unsafe {
+        lio_connect(
+          ptr::null_mut(),
+          -1,
+          raw,
+          (len - 1) as _,
+          invalid_addr_callback,
+        )
+      };
+      assert_eq!(INVALID_ADDR_RESULT.load(Ordering::SeqCst), -libc::EINVAL);
+      INVALID_ADDR_RESULT.store(PENDING, Ordering::SeqCst);
+      unsafe {
+        lio_sendto(
+          ptr::null_mut(),
+          -1,
+          ptr::null_mut(),
+          0,
+          0,
+          raw,
+          (len - 1) as _,
+          invalid_sendto_callback,
+        )
+      };
+      assert_eq!(INVALID_ADDR_RESULT.load(Ordering::SeqCst), -libc::EINVAL);
+    }
+  }
+
+  #[test]
+  fn unaligned_ipv4_bind_route() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let storage = std_socketaddr_into_libc(addr);
+    let len = mem::size_of::<libc::sockaddr_in>();
+    let mut bytes = vec![0u8; len + 1];
+    unsafe {
+      ptr::copy_nonoverlapping(
+        (&raw const storage).cast::<u8>(),
+        bytes.as_mut_ptr().add(1),
+        len,
+      );
+    }
+    let raw = unsafe { bytes.as_ptr().add(1) }.cast::<libc::sockaddr>();
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(fd >= 0);
+    let lio = lio_create(16);
+    assert!(!lio.is_null());
+    BIND_ROUTE_RESULT.store(PENDING, Ordering::SeqCst);
+    unsafe { lio_bind(lio, fd as _, raw, len as _, bind_route_callback) };
+    for _ in 0..1000 {
+      if BIND_ROUTE_RESULT.load(Ordering::SeqCst) != PENDING {
+        break;
+      }
+      unsafe { lio_tick(lio) };
+    }
+    assert_eq!(BIND_ROUTE_RESULT.load(Ordering::SeqCst), 0);
+    unsafe {
+      lio_destroy(lio);
+      libc::close(fd);
+    }
   }
 }
