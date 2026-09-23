@@ -19,7 +19,7 @@ enum MatcherKind {
 
 #[derive(Debug, Clone)]
 enum LiteralPrefilter {
-  One(memmem::Finder<'static>),
+  One(Box<memmem::Finder<'static>>),
   Many(regex::bytes::Regex),
 }
 
@@ -374,9 +374,9 @@ fn build_literal_prefilter(
     return Ok(None);
   }
   if literals.len() == 1 {
-    return Ok(Some(LiteralPrefilter::One(
+    return Ok(Some(LiteralPrefilter::One(Box::new(
       memmem::Finder::new(&literals.into_iter().next().unwrap()).into_owned(),
-    )));
+    ))));
   }
 
   let pattern = literals
