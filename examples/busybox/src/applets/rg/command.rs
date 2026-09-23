@@ -1,4 +1,4 @@
-use std::{fs, io};
+use std::io;
 
 use super::*;
 use crate::{app::AppContext, command::Command};
@@ -468,7 +468,8 @@ pub(super) fn parse_sort_kind(value: &str) -> io::Result<SortKind> {
 }
 
 pub(super) fn read_pattern_file(path: &str) -> io::Result<Vec<String>> {
-  let contents = fs::read_to_string(path)?;
+  let lio = lio::Lio::new(1)?;
+  let contents = crate::util::io::read_to_string(&lio, Some(path))?;
   Ok(contents.lines().map(str::to_owned).collect())
 }
 

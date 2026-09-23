@@ -4,7 +4,10 @@ use std::{
   env, io,
   path::PathBuf,
   rc::Rc,
-  sync::{Arc, atomic::AtomicUsize},
+  sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+  },
   thread,
   time::{Duration, Instant},
 };
@@ -22,7 +25,11 @@ use super::worker::{
 use super::*;
 use crate::app::AppContext;
 
-pub(super) const LIO_READ_BATCH_SIZE: usize = 2;
+pub(super) const LIO_MAX_FILES_PER_WORKER: usize = 32;
+// Whole-file modes retain every byte until a batch completes. Keep their
+// concurrency conservative; the larger worker capacity is streaming-only.
+const LIO_WHOLE_FILE_BATCH_SIZE: usize = 2;
+const LIO_PROCESS_FILE_BUDGET: usize = 128;
 const LIO_MIN_READ_BUF: usize = 8 * 1024;
 const LIO_MAX_READ_BUF: usize = 512 * 1024;
 const MAX_PARALLEL_SEARCH_WORKERS: usize = 12;
@@ -30,6 +37,11 @@ const MIN_FILES_PER_PARALLEL_WORKER: usize = 16;
 pub(super) const LOCAL_DIR_TASK_THRESHOLD: usize = 32;
 pub(super) const TRAVERSAL_TASK_BURST_SIZE: usize = 4;
 pub(super) const WRITER_CHANNEL_FLUSH_THRESHOLD: usize = 256 * 1024;
+
+enum WriterLoopExit {
+  Complete(SearchStats),
+  ChannelClosed(io::Error),
+}
 
 #[derive(Debug)]
 pub(super) enum SearchInput {
@@ -109,16 +121,18 @@ pub(super) struct WorkerFilePipeline {
   inflight: usize,
   active: HashMap<usize, PendingWorkerFile>,
   free_buffers: Vec<Vec<u8>>,
+  capacity: usize,
 }
 
 impl WorkerFilePipeline {
-  pub(super) fn new() -> Self {
+  pub(super) fn new(capacity: usize) -> Self {
     Self {
       events: Rc::new(RefCell::new(VecDeque::new())),
       next_id: 0,
       inflight: 0,
       active: HashMap::new(),
       free_buffers: Vec::new(),
+      capacity: capacity.clamp(1, LIO_MAX_FILES_PER_WORKER),
     }
   }
 
@@ -127,7 +141,11 @@ impl WorkerFilePipeline {
   }
 
   pub(super) fn has_capacity(&self) -> bool {
-    self.file_count() < LIO_READ_BATCH_SIZE
+    self.file_count() < self.capacity
+  }
+
+  pub(super) fn capacity(&self) -> usize {
+    self.capacity
   }
 
   pub(super) fn has_pending_work(&self) -> bool {
@@ -180,7 +198,7 @@ impl WorkerFilePipeline {
     if buf.is_empty() {
       buf.resize(initial_read_buffer_len(), 0);
     }
-    if self.free_buffers.len() < LIO_READ_BATCH_SIZE {
+    if self.free_buffers.len() < self.capacity {
       self.free_buffers.push(buf);
     }
   }
@@ -411,7 +429,7 @@ impl SearchFile {
 }
 
 fn initial_read_buffer_len() -> usize {
-  (LIO_MIN_READ_BUF * 16).min(LIO_MAX_READ_BUF)
+  (LIO_MIN_READ_BUF * 12).min(LIO_MAX_READ_BUF)
 }
 
 fn maybe_grow_read_buffer(buf: &mut Vec<u8>, bytes_read: usize) {
@@ -429,6 +447,11 @@ fn next_record_end(bytes: &[u8], start: usize, delimiter: u8) -> usize {
     .position(|&byte| byte == delimiter)
     .map(|offset| start + offset)
     .unwrap_or(bytes.len())
+}
+
+fn worker_file_capacity(worker_count: usize) -> usize {
+  (LIO_PROCESS_FILE_BUDGET / worker_count.max(1))
+    .clamp(1, LIO_MAX_FILES_PER_WORKER)
 }
 
 fn capped_parallel_worker_count(
@@ -493,13 +516,16 @@ impl SearchEngine {
     let matcher =
       super::matcher::CompiledMatcher::new(&plan.config.pattern_spec)?;
     let include_path = plan.include_path_in_results(runtime);
+    let ctx = AppContext::new()?;
+    let explicit_auto_filename =
+      plan.classify_explicit_auto_filename(&ctx, runtime)?;
     let targets = self.resolve_targets(plan, runtime, target_order)?;
     let (outcomes, _) = self.finalize_search_outcomes(
       plan,
-      runtime,
       include_path,
       targets,
       &matcher,
+      explicit_auto_filename,
     )?;
     Ok(outcomes)
   }
@@ -511,11 +537,19 @@ impl SearchEngine {
     plan: &SearchPlan,
     runtime: &SearchRuntime,
   ) -> io::Result<(Vec<SearchOutcome>, SearchStats)> {
+    let explicit_auto_filename =
+      plan.classify_explicit_auto_filename(ctx, runtime)?;
     let mut emitter = SearchResultEmitter::new();
-    let stats =
-      self.search_cli_with_sink(ctx, plan, runtime, true, &mut emitter)?;
+    let stats = self.search_cli_with_sink(
+      ctx,
+      plan,
+      runtime,
+      true,
+      explicit_auto_filename,
+      &mut emitter,
+    )?;
     let mut outcomes = emitter.into_outcomes();
-    if plan.should_suppress_auto_filename(runtime, &outcomes) {
+    if plan.should_suppress_auto_filename(explicit_auto_filename, &outcomes) {
       super::outcome::suppress_paths(&mut outcomes);
     }
     Ok((outcomes, stats))
@@ -528,7 +562,16 @@ impl SearchEngine {
     runtime: &SearchRuntime,
     sink: &mut dyn SearchOutcomeSink,
   ) -> io::Result<SearchStats> {
-    self.search_cli_with_sink(ctx, plan, runtime, true, sink)
+    let explicit_auto_filename =
+      plan.classify_explicit_auto_filename(ctx, runtime)?;
+    self.search_cli_with_sink(
+      ctx,
+      plan,
+      runtime,
+      true,
+      explicit_auto_filename,
+      sink,
+    )
   }
 
   pub(super) fn execute_cli_pipeline(
@@ -560,6 +603,8 @@ impl SearchEngine {
     runtime: &SearchRuntime,
   ) -> io::Result<SearchStats> {
     let presentation = plan.presentation(runtime)?;
+    let explicit_auto_filename =
+      plan.classify_explicit_auto_filename(ctx, runtime)?;
     let mut renderer = StreamingRenderer::new(
       presentation,
       plan,
@@ -570,6 +615,7 @@ impl SearchEngine {
       plan,
       runtime,
       presentation.color_enabled,
+      explicit_auto_filename,
       &mut renderer,
     )
   }
@@ -633,7 +679,7 @@ impl SearchEngine {
     ctx: &AppContext,
     worker_count: usize,
     writer_rx: kanal::Receiver<WriterMessage>,
-  ) -> io::Result<SearchStats> {
+  ) -> io::Result<WriterLoopExit> {
     let mut stdout = AppByteSink::new(ctx);
     let mut stats = SearchStats::default();
     let mut done_workers = 0usize;
@@ -656,20 +702,19 @@ impl SearchEngine {
           }
         }
         Err(err) => {
-          if first_error.is_none() {
-            first_error = Some(io::Error::other(format!(
-              "rg: writer channel failed: {err}"
-            )));
+          if let Some(err) = first_error {
+            return Err(err);
           }
-          break;
+          return Ok(WriterLoopExit::ChannelClosed(io::Error::other(format!(
+            "rg: writer channel failed: {err}"
+          ))));
         }
       }
     }
-
     if let Some(err) = first_error {
       return Err(err);
     }
-    Ok(stats)
+    Ok(WriterLoopExit::Complete(stats))
   }
 
   pub(super) fn search_cli_core_unordered_rendered(
@@ -693,7 +738,6 @@ impl SearchEngine {
 
     let matcher =
       super::matcher::CompiledMatcher::new(&plan.config.pattern_spec)?;
-    let include_path = plan.include_path_in_results(runtime);
     let effective_match_mode = plan.effective_match_mode();
     let target_paths = plan
       .targets
@@ -711,14 +755,18 @@ impl SearchEngine {
       TargetOrder::Cli,
     )?;
     let work = walker.build_parallel_walk_work(ctx, &target_paths)?;
-
+    let include_path = plan.include_path_in_results(runtime)
+      && !(plan.supports_explicit_auto_filename_suppression()
+        && work.explicit_single_file);
+    let work_items = work.immediate_files.len() + work.shard_tasks.len();
+    if work_items == 0 {
+      return Ok(SearchStats::default());
+    }
     let desired_workers = capped_parallel_worker_count(
       plan.config.search.threads,
-      Some(work.immediate_files.len() + work.shard_tasks.len()),
-    );
-    if desired_workers <= 1 {
-      return self.search_cli_with_plain_renderer(ctx, plan, runtime);
-    }
+      Some(work_items),
+    )
+    .max(1);
 
     let mut assignments = self.build_worker_assignments(
       work.immediate_files,
@@ -735,6 +783,7 @@ impl SearchEngine {
     let worker_count = assignments.len();
     let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
     let profiling_enabled = env::var_os("BUSYBOX_RG_PROFILE").is_some();
+    let cancellation = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::with_capacity(assignments.len());
     for (worker_index, (assignment, local_queue)) in
       assignments.into_iter().zip(local_queues).enumerate()
@@ -746,24 +795,44 @@ impl SearchEngine {
       let matcher = super::matcher::WorkerMatcher::new(matcher.clone());
       let worker_walker = walker.clone();
       let worker_writer_tx = writer_tx.clone();
+      let error_writer_tx = writer_tx.clone();
+      let worker_cancellation = Arc::clone(&cancellation);
       handles.push(thread::spawn(move || {
-        Worker::new(
-          worker_index,
-          assignment,
-          local_queue,
-          plan,
-          matcher,
-          presentation,
-          worker_writer_tx,
-          include_path,
-          effective_match_mode,
-          presentation.color_enabled,
-          outstanding_tasks,
-          global_tasks,
-          stealers,
-          worker_walker,
-        )?
-        .run()
+        let result =
+          std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Worker::new(
+              worker_index,
+              worker_file_capacity(worker_count),
+              assignment,
+              local_queue,
+              plan,
+              matcher,
+              presentation,
+              worker_writer_tx,
+              include_path,
+              effective_match_mode,
+              presentation.color_enabled,
+              outstanding_tasks,
+              Arc::clone(&worker_cancellation),
+              global_tasks,
+              stealers,
+              worker_walker,
+            )?
+            .run()
+          }));
+        match result {
+          Ok(Ok(result)) => Ok(result),
+          Ok(Err(err)) => {
+            worker_cancellation.store(true, Ordering::Release);
+            let report = io::Error::new(err.kind(), err.to_string());
+            let _ = error_writer_tx.send(WriterMessage::Error(report));
+            Err(err)
+          }
+          Err(panic) => {
+            worker_cancellation.store(true, Ordering::Release);
+            std::panic::resume_unwind(panic)
+          }
+        }
       }));
     }
     drop(writer_tx);
@@ -790,17 +859,29 @@ impl SearchEngine {
       }
     }
 
-    if let Some(err) = first_error {
-      return Err(err);
-    }
+    let writer_stats = match writer_result {
+      Err(err) => return Err(err),
+      Ok(WriterLoopExit::Complete(stats)) => {
+        if let Some(err) = first_error {
+          return Err(err);
+        }
+        stats
+      }
+      Ok(WriterLoopExit::ChannelClosed(channel_error)) => {
+        return Err(first_error.unwrap_or(channel_error));
+      }
+    };
     if profiling_enabled {
       let total_profile = worker_profiles
         .iter()
         .copied()
         .fold(WorkerLoopProfile::default(), |acc, p| acc.merge(p));
-      eprintln!();
+      use std::fmt::Write as _;
+      let mut profile_output = String::new();
+      let _ = writeln!(&mut profile_output);
       for (index, profile) in worker_profiles.iter().enumerate() {
-        eprintln!(
+        let _ = writeln!(
+          &mut profile_output,
           "rg-profile worker={index} iterations={} traversal_tasks={} files_admitted={} file_events_drained={} open_events={} read_events={} try_run_calls={} try_run_completions={} try_run_empty_calls={} drive_wait_calls={} traversal_ms={:.3} traversal_split_ms={:.3} traversal_filter_ms={:.3} drain_ms={:.3} open_event_ms={:.3} read_event_ms={:.3} match_render_ms={:.3} try_run_ms={:.3} drive_wait_ms={:.3} between_runtime_non_search_ms={:.3} idle_ms={:.3}",
           profile.iterations,
           profile.traversal_tasks,
@@ -825,7 +906,8 @@ impl SearchEngine {
           profile.idle_time.as_secs_f64() * 1000.0,
         );
       }
-      eprintln!(
+      let _ = writeln!(
+        &mut profile_output,
         "rg-profile total iterations={} traversal_tasks={} files_admitted={} file_events_drained={} open_events={} read_events={} try_run_calls={} try_run_completions={} try_run_empty_calls={} drive_wait_calls={} traversal_ms={:.3} traversal_split_ms={:.3} traversal_filter_ms={:.3} drain_ms={:.3} open_event_ms={:.3} read_event_ms={:.3} match_render_ms={:.3} try_run_ms={:.3} drive_wait_ms={:.3} between_runtime_non_search_ms={:.3} idle_ms={:.3}",
         total_profile.iterations,
         total_profile.traversal_tasks,
@@ -849,8 +931,13 @@ impl SearchEngine {
         total_profile.between_runtime_non_search_time.as_secs_f64() * 1000.0,
         total_profile.idle_time.as_secs_f64() * 1000.0,
       );
+      crate::util::io::write_all(
+        ctx.lio(),
+        &ctx.stderr(),
+        profile_output.into_bytes(),
+      )?;
     }
-    writer_result
+    Ok(writer_stats)
   }
 
   fn search_cli_with_sink(
@@ -859,6 +946,7 @@ impl SearchEngine {
     plan: &SearchPlan,
     runtime: &SearchRuntime,
     capture_spans: bool,
+    explicit_auto_filename: bool,
     sink: &mut dyn SearchOutcomeSink,
   ) -> io::Result<SearchStats> {
     if plan.config.search.files_mode {
@@ -898,14 +986,16 @@ impl SearchEngine {
       let files =
         self.collect_search_files_lio(ctx, plan, runtime, TargetOrder::Cli)?;
       if self.should_parallelize_cli_file_search(plan, files.len()) {
-        let (mut outcomes, parallel_stats) = self.search_files_parallel(
+        let (outcomes, parallel_stats) = self.search_files_parallel(
           files,
           plan,
           include_path,
           effective_match_mode,
           &matcher,
         )?;
-        if plan.should_suppress_auto_filename(runtime, &outcomes) {
+        let mut outcomes = outcomes;
+        if plan.should_suppress_auto_filename(explicit_auto_filename, &outcomes)
+        {
           super::outcome::suppress_paths(&mut outcomes);
         }
         for outcome in outcomes {
@@ -913,7 +1003,13 @@ impl SearchEngine {
         }
         return Ok(parallel_stats);
       }
-      'file_batches: for file_batch in files.chunks(LIO_READ_BATCH_SIZE) {
+      'file_batches: for file_batch in
+        files.chunks(if self.can_stream_search_files(plan) {
+          LIO_MAX_FILES_PER_WORKER
+        } else {
+          LIO_WHOLE_FILE_BATCH_SIZE
+        })
+      {
         if self.can_stream_search_files(plan) {
           if self.stream_search_file_batch_lio(
             ctx,
@@ -999,9 +1095,7 @@ impl SearchEngine {
   }
 
   fn can_stream_search_files(&self, plan: &SearchPlan) -> bool {
-    !plan.config.search.null_data
-      && !plan.config.search.passthru
-      && !matches!(plan.config.search.binary_mode, SearchBinaryMode::Report)
+    plan.supports_streaming_file_search()
   }
 
   fn should_parallelize_cli_file_search(
@@ -1011,7 +1105,8 @@ impl SearchEngine {
   ) -> bool {
     let worker_count =
       capped_parallel_worker_count(plan.config.search.threads, Some(files_len));
-    !plan.config.search.quiet
+    self.can_stream_search_files(plan)
+      && !plan.config.search.quiet
       && worker_count > 1
       && files_len >= worker_count * MIN_FILES_PER_PARALLEL_WORKER
   }
@@ -1280,10 +1375,12 @@ impl SearchEngine {
                   finished = true;
                 } else {
                   file.bytes_searched += n;
-                  maybe_grow_read_buffer(&mut file.buf, n);
-                  file.carry.extend_from_slice(&file.buf[..n]);
-                  self.process_stream_chunk(
+                  // Keep the read buffer separate while processing so complete
+                  // lines can be searched in place instead of copied to carry.
+                  let mut read_buf = std::mem::take(&mut file.buf);
+                  self.process_stream_bytes(
                     file,
+                    &read_buf[..n],
                     plan,
                     include_path,
                     effective_match_mode,
@@ -1291,6 +1388,8 @@ impl SearchEngine {
                     capture_spans,
                     sink,
                   )?;
+                  maybe_grow_read_buffer(&mut read_buf, n);
+                  file.buf = read_buf;
 
                   if file.done {
                     self.finish_stream_file(
@@ -1600,9 +1699,27 @@ impl SearchEngine {
       );
     }
 
-    file.carry.extend_from_slice(bytes);
+    let Some(first_newline) = memchr(b'\n', bytes) else {
+      file.carry.extend_from_slice(bytes);
+      return Ok(());
+    };
+    file.carry.extend_from_slice(&bytes[..=first_newline]);
     self.process_stream_chunk(
       file,
+      plan,
+      include_path,
+      effective_match_mode,
+      matcher,
+      capture_spans,
+      sink,
+    )?;
+    if file.done || first_newline + 1 == bytes.len() {
+      return Ok(());
+    }
+    debug_assert!(file.carry.is_empty());
+    self.process_stream_bytes_no_carry(
+      file,
+      &bytes[first_newline + 1..],
       plan,
       include_path,
       effective_match_mode,
@@ -1707,6 +1824,7 @@ impl SearchEngine {
         &carry,
         plan,
         include_path,
+        effective_match_mode,
         matcher,
         capture_spans,
         sink,
@@ -1777,6 +1895,7 @@ impl SearchEngine {
         &bytes[..=last_newline],
         plan,
         include_path,
+        effective_match_mode,
         matcher,
         capture_spans,
         sink,
@@ -1824,7 +1943,7 @@ impl SearchEngine {
     capture_spans: bool,
   ) -> bool {
     let _ = capture_spans;
-    effective_match_mode == MatchMode::Standard
+    matches!(effective_match_mode, MatchMode::Standard | MatchMode::Count)
       && !plan.config.search.invert_match
       && !plan.config.search.passthru
       && plan.config.context.before == 0
@@ -1838,6 +1957,7 @@ impl SearchEngine {
     complete: &[u8],
     plan: &SearchPlan,
     include_path: bool,
+    effective_match_mode: MatchMode,
     matcher: &mut super::matcher::WorkerMatcher,
     capture_spans: bool,
     sink: &mut dyn SearchOutcomeSink,
@@ -1846,7 +1966,11 @@ impl SearchEngine {
     while cursor < complete.len() {
       let Some(candidate) = matcher.find_candidate_line(&complete[cursor..])
       else {
-        self.advance_stream_nonmatch_prefix(file, &complete[cursor..]);
+        if effective_match_mode == MatchMode::Count {
+          file.next_offset += complete.len() - cursor;
+        } else {
+          self.advance_stream_nonmatch_prefix(file, &complete[cursor..]);
+        }
         break;
       };
       let candidate_offset = match candidate {
@@ -1860,7 +1984,12 @@ impl SearchEngine {
         Some(offset) => cursor + offset + 1,
         None => cursor,
       };
-      self.advance_stream_nonmatch_prefix(file, &complete[cursor..line_start]);
+      if effective_match_mode == MatchMode::Count {
+        file.next_offset += line_start - cursor;
+      } else {
+        self
+          .advance_stream_nonmatch_prefix(file, &complete[cursor..line_start]);
+      }
       let line_end = line_start
         + memchr(b'\n', &complete[line_start..])
           .expect("complete line chunk must contain newline");
@@ -1888,15 +2017,17 @@ impl SearchEngine {
         file.matched_lines += 1;
         file.matches += if capture_spans { spans.len() } else { 1 };
         file.has_match = true;
-        self.emit_stream_standard_match(
-          include_path.then_some(file.display_path.as_str()),
-          line_number,
-          absolute_offset,
-          line,
-          spans,
-          plan,
-          sink,
-        )?;
+        if effective_match_mode == MatchMode::Standard {
+          self.emit_stream_standard_match(
+            include_path.then_some(file.display_path.as_str()),
+            line_number,
+            absolute_offset,
+            line,
+            spans,
+            plan,
+            sink,
+          )?;
+        }
         if plan
           .config
           .search
@@ -2430,10 +2561,10 @@ impl SearchEngine {
   fn finalize_search_outcomes(
     &self,
     plan: &SearchPlan,
-    runtime: &SearchRuntime,
     include_path: bool,
     targets: Vec<SearchInput>,
     matcher: &super::matcher::CompiledMatcher,
+    explicit_auto_filename: bool,
   ) -> io::Result<(Vec<SearchOutcome>, SearchStats)> {
     let mut emitter = SearchResultEmitter::new();
     let mut stats = SearchStats::default();
@@ -2457,7 +2588,7 @@ impl SearchEngine {
     }
 
     let mut outcomes = emitter.into_outcomes();
-    if plan.should_suppress_auto_filename(runtime, &outcomes) {
+    if plan.should_suppress_auto_filename(explicit_auto_filename, &outcomes) {
       super::outcome::suppress_paths(&mut outcomes);
     }
 
@@ -3210,6 +3341,40 @@ mod tests {
     assert_eq!(capped_parallel_worker_count(None, Some(1)), 1);
     assert_eq!(capped_parallel_worker_count(None, Some(3)), 3);
     assert_eq!(capped_parallel_worker_count(Some(1), Some(8)), 1);
+  }
+
+  #[test]
+  fn whole_file_batches_remain_conservative() {
+    assert_eq!(LIO_WHOLE_FILE_BATCH_SIZE, 2);
+    assert!(LIO_WHOLE_FILE_BATCH_SIZE < LIO_MAX_FILES_PER_WORKER);
+  }
+
+  #[test]
+  fn whole_file_modes_do_not_enter_parallel_engines() {
+    let mut plan = SearchPlan::from_command(
+      &RgCommand::parse_args(&["needle".into(), ".".into()]).unwrap(),
+    );
+    plan.config.search.null_data = true;
+    assert!(!plan.supports_core_unordered_execute());
+    assert!(
+      !SearchEngine::default().should_parallelize_cli_file_search(&plan, 192)
+    );
+
+    plan.config.search.null_data = false;
+    plan.config.search.binary_mode = SearchBinaryMode::Report;
+    assert!(!plan.supports_core_unordered_execute());
+    assert!(
+      !SearchEngine::default().should_parallelize_cli_file_search(&plan, 192)
+    );
+  }
+
+  #[test]
+  fn worker_file_capacity_bounds_process_wide_pressure() {
+    assert_eq!(worker_file_capacity(1), LIO_MAX_FILES_PER_WORKER);
+    assert_eq!(worker_file_capacity(4), LIO_MAX_FILES_PER_WORKER);
+    assert_eq!(worker_file_capacity(8), 16);
+    assert_eq!(worker_file_capacity(12), 10);
+    assert!(worker_file_capacity(12) * 12 <= LIO_PROCESS_FILE_BUDGET);
   }
 
   #[test]
