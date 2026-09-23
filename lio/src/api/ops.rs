@@ -58,8 +58,12 @@ macro_rules! impl_op_model_contract_runtime {
       <Self as OpModel>::action(self)
     }
 
-    fn complete(&mut self, completion: Self::Completion) -> Self::Result {
-      <Self as OpModel>::complete(self, completion)
+    unsafe fn complete(
+      &mut self,
+      completion: Self::Completion,
+    ) -> Self::Result {
+      // SAFETY: fixtures stage the bytes declared by successful completions.
+      unsafe { <Self as OpModel>::complete(self, completion) }
     }
 
     fn is_again(result: &Self::Result) -> bool {
@@ -114,7 +118,10 @@ impl OpModel for Socket {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     if completion.result < 0 {
       return OpResult::Done(Err(io::Error::from_raw_os_error(
         (-completion.result) as i32,
@@ -206,7 +213,10 @@ impl OpModel for Accept {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     if completion.result < 0 {
       return OpResult::Done(Err(io::Error::from_raw_os_error(
         (-completion.result) as i32,
@@ -279,7 +289,10 @@ impl OpModel for Connect {
     Action::Io(Op::Connect { fd: self.res.clone(), addr: self.addr })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -332,7 +345,10 @@ impl OpModel for Bind {
     Action::Io(Op::Bind { fd: self.res.clone(), addr: self.addr })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -365,7 +381,10 @@ impl OpModel for Listen {
     Action::Io(Op::Listen { fd: self.res.clone(), backlog: self.backlog })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -398,7 +417,10 @@ impl OpModel for Shutdown {
     Action::Io(Op::Shutdown { fd: self.res.clone(), how: self.how })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -430,7 +452,10 @@ impl OpModel for Fsync {
     Action::Io(Op::Fsync { fd: self.res.clone() })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -474,7 +499,10 @@ impl OpModel for Nop {
     Action::Io(Op::Nop)
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     assert_eq!(completion.result, 0);
     OpResult::Done(Ok(()))
   }
@@ -576,18 +604,33 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let mut buf = self.buf.take().expect("buffer not available");
     let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
     let result = if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
-      let mut remaining = completion.result as usize;
+      let count = completion.result as usize;
+      let mut total = 0usize;
+      for i in 0..buf_count {
+        total = total.saturating_add(buf.buf_mut(i).1);
+      }
+      if count > total {
+        return OpResult::Done((
+          Err(io::Error::from_raw_os_error(libc::EIO)),
+          buf,
+        ));
+      }
+      let mut remaining = count;
       for i in 0..buf_count {
         let (_, cap) = buf.buf_mut(i);
         let len = remaining.min(cap);
-        buf.set_buf_len(i, len);
+        // SAFETY: the completed I/O initialized this prefix of the stable segment.
+        unsafe { buf.set_buf_len(i, len) };
         remaining = remaining.saturating_sub(cap);
       }
       Ok(completion.result as i32)
@@ -718,7 +761,10 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let buf = self.buf.take().expect("buffer not available");
     let result = if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
@@ -858,7 +904,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
     Action::Io(Op::Recv { fd: self.res.clone(), msg, flags: self.flags })
   }
 
-  fn complete_buf(
+  unsafe fn complete_buf(
     &mut self,
     completion: Completion,
   ) -> (std::io::Result<i32>, B) {
@@ -868,11 +914,25 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
     let result = if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
-      let mut remaining = completion.result as usize;
+      let count = completion.result as usize;
+      let mut total = 0usize;
+      for i in 0..buf_count {
+        total = total.saturating_add(buf.buf_mut(i).1);
+      }
+      // MSG_TRUNC on datagram sockets returns the full datagram length even
+      // though recvmsg only writes the submitted iovec capacity. Preserve that
+      // result, but expose no more than the actually written prefix.
+      if count > total && self.flags.bits() & libc::MSG_TRUNC == 0 {
+        return (Err(io::Error::from_raw_os_error(libc::EIO)), buf);
+      }
+      let mut remaining = count.min(total);
       for i in 0..buf_count {
         let (_, cap) = buf.buf_mut(i);
         let len = remaining.min(cap);
-        buf.set_buf_len(i, len);
+        // SAFETY: a genuine receive wrote this prefix of the submitted segment;
+        // MSG_TRUNC can report more bytes than were written, but we clamp to
+        // the submitted capacity before setting any lengths.
+        unsafe { buf.set_buf_len(i, len) };
         remaining = remaining.saturating_sub(cap);
       }
       Ok(completion.result as i32)
@@ -933,8 +993,12 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Recv<B> {
     self.core.action()
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    OpResult::Done(self.core.complete_buf(completion))
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
+    // SAFETY: RecvCore submitted this receive into its owned iovecs; completion arrives after the backend finishes writing them. complete_buf clamps exposed lengths to initialized capacity.
+    OpResult::Done(unsafe { self.core.complete_buf(completion) })
   }
 }
 
@@ -957,8 +1021,12 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for RecvFrom<B> {
     self.core.action()
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let (result, buf) = self.core.complete_buf(completion);
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
+    // SAFETY: RecvCore submitted this receive into its owned iovecs and optional source address; the backend finished initializing both before this completion. complete_buf clamps exposed lengths to capacity.
+    let (result, buf) = unsafe { self.core.complete_buf(completion) };
     let addr = result
       .as_ref()
       .ok()
@@ -1151,7 +1219,10 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Send<B> {
     Action::Io(Op::Send { fd: self.res.clone(), msg, flags: self.flags })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let buf = self.buf.take().expect("buffer not available");
     let result = if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
@@ -1260,7 +1331,10 @@ impl OpModel for Sleep {
     Action::Sleep(self.duration)
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     debug_assert!(completion.flags.contains(CompletionFlags::TIMER));
 
     let result = if completion.result == 0 {
@@ -1320,7 +1394,10 @@ impl OpModel for Interval {
     Action::Sleep(self.period)
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     debug_assert!(completion.flags.contains(CompletionFlags::TIMER));
 
     let result = if completion.result == 0 {
@@ -1392,7 +1469,10 @@ impl OpModel for OpenAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     use std::os::fd::FromRawFd;
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
@@ -1450,7 +1530,10 @@ impl OpModel for Stat {
     Action::Io(Op::Stat { target, out: NonNull::from(&mut self.out) })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -1490,7 +1573,10 @@ impl OpModel for ReadDir {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -1617,7 +1703,10 @@ impl OpModel for UnlinkAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -1688,7 +1777,10 @@ impl OpModel for RenameAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -1752,7 +1844,10 @@ impl OpModel for MkdirAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -1821,7 +1916,10 @@ impl OpModel for LinkAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -1900,12 +1998,24 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let mut buf = self.buf.take().expect("buffer not available");
     let result = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
-      buf.set_buf_len(0, completion.result as usize);
+      if (completion.result as usize) > self.raw_len
+        || (completion.result as usize) > buf.buf_mut(0).1
+      {
+        return OpResult::Done((
+          Err(io::Error::from_raw_os_error(libc::EIO)),
+          buf,
+        ));
+      }
+      // SAFETY: readlink wrote the returned bytes into this segment.
+      unsafe { buf.set_buf_len(0, completion.result as usize) };
       Ok(completion.result as i32)
     };
     OpResult::Done((result, buf))
@@ -1935,7 +2045,10 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
     Action::Io(Op::GetCwd { out: NonNull::from(&mut self.out) })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let mut buf = self.buf.take().expect("buffer not available");
     let result = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
@@ -1956,7 +2069,8 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
         unsafe {
           std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len())
         };
-        buf.set_buf_len(0, bytes.len());
+        // SAFETY: the copy above initialized exactly these bytes.
+        unsafe { buf.set_buf_len(0, bytes.len()) };
         Ok(bytes.len() as i32)
       }
     };
@@ -2041,7 +2155,10 @@ impl OpModel for Spawn {
     Action::Io(Op::Spawn { spec: self.spec.clone() })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let result = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -2262,5 +2379,94 @@ mod tests {
     use super::*;
 
     lio_test::test_op_model_contract!(Send<(Vec<u8>, Vec<u8>)>);
+  }
+}
+
+#[cfg(test)]
+mod oversized_completion_tests {
+  use super::*;
+
+  #[test]
+  fn read_rejects_oversized_completion_before_exposing_bytes() {
+    let mut op = Read::new(Resource::stdin(), Vec::<u8>::with_capacity(4), -1);
+    let _ = OpModel::action(&mut op);
+    // SAFETY: count exceeds the submitted capacity and is rejected before
+    // claiming any bytes initialized; no backend writes occurred.
+    let OpResult::Done((Err(_), buf)) =
+      (unsafe { OpModel::complete(&mut op, Completion::new(5)) })
+    else {
+      panic!("oversized read must fail");
+    };
+    assert_eq!(buf.len(), 0);
+  }
+
+  #[test]
+  fn recv_rejects_oversized_completion_before_exposing_bytes() {
+    let mut op =
+      Recv::new(Resource::stdin(), Vec::<u8>::with_capacity(4), None);
+    let _ = OpModel::action(&mut op);
+    // SAFETY: without MSG_TRUNC, count exceeds submitted capacity and is
+    // rejected before any setter runs; no backend writes occurred.
+    let OpResult::Done((Err(_), buf)) =
+      (unsafe { OpModel::complete(&mut op, Completion::new(5)) })
+    else {
+      panic!("oversized receive must fail");
+    };
+    assert_eq!(buf.len(), 0);
+  }
+
+  #[test]
+  fn recv_trunc_reports_full_datagram_without_exposing_tail() {
+    let flags = Some(RecvFlags::from_bits(libc::MSG_TRUNC).unwrap());
+    let mut op =
+      Recv::new(Resource::stdin(), Vec::<u8>::with_capacity(4), flags);
+    let _ = OpModel::action(&mut op);
+    op.core.stage_recv_data(b"payl");
+    // SAFETY: this models a seven-byte datagram truncated into the four-byte
+    // submitted segment; all four exposed bytes were explicitly initialized.
+    let OpResult::Done((Ok(7), buf)) =
+      (unsafe { OpModel::complete(&mut op, Completion::new(7)) })
+    else {
+      panic!("MSG_TRUNC must preserve the datagram length");
+    };
+    assert_eq!(buf, b"payl");
+  }
+
+  #[test]
+  fn recv_from_trunc_reports_full_datagram_without_exposing_tail() {
+    let flags = Some(RecvFlags::from_bits(libc::MSG_TRUNC).unwrap());
+    let mut op =
+      RecvFrom::new(Resource::stdin(), Vec::<u8>::with_capacity(4), flags);
+    let _ = OpModel::action(&mut op);
+    op.core.stage_recv_data(b"payl");
+    let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    op.core.stage_from_addr(addr);
+    // SAFETY: the submitted storage and address were initialized, while the
+    // result models the full seven-byte truncated datagram length.
+    let OpResult::Done((Ok(7), buf, Some(from))) =
+      (unsafe { OpModel::complete(&mut op, Completion::new(7)) })
+    else {
+      panic!("MSG_TRUNC must preserve the datagram length and source");
+    };
+    assert_eq!(buf, b"payl");
+    assert_eq!(from, addr);
+  }
+
+  #[test]
+  fn readlink_rejects_oversized_completion_before_exposing_bytes() {
+    let mut op = ReadlinkAt::new(
+      Resource::stdin(),
+      CString::new("x").unwrap(),
+      Vec::<u8>::with_capacity(4),
+    );
+    let _ = OpModel::action(&mut op);
+    // SAFETY: count exceeds submitted capacity and is rejected before
+    // claiming any initialized bytes; no backend writes occurred.
+    let OpResult::Done((Err(_), buf)) =
+      (unsafe { OpModel::complete(&mut op, Completion::new(5)) })
+    else {
+      panic!("oversized readlink must fail");
+    };
+    assert_eq!(buf.len(), 0);
   }
 }

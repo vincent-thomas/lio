@@ -54,8 +54,9 @@ impl OpModel for SocketAccept {
     self.inner.action()
   }
 
-  fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
-    match self.inner.complete(res) {
+  unsafe fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
+    // SAFETY: SocketAccept forwards the completed accept action it submitted through inner; the backend initialized the address and handed off the accepted descriptor.
+    match unsafe { self.inner.complete(res) } {
       OpResult::Done(Ok((resource, addr))) => {
         OpResult::Done(Ok((Socket::from_resource(resource), addr)))
       }
@@ -101,7 +102,10 @@ impl OpModel for SocketNew {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     if completion.result < 0 {
       return OpResult::Done(Err(io::Error::from_raw_os_error(
         (-completion.result) as i32,
@@ -148,8 +152,9 @@ impl OpModel for TcpAccept {
     self.inner.action()
   }
 
-  fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
-    match self.inner.complete(res) {
+  unsafe fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
+    // SAFETY: TcpAccept forwards the completed accept action it submitted through inner; the backend initialized the address and handed off the accepted descriptor.
+    match unsafe { self.inner.complete(res) } {
       OpResult::Done(Ok((resource, addr))) => {
         OpResult::Done(Ok((TcpStream::from_resource(resource), addr)))
       }
@@ -211,22 +216,28 @@ impl OpModel for TcpBindListener {
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match &mut self.state {
-      TcpBindState::Socket(inner) => match inner.complete(completion) {
-        OpResult::Done(Ok(resource)) => {
-          self.state = TcpBindState::Bind { resource };
-          OpResult::Again
+      TcpBindState::Socket(inner) => {
+        // SAFETY: The Socket state owns the submitted socket-creation action; its completed descriptor is handed off once by the backend before forwarding the result.
+        match unsafe { inner.complete(completion) } {
+          OpResult::Done(Ok(resource)) => {
+            self.state = TcpBindState::Bind { resource };
+            OpResult::Again
+          }
+          OpResult::Done(Err(err)) => {
+            self.state = TcpBindState::Done;
+            OpResult::Done(Err(err))
+          }
+          OpResult::Again => {
+            panic!("socket creation unexpectedly requested Again")
+          }
+          OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
         }
-        OpResult::Done(Err(err)) => {
-          self.state = TcpBindState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
+      }
       TcpBindState::Bind { resource } => {
         if completion.result < 0 {
           self.state = TcpBindState::Done;
@@ -303,22 +314,28 @@ impl OpModel for TcpStreamConnect {
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match &mut self.state {
-      TcpConnectState::Socket(inner) => match inner.complete(completion) {
-        OpResult::Done(Ok(resource)) => {
-          self.state = TcpConnectState::Connect { resource };
-          OpResult::Again
+      TcpConnectState::Socket(inner) => {
+        // SAFETY: The Socket state owns the submitted socket-creation action; its completed descriptor is handed off once by the backend before forwarding the result.
+        match unsafe { inner.complete(completion) } {
+          OpResult::Done(Ok(resource)) => {
+            self.state = TcpConnectState::Connect { resource };
+            OpResult::Again
+          }
+          OpResult::Done(Err(err)) => {
+            self.state = TcpConnectState::Done;
+            OpResult::Done(Err(err))
+          }
+          OpResult::Again => {
+            panic!("socket creation unexpectedly requested Again")
+          }
+          OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
         }
-        OpResult::Done(Err(err)) => {
-          self.state = TcpConnectState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
+      }
       TcpConnectState::Connect { resource } => {
         let resource = resource.clone();
         self.state = TcpConnectState::Done;
@@ -381,22 +398,28 @@ impl OpModel for UdpBindSocket {
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match &mut self.state {
-      UdpBindState::Socket(inner) => match inner.complete(completion) {
-        OpResult::Done(Ok(resource)) => {
-          self.state = UdpBindState::Bind { resource };
-          OpResult::Again
+      UdpBindState::Socket(inner) => {
+        // SAFETY: The Socket state owns the submitted socket-creation action; its completed descriptor is handed off once by the backend before forwarding the result.
+        match unsafe { inner.complete(completion) } {
+          OpResult::Done(Ok(resource)) => {
+            self.state = UdpBindState::Bind { resource };
+            OpResult::Again
+          }
+          OpResult::Done(Err(err)) => {
+            self.state = UdpBindState::Done;
+            OpResult::Done(Err(err))
+          }
+          OpResult::Again => {
+            panic!("socket creation unexpectedly requested Again")
+          }
+          OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
         }
-        OpResult::Done(Err(err)) => {
-          self.state = UdpBindState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
+      }
       UdpBindState::Bind { resource } => {
         let resource = resource.clone();
         self.state = UdpBindState::Done;
@@ -461,22 +484,28 @@ impl OpModel for UdpConnectSocket {
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match &mut self.state {
-      UdpConnectState::Socket(inner) => match inner.complete(completion) {
-        OpResult::Done(Ok(resource)) => {
-          self.state = UdpConnectState::Connect { resource };
-          OpResult::Again
+      UdpConnectState::Socket(inner) => {
+        // SAFETY: The Socket state owns the submitted socket-creation action; its completed descriptor is handed off once by the backend before forwarding the result.
+        match unsafe { inner.complete(completion) } {
+          OpResult::Done(Ok(resource)) => {
+            self.state = UdpConnectState::Connect { resource };
+            OpResult::Again
+          }
+          OpResult::Done(Err(err)) => {
+            self.state = UdpConnectState::Done;
+            OpResult::Done(Err(err))
+          }
+          OpResult::Again => {
+            panic!("socket creation unexpectedly requested Again")
+          }
+          OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
         }
-        OpResult::Done(Err(err)) => {
-          self.state = UdpConnectState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
+      }
       UdpConnectState::Connect { resource } => {
         let resource = resource.clone();
         self.state = UdpConnectState::Done;

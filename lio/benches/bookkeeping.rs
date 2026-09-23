@@ -161,7 +161,9 @@ impl OpModel for SteppedStream {
     Action::Io(Op::Nop)
   }
 
-  fn complete(&mut self, _: Completion) -> OpResult<()> {
+  // SAFETY: the only submitted action is Nop, which uses no pointers, owned
+  // handles, or output metadata; ImmediateBackend completes each queued Nop once.
+  unsafe fn complete(&mut self, _: Completion) -> OpResult<()> {
     if self.remaining > 0 {
       self.remaining -= 1;
       OpResult::Again

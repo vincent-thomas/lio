@@ -67,7 +67,8 @@ impl<B: IoBufVec> WriteCursor<B> {
   }
 }
 
-impl<B: IoBufVec> IoBufVec for WriteCursor<B> {
+// SAFETY: The inner IoBufVec guarantees stable readable storage. advance only moves to a later chunk or within its reported length, so each exposed suffix remains initialized and valid while I/O owns the cursor.
+unsafe impl<B: IoBufVec> IoBufVec for WriteCursor<B> {
   fn buf_count(&self) -> usize {
     self.inner.buf_count().saturating_sub(self.chunk_idx)
   }
@@ -182,22 +183,31 @@ impl OpModel for Copy {
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, CopyState::Done) {
-      CopyState::Reading(mut read) => match read.complete(completion) {
-        OpResult::Done((Ok(0), _buf)) => OpResult::Done(Ok(self.total)),
-        OpResult::Done((Ok(n), mut buf)) => {
-          let n = n as usize;
-          self.total += n as u64;
-          buf.truncate(n);
-          self.state =
-            CopyState::Writing(ops::Write::new(self.writer.clone(), buf, -1));
-          OpResult::Again
+      CopyState::Reading(mut read) => {
+        // SAFETY: The Reading state owns the submitted read; its completion is delivered once after the backend initializes the reported bytes in its buffer.
+        match unsafe { read.complete(completion) } {
+          OpResult::Done((Ok(0), _buf)) => OpResult::Done(Ok(self.total)),
+          OpResult::Done((Ok(n), mut buf)) => {
+            let n = n as usize;
+            self.total += n as u64;
+            buf.truncate(n);
+            self.state =
+              CopyState::Writing(ops::Write::new(self.writer.clone(), buf, -1));
+            OpResult::Again
+          }
+          OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
+          OpResult::Again | OpResult::Yield(_) => unreachable!(),
         }
-        OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
-        OpResult::Again | OpResult::Yield(_) => unreachable!(),
-      },
-      CopyState::Writing(mut write) => match write.complete(completion) {
+      }
+      // SAFETY: The Writing state owns the submitted write; its completion is delivered once after the backend stops accessing its buffer.
+      CopyState::Writing(mut write) => match unsafe {
+        write.complete(completion)
+      } {
         OpResult::Done((Ok(0), _buf)) => {
           OpResult::Done(Err(Self::write_zero()))
         }

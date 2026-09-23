@@ -57,7 +57,7 @@ mod immediate_sockets {
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].registration_id(), 11);
     let OpResult::Done((result, buf)) =
-      model.complete(Completion::new(completed[0].result()))
+      (unsafe { model.complete(Completion::new(completed[0].result())) })
     else {
       panic!();
     };

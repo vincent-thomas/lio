@@ -2823,7 +2823,10 @@ pub trait OpModelContract: Sized {
   fn contract_steps() -> Vec<ContractStep<Self>>;
 
   fn action(&mut self) -> Self::Action;
-  fn complete(&mut self, completion: Self::Completion) -> Self::Result;
+  /// # Safety
+  /// The completion must be genuine for the last action, with all reported
+  /// read bytes and output metadata initialized before this call.
+  unsafe fn complete(&mut self, completion: Self::Completion) -> Self::Result;
 
   fn is_again(result: &Self::Result) -> bool;
   fn is_yield(result: &Self::Result) -> bool;
@@ -2865,10 +2868,13 @@ macro_rules! test_op_model_contract {
             "action() did not satisfy the model contract"
           );
           (step.before_complete)(&mut model);
-          let result = <$model_ty as ::lio_test::OpModelContract>::complete(
-            &mut model,
-            step.completion,
-          );
+          // SAFETY: the fixture staged the backend output for this action.
+          let result = unsafe {
+            <$model_ty as ::lio_test::OpModelContract>::complete(
+              &mut model,
+              step.completion,
+            )
+          };
           assert!(
             (step.assert_result)(&result),
             "complete() did not satisfy the model contract"

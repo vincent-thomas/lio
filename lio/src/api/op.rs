@@ -94,7 +94,22 @@ pub trait OpModel: Send + 'static {
   fn action(&mut self) -> Action;
 
   /// Interpret the completion of the previously submitted low-level step.
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item>;
+  ///
+  /// # Safety
+  /// Completion must belong to the last submitted action of this model, must
+  /// not be delivered twice, and the backend must have finished using its
+  /// pointers before this call. Owned handles must be valid and newly owned;
+  /// output metadata inspected by the model must have been initialized.
+  /// A successful read count within the submitted capacity requires that
+  /// the corresponding writable prefixes were initialized. An out-of-range
+  /// read/readlink count is permitted only when the model rejects it before
+  /// exposing bytes. For receive with MSG_TRUNC, a result exceeding the
+  /// submitted capacity may instead report the full datagram length: the
+  /// backend must have initialized the entire submitted writable capacity,
+  /// and the model may expose only that capacity. Constructing a Completion
+  /// alone does not initialize memory.
+  unsafe fn complete(&mut self, completion: Completion)
+  -> OpResult<Self::Item>;
 }
 
 /// Marker trait for logical operations that produce exactly one final item.
