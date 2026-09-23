@@ -104,7 +104,8 @@ impl WakerResultHandler {
     let sender = &payload.sender;
     let op_model = &mut payload.op_model;
 
-    let result = match op_model.complete(completion) {
+    // SAFETY: the driver finished this action and initialized its reported outputs.
+    let result = match unsafe { op_model.complete(completion) } {
       OpResult::Again => {
         let next_action = op_model.action();
         // The driver resubmits internal steps. Preserve the consumer's waker
@@ -219,7 +220,8 @@ impl OpCallback {
     let callback = &payload.callback;
     let op_model = &mut payload.op_model;
 
-    match op_model.complete(completion) {
+    // SAFETY: the driver finished this action and initialized its reported outputs.
+    match unsafe { op_model.complete(completion) } {
       OpResult::Again => {
         let next_action = op_model.action();
         ProcessResult::continue_with(next_action)
@@ -350,7 +352,10 @@ impl Registration {
   /// Processes a driver-owned completion without materializing the terminal
   /// state, because the driver immediately removes terminal registrations.
   #[inline]
-  pub(crate) fn on_driver_completion(
+  /// # Safety
+  /// Deliver only a genuine completion for this registration's submitted
+  /// action, after all backend writes have finished.
+  pub(crate) unsafe fn on_driver_completion(
     &mut self,
     completion: Completion,
   ) -> ProcessResult {
@@ -422,7 +427,7 @@ mod tests {
       Action::Io(crate::backend::op::Op::Nop)
     }
 
-    fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
       assert_eq!(completion.result, self.stage as isize);
       match self.stage {
         0 => {
@@ -449,7 +454,7 @@ mod tests {
       Action::Io(crate::backend::op::Op::Nop)
     }
 
-    fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
       assert_eq!(completion.result, self.stage as isize);
       match self.stage {
         0 => {
@@ -637,7 +642,7 @@ mod tests {
         Action::Io(crate::backend::op::Op::Nop)
       }
 
-      fn complete(&mut self, _: Completion) -> OpResult<i32> {
+      unsafe fn complete(&mut self, _: Completion) -> OpResult<i32> {
         self.0 += 1;
         match self.0 {
           1..=8 => OpResult::Again,

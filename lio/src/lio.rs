@@ -373,7 +373,7 @@ impl Lio {
 
       let on_completion_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
-      let completion_result = op.on_driver_completion(Completion::new(result));
+      let completion_result = unsafe { op.on_driver_completion(Completion::new(result)) };
       if let Some(started) = on_completion_started {
         completion_on_completion_time += started.elapsed();
       }
@@ -427,10 +427,10 @@ impl Lio {
         let mut finished = false;
 
         if let Some(reg) = inner.store.get_mut(timer_id) {
-          let result = reg.on_driver_completion(Completion::with_flags(
+          let result = unsafe { reg.on_driver_completion(Completion::with_flags(
             SLEEP_RESULT,
             crate::api::op::CompletionFlags::TIMER,
-          ));
+          )) };
           finished = result.is_done();
           next_action = result.next_action;
         }

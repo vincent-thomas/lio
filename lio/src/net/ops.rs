@@ -54,8 +54,8 @@ impl OpModel for SocketAccept {
     self.inner.action()
   }
 
-  fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
-    match self.inner.complete(res) {
+  unsafe fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
+    match unsafe { self.inner.complete(res) } {
       OpResult::Done(Ok((resource, addr))) => {
         OpResult::Done(Ok((Socket::from_resource(resource), addr)))
       }
@@ -101,7 +101,7 @@ impl OpModel for SocketNew {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     if completion.result < 0 {
       return OpResult::Done(Err(io::Error::from_raw_os_error(
         (-completion.result) as i32,
@@ -148,8 +148,8 @@ impl OpModel for TcpAccept {
     self.inner.action()
   }
 
-  fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
-    match self.inner.complete(res) {
+  unsafe fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
+    match unsafe { self.inner.complete(res) } {
       OpResult::Done(Ok((resource, addr))) => {
         OpResult::Done(Ok((TcpStream::from_resource(resource), addr)))
       }
@@ -211,9 +211,9 @@ impl OpModel for TcpBindListener {
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     match &mut self.state {
-      TcpBindState::Socket(inner) => match inner.complete(completion) {
+      TcpBindState::Socket(inner) => match unsafe { inner.complete(completion) } {
         OpResult::Done(Ok(resource)) => {
           self.state = TcpBindState::Bind { resource };
           OpResult::Again
@@ -303,9 +303,9 @@ impl OpModel for TcpStreamConnect {
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     match &mut self.state {
-      TcpConnectState::Socket(inner) => match inner.complete(completion) {
+      TcpConnectState::Socket(inner) => match unsafe { inner.complete(completion) } {
         OpResult::Done(Ok(resource)) => {
           self.state = TcpConnectState::Connect { resource };
           OpResult::Again
@@ -381,9 +381,9 @@ impl OpModel for UdpBindSocket {
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     match &mut self.state {
-      UdpBindState::Socket(inner) => match inner.complete(completion) {
+      UdpBindState::Socket(inner) => match unsafe { inner.complete(completion) } {
         OpResult::Done(Ok(resource)) => {
           self.state = UdpBindState::Bind { resource };
           OpResult::Again
@@ -461,9 +461,9 @@ impl OpModel for UdpConnectSocket {
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     match &mut self.state {
-      UdpConnectState::Socket(inner) => match inner.complete(completion) {
+      UdpConnectState::Socket(inner) => match unsafe { inner.complete(completion) } {
         OpResult::Done(Ok(resource)) => {
           self.state = UdpConnectState::Connect { resource };
           OpResult::Again
