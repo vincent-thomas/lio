@@ -96,3 +96,58 @@ jobs:
         run: cargo test -p lio --test backends ${{ matrix.test_filter }}
 
   # TODO: test-backend-windows
+
+  valgrind-leaks:
+    name: valgrind-poller-leaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+
+      - name: Build and locate the Poller test executable
+        id: test-bin
+        shell: bash
+        run: |
+          set -euo pipefail
+          messages=$(mktemp)
+          trap 'rm -f "$messages"' EXIT
+          cargo test --locked -p lio --test valgrind_poller --no-run --message-format=json > "$messages"
+          python3 - "$messages" <<'PY'
+          import json
+          import os
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              artifacts = [message["executable"] for line in stream
+                           if (message := json.loads(line)).get("reason") == "compiler-artifact"
+                           and message["target"]["name"] == "valgrind_poller"
+                           and "test" in message["target"]["kind"]
+                           ]
+          if len(artifacts) != 1 or not artifacts[0] or not os.path.isfile(artifacts[0]) or not os.access(artifacts[0], os.X_OK):
+              sys.exit(f"Expected exactly one executable valgrind_poller artifact, got {artifacts!r}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"path={artifacts[0]}", file=output)
+          PY
+
+      - name: Assert the named Linux test exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${{ steps.test-bin.outputs.path }}" --list | grep -Fx 'leak_poller_roundtrip: test'
+
+      - name: Check definite and indirect leaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          valgrind --leak-check=full --errors-for-leak-kinds=definite,indirect --error-exitcode=1 \
+            "${{ steps.test-bin.outputs.path }}" --exact leak_poller_roundtrip --nocapture
