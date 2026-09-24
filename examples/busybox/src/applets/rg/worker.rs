@@ -3,7 +3,7 @@ use std::{
   io,
   sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
   },
   thread,
   time::{Duration, Instant},
@@ -16,9 +16,8 @@ use lio::{Lio, api::resource::Resource};
 use super::{
   render::{ByteSink, StreamingRenderer},
   search::{
-    LIO_READ_BATCH_SIZE, LOCAL_DIR_TASK_THRESHOLD, SearchFile,
-    TRAVERSAL_TASK_BURST_SIZE, WRITER_CHANNEL_FLUSH_THRESHOLD,
-    WorkerFilePipeline,
+    LOCAL_DIR_TASK_THRESHOLD, SearchFile, TRAVERSAL_TASK_BURST_SIZE,
+    WRITER_CHANNEL_FLUSH_THRESHOLD, WorkerFilePipeline,
   },
   walker::FileWalker,
   *,
@@ -37,11 +36,13 @@ pub(super) struct Worker {
   traversal_stage: TraversalStage,
   idle_stage: IdleStage,
   profile: WorkerLoopProfile,
+  cancellation: Arc<AtomicBool>,
 }
 
 impl Worker {
   pub(super) fn new(
     worker_index: usize,
+    file_capacity: usize,
     assignment: WorkerAssignment,
     local_tasks: DequeWorker<super::walker::ParallelWalkTask>,
     plan: Arc<SearchPlan>,
@@ -52,6 +53,7 @@ impl Worker {
     effective_match_mode: MatchMode,
     capture_spans: bool,
     outstanding_tasks: Arc<AtomicUsize>,
+    cancellation: Arc<AtomicBool>,
     global_tasks: Arc<Injector<super::walker::ParallelWalkTask>>,
     stealers: Arc<Vec<Stealer<super::walker::ParallelWalkTask>>>,
     walker: FileWalker,
@@ -71,7 +73,7 @@ impl Worker {
         include_path,
         effective_match_mode,
         capture_spans,
-        file_pipeline: WorkerFilePipeline::new(),
+        file_pipeline: WorkerFilePipeline::new(file_capacity),
         matcher,
         stats: SearchStats::default(),
       },
@@ -88,6 +90,7 @@ impl Worker {
         search_match_time_at_last_runtime_call: Duration::ZERO,
       },
       profile: WorkerLoopProfile::default(),
+      cancellation,
     })
   }
 
@@ -100,6 +103,9 @@ impl Worker {
     );
 
     loop {
+      if self.cancellation.load(Ordering::Acquire) {
+        break;
+      }
       self.profile.iterations += 1;
       let admitted_files = self.admission_stage.run(
         self.ctx.lio(),
@@ -386,8 +392,8 @@ impl TraversalStage {
     ready_files: &VecDeque<SearchFile>,
     file_pipeline: &WorkerFilePipeline,
   ) -> usize {
-    if ready_files.len() < LIO_READ_BATCH_SIZE
-      && file_pipeline.file_count() < LIO_READ_BATCH_SIZE
+    if ready_files.len() < file_pipeline.capacity()
+      && file_pipeline.file_count() < file_pipeline.capacity()
     {
       LOCAL_DIR_TASK_THRESHOLD * 2
     } else {
@@ -430,8 +436,17 @@ impl TraversalStage {
   ) -> io::Result<bool> {
     profile.traversal_tasks += 1;
     let split_started = Instant::now();
-    let (files, child_tasks) = self.walker.split_parallel_task(ctx, task)?;
+    let split_result = self.walker.split_parallel_task(ctx, task);
     let split_elapsed = split_started.elapsed();
+    let (files, child_tasks) = match split_result {
+      Ok(result) => result,
+      Err(err) => {
+        coordination.outstanding_tasks.fetch_sub(1, Ordering::AcqRel);
+        profile.traversal_split_time += split_elapsed;
+        profile.traversal_time += split_elapsed;
+        return Err(err);
+      }
+    };
     profile.traversal_split_time += split_elapsed;
 
     let filter_started = Instant::now();
@@ -489,7 +504,7 @@ impl TraversalStage {
     handoff
       .ready_files
       .extend(files.into_iter().map(SearchFile::from_walk_file));
-    handoff.ready_files.len() >= LIO_READ_BATCH_SIZE
+    handoff.ready_files.len() >= file_pipeline.capacity()
       || !file_pipeline.has_capacity()
   }
 }

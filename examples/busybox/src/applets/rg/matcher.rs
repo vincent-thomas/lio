@@ -13,13 +13,14 @@ pub(super) enum CandidateLineMatch {
 
 #[derive(Debug, Clone)]
 enum MatcherKind {
-  Literal {
-    needle: Vec<u8>,
-  },
-  Regex {
-    regex: regex::bytes::Regex,
-    fast_line_regex: Option<regex::bytes::Regex>,
-  },
+  Literal { needle: Vec<u8> },
+  Regex { regex: regex::bytes::Regex, prefilter: Option<LiteralPrefilter> },
+}
+
+#[derive(Debug, Clone)]
+enum LiteralPrefilter {
+  One(Box<memmem::Finder<'static>>),
+  Many(regex::bytes::Regex),
 }
 
 #[derive(Debug, Clone)]
@@ -53,14 +54,11 @@ impl CompiledMatcher {
       .build()
       .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
 
-    let candidate_literals = if case_insensitive {
-      Vec::new()
-    } else {
-      extract_candidate_literals(spec)
-    };
-    let fast_line_regex = build_fast_line_regex(&candidate_literals)?;
+    let mandatory_literals =
+      if case_insensitive { None } else { extract_mandatory_literals(spec) };
+    let prefilter = build_literal_prefilter(mandatory_literals)?;
 
-    Ok(Self { kind: MatcherKind::Regex { regex, fast_line_regex } })
+    Ok(Self { kind: MatcherKind::Regex { regex, prefilter } })
   }
 
   pub(super) fn line_spans(&self, line: &[u8]) -> io::Result<Vec<MatchSpan>> {
@@ -82,8 +80,8 @@ impl CompiledMatcher {
         }
         Ok(())
       }
-      MatcherKind::Regex { regex, fast_line_regex } => {
-        if !matches_fast_line_regex(line, fast_line_regex.as_ref()) {
+      MatcherKind::Regex { regex, prefilter } => {
+        if !matches_literal_prefilter(line, prefilter.as_ref()) {
           return Ok(());
         }
         for m in regex.find_iter(line) {
@@ -97,8 +95,8 @@ impl CompiledMatcher {
   pub(super) fn is_match(&self, bytes: &[u8]) -> bool {
     match &self.kind {
       MatcherKind::Literal { needle } => memmem::find(bytes, needle).is_some(),
-      MatcherKind::Regex { regex, fast_line_regex } => {
-        matches_fast_line_regex(bytes, fast_line_regex.as_ref())
+      MatcherKind::Regex { regex, prefilter } => {
+        matches_literal_prefilter(bytes, prefilter.as_ref())
           && regex.is_match(bytes)
       }
     }
@@ -112,8 +110,8 @@ impl CompiledMatcher {
       MatcherKind::Literal { needle } => {
         memmem::find(haystack, needle).map(CandidateLineMatch::Confirmed)
       }
-      MatcherKind::Regex { fast_line_regex, .. } => {
-        find_fast_line_candidate(haystack, fast_line_regex.as_ref())
+      MatcherKind::Regex { prefilter, .. } => {
+        find_prefilter_candidate(haystack, prefilter.as_ref())
           .map(CandidateLineMatch::Candidate)
       }
     }
@@ -122,7 +120,7 @@ impl CompiledMatcher {
   pub(super) fn has_candidate_line_search(&self) -> bool {
     match &self.kind {
       MatcherKind::Literal { .. } => true,
-      MatcherKind::Regex { fast_line_regex, .. } => fast_line_regex.is_some(),
+      MatcherKind::Regex { prefilter, .. } => prefilter.is_some(),
     }
   }
 
@@ -137,8 +135,8 @@ impl CompiledMatcher {
           visit(start, end);
         }
       }
-      MatcherKind::Regex { regex, fast_line_regex } => {
-        if matches_fast_line_regex(bytes, fast_line_regex.as_ref()) {
+      MatcherKind::Regex { regex, prefilter } => {
+        if matches_literal_prefilter(bytes, prefilter.as_ref()) {
           for m in regex.find_iter(bytes) {
             visit(m.start(), m.end());
           }
@@ -188,69 +186,142 @@ fn exact_literal_needle(
 
   match spec.mode {
     PatternMode::FixedStrings => Some(spec.patterns[0].as_bytes().to_vec()),
-    PatternMode::Regex
-      if !super::util::contains_regex_meta(&spec.patterns[0]) =>
-    {
-      Some(unescape_literal(&spec.patterns[0]).into_bytes())
-    }
-    PatternMode::Regex => None,
+    PatternMode::Regex => regex_literal_needle(&spec.patterns[0]),
   }
 }
 
-fn extract_candidate_literals(spec: &PatternSpec) -> Vec<Vec<u8>> {
-  if spec.line_regexp {
-    return Vec::new();
-  }
-
-  match spec.mode {
-    PatternMode::FixedStrings => spec
-      .patterns
-      .iter()
-      .filter(|pattern| !pattern.is_empty())
-      .map(|pattern| pattern.as_bytes().to_vec())
-      .collect(),
-    PatternMode::Regex => {
-      let mut literals = Vec::new();
-      for pattern in &spec.patterns {
-        for literal in literal_runs(pattern) {
-          if literal.len() >= 2 && !literals.iter().any(|prev| prev == &literal)
-          {
-            literals.push(literal);
-          }
-        }
+fn extract_mandatory_literals(spec: &PatternSpec) -> Option<Vec<Vec<u8>>> {
+  spec
+    .patterns
+    .iter()
+    .map(|pattern| match spec.mode {
+      PatternMode::FixedStrings => {
+        (!pattern.is_empty()).then(|| pattern.as_bytes().to_vec())
       }
-      literals.sort_by(|left, right| right.len().cmp(&left.len()));
-      literals.truncate(8);
-      literals
-    }
-  }
+      PatternMode::Regex => mandatory_literal(pattern),
+    })
+    .collect()
 }
 
-fn literal_runs(pattern: &str) -> Vec<Vec<u8>> {
+/// Returns one literal that every match of the pattern must contain.
+///
+/// This deliberately recognizes only a small, easy-to-prove subset. In
+/// particular, alternation and repetition that may match zero times disable
+/// the prefilter rather than risking a false negative.
+fn mandatory_literal(pattern: &str) -> Option<Vec<u8>> {
+  let chars: Vec<char> = pattern.chars().collect();
   let mut runs = Vec::new();
   let mut current = String::new();
-  let mut escaped = false;
+  let mut index = 0;
+  // States: immediately after opening, after an optional leading caret, or body.
+  let mut class_states = Vec::new();
 
-  for ch in pattern.chars() {
-    if escaped {
-      if ch.is_ascii_alphanumeric() || ch == '_' {
-        if !current.is_empty() {
-          runs.push(current.clone().into_bytes());
-        }
-        current.clear();
-      } else {
-        current.push(ch);
+  while index < chars.len() {
+    let ch = chars[index];
+
+    if let Some(state) = class_states.last_mut() {
+      if ch == '\\' {
+        *state = 2;
+        index += 2;
+        continue;
       }
-      escaped = false;
+      match ch {
+        '^' if *state == 0 => *state = 1,
+        ']' if *state < 2 => *state = 2,
+        ']' => {
+          class_states.pop();
+        }
+        '[' => {
+          *state = 2;
+          class_states.push(0);
+        }
+        _ => *state = 2,
+      }
+      index += 1;
       continue;
     }
 
+    match ch {
+      '[' => {
+        push_literal_run(&mut runs, &mut current);
+        class_states.push(0);
+        index += 1;
+      }
+      '\\' => {
+        let escaped = *chars.get(index + 1)?;
+        if escaped.is_ascii_alphanumeric() {
+          // These escapes consume one character or assert a boundary. Other
+          // alphanumeric escapes (such as hex and Unicode escapes) have more
+          // syntax that this deliberately small scanner does not parse.
+          if matches!(
+            escaped,
+            'd' | 'D' | 's' | 'S' | 'w' | 'W' | 'b' | 'B' | 'A' | 'z'
+          ) {
+            push_literal_run(&mut runs, &mut current);
+            index += 2;
+            continue;
+          }
+          return None;
+        }
+        push_literal_char(&mut runs, &mut current, escaped);
+        index += 2;
+      }
+      '|' | '*' | '?' => return None,
+      '{' => {
+        push_literal_run(&mut runs, &mut current);
+        let close = chars[index + 1..]
+          .iter()
+          .position(|ch| *ch == '}')
+          .map(|offset| index + 1 + offset)?;
+        let repetition: String = chars[index + 1..close].iter().collect();
+        let minimum = repetition
+          .split_once(',')
+          .map_or(repetition.as_str(), |(minimum, _)| minimum);
+        if minimum.parse::<usize>().ok()? == 0 {
+          return None;
+        }
+        index = close + 1;
+      }
+      '.' | '+' | '(' | ')' | '}' | '^' | '$' => {
+        push_literal_run(&mut runs, &mut current);
+        index += 1;
+      }
+      _ => {
+        push_literal_char(&mut runs, &mut current, ch);
+        index += 1;
+      }
+    }
+  }
+
+  push_literal_run(&mut runs, &mut current);
+  runs.into_iter().max_by_key(Vec::len)
+}
+
+fn push_literal_char(runs: &mut Vec<Vec<u8>>, current: &mut String, ch: char) {
+  if ch.is_alphanumeric() || ch == '_' {
+    current.push(ch);
+  } else {
+    push_literal_run(runs, current);
+  }
+}
+
+fn push_literal_run(runs: &mut Vec<Vec<u8>>, current: &mut String) {
+  if !current.is_empty() {
+    runs.push(std::mem::take(current).into_bytes());
+  }
+}
+
+fn regex_literal_needle(pattern: &str) -> Option<Vec<u8>> {
+  let mut literal = String::with_capacity(pattern.len());
+  let mut chars = pattern.chars();
+  while let Some(ch) = chars.next() {
     if ch == '\\' {
-      escaped = true;
-      continue;
-    }
-
-    if matches!(
+      let escaped = chars.next()?;
+      if escaped.is_ascii_alphanumeric() {
+        return None;
+      }
+      literal.push(escaped);
+    } else if matches!(
       ch,
       '.'
         | '+'
@@ -266,57 +337,46 @@ fn literal_runs(pattern: &str) -> Vec<Vec<u8>> {
         | '^'
         | '$'
     ) {
-      if !current.is_empty() {
-        runs.push(current.clone().into_bytes());
-      }
-      current.clear();
-      continue;
-    }
-
-    current.push(ch);
-  }
-
-  if !current.is_empty() {
-    runs.push(current.into_bytes());
-  }
-  runs
-}
-
-fn unescape_literal(pattern: &str) -> String {
-  let mut out = String::with_capacity(pattern.len());
-  let mut escaped = false;
-  for ch in pattern.chars() {
-    if escaped {
-      out.push(ch);
-      escaped = false;
-    } else if ch == '\\' {
-      escaped = true;
+      return None;
     } else {
-      out.push(ch);
+      literal.push(ch);
     }
   }
-  out
+  Some(literal.into_bytes())
 }
-
-fn matches_fast_line_regex(
+fn matches_literal_prefilter(
   haystack: &[u8],
-  fast_line_regex: Option<&regex::bytes::Regex>,
+  prefilter: Option<&LiteralPrefilter>,
 ) -> bool {
-  fast_line_regex.is_none_or(|regex| regex.is_match(haystack))
+  prefilter.is_none_or(|prefilter| match prefilter {
+    LiteralPrefilter::One(literal) => literal.find(haystack).is_some(),
+    LiteralPrefilter::Many(regex) => regex.is_match(haystack),
+  })
 }
 
-fn find_fast_line_candidate(
+fn find_prefilter_candidate(
   haystack: &[u8],
-  fast_line_regex: Option<&regex::bytes::Regex>,
+  prefilter: Option<&LiteralPrefilter>,
 ) -> Option<usize> {
-  fast_line_regex.and_then(|regex| regex.find(haystack).map(|m| m.start()))
+  match prefilter? {
+    LiteralPrefilter::One(literal) => literal.find(haystack),
+    LiteralPrefilter::Many(regex) => regex.find(haystack).map(|m| m.start()),
+  }
 }
 
-fn build_fast_line_regex(
-  literals: &[Vec<u8>],
-) -> io::Result<Option<regex::bytes::Regex>> {
+fn build_literal_prefilter(
+  literals: Option<Vec<Vec<u8>>>,
+) -> io::Result<Option<LiteralPrefilter>> {
+  let Some(literals) = literals else {
+    return Ok(None);
+  };
   if literals.is_empty() {
     return Ok(None);
+  }
+  if literals.len() == 1 {
+    return Ok(Some(LiteralPrefilter::One(Box::new(
+      memmem::Finder::new(&literals.into_iter().next().unwrap()).into_owned(),
+    ))));
   }
 
   let pattern = literals
@@ -327,7 +387,7 @@ fn build_fast_line_regex(
   let regex = RegexBuilder::new(&pattern)
     .build()
     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-  Ok(Some(regex))
+  Ok(Some(LiteralPrefilter::Many(regex)))
 }
 
 fn build_combined_pattern(spec: &PatternSpec) -> String {
@@ -429,5 +489,159 @@ mod tests {
     assert!(matcher.has_candidate_line_search());
     assert!(matcher.is_match(b" PM_SUSPEND "));
     assert!(!matcher.is_match(b"pm_suspend"));
+  }
+
+  #[test]
+  fn canonical_regex_uses_one_mandatory_literal() {
+    let matcher =
+      CompiledMatcher::new(&spec("NEEDLE_[0-9]{4}::[A-Za-z]{8}::payload"))
+        .unwrap();
+
+    let literal = match &matcher.kind {
+      MatcherKind::Regex {
+        prefilter: Some(LiteralPrefilter::One(literal)),
+        ..
+      } => {
+        assert!(
+          literal.needle() == b"NEEDLE_" || literal.needle() == b"payload"
+        );
+        literal
+      }
+      kind => panic!("expected one-literal prefilter, got {kind:?}"),
+    };
+    let matching = b"NEEDLE_1234::abcdefgh::payload";
+    assert_eq!(
+      matcher.find_candidate_line(matching),
+      literal.find(matching).map(CandidateLineMatch::Candidate)
+    );
+    assert!(matcher.is_match(matching));
+    assert!(!matcher.is_match(b"payload without the required structure"));
+  }
+
+  #[test]
+  fn unsafe_regex_constructs_disable_prefilter() {
+    for pattern in ["foo|bar", "foo*bar", "foo?bar", "foo{0}bar", "foo{0,3}bar"]
+    {
+      let matcher = CompiledMatcher::new(&spec(pattern)).unwrap();
+      assert!(
+        !matcher.has_candidate_line_search(),
+        "unexpected prefilter for {pattern}"
+      );
+    }
+  }
+
+  #[test]
+  fn character_class_contents_are_not_candidate_literals() {
+    let matcher = CompiledMatcher::new(&spec("[A-Za-z]{8}::payload")).unwrap();
+    match &matcher.kind {
+      MatcherKind::Regex {
+        prefilter: Some(LiteralPrefilter::One(literal)),
+        ..
+      } => assert_eq!(literal.needle(), b"payload"),
+      kind => panic!("expected one-literal prefilter, got {kind:?}"),
+    }
+  }
+
+  #[test]
+  fn multiple_patterns_require_one_literal_from_each() {
+    let mut patterns = spec("unused");
+    patterns.patterns = vec!["alpha[0-9]+".to_owned(), "beta.+".to_owned()];
+    let matcher = CompiledMatcher::new(&patterns).unwrap();
+    assert!(matches!(
+      matcher.kind,
+      MatcherKind::Regex { prefilter: Some(LiteralPrefilter::Many(_)), .. }
+    ));
+    assert!(matcher.is_match(b"alpha7"));
+    assert!(matcher.is_match(b"beta!"));
+
+    patterns.patterns.push("[0-9]+".to_owned());
+    let matcher = CompiledMatcher::new(&patterns).unwrap();
+    assert!(!matcher.has_candidate_line_search());
+    assert!(matcher.is_match(b"123"));
+  }
+
+  #[test]
+  fn mandatory_literal_prefilter_matches_regex_on_tricky_constructs() {
+    let cases: &[(&str, &[&[u8]])] = &[
+      ("((foo)(bar))baz", &[b"foobarbaz", b"barbaz", b"xxfoobarbazyy"]),
+      ("longliteral|x", &[b"longliteral", b"x", b"neither"]),
+      ("(?:foo)?bar", &[b"bar", b"foobar", b"foo"]),
+      ("ab{0,2}c", &[b"ac", b"abc", b"abbc", b"abbbc"]),
+      (r"[ab]\d\x66oo", &[b"a1foo", b"b9foo", b"aXfoo"]),
+      (r"\p{Greek}+", &["Ω".as_bytes(), b"Greek", "λδ".as_bytes()]),
+      ("(?i)foo", &[b"FOO", b"foo", b"bar"]),
+      ("(?x)foo bar", &[b"foobar", b"foo bar"]),
+      (r"\bfoo\b", &[b" foo ", b"foobar", b"foo!"]),
+      (r"foo\Bbar", &[b"foobar", b"foo bar"]),
+      ("[]abc]", &[b"]", b"a", b"x"]),
+      ("[^]abc]", &[b"x", b"]", b"a"]),
+      (r"[\]]", &[b"]", b"[", b"x"]),
+    ];
+
+    for (pattern, haystacks) in cases {
+      let matcher = CompiledMatcher::new(&spec(pattern)).unwrap();
+      let reference = RegexBuilder::new(pattern).build().unwrap();
+      for haystack in *haystacks {
+        assert_eq!(
+          matcher.is_match(haystack),
+          reference.is_match(haystack),
+          "pattern {pattern:?}, haystack {haystack:?}"
+        );
+        assert_eq!(
+          !matcher.line_spans(haystack).unwrap().is_empty(),
+          reference.is_match(haystack),
+          "span mismatch for pattern {pattern:?}, haystack {haystack:?}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn fixed_string_prefilter_handles_empty_unicode_and_regex_syntax() {
+    let mut patterns = spec("unused");
+    patterns.mode = PatternMode::FixedStrings;
+    patterns.patterns =
+      vec![String::new(), r"\d.+".to_owned(), "naïve".to_owned()];
+    let matcher = CompiledMatcher::new(&patterns).unwrap();
+    for haystack in
+      [b"".as_slice(), b"plain", r"\d.+".as_bytes(), "naïve".as_bytes()]
+    {
+      assert!(matcher.is_match(haystack), "empty fixed string must match");
+    }
+    assert!(!matcher.has_candidate_line_search());
+  }
+
+  #[test]
+  fn mandatory_literal_classification_is_conservative_at_boundaries() {
+    assert_eq!(mandatory_literal("((alpha)(beta))"), Some(b"alpha".to_vec()));
+    for pattern in [
+      "alpha|b",
+      "(?:alpha)?b",
+      "[αβ]",
+      r"\p{Greek}+",
+      "(?i)alpha",
+      "(?x)alpha beta",
+      r"\b",
+    ] {
+      assert_eq!(mandatory_literal(pattern), None, "pattern {pattern:?}");
+    }
+    assert_eq!(mandatory_literal(r"\bneedle\b"), Some(b"needle".to_vec()));
+    assert_eq!(mandatory_literal("[]abc]"), None);
+    assert_eq!(mandatory_literal("[^]abc]"), None);
+    assert_eq!(mandatory_literal("[]abc]needle"), Some(b"needle".to_vec()));
+    assert_eq!(mandatory_literal("[^]abc]needle"), Some(b"needle".to_vec()));
+  }
+
+  #[test]
+  fn multiple_fixed_strings_are_escaped_in_prefilter() {
+    let mut patterns = spec("unused");
+    patterns.mode = PatternMode::FixedStrings;
+    patterns.patterns = vec!["a.b".to_owned(), "c+d".to_owned()];
+    let matcher = CompiledMatcher::new(&patterns).unwrap();
+
+    assert!(matcher.is_match(b"a.b"));
+    assert!(matcher.is_match(b"c+d"));
+    assert!(!matcher.is_match(b"axb"));
+    assert!(!matcher.is_match(b"ccd"));
   }
 }
