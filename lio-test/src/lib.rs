@@ -2813,7 +2813,45 @@ impl<M: OpModelContract> ContractStep<M> {
 }
 
 /// Test fixture for generating generic `OpModel` contract tests per type.
-pub trait OpModelContract: Sized {
+///
+/// # Safety
+/// Implementors must ensure that `contract_model()` and `contract_steps()` together
+/// describe a safe execution of [`test_op_model_contract!`]. For each step,
+/// calling `action()`, checking `assert_action`, and running `before_complete` must
+/// establish **all** safety preconditions of `complete` for that completion. These
+/// include matching action/completion ordering, initialized output prefixes and
+/// metadata within exposed capacities, genuine ownership of returned resources,
+/// and quiescence: no backend or other actor may still access the model's storage
+/// in conflict with completion. Action predicates or success counts are not enough.
+///
+/// These guarantees must hold for every model/script pair returned by the fixture,
+/// including repeated runs. Result predicates and any final `action()` after a
+/// nonterminal result must preserve safety. Adapters forwarding to runtime models
+/// must satisfy the runtime completion contract, not just fixture assertions.
+/// Macro callers need not make a separate safety promise.
+///
+/// A complete, otherwise-valid implementation cannot omit `unsafe`:
+///
+/// ```compile_fail,E0200
+/// use lio_test::{ContractKind, ContractStep, OpModelContract};
+/// struct Fixture;
+/// impl OpModelContract for Fixture {
+///     type Action = ();
+///     type Completion = ();
+///     type Result = ();
+///     fn contract_kind() -> ContractKind { ContractKind::Oneshot }
+///     fn contract_model() -> Self { Self }
+///     fn contract_steps() -> Vec<ContractStep<Self>> {
+///         vec![ContractStep::new(|_| true, (), |_| true)]
+///     }
+///     fn action(&mut self) {}
+///     unsafe fn complete(&mut self, _: ()) {}
+///     fn is_again(_: &()) -> bool { false }
+///     fn is_yield(_: &()) -> bool { false }
+///     fn is_done(_: &()) -> bool { true }
+/// }
+/// ```
+pub unsafe trait OpModelContract: Sized {
   type Action;
   type Completion;
   type Result;
@@ -2823,7 +2861,11 @@ pub trait OpModelContract: Sized {
   fn contract_steps() -> Vec<ContractStep<Self>>;
 
   fn action(&mut self) -> Self::Action;
-  fn complete(&mut self, completion: Self::Completion) -> Self::Result;
+  /// # Safety
+  /// The caller must establish all runtime completion preconditions, including
+  /// initialized output prefixes, genuinely owned returned handles, correct step
+  /// ordering, and absence of conflicting in-flight access.
+  unsafe fn complete(&mut self, completion: Self::Completion) -> Self::Result;
 
   fn is_again(result: &Self::Result) -> bool;
   fn is_yield(result: &Self::Result) -> bool;
@@ -2832,6 +2874,10 @@ pub trait OpModelContract: Sized {
 
 /// Shared contract tests for `OpModel`-like implementations described through
 /// [`lio_test::OpModelContract`].
+///
+/// The model's unsafe OpModelContract implementation guarantees that its script
+/// and setup hooks establish every completion precondition. The macro relies on
+/// that unsafe trait contract, not merely on its action predicates.
 #[macro_export]
 macro_rules! test_op_model_contract {
   ($model_ty:ty) => {
@@ -2865,10 +2911,16 @@ macro_rules! test_op_model_contract {
             "action() did not satisfy the model contract"
           );
           (step.before_complete)(&mut model);
-          let result = <$model_ty as ::lio_test::OpModelContract>::complete(
-            &mut model,
-            step.completion,
-          );
+          // SAFETY: the unsafe OpModelContract implementation guarantees that
+          // this model/script pair and the action/setup sequence above establish
+          // all completion preconditions, including initialization, ownership,
+          // ordering, and quiescence.
+          let result = unsafe {
+            <$model_ty as ::lio_test::OpModelContract>::complete(
+              &mut model,
+              step.completion,
+            )
+          };
           assert!(
             (step.assert_result)(&result),
             "complete() did not satisfy the model contract"

@@ -35,7 +35,7 @@ impl ProcessResult {
 pub(crate) struct WakerResultHandler {
   payload: *mut (),
   on_completion_fn:
-    fn(*mut (), Completion, &mut Option<Waker>) -> ProcessResult,
+    unsafe fn(*mut (), Completion, &mut Option<Waker>) -> ProcessResult,
   action_fn: fn(*mut ()) -> Action,
   drop_fn: fn(*mut ()),
 }
@@ -76,12 +76,14 @@ impl WakerResultHandler {
   ///
   /// Returns whether the operation is done and optionally an operation to resubmit.
   #[inline]
-  fn on_completion(
+  // Caller must satisfy OpModel::complete for the outstanding action.
+  unsafe fn on_completion(
     &self,
     completion: Completion,
     waker: &mut Option<Waker>,
   ) -> ProcessResult {
-    (self.on_completion_fn)(self.payload, completion, waker)
+    // SAFETY: forwards the caller's completion contract through type erasure.
+    unsafe { (self.on_completion_fn)(self.payload, completion, waker) }
   }
 
   #[inline]
@@ -93,7 +95,8 @@ impl WakerResultHandler {
   }
 
   #[inline]
-  fn on_completion_impl<T: OpModel>(
+  // Caller must satisfy OpModel::complete for the outstanding action.
+  unsafe fn on_completion_impl<T: OpModel>(
     payload_ptr: *mut (),
     completion: Completion,
     waker: &mut Option<Waker>,
@@ -104,7 +107,8 @@ impl WakerResultHandler {
     let sender = &payload.sender;
     let op_model = &mut payload.op_model;
 
-    let result = match op_model.complete(completion) {
+    // SAFETY: caller guarantees the completion of this active inner action.
+    let result = match unsafe { op_model.complete(completion) } {
       OpResult::Again => {
         let next_action = op_model.action();
         // The driver resubmits internal steps. Preserve the consumer's waker
@@ -154,7 +158,7 @@ unsafe impl Send for WakerResultHandler {}
 /// 3. Returns the next Op for resubmission if needed
 pub(crate) struct OpCallback {
   payload: *mut (),
-  on_completion_fn: fn(*mut (), Completion) -> ProcessResult,
+  on_completion_fn: unsafe fn(*mut (), Completion) -> ProcessResult,
   action_fn: fn(*mut ()) -> Action,
   drop_fn: fn(*mut ()),
 }
@@ -192,8 +196,10 @@ impl OpCallback {
   ///
   /// Returns whether the operation is done and optionally an operation to resubmit.
   #[inline]
-  fn on_completion(&self, completion: Completion) -> ProcessResult {
-    (self.on_completion_fn)(self.payload, completion)
+  // Caller must satisfy OpModel::complete for the outstanding action.
+  unsafe fn on_completion(&self, completion: Completion) -> ProcessResult {
+    // SAFETY: forwards the caller's completion contract through type erasure.
+    unsafe { (self.on_completion_fn)(self.payload, completion) }
   }
 
   #[inline]
@@ -205,7 +211,8 @@ impl OpCallback {
   }
 
   #[inline]
-  fn on_completion_impl<T, F>(
+  // Caller must satisfy OpModel::complete for the outstanding action.
+  unsafe fn on_completion_impl<T, F>(
     payload_ptr: *mut (),
     completion: Completion,
   ) -> ProcessResult
@@ -219,7 +226,8 @@ impl OpCallback {
     let callback = &payload.callback;
     let op_model = &mut payload.op_model;
 
-    match op_model.complete(completion) {
+    // SAFETY: caller guarantees the completion of this active inner action.
+    match unsafe { op_model.complete(completion) } {
       OpResult::Again => {
         let next_action = op_model.action();
         ProcessResult::continue_with(next_action)
@@ -339,8 +347,14 @@ impl Registration {
   ///
   /// Returns Some(action) if the model should continue, None otherwise.
   #[cfg(test)]
-  pub fn on_completion(&mut self, completion: Completion) -> ProcessResult {
-    let result = self.process_completion(completion);
+  /// # Safety
+  /// For a live registration, must satisfy OpModel::complete. Done is a no-op.
+  pub unsafe fn on_completion(
+    &mut self,
+    completion: Completion,
+  ) -> ProcessResult {
+    // SAFETY: forwards the caller's contract to the registered model.
+    let result = unsafe { self.process_completion(completion) };
     if result.is_done() {
       self.state = State::Done;
     }
@@ -350,20 +364,28 @@ impl Registration {
   /// Processes a driver-owned completion without materializing the terminal
   /// state, because the driver immediately removes terminal registrations.
   #[inline]
-  pub(crate) fn on_driver_completion(
+  /// # Safety
+  /// Must satisfy OpModel::complete for the registered model and outstanding action.
+  pub(crate) unsafe fn on_driver_completion(
     &mut self,
     completion: Completion,
   ) -> ProcessResult {
-    self.process_completion(completion)
+    // SAFETY: forwards the caller's contract to the registered model.
+    unsafe { self.process_completion(completion) }
   }
 
   #[inline]
-  fn process_completion(&mut self, completion: Completion) -> ProcessResult {
+  unsafe fn process_completion(
+    &mut self,
+    completion: Completion,
+  ) -> ProcessResult {
     match &mut self.state {
-      State::Waker { waker, handler } => {
+      // SAFETY: dispatches to the outstanding model under the caller's completion contract.
+      State::Waker { waker, handler } => unsafe {
         handler.on_completion(completion, waker)
-      }
-      State::Callback(cb) => cb.on_completion(completion),
+      },
+      // SAFETY: dispatches to the outstanding model under the caller's completion contract.
+      State::Callback(cb) => unsafe { cb.on_completion(completion) },
       #[cfg(test)]
       State::Done => ProcessResult::done(),
     }
@@ -422,7 +444,10 @@ mod tests {
       Action::Io(crate::backend::op::Op::Nop)
     }
 
-    fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    unsafe fn complete(
+      &mut self,
+      completion: Completion,
+    ) -> OpResult<Self::Item> {
       assert_eq!(completion.result, self.stage as isize);
       match self.stage {
         0 => {
@@ -449,7 +474,10 @@ mod tests {
       Action::Io(crate::backend::op::Op::Nop)
     }
 
-    fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    unsafe fn complete(
+      &mut self,
+      completion: Completion,
+    ) -> OpResult<Self::Item> {
       assert_eq!(completion.result, self.stage as isize);
       match self.stage {
         0 => {
@@ -515,7 +543,11 @@ mod tests {
       reg.action(),
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(0)) }.next_action.is_none()
+    );
     assert!(reg.is_finished());
 
     let items = received.lock().unwrap();
@@ -534,7 +566,11 @@ mod tests {
       reg.action(),
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(0)) }.next_action.is_none()
+    );
     assert!(reg.is_finished());
     assert_eq!(wake_count.load(Ordering::SeqCst), 1);
 
@@ -556,12 +592,18 @@ mod tests {
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert!(matches!(
-      reg.on_completion(Completion::new(0)).next_action,
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(0)) }.next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert!(!reg.is_finished(), "Again must keep the registration live");
 
-    assert!(reg.on_completion(Completion::new(1)).next_action.is_none());
+    assert!(
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(1)) }.next_action.is_none()
+    );
     assert!(reg.is_finished(), "Done must finish the registration");
 
     let items = received.lock().unwrap();
@@ -582,13 +624,17 @@ mod tests {
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert!(matches!(
-      reg.on_completion(Completion::new(0)).next_action,
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(0)) }.next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert!(!reg.is_finished(), "Yield must keep the registration live");
 
     assert!(matches!(
-      reg.on_completion(Completion::new(1)).next_action,
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(1)) }.next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert!(
@@ -596,7 +642,11 @@ mod tests {
       "subsequent Yield must keep the registration live"
     );
 
-    assert!(reg.on_completion(Completion::new(2)).next_action.is_none());
+    assert!(
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(2)) }.next_action.is_none()
+    );
     assert!(reg.is_finished());
 
     let items = received.lock().unwrap();
@@ -611,15 +661,22 @@ mod tests {
     let (_arena, mut reg) =
       new_waker_reg(waker, tx, AgainThenDone { stage: 0 });
 
+    assert!(reg.action().is_some());
     assert!(matches!(
-      reg.on_completion(Completion::new(0)).next_action,
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(0)) }.next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert_eq!(wake_count.load(Ordering::SeqCst), 0);
     assert!(rx.try_recv().is_err(), "Again must not send a terminal item");
     assert!(!reg.is_finished());
 
-    assert!(reg.on_completion(Completion::new(1)).next_action.is_none());
+    assert!(
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(1)) }.next_action.is_none()
+    );
     assert_eq!(wake_count.load(Ordering::SeqCst), 1);
     let item = rx.try_recv().expect("Done result should be sent");
     assert_eq!(item, 7);
@@ -637,7 +694,7 @@ mod tests {
         Action::Io(crate::backend::op::Op::Nop)
       }
 
-      fn complete(&mut self, _: Completion) -> OpResult<i32> {
+      unsafe fn complete(&mut self, _: Completion) -> OpResult<i32> {
         self.0 += 1;
         match self.0 {
           1..=8 => OpResult::Again,
@@ -651,17 +708,24 @@ mod tests {
     let (tx, rx) = mpsc::channel();
     let (_arena, mut reg) =
       new_waker_reg(test_waker(Arc::clone(&wake_count)), tx, AgainThenYield(0));
+    assert!(reg.action().is_some());
     for _ in 0..8 {
-      assert!(!reg.on_completion(Completion::new(0)).is_done());
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      assert!(!unsafe { reg.on_completion(Completion::new(0)) }.is_done());
       assert_eq!(wake_count.load(Ordering::SeqCst), 0);
       assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
-    assert!(!reg.on_completion(Completion::new(0)).is_done());
+    // SAFETY: this simulates the active Nop/integer-only model, with no
+    // buffer writes, owned handles, or concurrent backend access.
+    assert!(!unsafe { reg.on_completion(Completion::new(0)) }.is_done());
     assert_eq!(wake_count.load(Ordering::SeqCst), 1);
     assert_eq!(rx.try_recv().unwrap(), 11);
 
     reg.set_waker(test_waker(Arc::clone(&wake_count)));
-    assert!(reg.on_completion(Completion::new(0)).is_done());
+    // SAFETY: this simulates the active Nop/integer-only model, with no
+    // buffer writes, owned handles, or concurrent backend access.
+    assert!(unsafe { reg.on_completion(Completion::new(0)) }.is_done());
     assert_eq!(wake_count.load(Ordering::SeqCst), 2);
     assert_eq!(rx.try_recv().unwrap(), 17);
   }
@@ -674,8 +738,11 @@ mod tests {
     let (_arena, mut reg) =
       new_waker_reg(waker, tx, YieldTwiceThenDone { stage: 0 });
 
+    assert!(reg.action().is_some());
     assert!(matches!(
-      reg.on_completion(Completion::new(0)).next_action,
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(0)) }.next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert_eq!(wake_count.load(Ordering::SeqCst), 1);
@@ -684,7 +751,9 @@ mod tests {
 
     reg.set_waker(test_waker(Arc::clone(&wake_count)));
     assert!(matches!(
-      reg.on_completion(Completion::new(1)).next_action,
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(1)) }.next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert_eq!(wake_count.load(Ordering::SeqCst), 2);
@@ -692,7 +761,11 @@ mod tests {
     assert!(!reg.is_finished());
 
     reg.set_waker(test_waker(Arc::clone(&wake_count)));
-    assert!(reg.on_completion(Completion::new(2)).next_action.is_none());
+    assert!(
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(2)) }.next_action.is_none()
+    );
     assert_eq!(wake_count.load(Ordering::SeqCst), 3);
     assert_eq!(rx.try_recv().unwrap(), 17);
     assert!(reg.is_finished());
@@ -705,7 +778,12 @@ mod tests {
     let (tx, _rx) = mpsc::channel();
     let (_arena, mut reg) = new_waker_reg(waker, tx, Nop);
 
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(reg.action().is_some());
+    assert!(
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(0)) }.next_action.is_none()
+    );
     assert!(reg.is_finished());
 
     reg.set_waker(test_waker(Arc::clone(&wake_count)));
@@ -716,9 +794,17 @@ mod tests {
   fn done_registration_has_no_further_action_or_completion() {
     let (_arena, mut reg) = new_callback_reg(|_: std::io::Result<()>| {}, Nop);
 
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(reg.action().is_some());
+    assert!(
+      // SAFETY: this simulates the active Nop/integer-only model, with no
+      // buffer writes, owned handles, or concurrent backend access.
+      unsafe { reg.on_completion(Completion::new(0)) }.next_action.is_none()
+    );
     assert!(reg.is_finished());
     assert!(reg.action().is_none());
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(
+      // SAFETY: Done has no model; dispatch is a no-op, not a repeated completion.
+      unsafe { reg.on_completion(Completion::new(0)) }.next_action.is_none()
+    );
   }
 }

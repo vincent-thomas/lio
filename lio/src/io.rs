@@ -67,7 +67,10 @@ impl<B: IoBufVec> WriteCursor<B> {
   }
 }
 
-impl<B: IoBufVec> IoBufVec for WriteCursor<B> {
+// SAFETY: The inner contract supplies stable initialized storage; the cursor
+// owns it and only exposes suffixes within those regions. Moving the cursor does
+// not move that storage, and advancing without dependent raw access is safe.
+unsafe impl<B: IoBufVec> IoBufVec for WriteCursor<B> {
   fn buf_count(&self) -> usize {
     self.inner.buf_count().saturating_sub(self.chunk_idx)
   }
@@ -182,22 +185,31 @@ impl OpModel for Copy {
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, CopyState::Done) {
-      CopyState::Reading(mut read) => match read.complete(completion) {
-        OpResult::Done((Ok(0), _buf)) => OpResult::Done(Ok(self.total)),
-        OpResult::Done((Ok(n), mut buf)) => {
-          let n = n as usize;
-          self.total += n as u64;
-          buf.truncate(n);
-          self.state =
-            CopyState::Writing(ops::Write::new(self.writer.clone(), buf, -1));
-          OpResult::Again
+      CopyState::Reading(mut read) => {
+        // SAFETY: caller guarantees the completion of this active inner action.
+        match unsafe { read.complete(completion) } {
+          OpResult::Done((Ok(0), _buf)) => OpResult::Done(Ok(self.total)),
+          OpResult::Done((Ok(n), mut buf)) => {
+            let n = n as usize;
+            self.total += n as u64;
+            buf.truncate(n);
+            self.state =
+              CopyState::Writing(ops::Write::new(self.writer.clone(), buf, -1));
+            OpResult::Again
+          }
+          OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
+          OpResult::Again | OpResult::Yield(_) => unreachable!(),
         }
-        OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
-        OpResult::Again | OpResult::Yield(_) => unreachable!(),
-      },
-      CopyState::Writing(mut write) => match write.complete(completion) {
+      }
+      // SAFETY: caller guarantees the completion of this active inner action.
+      CopyState::Writing(mut write) => match unsafe {
+        write.complete(completion)
+      } {
         OpResult::Done((Ok(0), _buf)) => {
           OpResult::Done(Err(Self::write_zero()))
         }
@@ -240,6 +252,29 @@ mod tests {
     let (ptr, len) = bufs.buf(idx);
     // SAFETY: test helper only reads the exact bytes exposed by IoBufVec.
     unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+  }
+
+  #[test]
+  fn write_cursor_initialized_spare_capacity_move_and_empty_regions() {
+    let mut buf = Vec::<u8>::with_capacity(8);
+    for (slot, byte) in buf.spare_capacity_mut().iter_mut().zip(*b"abcd") {
+      slot.write(byte);
+    }
+    // SAFETY: Four bytes initialized above, within capacity and with no pending I/O.
+    unsafe { crate::IoBufMut::set_len(&mut buf, 4) };
+    let cursor = WriteCursor::new((Vec::<u8>::new(), buf));
+    let ptr = cursor.buf(1).0;
+    // Move through separately allocated storage before using the cursor again.
+    let boxed = Box::new(cursor);
+    assert_eq!(boxed.buf(1).0, ptr);
+    let mut moved = *boxed;
+    assert_eq!(moved.buf(1).0, ptr);
+    assert!(buf_bytes(&moved, 0).is_empty());
+    moved.advance(2);
+    assert_eq!(buf_bytes(&moved, 0), b"cd");
+    moved.advance(2);
+    assert!(moved.is_empty());
+    assert_eq!(moved.buf_count(), 0);
   }
 
   #[test]

@@ -56,8 +56,10 @@ mod immediate_sockets {
     backend.wait(None, &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].registration_id(), 11);
+    // SAFETY: the matching backend completion follows the actual receive;
+    // its output is initialized and the backend has released buffer access.
     let OpResult::Done((result, buf)) =
-      model.complete(Completion::new(completed[0].result()))
+      (unsafe { model.complete(Completion::new(completed[0].result())) })
     else {
       panic!();
     };

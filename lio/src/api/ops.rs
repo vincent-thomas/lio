@@ -58,8 +58,16 @@ macro_rules! impl_op_model_contract_runtime {
       <Self as OpModel>::action(self)
     }
 
-    fn complete(&mut self, completion: Self::Completion) -> Self::Result {
-      <Self as OpModel>::complete(self, completion)
+    unsafe fn complete(
+      &mut self,
+      completion: Self::Completion,
+    ) -> Self::Result {
+      // SAFETY: the unsafe contract caller guarantees the matching action,
+      // initialized outputs/owned handles, and quiescence required by the
+      // runtime OpModel. This adapter forwards the same model and completion
+      // unchanged; each unsafe fixture impl below establishes those guarantees
+      // for its script (the adapter does not make arbitrary completions safe).
+      unsafe { <Self as OpModel>::complete(self, completion) }
     }
 
     fn is_again(result: &Self::Result) -> bool {
@@ -74,6 +82,16 @@ macro_rules! impl_op_model_contract_runtime {
       matches!(result, OpResult::Done(_))
     }
   };
+}
+
+#[cfg(all(test, unix))]
+fn owned_fd_completion() -> Completion {
+  use std::os::fd::IntoRawFd;
+
+  // Transfer a fresh owned descriptor to the simulated completion, just as a
+  // successful backend socket/accept action would. Do not assume stdin is open.
+  let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+  Completion::new(file.into_raw_fd() as isize)
 }
 
 pub use crate::backend::op::LinkKind;
@@ -114,7 +132,10 @@ impl OpModel for Socket {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     if completion.result < 0 {
       return OpResult::Done(Err(io::Error::from_raw_os_error(
         (-completion.result) as i32,
@@ -142,7 +163,11 @@ impl OpModel for Socket {
 impl OneshotOpModel for Socket {}
 
 #[cfg(test)]
-impl OpModelContract for Socket {
+// SAFETY: On Unix, owned_fd_completion transfers a fresh live descriptor exactly once;
+// on Windows the negative result constructs no handle. No output storage is read.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Socket {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -165,11 +190,19 @@ impl OpModelContract for Socket {
         )
       },
       #[cfg(unix)]
-      // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
-      Completion::new(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
+      owned_fd_completion(),
       #[cfg(windows)]
-      Completion::new(1),
-      |result| matches!(result, OpResult::Done(Ok(_))),
+      Completion::new(-1),
+      |result| {
+        #[cfg(unix)]
+        {
+          matches!(result, OpResult::Done(Ok(_)))
+        }
+        #[cfg(windows)]
+        {
+          matches!(result, OpResult::Done(Err(_)))
+        }
+      },
     )]
   }
 }
@@ -206,7 +239,10 @@ impl OpModel for Accept {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     if completion.result < 0 {
       return OpResult::Done(Err(io::Error::from_raw_os_error(
         (-completion.result) as i32,
@@ -229,7 +265,12 @@ impl OpModel for Accept {
 impl OneshotOpModel for Accept {}
 
 #[cfg(test)]
-impl OpModelContract for Accept {
+// SAFETY: Setup initializes the complete peer address before success;
+// owned_fd_completion transfers a fresh live descriptor exactly once. The stdin
+// placeholder is never submitted and is not the returned owned descriptor.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Accept {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -244,8 +285,7 @@ impl OpModelContract for Accept {
       |action| matches!(action, Action::Io(Op::Accept { .. })),
       |model| model.stage_peer_addr("127.0.0.1:8080".parse().unwrap()),
       #[cfg(unix)]
-      // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
-      Completion::new(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
+      owned_fd_completion(),
       |result| {
         matches!(
           result,
@@ -279,7 +319,10 @@ impl OpModel for Connect {
     Action::Io(Op::Connect { fd: self.res.clone(), addr: self.addr })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -291,7 +334,11 @@ impl OpModel for Connect {
 impl OneshotOpModel for Connect {}
 
 #[cfg(test)]
-impl OpModelContract for Connect {
+// SAFETY: The address is initialized by new; zero success only produces ().
+// The stdin placeholder is never submitted and no output handle is adopted.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Connect {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -332,7 +379,10 @@ impl OpModel for Bind {
     Action::Io(Op::Bind { fd: self.res.clone(), addr: self.addr })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -365,7 +415,10 @@ impl OpModel for Listen {
     Action::Io(Op::Listen { fd: self.res.clone(), backlog: self.backlog })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -398,7 +451,10 @@ impl OpModel for Shutdown {
     Action::Io(Op::Shutdown { fd: self.res.clone(), how: self.how })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -430,7 +486,10 @@ impl OpModel for Fsync {
     Action::Io(Op::Fsync { fd: self.res.clone() })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -442,7 +501,11 @@ impl OpModel for Fsync {
 impl OneshotOpModel for Fsync {}
 
 #[cfg(test)]
-impl OpModelContract for Fsync {
+// SAFETY: Zero success only produces (); stdout is a placeholder never
+// submitted, and completion reads no output storage or owned handle.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Fsync {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -474,7 +537,10 @@ impl OpModel for Nop {
     Action::Io(Op::Nop)
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     assert_eq!(completion.result, 0);
     OpResult::Done(Ok(()))
   }
@@ -483,7 +549,11 @@ impl OpModel for Nop {
 impl OneshotOpModel for Nop {}
 
 #[cfg(test)]
-impl OpModelContract for Nop {
+// SAFETY: The sole completion is zero, as Nop requires; there is no output
+// storage or handle to initialize.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Nop {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -506,6 +576,16 @@ impl OpModelContract for Nop {
 // Read
 // ============================================================================
 
+/// An owned-buffer I/O operation.
+///
+/// Extracting the model does not permit safe fabricated completion.
+///
+/// ```compile_fail,E0133
+/// use lio::api::{self, op::{Completion, OpModel}, resource::Resource};
+/// let resource = Resource::stdin();
+/// let mut model = api::read(&resource, Vec::<u8>::with_capacity(8)).into_inner();
+/// let _ = model.complete(Completion::new(8));
+/// ```
 pub struct Read<B: IoBufMutVec> {
   res: Resource,
   buf: Option<B>,
@@ -576,7 +656,10 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let mut buf = self.buf.take().expect("buffer not available");
     let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
@@ -587,7 +670,9 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
       for i in 0..buf_count {
         let (_, cap) = buf.buf_mut(i);
         let len = remaining.min(cap);
-        buf.set_buf_len(i, len);
+        // SAFETY: completion guarantees the reported prefix is initialized and
+        // dependent raw access has ended. The index is valid and len <= cap.
+        unsafe { buf.set_buf_len(i, len) };
         remaining = remaining.saturating_sub(cap);
       }
       Ok(completion.result as i32)
@@ -600,7 +685,11 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
 impl<B: IoBufMutVec> OneshotOpModel for Read<B> {}
 
 #[cfg(test)]
-impl OpModelContract for Read<Vec<u8>> {
+// SAFETY: The owned eight-byte vector has room for the four-byte result;
+// setup writes "ping" into that prefix before complete sets its length.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Read<Vec<u8>> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -636,7 +725,12 @@ impl OpModelContract for Read<Vec<u8>> {
 }
 
 #[cfg(test)]
-impl OpModelContract for Read<(Vec<u8>, Vec<u8>)> {
+// SAFETY: The owned three- and five-byte vectors hold the five-byte result;
+// setup initializes the reported scatter prefix ("abc", "de") before lengths
+// are set. Both segments are within MAX_IOV_COUNT.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Read<(Vec<u8>, Vec<u8>)> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -718,7 +812,10 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let buf = self.buf.take().expect("buffer not available");
     let result = if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
@@ -735,7 +832,11 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OneshotOpModel
 }
 
 #[cfg(test)]
-impl OpModelContract for Write<Vec<u8>> {
+// SAFETY: The owned "pong" vector initializes all four reported bytes;
+// completion only returns that buffer and adopts no handle.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Write<Vec<u8>> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -768,7 +869,11 @@ impl OpModelContract for Write<Vec<u8>> {
 }
 
 #[cfg(test)]
-impl OpModelContract for Write<(Vec<u8>, Vec<u8>)> {
+// SAFETY: Owned "ab" and "cde" vectors initialize all five reported
+// bytes in the two advertised segments; completion only returns the buffers.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Write<(Vec<u8>, Vec<u8>)> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -858,7 +963,10 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
     Action::Io(Op::Recv { fd: self.res.clone(), msg, flags: self.flags })
   }
 
-  fn complete_buf(
+  /// # Safety
+  /// Requires the runtime OpModel completion guarantees: initialized receive
+  /// prefixes for successful byte counts and no remaining dependent raw access.
+  unsafe fn complete_buf(
     &mut self,
     completion: Completion,
   ) -> (std::io::Result<i32>, B) {
@@ -872,7 +980,9 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
       for i in 0..buf_count {
         let (_, cap) = buf.buf_mut(i);
         let len = remaining.min(cap);
-        buf.set_buf_len(i, len);
+        // SAFETY: completion guarantees the reported prefix is initialized and
+        // dependent raw access has ended. The index is valid and len <= cap.
+        unsafe { buf.set_buf_len(i, len) };
         remaining = remaining.saturating_sub(cap);
       }
       Ok(completion.result as i32)
@@ -916,6 +1026,16 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
   }
 }
 
+/// An owned-buffer I/O operation.
+///
+/// Extracting the model does not permit safe fabricated completion.
+///
+/// ```compile_fail,E0133
+/// use lio::api::{self, op::{Completion, OpModel}, resource::Resource};
+/// let resource = Resource::stdin();
+/// let mut model = api::recv(&resource, Vec::<u8>::with_capacity(8), None).into_inner();
+/// let _ = model.complete(Completion::new(8));
+/// ```
 pub struct Recv<B: IoBufMutVec + std::marker::Send + Sync> {
   core: RecvCore<B>,
 }
@@ -933,13 +1053,27 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Recv<B> {
     self.core.action()
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    OpResult::Done(self.core.complete_buf(completion))
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
+    // SAFETY: the caller guarantees completion of the action from this core.
+    OpResult::Done(unsafe { self.core.complete_buf(completion) })
   }
 }
 
 impl<B: IoBufMutVec + std::marker::Send + Sync> OneshotOpModel for Recv<B> {}
 
+/// An owned-buffer I/O operation.
+///
+/// Extracting the model does not permit safe fabricated completion.
+///
+/// ```compile_fail,E0133
+/// use lio::api::{self, op::{Completion, OpModel}, resource::Resource};
+/// let resource = Resource::stdin();
+/// let mut model = api::recvfrom(&resource, Vec::<u8>::with_capacity(8), None).into_inner();
+/// let _ = model.complete(Completion::new(8));
+/// ```
 pub struct RecvFrom<B: IoBufMutVec + std::marker::Send + Sync> {
   core: RecvCore<B>,
 }
@@ -957,8 +1091,13 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for RecvFrom<B> {
     self.core.action()
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let (result, buf) = self.core.complete_buf(completion);
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
+    // SAFETY: the caller guarantees completion of this core's action, including
+    // receive storage and the optional source-address output.
+    let (result, buf) = unsafe { self.core.complete_buf(completion) };
     let addr = result
       .as_ref()
       .ok()
@@ -971,7 +1110,11 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for RecvFrom<B> {
 impl<B: IoBufMutVec + std::marker::Send + Sync> OneshotOpModel for RecvFrom<B> {}
 
 #[cfg(test)]
-impl OpModelContract for Recv<Vec<u8>> {
+// SAFETY: The owned eight-byte vector fits the four-byte result; setup
+// initializes "recv" before complete sets the length. No source address is read.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Recv<Vec<u8>> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -1004,7 +1147,12 @@ impl OpModelContract for Recv<Vec<u8>> {
 }
 
 #[cfg(test)]
-impl OpModelContract for Recv<(Vec<u8>, Vec<u8>)> {
+// SAFETY: Owned two- and four-byte vectors fit the five-byte result;
+// setup initializes the scatter prefix ("he", "llo") before lengths are set.
+// Both segments are within MAX_IOV_COUNT; no source address is read.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Recv<(Vec<u8>, Vec<u8>)> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -1039,7 +1187,11 @@ impl OpModelContract for Recv<(Vec<u8>, Vec<u8>)> {
 }
 
 #[cfg(test)]
-impl OpModelContract for RecvFrom<Vec<u8>> {
+// SAFETY: Setup initializes both the four-byte "recv" prefix in the owned
+// eight-byte vector and the complete source address before success reads them.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for RecvFrom<Vec<u8>> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -1151,7 +1303,10 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Send<B> {
     Action::Io(Op::Send { fd: self.res.clone(), msg, flags: self.flags })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let buf = self.buf.take().expect("buffer not available");
     let result = if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
@@ -1168,7 +1323,11 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OneshotOpModel
 }
 
 #[cfg(test)]
-impl OpModelContract for Send<Vec<u8>> {
+// SAFETY: The owned "send" vector initializes all four reported bytes;
+// there is no destination metadata output or returned handle.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Send<Vec<u8>> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -1201,7 +1360,11 @@ impl OpModelContract for Send<Vec<u8>> {
 }
 
 #[cfg(test)]
-impl OpModelContract for Send<(Vec<u8>, Vec<u8>)> {
+// SAFETY: Owned "he" and "llo" vectors initialize all five reported
+// bytes in the two advertised segments; no output handle is adopted.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Send<(Vec<u8>, Vec<u8>)> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -1260,7 +1423,10 @@ impl OpModel for Sleep {
     Action::Sleep(self.duration)
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     debug_assert!(completion.flags.contains(CompletionFlags::TIMER));
 
     let result = if completion.result == 0 {
@@ -1276,7 +1442,11 @@ impl OpModel for Sleep {
 impl OneshotOpModel for Sleep {}
 
 #[cfg(test)]
-impl OpModelContract for Sleep {
+// SAFETY: Zero success carries TIMER for the matching sleep action;
+// completion reads no external storage and adopts no handle.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Sleep {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -1320,7 +1490,10 @@ impl OpModel for Interval {
     Action::Sleep(self.period)
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     debug_assert!(completion.flags.contains(CompletionFlags::TIMER));
 
     let result = if completion.result == 0 {
@@ -1336,7 +1509,12 @@ impl OpModel for Interval {
 impl StreamOpModel for Interval {}
 
 #[cfg(test)]
-impl OpModelContract for Interval {
+// SAFETY: Each of the two sleep actions has its own zero TIMER completion,
+// in order after the preceding Yield. No storage or handle is returned; the
+// runner's final unsubmitted action probe starts no timer or dependent access.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Interval {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Stream
@@ -1392,7 +1570,10 @@ impl OpModel for OpenAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     use std::os::fd::FromRawFd;
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
@@ -1450,7 +1631,10 @@ impl OpModel for Stat {
     Action::Io(Op::Stat { target, out: NonNull::from(&mut self.out) })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -1490,7 +1674,10 @@ impl OpModel for ReadDir {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -1503,7 +1690,13 @@ impl OpModel for ReadDir {
 impl OneshotOpModel for ReadDir {}
 
 #[cfg(test)]
-impl OpModelContract for ReadDir {
+// SAFETY: Setup initializes "child", its in-bounds entry (offset 0, length
+// 5), and result counts (one entry, five bytes, EOF) within the 64-byte/four-entry
+// buffers. with_capacity initializes all storage and leaves opaque null with
+// no drop hook, so returning/dropping the buffer adopts no backend allocation.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for ReadDir {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -1544,7 +1737,11 @@ impl OpModelContract for ReadDir {
 }
 
 #[cfg(test)]
-impl OpModelContract for Stat {
+// SAFETY: Setup assigns every FileStat field before the zero success
+// copies it out; the cwd/path placeholders are never submitted.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Stat {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -1617,7 +1814,10 @@ impl OpModel for UnlinkAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -1630,7 +1830,11 @@ impl OpModel for UnlinkAt {
 impl OneshotOpModel for UnlinkAt {}
 
 #[cfg(test)]
-impl OpModelContract for UnlinkAt {
+// SAFETY: Zero success only returns (); the owned path and cwd placeholder
+// require no output initialization or handle transfer.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for UnlinkAt {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -1688,7 +1892,10 @@ impl OpModel for RenameAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -1701,7 +1908,11 @@ impl OpModel for RenameAt {
 impl OneshotOpModel for RenameAt {}
 
 #[cfg(test)]
-impl OpModelContract for RenameAt {
+// SAFETY: Zero success only returns (); both paths are owned and the cwd
+// placeholders require no output initialization or handle transfer.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for RenameAt {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -1752,7 +1963,10 @@ impl OpModel for MkdirAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -1765,7 +1979,11 @@ impl OpModel for MkdirAt {
 impl OneshotOpModel for MkdirAt {}
 
 #[cfg(test)]
-impl OpModelContract for MkdirAt {
+// SAFETY: Zero success only returns (); the owned path, cwd placeholder,
+// and mode require no output initialization or handle transfer.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for MkdirAt {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -1821,7 +2039,10 @@ impl OpModel for LinkAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -1834,7 +2055,11 @@ impl OpModel for LinkAt {
 impl OneshotOpModel for LinkAt {}
 
 #[cfg(test)]
-impl OpModelContract for LinkAt {
+// SAFETY: Zero success only returns (); the owned paths and cwd
+// placeholders require no output initialization or handle transfer.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for LinkAt {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -1900,12 +2125,17 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let mut buf = self.buf.take().expect("buffer not available");
     let result = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
-      buf.set_buf_len(0, completion.result as usize);
+      // SAFETY: completion guarantees this prefix in slot zero was initialized
+      // within capacity by readlink, and no dependent raw access remains.
+      unsafe { buf.set_buf_len(0, completion.result as usize) };
       Ok(completion.result as i32)
     };
     OpResult::Done((result, buf))
@@ -1935,7 +2165,10 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
     Action::Io(Op::GetCwd { out: NonNull::from(&mut self.out) })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let mut buf = self.buf.take().expect("buffer not available");
     let result = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
@@ -1956,7 +2189,9 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
         unsafe {
           std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len())
         };
-        buf.set_buf_len(0, bytes.len());
+        // SAFETY: the copy above initialized the prefix within the checked
+        // capacity of slot zero; completion ends conflicting raw access.
+        unsafe { buf.set_buf_len(0, bytes.len()) };
         Ok(bytes.len() as i32)
       }
     };
@@ -1967,7 +2202,12 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
 impl<B: IoBufMutVec + std::marker::Send + Sync> OneshotOpModel for GetCwd<B> {}
 
 #[cfg(test)]
-impl OpModelContract for GetCwd<Vec<u8>> {
+// SAFETY: Setup installs a valid owned "/tmp" OsString before success;
+// complete copies its four bytes into the owned 32-byte vector and only then
+// sets its length. No handle is transferred.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for GetCwd<Vec<u8>> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -2041,7 +2281,10 @@ impl OpModel for Spawn {
     Action::Io(Op::Spawn { spec: self.spec.clone() })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let result = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
@@ -2055,7 +2298,12 @@ impl OpModel for Spawn {
 impl OneshotOpModel for Spawn {}
 
 #[cfg(all(test, unix))]
-impl OpModelContract for Spawn {
+// SAFETY: The owned spawn specification is only inspected, never executed.
+// Success wraps 1234 in the inert Copy Pid value (no ownership or destructor),
+// so no real process or owned handle is required.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for Spawn {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot
@@ -2079,7 +2327,11 @@ impl OpModelContract for Spawn {
 }
 
 #[cfg(test)]
-impl OpModelContract for ReadlinkAt<Vec<u8>> {
+// SAFETY: Setup initializes "dest" in the owned 32-byte vector before
+// the four-byte success sets its length; the path/cwd are never submitted.
+// The runner inspects but never submits actions: no dependent raw access is
+// outstanding. Setup (if any) and completion run in script order, once per action.
+unsafe impl OpModelContract for ReadlinkAt<Vec<u8>> {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
     ContractKind::Oneshot

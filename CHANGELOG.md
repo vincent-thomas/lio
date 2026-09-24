@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Breaking:** IoBuf, IoBufMut, IoBufVec, and IoBufMutVec now require unsafe implementations and documented pointer, initialization, storage, and aliasing contracts. Their length setters require unsafe calls with initialized prefixes within capacity and no conflicting in-flight access.
+- Runtime api::op::OpModel::complete and its test-contract adapter are now unsafe. Simulated completions must establish initialized output and genuinely owned resources. Ordinary await, callback, and channel APIs remain safe; the independent api::op_contract illustration is unchanged.
+- This is focused buffer/completion hardening, not complete soundness. Independent raw-action, backend, cancellation, and shutdown concerns remain outside this change.
+
 ## v0.4.1 - 2026-03-13
 
 - try ([65b2e02](https://github.com/vincent-thomas/lio/commit/65b2e0246b3b62cc1ae3820b92021a271c614fb7))
