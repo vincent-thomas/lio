@@ -1,5 +1,3 @@
-#![allow(clippy::unnecessary_lazy_evaluations)]
-
 //! I/O operation definitions.
 //!
 //! This module contains all the typed operation structs that implement `TypedOp`.
@@ -962,7 +960,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for RecvFrom<B> {
     let addr = result
       .as_ref()
       .ok()
-      .and_then(|_| self.core.from.as_ref())
+      .and(self.core.from.as_ref())
       .and_then(|from| socket_addr_from_buf(from).ok());
     OpResult::Done((result, buf, addr))
   }
