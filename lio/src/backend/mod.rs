@@ -53,9 +53,6 @@ pub mod impls {
   #[macro_use]
   pub(crate) mod syscall;
 
-  // #[cfg(test)]
-  // pub mod dummy;
-
   #[cfg(target_os = "linux")]
   mod io_uring;
 

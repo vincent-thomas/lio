@@ -477,51 +477,6 @@ impl Poller {
     Some((iovecs, hdr, addr))
   }
 
-  fn debug_sendmsg_zero(fd: RawFd, hdr: &libc::msghdr) {
-    let mut so_error: i32 = 0;
-    let mut so_error_len = std::mem::size_of::<i32>() as libc::socklen_t;
-    let so_error_ret = syscall!(raw getsockopt(
-      fd,
-      libc::SOL_SOCKET,
-      libc::SO_ERROR,
-      (&mut so_error as *mut i32).cast(),
-      &mut so_error_len,
-    ));
-
-    let mut peer = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
-    let mut peer_len =
-      std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let peer_ret = syscall!(raw getpeername(
-      fd,
-      (&mut peer as *mut libc::sockaddr_storage).cast(),
-      &mut peer_len,
-    ));
-
-    let peer = if peer_ret >= 0 {
-      Self::raise_socket_addr(&peer, peer_len)
-        .and_then(|addr| crate::backend::op::socket_addr_from_buf(&addr))
-        .map(|addr| addr.to_string())
-        .unwrap_or_else(|err| format!("<decode-error:{err}>"))
-    } else {
-      format!("<getpeername:{}>", -peer_ret)
-    };
-
-    eprintln!(
-      "lio-debug sendmsg returned 0 fd={} msg_iovlen={} first_iov_len={} so_error_ret={} so_error={} peer={}",
-      fd,
-      hdr.msg_iovlen,
-      if hdr.msg_iovlen > 0 {
-        // SAFETY: msg_iovlen > 0 means msg_iov points to at least one iovec.
-        unsafe { (*hdr.msg_iov).iov_len }
-      } else {
-        0
-      },
-      so_error_ret,
-      so_error,
-      peer,
-    );
-  }
-
   pub fn new() -> Self {
     Self::default()
   }
@@ -864,12 +819,7 @@ impl Poller {
           hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
           hdr.msg_namelen = *len;
         }
-        let result =
-          syscall!(raw sendmsg(fd, &mut hdr, flags.bits() | socket_flags));
-        if result == 0 && hdr.msg_iovlen > 0 {
-          Self::debug_sendmsg_zero(fd, &hdr);
-        }
-        result
+        syscall!(raw sendmsg(fd, &mut hdr, flags.bits() | socket_flags))
       }
 
       Op::Accept { fd, addr } => {
