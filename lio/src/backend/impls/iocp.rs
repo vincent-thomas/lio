@@ -731,7 +731,18 @@ impl Iocp {
       )
     };
     if ok == FALSE {
-      return last_wsa_error();
+      // SAFETY: reads the calling thread's last Winsock error.
+      let code = unsafe { ws::WSAGetLastError() };
+      // A datagram larger than the buffer is truncated, as on Unix, rather
+      // than failing the receive.
+      let truncated = code == ws::WSAEMSGSIZE
+        && matches!(
+          state.kind,
+          AsyncKind::Transfer | AsyncKind::RecvFrom { .. }
+        );
+      if !truncated {
+        return -(code as isize);
+      }
     }
 
     match &mut state.kind {

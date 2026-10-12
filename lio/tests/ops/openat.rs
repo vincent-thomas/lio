@@ -7,13 +7,20 @@
 #[path = "../common.rs"]
 mod common;
 
+use common::raw_id;
 use lio::{
   Lio,
   api::{self, resource::Resource},
   backend::ds::{DSBackend, DSConfig},
 };
 use std::ffi::CString;
-use std::os::fd::{AsFd, AsRawFd};
+
+/// `O_DIRECTORY` as the simulation backend interprets it. Windows' CRT has no
+/// such flag; the simulator uses the Linux value there.
+#[cfg(unix)]
+const O_DIRECTORY: i32 = libc::O_DIRECTORY;
+#[cfg(not(unix))]
+const O_DIRECTORY: i32 = 0o200000;
 
 fn new_ds_lio() -> Lio {
   Lio::new_with_backend(
@@ -96,7 +103,7 @@ fn test_openat_with_directory_fd() {
     &mut lio,
     &Resource::cwd(),
     dir_path.clone(),
-    libc::O_RDONLY | libc::O_DIRECTORY,
+    libc::O_RDONLY | O_DIRECTORY,
     0,
   )
   .expect("Failed to open synthetic directory");
@@ -111,7 +118,7 @@ fn test_openat_with_directory_fd() {
   )
   .expect("Failed to open file with directory fd");
 
-  assert!(fd.as_fd().as_raw_fd() >= 0);
+  let _ = raw_id(&fd);
 
   let child_path =
     CString::new(format!("{}/child.txt", dir_path.to_string_lossy())).unwrap();
@@ -134,12 +141,12 @@ fn test_openat_concurrent() {
       0o666,
     )
     .expect("Failed to open file");
-    assert!(fd.as_fd().as_raw_fd() >= 0);
+    let _ = raw_id(&fd);
     fds.push(fd);
     unlink_file(&mut lio, path);
   }
 
-  let raw_fds: Vec<_> = fds.iter().map(|f| f.as_fd().as_raw_fd()).collect();
+  let raw_fds: Vec<_> = fds.iter().map(raw_id).collect();
   for i in 0..raw_fds.len() {
     for j in i + 1..raw_fds.len() {
       assert_ne!(raw_fds[i], raw_fds[j]);
@@ -217,11 +224,11 @@ fn test_openat_directory() {
     &mut lio,
     &Resource::cwd(),
     path,
-    libc::O_RDONLY | libc::O_DIRECTORY,
+    libc::O_RDONLY | O_DIRECTORY,
     0,
   )
   .expect("Failed to open directory");
-  assert!(fd.as_fd().as_raw_fd() >= 0);
+  let _ = raw_id(&fd);
 }
 
 #[test]
@@ -241,7 +248,7 @@ fn test_openat_directory_flag_on_file() {
     &mut lio,
     &Resource::cwd(),
     path.clone(),
-    libc::O_RDONLY | libc::O_DIRECTORY,
+    libc::O_RDONLY | O_DIRECTORY,
     0,
   );
   assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOTDIR));

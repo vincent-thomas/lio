@@ -70,6 +70,9 @@ jobs:
       - name: bookkeeping tests
         run: cargo test -p lio --lib
 
+      - name: ops tests
+        run: cargo test -p lio --features high --test ops
+
   test-backend:
     name: backend-${{ matrix.backend }}-${{ matrix.os }}
     runs-on: ${{ matrix.os }}

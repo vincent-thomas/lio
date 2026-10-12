@@ -5,11 +5,9 @@
 )]
 
 use super::common::{self, poll_recv};
-use lio::api::{ShutdownHow, resource::Resource};
+use lio::api::ShutdownHow;
 use lio::{Lio, api};
-use std::mem::MaybeUninit;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, FromRawFd};
 
 #[test]
 fn test_shutdown_write() {
@@ -25,19 +23,7 @@ fn test_shutdown_write() {
 
   bind_recv.recv().expect("Failed to bind");
 
-  let bound_addr = unsafe {
-    let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    libc::getsockname(
-      server_sock.as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    let sockaddr_in = addr_storage.assume_init();
-    let port = u16::from_be(sockaddr_in.sin_port);
-    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-  };
+  let bound_addr = super::common::get_bound_addr(&server_sock);
 
   let listen_recv = api::listen(&server_sock, 128).with_lio(&mut lio).send();
 
@@ -107,19 +93,7 @@ fn test_shutdown_read() {
 
   bind_recv.recv().expect("Failed to bind");
 
-  let bound_addr = unsafe {
-    let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    libc::getsockname(
-      server_sock.as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    let sockaddr_in = addr_storage.assume_init();
-    let port = u16::from_be(sockaddr_in.sin_port);
-    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-  };
+  let bound_addr = super::common::get_bound_addr(&server_sock);
 
   let listen_recv = api::listen(&server_sock, 128).with_lio(&mut lio).send();
 
@@ -179,19 +153,7 @@ fn test_shutdown_both() {
 
   poll_recv(&mut lio, &mut bind_recv).expect("Failed to bind");
 
-  let bound_addr = unsafe {
-    let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    libc::getsockname(
-      server_sock.as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    let sockaddr_in = addr_storage.assume_init();
-    let port = u16::from_be(sockaddr_in.sin_port);
-    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-  };
+  let bound_addr = super::common::get_bound_addr(&server_sock);
 
   let mut listen_recv =
     api::listen(&server_sock, 128).with_lio(&mut lio).send();
@@ -250,7 +212,7 @@ fn test_shutdown_invalid_fd() {
 
   // Try to shutdown an invalid file descriptor
   let mut shutdown_recv =
-    api::shutdown(&unsafe { Resource::from_raw_fd(-1) }, ShutdownHow::Both)
+    api::shutdown(&super::common::invalid_resource(), ShutdownHow::Both)
       .with_lio(&mut lio)
       .send();
 
@@ -271,19 +233,7 @@ fn test_shutdown_after_close() {
 
   bind_recv.recv().expect("Failed to bind");
 
-  let bound_addr = unsafe {
-    let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    libc::getsockname(
-      server_sock.as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    let sockaddr_in = addr_storage.assume_init();
-    let port = u16::from_be(sockaddr_in.sin_port);
-    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-  };
+  let bound_addr = super::common::get_bound_addr(&server_sock);
 
   let listen_recv = api::listen(&server_sock, 128).with_lio(&mut lio).send();
 
@@ -298,16 +248,13 @@ fn test_shutdown_after_close() {
 
   poll_recv(&mut lio, &mut connect_recv).unwrap();
 
-  // Close the socket manually and forget to prevent double-close
-  unsafe {
-    libc::close(client_sock.as_raw_fd());
-  }
-  std::mem::forget(client_sock);
+  // Close the client socket.
+  drop(client_sock);
 
   // Try to shutdown after close (should fail)
   // Note: We create a new Resource with the same (now invalid) fd for testing
   let mut shutdown_recv =
-    api::shutdown(&unsafe { Resource::from_raw_fd(-1) }, ShutdownHow::Both)
+    api::shutdown(&super::common::invalid_resource(), ShutdownHow::Both)
       .with_lio(&mut lio)
       .send();
 
@@ -330,19 +277,7 @@ fn test_shutdown_twice() {
 
   bind_recv.recv().expect("Failed to bind");
 
-  let bound_addr = unsafe {
-    let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    libc::getsockname(
-      server_sock.as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    let sockaddr_in = addr_storage.assume_init();
-    let port = u16::from_be(sockaddr_in.sin_port);
-    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-  };
+  let bound_addr = super::common::get_bound_addr(&server_sock);
 
   let listen_recv = api::listen(&server_sock, 128).with_lio(&mut lio).send();
 
@@ -395,19 +330,7 @@ fn test_shutdown_sequential_directions() {
 
   bind_recv.recv().expect("Failed to bind");
 
-  let bound_addr = unsafe {
-    let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    libc::getsockname(
-      server_sock.as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    let sockaddr_in = addr_storage.assume_init();
-    let port = u16::from_be(sockaddr_in.sin_port);
-    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-  };
+  let bound_addr = super::common::get_bound_addr(&server_sock);
 
   let listen_recv = api::listen(&server_sock, 128).with_lio(&mut lio).send();
 
@@ -475,19 +398,7 @@ fn test_shutdown_before_data_sent() {
 
   bind_recv.recv().expect("Failed to bind");
 
-  let bound_addr = unsafe {
-    let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    libc::getsockname(
-      server_sock.as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    let sockaddr_in = addr_storage.assume_init();
-    let port = u16::from_be(sockaddr_in.sin_port);
-    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-  };
+  let bound_addr = super::common::get_bound_addr(&server_sock);
 
   let listen_recv = api::listen(&server_sock, 128).with_lio(&mut lio).send();
 
@@ -540,19 +451,7 @@ fn test_shutdown_ipv6() {
 
   bind_recv.recv().expect("Failed to bind IPv6");
 
-  let bound_addr = unsafe {
-    let mut addr_storage = MaybeUninit::<libc::sockaddr_in6>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-    libc::getsockname(
-      server_sock.as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    let sockaddr_in6 = addr_storage.assume_init();
-    let port = u16::from_be(sockaddr_in6.sin6_port);
-    format!("[::1]:{}", port).parse::<SocketAddr>().unwrap()
-  };
+  let bound_addr = super::common::get_bound_addr(&server_sock);
 
   let listen_recv = api::listen(&server_sock, 128).with_lio(&mut lio).send();
 
@@ -605,19 +504,7 @@ fn test_shutdown_concurrent() {
 
     poll_recv(&mut lio, &mut bind_recv).expect("Failed to bind");
 
-    let bound_addr = unsafe {
-      let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-      let mut addr_len =
-        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-      libc::getsockname(
-        server_sock.as_raw_fd(),
-        addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-        &mut addr_len,
-      );
-      let sockaddr_in = addr_storage.assume_init();
-      let port = u16::from_be(sockaddr_in.sin_port);
-      format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-    };
+    let bound_addr = super::common::get_bound_addr(&server_sock);
 
     let mut listen_recv =
       api::listen(&server_sock, 128).with_lio(&mut lio).send();
@@ -661,19 +548,7 @@ fn test_shutdown_with_pending_data() {
 
   bind_recv.recv().expect("Failed to bind");
 
-  let bound_addr = unsafe {
-    let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    libc::getsockname(
-      server_sock.as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    let sockaddr_in = addr_storage.assume_init();
-    let port = u16::from_be(sockaddr_in.sin_port);
-    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-  };
+  let bound_addr = super::common::get_bound_addr(&server_sock);
 
   let listen_recv = api::listen(&server_sock, 128).with_lio(&mut lio).send();
 

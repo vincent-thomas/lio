@@ -7,15 +7,21 @@
 //! Tests for sendto operations.
 
 use super::common::{
-  TcpPair, get_bound_addr, poll_recv, poll_until_recv, setup_tcp_pair,
-  udp_socket,
+  TcpPair, as_tcp_stream, poll_recv, poll_until_recv, setup_tcp_pair,
+  socket_resource,
 };
 use lio::Lio;
 use lio::api;
 use lio::api::resource::Resource;
+use std::io::Read;
 use std::net::{SocketAddr, UdpSocket};
-use std::os::fd::{AsFd, AsRawFd};
 use std::sync::mpsc;
+
+/// "Already connected": `EISCONN` / `WSAEISCONN`.
+#[cfg(unix)]
+const EISCONN: i32 = libc::EISCONN;
+#[cfg(windows)]
+const EISCONN: i32 = 10056;
 
 struct UdpPair {
   sender: Resource,
@@ -24,49 +30,13 @@ struct UdpPair {
 }
 
 fn setup_udp_pair() -> UdpPair {
-  let sender = udp_socket();
+  let sender = socket_resource(
+    UdpSocket::bind("127.0.0.1:0").expect("failed to bind sender socket"),
+  );
   let receiver =
     UdpSocket::bind("127.0.0.1:0").expect("failed to bind receiver socket");
   let receiver_addr =
     receiver.local_addr().expect("failed to query receiver address");
-
-  let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-  let std_sockaddr = match bind_addr {
-    SocketAddr::V4(addr) => {
-      let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-      #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-      ))]
-      {
-        sockaddr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
-      }
-      sockaddr.sin_family = libc::AF_INET as libc::sa_family_t;
-      sockaddr.sin_port = addr.port().to_be();
-      sockaddr.sin_addr =
-        libc::in_addr { s_addr: u32::from(*addr.ip()).to_be() };
-      sockaddr
-    }
-    SocketAddr::V6(_) => unreachable!("IPv4-only test helper"),
-  };
-  let bind_result = unsafe {
-    libc::bind(
-      sender.as_fd().as_raw_fd(),
-      (&std_sockaddr as *const libc::sockaddr_in).cast(),
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-    )
-  };
-  assert_eq!(
-    bind_result,
-    0,
-    "failed to bind sender socket: {}",
-    std::io::Error::last_os_error()
-  );
-  let _sender_addr = get_bound_addr(&sender);
 
   UdpPair { sender, receiver, receiver_addr }
 }
@@ -81,21 +51,14 @@ fn recv_once(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
 fn recv_all(fd: &Resource, len: usize) -> Vec<u8> {
   let mut out = vec![0u8; len];
   let mut read = 0usize;
+  let mut stream = as_tcp_stream(fd);
 
   while read < len {
-    let n = unsafe {
-      libc::recv(
-        fd.as_fd().as_raw_fd(),
-        out[read..].as_mut_ptr().cast(),
-        out.len() - read,
-        0,
-      )
-    };
-    assert!(n >= 0, "peer recv failed");
+    let n = stream.read(&mut out[read..]).expect("peer recv failed");
     if n == 0 {
       break;
     }
-    read += n as usize;
+    read += n;
   }
 
   out.truncate(read);
@@ -103,25 +66,7 @@ fn recv_all(fd: &Resource, len: usize) -> Vec<u8> {
 }
 
 fn get_peer_addr(sock: &Resource) -> SocketAddr {
-  unsafe {
-    let mut addr_storage = std::mem::MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    let result = libc::getpeername(
-      sock.as_fd().as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    assert_eq!(
-      result,
-      0,
-      "getpeername failed: {}",
-      std::io::Error::last_os_error()
-    );
-    let sockaddr_in = addr_storage.assume_init();
-    let port = u16::from_be(sockaddr_in.sin_port);
-    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-  }
+  as_tcp_stream(sock).peer_addr().expect("getpeername failed")
 }
 
 #[test]
@@ -242,7 +187,7 @@ fn tcp_stream() {
     Err(err) => {
       let errno = err.raw_os_error();
       assert!(
-        errno == Some(libc::EISCONN),
+        errno == Some(EISCONN),
         "unexpected sendto-on-TCP error: {err:?}"
       );
     }

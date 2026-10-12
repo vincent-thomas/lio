@@ -1,78 +1,386 @@
-// Drives raw Unix descriptors directly; Windows is covered by the backend
-// contract suite in `backends`.
-#![cfg(unix)]
+//! Test helpers shared by the integration tests.
+//!
+//! Platform differences live here so the tests themselves stay portable.
+
 use std::{
   ffi::CString,
-  mem::MaybeUninit,
-  net::{SocketAddr, TcpListener, TcpStream},
+  fs::File,
+  mem::ManuallyDrop,
+  net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
+  path::PathBuf,
   sync::mpsc,
   time::Duration,
 };
 
 use lio::{Lio, api::io::Receiver, api::resource::Resource};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd};
 
-// // ============================================================================
-// // Socket creation utilities
-// // ============================================================================
+// ============================================================================
+// Ownership transfer between std types and `Resource`
+// ============================================================================
 
-fn create_socket(
-  domain: libc::c_int,
-  ty: libc::c_int,
-  proto: libc::c_int,
+/// Transfers ownership of a std socket to a `Resource`.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn socket_resource(socket: impl std::os::fd::IntoRawFd) -> Resource {
+  use std::os::fd::FromRawFd;
+  // SAFETY: the socket hands its owned descriptor to exactly one Resource.
+  unsafe { Resource::from_raw_fd(socket.into_raw_fd()) }
+}
+
+/// Transfers ownership of a std socket to a `Resource`.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub fn socket_resource(
+  socket: impl std::os::windows::io::IntoRawSocket,
 ) -> Resource {
-  let fd = unsafe { libc::socket(domain, ty, proto) };
+  use std::os::windows::io::FromRawHandle;
+  // SAFETY: the socket hands its owned handle to exactly one Resource.
+  unsafe { Resource::from_raw_handle(socket.into_raw_socket() as _) }
+}
+
+/// Transfers ownership of a file to a `Resource`.
+#[allow(dead_code)]
+pub fn file_resource(file: File) -> Resource {
+  #[cfg(unix)]
+  {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    // SAFETY: the file hands its owned descriptor to exactly one Resource.
+    unsafe { Resource::from_raw_fd(file.into_raw_fd()) }
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+    // SAFETY: the file hands its owned handle to exactly one Resource.
+    unsafe { Resource::from_raw_handle(file.into_raw_handle()) }
+  }
+}
+
+/// Opens a directory as a `Resource` (for `readdir` and `*at` operations).
+#[allow(dead_code)]
+pub fn open_dir(path: &std::path::Path) -> Resource {
+  #[cfg(unix)]
+  let dir = File::open(path);
+  #[cfg(windows)]
+  let dir = {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Directories can only be opened with FILE_FLAG_BACKUP_SEMANTICS.
+    std::fs::OpenOptions::new().read(true).custom_flags(0x0200_0000).open(path)
+  };
+  file_resource(dir.expect("failed to open directory"))
+}
+
+/// A resource that is never a valid descriptor/handle. It is borrowed, so
+/// dropping it never closes anything.
+#[allow(dead_code)]
+pub fn invalid_resource() -> Resource {
+  #[cfg(unix)]
+  // SAFETY: -1 is never a valid descriptor and is never closed.
+  return unsafe { Resource::borrow(-1) };
+  #[cfg(windows)]
+  // SAFETY: the null handle is never valid and is never closed.
+  return unsafe { Resource::borrow(std::ptr::null_mut()) };
+}
+
+/// Borrows a socket `Resource` as a std `TcpStream`, for inspecting it or for
+/// synchronous I/O in tests. The resource stays owned by `res`.
+#[allow(dead_code)]
+pub fn as_tcp_stream(res: &Resource) -> ManuallyDrop<TcpStream> {
+  #[cfg(unix)]
+  {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: `ManuallyDrop` never closes the borrowed descriptor.
+    ManuallyDrop::new(unsafe { TcpStream::from_raw_fd(res.as_raw_fd()) })
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::io::{AsRawHandle, FromRawSocket};
+    // SAFETY: `ManuallyDrop` never closes the borrowed socket.
+    ManuallyDrop::new(unsafe {
+      TcpStream::from_raw_socket(res.as_raw_handle() as u64)
+    })
+  }
+}
+
+/// Borrows a socket `Resource` as a std `UdpSocket`.
+#[allow(dead_code)]
+pub fn as_udp_socket(res: &Resource) -> ManuallyDrop<UdpSocket> {
+  #[cfg(unix)]
+  {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: `ManuallyDrop` never closes the borrowed descriptor.
+    ManuallyDrop::new(unsafe { UdpSocket::from_raw_fd(res.as_raw_fd()) })
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::io::{AsRawHandle, FromRawSocket};
+    // SAFETY: `ManuallyDrop` never closes the borrowed socket.
+    ManuallyDrop::new(unsafe {
+      UdpSocket::from_raw_socket(res.as_raw_handle() as u64)
+    })
+  }
+}
+
+/// Borrows a file `Resource` as a std `File`.
+#[allow(dead_code)]
+pub fn as_file(res: &Resource) -> ManuallyDrop<File> {
+  #[cfg(unix)]
+  {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: `ManuallyDrop` never closes the borrowed descriptor.
+    ManuallyDrop::new(unsafe { File::from_raw_fd(res.as_raw_fd()) })
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    // SAFETY: `ManuallyDrop` never closes the borrowed handle.
+    ManuallyDrop::new(unsafe { File::from_raw_handle(res.as_raw_handle()) })
+  }
+}
+
+/// The raw descriptor/handle value, for identity comparisons.
+#[allow(dead_code)]
+pub fn raw_id(res: &Resource) -> u64 {
+  #[cfg(unix)]
+  {
+    use std::os::fd::AsRawFd;
+    res.as_raw_fd() as u64
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::io::AsRawHandle;
+    res.as_raw_handle() as u64
+  }
+}
+
+// ============================================================================
+// Socket creation and inspection
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SocketKind {
+  Stream,
+  Datagram,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum Family {
+  Ipv4,
+  Ipv6,
+  Unix,
+}
+
+#[cfg(unix)]
+fn create_socket(family: Family, kind: SocketKind) -> Resource {
+  use std::os::fd::FromRawFd;
+  let domain = match family {
+    Family::Ipv4 => libc::AF_INET,
+    Family::Ipv6 => libc::AF_INET6,
+    Family::Unix => libc::AF_UNIX,
+  };
+  let ty = match kind {
+    SocketKind::Stream => libc::SOCK_STREAM,
+    SocketKind::Datagram => libc::SOCK_DGRAM,
+  };
+  // SAFETY: plain socket creation.
+  let fd = unsafe { libc::socket(domain, ty, 0) };
   assert!(fd >= 0, "socket() failed: {}", std::io::Error::last_os_error());
+  // SAFETY: `fd` is a fresh descriptor owned by the returned Resource.
   unsafe { Resource::from_raw_fd(fd) }
+}
+
+#[cfg(windows)]
+fn create_socket(family: Family, kind: SocketKind) -> Resource {
+  use std::os::windows::io::FromRawHandle;
+  use windows_sys::Win32::Networking::WinSock as ws;
+  // std initializes Winsock on first use.
+  drop(UdpSocket::bind("127.0.0.1:0"));
+  let domain = match family {
+    Family::Ipv4 => ws::AF_INET,
+    Family::Ipv6 => ws::AF_INET6,
+    Family::Unix => ws::AF_UNIX,
+  };
+  let ty = match kind {
+    SocketKind::Stream => ws::SOCK_STREAM,
+    SocketKind::Datagram => ws::SOCK_DGRAM,
+  };
+  // SAFETY: plain socket creation.
+  let socket = unsafe {
+    ws::WSASocketW(
+      domain as i32,
+      ty,
+      0,
+      std::ptr::null(),
+      0,
+      ws::WSA_FLAG_OVERLAPPED | ws::WSA_FLAG_NO_HANDLE_INHERIT,
+    )
+  };
+  assert_ne!(
+    socket,
+    ws::INVALID_SOCKET,
+    "WSASocketW failed: {}",
+    std::io::Error::last_os_error()
+  );
+  // SAFETY: `socket` is fresh and owned by the returned Resource.
+  unsafe { Resource::from_raw_handle(socket as _) }
 }
 
 /// Creates a Unix stream socket resource.
 #[allow(dead_code)]
 pub fn unix_stream_socket() -> Resource {
-  create_socket(libc::AF_UNIX, libc::SOCK_STREAM, 0)
+  create_socket(Family::Unix, SocketKind::Stream)
 }
 
-/// Creates a Unix datagram socket resource.
+/// Creates a Unix datagram socket resource (Windows has no `AF_UNIX`
+/// datagrams).
+#[cfg(unix)]
 #[allow(dead_code)]
 pub fn unix_dgram_socket() -> Resource {
-  create_socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0)
+  create_socket(Family::Unix, SocketKind::Datagram)
 }
 
 /// Creates a TCP IPv4 socket resource.
 #[allow(dead_code)]
 pub fn tcp_socket() -> Resource {
-  create_socket(libc::AF_INET, libc::SOCK_STREAM, 0)
+  create_socket(Family::Ipv4, SocketKind::Stream)
 }
 
 /// Creates a TCP IPv6 socket resource.
 #[allow(dead_code)]
 pub fn tcp6_socket() -> Resource {
-  create_socket(libc::AF_INET6, libc::SOCK_STREAM, libc::IPPROTO_TCP)
+  create_socket(Family::Ipv6, SocketKind::Stream)
 }
 
 /// Creates a UDP IPv4 socket resource.
 #[allow(dead_code)]
 pub fn udp_socket() -> Resource {
-  create_socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP)
+  create_socket(Family::Ipv4, SocketKind::Datagram)
 }
 
 /// Creates a UDP IPv6 socket resource.
 #[allow(dead_code)]
 pub fn udp6_socket() -> Resource {
-  create_socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP)
+  create_socket(Family::Ipv6, SocketKind::Datagram)
+}
+
+/// Reports whether a socket is a stream or datagram socket (`SO_TYPE`).
+#[allow(dead_code)]
+pub fn socket_kind(res: &Resource) -> SocketKind {
+  let mut ty: i32 = 0;
+  #[cfg(unix)]
+  {
+    use std::os::fd::AsRawFd;
+    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+    // SAFETY: `ty`/`len` are valid output storage for `SO_TYPE`.
+    let rc = unsafe {
+      libc::getsockopt(
+        res.as_raw_fd(),
+        libc::SOL_SOCKET,
+        libc::SO_TYPE,
+        (&mut ty as *mut i32).cast(),
+        &mut len,
+      )
+    };
+    assert_eq!(rc, 0, "getsockopt: {}", std::io::Error::last_os_error());
+    match ty {
+      libc::SOCK_STREAM => SocketKind::Stream,
+      libc::SOCK_DGRAM => SocketKind::Datagram,
+      other => panic!("unexpected socket type {other}"),
+    }
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Networking::WinSock as ws;
+    let mut len = std::mem::size_of::<i32>() as i32;
+    // SAFETY: `ty`/`len` are valid output storage for `SO_TYPE`.
+    let rc = unsafe {
+      ws::getsockopt(
+        res.as_raw_handle() as ws::SOCKET,
+        ws::SOL_SOCKET,
+        ws::SO_TYPE,
+        (&mut ty as *mut i32).cast(),
+        &mut len,
+      )
+    };
+    assert_eq!(rc, 0, "getsockopt: {}", std::io::Error::last_os_error());
+    match ty {
+      ws::SOCK_STREAM => SocketKind::Stream,
+      ws::SOCK_DGRAM => SocketKind::Datagram,
+      other => panic!("unexpected socket type {other}"),
+    }
+  }
+}
+
+/// Sets `SO_REUSEADDR` on a socket.
+#[allow(dead_code)]
+pub fn set_reuse_addr(res: &Resource) {
+  let on: i32 = 1;
+  #[cfg(unix)]
+  // SAFETY: `on` is a valid `int` option value.
+  let rc = unsafe {
+    use std::os::fd::AsRawFd;
+    libc::setsockopt(
+      res.as_raw_fd(),
+      libc::SOL_SOCKET,
+      libc::SO_REUSEADDR,
+      (&on as *const i32).cast(),
+      std::mem::size_of::<i32>() as libc::socklen_t,
+    )
+  };
+  #[cfg(windows)]
+  // SAFETY: `on` is a valid `int` option value.
+  let rc = unsafe {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Networking::WinSock as ws;
+    ws::setsockopt(
+      res.as_raw_handle() as ws::SOCKET,
+      ws::SOL_SOCKET,
+      ws::SO_REUSEADDR,
+      (&on as *const i32).cast(),
+      std::mem::size_of::<i32>() as i32,
+    )
+  };
+  assert_eq!(rc, 0, "setsockopt: {}", std::io::Error::last_os_error());
+}
+
+// ============================================================================
+// Paths
+// ============================================================================
+
+/// Creates a symlink to a file.
+#[allow(dead_code)]
+pub fn symlink_file(target: &std::path::Path, link: &std::path::Path) {
+  #[cfg(unix)]
+  std::os::unix::fs::symlink(target, link).expect("symlink failed");
+  #[cfg(windows)]
+  std::os::windows::fs::symlink_file(target, link).expect("symlink failed");
+}
+
+/// A path in the system temp directory, unique to this process and `name`.
+#[allow(dead_code)]
+pub fn temp_path(name: &str) -> PathBuf {
+  std::env::temp_dir().join(format!("lio_test_{}_{}", name, std::process::id()))
+}
+
+/// Like [`temp_path`], as the `CString` the path-based APIs take.
+#[allow(dead_code)]
+pub fn temp_cpath(name: &str) -> CString {
+  path_to_cstring(&temp_path(name))
+}
+
+#[allow(dead_code)]
+pub fn path_to_cstring(path: &std::path::Path) -> CString {
+  CString::new(path.to_str().expect("test paths are UTF-8"))
+    .expect("test paths have no NUL bytes")
 }
 
 /// Utility function to create a unique temporary file path for proptest tests.
 /// Returns a CString path that includes the process ID and a unique value to avoid conflicts.
 #[allow(dead_code)]
 pub fn make_temp_path(test_name: &str, unique_value: u64) -> CString {
-  CString::new(format!(
-    "/tmp/lio_test_{}_{}_{}.txt",
-    test_name,
-    std::process::id(),
-    unique_value
-  ))
-  .expect("Failed to create CString path")
+  temp_cpath(&format!("{test_name}_{unique_value}.txt"))
 }
 
 /// A connected TCP client-server pair.
@@ -97,31 +405,17 @@ pub fn setup_tcp_pair(_lio: &mut Lio) -> TcpPair {
   let (accepted, _) =
     listener.accept().expect("Failed to accept client connection");
 
-  unsafe {
-    TcpPair {
-      server_sock: Resource::from_raw_fd(listener.into_raw_fd()),
-      client_sock: Resource::from_raw_fd(client.into_raw_fd()),
-      accepted_fd: Resource::from_raw_fd(accepted.into_raw_fd()),
-    }
+  TcpPair {
+    server_sock: socket_resource(listener),
+    client_sock: socket_resource(client),
+    accepted_fd: socket_resource(accepted),
   }
 }
 
 /// Get the bound address of a socket.
 #[allow(dead_code)]
 pub fn get_bound_addr(sock: &Resource) -> SocketAddr {
-  unsafe {
-    let mut addr_storage = MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    libc::getsockname(
-      sock.as_fd().as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    let sockaddr_in = addr_storage.assume_init();
-    let port = u16::from_be(sockaddr_in.sin_port);
-    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-  }
+  as_tcp_stream(sock).local_addr().expect("getsockname failed")
 }
 
 /// RAII temporary file that cleans up on drop.
@@ -133,21 +427,13 @@ pub struct TempFile {
 impl TempFile {
   #[allow(dead_code)]
   pub fn new(name: &str) -> Self {
-    let path = CString::new(format!(
-      "/tmp/lio_test_{}_{}.txt",
-      name,
-      std::process::id()
-    ))
-    .expect("Failed to create CString path");
-    Self { path }
+    Self { path: temp_cpath(&format!("{name}.txt")) }
   }
 }
 
 impl Drop for TempFile {
   fn drop(&mut self) {
-    unsafe {
-      libc::unlink(self.path.as_ptr());
-    }
+    let _ = std::fs::remove_file(self.path.to_str().unwrap());
   }
 }
 
