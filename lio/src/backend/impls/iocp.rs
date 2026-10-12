@@ -26,23 +26,26 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Once, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use bumpalo::Bump;
 use windows_sys::Win32::Foundation::{
   CloseHandle, ERROR_BROKEN_PIPE, ERROR_DIRECTORY, ERROR_HANDLE_EOF,
   ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_NOT_SUPPORTED, FALSE,
-  GetLastError, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_TIMEOUT,
+  GetLastError, HANDLE, INVALID_HANDLE_VALUE, NO_ERROR, TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock as ws;
 use windows_sys::Win32::Storage::FileSystem::{
   BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
-  FILE_FLAG_OPEN_REPARSE_POINT, FlushFileBuffers, GetFileInformationByHandle,
-  GetFinalPathNameByHandleW, ReadFile, WriteFile,
+  FILE_FLAG_OPEN_REPARSE_POINT, FILE_TYPE_UNKNOWN, FlushFileBuffers,
+  GetFileInformationByHandle, GetFileType, GetFinalPathNameByHandleW, ReadFile,
+  WriteFile,
 };
 use windows_sys::Win32::System::IO::{
-  CancelIoEx, CreateIoCompletionPort, GetOverlappedResult,
+  CancelIoEx, CancelSynchronousIo, CreateIoCompletionPort, GetOverlappedResult,
   GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_ENTRY,
   PostQueuedCompletionStatus,
 };
@@ -62,6 +65,10 @@ use crate::backend::{IoBackend, OpCompleted};
 
 /// Completion key for wake-up packets posted by [`Iocp::notify`].
 const NOTIFY_KEY: usize = usize::MAX;
+
+/// Completion key for results posted by blocking-pool workers; the packet's
+/// "overlapped" pointer is a `Box<BlockingDone>`.
+const BLOCKING_KEY: usize = usize::MAX - 1;
 
 /// Bytes `AcceptEx` needs for each of the local and remote addresses.
 const ACCEPT_ADDR_LEN: usize = mem::size_of::<Storage>() + 16;
@@ -144,6 +151,101 @@ impl Drop for Overlapped {
   }
 }
 
+/// An operation with no overlapped form, run on a pool worker.
+struct BlockingJob {
+  id: u64,
+  op: Op,
+}
+
+// SAFETY: the op's raw pointers refer to op-model storage that stays alive
+// until its completion is reaped, and `Iocp::drop` waits for every worker
+// before the op models can be freed (`Lio` drops its backend first).
+unsafe impl Send for BlockingJob {}
+
+/// A worker's result, posted back through the completion port.
+struct BlockingDone {
+  id: u64,
+  result: isize,
+}
+
+/// Threads that run blocking operations (files, pipes, path operations,
+/// process spawning) so they never stall the event loop. Results come back
+/// through the completion port like any other completion.
+struct BlockingPool {
+  jobs: Option<mpsc::Sender<BlockingJob>>,
+  workers: Vec<thread::JoinHandle<()>>,
+  shutting_down: Arc<AtomicBool>,
+}
+
+impl BlockingPool {
+  fn new(port: HANDLE) -> io::Result<Self> {
+    let (tx, rx) = mpsc::channel::<BlockingJob>();
+    let rx = Arc::new(Mutex::new(rx));
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let threads =
+      thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8);
+    let port = port as usize;
+    let workers = (0..threads)
+      .map(|i| {
+        let rx = Arc::clone(&rx);
+        let shutting_down = Arc::clone(&shutting_down);
+        thread::Builder::new()
+          .name(format!("lio-iocp-blocking-{i}"))
+          .spawn(move || worker_loop(port as HANDLE, &rx, &shutting_down))
+      })
+      .collect::<io::Result<Vec<_>>>()?;
+    Ok(Self { jobs: Some(tx), workers, shutting_down })
+  }
+
+  /// Stops the workers, cancelling any blocked synchronous I/O, and waits
+  /// for them so no worker can touch op memory afterwards.
+  fn shutdown(&mut self) {
+    self.shutting_down.store(true, Ordering::SeqCst);
+    self.jobs = None;
+    while self.workers.iter().any(|w| !w.is_finished()) {
+      for worker in &self.workers {
+        if !worker.is_finished() {
+          // SAFETY: the thread handle is alive while we hold its JoinHandle;
+          // cancelling with no I/O pending is harmless.
+          unsafe { CancelSynchronousIo(worker.as_raw_handle()) };
+        }
+      }
+      thread::sleep(Duration::from_millis(1));
+    }
+    for worker in self.workers.drain(..) {
+      let _ = worker.join();
+    }
+  }
+}
+
+fn worker_loop(
+  port: HANDLE,
+  rx: &Mutex<mpsc::Receiver<BlockingJob>>,
+  shutting_down: &AtomicBool,
+) {
+  loop {
+    let job = match rx.lock() {
+      Ok(rx) => rx.recv(),
+      Err(_) => return,
+    };
+    let Ok(BlockingJob { id, op }) = job else { return };
+    if shutting_down.load(Ordering::SeqCst) {
+      // The backend is going away; nobody will reap this.
+      return;
+    }
+    let result = run_blocking(op);
+    let done = Box::into_raw(Box::new(BlockingDone { id, result }));
+    // SAFETY: the pointer is only passed through the port and turned back
+    // into a `Box` by `reap`.
+    let posted =
+      unsafe { PostQueuedCompletionStatus(port, 0, BLOCKING_KEY, done.cast()) };
+    if posted == FALSE {
+      // SAFETY: the packet was not queued, so we still own `done`.
+      drop(unsafe { Box::from_raw(done) });
+    }
+  }
+}
+
 struct Queued {
   id: u64,
   op: Op,
@@ -158,6 +260,9 @@ pub struct Iocp {
   ready: Vec<OpCompleted>,
   entries: Vec<OVERLAPPED_ENTRY>,
   connect_ex: Option<ConnectExFn>,
+  pool: Option<BlockingPool>,
+  /// Jobs handed to the pool whose results have not been reaped yet.
+  blocking_in_flight: usize,
 }
 
 impl Default for Iocp {
@@ -170,6 +275,8 @@ impl Default for Iocp {
       ready: Vec::new(),
       entries: Vec::new(),
       connect_ex: None,
+      pool: None,
+      blocking_in_flight: 0,
     }
   }
 }
@@ -293,7 +400,10 @@ impl Iocp {
           let bufs = bufs.iter().map(|b| (b.ptr, b.len));
           return self.start_recv(id, &fd, bufs, 0, None);
         }
-        Some(file_transfer(handle_of(&fd), bufs, offset, false))
+        if let Err(code) = check_handle(handle_of(&fd)) {
+          return Some(code);
+        }
+        self.offload(id, Op::Read { fd, iovecs, iov_count, offset, flags })
       }
       Op::Write { fd, iovecs, iov_count, offset, flags } => {
         // SAFETY: the op model keeps `iov_count` buffers alive until done.
@@ -309,7 +419,10 @@ impl Iocp {
           let bufs = bufs.iter().map(|b| (b.ptr, b.len));
           return self.start_send(id, &fd, bufs, 0, None);
         }
-        Some(file_transfer(handle_of(&fd), bufs, offset, true))
+        if let Err(code) = check_handle(handle_of(&fd)) {
+          return Some(code);
+        }
+        self.offload(id, Op::Write { fd, iovecs, iov_count, offset, flags })
       }
       Op::Recv { fd, msg, flags } => {
         let socket = socket_of(&fd);
@@ -377,99 +490,39 @@ impl Iocp {
         let rc = unsafe { ws::shutdown(socket_of(&fd), how) };
         Some(if rc == 0 { 0 } else { last_wsa_error() })
       }
-      Op::Fsync { fd } => {
-        // SAFETY: no pointers are passed.
-        let ok = unsafe { FlushFileBuffers(handle_of(&fd)) };
-        Some(if ok == FALSE { last_error() } else { 0 })
-      }
-      Op::OpenAt { dir_fd, path, flags, mode: _ } => {
-        Some(open_at(&dir_fd, &path, flags).unwrap_or_else(io_error))
-      }
-      Op::Stat { target, out } => Some(match stat(&target) {
-        Ok(stat) => {
-          // SAFETY: `out` is op-owned output storage valid until completion.
-          unsafe { out.as_ptr().write(stat) };
-          0
-        }
-        Err(err) => io_error(err),
-      }),
-      Op::ReadDir {
-        fd,
-        raw_buf,
-        raw_cap,
-        entries,
-        entries_cap,
-        opaque,
-        opaque_drop,
-        out,
-      } => {
-        // SAFETY: all pointers are op-owned storage valid until completion.
-        let result = unsafe {
-          read_dir(
-            &fd,
-            std::slice::from_raw_parts_mut(raw_buf.as_ptr(), raw_cap),
-            std::slice::from_raw_parts_mut(entries.as_ptr(), entries_cap),
-            &mut *opaque.as_ptr(),
-            &mut *opaque_drop.as_ptr(),
-          )
-        };
-        Some(match result {
-          Ok(result) => {
-            // SAFETY: `out` is op-owned output storage.
-            unsafe { out.as_ptr().write(result) };
-            0
-          }
-          Err(err) => io_error(err),
-        })
-      }
-      Op::UnlinkAt { dir_fd, path, kind } => Some(
-        resolve(&dir_fd, &path)
-          .and_then(|path| match kind {
-            UnlinkKind::File => fs::remove_file(path),
-            UnlinkKind::Directory => fs::remove_dir(path),
-          })
-          .map_or_else(io_error, |()| 0),
-      ),
-      Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => Some(
-        resolve(&old_dir_fd, &old_path)
-          .and_then(|old| fs::rename(old, resolve(&new_dir_fd, &new_path)?))
-          .map_or_else(io_error, |()| 0),
-      ),
-      Op::MkdirAt { dir_fd, path, mode: _ } => Some(
-        resolve(&dir_fd, &path)
-          .and_then(fs::create_dir)
-          .map_or_else(io_error, |()| 0),
-      ),
-      Op::LinkAt { kind, source_dir_fd, source_path, new_dir_fd, new_path } => {
-        Some(
-          link_at(kind, &source_dir_fd, &source_path, &new_dir_fd, &new_path)
-            .map_or_else(io_error, |()| 0),
-        )
-      }
-      Op::ReadlinkAt { dir_fd, path, buf, buf_len } => {
-        Some(resolve(&dir_fd, &path).and_then(fs::read_link).map_or_else(
-          io_error,
-          |target| {
-            let bytes = target.as_os_str().as_encoded_bytes();
-            let len = bytes.len().min(buf_len);
-            // SAFETY: `buf` is op-owned output storage of `buf_len` bytes.
-            unsafe {
-              ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_ptr(), len)
-            };
-            len as isize
-          },
-        ))
-      }
-      Op::GetCwd { out } => Some(match std::env::current_dir() {
-        Ok(cwd) => {
-          // SAFETY: `out` is op-owned output storage.
-          unsafe { out.as_ptr().write(cwd.into_os_string()) };
-          0
-        }
-        Err(err) => io_error(err),
-      }),
-      Op::Spawn { spec } => Some(spawn(&spec).unwrap_or_else(io_error)),
+      Op::Fsync { .. }
+      | Op::OpenAt { .. }
+      | Op::Stat { .. }
+      | Op::ReadDir { .. }
+      | Op::UnlinkAt { .. }
+      | Op::RenameAt { .. }
+      | Op::MkdirAt { .. }
+      | Op::LinkAt { .. }
+      | Op::ReadlinkAt { .. }
+      | Op::GetCwd { .. }
+      | Op::Spawn { .. } => self.offload(id, op),
     }
+  }
+
+  /// Hands an operation to the blocking pool; its result arrives through the
+  /// port.
+  fn offload(&mut self, id: u64, op: Op) -> Option<isize> {
+    if self.pool.is_none() {
+      match BlockingPool::new(self.port) {
+        Ok(pool) => self.pool = Some(pool),
+        Err(err) => return Some(io_error(err)),
+      }
+    }
+    let sent = self
+      .pool
+      .as_ref()
+      .and_then(|pool| pool.jobs.as_ref())
+      .is_some_and(|jobs| jobs.send(BlockingJob { id, op }).is_ok());
+    if !sent {
+      return Some(neg(ERROR_NOT_SUPPORTED));
+    }
+    self.blocking_in_flight += 1;
+    None
   }
 
   fn start_recv(
@@ -827,6 +880,14 @@ impl Iocp {
     // SAFETY: the kernel initialized the first `removed` entries.
     unsafe { self.entries.set_len(removed as usize) };
     for entry in mem::take(&mut self.entries) {
+      if entry.lpCompletionKey == BLOCKING_KEY {
+        // SAFETY: workers post `Box<BlockingDone>` pointers under this key.
+        let done =
+          unsafe { Box::from_raw(entry.lpOverlapped.cast::<BlockingDone>()) };
+        self.blocking_in_flight -= 1;
+        completed.push(OpCompleted::new(done.id, done.result));
+        continue;
+      }
       if entry.lpCompletionKey == NOTIFY_KEY || entry.lpOverlapped.is_null() {
         continue;
       }
@@ -850,6 +911,10 @@ impl Drop for Iocp {
     if self.port.is_null() {
       return;
     }
+    // Workers write into op memory; stop them first.
+    if let Some(mut pool) = self.pool.take() {
+      pool.shutdown();
+    }
     for &ptr in &self.in_flight {
       let state = ptr as *const Overlapped;
       // SAFETY: `state` is a live in-flight operation.
@@ -866,6 +931,8 @@ impl Drop for Iocp {
       }
       rounds += 1;
     }
+    // Free results the workers posted that were never reaped.
+    while self.reap(0, &mut completed).unwrap_or(false) {}
     // SAFETY: the port is owned by this backend.
     unsafe { CloseHandle(self.port) };
   }
@@ -881,6 +948,10 @@ impl IoBackend for Iocp {
     if port.is_null() {
       return Err(io::Error::last_os_error());
     }
+    if let Some(mut pool) = self.pool.take() {
+      pool.shutdown();
+    }
+    self.blocking_in_flight = 0;
     if !self.port.is_null() {
       // SAFETY: the previous port is owned by this backend.
       unsafe { CloseHandle(self.port) };
@@ -896,7 +967,8 @@ impl IoBackend for Iocp {
 
   fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
     assert!(
-      self.backlog.len() + self.in_flight.len() < self.capacity,
+      self.backlog.len() + self.in_flight.len() + self.blocking_in_flight
+        < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
@@ -920,7 +992,10 @@ impl IoBackend for Iocp {
     completed.clear();
     completed.append(&mut self.ready);
 
-    if self.in_flight.is_empty() && !completed.is_empty() {
+    if self.in_flight.is_empty()
+      && self.blocking_in_flight == 0
+      && !completed.is_empty()
+    {
       return Ok(());
     }
     if !completed.is_empty() {
@@ -945,6 +1020,135 @@ impl IoBackend for Iocp {
       }
     }
   }
+}
+
+/// Runs an operation that has no overlapped form on a pool worker.
+fn run_blocking(op: Op) -> isize {
+  blocking_result(op).unwrap_or(neg(ERROR_NOT_SUPPORTED))
+}
+
+fn blocking_result(op: Op) -> Option<isize> {
+  match op {
+    Op::Read { fd, iovecs, iov_count, offset, .. } => {
+      // SAFETY: the op model keeps `iov_count` buffers alive until done.
+      let bufs =
+        unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) };
+      Some(file_transfer(handle_of(&fd), bufs, offset, false))
+    }
+    Op::Write { fd, iovecs, iov_count, offset, .. } => {
+      // SAFETY: the op model keeps `iov_count` buffers alive until done.
+      let bufs =
+        unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) };
+      Some(file_transfer(handle_of(&fd), bufs, offset, true))
+    }
+    Op::Fsync { fd } => {
+      // SAFETY: no pointers are passed.
+      let ok = unsafe { FlushFileBuffers(handle_of(&fd)) };
+      Some(if ok == FALSE { last_error() } else { 0 })
+    }
+    Op::OpenAt { dir_fd, path, flags, mode: _ } => {
+      Some(open_at(&dir_fd, &path, flags).unwrap_or_else(io_error))
+    }
+    Op::Stat { target, out } => Some(match stat(&target) {
+      Ok(stat) => {
+        // SAFETY: `out` is op-owned output storage valid until completion.
+        unsafe { out.as_ptr().write(stat) };
+        0
+      }
+      Err(err) => io_error(err),
+    }),
+    Op::ReadDir {
+      fd,
+      raw_buf,
+      raw_cap,
+      entries,
+      entries_cap,
+      opaque,
+      opaque_drop,
+      out,
+    } => {
+      // SAFETY: all pointers are op-owned storage valid until completion.
+      let result = unsafe {
+        read_dir(
+          &fd,
+          std::slice::from_raw_parts_mut(raw_buf.as_ptr(), raw_cap),
+          std::slice::from_raw_parts_mut(entries.as_ptr(), entries_cap),
+          &mut *opaque.as_ptr(),
+          &mut *opaque_drop.as_ptr(),
+        )
+      };
+      Some(match result {
+        Ok(result) => {
+          // SAFETY: `out` is op-owned output storage.
+          unsafe { out.as_ptr().write(result) };
+          0
+        }
+        Err(err) => io_error(err),
+      })
+    }
+    Op::UnlinkAt { dir_fd, path, kind } => Some(
+      resolve(&dir_fd, &path)
+        .and_then(|path| match kind {
+          UnlinkKind::File => fs::remove_file(path),
+          UnlinkKind::Directory => fs::remove_dir(path),
+        })
+        .map_or_else(io_error, |()| 0),
+    ),
+    Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => Some(
+      resolve(&old_dir_fd, &old_path)
+        .and_then(|old| fs::rename(old, resolve(&new_dir_fd, &new_path)?))
+        .map_or_else(io_error, |()| 0),
+    ),
+    Op::MkdirAt { dir_fd, path, mode: _ } => Some(
+      resolve(&dir_fd, &path)
+        .and_then(fs::create_dir)
+        .map_or_else(io_error, |()| 0),
+    ),
+    Op::LinkAt { kind, source_dir_fd, source_path, new_dir_fd, new_path } => {
+      Some(
+        link_at(kind, &source_dir_fd, &source_path, &new_dir_fd, &new_path)
+          .map_or_else(io_error, |()| 0),
+      )
+    }
+    Op::ReadlinkAt { dir_fd, path, buf, buf_len } => {
+      Some(resolve(&dir_fd, &path).and_then(fs::read_link).map_or_else(
+        io_error,
+        |target| {
+          let bytes = target.as_os_str().as_encoded_bytes();
+          let len = bytes.len().min(buf_len);
+          // SAFETY: `buf` is op-owned output storage of `buf_len` bytes.
+          unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_ptr(), len)
+          };
+          len as isize
+        },
+      ))
+    }
+    Op::GetCwd { out } => Some(match std::env::current_dir() {
+      Ok(cwd) => {
+        // SAFETY: `out` is op-owned output storage.
+        unsafe { out.as_ptr().write(cwd.into_os_string()) };
+        0
+      }
+      Err(err) => io_error(err),
+    }),
+    Op::Spawn { spec } => Some(spawn(&spec).unwrap_or_else(io_error)),
+    _ => None,
+  }
+}
+
+/// Fails fast on handles that are not open, as the readiness backends do,
+/// instead of handing them to a worker.
+fn check_handle(handle: HANDLE) -> Result<(), isize> {
+  // SAFETY: `GetFileType` accepts any handle value.
+  if unsafe { GetFileType(handle) } == FILE_TYPE_UNKNOWN {
+    // SAFETY: reads the calling thread's last-error value.
+    let code = unsafe { GetLastError() };
+    if code != NO_ERROR {
+      return Err(neg(code));
+    }
+  }
+  Ok(())
 }
 
 fn wsa_bufs(bufs: impl Iterator<Item = (*mut u8, usize)>) -> Vec<ws::WSABUF> {
