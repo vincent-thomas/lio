@@ -679,8 +679,8 @@ fn assert_event_invariants(seed: u64, event: &Event) {
           matches!(
             err.raw_os_error(),
             Some(common::BUFFER_TOO_SMALL)
-              | Some(libc::ENOENT)
-              | Some(libc::EINVAL)
+              | Some(lio::backend::ds::errno::ENOENT)
+              | Some(lio::backend::ds::errno::EINVAL)
           ),
           "seed {seed} produced invalid path-buffer error: {err:?}"
         );
@@ -693,12 +693,12 @@ fn assert_event_invariants(seed: u64, event: &Event) {
           assert!(
             matches!(
               err.raw_os_error(),
-              Some(libc::EIO)
-                | Some(libc::EBADF)
-                | Some(libc::EINVAL)
-                | Some(libc::ENOTSUP)
-                | Some(libc::ECONNRESET)
-                | Some(libc::EAGAIN)
+              Some(lio::backend::ds::errno::EIO)
+                | Some(lio::backend::ds::errno::EBADF)
+                | Some(lio::backend::ds::errno::EINVAL)
+                | Some(lio::backend::ds::errno::ENOTSUP)
+                | Some(lio::backend::ds::errno::ECONNRESET)
+                | Some(lio::backend::ds::errno::EAGAIN)
             ),
             "seed {seed} produced invalid read-style error: {err:?}"
           );
@@ -719,14 +719,14 @@ fn assert_event_invariants(seed: u64, event: &Event) {
           assert!(
             matches!(
               err.raw_os_error(),
-              Some(libc::EIO)
-                | Some(libc::EBADF)
-                | Some(libc::EINVAL)
-                | Some(libc::EAGAIN)
-                | Some(libc::EPIPE)
-                | Some(libc::ECONNRESET)
-                | Some(libc::ENOSPC)
-                | Some(libc::EFBIG)
+              Some(lio::backend::ds::errno::EIO)
+                | Some(lio::backend::ds::errno::EBADF)
+                | Some(lio::backend::ds::errno::EINVAL)
+                | Some(lio::backend::ds::errno::EAGAIN)
+                | Some(lio::backend::ds::errno::EPIPE)
+                | Some(lio::backend::ds::errno::ECONNRESET)
+                | Some(lio::backend::ds::errno::ENOSPC)
+                | Some(lio::backend::ds::errno::EFBIG)
             ),
             "seed {seed} produced invalid write-style error: {err:?}"
           );
@@ -745,11 +745,11 @@ fn assert_event_invariants(seed: u64, event: &Event) {
         assert!(
           matches!(
             err.raw_os_error(),
-            Some(libc::EMFILE)
-              | Some(libc::ENFILE)
-              | Some(libc::ENOENT)
-              | Some(libc::EACCES)
-              | Some(libc::EINVAL)
+            Some(lio::backend::ds::errno::EMFILE)
+              | Some(lio::backend::ds::errno::ENFILE)
+              | Some(lio::backend::ds::errno::ENOENT)
+              | Some(lio::backend::ds::errno::EACCES)
+              | Some(lio::backend::ds::errno::EINVAL)
           ),
           "seed {seed} produced invalid resource-creation error: {err:?}"
         );
@@ -766,12 +766,12 @@ fn assert_event_invariants(seed: u64, event: &Event) {
         assert!(
           matches!(
             err.raw_os_error(),
-            Some(libc::EADDRINUSE)
-              | Some(libc::EACCES)
-              | Some(libc::EINVAL)
-              | Some(libc::ENOTSOCK)
-              | Some(libc::ENOENT)
-              | Some(libc::EEXIST)
+            Some(lio::backend::ds::errno::EADDRINUSE)
+              | Some(lio::backend::ds::errno::EACCES)
+              | Some(lio::backend::ds::errno::EINVAL)
+              | Some(lio::backend::ds::errno::ENOTSOCK)
+              | Some(lio::backend::ds::errno::ENOENT)
+              | Some(lio::backend::ds::errno::EEXIST)
           ),
           "seed {seed} produced invalid unit-op error: {err:?}"
         );
@@ -787,7 +787,11 @@ fn assert_event_invariants(seed: u64, event: &Event) {
       }
       Err(err) => {
         assert!(
-          matches!(err.raw_os_error(), Some(libc::ENOENT) | Some(libc::EACCES)),
+          matches!(
+            err.raw_os_error(),
+            Some(lio::backend::ds::errno::ENOENT)
+              | Some(lio::backend::ds::errno::EACCES)
+          ),
           "seed {seed} produced invalid stat error: {err:?}"
         );
       }
@@ -798,7 +802,11 @@ fn assert_event_invariants(seed: u64, event: &Event) {
       }
       Err(err) => {
         assert!(
-          matches!(err.raw_os_error(), Some(libc::ENOENT) | Some(libc::EACCES)),
+          matches!(
+            err.raw_os_error(),
+            Some(lio::backend::ds::errno::ENOENT)
+              | Some(lio::backend::ds::errno::EACCES)
+          ),
           "seed {seed} produced invalid spawn error: {err:?}"
         );
       }
