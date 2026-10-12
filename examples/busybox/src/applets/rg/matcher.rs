@@ -106,15 +106,31 @@ impl CompiledMatcher {
     &self,
     haystack: &[u8],
   ) -> Option<CandidateLineMatch> {
-    match &self.kind {
-      MatcherKind::Literal { needle } => {
-        memmem::find(haystack, needle).map(CandidateLineMatch::Confirmed)
+    // Search each line independently: a cross-line candidate is not a match.
+    let mut offset = 0;
+    for line in haystack.split(|byte| *byte == b'\n') {
+      let candidate = match &self.kind {
+        MatcherKind::Literal { needle } => {
+          memmem::find(line, needle).map(CandidateLineMatch::Confirmed)
+        }
+        MatcherKind::Regex { prefilter, .. } => {
+          find_prefilter_candidate(line, prefilter.as_ref())
+            .map(CandidateLineMatch::Candidate)
+        }
+      };
+      if let Some(candidate) = candidate {
+        return Some(match candidate {
+          CandidateLineMatch::Confirmed(pos) => {
+            CandidateLineMatch::Confirmed(offset + pos)
+          }
+          CandidateLineMatch::Candidate(pos) => {
+            CandidateLineMatch::Candidate(offset + pos)
+          }
+        });
       }
-      MatcherKind::Regex { prefilter, .. } => {
-        find_prefilter_candidate(haystack, prefilter.as_ref())
-          .map(CandidateLineMatch::Candidate)
-      }
+      offset += line.len() + 1;
     }
+    None
   }
 
   pub(super) fn has_candidate_line_search(&self) -> bool {
@@ -452,6 +468,24 @@ mod tests {
       word_regexp: false,
       line_regexp: false,
     }
+  }
+
+  #[test]
+  fn candidate_search_never_fabricates_cross_line_match() {
+    let mut fixed = spec("unused");
+    fixed.mode = PatternMode::FixedStrings;
+    fixed.patterns = vec!["ab\ncd".to_owned()];
+    let matcher = CompiledMatcher::new(&fixed).unwrap();
+    assert_eq!(matcher.find_candidate_line(b"ab\ncd\nother"), None);
+    assert!(!matcher.is_match(b"cd"));
+
+    fixed.patterns = vec!["ab\ncd".to_owned(), "abX".to_owned()];
+    let matcher = CompiledMatcher::new(&fixed).unwrap();
+    assert_eq!(
+      matcher.find_candidate_line(b"ab\ncd abX\n"),
+      Some(CandidateLineMatch::Candidate(6))
+    );
+    assert!(matcher.is_match(b"cd abX"));
   }
 
   #[test]
