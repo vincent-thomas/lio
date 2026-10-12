@@ -12,15 +12,22 @@ use std::{ffi::CString, sync::mpsc};
 
 use common::poll_until_recv;
 
+/// A shell command that exits successfully, as `(program, argv)`.
+fn exit_zero_command() -> (CString, Vec<CString>) {
+  let cstr = |s: &str| CString::new(s).unwrap();
+  #[cfg(unix)]
+  return (cstr("/bin/sh"), vec![cstr("sh"), cstr("-c"), cstr("exit 0")]);
+  #[cfg(windows)]
+  return (
+    cstr(r"C:\Windows\System32\cmd.exe"),
+    vec![cstr("cmd"), cstr("/C"), cstr("exit 0")],
+  );
+}
+
 #[test]
 fn test_spawn_basic() {
   let mut lio = Lio::new(64).unwrap();
-  let path = CString::new("/bin/sh").unwrap();
-  let argv = vec![
-    CString::new("sh").unwrap(),
-    CString::new("-c").unwrap(),
-    CString::new("exit 0").unwrap(),
-  ];
+  let (path, argv) = exit_zero_command();
 
   let (sender, receiver) = mpsc::channel();
   api::spawn(path, argv, None).with_lio(&mut lio).send_with(sender);
@@ -29,6 +36,9 @@ fn test_spawn_basic() {
   let pid = result.unwrap();
   assert!(pid.as_raw() > 0);
 
+  // Reap the child so it does not linger as a zombie.
+  #[cfg(unix)]
+  // SAFETY: `pid` is our child and is waited on exactly once.
   unsafe {
     libc::waitpid(pid.as_raw() as libc::pid_t, std::ptr::null_mut(), 0);
   }

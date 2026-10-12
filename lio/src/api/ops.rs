@@ -1998,40 +1998,26 @@ impl OpModelContract for GetCwd<Vec<u8>> {
   }
 }
 
-#[cfg(unix)]
 pub struct Spawn {
   spec: crate::backend::op::SpawnSpec,
 }
 
-#[cfg(unix)]
 impl Spawn {
   pub(crate) fn new(
     path: CString,
     argv: Vec<CString>,
     envp: Option<Vec<CString>>,
   ) -> Self {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
-
     Self {
       spec: crate::backend::op::SpawnSpec {
-        program: OsString::from_vec(path.into_bytes()),
-        args: argv
-          .into_iter()
-          .map(|arg| OsString::from_vec(arg.into_bytes()))
-          .collect(),
-        env: envp.map(|vars| {
-          vars
-            .into_iter()
-            .map(|var| OsString::from_vec(var.into_bytes()))
-            .collect()
-        }),
+        program: cstring_to_osstring(&path),
+        args: argv.iter().map(cstring_to_osstring).collect(),
+        env: envp.map(|vars| vars.iter().map(cstring_to_osstring).collect()),
       },
     }
   }
 }
 
-#[cfg(unix)]
 impl OpModel for Spawn {
   type Item = std::io::Result<crate::api::Pid>;
 
@@ -2049,10 +2035,9 @@ impl OpModel for Spawn {
   }
 }
 
-#[cfg(unix)]
 impl OneshotOpModel for Spawn {}
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl OpModelContract for Spawn {
   impl_op_model_contract_runtime!();
   fn contract_kind() -> ContractKind {
@@ -2147,7 +2132,6 @@ mod tests {
     lio_test::test_op_model_contract!(ReadDir);
   }
 
-  #[cfg(unix)]
   mod spawn_contract {
     use super::*;
 

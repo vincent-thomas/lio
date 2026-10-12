@@ -1,13 +1,9 @@
-// Drives raw Unix descriptors directly; Windows is covered by the backend
-// contract suite in `backends`.
-#![cfg(unix)]
 use std::{
   collections::BTreeSet,
   env,
   ffi::CString,
   io,
   net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-  os::fd::{AsFd, AsRawFd},
   sync::mpsc,
   time::Duration,
   time::SystemTime,
@@ -734,7 +730,7 @@ fn assert_event_invariants(seed: u64, event: &Event) {
     {
       Ok(resource) => {
         assert!(
-          resource.as_fd().as_raw_fd() >= 0,
+          resource_number(resource) >= 0,
           "seed {seed} returned negative synthetic resource"
         );
       }
@@ -826,4 +822,18 @@ fn random_addr(rng: &mut Prng) -> SocketAddr {
 
 fn scripted_path(seed: u64, index: usize, tag: &str) -> CString {
   CString::new(format!("/tmp/lio-fuzz-{tag}-{seed:016x}-{index:04x}")).unwrap()
+}
+
+/// The simulated descriptor number behind a `Resource`.
+fn resource_number(resource: &lio::api::resource::Resource) -> i64 {
+  #[cfg(unix)]
+  {
+    use std::os::fd::AsRawFd;
+    resource.as_raw_fd() as i64
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::io::AsRawHandle;
+    resource.as_raw_handle() as i64
+  }
 }
