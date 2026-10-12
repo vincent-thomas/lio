@@ -49,6 +49,9 @@ pub mod test_macro;
 
 #[cfg(feature = "backend_impls")]
 pub mod impls {
+  #[cfg(unix)]
+  #[macro_use]
+  pub(crate) mod syscall;
 
   // #[cfg(test)]
   // pub mod dummy;
