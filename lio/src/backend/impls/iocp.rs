@@ -87,6 +87,9 @@ struct Overlapped {
   ov: OVERLAPPED,
   id: u64,
   socket: ws::SOCKET,
+  /// Keeps the socket open until the kernel is done with this operation,
+  /// even if the caller drops its last handle to it meanwhile.
+  _resource: Resource,
   kind: AsyncKind,
   bufs: Vec<ws::WSABUF>,
   flags: u32,
@@ -112,12 +115,13 @@ enum AsyncKind {
 }
 
 impl Overlapped {
-  fn new(id: u64, socket: ws::SOCKET, kind: AsyncKind) -> Box<Self> {
+  fn new(id: u64, resource: &Resource, kind: AsyncKind) -> Box<Self> {
     Box::new(Self {
       // SAFETY: `OVERLAPPED` is plain old data; all-zero is its initial state.
       ov: unsafe { mem::zeroed() },
       id,
-      socket,
+      socket: socket_of(resource),
+      _resource: resource.clone(),
       kind,
       bufs: Vec::new(),
       flags: 0,
@@ -286,7 +290,7 @@ impl Iocp {
         }
         if probe_socket(socket_of(&fd)).is_ok() {
           let bufs = bufs.iter().map(|b| (b.ptr, b.len));
-          return self.start_recv(id, socket_of(&fd), bufs, 0, None);
+          return self.start_recv(id, &fd, bufs, 0, None);
         }
         Some(file_transfer(handle_of(&fd), bufs, offset, false))
       }
@@ -302,7 +306,7 @@ impl Iocp {
         }
         if probe_socket(socket_of(&fd)).is_ok() {
           let bufs = bufs.iter().map(|b| (b.ptr, b.len));
-          return self.start_send(id, socket_of(&fd), bufs, 0, None);
+          return self.start_send(id, &fd, bufs, 0, None);
         }
         Some(file_transfer(handle_of(&fd), bufs, offset, true))
       }
@@ -312,7 +316,7 @@ impl Iocp {
           return Some(code);
         }
         let bufs = recv_bufs(&msg);
-        self.start_recv(id, socket, bufs, flags.bits() as u32, msg.from)
+        self.start_recv(id, &fd, bufs, flags.bits() as u32, msg.from)
       }
       Op::Send { fd, msg, flags } => {
         let socket = socket_of(&fd);
@@ -320,10 +324,10 @@ impl Iocp {
           return Some(code);
         }
         let bufs = send_bufs(&msg);
-        self.start_send(id, socket, bufs, flags.bits() as u32, msg.to)
+        self.start_send(id, &fd, bufs, flags.bits() as u32, msg.to)
       }
-      Op::Accept { fd, addr } => self.start_accept(id, socket_of(&fd), addr),
-      Op::Connect { fd, addr } => self.start_connect(id, socket_of(&fd), &addr),
+      Op::Accept { fd, addr } => self.start_accept(id, &fd, addr),
+      Op::Connect { fd, addr } => self.start_connect(id, &fd, &addr),
       Op::Socket { domain, ty, proto } => {
         Some(match socket_to_raw(domain, ty, proto) {
           Ok((domain, ty, proto)) => {
@@ -470,11 +474,12 @@ impl Iocp {
   fn start_recv(
     &mut self,
     id: u64,
-    socket: ws::SOCKET,
+    fd: &Resource,
     bufs: impl Iterator<Item = (*mut u8, usize)>,
     flags: u32,
     from: Option<NonNull<SocketAddrBuf>>,
   ) -> Option<isize> {
+    let socket = socket_of(fd);
     if let Err(code) = self.associate(socket as HANDLE) {
       return Some(code);
     }
@@ -482,7 +487,7 @@ impl Iocp {
       Some(out) => AsyncKind::RecvFrom { out },
       None => AsyncKind::Transfer,
     };
-    let mut state = Overlapped::new(id, socket, kind);
+    let mut state = Overlapped::new(id, fd, kind);
     state.bufs = wsa_bufs(bufs);
     state.flags = flags;
     let state_ptr: *mut Overlapped = &mut *state;
@@ -520,15 +525,16 @@ impl Iocp {
   fn start_send(
     &mut self,
     id: u64,
-    socket: ws::SOCKET,
+    fd: &Resource,
     bufs: impl Iterator<Item = (*mut u8, usize)>,
     flags: u32,
     to: Option<std::net::SocketAddr>,
   ) -> Option<isize> {
+    let socket = socket_of(fd);
     if let Err(code) = self.associate(socket as HANDLE) {
       return Some(code);
     }
-    let mut state = Overlapped::new(id, socket, AsyncKind::Transfer);
+    let mut state = Overlapped::new(id, fd, AsyncKind::Transfer);
     state.bufs = wsa_bufs(bufs);
     if let Some(to) = to {
       let (addr, len) = socket_addr_to_storage(to);
@@ -569,9 +575,10 @@ impl Iocp {
   fn start_accept(
     &mut self,
     id: u64,
-    listener: ws::SOCKET,
+    fd: &Resource,
     out: NonNull<SocketAddrBuf>,
   ) -> Option<isize> {
+    let listener = socket_of(fd);
     if let Err(code) = probe_socket(listener) {
       return Some(code);
     }
@@ -595,7 +602,7 @@ impl Iocp {
     }
     let mut state = Overlapped::new(
       id,
-      listener,
+      fd,
       AsyncKind::Accept { accepted, out, buf: [0; 2 * ACCEPT_ADDR_LEN] },
     );
     if let Err(code) = self.associate(listener as HANDLE) {
@@ -627,9 +634,10 @@ impl Iocp {
   fn start_connect(
     &mut self,
     id: u64,
-    socket: ws::SOCKET,
+    fd: &Resource,
     addr: &SocketAddrBuf,
   ) -> Option<isize> {
+    let socket = socket_of(fd);
     if let Err(code) = probe_socket(socket) {
       return Some(code);
     }
@@ -658,7 +666,7 @@ impl Iocp {
     if let Err(code) = self.associate(socket as HANDLE) {
       return Some(code);
     }
-    let mut state = Overlapped::new(id, socket, AsyncKind::Connect);
+    let mut state = Overlapped::new(id, fd, AsyncKind::Connect);
     state.addr = storage;
     state.addr_len = len;
     let state_ptr: *mut Overlapped = &mut *state;
@@ -1085,7 +1093,9 @@ fn open_at(dir: &Resource, path: &OsStr, bits: i32) -> io::Result<isize> {
   let path = resolve(dir, path)?;
   let access = bits & (libc::O_WRONLY | libc::O_RDWR);
   let mut options = OpenOptions::new();
+  // Directories can only be opened with backup semantics.
   options
+    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
     .read(access != libc::O_WRONLY)
     .write(access != libc::O_RDONLY)
     .append(bits & libc::O_APPEND != 0)
