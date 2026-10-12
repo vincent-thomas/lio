@@ -72,7 +72,10 @@ fn test_mkdirat_existing_path_fails() {
   mkdir(&mut lio, path.clone()).unwrap();
 
   let result = mkdir(&mut lio, path.clone());
-  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EEXIST));
+  assert_eq!(
+    result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::EEXIST)
+  );
 
   unlink_dir(&mut lio, path);
 }

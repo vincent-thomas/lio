@@ -220,7 +220,10 @@ fn test_openat_excl_flag() {
       | lio::api::OpenFlags::EXCLUSIVE,
     0o666,
   );
-  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EEXIST));
+  assert_eq!(
+    result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::EEXIST)
+  );
 
   unlink_file(&mut lio, path);
 }
@@ -264,7 +267,10 @@ fn test_openat_directory_flag_on_file() {
     lio::api::OpenFlags::READ | lio::api::OpenFlags::DIRECTORY,
     0,
   );
-  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOTDIR));
+  assert_eq!(
+    result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::ENOTDIR)
+  );
 
   unlink_file(&mut lio, path);
 }
