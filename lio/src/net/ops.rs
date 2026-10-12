@@ -15,10 +15,13 @@
 //! - [`TcpConnectSocket`]: Socket-create/connect operation that returns a [`TcpSocket`]
 //! - [`UdpBindSocket`]: Socket-create/bind operation that returns a [`UdpSocket`]
 //! - [`UdpConnectSocket`]: Socket-create/connect operation that returns a [`UdpSocket`]
+//! - [`BindListener`] / [`StreamConnect`]: generic create/bind/listen and
+//!   create/connect operations, also used for Unix domain sockets
+//! - [`UnixAccept`]: Accept operation that returns a [`UnixStream`]
 
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
-use std::{io, net::SocketAddr};
+use std::{io, marker::PhantomData, net::SocketAddr};
 
 #[allow(unused_imports)] // TcpListener used in doc links
 use crate::{
@@ -27,8 +30,10 @@ use crate::{
     ops,
     resource::FromResource,
   },
-  backend::op::{SockDomain, SockProto, SockType},
-  net::{Socket, TcpListener, TcpStream, UdpSocket},
+  backend::op::{
+    SockDomain, SockProto, SockType, SocketAddrBuf, socket_addr_into_buf,
+  },
+  net::{Socket, TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream},
 };
 
 /// Accept operation specialized for [`Socket`].
@@ -162,64 +167,88 @@ impl OpModel for TcpAccept {
   }
 }
 
-pub struct TcpBindListener {
-  state: TcpBindState,
-  addr: SocketAddr,
+/// Socket-create/bind/listen operation that returns a listener of type `T`.
+pub struct BindListener<T> {
+  state: BindListenerState,
+  addr: SocketAddrBuf,
+  _listener: PhantomData<fn() -> T>,
 }
 
-enum TcpBindState {
+/// Socket-create/bind/listen operation that returns a [`TcpListener`].
+pub type TcpBindListener = BindListener<TcpListener>;
+
+enum BindListenerState {
   Socket(ops::Socket),
   Bind { resource: crate::api::resource::Resource },
   Listen { resource: crate::api::resource::Resource },
   Done,
 }
 
-impl TcpBindListener {
-  pub(crate) fn new(addr: SocketAddr) -> Self {
-    let domain =
-      if addr.is_ipv4() { SockDomain::IPV4 } else { SockDomain::IPV6 };
+impl<T> BindListener<T> {
+  fn with_addr(
+    domain: SockDomain,
+    proto: SockProto,
+    addr: SocketAddrBuf,
+  ) -> Self {
     Self {
-      state: TcpBindState::Socket(ops::Socket::new(
+      state: BindListenerState::Socket(ops::Socket::new(
         domain,
         SockType::STREAM,
-        SockProto::TCP,
+        proto,
       )),
       addr,
+      _listener: PhantomData,
     }
   }
 }
 
-impl OpModel for TcpBindListener {
-  type Item = io::Result<TcpListener>;
+impl TcpBindListener {
+  pub(crate) fn new(addr: SocketAddr) -> Self {
+    let domain =
+      if addr.is_ipv4() { SockDomain::IPV4 } else { SockDomain::IPV6 };
+    Self::with_addr(domain, SockProto::TCP, socket_addr_into_buf(addr))
+  }
+}
+
+impl BindListener<UnixListener> {
+  pub(crate) fn unix(addr: SocketAddrBuf) -> Self {
+    Self::with_addr(SockDomain::UNIX, SockProto::DEFAULT, addr)
+  }
+}
+
+impl<T: FromResource + std::marker::Send + 'static> OpModel
+  for BindListener<T>
+{
+  type Item = io::Result<T>;
 
   fn action(&mut self) -> Action {
     match &mut self.state {
-      TcpBindState::Socket(inner) => inner.action(),
-      TcpBindState::Bind { resource } => {
+      BindListenerState::Socket(inner) => inner.action(),
+      BindListenerState::Bind { resource } => {
         Action::Io(crate::backend::op::Op::Bind {
           fd: resource.clone(),
           addr: self.addr,
         })
       }
-      TcpBindState::Listen { resource } => {
+      BindListenerState::Listen { resource } => {
         Action::Io(crate::backend::op::Op::Listen {
           fd: resource.clone(),
           backlog: 128,
         })
       }
-      TcpBindState::Done => panic!("TcpBindListener polled after completion"),
+      BindListenerState::Done => panic!("BindListener polled after completion"),
     }
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     match &mut self.state {
-      TcpBindState::Socket(inner) => match inner.complete(completion) {
+      BindListenerState::Socket(inner) => match inner.complete(completion) {
         OpResult::Done(Ok(resource)) => {
-          self.state = TcpBindState::Bind { resource };
+          self.state = BindListenerState::Bind { resource };
           OpResult::Again
         }
         OpResult::Done(Err(err)) => {
-          self.state = TcpBindState::Done;
+          self.state = BindListenerState::Done;
           OpResult::Done(Err(err))
         }
         OpResult::Again => {
@@ -227,91 +256,118 @@ impl OpModel for TcpBindListener {
         }
         OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
       },
-      TcpBindState::Bind { resource } => {
+      BindListenerState::Bind { resource } => {
         if completion.result < 0 {
-          self.state = TcpBindState::Done;
+          self.state = BindListenerState::Done;
           OpResult::Done(Err(io::Error::from_raw_os_error(
             (-completion.result) as i32,
           )))
         } else {
           let resource = resource.clone();
-          self.state = TcpBindState::Listen { resource };
+          self.state = BindListenerState::Listen { resource };
           OpResult::Again
         }
       }
-      TcpBindState::Listen { resource } => {
+      BindListenerState::Listen { resource } => {
         let resource = resource.clone();
-        self.state = TcpBindState::Done;
+        self.state = BindListenerState::Done;
         if completion.result < 0 {
           OpResult::Done(Err(io::Error::from_raw_os_error(
             (-completion.result) as i32,
           )))
         } else {
-          OpResult::Done(Ok(TcpListener::from_resource(resource)))
+          OpResult::Done(Ok(T::from_resource(resource)))
         }
       }
-      TcpBindState::Done => {
-        panic!("TcpBindListener received completion after finish")
+      BindListenerState::Done => {
+        panic!("BindListener received completion after finish")
       }
     }
   }
 }
 
-impl OneshotOpModel for TcpBindListener {}
-
-pub struct TcpStreamConnect {
-  state: TcpConnectState,
-  addr: SocketAddr,
+impl<T: FromResource + std::marker::Send + 'static> OneshotOpModel
+  for BindListener<T>
+{
 }
 
-enum TcpConnectState {
+/// Socket-create/connect operation that returns a stream of type `T`.
+pub struct StreamConnect<T> {
+  state: StreamConnectState,
+  addr: SocketAddrBuf,
+  _stream: PhantomData<fn() -> T>,
+}
+
+/// Socket-create/connect operation that returns a [`TcpStream`].
+pub type TcpStreamConnect = StreamConnect<TcpStream>;
+
+enum StreamConnectState {
   Socket(ops::Socket),
   Connect { resource: crate::api::resource::Resource },
   Done,
+}
+
+impl<T> StreamConnect<T> {
+  fn with_addr(
+    domain: SockDomain,
+    proto: SockProto,
+    addr: SocketAddrBuf,
+  ) -> Self {
+    Self {
+      state: StreamConnectState::Socket(ops::Socket::new(
+        domain,
+        SockType::STREAM,
+        proto,
+      )),
+      addr,
+      _stream: PhantomData,
+    }
+  }
 }
 
 impl TcpStreamConnect {
   pub(crate) fn new(addr: SocketAddr) -> Self {
     let domain =
       if addr.is_ipv4() { SockDomain::IPV4 } else { SockDomain::IPV6 };
-    Self {
-      state: TcpConnectState::Socket(ops::Socket::new(
-        domain,
-        SockType::STREAM,
-        SockProto::TCP,
-      )),
-      addr,
-    }
+    Self::with_addr(domain, SockProto::TCP, socket_addr_into_buf(addr))
   }
 }
 
-impl OpModel for TcpStreamConnect {
-  type Item = io::Result<TcpStream>;
+impl StreamConnect<UnixStream> {
+  pub(crate) fn unix(addr: SocketAddrBuf) -> Self {
+    Self::with_addr(SockDomain::UNIX, SockProto::DEFAULT, addr)
+  }
+}
+
+impl<T: FromResource + std::marker::Send + 'static> OpModel
+  for StreamConnect<T>
+{
+  type Item = io::Result<T>;
 
   fn action(&mut self) -> Action {
     match &mut self.state {
-      TcpConnectState::Socket(inner) => inner.action(),
-      TcpConnectState::Connect { resource } => {
+      StreamConnectState::Socket(inner) => inner.action(),
+      StreamConnectState::Connect { resource } => {
         Action::Io(crate::backend::op::Op::Connect {
           fd: resource.clone(),
-          addr: crate::backend::op::socket_addr_into_buf(self.addr),
+          addr: self.addr,
         })
       }
-      TcpConnectState::Done => {
-        panic!("TcpConnectSocket polled after completion")
+      StreamConnectState::Done => {
+        panic!("StreamConnect polled after completion")
       }
     }
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     match &mut self.state {
-      TcpConnectState::Socket(inner) => match inner.complete(completion) {
+      StreamConnectState::Socket(inner) => match inner.complete(completion) {
         OpResult::Done(Ok(resource)) => {
-          self.state = TcpConnectState::Connect { resource };
+          self.state = StreamConnectState::Connect { resource };
           OpResult::Again
         }
         OpResult::Done(Err(err)) => {
-          self.state = TcpConnectState::Done;
+          self.state = StreamConnectState::Done;
           OpResult::Done(Err(err))
         }
         OpResult::Again => {
@@ -319,25 +375,57 @@ impl OpModel for TcpStreamConnect {
         }
         OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
       },
-      TcpConnectState::Connect { resource } => {
+      StreamConnectState::Connect { resource } => {
         let resource = resource.clone();
-        self.state = TcpConnectState::Done;
+        self.state = StreamConnectState::Done;
         if completion.result < 0 {
           OpResult::Done(Err(io::Error::from_raw_os_error(
             (-completion.result) as i32,
           )))
         } else {
-          OpResult::Done(Ok(TcpStream::from_resource(resource)))
+          OpResult::Done(Ok(T::from_resource(resource)))
         }
       }
-      TcpConnectState::Done => {
-        panic!("TcpConnectSocket received completion after finish")
+      StreamConnectState::Done => {
+        panic!("StreamConnect received completion after finish")
       }
     }
   }
 }
 
-impl OneshotOpModel for TcpStreamConnect {}
+impl<T: FromResource + std::marker::Send + 'static> OneshotOpModel
+  for StreamConnect<T>
+{
+}
+
+/// Accept operation specialized for [`UnixStream`].
+///
+/// Unix peers are usually unnamed, so the peer address is not decoded.
+pub struct UnixAccept {
+  inner: ops::Accept,
+}
+
+impl UnixAccept {
+  pub(crate) fn new(res: crate::api::resource::Resource) -> Self {
+    Self { inner: ops::Accept::new(res) }
+  }
+}
+
+impl OpModel for UnixAccept {
+  type Item = io::Result<UnixStream>;
+
+  fn action(&mut self) -> Action {
+    self.inner.action()
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    OpResult::Done(
+      self.inner.complete_resource(completion).map(UnixStream::from_resource),
+    )
+  }
+}
+
+impl OneshotOpModel for UnixAccept {}
 
 pub struct UdpBindSocket {
   state: UdpBindState,
@@ -374,7 +462,7 @@ impl OpModel for UdpBindSocket {
       UdpBindState::Bind { resource } => {
         Action::Io(crate::backend::op::Op::Bind {
           fd: resource.clone(),
-          addr: self.addr,
+          addr: crate::backend::op::socket_addr_into_buf(self.addr),
         })
       }
       UdpBindState::Done => panic!("UdpBindSocket polled after completion"),

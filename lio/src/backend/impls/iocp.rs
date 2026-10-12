@@ -220,8 +220,17 @@ impl Iocp {
 
       Op::Bind { fd, addr } => {
         let handle = fd.as_raw_handle() as SOCKET;
-        let (addr_ptr, addr_len) = sockaddr_storage_to_ptr(addr);
-        let result = unsafe { bind(handle, addr_ptr, addr_len) };
+        let (storage, len) =
+          match crate::backend::impls::sockaddr::socket_addr_buf_to_storage(
+            addr,
+          ) {
+            Ok(lowered) => lowered,
+            Err(err) => {
+              return -(err.raw_os_error().unwrap_or(libc::EINVAL) as isize);
+            }
+          };
+        let (addr_ptr, _) = sockaddr_storage_to_ptr(&storage);
+        let result = unsafe { bind(handle, addr_ptr, len as i32) };
         if result == SOCKET_ERROR {
           Self::error_result(unsafe { WSAGetLastError() } as u32)
         } else {

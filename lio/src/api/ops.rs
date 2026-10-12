@@ -207,15 +207,10 @@ impl OpModel for Accept {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    if completion.result < 0 {
-      return OpResult::Done(Err(io::Error::from_raw_os_error(
-        (-completion.result) as i32,
-      )));
-    }
-
-    #[cfg(unix)]
-    // SAFETY: successful accept returns a live file descriptor owned by us.
-    let resource = unsafe { Resource::from_raw_fd(completion.result as RawFd) };
+    let resource = match self.complete_resource(completion) {
+      Ok(resource) => resource,
+      Err(err) => return OpResult::Done(Err(err)),
+    };
 
     let addr = match socket_addr_from_buf(&self.addr) {
       Ok(addr) => addr,
@@ -223,6 +218,24 @@ impl OpModel for Accept {
     };
 
     OpResult::Done(Ok((resource, addr)))
+  }
+}
+
+impl Accept {
+  /// Takes ownership of the accepted socket without decoding the peer address.
+  pub(crate) fn complete_resource(
+    &mut self,
+    completion: Completion,
+  ) -> io::Result<Resource> {
+    if completion.result < 0 {
+      return Err(io::Error::from_raw_os_error((-completion.result) as i32));
+    }
+
+    #[cfg(unix)]
+    // SAFETY: successful accept returns a live file descriptor owned by us.
+    let resource = unsafe { Resource::from_raw_fd(completion.result as RawFd) };
+
+    Ok(resource)
   }
 }
 
@@ -316,11 +329,15 @@ impl OpModelContract for Connect {
 
 pub struct Bind {
   res: Resource,
-  addr: SocketAddr,
+  addr: SocketAddrBuf,
 }
 
 impl Bind {
   pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {
+    Self::from_buf(res, socket_addr_into_buf(addr))
+  }
+
+  pub(crate) fn from_buf(res: Resource, addr: SocketAddrBuf) -> Self {
     Self { res, addr }
   }
 }

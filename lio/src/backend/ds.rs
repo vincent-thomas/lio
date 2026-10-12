@@ -2323,7 +2323,6 @@ impl DSBackend {
       }
       Op::Bind { fd, addr } => {
         let raw = Self::resource_key(&fd);
-        let addr = op::socket_addr_into_buf(addr);
         let key = Self::socket_addr_key(&addr);
         if self.world.bound_listeners.contains_key(&key)
           || self
@@ -3461,7 +3460,6 @@ impl DSTBackend {
       }
       Op::Bind { fd, addr } => {
         let raw = DSBackend::resource_key(&fd);
-        let addr = op::socket_addr_into_buf(addr);
         let key = DSBackend::socket_addr_key(&addr);
         let mut node = self.node.borrow_mut();
         let Some(socket) = node.sockets.get_mut(&raw) else {
@@ -3966,8 +3964,10 @@ mod tests {
     let listener_fd = dst_take_ready(&listener_backend.node)[0].result() as i32;
     let listener = dst_resource(listener_fd);
     let addr: SocketAddr = "127.0.0.1:7020".parse().unwrap();
-    listener_backend
-      .network_complete_op(2, Op::Bind { fd: listener.clone(), addr });
+    listener_backend.network_complete_op(
+      2,
+      Op::Bind { fd: listener.clone(), addr: op::socket_addr_into_buf(addr) },
+    );
     let _ = dst_take_ready(&listener_backend.node);
     listener_backend
       .network_complete_op(3, Op::Listen { fd: listener, backlog: 1 });
@@ -4806,8 +4806,10 @@ mod tests {
     let listener_fd = dst_take_ready(&listener_backend.node)[0].result() as i32;
     let listener = dst_resource(listener_fd);
     let addr: SocketAddr = "127.0.0.1:7010".parse().unwrap();
-    listener_backend
-      .network_complete_op(2, Op::Bind { fd: listener.clone(), addr });
+    listener_backend.network_complete_op(
+      2,
+      Op::Bind { fd: listener.clone(), addr: op::socket_addr_into_buf(addr) },
+    );
     assert_eq!(dst_take_ready(&listener_backend.node)[0].result(), 0);
     listener_backend
       .network_complete_op(3, Op::Listen { fd: listener.clone(), backlog: 1 });

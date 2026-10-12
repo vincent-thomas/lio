@@ -4,7 +4,6 @@
 
 use std::io;
 use std::mem;
-use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
@@ -181,8 +180,11 @@ impl NativeRwState {
 
 #[derive(Debug)]
 enum NativeSocketKind {
-  Accept { out: std::ptr::NonNull<crate::backend::op::SocketAddrBuf> },
-  Connect,
+  Accept {
+    out: std::ptr::NonNull<crate::backend::op::SocketAddrBuf>,
+  },
+  /// Address input for `bind`/`connect`; nothing to write back.
+  Addr,
 }
 
 #[derive(Debug)]
@@ -260,12 +262,10 @@ impl NativeSocketState {
     }
   }
 
-  fn from_connect(
-    addr: &crate::backend::op::SocketAddrBuf,
-  ) -> io::Result<Self> {
+  fn from_addr(addr: &crate::backend::op::SocketAddrBuf) -> io::Result<Self> {
     let (storage, len) =
       crate::backend::impls::sockaddr::socket_addr_buf_to_storage(addr)?;
-    Ok(Self { storage, len, kind: NativeSocketKind::Connect })
+    Ok(Self { storage, len, kind: NativeSocketKind::Addr })
   }
 }
 
@@ -334,9 +334,11 @@ impl LoweredState {
       Op::Accept { addr, .. } => Self::Socket(NonNull::from(
         arena.alloc(NativeSocketState::from_accept(*addr)),
       )),
-      Op::Connect { addr, .. } => Self::Socket(NonNull::from(
-        arena.alloc(NativeSocketState::from_connect(addr)?),
-      )),
+      // The kernel copies the address at submission time, so it has to live
+      // in the arena rather than on the stack of `create_entry`.
+      Op::Connect { addr, .. } | Op::Bind { addr, .. } => Self::Socket(
+        NonNull::from(arena.alloc(NativeSocketState::from_addr(addr)?)),
+      ),
       Op::Stat { target, out } => {
         let state = match target {
           crate::backend::op::StatTarget::Path { path, .. } => {
@@ -846,7 +848,7 @@ impl IoUring {
 
         None
       }
-      Op::Connect { addr, .. } => {
+      Op::Connect { addr, .. } | Op::Bind { addr, .. } => {
         crate::backend::impls::sockaddr::socket_addr_buf_to_storage(addr)
           .err()
           .and_then(|err| err.raw_os_error())
@@ -941,19 +943,8 @@ impl IoUring {
       Op::Spawn { .. } => {
         unreachable!("immediate-only op must not build an io_uring entry")
       }
-      Op::Bind { fd, addr } => {
-        let storage =
-          crate::backend::impls::sockaddr::std_socketaddr_into_libc(*addr);
-        let len = match addr {
-          SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>(),
-          SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>(),
-        } as libc::socklen_t;
-        Bind::new(
-          fd.as_raw_fd(),
-          (&storage as *const libc::sockaddr_storage).cast(),
-          len,
-        )
-        .build()
+      Op::Bind { .. } => {
+        unreachable!("bind must build its entry from lowered socket state")
       }
       Op::Listen { fd, backlog } => {
         Listen::new(fd.as_raw_fd(), *backlog).build()
@@ -1031,7 +1022,13 @@ impl IoUring {
         native_socket.len,
       )
       .build(),
-      _ => unreachable!("socket entry requires accept/connect op"),
+      Op::Bind { fd, .. } => Bind::new(
+        fd.as_raw_fd(),
+        (&native_socket.storage as *const libc::sockaddr_storage).cast(),
+        native_socket.len,
+      )
+      .build(),
+      _ => unreachable!("socket entry requires accept/connect/bind op"),
     }
   }
 

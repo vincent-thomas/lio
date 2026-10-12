@@ -24,7 +24,6 @@ pub(crate) mod tests;
 
 use std::{
   io,
-  net::SocketAddr,
   os::fd::{AsRawFd, RawFd},
   time::Duration,
 };
@@ -1177,19 +1176,14 @@ impl Poller {
           Err(errno) => -(errno as isize),
         }
       }
-      Op::Bind { fd, addr } => {
-        let storage =
-          crate::backend::impls::sockaddr::std_socketaddr_into_libc(*addr);
-        let len = match addr {
-          SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>(),
-          SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>(),
-        } as libc::socklen_t;
-        syscall!(raw bind(
+      Op::Bind { fd, addr } => match Self::lower_socket_addr(addr) {
+        Ok((storage, len)) => syscall!(raw bind(
           fd.as_raw_fd(),
           (&storage as *const libc::sockaddr_storage).cast(),
           len
-        ))
-      }
+        )),
+        Err(err) => -(err.raw_os_error().unwrap_or(libc::EINVAL) as isize),
+      },
       Op::Listen { fd, backlog } => {
         syscall!(raw listen(fd.as_raw_fd(), *backlog))
       }
