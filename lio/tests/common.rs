@@ -345,6 +345,15 @@ pub fn set_reuse_addr(res: &Resource) {
   assert_eq!(rc, 0, "setsockopt: {}", std::io::Error::last_os_error());
 }
 
+/// The error code for "the caller's buffer is too small" (`getcwd`):
+/// `ERANGE` on Unix, `ERROR_INSUFFICIENT_BUFFER` on Windows.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub const BUFFER_TOO_SMALL: i32 = libc::ERANGE;
+#[cfg(windows)]
+#[allow(dead_code)]
+pub const BUFFER_TOO_SMALL: i32 = 122;
+
 // ============================================================================
 // Paths
 // ============================================================================
