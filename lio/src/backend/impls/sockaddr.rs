@@ -341,6 +341,7 @@ fn socket_addr_v6(addr: &sys::SockaddrIn6) -> SocketAddrV6 {
 }
 
 /// Looks up the local (`peer == false`) or remote address of a socket.
+#[cfg(feature = "high")]
 pub(crate) fn socket_name(
   socket: &crate::api::resource::Resource,
   peer: bool,

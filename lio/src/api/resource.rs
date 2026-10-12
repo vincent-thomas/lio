@@ -6,10 +6,9 @@
 //! ```rust,no_run
 //! use std::ffi::CString;
 //! use lio::api::resource::Resource;
-//! use std::os::fd::FromRawFd;
 //!
 //! async fn example() -> std::io::Result<()> {
-//!     # let dir = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+//!     # let dir = Resource::cwd();
 //!     let path = CString::new("/tmp/test").unwrap();
 //!     let fd: Resource =
 //!         lio::api::openat(&dir, path, libc::O_RDONLY, 0).await?;
@@ -43,10 +42,9 @@
 //! ```rust,no_run
 //! use std::ffi::CString;
 //! use lio::api::resource::Resource;
-//! use std::os::fd::FromRawFd;
 //!
 //! async fn open_file() -> std::io::Result<Resource> {
-//!     # let dir = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+//!     # let dir = Resource::cwd();
 //!     let path = CString::new("/tmp/test").unwrap();
 //!     let resource: Resource =
 //!         lio::api::openat(&dir, path, libc::O_RDONLY, 0).await?;
@@ -66,9 +64,11 @@
 //! Or from raw file descriptors (Unix):
 //!
 //! ```rust
+//! # #[cfg(unix)]
 //! use std::os::fd::{FromRawFd, RawFd};
 //! use lio::api::resource::Resource;
 //!
+//! # #[cfg(unix)]
 //! fn from_raw(raw_fd: RawFd) -> Resource {
 //!     // Safe if raw_fd is a valid, open file descriptor
 //!     unsafe { Resource::from_raw_fd(raw_fd) }

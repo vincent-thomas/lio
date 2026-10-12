@@ -21,11 +21,11 @@
 //! # Example
 //!
 //! ```
-//! use lio::backend::{IoBackend, op::Op, impls::Poller};
+//! use lio::backend::{IoBackend, op::Op, impls::DefaultBackend};
 //! use std::time::Duration;
 //!
 //! // Create and initialize backend
-//! let mut backend = Poller::default();
+//! let mut backend = DefaultBackend::new();
 //! backend.init(1024).unwrap();  // Pre-allocate for 1024 concurrent ops
 //!
 //! // Submit a nop operation
