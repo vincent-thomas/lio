@@ -27,7 +27,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::Once;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bumpalo::Bump;
 use windows_sys::Win32::Foundation::{
@@ -795,11 +795,15 @@ impl Iocp {
     }
   }
 
+  /// Dequeues completion packets, waiting up to `timeout` ms for the first.
+  ///
+  /// Returns `false` when the wait timed out without any packet (including
+  /// wake-ups from [`Iocp::notify`]).
   fn reap(
     &mut self,
     timeout: u32,
     completed: &mut Vec<OpCompleted>,
-  ) -> io::Result<()> {
+  ) -> io::Result<bool> {
     let mut removed = 0u32;
     // SAFETY: `entries` has room for `MAX_ENTRIES` entries.
     let ok = unsafe {
@@ -815,7 +819,7 @@ impl Iocp {
     if ok == FALSE {
       // SAFETY: reads the calling thread's last-error value.
       return match unsafe { GetLastError() } {
-        WAIT_TIMEOUT => Ok(()),
+        WAIT_TIMEOUT => Ok(false),
         code => Err(io::Error::from_raw_os_error(code as i32)),
       };
     }
@@ -836,7 +840,7 @@ impl Iocp {
       completed.push(OpCompleted::new(id, self.finish(state)));
     }
     self.entries = Vec::with_capacity(MAX_ENTRIES);
-    Ok(())
+    Ok(true)
   }
 }
 
@@ -918,17 +922,27 @@ impl IoBackend for Iocp {
     if self.in_flight.is_empty() && !completed.is_empty() {
       return Ok(());
     }
-    let timeout = if !completed.is_empty() {
-      0
-    } else {
-      match timeout {
-        None => u32::MAX,
-        Some(d) => {
-          d.as_nanos().div_ceil(1_000_000).min(u32::MAX as u128 - 1) as u32
-        }
-      }
+    if !completed.is_empty() {
+      self.reap(0, completed)?;
+      return Ok(());
+    }
+    let Some(timeout) = timeout else {
+      self.reap(u32::MAX, completed)?;
+      return Ok(());
     };
-    self.reap(timeout, completed)
+
+    // Windows waits are tick-based and may return before the timeout. Keep
+    // waiting for the remainder so callers never wake before their deadline,
+    // as with epoll/kqueue.
+    let deadline = Instant::now() + timeout;
+    loop {
+      let remaining = deadline.saturating_duration_since(Instant::now());
+      let ms =
+        remaining.as_nanos().div_ceil(1_000_000).min(u32::MAX as u128 - 1);
+      if self.reap(ms as u32, completed)? || remaining.is_zero() {
+        return Ok(());
+      }
+    }
   }
 }
 
