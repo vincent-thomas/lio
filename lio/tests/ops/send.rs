@@ -10,27 +10,20 @@ use super::common;
 use super::common::{poll_recv, poll_until_recv, setup_tcp_pair};
 use lio::Lio;
 use lio::api;
-use std::os::fd::{AsFd, AsRawFd};
+use std::io::Read;
 use std::sync::mpsc;
 
 fn recv_all(fd: &lio::api::resource::Resource, len: usize) -> Vec<u8> {
   let mut out = vec![0u8; len];
   let mut read = 0usize;
 
+  let mut stream = common::as_tcp_stream(fd);
   while read < len {
-    let n = unsafe {
-      libc::recv(
-        fd.as_fd().as_raw_fd(),
-        out[read..].as_mut_ptr().cast(),
-        out.len() - read,
-        0,
-      )
-    };
-    assert!(n >= 0, "peer recv failed");
+    let n = stream.read(&mut out[read..]).expect("peer recv failed");
     if n == 0 {
       break;
     }
-    read += n as usize;
+    read += n;
   }
 
   out.truncate(read);

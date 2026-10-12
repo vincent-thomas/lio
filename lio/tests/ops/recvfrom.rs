@@ -7,14 +7,14 @@
 //! Tests for recvfrom operations.
 
 use super::common::{
-  TcpPair, get_bound_addr, poll_recv, poll_until_recv, setup_tcp_pair,
-  udp_socket,
+  TcpPair, as_tcp_stream, poll_recv, poll_until_recv, setup_tcp_pair,
+  socket_resource,
 };
 use lio::Lio;
 use lio::api;
 use lio::api::resource::Resource;
+use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::sync::mpsc;
 
 struct UdpPair {
@@ -24,44 +24,10 @@ struct UdpPair {
 }
 
 fn setup_udp_pair() -> UdpPair {
-  let receiver = udp_socket();
-  let recv_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-  let std_sockaddr = match recv_addr {
-    SocketAddr::V4(addr) => {
-      let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-      #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-      ))]
-      {
-        sockaddr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
-      }
-      sockaddr.sin_family = libc::AF_INET as libc::sa_family_t;
-      sockaddr.sin_port = addr.port().to_be();
-      sockaddr.sin_addr =
-        libc::in_addr { s_addr: u32::from(*addr.ip()).to_be() };
-      sockaddr
-    }
-    SocketAddr::V6(_) => unreachable!("IPv4-only test helper"),
-  };
-  let bind_result = unsafe {
-    libc::bind(
-      receiver.as_fd().as_raw_fd(),
-      (&std_sockaddr as *const libc::sockaddr_in).cast(),
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-    )
-  };
-  assert_eq!(
-    bind_result,
-    0,
-    "failed to bind receiver socket: {}",
-    std::io::Error::last_os_error()
-  );
-  let recv_addr = get_bound_addr(&receiver);
+  let receiver =
+    UdpSocket::bind("127.0.0.1:0").expect("failed to bind receiver socket");
+  let recv_addr = receiver.local_addr().expect("failed to query receiver");
+  let receiver = socket_resource(receiver);
 
   let sender =
     UdpSocket::bind("127.0.0.1:0").expect("failed to bind sender socket");
@@ -73,59 +39,14 @@ fn setup_udp_pair() -> UdpPair {
 }
 
 fn send_all(fd: &Resource, data: &[u8]) {
-  let mut written = 0usize;
-
-  while written < data.len() {
-    let n = unsafe {
-      libc::send(
-        fd.as_fd().as_raw_fd(),
-        data[written..].as_ptr().cast(),
-        data.len() - written,
-        0,
-      )
-    };
-    assert!(n >= 0, "peer send failed");
-    written += n as usize;
-  }
-}
-
-#[allow(dead_code)]
-fn get_peer_addr(sock: &Resource) -> SocketAddr {
-  unsafe {
-    let mut addr_storage = std::mem::MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    let result = libc::getpeername(
-      sock.as_fd().as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    assert_eq!(
-      result,
-      0,
-      "getpeername failed: {}",
-      std::io::Error::last_os_error()
-    );
-    let sockaddr_in = addr_storage.assume_init();
-    let port = u16::from_be(sockaddr_in.sin_port);
-    format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap()
-  }
+  as_tcp_stream(fd).write_all(data).expect("peer send failed");
 }
 
 #[cfg(unix)]
 fn setup_unix_dgram_pair() -> (Resource, Resource) {
-  let mut fds = [0; 2];
-  let result = unsafe {
-    libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr())
-  };
-  assert_eq!(
-    result,
-    0,
-    "socketpair failed: {}",
-    std::io::Error::last_os_error()
-  );
-
-  unsafe { (Resource::from_raw_fd(fds[0]), Resource::from_raw_fd(fds[1])) }
+  use std::os::unix::net::UnixDatagram;
+  let (a, b) = UnixDatagram::pair().expect("socketpair failed");
+  (socket_resource(a), socket_resource(b))
 }
 
 #[test]

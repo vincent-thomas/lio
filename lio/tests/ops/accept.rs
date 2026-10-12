@@ -4,12 +4,11 @@
   clippy::expect_fun_call
 )]
 
-use super::common::poll_until_recv;
+use super::common::{poll_until_recv, raw_id, socket_resource};
 use lio::api::resource::Resource;
 use lio::{Lio, api};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd};
 use std::sync::mpsc;
 use std::thread;
 
@@ -18,7 +17,7 @@ fn setup_listener() -> (Resource, std::net::SocketAddr) {
     TcpListener::bind("127.0.0.1:0").expect("Failed to bind TCP listener");
   listener.set_nonblocking(true).expect("Failed to set listener non-blocking");
   let addr = listener.local_addr().expect("Failed to query listener address");
-  unsafe { (Resource::from_raw_fd(listener.into_raw_fd()), addr) }
+  (socket_resource(listener), addr)
 }
 
 #[test]
@@ -35,7 +34,7 @@ fn basic() {
 
   let (accepted_fd, _) =
     poll_until_recv(&mut lio, &receiver_accept).expect("Failed to accept");
-  assert!(accepted_fd.as_fd().as_raw_fd() >= 0);
+  let _ = raw_id(&accepted_fd);
 
   let mut client = client.join().expect("client thread panicked");
   client.write_all(b"ping").expect("Failed to write from client");
@@ -63,7 +62,7 @@ fn multiple() {
     });
     let (accepted_fd, _) =
       poll_until_recv(&mut lio, &receiver_accept).expect("Failed to accept");
-    assert!(accepted_fd.as_fd().as_raw_fd() >= 0);
+    let _ = raw_id(&accepted_fd);
     client.join().expect("client thread panicked");
   }
 }
@@ -81,7 +80,7 @@ fn with_client_info() {
 
   let (accepted_fd, client_addr) =
     poll_until_recv(&mut lio, &receiver_accept).expect("Failed to accept");
-  assert!(accepted_fd.as_fd().as_raw_fd() >= 0);
+  let _ = raw_id(&accepted_fd);
   assert_eq!(
     client_addr.ip(),
     std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
@@ -99,7 +98,7 @@ fn ipv6() {
     .expect("Failed to set IPv6 listener non-blocking");
   let addr =
     listener.local_addr().expect("Failed to query IPv6 listener address");
-  let listener = unsafe { Resource::from_raw_fd(listener.into_raw_fd()) };
+  let listener = socket_resource(listener);
 
   let (sender_accept, receiver_accept) = mpsc::channel();
   api::accept(&listener).with_lio(&mut lio).send_with(sender_accept);
@@ -109,7 +108,7 @@ fn ipv6() {
 
   let (accepted_fd, client_addr) =
     poll_until_recv(&mut lio, &receiver_accept).expect("Failed to accept IPv6");
-  assert!(accepted_fd.as_fd().as_raw_fd() >= 0);
+  let _ = raw_id(&accepted_fd);
   assert!(client_addr.is_ipv6());
   client.join().expect("client thread panicked");
 }

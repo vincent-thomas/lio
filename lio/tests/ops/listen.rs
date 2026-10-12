@@ -7,11 +7,9 @@
 use super::common::{self, poll_until_recv};
 use lio::Lio;
 use lio::api;
-use std::{
-  net::SocketAddr,
-  os::fd::{AsFd, AsRawFd, FromRawFd},
-  sync::mpsc,
-};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsFd, AsRawFd};
+use std::{net::SocketAddr, sync::mpsc};
 
 #[cfg(target_os = "linux")]
 #[test]
@@ -274,15 +272,12 @@ fn test_listen_after_close() {
 
   poll_until_recv(&mut lio, &receiver_bind).expect("Failed to bind socket");
 
-  // Close the socket manually and forget to prevent double-close
-  unsafe {
-    libc::close(sock.as_fd().as_raw_fd());
-  }
-  std::mem::forget(sock);
+  // Close the socket.
+  drop(sock);
 
   // Try to listen on closed socket using invalid fd
   let (sender_l, receiver_l) = mpsc::channel();
-  api::listen(&unsafe { lio::api::resource::Resource::from_raw_fd(-1) }, 128)
+  api::listen(&common::invalid_resource(), 128)
     .with_lio(&mut lio)
     .send_with(sender_l);
 
