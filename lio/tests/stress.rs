@@ -1,5 +1,8 @@
 //! Stress tests for high-concurrency scenarios.
 
+// Drives raw Unix descriptors directly; Windows is covered by the backend
+// contract suite in `backends`.
+#![cfg(unix)]
 #![allow(clippy::expect_fun_call, clippy::unnecessary_mut_passed)]
 
 mod common;

@@ -2,7 +2,6 @@ use lio::api::resource::Resource;
 use lio::{Lio, api};
 use std::cell::{Cell, RefCell};
 use std::net::UdpSocket;
-use std::os::fd::{FromRawFd, IntoRawFd};
 use std::rc::Rc;
 
 struct Pair {
@@ -29,10 +28,8 @@ impl Workload {
         receiver.connect(sender.local_addr().unwrap()).unwrap();
         sender.set_nonblocking(true).unwrap();
         receiver.set_nonblocking(true).unwrap();
-        // SAFETY: each socket transfers its owned descriptor to exactly one Resource.
-        let sender = unsafe { Resource::from_raw_fd(sender.into_raw_fd()) };
-        // SAFETY: each socket transfers its owned descriptor to exactly one Resource.
-        let receiver = unsafe { Resource::from_raw_fd(receiver.into_raw_fd()) };
+        let sender = into_resource(sender);
+        let receiver = into_resource(receiver);
         Pair {
           sender,
           receiver,
@@ -73,5 +70,21 @@ impl Workload {
     while self.done.get() < self.pairs.len() * 2 {
       self.lio.run().unwrap();
     }
+  }
+}
+
+/// Transfers ownership of a std socket to a `Resource`.
+fn into_resource(socket: UdpSocket) -> Resource {
+  #[cfg(unix)]
+  {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    // SAFETY: the socket hands its owned descriptor to exactly one Resource.
+    unsafe { Resource::from_raw_fd(socket.into_raw_fd()) }
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::io::{FromRawHandle, IntoRawSocket};
+    // SAFETY: the socket hands its owned handle to exactly one Resource.
+    unsafe { Resource::from_raw_handle(socket.into_raw_socket() as _) }
   }
 }

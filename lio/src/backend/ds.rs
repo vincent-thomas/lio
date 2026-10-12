@@ -3937,7 +3937,12 @@ mod tests {
     // DS tests use simulated descriptor numbers managed by DSBackend, not the
     // process fd table. Borrow them so dropping Resource never closes an
     // unrelated real fd owned by a concurrently running test.
-    unsafe { Resource::borrow(fd) }
+    #[cfg(unix)]
+    return unsafe { Resource::borrow(fd) };
+    #[cfg(windows)]
+    return unsafe {
+      Resource::borrow(fd as isize as std::os::windows::io::RawHandle)
+    };
   }
 
   fn dst_connect_completion_tick(seed: u64) -> u64 {

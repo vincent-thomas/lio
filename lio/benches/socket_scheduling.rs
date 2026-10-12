@@ -1,9 +1,11 @@
 //! Real loopback UDP transfers through the public I/O API.
 //! Uses Poller unless LIO_BENCH_DEFAULT_BACKEND is set (io_uring on Linux).
+//! Platforms without Poller always use the default backend.
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput};
 use lio::Lio;
+#[cfg(unix)]
 use lio::backend::impls::Poller;
 
 #[path = "support/socket_workload.rs"]
@@ -11,11 +13,11 @@ mod socket_workload;
 use socket_workload::Workload;
 
 fn driver(depth: usize) -> Lio {
-  if std::env::var_os("LIO_BENCH_DEFAULT_BACKEND").is_some() {
-    Lio::new(depth * 2).unwrap()
-  } else {
-    Lio::new_with_backend(Poller::new(), depth * 2).unwrap()
+  #[cfg(unix)]
+  if std::env::var_os("LIO_BENCH_DEFAULT_BACKEND").is_none() {
+    return Lio::new_with_backend(Poller::new(), depth * 2).unwrap();
   }
+  Lio::new(depth * 2).unwrap()
 }
 
 fn main() {

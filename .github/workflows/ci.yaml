@@ -24,15 +24,32 @@ jobs:
       - name: nix flake check
         run: nix flake check '.?submodules=1&shallow=0'
 
-  rust-check:
-    name: rust-check
-    runs-on: ubuntu-latest
+  check:
+    name: check-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            packages: --workspace
+            features: --all-features
+          # lio-uring is Linux-only.
+          - os: macos-latest
+            packages: --workspace --exclude lio-uring
+            features: --all-features
+          # busybox is a Unix coreutils clone and `unstable_ffi` is a C ABI
+          # built on POSIX types; neither targets Windows.
+          - os: windows-latest
+            packages: --workspace --exclude lio-uring --exclude busybox
+            features: --features lio/high
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: true
 
       - uses: DeterminateSystems/nix-installer-action@main
+        if: runner.os == 'Linux'
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -42,26 +59,13 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo check
-        run: cargo check --workspace --all-targets --all-features
+        run: cargo check ${{ matrix.packages }} --all-targets ${{ matrix.features }}
 
       - name: cargo doc
-        run: cargo test --doc -p lio -p lio-test --all-features
+        run: cargo test --doc -p lio -p lio-test ${{ matrix.features }}
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features
-
-  test-bookkeeping:
-    name: test-bookkeeping
-    runs-on: ubuntu-latest
-    needs: [rust-check, nix-check]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.94.1
+        run: cargo clippy ${{ matrix.packages }} --all-targets ${{ matrix.features }}
 
       - name: bookkeeping tests
         run: cargo test -p lio --lib
@@ -85,7 +89,7 @@ jobs:
             os: windows-latest
             test_filter: iocp
 
-    needs: [rust-check, nix-check]
+    needs: [check, nix-check]
     steps:
       - uses: actions/checkout@v6
         with:

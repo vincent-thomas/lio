@@ -31,6 +31,13 @@ use crate::{
 #[cfg(test)]
 use lio_test::{ContractKind, ContractStep, OpModelContract};
 
+/// Arbitrary flag bits for contract tests: op models pass flags through
+/// untouched, whatever the platform means by them.
+#[cfg(test)]
+const TEST_RECV_FLAG: i32 = 0x40;
+#[cfg(test)]
+const TEST_SEND_FLAG: i32 = 0x4000;
+
 fn cstring_to_osstring(path: &CString) -> OsString {
   #[cfg(unix)]
   {
@@ -150,7 +157,12 @@ impl OpModelContract for Socket {
       // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
       Completion::new(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
       #[cfg(windows)]
-      Completion::new(1),
+      Completion::new({
+        use std::os::windows::io::IntoRawSocket;
+        // A fresh owned socket for the resulting `Resource` to take over.
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into_raw_socket()
+          as isize
+      }),
       |result| matches!(result, OpResult::Done(Ok(_))),
     )]
   }
@@ -238,6 +250,13 @@ impl OpModelContract for Accept {
       #[cfg(unix)]
       // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
       Completion::new(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
+      #[cfg(windows)]
+      Completion::new({
+        use std::os::windows::io::IntoRawSocket;
+        // A fresh owned socket for the resulting `Resource` to take over.
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into_raw_socket()
+          as isize
+      }),
       |result| {
         matches!(
           result,
@@ -977,16 +996,14 @@ impl OpModelContract for Recv<Vec<u8>> {
     Self::new(
       Resource::stdin(),
       vec![0u8; 8],
-      Some(RecvFlags::from_bits(libc::MSG_DONTWAIT).unwrap()),
+      Some(RecvFlags::from_bits(TEST_RECV_FLAG).unwrap()),
     )
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
       |action| match action {
-        Action::Io(Op::Recv { flags, .. }) => {
-          flags.bits() == libc::MSG_DONTWAIT
-        }
+        Action::Io(Op::Recv { flags, .. }) => flags.bits() == TEST_RECV_FLAG,
         _ => false,
       },
       |model| model.core.stage_recv_data(b"recv"),
@@ -1010,16 +1027,14 @@ impl OpModelContract for Recv<(Vec<u8>, Vec<u8>)> {
     Self::new(
       Resource::stdin(),
       (vec![0u8; 2], vec![0u8; 4]),
-      Some(RecvFlags::from_bits(libc::MSG_DONTWAIT).unwrap()),
+      Some(RecvFlags::from_bits(TEST_RECV_FLAG).unwrap()),
     )
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
       |action| match action {
-        Action::Io(Op::Recv { flags, .. }) => {
-          flags.bits() == libc::MSG_DONTWAIT
-        }
+        Action::Io(Op::Recv { flags, .. }) => flags.bits() == TEST_RECV_FLAG,
         _ => false,
       },
       |model| model.core.stage_recv_data(b"hello"),
@@ -1045,16 +1060,14 @@ impl OpModelContract for RecvFrom<Vec<u8>> {
     Self::new(
       Resource::stdin(),
       vec![0u8; 8],
-      Some(RecvFlags::from_bits(libc::MSG_DONTWAIT).unwrap()),
+      Some(RecvFlags::from_bits(TEST_RECV_FLAG).unwrap()),
     )
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
       |action| match action {
-        Action::Io(Op::Recv { flags, .. }) => {
-          flags.bits() == libc::MSG_DONTWAIT
-        }
+        Action::Io(Op::Recv { flags, .. }) => flags.bits() == TEST_RECV_FLAG,
         _ => false,
       },
       |model| {
@@ -1175,16 +1188,14 @@ impl OpModelContract for Send<Vec<u8>> {
       Resource::stdin(),
       b"send".to_vec(),
       None,
-      Some(SendFlags::from_bits(libc::MSG_NOSIGNAL).unwrap()),
+      Some(SendFlags::from_bits(TEST_SEND_FLAG).unwrap()),
     )
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
       |action| match action {
-        Action::Io(Op::Send { flags, .. }) => {
-          flags.bits() == libc::MSG_NOSIGNAL
-        }
+        Action::Io(Op::Send { flags, .. }) => flags.bits() == TEST_SEND_FLAG,
         _ => false,
       },
       Completion::new(4),
@@ -1208,16 +1219,14 @@ impl OpModelContract for Send<(Vec<u8>, Vec<u8>)> {
       Resource::stdin(),
       (b"he".to_vec(), b"llo".to_vec()),
       None,
-      Some(SendFlags::from_bits(libc::MSG_NOSIGNAL).unwrap()),
+      Some(SendFlags::from_bits(TEST_SEND_FLAG).unwrap()),
     )
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
       |action| match action {
-        Action::Io(Op::Send { flags, .. }) => {
-          flags.bits() == libc::MSG_NOSIGNAL
-        }
+        Action::Io(Op::Send { flags, .. }) => flags.bits() == TEST_SEND_FLAG,
         _ => false,
       },
       Completion::new(5),
