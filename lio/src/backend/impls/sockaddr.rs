@@ -269,6 +269,11 @@ pub(crate) fn socket_addr_buf_to_storage(
         unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_un) };
       unix.sun_family = libc::AF_UNIX as libc::sa_family_t;
       let len = addr.unix_path_len as usize;
+      // `sun_path` is shorter than `SocketAddrBuf::unix_path` on some
+      // platforms (104 bytes on the BSDs), and needs a trailing NUL.
+      if len >= unix.sun_path.len() {
+        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+      }
       for (dst, src) in
         unix.sun_path[..len].iter_mut().zip(addr.unix_path[..len].iter())
       {

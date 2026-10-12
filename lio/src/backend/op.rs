@@ -824,11 +824,15 @@ pub enum Op {
     /// Cross-platform semantic socket protocol.
     proto: SockProto,
   },
+  /// Bind a socket to a local address.
+  ///
+  /// This is an immediate operation on readiness backends: it should execute
+  /// during `flush()` and surface its completion on the next `wait()`.
   Bind {
     /// Socket resource to bind.
     fd: Resource,
-    /// Socket address to bind to.
-    addr: SocketAddr,
+    /// Local socket address (IP or Unix path).
+    addr: SocketAddrBuf,
   },
   Listen {
     /// Socket resource to mark listening.
