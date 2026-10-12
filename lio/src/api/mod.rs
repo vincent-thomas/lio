@@ -313,12 +313,12 @@ doc_op! {
     pub fn unlinkat(
         dir_res: &impl AsResource,
         path: std::ffi::CString,
-        kind: impl Into<UnlinkKind>,
+        kind: UnlinkKind,
     ) -> Io<ops::UnlinkAt> {
         Io::from_op(ops::UnlinkAt::new(
             dir_res.as_resource().clone(),
             path,
-            kind.into(),
+            kind,
         ))
     }
 }

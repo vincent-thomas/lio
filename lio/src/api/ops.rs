@@ -1600,9 +1600,9 @@ impl UnlinkAt {
   pub(crate) fn new(
     dir_res: Resource,
     pathname: CString,
-    kind: impl Into<UnlinkKind>,
+    kind: UnlinkKind,
   ) -> Self {
-    Self { dir_res, pathname, kind: kind.into() }
+    Self { dir_res, pathname, kind }
   }
 }
 

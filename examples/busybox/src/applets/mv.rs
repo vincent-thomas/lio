@@ -355,9 +355,10 @@ fn copy_dir_recursive(
 
 fn remove_source_dir_tree(ctx: &AppContext, path: &Path) -> io::Result<()> {
   let cpath = path_to_cstring(path, "mv")?;
-  let mut receiver = api::unlinkat(&ctx.cwd(), cpath, libc::AT_REMOVEDIR)
-    .with_lio(ctx.lio())
-    .send();
+  let mut receiver =
+    api::unlinkat(&ctx.cwd(), cpath, api::UnlinkKind::Directory)
+      .with_lio(ctx.lio())
+      .send();
   io_util::run_recv(ctx.lio(), &mut receiver)
 }
 
@@ -370,8 +371,9 @@ fn mkdir_path(ctx: &AppContext, path: &Path, mode: u32) -> io::Result<()> {
 
 fn unlink_path(ctx: &AppContext, path: &Path) -> io::Result<()> {
   let cpath = path_to_cstring(path, "mv")?;
-  let mut receiver =
-    api::unlinkat(&ctx.cwd(), cpath, 0).with_lio(ctx.lio()).send();
+  let mut receiver = api::unlinkat(&ctx.cwd(), cpath, api::UnlinkKind::File)
+    .with_lio(ctx.lio())
+    .send();
   io_util::run_recv(ctx.lio(), &mut receiver)
 }
 

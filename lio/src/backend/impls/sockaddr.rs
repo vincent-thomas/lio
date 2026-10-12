@@ -10,7 +10,10 @@ use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::ptr;
 
-use crate::backend::op::{SocketAddrBuf, SocketAddrFamily};
+use crate::backend::op::{
+  SockDomain, SockProto, SockType, SocketAddrBuf, SocketAddrFamily,
+  is_supported_socket,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Raw constants
@@ -44,6 +47,78 @@ const fn raw_af_unix() -> Result<i32, i32> {
 #[cfg(windows)]
 const fn raw_af_unix() -> Result<i32, i32> {
   Ok(windows_sys::Win32::Networking::WinSock::AF_UNIX)
+}
+
+#[cfg(unix)]
+const fn raw_sock_stream() -> i32 {
+  libc::SOCK_STREAM
+}
+
+#[cfg(windows)]
+const fn raw_sock_stream() -> i32 {
+  windows_sys::Win32::Networking::WinSock::SOCK_STREAM
+}
+
+#[cfg(unix)]
+const fn raw_sock_dgram() -> i32 {
+  libc::SOCK_DGRAM
+}
+
+#[cfg(windows)]
+const fn raw_sock_dgram() -> i32 {
+  windows_sys::Win32::Networking::WinSock::SOCK_DGRAM
+}
+
+#[cfg(unix)]
+const fn raw_proto_tcp() -> i32 {
+  libc::IPPROTO_TCP
+}
+
+#[cfg(windows)]
+const fn raw_proto_tcp() -> i32 {
+  windows_sys::Win32::Networking::WinSock::IPPROTO_TCP
+}
+
+#[cfg(unix)]
+const fn raw_proto_udp() -> i32 {
+  libc::IPPROTO_UDP
+}
+
+#[cfg(windows)]
+const fn raw_proto_udp() -> i32 {
+  windows_sys::Win32::Networking::WinSock::IPPROTO_UDP
+}
+
+/// Translates abstract socket domain/type/proto to raw OS constants.
+///
+/// Returns the errno to complete the op with when the triple is unsupported.
+pub(crate) fn socket_to_raw(
+  domain: SockDomain,
+  ty: SockType,
+  proto: SockProto,
+) -> Result<(i32, i32, i32), i32> {
+  if !is_supported_socket(domain, ty, proto) {
+    return Err(libc::EINVAL);
+  }
+
+  let domain = match domain {
+    SockDomain::IPV4 => raw_af_inet(),
+    SockDomain::IPV6 => raw_af_inet6(),
+    SockDomain::UNIX => raw_af_unix()?,
+    _ => return Err(libc::EAFNOSUPPORT),
+  };
+  let ty = match ty {
+    SockType::STREAM => raw_sock_stream(),
+    SockType::DGRAM => raw_sock_dgram(),
+    _ => return Err(libc::EINVAL),
+  };
+  let proto = match proto {
+    SockProto::TCP => raw_proto_tcp(),
+    SockProto::UDP => raw_proto_udp(),
+    _ => 0,
+  };
+
+  Ok((domain, ty, proto))
 }
 
 #[cfg(unix)]

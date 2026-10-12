@@ -21,7 +21,8 @@ use lio_uring::{
 
 use crate::backend::{
   IoBackend, OpCompleted,
-  op::{DirEntryRef, LinkKind, Op, ReadDirResult, file_type_from_dirent_dtype},
+  impls::unix_stat::file_type_from_dirent_dtype,
+  op::{DirEntryRef, LinkKind, Op, ReadDirResult},
 };
 use crate::slab::{Slab, SlabKey};
 
@@ -852,7 +853,7 @@ impl IoUring {
           .map(|errno| -(errno as isize))
       }
       Op::Socket { domain, ty, proto } => {
-        crate::backend::op::socket_to_raw(*domain, *ty, *proto)
+        crate::backend::impls::sockaddr::socket_to_raw(*domain, *ty, *proto)
           .err()
           .map(|errno| -(errno as isize))
       }
@@ -926,7 +927,7 @@ impl IoUring {
       }
       Op::Socket { domain, ty, proto } => {
         let (domain, ty, proto) =
-          crate::backend::op::socket_to_raw(*domain, *ty, *proto)
+          crate::backend::impls::sockaddr::socket_to_raw(*domain, *ty, *proto)
             .expect("socket op must be validated before entry creation");
         Socket::new(domain, ty, proto).build()
       }

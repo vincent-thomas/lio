@@ -90,6 +90,8 @@ pub mod impls {
   pub use iocp::*;
 
   pub(crate) mod sockaddr;
+  #[cfg(unix)]
+  pub(crate) mod unix_stat;
 }
 
 pub(crate) mod store;

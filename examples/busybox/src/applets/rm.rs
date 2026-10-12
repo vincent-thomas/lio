@@ -140,9 +140,9 @@ fn remove_path(
         remove_path(ctx, &path.join(entry.name), options)?;
       }
 
-      unlink_path(ctx, path, libc::AT_REMOVEDIR)?;
+      unlink_path(ctx, path, api::UnlinkKind::Directory)?;
     } else if options.dir {
-      unlink_path(ctx, path, libc::AT_REMOVEDIR)?;
+      unlink_path(ctx, path, api::UnlinkKind::Directory)?;
     } else {
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -150,7 +150,7 @@ fn remove_path(
       ));
     }
   } else {
-    unlink_path(ctx, path, 0)?;
+    unlink_path(ctx, path, api::UnlinkKind::File)?;
   }
 
   if options.verbose {
@@ -181,10 +181,14 @@ fn reject_protected_path(path: &Path) -> io::Result<()> {
   Ok(())
 }
 
-fn unlink_path(ctx: &AppContext, path: &Path, flags: i32) -> io::Result<()> {
+fn unlink_path(
+  ctx: &AppContext,
+  path: &Path,
+  kind: api::UnlinkKind,
+) -> io::Result<()> {
   let cpath = path_to_cstring(path)?;
   let mut result =
-    api::unlinkat(&ctx.cwd(), cpath, flags).with_lio(ctx.lio()).send();
+    api::unlinkat(&ctx.cwd(), cpath, kind).with_lio(ctx.lio()).send();
   let result = io_util::run_recv(ctx.lio(), &mut result);
   result
 }

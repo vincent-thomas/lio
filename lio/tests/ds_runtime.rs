@@ -16,7 +16,10 @@ use lio::{
   api::resource::Resource,
   backend::{
     ds::{DSBackend, DSConfig, DSNetworkFaults, last_ds_trace_snapshot},
-    op::{FileStat, LinkKind, ShutdownHow, SockDomain, SockProto, SockType},
+    op::{
+      FileStat, LinkKind, ShutdownHow, SockDomain, SockProto, SockType,
+      UnlinkKind,
+    },
   },
 };
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -91,7 +94,7 @@ enum ScriptOp {
   StatAt { path: CString, follow_symlinks: bool },
   ReadlinkAt { path: CString, len: usize },
   MkdirAt { path: CString, mode: u32 },
-  UnlinkAt { path: CString, flags: i32 },
+  UnlinkAt { path: CString, kind: UnlinkKind },
   RenameAt { old_path: CString, new_path: CString },
   LinkAt { source_path: CString, new_path: CString, kind: LinkKind },
   Spawn { path: CString, argv: Vec<CString> },
@@ -299,7 +302,11 @@ fn build_script(
       }
       14 => ScriptOp::UnlinkAt {
         path,
-        flags: if rng.next_bool() { 0 } else { libc::AT_REMOVEDIR },
+        kind: if rng.next_bool() {
+          UnlinkKind::File
+        } else {
+          UnlinkKind::Directory
+        },
       },
       15 => ScriptOp::RenameAt { old_path: path, new_path: alt_path },
       16 => ScriptOp::LinkAt {
@@ -501,9 +508,9 @@ fn schedule_script_op(
         tx.send(Event::MkdirAt { id, result }).unwrap();
       });
     }
-    ScriptOp::UnlinkAt { path, flags } => {
+    ScriptOp::UnlinkAt { path, kind } => {
       let tx = tx.clone();
-      api::unlinkat(&cwd, path, flags).with_lio(lio).when_done(move |result| {
+      api::unlinkat(&cwd, path, kind).with_lio(lio).when_done(move |result| {
         tx.send(Event::UnlinkAt { id, result }).unwrap();
       });
     }
