@@ -183,25 +183,7 @@ impl Lio {
   /// ```
   #[cfg(feature = "backend_impls")]
   pub fn new(cap: usize) -> io::Result<Self> {
-    #[cfg(any(
-      target_os = "macos",
-      target_os = "ios",
-      target_os = "tvos",
-      target_os = "watchos",
-      target_os = "freebsd",
-      target_os = "dragonfly",
-      target_os = "openbsd",
-      target_os = "netbsd"
-    ))]
-    {
-      use crate::backend::impls::Poller;
-      Self::new_with_backend(Poller::new(), cap)
-    }
-    #[cfg(target_os = "linux")]
-    {
-      use crate::backend::impls::IoUring;
-      Self::new_with_backend(IoUring::new(), cap)
-    }
+    Self::new_with_backend(crate::backend::impls::DefaultBackend::new(), cap)
   }
 
   /// Creates a new Lio driver with the specified backend and capacity.

@@ -15,10 +15,4 @@ pub(crate) fn last_os_error_code() -> i32 {
     // SAFETY: `__error` is the libc errno accessor on these targets.
     unsafe { *libc::__error() }
   }
-
-  #[cfg(windows)]
-  {
-    // SAFETY: `GetLastError` returns the thread-local Win32 error code.
-    unsafe { windows_sys::Win32::Foundation::GetLastError() as i32 }
-  }
 }

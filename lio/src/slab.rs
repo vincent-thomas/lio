@@ -160,6 +160,8 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     removed
   }
 
+  // Only the Unix backends use the slab.
+  #[cfg_attr(windows, allow(dead_code))]
   #[inline]
   pub(crate) fn len(&self) -> usize {
     self.len as usize
@@ -170,10 +172,12 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
 ///
 /// Allocates items of type `T` in contiguous memory with O(1) insert/remove.
 /// Uses bump allocation for new slots and a free list for reuse.
+#[cfg_attr(windows, allow(dead_code))]
 pub struct Slab<T> {
   pool: SlotPool<MaybeUninit<T>>,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 impl<T> Slab<T> {
   /// Creates a new slab with the given capacity.
   ///

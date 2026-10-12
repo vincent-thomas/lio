@@ -27,6 +27,7 @@ pub mod time;
 
 pub use buf::{BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec};
 
+#[cfg(unix)]
 mod platform;
 mod registration;
 mod slab;

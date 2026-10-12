@@ -97,6 +97,7 @@ macro_rules! impl_native_convervions {
     #[cfg(windows)]
     impl std::os::windows::io::AsHandle for $nice {
       fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        // SAFETY: the handle stays open for as long as `self` is borrowed.
         unsafe {
           std::os::windows::io::BorrowedHandle::borrow_raw(self.0.inner)
         }
@@ -116,7 +117,24 @@ macro_rules! impl_native_convervions {
 type Inner = std::os::fd::RawFd;
 
 #[cfg(windows)]
+use std::os::windows::io::RawHandle;
+
+#[cfg(windows)]
 type Inner = RawHandle;
+
+/// Handle value standing in for "the current working directory" on Windows,
+/// mirroring `AT_FDCWD`. It is never a valid kernel handle (those are
+/// multiples of four) nor one of the documented pseudo-handles.
+#[cfg(windows)]
+pub(crate) const CWD_HANDLE: RawHandle = -100isize as RawHandle;
+
+// SAFETY: a raw handle is an opaque identifier; like `OwnedHandle`, owning
+// or sharing it across threads is sound.
+#[cfg(windows)]
+unsafe impl Send for InnerResource {}
+// SAFETY: see `Send` above; `InnerResource` has no interior mutability.
+#[cfg(windows)]
+unsafe impl Sync for InnerResource {}
 
 /// Internal owned resource with automatic cleanup support.
 ///
@@ -148,7 +166,24 @@ impl Drop for InnerResource {
       return;
     }
 
+    #[cfg(unix)]
     let _ = syscall!(close(self.inner));
+
+    #[cfg(windows)]
+    {
+      use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        Networking::WinSock::{SOCKET, closesocket},
+      };
+      // Sockets must be released with `closesocket`; anything else (or a
+      // socket when Winsock is not initialized) falls back to `CloseHandle`.
+      // SAFETY: we own `inner` and close it exactly once.
+      unsafe {
+        if closesocket(self.inner as SOCKET) != 0 {
+          CloseHandle(self.inner);
+        }
+      }
+    }
   }
 }
 
@@ -262,6 +297,17 @@ impl std::os::fd::FromRawFd for Resource {
 }
 
 impl Resource {
+  /// Takes ownership of the descriptor/handle in a successful completion.
+  ///
+  /// # Safety
+  ///
+  /// `result` must be a non-negative completion result that carries a newly
+  /// created descriptor/handle owned by the caller.
+  pub(crate) unsafe fn from_completion(result: isize) -> Self {
+    debug_assert!(result >= 0, "completion result must carry a resource");
+    Resource(Arc::new(InnerResource::new(result as Inner)))
+  }
+
   /// Creates a Resource that borrows a file descriptor without taking ownership.
   ///
   /// The fd/handle will NOT be closed when this Resource is dropped. Use this when the
@@ -309,44 +355,14 @@ impl Resource {
     unsafe { Self::borrow(libc::STDOUT_FILENO) }
   }
 
-  /// Returns a `Resource` for standard output (stdout).
   #[cfg(windows)]
   pub fn stdout() -> Self {
-    use windows_sys::Win32::Foundation::{
-      DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
-    };
     use windows_sys::Win32::System::Console::{
       GetStdHandle, STD_OUTPUT_HANDLE,
     };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    // SAFETY: GetStdHandle is safe to call with valid constants
-    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    assert!(handle != INVALID_HANDLE_VALUE, "Failed to get stdout handle");
-
-    let mut dup_handle: HANDLE = 0;
-    let current_process = unsafe { GetCurrentProcess() };
-
-    // SAFETY: All handles are valid, dup_handle is a valid out pointer
-    let result = unsafe {
-      DuplicateHandle(
-        current_process,
-        handle,
-        current_process,
-        &mut dup_handle,
-        0,
-        0, // bInheritHandle = FALSE
-        DUPLICATE_SAME_ACCESS,
-      )
-    };
-    assert!(result != 0, "Failed to duplicate stdout handle");
-
-    // SAFETY: dup_handle is valid, just returned from DuplicateHandle
-    unsafe {
-      <Self as std::os::windows::io::FromRawHandle>::from_raw_handle(
-        dup_handle as *mut std::ffi::c_void,
-      )
-    }
+    // SAFETY: the standard handles are owned by the process; borrowing them
+    // means they are never closed by this `Resource`.
+    unsafe { Self::borrow(GetStdHandle(STD_OUTPUT_HANDLE)) }
   }
 
   /// Returns a `Resource` for standard error (stderr).
@@ -372,42 +388,12 @@ impl Resource {
     unsafe { Self::borrow(libc::STDERR_FILENO) }
   }
 
-  /// Returns a `Resource` for standard error (stderr).
   #[cfg(windows)]
   pub fn stderr() -> Self {
-    use windows_sys::Win32::Foundation::{
-      DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
-    };
     use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    // SAFETY: GetStdHandle is safe to call with valid constants
-    let handle = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
-    assert!(handle != INVALID_HANDLE_VALUE, "Failed to get stderr handle");
-
-    let mut dup_handle: HANDLE = 0;
-    let current_process = unsafe { GetCurrentProcess() };
-
-    // SAFETY: All handles are valid, dup_handle is a valid out pointer
-    let result = unsafe {
-      DuplicateHandle(
-        current_process,
-        handle,
-        current_process,
-        &mut dup_handle,
-        0,
-        0, // bInheritHandle = FALSE
-        DUPLICATE_SAME_ACCESS,
-      )
-    };
-    assert!(result != 0, "Failed to duplicate stderr handle");
-
-    // SAFETY: dup_handle is valid, just returned from DuplicateHandle
-    unsafe {
-      <Self as std::os::windows::io::FromRawHandle>::from_raw_handle(
-        dup_handle as *mut std::ffi::c_void,
-      )
-    }
+    // SAFETY: the standard handles are owned by the process; borrowing them
+    // means they are never closed by this `Resource`.
+    unsafe { Self::borrow(GetStdHandle(STD_ERROR_HANDLE)) }
   }
 
   /// Returns a `Resource` for standard input (stdin).
@@ -433,42 +419,12 @@ impl Resource {
     unsafe { Self::borrow(libc::STDIN_FILENO) }
   }
 
-  /// Returns a `Resource` for standard input (stdin).
   #[cfg(windows)]
   pub fn stdin() -> Self {
-    use windows_sys::Win32::Foundation::{
-      DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
-    };
     use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    // SAFETY: GetStdHandle is safe to call with valid constants
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    assert!(handle != INVALID_HANDLE_VALUE, "Failed to get stdin handle");
-
-    let mut dup_handle: HANDLE = 0;
-    let current_process = unsafe { GetCurrentProcess() };
-
-    // SAFETY: All handles are valid, dup_handle is a valid out pointer
-    let result = unsafe {
-      DuplicateHandle(
-        current_process,
-        handle,
-        current_process,
-        &mut dup_handle,
-        0,
-        0, // bInheritHandle = FALSE
-        DUPLICATE_SAME_ACCESS,
-      )
-    };
-    assert!(result != 0, "Failed to duplicate stdin handle");
-
-    // SAFETY: dup_handle is valid, just returned from DuplicateHandle
-    unsafe {
-      <Self as std::os::windows::io::FromRawHandle>::from_raw_handle(
-        dup_handle as *mut std::ffi::c_void,
-      )
-    }
+    // SAFETY: the standard handles are owned by the process; borrowing them
+    // means they are never closed by this `Resource`.
+    unsafe { Self::borrow(GetStdHandle(STD_INPUT_HANDLE)) }
   }
 
   /// Returns a `Resource` representing the current working directory.
@@ -497,6 +453,14 @@ impl Resource {
     // that tells *at() syscalls to use the current working directory.
     // We use borrow_fd so it won't be closed on drop.
     unsafe { Self::borrow(libc::AT_FDCWD) }
+  }
+
+  /// Returns a `Resource` that refers to the current working directory.
+  #[cfg(windows)]
+  pub fn cwd() -> Self {
+    // SAFETY: `CWD_HANDLE` is a sentinel the backends resolve themselves; it
+    // is borrowed and therefore never closed.
+    unsafe { Self::borrow(CWD_HANDLE) }
   }
 
   /// Returns the number of strong references to this resource.

@@ -92,6 +92,27 @@ pub mod impls {
   pub(crate) mod sockaddr;
   #[cfg(unix)]
   pub(crate) mod unix_stat;
+
+  /// The backend [`Lio::new`](crate::Lio::new) uses on this platform.
+  #[cfg(target_os = "linux")]
+  pub type DefaultBackend = IoUring;
+
+  /// The backend [`Lio::new`](crate::Lio::new) uses on this platform.
+  #[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+  ))]
+  pub type DefaultBackend = Poller;
+
+  /// The backend [`Lio::new`](crate::Lio::new) uses on this platform.
+  #[cfg(windows)]
+  pub type DefaultBackend = Iocp;
 }
 
 pub(crate) mod store;

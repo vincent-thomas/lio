@@ -7,12 +7,17 @@
 //!
 //! The examples here are meant to make the state management concrete.
 
+// Illustration only: not every item is exercised by the tests below.
+#![allow(dead_code)]
+
 use std::{collections::VecDeque, io, net::SocketAddr};
+
+use crate::backend::op::{SockDomain, SockProto, SockType};
 
 /// Illustration-only low-level op enum for the proposed serial contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
-  Socket { domain: i32, ty: i32, proto: i32 },
+  Socket { domain: SockDomain, ty: SockType, proto: SockProto },
   Bind { fd: i32, addr: SocketAddr },
   Listen { fd: i32, backlog: i32 },
   Read { fd: i32, len: usize },
@@ -110,12 +115,12 @@ impl OpModel for TcpBindModel {
     match self.state {
       TcpBindState::Socket => Op::Socket {
         domain: if self.addr.is_ipv4() {
-          libc::AF_INET
+          SockDomain::IPV4
         } else {
-          libc::AF_INET6
+          SockDomain::IPV6
         },
-        ty: libc::SOCK_STREAM,
-        proto: libc::IPPROTO_TCP,
+        ty: SockType::STREAM,
+        proto: SockProto::TCP,
       },
       TcpBindState::Bind { fd } => Op::Bind { fd, addr: self.addr },
       TcpBindState::Listen { fd } => Op::Listen { fd, backlog: self.backlog },
@@ -179,9 +184,9 @@ impl lio_test::serial_op_contract::OpModelContract for TcpBindModel {
           matches!(
             op,
             Op::Socket {
-              domain: libc::AF_INET,
-              ty: libc::SOCK_STREAM,
-              proto: libc::IPPROTO_TCP,
+              domain: SockDomain::IPV4,
+              ty: SockType::STREAM,
+              proto: SockProto::TCP,
             }
           )
         },
@@ -336,9 +341,9 @@ mod tests {
     assert!(matches!(
       model.op(),
       Op::Socket {
-        domain: libc::AF_INET,
-        ty: libc::SOCK_STREAM,
-        proto: libc::IPPROTO_TCP,
+        domain: SockDomain::IPV4,
+        ty: SockType::STREAM,
+        proto: SockProto::TCP,
       }
     ));
     assert!(matches!(

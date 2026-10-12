@@ -81,6 +81,9 @@ jobs:
           - backend: poller
             os: macos-latest
             test_filter: poller
+          - backend: iocp
+            os: windows-latest
+            test_filter: iocp
 
     needs: [rust-check, nix-check]
     steps:
@@ -94,5 +97,3 @@ jobs:
 
       - name: test backend
         run: cargo test -p lio --test backends ${{ matrix.test_filter }}
-
-  # TODO: test-backend-windows
