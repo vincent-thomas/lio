@@ -44,6 +44,10 @@ use crate::backend::op::{
 use crate::backend::{IoBackend, OpCompleted};
 use crate::{Lio, install_global};
 
+/// Simulation key for `Resource::cwd()` on Windows, mirroring `AT_FDCWD`.
+#[cfg(windows)]
+const WINDOWS_CWD_KEY: i32 = -100;
+
 /// Mode and open-flag bits the simulation interprets.
 ///
 /// Callers pass the platform's native `O_*` bits; where the platform has no
@@ -1416,9 +1420,28 @@ impl DSBackend {
     resource.as_raw_fd()
   }
 
+  /// Maps the process std handles and the cwd sentinel to the same keys the
+  /// simulation uses on Unix (0/1/2 and [`WINDOWS_CWD_KEY`]).
   #[cfg(windows)]
   fn resource_key(resource: &Resource) -> i32 {
-    resource.as_raw_handle() as isize as i32
+    use windows_sys::Win32::System::Console::{
+      GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    let handle = resource.as_raw_handle();
+    if handle == crate::api::resource::CWD_HANDLE {
+      return WINDOWS_CWD_KEY;
+    }
+    for (key, which) in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+      .into_iter()
+      .enumerate()
+    {
+      // SAFETY: querying the process std handles has no preconditions.
+      let std = unsafe { GetStdHandle(which) };
+      if !std.is_null() && handle == std {
+        return key as i32;
+      }
+    }
+    handle as isize as i32
   }
 
   fn is_builtin_stdin(raw: i32) -> bool {
@@ -1435,8 +1458,8 @@ impl DSBackend {
   }
 
   #[cfg(not(unix))]
-  fn is_builtin_cwd(_raw: i32) -> bool {
-    false
+  fn is_builtin_cwd(raw: i32) -> bool {
+    raw == WINDOWS_CWD_KEY
   }
 
   fn choose_len(&mut self, total: usize, may_be_zero: bool) -> usize {
