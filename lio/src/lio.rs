@@ -78,8 +78,11 @@ pub(crate) fn get_global() -> Option<Lio> {
 }
 
 struct LioInner {
-  store: OpStore,
+  // Field order is drop order: the backend must shut down (finishing or
+  // cancelling in-flight work) before `store` frees the buffers that work
+  // still points into.
   io: Box<dyn IoBackend>,
+  store: OpStore,
   /// The backend's close for resources its completions carry.
   resource_close: crate::api::resource::CloseFn,
   time: TimeManager,

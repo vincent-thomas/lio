@@ -840,6 +840,58 @@ macro_rules! test_io_backend {
       completed
     }
 
+    mod pipe {
+      use super::*;
+      use std::io::Write;
+
+      /// An anonymous pipe as (`Resource` read end, std write end).
+      fn pipe() -> (Resource, std::io::PipeWriter) {
+        let (reader, writer) = std::io::pipe().expect("pipe() failed");
+        #[cfg(unix)]
+        let reader = own_raw(reader.into_raw_fd() as isize);
+        #[cfg(windows)]
+        let reader = own_raw(reader.into_raw_handle() as isize);
+        (reader, writer)
+      }
+
+      #[test]
+      fn read_without_data_does_not_block_the_loop() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let (reader, mut writer) = pipe();
+        let mut buf = [0_u8; 4];
+        let mut raw_buf = raw_buf_from_mut_slice(&mut buf);
+
+        push_op(&mut backend,
+          95,
+          Op::Read {
+            fd: reader.clone(),
+            iovecs: nonnull(&mut raw_buf),
+            iov_count: 1,
+            offset: -1,
+            flags: read_flags(0),
+          },
+        );
+
+        // Neither submitting nor polling may wait for the pipe.
+        let start = Instant::now();
+        backend.flush().unwrap();
+        let completed = wait_completions(&mut backend, Some(Duration::ZERO));
+        assert!(completed.is_empty(), "read on an empty pipe must stay pending");
+        assert!(
+          start.elapsed() < Duration::from_millis(500),
+          "flush/wait blocked on an empty pipe for {:?}",
+          start.elapsed()
+        );
+
+        writer.write_all(b"pipe").unwrap();
+        let completed = wait_for_single_completion(&mut backend);
+        assert_exact_result(&completed, 95, 4);
+        assert_eq!(&buf, b"pipe");
+      }
+    }
+
     mod nop {
       use super::*;
 
