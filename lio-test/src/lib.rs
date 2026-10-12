@@ -749,7 +749,18 @@ macro_rules! test_io_backend {
 
     /// Opens a directory for `Op::ReadDir`.
     fn open_dir(path: &std::path::Path) -> Resource {
+      #[cfg(unix)]
       let dir = fs::File::open(path).unwrap();
+      #[cfg(windows)]
+      let dir = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Directories can only be opened with FILE_FLAG_BACKUP_SEMANTICS.
+        fs::OpenOptions::new()
+          .read(true)
+          .custom_flags(0x0200_0000)
+          .open(path)
+          .unwrap()
+      };
       #[cfg(unix)]
       return own_raw(dir.into_raw_fd() as isize);
       #[cfg(windows)]
