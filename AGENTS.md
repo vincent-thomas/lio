@@ -21,13 +21,9 @@ be pushed into backend implementations or abstracted behind the contract:
 
 | Location | What depends on OS |
 |---|---|
-| `lio/src/macros.rs` | `syscall!` macro wraps `libc` directly |
 | `lio/src/api/ops.rs` | Socket addr conversion uses `libc::sockaddr_*`; `MSG_DONTWAIT`, `MSG_NOSIGNAL`, `S_IFREG`, `ERANGE` constants; `libc::dup` / `libc::STDIN_FILENO` for pipe/tee models |
 | `lio/src/api/resource.rs` | `libc::STDIN_FILENO`, `STDOUT_FILENO`, `STDERR_FILENO`, `AT_FDCWD` |
 | `lio/src/fs.rs` | `libc::O_*` flags, `libc::AT_REMOVEDIR`, `libc::EINVAL` |
-| `lio/src/net/socket.rs` | `libc::sockaddr_storage`, `libc::getsockname`, `libc::getpeername` |
-| `lio/src/platform/errno.rs` | `cfg(target_os)` for `__errno_location` / `__error` / `GetLastError` |
-| `lio/src/api/mod.rs` | Imports and re-exports `SockDomain`, `SockProto`, etc. from `backend::op` |
 
 Each of these must either:
 1. Be moved into a backend implementation, or

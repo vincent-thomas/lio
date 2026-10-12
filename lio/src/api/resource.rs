@@ -166,8 +166,14 @@ impl Drop for InnerResource {
       return;
     }
 
+    // Not `OwnedFd`: resources from the simulation backend carry synthetic
+    // descriptor numbers, and `OwnedFd` aborts on the resulting `EBADF`.
+    // Closing should move to the backend that created the resource.
     #[cfg(unix)]
-    let _ = syscall!(close(self.inner));
+    // SAFETY: closing a descriptor we own; errors are deliberately ignored.
+    unsafe {
+      libc::close(self.inner);
+    }
 
     #[cfg(windows)]
     {
