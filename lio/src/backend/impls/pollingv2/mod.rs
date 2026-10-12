@@ -925,12 +925,15 @@ impl Poller {
         let Ok(path) = Self::os_path_to_cstring(path) else {
           return -(libc::EINVAL as isize);
         };
-        syscall!(raw openat(
-          dir_fd.as_raw_fd(),
-          path.as_ptr(),
-          flags.bits(),
-          mode.bits(),
-        ))
+        match crate::backend::native::open_flags(*flags) {
+          Ok(flags) => syscall!(raw openat(
+            dir_fd.as_raw_fd(),
+            path.as_ptr(),
+            flags,
+            mode.bits(),
+          )),
+          Err(errno) => -(errno as isize),
+        }
       }
       Op::Stat { target, out } => {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();

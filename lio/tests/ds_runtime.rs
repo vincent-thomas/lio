@@ -89,7 +89,7 @@ enum ScriptOp {
   ListenOn { res: Resource, backlog: i32 },
   Shutdown { how: ShutdownHow },
   ShutdownOn { res: Resource, how: ShutdownHow },
-  OpenAt { path: CString, flags: i32, mode: u32 },
+  OpenAt { path: CString, flags: lio::api::OpenFlags, mode: u32 },
   StatAt { path: CString, follow_symlinks: bool },
   ReadlinkAt { path: CString, len: usize },
   MkdirAt { path: CString, mode: u32 },
@@ -290,8 +290,11 @@ fn build_script(
       },
       10 => ScriptOp::OpenAt {
         path,
-        flags: [libc::O_RDONLY, libc::O_WRONLY, libc::O_RDWR]
-          [rng.range_usize(3)],
+        flags: [
+          lio::api::OpenFlags::READ,
+          lio::api::OpenFlags::WRITE,
+          lio::api::OpenFlags::READ | lio::api::OpenFlags::WRITE,
+        ][rng.range_usize(3)],
         mode: 0o600 + rng.range_usize(0o177) as u32,
       },
       11 => ScriptOp::StatAt { path, follow_symlinks: rng.next_bool() },

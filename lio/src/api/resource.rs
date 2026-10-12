@@ -11,7 +11,7 @@
 //!     # let dir = Resource::cwd();
 //!     let path = CString::new("/tmp/test").unwrap();
 //!     let fd: Resource =
-//!         lio::api::openat(&dir, path, libc::O_RDONLY, 0).await?;
+//!         lio::api::openat(&dir, path, lio::api::OpenFlags::READ, 0).await?;
 //!
 //!     // Use the resource...
 //!     // Resource is automatically closed when dropped.
@@ -47,7 +47,7 @@
 //!     # let dir = Resource::cwd();
 //!     let path = CString::new("/tmp/test").unwrap();
 //!     let resource: Resource =
-//!         lio::api::openat(&dir, path, libc::O_RDONLY, 0).await?;
+//!         lio::api::openat(&dir, path, lio::api::OpenFlags::READ, 0).await?;
 //!     Ok(resource)
 //! }
 //!
@@ -420,7 +420,7 @@ impl Resource {
   /// async fn open_file() -> std::io::Result<Resource> {
   ///     let cwd = Resource::cwd();
   ///     let path = CString::new("myfile.txt").unwrap();
-  ///     lio::api::openat(&cwd, path, libc::O_RDONLY, 0).await
+  ///     lio::api::openat(&cwd, path, lio::api::OpenFlags::READ, 0).await
   /// }
   /// ```
   pub fn cwd() -> Self {

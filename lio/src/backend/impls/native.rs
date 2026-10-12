@@ -7,6 +7,8 @@
 //! and those adopted through `FromRawFd`/`FromRawHandle`.
 
 use crate::api::resource::RawResource;
+#[cfg(unix)]
+use crate::backend::op::OpenFlags;
 
 /// Handle value standing in for "the current working directory" on Windows,
 /// mirroring `AT_FDCWD`. It is never a valid kernel handle (those are
@@ -17,6 +19,16 @@ pub(crate) const CWD: RawResource = -100isize as RawResource;
 /// Value meaning "the current working directory" for `*at` operations.
 #[cfg(unix)]
 pub(crate) const CWD: RawResource = libc::AT_FDCWD;
+
+/// Error code for "the caller's buffer is too small" (as `getcwd(3)`
+/// reports it).
+#[cfg(unix)]
+pub(crate) const BUFFER_TOO_SMALL: i32 = libc::ERANGE;
+
+/// Error code for "the caller's buffer is too small".
+#[cfg(windows)]
+pub(crate) const BUFFER_TOO_SMALL: i32 =
+  windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER as i32;
 
 /// Closes a native descriptor/handle.
 ///
@@ -79,4 +91,30 @@ fn std_handle(
 ) -> RawResource {
   // SAFETY: querying the process std handles has no preconditions.
   unsafe { windows_sys::Win32::System::Console::GetStdHandle(which) }
+}
+
+/// Translates [`OpenFlags`] to `open(2)` flags, always adding `O_CLOEXEC`.
+///
+/// Returns `EINVAL` when no access mode is requested.
+#[cfg(unix)]
+#[cfg_attr(not(feature = "backend_impls"), allow(dead_code))]
+pub(crate) fn open_flags(flags: OpenFlags) -> Result<i32, i32> {
+  let mut bits = match (flags.reads(), flags.writes()) {
+    (true, false) => libc::O_RDONLY,
+    (false, true) => libc::O_WRONLY,
+    (true, true) => libc::O_RDWR,
+    (false, false) => return Err(libc::EINVAL),
+  } | libc::O_CLOEXEC;
+  for (flag, native) in [
+    (OpenFlags::APPEND, libc::O_APPEND),
+    (OpenFlags::CREATE, libc::O_CREAT),
+    (OpenFlags::TRUNCATE, libc::O_TRUNC),
+    (OpenFlags::EXCLUSIVE, libc::O_EXCL),
+    (OpenFlags::DIRECTORY, libc::O_DIRECTORY),
+  ] {
+    if flags.contains(flag) {
+      bits |= native;
+    }
+  }
+  Ok(bits)
 }

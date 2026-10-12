@@ -1378,10 +1378,10 @@ impl OpenAt {
   pub(crate) fn new(
     dir_res: Resource,
     pathname: CString,
-    flags: impl Into<OpenFlags>,
+    flags: OpenFlags,
     mode: impl Into<FileMode>,
   ) -> Self {
-    Self { dir_res, pathname, flags: flags.into(), mode: mode.into() }
+    Self { dir_res, pathname, flags, mode: mode.into() }
   }
 }
 
@@ -1570,8 +1570,8 @@ impl OpModelContract for Stat {
         )
       },
       |model| {
-        #[allow(clippy::unnecessary_cast)]
-        let mode = (libc::S_IFREG as u32) | 0o644;
+        // S_IFREG | 0o644
+        let mode = 0o100644;
         model.out = FileStat {
           file_type: crate::backend::op::FileType::File,
           size: 7,
@@ -1948,7 +1948,9 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
 
       let (ptr, cap) = buf.buf_mut(0);
       if bytes.len() > cap {
-        Err(std::io::Error::from_raw_os_error(libc::ERANGE))
+        Err(std::io::Error::from_raw_os_error(
+          crate::backend::native::BUFFER_TOO_SMALL,
+        ))
       } else {
         // SAFETY: `ptr` points to writable storage of at least `cap` bytes.
         unsafe {

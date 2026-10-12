@@ -50,7 +50,7 @@ impl Command for CmpCommand {
       api::openat(
         &ctx.cwd(),
         CString::new(self.left.as_str())?,
-        libc::O_RDONLY,
+        lio::api::OpenFlags::READ,
         0,
       )
       .with_lio(ctx.lio())
@@ -61,7 +61,7 @@ impl Command for CmpCommand {
       api::openat(
         &ctx.cwd(),
         CString::new(self.right.as_str())?,
-        libc::O_RDONLY,
+        lio::api::OpenFlags::READ,
         0,
       )
       .with_lio(ctx.lio())
@@ -164,7 +164,7 @@ mod tests {
       api::openat(
         &ctx.cwd(),
         CString::new(left_path.to_str().unwrap()).unwrap(),
-        libc::O_RDONLY,
+        lio::api::OpenFlags::READ,
         0,
       )
       .with_lio(ctx.lio())
@@ -176,7 +176,7 @@ mod tests {
       api::openat(
         &ctx.cwd(),
         CString::new(right_path.to_str().unwrap()).unwrap(),
-        libc::O_RDONLY,
+        lio::api::OpenFlags::READ,
         0,
       )
       .with_lio(ctx.lio())

@@ -9,17 +9,10 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-/// Open flag requesting a directory. Windows opens directories without a
-/// dedicated flag.
-#[cfg(unix)]
-const O_DIRECTORY: i32 = libc::O_DIRECTORY;
-#[cfg(not(unix))]
-const O_DIRECTORY: i32 = 0;
+use std::os::unix::ffi::OsStringExt;
 
 use crate::api::{
-  FileStat, FileType, ReadDirBuf, UnlinkKind,
+  FileStat, FileType, OpenFlags, ReadDirBuf, UnlinkKind,
   io::Io,
   op::{Action, Completion, OneshotOpModel, OpModel, OpResult},
   ops,
@@ -104,7 +97,7 @@ impl Directory {
       inner: ops::OpenAt::new(
         Resource::cwd(),
         path,
-        libc::O_RDONLY | O_DIRECTORY,
+        OpenFlags::READ | OpenFlags::DIRECTORY,
         0,
       ),
     })
@@ -258,23 +251,25 @@ impl OpenOptions {
     })
   }
 
-  fn flags(&self) -> i32 {
-    let mut flags = match (self.read, self.write || self.append) {
-      (true, false) => libc::O_RDONLY,
-      (false, true) => libc::O_WRONLY,
-      (true, true) => libc::O_RDWR,
-      (false, false) => libc::O_RDONLY,
-    };
+  fn flags(&self) -> OpenFlags {
+    let mut flags = OpenFlags::empty();
+    // With neither read nor write requested, open read-only.
+    if self.read || !(self.write || self.append) {
+      flags |= OpenFlags::READ;
+    }
+    if self.write {
+      flags |= OpenFlags::WRITE;
+    }
     if self.append {
-      flags |= libc::O_APPEND;
+      flags |= OpenFlags::APPEND;
     }
     if self.truncate {
-      flags |= libc::O_TRUNC;
+      flags |= OpenFlags::TRUNCATE;
     }
     if self.create_new {
-      flags |= libc::O_CREAT | libc::O_EXCL;
+      flags |= OpenFlags::CREATE | OpenFlags::EXCLUSIVE;
     } else if self.create {
-      flags |= libc::O_CREAT;
+      flags |= OpenFlags::CREATE;
     }
     flags
   }
@@ -354,7 +349,7 @@ impl OpenReadDir {
       state: OpenReadDirState::Opening(ops::OpenAt::new(
         Resource::cwd(),
         path,
-        libc::O_RDONLY | O_DIRECTORY,
+        OpenFlags::READ | OpenFlags::DIRECTORY,
         0,
       )),
       parent,
@@ -513,7 +508,7 @@ impl RemoveDirAll {
         op: ops::OpenAt::new(
           parent.clone(),
           path.clone(),
-          libc::O_RDONLY | O_DIRECTORY,
+          OpenFlags::READ | OpenFlags::DIRECTORY,
           0,
         ),
         parent,
@@ -536,7 +531,7 @@ impl RemoveDirAll {
               op: ops::OpenAt::new(
                 frame.fd.clone(),
                 entry.name.clone(),
-                libc::O_RDONLY | O_DIRECTORY,
+                OpenFlags::READ | OpenFlags::DIRECTORY,
                 0,
               ),
               parent: frame.fd.clone(),
@@ -647,7 +642,7 @@ impl OpModel for RemoveDirAll {
                 op: ops::OpenAt::new(
                   parent.clone(),
                   name.clone(),
-                  libc::O_RDONLY | O_DIRECTORY,
+                  OpenFlags::READ | OpenFlags::DIRECTORY,
                   0,
                 ),
                 parent,
@@ -781,7 +776,7 @@ impl ReadToString {
       state: ReadToStringState::Opening(ops::OpenAt::new(
         Resource::cwd(),
         path,
-        libc::O_RDONLY,
+        OpenFlags::READ,
         0,
       )),
       bytes: Vec::new(),
@@ -940,15 +935,7 @@ fn os_string_from_bytes(bytes: &[u8]) -> OsString {
 }
 
 fn path_to_cstring(path: &std::path::Path) -> io::Result<CString> {
-  #[cfg(unix)]
-  {
-    CString::new(path.as_os_str().as_bytes())
-      .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
-  }
-
-  #[cfg(not(unix))]
-  {
-    CString::new(path.to_string_lossy().as_bytes())
-      .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
-  }
+  CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+    io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte")
+  })
 }

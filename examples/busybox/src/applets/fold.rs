@@ -59,9 +59,14 @@ fn open_input(
   match path {
     Some(path) => io_util::run(
       ctx.lio(),
-      api::openat(&ctx.cwd(), std::ffi::CString::new(path)?, libc::O_RDONLY, 0)
-        .with_lio(ctx.lio())
-        .send(),
+      api::openat(
+        &ctx.cwd(),
+        std::ffi::CString::new(path)?,
+        lio::api::OpenFlags::READ,
+        0,
+      )
+      .with_lio(ctx.lio())
+      .send(),
     ),
     None => Ok(ctx.stdin()),
   }

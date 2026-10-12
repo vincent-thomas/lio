@@ -1999,7 +1999,7 @@ macro_rules! test_io_backend {
           Op::OpenAt {
             dir_fd: Resource::cwd(),
             path: path.as_os_str().to_os_string(),
-            flags: OpenFlags::from_bits(libc::O_RDONLY),
+            flags: OpenFlags::READ,
             mode: FileMode::from_bits(0),
           },
         );
@@ -2028,7 +2028,7 @@ macro_rules! test_io_backend {
           Op::OpenAt {
             dir_fd: Resource::cwd(),
             path: path.as_os_str().to_os_string(),
-            flags: OpenFlags::from_bits(libc::O_RDONLY),
+            flags: OpenFlags::READ,
             mode: FileMode::from_bits(0),
           },
         );

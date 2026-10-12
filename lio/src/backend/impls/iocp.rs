@@ -31,9 +31,9 @@ use std::time::{Duration, Instant};
 
 use bumpalo::Bump;
 use windows_sys::Win32::Foundation::{
-  CloseHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_INVALID_PARAMETER,
-  ERROR_IO_PENDING, ERROR_NOT_SUPPORTED, FALSE, GetLastError, HANDLE,
-  INVALID_HANDLE_VALUE, TRUE, WAIT_TIMEOUT,
+  CloseHandle, ERROR_BROKEN_PIPE, ERROR_DIRECTORY, ERROR_HANDLE_EOF,
+  ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_NOT_SUPPORTED, FALSE,
+  GetLastError, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock as ws;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -55,7 +55,7 @@ use crate::backend::impls::sockaddr::{
 use crate::backend::native::CWD as CWD_HANDLE;
 use crate::backend::op::{
   DirEntryRef, FileStat, FileType, LinkKind, MsgRecv, MsgSend, Op,
-  OpaqueDropFn, RawBuf, ReadDirResult, ShutdownHow, SocketAddrBuf,
+  OpaqueDropFn, OpenFlags, RawBuf, ReadDirResult, ShutdownHow, SocketAddrBuf,
   SocketAddrFamily, SpawnSpec, StatTarget, UnlinkKind,
 };
 use crate::backend::{IoBackend, OpCompleted};
@@ -383,7 +383,7 @@ impl Iocp {
         Some(if ok == FALSE { last_error() } else { 0 })
       }
       Op::OpenAt { dir_fd, path, flags, mode: _ } => {
-        Some(open_at(&dir_fd, &path, flags.bits()).unwrap_or_else(io_error))
+        Some(open_at(&dir_fd, &path, flags).unwrap_or_else(io_error))
       }
       Op::Stat { target, out } => Some(match stat(&target) {
         Ok(stat) => {
@@ -1115,25 +1115,36 @@ fn resolve(dir: &Resource, path: &OsStr) -> io::Result<PathBuf> {
   Ok(final_path(handle_of(dir))?.join(path))
 }
 
-fn open_at(dir: &Resource, path: &OsStr, bits: i32) -> io::Result<isize> {
+fn open_at(
+  dir: &Resource,
+  path: &OsStr,
+  flags: OpenFlags,
+) -> io::Result<isize> {
+  if !flags.reads() && !flags.writes() {
+    return Err(io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32));
+  }
   let path = resolve(dir, path)?;
-  let access = bits & (libc::O_WRONLY | libc::O_RDWR);
   let mut options = OpenOptions::new();
-  // Directories can only be opened with backup semantics.
+  // Directories can only be opened with backup semantics. std opens handles
+  // non-inheritable, so they never leak into child processes.
   options
     .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-    .read(access != libc::O_WRONLY)
-    .write(access != libc::O_RDONLY)
-    .append(bits & libc::O_APPEND != 0)
-    .truncate(bits & libc::O_TRUNC != 0);
-  if bits & libc::O_CREAT != 0 {
-    if bits & libc::O_EXCL != 0 {
+    .read(flags.reads())
+    .write(flags.contains(OpenFlags::WRITE))
+    .append(flags.contains(OpenFlags::APPEND))
+    .truncate(flags.contains(OpenFlags::TRUNCATE));
+  if flags.contains(OpenFlags::CREATE) {
+    if flags.contains(OpenFlags::EXCLUSIVE) {
       options.create_new(true);
     } else {
       options.create(true);
     }
   }
-  Ok(options.open(path)?.into_raw_handle() as isize)
+  let file = options.open(path)?;
+  if flags.contains(OpenFlags::DIRECTORY) && !file.metadata()?.is_dir() {
+    return Err(io::Error::from_raw_os_error(ERROR_DIRECTORY as i32));
+  }
+  Ok(file.into_raw_handle() as isize)
 }
 
 fn stat(target: &StatTarget) -> io::Result<FileStat> {

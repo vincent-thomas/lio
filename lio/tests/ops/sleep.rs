@@ -26,7 +26,10 @@ fn open_rw_file(lio: &mut Lio, path: std::ffi::CString) -> Resource {
   let mut receiver = api::openat(
     &Resource::cwd(),
     path,
-    libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+    lio::api::OpenFlags::READ
+      | lio::api::OpenFlags::WRITE
+      | lio::api::OpenFlags::CREATE
+      | lio::api::OpenFlags::TRUNCATE,
     0o644,
   )
   .with_lio(lio)

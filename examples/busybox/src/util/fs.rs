@@ -68,7 +68,7 @@ pub fn read_dir_paths(
         api::openat(
           &ctx.cwd(),
           path_to_cstring(path)?,
-          libc::O_RDONLY | libc::O_DIRECTORY,
+          lio::api::OpenFlags::READ | lio::api::OpenFlags::DIRECTORY,
           0,
         )
         .with_lio(ctx.lio())

@@ -55,8 +55,10 @@ impl Command for TouchCommand {
     let mut open_receivers = Vec::with_capacity(self.files.len());
     for path in &self.files {
       let cpath = CString::new(path.as_str())?;
-      let flags =
-        libc::O_WRONLY | if self.no_create { 0 } else { libc::O_CREAT };
+      let mut flags = lio::api::OpenFlags::WRITE;
+      if !self.no_create {
+        flags |= lio::api::OpenFlags::CREATE;
+      }
       let mode = if self.no_create { 0 } else { 0o666 };
       open_receivers
         .push(api::openat(&cwd, cpath, flags, mode).with_lio(ctx.lio()).send());

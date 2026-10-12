@@ -22,7 +22,12 @@ fn new_ds_lio() -> Lio {
   .unwrap()
 }
 
-fn open_file(lio: &mut Lio, path: CString, flags: i32, mode: u32) -> Resource {
+fn open_file(
+  lio: &mut Lio,
+  path: CString,
+  flags: lio::api::OpenFlags,
+  mode: u32,
+) -> Resource {
   let mut receiver =
     api::openat(&Resource::cwd(), path, flags, mode).with_lio(lio).send();
   common::poll_recv(lio, &mut receiver).unwrap()
@@ -55,7 +60,9 @@ fn test_unlinkat_file() {
   let _file = open_file(
     &mut lio,
     path.clone(),
-    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+    lio::api::OpenFlags::WRITE
+      | lio::api::OpenFlags::CREATE
+      | lio::api::OpenFlags::TRUNCATE,
     0o644,
   );
 

@@ -38,8 +38,8 @@ use crate::api::resource::Resource;
 use crate::backend::op::SendFlags;
 use crate::backend::op::{
   self, DirEntryRef, FileStat, FileType, MsgRecv, MsgSend, Op, OpaqueDropFn,
-  RawBuf, ReadDirResult, ReadFlags, RecvFlags, ShutdownHow, SockDomain,
-  SockProto, SockType, SocketAddrBuf, SocketAddrFamily, UnlinkKind,
+  OpenFlags, RawBuf, ReadDirResult, ReadFlags, RecvFlags, ShutdownHow,
+  SockDomain, SockProto, SockType, SocketAddrBuf, SocketAddrFamily, UnlinkKind,
 };
 use crate::backend::{IoBackend, OpCompleted};
 use crate::{Lio, install_global};
@@ -52,18 +52,12 @@ const WINDOWS_CWD_KEY: i32 = -100;
 /// dropping them must not close anything real.
 unsafe fn close_simulated(_raw: crate::api::resource::RawResource) {}
 
-/// Mode and open-flag bits the simulation interprets.
-///
-/// Callers pass the platform's native `O_*` bits; where the platform has no
-/// equivalent (Windows' CRT), the simulation falls back to Linux values.
+/// File-type mode bits the simulation reports; Linux values where the
+/// platform has none (Windows' CRT).
 mod sim {
   #[cfg(unix)]
-  pub(super) use libc::{O_ACCMODE, O_DIRECTORY, S_IFLNK, S_IFSOCK};
+  pub(super) use libc::{S_IFLNK, S_IFSOCK};
 
-  #[cfg(not(unix))]
-  pub(super) const O_ACCMODE: i32 = 0o3;
-  #[cfg(not(unix))]
-  pub(super) const O_DIRECTORY: i32 = 0o200000;
   #[cfg(not(unix))]
   pub(super) const S_IFLNK: u32 = 0o120000;
   #[cfg(not(unix))]
@@ -1748,16 +1742,13 @@ impl DSBackend {
     fd
   }
 
-  fn make_file_handle(&self, path: Vec<u8>, flags: i32) -> SimFileHandle {
-    let accmode = flags & sim::O_ACCMODE;
-    let readable = accmode != libc::O_WRONLY;
-    let writable = accmode != libc::O_RDONLY;
+  fn make_file_handle(&self, path: Vec<u8>, flags: OpenFlags) -> SimFileHandle {
     SimFileHandle {
       path,
       cursor: 0,
-      readable,
-      writable,
-      append: flags & libc::O_APPEND != 0,
+      readable: flags.reads(),
+      writable: flags.writes(),
+      append: flags.contains(OpenFlags::APPEND),
     }
   }
 
@@ -2227,15 +2218,15 @@ impl DSBackend {
           Ok(path) => path,
           Err(err) => return OpAction::Complete(err),
         };
+        if !flags.reads() && !flags.writes() {
+          return OpAction::Complete(-(libc::EINVAL as isize));
+        }
         let exists = self.world.fs.contains_key(&path);
-        if exists
-          && flags.bits() & libc::O_CREAT != 0
-          && flags.bits() & libc::O_EXCL != 0
-        {
+        if exists && flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
           return OpAction::Complete(-(libc::EEXIST as isize));
         }
         if !exists {
-          if flags.bits() & libc::O_CREAT == 0 {
+          if !flags.contains(OpenFlags::CREATE) {
             return OpAction::Complete(-(libc::ENOENT as isize));
           }
           self.world.fs.insert(
@@ -2243,19 +2234,19 @@ impl DSBackend {
             SimNode::File { bytes: Vec::new(), mode: 0o644 },
           );
         }
-        if flags.bits() & sim::O_DIRECTORY != 0 {
+        if flags.contains(OpenFlags::DIRECTORY) {
           let Some(SimNode::Directory { .. }) = self.world.fs.get(&path) else {
             return OpAction::Complete(-(libc::ENOTDIR as isize));
           };
         }
-        if flags.bits() & libc::O_TRUNC != 0
+        if flags.contains(OpenFlags::TRUNCATE)
           && let Some(SimNode::File { bytes, .. }) =
             self.world.fs.get_mut(&path)
         {
           bytes.clear();
         }
         let fd = self.allocate_resource_id();
-        let handle = self.make_file_handle(path, flags.bits());
+        let handle = self.make_file_handle(path, flags);
         self.world.resources.insert(fd, SimResource::File(handle));
         OpAction::Complete(fd as isize)
       }
@@ -5064,7 +5055,7 @@ mod tests {
       Op::OpenAt {
         dir_fd: Resource::cwd(),
         path,
-        flags: crate::backend::op::OpenFlags::from_bits(libc::O_RDONLY),
+        flags: OpenFlags::READ,
         mode: crate::backend::op::FileMode::from_bits(0),
       },
       &mut step_bump,
@@ -5089,9 +5080,10 @@ mod tests {
     let file_fd = 1_000_000;
     backend.world.resources.insert(
       file_fd,
-      SimResource::File(
-        backend.make_file_handle(b"/tmp/file".to_vec(), libc::O_RDWR),
-      ),
+      SimResource::File(backend.make_file_handle(
+        b"/tmp/file".to_vec(),
+        OpenFlags::READ | OpenFlags::WRITE,
+      )),
     );
     let file_resource = dst_resource(file_fd);
     let file_result = backend.complete_op(Op::Fsync { fd: file_resource });
