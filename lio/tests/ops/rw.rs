@@ -270,7 +270,7 @@ fn read_nonexistent_file() {
     CString::new("/tmp/lio_test_nonexistent_12345_abcdef.txt").unwrap();
   let err =
     open_file(&mut lio, path, lio::api::OpenFlags::READ, 0).unwrap_err();
-  assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+  assert_eq!(err.raw_os_error(), Some(lio::backend::ds::errno::ENOENT));
 }
 
 #[test]

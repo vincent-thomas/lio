@@ -84,7 +84,10 @@ fn test_renameat_basic() {
   common::poll_recv(&mut lio, &mut receiver).expect("renameat should succeed");
 
   let old_result = stat_path(&mut lio, old_path);
-  assert_eq!(old_result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+  assert_eq!(
+    old_result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::ENOENT)
+  );
 
   let new_stat =
     stat_path(&mut lio, new_path.clone()).expect("new path should exist");
@@ -112,5 +115,8 @@ fn test_renameat_missing_source_fails() {
       .with_lio(&mut lio)
       .send();
   let result = common::poll_recv(&mut lio, &mut receiver);
-  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+  assert_eq!(
+    result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::ENOENT)
+  );
 }

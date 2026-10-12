@@ -73,7 +73,10 @@ fn test_unlinkat_file() {
   common::poll_recv(&mut lio, &mut receiver).expect("unlinkat should succeed");
 
   let result = stat_path(&mut lio, path);
-  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+  assert_eq!(
+    result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::ENOENT)
+  );
 }
 
 #[test]
@@ -93,5 +96,8 @@ fn test_unlinkat_directory() {
     .expect("unlinkat AT_REMOVEDIR should succeed");
 
   let result = stat_path(&mut lio, path);
-  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+  assert_eq!(
+    result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::ENOENT)
+  );
 }
