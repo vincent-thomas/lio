@@ -48,6 +48,107 @@ use crate::{Lio, install_global};
 #[cfg(windows)]
 const WINDOWS_CWD_KEY: i32 = -100;
 
+/// Error codes the simulation reports, in the host's native error space.
+///
+/// Completions carry raw OS error codes, which `io::Error` decodes per
+/// platform. On Unix these are the `libc` errno values; on Windows each maps
+/// to the equivalent Win32/Winsock code, so simulated errors decode to the
+/// same `io::ErrorKind` as real ones there.
+pub mod errno {
+  #[cfg(unix)]
+  pub use libc::{
+    EACCES, EADDRINUSE, EAGAIN, EBADF, ECONNABORTED, ECONNREFUSED, ECONNRESET,
+    EDESTADDRREQ, EEXIST, EFBIG, EHOSTUNREACH, EINVAL, EIO, EISCONN, EMFILE,
+    ENFILE, ENOENT, ENOSPC, ENOTCONN, ENOTDIR, ENOTSOCK, ENOTSUP, EOPNOTSUPP,
+    EPIPE, EPROTOTYPE, ERANGE, ESPIPE, ETIMEDOUT,
+  };
+
+  /// `ERROR_ACCESS_DENIED`
+  #[cfg(windows)]
+  pub const EACCES: i32 = 5;
+  /// `WSAEADDRINUSE`
+  #[cfg(windows)]
+  pub const EADDRINUSE: i32 = 10048;
+  /// `WSAEWOULDBLOCK`
+  #[cfg(windows)]
+  pub const EAGAIN: i32 = 10035;
+  /// `ERROR_INVALID_HANDLE`
+  #[cfg(windows)]
+  pub const EBADF: i32 = 6;
+  /// `WSAECONNABORTED`
+  #[cfg(windows)]
+  pub const ECONNABORTED: i32 = 10053;
+  /// `WSAECONNREFUSED`
+  #[cfg(windows)]
+  pub const ECONNREFUSED: i32 = 10061;
+  /// `WSAECONNRESET`
+  #[cfg(windows)]
+  pub const ECONNRESET: i32 = 10054;
+  /// `WSAEDESTADDRREQ`
+  #[cfg(windows)]
+  pub const EDESTADDRREQ: i32 = 10039;
+  /// `ERROR_ALREADY_EXISTS`
+  #[cfg(windows)]
+  pub const EEXIST: i32 = 183;
+  /// `ERROR_FILE_TOO_LARGE`
+  #[cfg(windows)]
+  pub const EFBIG: i32 = 223;
+  /// `WSAEHOSTUNREACH`
+  #[cfg(windows)]
+  pub const EHOSTUNREACH: i32 = 10065;
+  /// `ERROR_INVALID_PARAMETER`
+  #[cfg(windows)]
+  pub const EINVAL: i32 = 87;
+  /// `ERROR_IO_DEVICE`
+  #[cfg(windows)]
+  pub const EIO: i32 = 1117;
+  /// `WSAEISCONN`
+  #[cfg(windows)]
+  pub const EISCONN: i32 = 10056;
+  /// `ERROR_TOO_MANY_OPEN_FILES`
+  #[cfg(windows)]
+  pub const EMFILE: i32 = 4;
+  /// `ERROR_NO_SYSTEM_RESOURCES`
+  #[cfg(windows)]
+  pub const ENFILE: i32 = 1450;
+  /// `ERROR_FILE_NOT_FOUND`
+  #[cfg(windows)]
+  pub const ENOENT: i32 = 2;
+  /// `ERROR_DISK_FULL`
+  #[cfg(windows)]
+  pub const ENOSPC: i32 = 112;
+  /// `WSAENOTCONN`
+  #[cfg(windows)]
+  pub const ENOTCONN: i32 = 10057;
+  /// `ERROR_DIRECTORY`
+  #[cfg(windows)]
+  pub const ENOTDIR: i32 = 267;
+  /// `WSAENOTSOCK`
+  #[cfg(windows)]
+  pub const ENOTSOCK: i32 = 10038;
+  /// `ERROR_NOT_SUPPORTED`
+  #[cfg(windows)]
+  pub const ENOTSUP: i32 = 50;
+  /// `WSAEOPNOTSUPP`
+  #[cfg(windows)]
+  pub const EOPNOTSUPP: i32 = 10045;
+  /// `ERROR_BROKEN_PIPE`
+  #[cfg(windows)]
+  pub const EPIPE: i32 = 109;
+  /// `WSAEPROTOTYPE`
+  #[cfg(windows)]
+  pub const EPROTOTYPE: i32 = 10041;
+  /// `ERROR_INSUFFICIENT_BUFFER`
+  #[cfg(windows)]
+  pub const ERANGE: i32 = 122;
+  /// `ERROR_SEEK_ON_DEVICE`
+  #[cfg(windows)]
+  pub const ESPIPE: i32 = 132;
+  /// `WSAETIMEDOUT`
+  #[cfg(windows)]
+  pub const ETIMEDOUT: i32 = 10060;
+}
+
 /// Resources from the simulation are synthetic numbers, not OS descriptors:
 /// dropping them must not close anything real.
 unsafe fn close_simulated(_raw: crate::api::resource::RawResource) {}
@@ -1373,42 +1474,48 @@ impl DSBackend {
 
   fn op_errno(&mut self, op: &Op) -> i32 {
     let choices: &[i32] = match op {
-      Op::Read { .. } => &[libc::EIO, libc::EBADF, libc::EINVAL, libc::EAGAIN],
+      Op::Read { .. } => {
+        &[errno::EIO, errno::EBADF, errno::EINVAL, errno::EAGAIN]
+      }
       Op::Write { fd, .. } => {
         match self.world.resources.get(&Self::resource_key(fd)) {
           Some(SimResource::Socket(_)) => {
-            &[libc::EAGAIN, libc::ECONNRESET, libc::EPIPE, libc::EBADF]
+            &[errno::EAGAIN, errno::ECONNRESET, errno::EPIPE, errno::EBADF]
           }
-          _ => {
-            &[libc::EIO, libc::EBADF, libc::EINVAL, libc::ENOSPC, libc::EFBIG]
-          }
+          _ => &[
+            errno::EIO,
+            errno::EBADF,
+            errno::EINVAL,
+            errno::ENOSPC,
+            errno::EFBIG,
+          ],
         }
       }
-      Op::Recv { .. } => &[libc::ECONNRESET, libc::EAGAIN, libc::EBADF],
-      Op::Send { .. } => &[libc::ECONNRESET, libc::EPIPE, libc::EBADF],
-      Op::Accept { .. } => &[libc::ECONNABORTED, libc::EAGAIN, libc::EMFILE],
+      Op::Recv { .. } => &[errno::ECONNRESET, errno::EAGAIN, errno::EBADF],
+      Op::Send { .. } => &[errno::ECONNRESET, errno::EPIPE, errno::EBADF],
+      Op::Accept { .. } => &[errno::ECONNABORTED, errno::EAGAIN, errno::EMFILE],
       Op::Connect { .. } => {
-        &[libc::ECONNREFUSED, libc::ETIMEDOUT, libc::ENOENT]
+        &[errno::ECONNREFUSED, errno::ETIMEDOUT, errno::ENOENT]
       }
-      Op::OpenAt { .. } => &[libc::ENOENT, libc::EACCES],
-      Op::UnlinkAt { .. } => &[libc::ENOENT, libc::EACCES],
-      Op::RenameAt { .. } => &[libc::ENOENT, libc::EACCES],
-      Op::MkdirAt { .. } => &[libc::EEXIST, libc::EACCES],
-      Op::LinkAt { .. } => &[libc::ENOENT, libc::EEXIST],
-      Op::ReadlinkAt { .. } => &[libc::ENOENT, libc::EINVAL],
-      Op::GetCwd { .. } => &[libc::ERANGE],
-      Op::Spawn { .. } => &[libc::ENOENT, libc::EACCES],
-      Op::Socket { .. } => &[libc::EMFILE, libc::ENFILE],
-      Op::Bind { .. } => &[libc::EADDRINUSE, libc::EACCES],
-      Op::Listen { .. } => &[libc::EINVAL, libc::ENOTSOCK],
-      Op::Shutdown { .. } => &[libc::ENOTSOCK, libc::EINVAL],
-      Op::Fsync { .. } => &[libc::EBADF, libc::EINVAL, libc::EIO],
+      Op::OpenAt { .. } => &[errno::ENOENT, errno::EACCES],
+      Op::UnlinkAt { .. } => &[errno::ENOENT, errno::EACCES],
+      Op::RenameAt { .. } => &[errno::ENOENT, errno::EACCES],
+      Op::MkdirAt { .. } => &[errno::EEXIST, errno::EACCES],
+      Op::LinkAt { .. } => &[errno::ENOENT, errno::EEXIST],
+      Op::ReadlinkAt { .. } => &[errno::ENOENT, errno::EINVAL],
+      Op::GetCwd { .. } => &[errno::ERANGE],
+      Op::Spawn { .. } => &[errno::ENOENT, errno::EACCES],
+      Op::Socket { .. } => &[errno::EMFILE, errno::ENFILE],
+      Op::Bind { .. } => &[errno::EADDRINUSE, errno::EACCES],
+      Op::Listen { .. } => &[errno::EINVAL, errno::ENOTSOCK],
+      Op::Shutdown { .. } => &[errno::ENOTSOCK, errno::EINVAL],
+      Op::Fsync { .. } => &[errno::EBADF, errno::EINVAL, errno::EIO],
       Op::Stat { target, .. } => match target {
-        op::StatTarget::Path { .. } => &[libc::ENOENT, libc::EACCES],
-        op::StatTarget::Fd { .. } => &[libc::EBADF],
+        op::StatTarget::Path { .. } => &[errno::ENOENT, errno::EACCES],
+        op::StatTarget::Fd { .. } => &[errno::EBADF],
       },
-      Op::ReadDir { .. } => &[libc::EBADF, libc::EINVAL],
-      Op::Nop => &[libc::EIO],
+      Op::ReadDir { .. } => &[errno::EBADF, errno::EINVAL],
+      Op::Nop => &[errno::EIO],
     };
     choices[self.fault_rng.range_usize(choices.len())]
   }
@@ -1521,12 +1628,12 @@ impl DSBackend {
       return Ok(self.fake_cwd().to_vec());
     }
     let Some(SimResource::File(handle)) = self.world.resources.get(&raw) else {
-      return Err(-(libc::EBADF as isize));
+      return Err(-(errno::EBADF as isize));
     };
     match self.world.fs.get(&handle.path) {
       Some(SimNode::Directory { .. }) => Ok(handle.path.clone()),
-      Some(_) => Err(-(libc::ENOTDIR as isize)),
-      None => Err(-(libc::ENOENT as isize)),
+      Some(_) => Err(-(errno::ENOTDIR as isize)),
+      None => Err(-(errno::ENOENT as isize)),
     }
   }
 
@@ -1549,7 +1656,7 @@ impl DSBackend {
     bytes: &[u8],
   ) -> isize {
     if buf_len < bytes.len() + 1 {
-      return -(libc::ERANGE as isize);
+      return -(errno::ERANGE as isize);
     }
     // SAFETY: caller provides a writable output buffer of `buf_len` bytes.
     let out = unsafe { std::slice::from_raw_parts_mut(buf.as_ptr(), buf_len) };
@@ -1770,11 +1877,11 @@ impl DSBackend {
     allow_pending: bool,
   ) -> Result<PendingResult<Vec<u8>>, isize> {
     let Some(resource) = self.world.resources.remove(&raw) else {
-      return Err(-(libc::EBADF as isize));
+      return Err(-(errno::EBADF as isize));
     };
     let SimResource::Socket(mut socket) = resource else {
       self.world.resources.insert(raw, resource);
-      return Err(-(libc::EBADF as isize));
+      return Err(-(errno::EBADF as isize));
     };
 
     if socket.shutdown_read {
@@ -1787,7 +1894,7 @@ impl DSBackend {
       if allow_pending && is_connected {
         return Ok(PendingResult::Pending);
       }
-      return Err(-(libc::ENOTSUP as isize));
+      return Err(-(errno::ENOTSUP as isize));
     }
 
     let take = self.choose_len(socket.inbox.len().min(len_hint.max(1)), false);
@@ -1825,7 +1932,7 @@ impl DSBackend {
     match op {
       Op::Read { fd, iovecs, iov_count, offset, flags } => {
         if offset < -1 || flags.bits() < 0 || offset >= 0 {
-          return PendingAction::Complete(-(libc::EINVAL as isize));
+          return PendingAction::Complete(-(errno::EINVAL as isize));
         }
         let raw = Self::resource_key(&fd);
         let total: usize =
@@ -1849,7 +1956,7 @@ impl DSBackend {
       }
       Op::Recv { fd, msg, flags } => {
         if flags.bits() < 0 {
-          return PendingAction::Complete(-(libc::EINVAL as isize));
+          return PendingAction::Complete(-(errno::EINVAL as isize));
         }
         let raw = Self::resource_key(&fd);
         let total = unsafe {
@@ -1885,15 +1992,15 @@ impl DSBackend {
       Op::Accept { fd, addr } => {
         let raw = Self::resource_key(&fd);
         let Some(resource) = self.world.resources.remove(&raw) else {
-          return PendingAction::Complete(-(libc::EBADF as isize));
+          return PendingAction::Complete(-(errno::EBADF as isize));
         };
         let SimResource::Socket(mut listener) = resource else {
           self.world.resources.insert(raw, resource);
-          return PendingAction::Complete(-(libc::EBADF as isize));
+          return PendingAction::Complete(-(errno::EBADF as isize));
         };
         if !listener.listening {
           self.world.resources.insert(raw, SimResource::Socket(listener));
-          return PendingAction::Complete(-(libc::EINVAL as isize));
+          return PendingAction::Complete(-(errno::EINVAL as isize));
         }
         let Some(accepted_fd) = listener.pending_accept.pop_front() else {
           self.world.resources.insert(raw, SimResource::Socket(listener));
@@ -1914,7 +2021,7 @@ impl DSBackend {
         self.world.resources.insert(raw, SimResource::Socket(listener));
         PendingAction::Complete(accepted_fd as isize)
       }
-      _ => PendingAction::Complete(-(libc::EINVAL as isize)),
+      _ => PendingAction::Complete(-(errno::EINVAL as isize)),
     }
   }
 
@@ -1926,19 +2033,19 @@ impl DSBackend {
   ) -> Result<Vec<u8>, isize> {
     let raw = Self::resource_key(fd);
     if offset.is_some() && Self::is_builtin_stdin(raw) {
-      return Err(-(libc::ESPIPE as isize));
+      return Err(-(errno::ESPIPE as isize));
     }
     if Self::is_builtin_stdin(raw) {
-      return Err(-(libc::ENOTSUP as isize));
+      return Err(-(errno::ENOTSUP as isize));
     }
     let Some(resource) = self.world.resources.remove(&raw) else {
-      return Err(-(libc::EBADF as isize));
+      return Err(-(errno::EBADF as isize));
     };
     match resource {
       SimResource::File(mut handle) => {
         if !handle.readable {
           self.world.resources.insert(raw, SimResource::File(handle));
-          return Err(-(libc::EBADF as isize));
+          return Err(-(errno::EBADF as isize));
         }
         let start = offset.unwrap_or(handle.cursor);
         let remaining = match self.world.fs.get(&handle.path) {
@@ -1962,12 +2069,12 @@ impl DSBackend {
       SimResource::Socket(socket) => {
         if offset.is_some() {
           self.world.resources.insert(raw, SimResource::Socket(socket));
-          return Err(-(libc::ESPIPE as isize));
+          return Err(-(errno::ESPIPE as isize));
         }
         self.world.resources.insert(raw, SimResource::Socket(socket));
         match self.try_read_socket_bytes(raw, len_hint, false)? {
           PendingResult::Ready(bytes) => Ok(bytes),
-          PendingResult::Pending => Err(-(libc::ENOTSUP as isize)),
+          PendingResult::Pending => Err(-(errno::ENOTSUP as isize)),
         }
       }
     }
@@ -1981,19 +2088,19 @@ impl DSBackend {
   ) -> Result<usize, isize> {
     let raw = Self::resource_key(fd);
     if offset.is_some() && Self::is_builtin_stdout(raw) {
-      return Err(-(libc::ESPIPE as isize));
+      return Err(-(errno::ESPIPE as isize));
     }
     if Self::is_builtin_stdout(raw) {
       return Ok(self.choose_len(bytes.len().max(1), false));
     }
     let Some(resource) = self.world.resources.remove(&raw) else {
-      return Err(-(libc::EBADF as isize));
+      return Err(-(errno::EBADF as isize));
     };
     match resource {
       SimResource::File(mut handle) => {
         if !handle.writable {
           self.world.resources.insert(raw, SimResource::File(handle));
-          return Err(-(libc::EBADF as isize));
+          return Err(-(errno::EBADF as isize));
         }
         let to_write =
           self.choose_len(bytes.len().max(1), false).min(bytes.len());
@@ -2001,7 +2108,7 @@ impl DSBackend {
           self.world.fs.get_mut(&handle.path)
         else {
           self.world.resources.insert(raw, SimResource::File(handle));
-          return Err(-(libc::ENOENT as isize));
+          return Err(-(errno::ENOENT as isize));
         };
         let start = if handle.append {
           file_bytes.len()
@@ -2022,11 +2129,11 @@ impl DSBackend {
       SimResource::Socket(socket) => {
         if offset.is_some() {
           self.world.resources.insert(raw, SimResource::Socket(socket));
-          return Err(-(libc::ESPIPE as isize));
+          return Err(-(errno::ESPIPE as isize));
         }
         if socket.shutdown_write {
           self.world.resources.insert(raw, SimResource::Socket(socket));
-          return Err(-(libc::EPIPE as isize));
+          return Err(-(errno::EPIPE as isize));
         }
         let to_write =
           self.choose_len(bytes.len().max(1), false).min(bytes.len());
@@ -2057,10 +2164,10 @@ impl DSBackend {
     match op {
       Op::Read { fd, iovecs, iov_count, offset, flags } => {
         if offset < -1 {
-          return OpAction::Complete(-(libc::EINVAL as isize));
+          return OpAction::Complete(-(errno::EINVAL as isize));
         }
         if flags.bits() < 0 {
-          return OpAction::Complete(-(libc::ENOTSUP as isize));
+          return OpAction::Complete(-(errno::ENOTSUP as isize));
         }
         let total: usize =
           // SAFETY: read-only access to caller-provided iovec metadata.
@@ -2105,10 +2212,10 @@ impl DSBackend {
       }
       Op::Write { fd, iovecs, iov_count, offset, flags } => {
         if offset < -1 {
-          return OpAction::Complete(-(libc::EINVAL as isize));
+          return OpAction::Complete(-(errno::EINVAL as isize));
         }
         if flags.bits() < 0 {
-          return OpAction::Complete(-(libc::ENOTSUP as isize));
+          return OpAction::Complete(-(errno::ENOTSUP as isize));
         }
         let bytes = Self::extract_iovec_bytes(iovecs, iov_count);
         match self.write_bytes_to_resource(
@@ -2122,7 +2229,7 @@ impl DSBackend {
       }
       Op::Recv { fd, msg, flags } => {
         if flags.bits() < 0 {
-          return OpAction::Complete(-(libc::EINVAL as isize));
+          return OpAction::Complete(-(errno::EINVAL as isize));
         }
         let total =
           // SAFETY: `MsgRecv` buffers stay alive for the op lifetime.
@@ -2162,7 +2269,7 @@ impl DSBackend {
       }
       Op::Send { fd, msg, flags } => {
         if flags.bits() < 0 {
-          return OpAction::Complete(-(libc::EINVAL as isize));
+          return OpAction::Complete(-(errno::EINVAL as isize));
         }
         let bytes = Self::read_msg_send(msg);
         match self.write_bytes_to_resource(&fd, &bytes, None) {
@@ -2182,22 +2289,22 @@ impl DSBackend {
         let Some(SimResource::Socket(mut socket)) =
           self.world.resources.remove(&raw)
         else {
-          return OpAction::Complete(-(libc::EBADF as isize));
+          return OpAction::Complete(-(errno::EBADF as isize));
         };
         let Some(listener_fd) = self.world.bound_listeners.get(&key).copied()
         else {
           self.world.resources.insert(raw, SimResource::Socket(socket));
-          return OpAction::Complete(-(libc::ENOENT as isize));
+          return OpAction::Complete(-(errno::ENOENT as isize));
         };
         let Some(SimResource::Socket(listener_socket)) =
           self.world.resources.get(&listener_fd)
         else {
           self.world.resources.insert(raw, SimResource::Socket(socket));
-          return OpAction::Complete(-(libc::ENOENT as isize));
+          return OpAction::Complete(-(errno::ENOENT as isize));
         };
         if !listener_socket.listening {
           self.world.resources.insert(raw, SimResource::Socket(socket));
-          return OpAction::Complete(-(libc::EINVAL as isize));
+          return OpAction::Complete(-(errno::EINVAL as isize));
         }
         let accepted_fd =
           self.create_socket_resource(socket.domain, socket.ty, socket.proto);
@@ -2219,15 +2326,15 @@ impl DSBackend {
           Err(err) => return OpAction::Complete(err),
         };
         if !flags.reads() && !flags.writes() {
-          return OpAction::Complete(-(libc::EINVAL as isize));
+          return OpAction::Complete(-(errno::EINVAL as isize));
         }
         let exists = self.world.fs.contains_key(&path);
         if exists && flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
-          return OpAction::Complete(-(libc::EEXIST as isize));
+          return OpAction::Complete(-(errno::EEXIST as isize));
         }
         if !exists {
           if !flags.contains(OpenFlags::CREATE) {
-            return OpAction::Complete(-(libc::ENOENT as isize));
+            return OpAction::Complete(-(errno::ENOENT as isize));
           }
           self.world.fs.insert(
             path.clone(),
@@ -2236,7 +2343,7 @@ impl DSBackend {
         }
         if flags.contains(OpenFlags::DIRECTORY) {
           let Some(SimNode::Directory { .. }) = self.world.fs.get(&path) else {
-            return OpAction::Complete(-(libc::ENOTDIR as isize));
+            return OpAction::Complete(-(errno::ENOTDIR as isize));
           };
         }
         if flags.contains(OpenFlags::TRUNCATE)
@@ -2253,12 +2360,12 @@ impl DSBackend {
       Op::UnlinkAt { path, kind, .. } => {
         let path = Self::os_path(&path);
         let Some(node) = self.world.fs.get(&path) else {
-          return OpAction::Complete(-(libc::ENOENT as isize));
+          return OpAction::Complete(-(errno::ENOENT as isize));
         };
         if matches!(kind, UnlinkKind::Directory)
           && !matches!(node, SimNode::Directory { .. })
         {
-          return OpAction::Complete(-(libc::ENOENT as isize));
+          return OpAction::Complete(-(errno::ENOENT as isize));
         }
         self.world.fs.remove(&path);
         OpAction::Complete(0)
@@ -2267,7 +2374,7 @@ impl DSBackend {
         let old_path = Self::os_path(&old_path);
         let new_path = Self::os_path(&new_path);
         let Some(node) = self.world.fs.remove(&old_path) else {
-          return OpAction::Complete(-(libc::ENOENT as isize));
+          return OpAction::Complete(-(errno::ENOENT as isize));
         };
         self.world.fs.insert(new_path, node);
         OpAction::Complete(0)
@@ -2275,7 +2382,7 @@ impl DSBackend {
       Op::MkdirAt { path, .. } => {
         let path = Self::os_path(&path);
         if self.world.fs.contains_key(&path) {
-          return OpAction::Complete(-(libc::EEXIST as isize));
+          return OpAction::Complete(-(errno::EEXIST as isize));
         }
         self.world.fs.insert(path, SimNode::Directory { mode: 0o755 });
         OpAction::Complete(0)
@@ -2286,7 +2393,7 @@ impl DSBackend {
         match kind {
           op::LinkKind::Hard => {
             let Some(node) = self.world.fs.get(&source_path).cloned() else {
-              return OpAction::Complete(-(libc::ENOENT as isize));
+              return OpAction::Complete(-(errno::ENOENT as isize));
             };
             self.world.fs.insert(new_path, node);
           }
@@ -2303,7 +2410,7 @@ impl DSBackend {
         let path = Self::os_path(&path);
         let Some(SimNode::Symlink { target, .. }) = self.world.fs.get(&path)
         else {
-          return OpAction::Complete(-(libc::ENOENT as isize));
+          return OpAction::Complete(-(errno::ENOENT as isize));
         };
         OpAction::Complete(Self::write_c_string_bytes(buf, buf_len, target))
       }
@@ -2324,13 +2431,13 @@ impl DSBackend {
         let path = Self::normalize_path(spec.program.as_encoded_bytes());
 
         if path.is_empty() || !self.world.fs.contains_key(&path) {
-          return OpAction::Complete(-(libc::ENOENT as isize));
+          return OpAction::Complete(-(errno::ENOENT as isize));
         }
         OpAction::Complete(self.allocate_pid() as isize)
       }
       Op::Socket { domain, ty, proto } => {
         if !op::is_supported_socket(domain, ty, proto) {
-          return OpAction::Complete(-(libc::EINVAL as isize));
+          return OpAction::Complete(-(errno::EINVAL as isize));
         }
         OpAction::Complete(
           self.create_socket_resource(domain, ty, proto) as isize
@@ -2346,7 +2453,7 @@ impl DSBackend {
             .iter()
             .any(|occupied| occupied == &key)
         {
-          return OpAction::Complete(-(libc::EADDRINUSE as isize));
+          return OpAction::Complete(-(errno::EADDRINUSE as isize));
         }
         let Some(SimResource::Socket(mut socket)) =
           self.world.resources.remove(&raw)
@@ -2355,9 +2462,9 @@ impl DSBackend {
             || Self::is_builtin_stdout(raw)
             || Self::is_builtin_cwd(raw)
           {
-            return OpAction::Complete(-(libc::ENOTSOCK as isize));
+            return OpAction::Complete(-(errno::ENOTSOCK as isize));
           }
-          return OpAction::Complete(-(libc::EBADF as isize));
+          return OpAction::Complete(-(errno::EBADF as isize));
         };
         socket.bound = Some(addr);
         self.world.resources.insert(raw, SimResource::Socket(socket));
@@ -2373,9 +2480,9 @@ impl DSBackend {
             || Self::is_builtin_stdout(raw)
             || Self::is_builtin_cwd(raw)
           {
-            return OpAction::Complete(-(libc::ENOTSOCK as isize));
+            return OpAction::Complete(-(errno::ENOTSOCK as isize));
           }
-          return OpAction::Complete(-(libc::EBADF as isize));
+          return OpAction::Complete(-(errno::EBADF as isize));
         };
         socket.listening = true;
         socket.backlog = backlog;
@@ -2391,9 +2498,9 @@ impl DSBackend {
             || Self::is_builtin_stdout(raw)
             || Self::is_builtin_cwd(raw)
           {
-            return OpAction::Complete(-(libc::ENOTSOCK as isize));
+            return OpAction::Complete(-(errno::ENOTSOCK as isize));
           }
-          return OpAction::Complete(-(libc::EBADF as isize));
+          return OpAction::Complete(-(errno::EBADF as isize));
         };
         let peer = socket.peer;
         match how {
@@ -2425,17 +2532,17 @@ impl DSBackend {
         match self.world.resources.get(&raw) {
           Some(SimResource::File(_)) => OpAction::Complete(0),
           Some(SimResource::Socket(_)) => {
-            OpAction::Complete(-(libc::EINVAL as isize))
+            OpAction::Complete(-(errno::EINVAL as isize))
           }
           None if Self::is_builtin_cwd(raw) => {
-            OpAction::Complete(-(libc::EBADF as isize))
+            OpAction::Complete(-(errno::EBADF as isize))
           }
           None
             if Self::is_builtin_stdin(raw) || Self::is_builtin_stdout(raw) =>
           {
-            OpAction::Complete(-(libc::EINVAL as isize))
+            OpAction::Complete(-(errno::EINVAL as isize))
           }
-          None => OpAction::Complete(-(libc::EBADF as isize)),
+          None => OpAction::Complete(-(errno::EBADF as isize)),
         }
       }
       Op::Stat { target, out } => {
@@ -2444,7 +2551,7 @@ impl DSBackend {
             let path = Self::os_path(&path);
             let Some(node) = self.resolve_path_node(&path, follow_symlinks)
             else {
-              return OpAction::Complete(-(libc::ENOENT as isize));
+              return OpAction::Complete(-(errno::ENOENT as isize));
             };
             Self::file_stat_for_node(node)
           }
@@ -2453,7 +2560,7 @@ impl DSBackend {
             match self.world.resources.get(&raw) {
               Some(SimResource::File(handle)) => {
                 let Some(node) = self.world.fs.get(&handle.path) else {
-                  return OpAction::Complete(-(libc::EBADF as isize));
+                  return OpAction::Complete(-(errno::EBADF as isize));
                 };
                 Self::file_stat_for_node(node)
               }
@@ -2466,7 +2573,7 @@ impl DSBackend {
                 uid: 0,
                 gid: 0,
               },
-              None => return OpAction::Complete(-(libc::EBADF as isize)),
+              None => return OpAction::Complete(-(errno::EBADF as isize)),
             }
           }
         };
@@ -2745,7 +2852,7 @@ impl DST {
                 }
                 client_node.ready.push(OpCompleted::new(
                   connect_id,
-                  -(libc::EHOSTUNREACH as isize),
+                  -(errno::EHOSTUNREACH as isize),
                 ));
               }
 
@@ -2814,7 +2921,7 @@ impl DST {
                 inner: self.inner.clone(),
                 queued: Vec::new(),
               };
-              backend.schedule_stream_link_reset(from, to, libc::ECONNRESET);
+              backend.schedule_stream_link_reset(from, to, errno::ECONNRESET);
               continue;
             }
             {
@@ -3112,7 +3219,7 @@ impl DSTBackend {
           {
             return Ok(PendingResult::Pending);
           }
-          return Err(-(libc::ENOTCONN as isize));
+          return Err(-(errno::ENOTCONN as isize));
         }
         let take = inbox.len().min(len_hint.max(1));
         let mut out = Vec::with_capacity(take);
@@ -3131,7 +3238,7 @@ impl DSTBackend {
         if allow_pending && socket.can_receive_pending() {
           return Ok(PendingResult::Pending);
         }
-        Err(-(libc::EAGAIN as isize))
+        Err(-(errno::EAGAIN as isize))
       }
     }
   }
@@ -3214,17 +3321,17 @@ impl DSTBackend {
     flags: ReadFlags,
   ) -> PendingAction {
     if offset < -1 {
-      return PendingAction::Complete(-(libc::EINVAL as isize));
+      return PendingAction::Complete(-(errno::EINVAL as isize));
     }
     if flags.bits() < 0 {
-      return PendingAction::Complete(-(libc::ENOTSUP as isize));
+      return PendingAction::Complete(-(errno::ENOTSUP as isize));
     }
     if offset >= 0 {
-      return PendingAction::Complete(-(libc::ESPIPE as isize));
+      return PendingAction::Complete(-(errno::ESPIPE as isize));
     }
     let raw = DSBackend::resource_key(fd);
     let Some(socket) = node.sockets.get_mut(&raw) else {
-      return PendingAction::Complete(-(libc::EBADF as isize));
+      return PendingAction::Complete(-(errno::EBADF as isize));
     };
     let total: usize =
       // SAFETY: read-only access to caller-provided iovec metadata.
@@ -3254,11 +3361,11 @@ impl DSTBackend {
     flags: RecvFlags,
   ) -> PendingAction {
     if flags.bits() < 0 {
-      return PendingAction::Complete(-(libc::EINVAL as isize));
+      return PendingAction::Complete(-(errno::EINVAL as isize));
     }
     let raw = DSBackend::resource_key(fd);
     let Some(socket) = node.sockets.get_mut(&raw) else {
-      return PendingAction::Complete(-(libc::EBADF as isize));
+      return PendingAction::Complete(-(errno::EBADF as isize));
     };
     if let Some(out) = msg.from {
       let addr = socket.peer_addr.unwrap_or_else(SocketAddrBuf::unspecified);
@@ -3290,10 +3397,10 @@ impl DSTBackend {
   ) -> PendingAction {
     let raw = DSBackend::resource_key(fd);
     let Some(listener) = node.sockets.get_mut(&raw) else {
-      return PendingAction::Complete(-(libc::EBADF as isize));
+      return PendingAction::Complete(-(errno::EBADF as isize));
     };
     if listener.state != DSTSocketState::Listening {
-      return PendingAction::Complete(-(libc::EINVAL as isize));
+      return PendingAction::Complete(-(errno::EINVAL as isize));
     }
     let Some(accepted_fd) = listener.pending_accept.pop_front() else {
       return PendingAction::KeepPending(Op::Accept { fd: fd.clone(), addr });
@@ -3329,7 +3436,7 @@ impl DSTBackend {
         }
         other => PendingAction::Complete(match other {
           Op::Nop => 0,
-          _ => -(libc::EINVAL as isize),
+          _ => -(errno::EINVAL as isize),
         }),
       };
       match action {
@@ -3352,19 +3459,19 @@ impl DSTBackend {
   ) -> Result<usize, isize> {
     let raw = DSBackend::resource_key(fd);
     if offset.is_some() {
-      return Err(-(libc::ESPIPE as isize));
+      return Err(-(errno::ESPIPE as isize));
     }
 
     let (peer, ty, state, domain, bound) = {
       let mut node = self.node.borrow_mut();
       let Some(socket) = node.sockets.get_mut(&raw) else {
-        return Err(-(libc::EBADF as isize));
+        return Err(-(errno::EBADF as isize));
       };
       if let Some(errno) = socket.peer_reset_error {
         return Err(-(errno as isize));
       }
       if socket.local_shutdown_write {
-        return Err(-(libc::EPIPE as isize));
+        return Err(-(errno::EPIPE as isize));
       }
       (socket.peer, socket.ty, socket.state, socket.domain, socket.bound)
     };
@@ -3377,18 +3484,18 @@ impl DSTBackend {
     match ty {
       SockType::STREAM => {
         if state != DSTSocketState::Connected {
-          return Err(-(libc::ENOTCONN as isize));
+          return Err(-(errno::ENOTCONN as isize));
         }
         let Some(peer_fd) = peer else {
-          return Err(-(libc::ENOTCONN as isize));
+          return Err(-(errno::ENOTCONN as isize));
         };
         if !self.link_is_available(peer_fd) {
           self.schedule_stream_link_reset(
             DSTSocketRef { node_id: self.node_id, fd: raw },
             peer_fd,
-            libc::ECONNRESET,
+            errno::ECONNRESET,
           );
-          return Err(-(libc::EHOSTUNREACH as isize));
+          return Err(-(errno::EHOSTUNREACH as isize));
         }
         let mut inner = self.inner.borrow_mut();
         let base_ready_at_tick =
@@ -3396,7 +3503,7 @@ impl DSTBackend {
         let ready_at_tick = {
           let mut node = self.node.borrow_mut();
           let Some(socket) = node.sockets.get_mut(&raw) else {
-            return Err(-(libc::EBADF as isize));
+            return Err(-(errno::EBADF as isize));
           };
           let ready_at_tick =
             base_ready_at_tick.max(socket.next_stream_ready_at_tick);
@@ -3414,13 +3521,13 @@ impl DSTBackend {
       }
       SockType::DGRAM => {
         if matches!(state, DSTSocketState::Closed) {
-          return Err(-(libc::ENOTCONN as isize));
+          return Err(-(errno::ENOTCONN as isize));
         }
         let peer_fd = if let Some(addr) = to {
           let key = DSBackend::socket_addr_key(&addr);
           let inner = self.inner.borrow();
           let peer =
-            inner.bound.get(&key).copied().ok_or(-(libc::ENOENT as isize))?;
+            inner.bound.get(&key).copied().ok_or(-(errno::ENOENT as isize))?;
           let is_dgram = inner
             .node(peer.node_id)
             .borrow()
@@ -3428,14 +3535,14 @@ impl DSTBackend {
             .get(&peer.fd)
             .is_some_and(|socket| socket.ty == SockType::DGRAM);
           if !is_dgram {
-            return Err(-(libc::EPROTOTYPE as isize));
+            return Err(-(errno::EPROTOTYPE as isize));
           }
           peer
         } else {
-          peer.ok_or(-(libc::EDESTADDRREQ as isize))?
+          peer.ok_or(-(errno::EDESTADDRREQ as isize))?
         };
         if !self.link_is_available(peer_fd) {
-          return Err(-(libc::EHOSTUNREACH as isize));
+          return Err(-(errno::EHOSTUNREACH as isize));
         }
         let mut inner = self.inner.borrow_mut();
         let ready_at_tick =
@@ -3453,7 +3560,7 @@ impl DSTBackend {
           packet: bytes.to_vec(),
         });
       }
-      _ => return Err(-(libc::ENOTSUP as isize)),
+      _ => return Err(-(errno::ENOTSUP as isize)),
     }
     Ok(bytes.len())
   }
@@ -3466,7 +3573,7 @@ impl DSTBackend {
             .node
             .borrow_mut()
             .ready
-            .push(OpCompleted::new(id, -(libc::EINVAL as isize)));
+            .push(OpCompleted::new(id, -(errno::EINVAL as isize)));
           return;
         }
         let fd = {
@@ -3482,7 +3589,7 @@ impl DSTBackend {
         let key = DSBackend::socket_addr_key(&addr);
         let mut node = self.node.borrow_mut();
         let Some(socket) = node.sockets.get_mut(&raw) else {
-          node.ready.push(OpCompleted::new(id, -(libc::EBADF as isize)));
+          node.ready.push(OpCompleted::new(id, -(errno::EBADF as isize)));
           return;
         };
         let mut inner = self.inner.borrow_mut();
@@ -3490,7 +3597,7 @@ impl DSTBackend {
           || inner.listeners.contains_key(&key)
           || inner.occupied_addr_keys.iter().any(|occupied| occupied == &key)
         {
-          node.ready.push(OpCompleted::new(id, -(libc::EADDRINUSE as isize)));
+          node.ready.push(OpCompleted::new(id, -(errno::EADDRINUSE as isize)));
           return;
         }
         socket.bound = Some(addr);
@@ -3504,15 +3611,15 @@ impl DSTBackend {
         let raw = DSBackend::resource_key(&fd);
         let mut node = self.node.borrow_mut();
         let Some(socket) = node.sockets.get_mut(&raw) else {
-          node.ready.push(OpCompleted::new(id, -(libc::EBADF as isize)));
+          node.ready.push(OpCompleted::new(id, -(errno::EBADF as isize)));
           return;
         };
         if socket.ty != SockType::STREAM {
-          node.ready.push(OpCompleted::new(id, -(libc::EOPNOTSUPP as isize)));
+          node.ready.push(OpCompleted::new(id, -(errno::EOPNOTSUPP as isize)));
           return;
         }
         let Some(bound) = socket.bound else {
-          node.ready.push(OpCompleted::new(id, -(libc::EINVAL as isize)));
+          node.ready.push(OpCompleted::new(id, -(errno::EINVAL as isize)));
           return;
         };
         let key = DSBackend::socket_addr_key(&bound);
@@ -3535,7 +3642,7 @@ impl DSTBackend {
               .node
               .borrow_mut()
               .ready
-              .push(OpCompleted::new(id, -(libc::EBADF as isize)));
+              .push(OpCompleted::new(id, -(errno::EBADF as isize)));
             return;
           };
           (socket.domain, socket.ty, socket.proto, socket.bound, socket.state)
@@ -3551,7 +3658,7 @@ impl DSTBackend {
                 .node
                 .borrow_mut()
                 .ready
-                .push(OpCompleted::new(id, -(libc::EISCONN as isize)));
+                .push(OpCompleted::new(id, -(errno::EISCONN as isize)));
               return;
             }
             let listener_ref = {
@@ -3563,7 +3670,7 @@ impl DSTBackend {
                 .node
                 .borrow_mut()
                 .ready
-                .push(OpCompleted::new(id, -(libc::ENOENT as isize)));
+                .push(OpCompleted::new(id, -(errno::ENOENT as isize)));
               return;
             };
             if !self.link_is_available(listener_ref) {
@@ -3571,7 +3678,7 @@ impl DSTBackend {
                 .node
                 .borrow_mut()
                 .ready
-                .push(OpCompleted::new(id, -(libc::EHOSTUNREACH as isize)));
+                .push(OpCompleted::new(id, -(errno::EHOSTUNREACH as isize)));
               return;
             }
             let client_peer_addr = client_bound.unwrap_or_else(|| {
@@ -3579,42 +3686,41 @@ impl DSTBackend {
             });
 
             let listener_node = self.inner.borrow().node(listener_ref.node_id);
-            let server_fd = {
-              let mut listener_node = listener_node.borrow_mut();
-              let Some(listener_socket) =
-                listener_node.sockets.get_mut(&listener_ref.fd)
-              else {
-                self
-                  .node
-                  .borrow_mut()
-                  .ready
-                  .push(OpCompleted::new(id, -(libc::ECONNREFUSED as isize)));
-                return;
-              };
-              let backlog_limit = listener_socket.backlog.max(0) as usize;
-              if listener_socket.state != DSTSocketState::Listening
-                || backlog_limit == 0
-                || listener_socket.pending_accept.len()
-                  + listener_socket.backlog_reserved
-                  >= backlog_limit
+            let server_fd =
               {
-                self
-                  .node
-                  .borrow_mut()
-                  .ready
-                  .push(OpCompleted::new(id, -(libc::ECONNREFUSED as isize)));
-                return;
-              }
-              listener_socket.backlog_reserved += 1;
-              let server_fd = Self::allocate_socket_fd(&mut listener_node);
-              let mut accepted = DSTSocketHandle::new(domain, ty, proto);
-              accepted.state = DSTSocketState::Connected;
-              accepted.peer_addr = Some(client_peer_addr);
-              accepted.peer =
-                Some(DSTSocketRef { node_id: self.node_id, fd: raw });
-              listener_node.sockets.insert(server_fd, accepted);
-              server_fd
-            };
+                let mut listener_node = listener_node.borrow_mut();
+                let Some(listener_socket) =
+                  listener_node.sockets.get_mut(&listener_ref.fd)
+                else {
+                  self.node.borrow_mut().ready.push(OpCompleted::new(
+                    id,
+                    -(errno::ECONNREFUSED as isize),
+                  ));
+                  return;
+                };
+                let backlog_limit = listener_socket.backlog.max(0) as usize;
+                if listener_socket.state != DSTSocketState::Listening
+                  || backlog_limit == 0
+                  || listener_socket.pending_accept.len()
+                    + listener_socket.backlog_reserved
+                    >= backlog_limit
+                {
+                  self.node.borrow_mut().ready.push(OpCompleted::new(
+                    id,
+                    -(errno::ECONNREFUSED as isize),
+                  ));
+                  return;
+                }
+                listener_socket.backlog_reserved += 1;
+                let server_fd = Self::allocate_socket_fd(&mut listener_node);
+                let mut accepted = DSTSocketHandle::new(domain, ty, proto);
+                accepted.state = DSTSocketState::Connected;
+                accepted.peer_addr = Some(client_peer_addr);
+                accepted.peer =
+                  Some(DSTSocketRef { node_id: self.node_id, fd: raw });
+                listener_node.sockets.insert(server_fd, accepted);
+                server_fd
+              };
 
             let source_seq = {
               let mut node = self.node.borrow_mut();
@@ -3652,7 +3758,7 @@ impl DSTBackend {
                 .node
                 .borrow_mut()
                 .ready
-                .push(OpCompleted::new(id, -(libc::ENOENT as isize)));
+                .push(OpCompleted::new(id, -(errno::ENOENT as isize)));
               return;
             };
             if !self.link_is_available(peer_ref) {
@@ -3660,7 +3766,7 @@ impl DSTBackend {
                 .node
                 .borrow_mut()
                 .ready
-                .push(OpCompleted::new(id, -(libc::EHOSTUNREACH as isize)));
+                .push(OpCompleted::new(id, -(errno::EHOSTUNREACH as isize)));
               return;
             }
             let peer_is_dgram = self
@@ -3676,12 +3782,12 @@ impl DSTBackend {
                 .node
                 .borrow_mut()
                 .ready
-                .push(OpCompleted::new(id, -(libc::EPROTOTYPE as isize)));
+                .push(OpCompleted::new(id, -(errno::EPROTOTYPE as isize)));
               return;
             }
             let mut node = self.node.borrow_mut();
             let Some(socket) = node.sockets.get_mut(&raw) else {
-              node.ready.push(OpCompleted::new(id, -(libc::EBADF as isize)));
+              node.ready.push(OpCompleted::new(id, -(errno::EBADF as isize)));
               return;
             };
             socket.state = DSTSocketState::Connected;
@@ -3694,7 +3800,7 @@ impl DSTBackend {
               .node
               .borrow_mut()
               .ready
-              .push(OpCompleted::new(id, -(libc::ENOTSUP as isize)));
+              .push(OpCompleted::new(id, -(errno::ENOTSUP as isize)));
           }
         }
       }
@@ -3704,7 +3810,7 @@ impl DSTBackend {
             .node
             .borrow_mut()
             .ready
-            .push(OpCompleted::new(id, -(libc::EINVAL as isize)));
+            .push(OpCompleted::new(id, -(errno::EINVAL as isize)));
           return;
         }
         let target = msg.to.map(op::socket_addr_into_buf);
@@ -3721,7 +3827,7 @@ impl DSTBackend {
             .node
             .borrow_mut()
             .ready
-            .push(OpCompleted::new(id, -(libc::EINVAL as isize)));
+            .push(OpCompleted::new(id, -(errno::EINVAL as isize)));
           return;
         }
         if flags.bits() < 0 {
@@ -3729,7 +3835,7 @@ impl DSTBackend {
             .node
             .borrow_mut()
             .ready
-            .push(OpCompleted::new(id, -(libc::ENOTSUP as isize)));
+            .push(OpCompleted::new(id, -(errno::ENOTSUP as isize)));
           return;
         }
         let bytes = DSBackend::extract_iovec_bytes(iovecs, iov_count);
@@ -3781,7 +3887,7 @@ impl DSTBackend {
         let peer = {
           let mut node = self.node.borrow_mut();
           let Some(socket) = node.sockets.get_mut(&raw) else {
-            node.ready.push(OpCompleted::new(id, -(libc::EBADF as isize)));
+            node.ready.push(OpCompleted::new(id, -(errno::EBADF as isize)));
             return;
           };
           match how {
@@ -3828,7 +3934,7 @@ impl DSTBackend {
           .node
           .borrow_mut()
           .ready
-          .push(OpCompleted::new(id, -(libc::EINVAL as isize)));
+          .push(OpCompleted::new(id, -(errno::EINVAL as isize)));
       }
       other => {
         self
@@ -4151,7 +4257,7 @@ mod tests {
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
-    assert_eq!(completed[0].result(), -(libc::ENOTSUP as isize));
+    assert_eq!(completed[0].result(), -(errno::ENOTSUP as isize));
   }
 
   #[test]
@@ -4185,7 +4291,7 @@ mod tests {
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
-    assert_eq!(completed[0].result(), -(libc::ENOTSUP as isize));
+    assert_eq!(completed[0].result(), -(errno::ENOTSUP as isize));
   }
 
   #[test]
@@ -4787,7 +4893,7 @@ mod tests {
 
     sender.schedule_socket_reset(
       DSTSocketRef { node_id: receiver.node_id, fd: 22 },
-      libc::ECONNRESET,
+      errno::ECONNRESET,
     );
 
     for _ in 0..8 {
@@ -4798,7 +4904,7 @@ mod tests {
 
     let receiver_ready = dst_take_ready(&receiver.node);
     assert_eq!(receiver_ready.len(), 1);
-    assert_eq!(receiver_ready[0].result(), -(libc::ECONNRESET as isize));
+    assert_eq!(receiver_ready[0].result(), -(errno::ECONNRESET as isize));
 
     let send_buf = crate::backend::op::MsgBuf::from_slice(b"hello");
     let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
@@ -4808,7 +4914,7 @@ mod tests {
     );
     let receiver_ready = dst_take_ready(&receiver.node);
     assert_eq!(receiver_ready.len(), 1);
-    assert_eq!(receiver_ready[0].result(), -(libc::ECONNRESET as isize));
+    assert_eq!(receiver_ready[0].result(), -(errno::ECONNRESET as isize));
   }
 
   #[test]
@@ -4874,7 +4980,7 @@ mod tests {
     );
     let client_b_ready = dst_take_ready(&client_b.node);
     assert_eq!(client_b_ready.len(), 1);
-    assert_eq!(client_b_ready[0].result(), -(libc::ECONNREFUSED as isize));
+    assert_eq!(client_b_ready[0].result(), -(errno::ECONNREFUSED as isize));
 
     for _ in 0..8 {
       if !dst.step() {
@@ -4924,7 +5030,7 @@ mod tests {
       .network_complete_op(2, Op::Listen { fd: stream.clone(), backlog: 1 });
     let ready = dst_take_ready(&backend.node);
     assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].result(), -(libc::EINVAL as isize));
+    assert_eq!(ready[0].result(), -(errno::EINVAL as isize));
 
     let send_buf = crate::backend::op::MsgBuf::from_slice(b"hello");
     let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
@@ -4934,7 +5040,7 @@ mod tests {
     );
     let ready = dst_take_ready(&backend.node);
     assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].result(), -(libc::ENOTCONN as isize));
+    assert_eq!(ready[0].result(), -(errno::ENOTCONN as isize));
 
     backend.network_complete_op(
       4,
@@ -4951,7 +5057,7 @@ mod tests {
       .network_complete_op(5, Op::Listen { fd: dgram.clone(), backlog: 1 });
     let ready = dst_take_ready(&backend.node);
     assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].result(), -(libc::EOPNOTSUPP as isize));
+    assert_eq!(ready[0].result(), -(errno::EOPNOTSUPP as isize));
 
     let mut recv_buf = [0_u8; 8];
     let mut msg_buf = MsgBufMut::from_slice(&mut recv_buf);
@@ -4966,7 +5072,7 @@ mod tests {
     );
     let ready = dst_take_ready(&backend.node);
     assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].result(), -(libc::EINVAL as isize));
+    assert_eq!(ready[0].result(), -(errno::EINVAL as isize));
 
     backend.network_complete_op(
       7,
@@ -4974,7 +5080,7 @@ mod tests {
     );
     let ready = dst_take_ready(&backend.node);
     assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].result(), -(libc::ENOTCONN as isize));
+    assert_eq!(ready[0].result(), -(errno::ENOTCONN as isize));
   }
 
   #[test]
@@ -5111,7 +5217,7 @@ mod tests {
     let socket_result = backend.complete_op(Op::Fsync { fd: socket_resource });
     assert!(matches!(
       socket_result,
-      OpAction::Complete(result) if result == -(libc::EINVAL as isize)
+      OpAction::Complete(result) if result == -(errno::EINVAL as isize)
     ));
   }
 
@@ -5135,6 +5241,6 @@ mod tests {
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
-    assert_eq!(completed[0].result(), -(libc::EINVAL as isize));
+    assert_eq!(completed[0].result(), -(errno::EINVAL as isize));
   }
 }
