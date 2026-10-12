@@ -120,6 +120,10 @@ pub mod impls {
 
 pub(crate) mod store;
 
+/// The host OS's native close and standard handles.
+#[path = "impls/native.rs"]
+pub(crate) mod native;
+
 /// OS socket-address conversions. Lives with the backend implementations but
 /// is also needed by `net` when no backend implementations are compiled in.
 #[path = "impls/sockaddr.rs"]
@@ -131,6 +135,7 @@ use std::time::Duration;
 
 use bumpalo::Bump;
 
+use crate::api::resource::CloseFn;
 use crate::backend::op::Op;
 
 /// Represents a completed I/O operation.
@@ -195,6 +200,16 @@ pub trait IoBackend {
   /// Pre-allocates all resources for zero-allocation runtime.
   /// Must be called once before any other methods.
   fn init(&mut self, cap: usize) -> io::Result<()>;
+
+  /// How resources produced by this backend's completions are closed.
+  ///
+  /// The default closes them as native OS descriptors/handles. A backend
+  /// whose completions do not carry real OS resources (such as a simulation)
+  /// must override this, or dropping those resources would close unrelated
+  /// descriptors of the process.
+  fn resource_close(&self) -> CloseFn {
+    native::close
+  }
 
   /// Queue an operation for submission.
   ///

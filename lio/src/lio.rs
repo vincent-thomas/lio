@@ -80,6 +80,8 @@ pub(crate) fn get_global() -> Option<Lio> {
 struct LioInner {
   store: OpStore,
   io: Box<dyn IoBackend>,
+  /// The backend's close for resources its completions carry.
+  resource_close: crate::api::resource::CloseFn,
   time: TimeManager,
   // Reused scratch vectors for `run_inner`.
   completed: Vec<OpCompleted>,
@@ -199,6 +201,7 @@ impl Lio {
     backend.init(cap)?;
 
     let inner = LioInner {
+      resource_close: backend.resource_close(),
       io: Box::new(backend),
       store: OpStore::with_capacity(cap),
       time: TimeManager::with_capacity(cap),
@@ -332,6 +335,7 @@ impl Lio {
     }
 
     let mut num_completed = 0;
+    let resource_close = inner.resource_close;
 
     let completion_loop_started =
       if profiling_enabled { Some(Instant::now()) } else { None };
@@ -355,7 +359,9 @@ impl Lio {
 
       let on_completion_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
-      let completion_result = op.on_driver_completion(Completion::new(result));
+      let completion_result = op.on_driver_completion(
+        Completion::new(result).with_resource_close(resource_close),
+      );
       if let Some(started) = on_completion_started {
         completion_on_completion_time += started.elapsed();
       }

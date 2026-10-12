@@ -22,7 +22,6 @@ be pushed into backend implementations or abstracted behind the contract:
 | Location | What depends on OS |
 |---|---|
 | `lio/src/api/ops.rs` | Socket addr conversion uses `libc::sockaddr_*`; `MSG_DONTWAIT`, `MSG_NOSIGNAL`, `S_IFREG`, `ERANGE` constants; `libc::dup` / `libc::STDIN_FILENO` for pipe/tee models |
-| `lio/src/api/resource.rs` | `libc::STDIN_FILENO`, `STDOUT_FILENO`, `STDERR_FILENO`, `AT_FDCWD` |
 | `lio/src/fs.rs` | `libc::O_*` flags, `libc::AT_REMOVEDIR`, `libc::EINVAL` |
 
 Each of these must either:
