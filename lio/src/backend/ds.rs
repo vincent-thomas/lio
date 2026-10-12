@@ -44,6 +44,24 @@ use crate::backend::op::{
 use crate::backend::{IoBackend, OpCompleted};
 use crate::{Lio, install_global};
 
+/// Mode and open-flag bits the simulation interprets.
+///
+/// Callers pass the platform's native `O_*` bits; where the platform has no
+/// equivalent (Windows' CRT), the simulation falls back to Linux values.
+mod sim {
+  #[cfg(unix)]
+  pub(super) use libc::{O_ACCMODE, O_DIRECTORY, S_IFLNK, S_IFSOCK};
+
+  #[cfg(not(unix))]
+  pub(super) const O_ACCMODE: i32 = 0o3;
+  #[cfg(not(unix))]
+  pub(super) const O_DIRECTORY: i32 = 0o200000;
+  #[cfg(not(unix))]
+  pub(super) const S_IFLNK: u32 = 0o120000;
+  #[cfg(not(unix))]
+  pub(super) const S_IFSOCK: u32 = 0o140000;
+}
+
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(windows)]
@@ -1434,15 +1452,7 @@ impl DSBackend {
   }
 
   fn os_path(path: &std::ffi::OsString) -> Vec<u8> {
-    #[cfg(unix)]
-    {
-      use std::os::unix::ffi::OsStrExt;
-      Self::normalize_path(path.as_os_str().as_bytes())
-    }
-    #[cfg(not(unix))]
-    {
-      Self::normalize_path(path.to_string_lossy().as_bytes())
-    }
+    Self::normalize_path(path.as_encoded_bytes())
   }
 
   fn normalize_path_from(dir: &[u8], path: &[u8]) -> Vec<u8> {
@@ -1504,13 +1514,7 @@ impl DSBackend {
     dir_fd: &Resource,
     path: &std::ffi::OsString,
   ) -> Result<Vec<u8>, isize> {
-    #[cfg(unix)]
-    let bytes = {
-      use std::os::unix::ffi::OsStrExt;
-      path.as_os_str().as_bytes()
-    };
-    #[cfg(not(unix))]
-    let bytes = path.to_string_lossy().as_bytes();
+    let bytes = path.as_encoded_bytes();
     if bytes.first() == Some(&b'/') {
       return Ok(Self::normalize_path(bytes));
     }
@@ -1670,7 +1674,7 @@ impl DSBackend {
         file_type: FileType::Symlink,
         size: target.len() as u64,
         permissions: mode & 0o7777,
-        mode: (libc::S_IFLNK as u32) | mode,
+        mode: (sim::S_IFLNK as u32) | mode,
         nlink: 1,
         uid: 0,
         gid: 0,
@@ -1718,7 +1722,7 @@ impl DSBackend {
   }
 
   fn make_file_handle(&self, path: Vec<u8>, flags: i32) -> SimFileHandle {
-    let accmode = flags & libc::O_ACCMODE;
+    let accmode = flags & sim::O_ACCMODE;
     let readable = accmode != libc::O_WRONLY;
     let writable = accmode != libc::O_RDONLY;
     SimFileHandle {
@@ -2212,7 +2216,7 @@ impl DSBackend {
             SimNode::File { bytes: Vec::new(), mode: 0o644 },
           );
         }
-        if flags.bits() & libc::O_DIRECTORY != 0 {
+        if flags.bits() & sim::O_DIRECTORY != 0 {
           let Some(SimNode::Directory { .. }) = self.world.fs.get(&path) else {
             return OpAction::Complete(-(libc::ENOTDIR as isize));
           };
@@ -2299,14 +2303,7 @@ impl DSBackend {
         OpAction::Complete(0)
       }
       Op::Spawn { spec } => {
-        #[cfg(unix)]
-        let path = {
-          use std::os::unix::ffi::OsStrExt;
-          Self::normalize_path(spec.program.as_bytes())
-        };
-        #[cfg(not(unix))]
-        let path =
-          Self::normalize_path(spec.program.to_string_lossy().as_bytes());
+        let path = Self::normalize_path(spec.program.as_encoded_bytes());
 
         if path.is_empty() || !self.world.fs.contains_key(&path) {
           return OpAction::Complete(-(libc::ENOENT as isize));
@@ -2446,7 +2443,7 @@ impl DSBackend {
                 file_type: crate::backend::op::FileType::Socket,
                 size: 0,
                 permissions: 0,
-                mode: libc::S_IFSOCK as u32,
+                mode: sim::S_IFSOCK as u32,
                 nlink: 1,
                 uid: 0,
                 gid: 0,

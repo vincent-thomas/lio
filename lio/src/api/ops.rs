@@ -8,17 +8,12 @@ use std::ffi::{CString, OsString};
 use std::io;
 use std::mem;
 use std::net::SocketAddr;
-#[cfg(unix)]
-use std::os::fd::{FromRawFd, RawFd};
-#[cfg(windows)]
-use std::os::windows::io::RawHandle;
 use std::ptr::{self, NonNull};
 use std::time::Duration;
 
 use crate::{
   BufResult, IoBufMutVec, IoBufVec,
   api::{
-    Pid,
     op::{
       Action, Completion, CompletionFlags, OneshotOpModel, OpModel, OpResult,
       StreamOpModel,
@@ -121,21 +116,8 @@ impl OpModel for Socket {
       )));
     }
 
-    #[cfg(unix)]
-    {
-      // SAFETY: `fd` was returned by `socket(2)` and ownership transfers here.
-      OpResult::Done(Ok(unsafe {
-        Resource::from_raw_fd(completion.result as RawFd)
-      }))
-    }
-
-    #[cfg(windows)]
-    {
-      // SAFETY: result is a valid socket handle returned by the backend.
-      return OpResult::Done(Ok(unsafe {
-        Resource::from_raw_handle(completion.result as RawHandle)
-      }));
-    }
+    // SAFETY: a successful socket completion carries a new owned socket.
+    OpResult::Done(Ok(unsafe { Resource::from_completion(completion.result) }))
   }
 }
 
@@ -231,11 +213,8 @@ impl Accept {
       return Err(io::Error::from_raw_os_error((-completion.result) as i32));
     }
 
-    #[cfg(unix)]
-    // SAFETY: successful accept returns a live file descriptor owned by us.
-    let resource = unsafe { Resource::from_raw_fd(completion.result as RawFd) };
-
-    Ok(resource)
+    // SAFETY: a successful accept completion carries a new owned socket.
+    Ok(unsafe { Resource::from_completion(completion.result) })
   }
 }
 
@@ -1410,12 +1389,11 @@ impl OpModel for OpenAt {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    use std::os::fd::FromRawFd;
     let res = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
-      // SAFETY: result is a valid file descriptor returned by the kernel.
-      Ok(unsafe { Resource::from_raw_fd(completion.result as i32) })
+      // SAFETY: a successful open completion carries a new owned handle.
+      Ok(unsafe { Resource::from_completion(completion.result) })
     };
     OpResult::Done(res)
   }
@@ -1957,13 +1935,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
     let result = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
-      #[cfg(unix)]
-      let bytes = {
-        use std::os::unix::ffi::OsStrExt;
-        self.out.as_os_str().as_bytes()
-      };
-      #[cfg(not(unix))]
-      let bytes = self.out.to_string_lossy().as_bytes();
+      let bytes = self.out.as_encoded_bytes();
 
       let (ptr, cap) = buf.buf_mut(0);
       if bytes.len() > cap {
@@ -2052,7 +2024,7 @@ impl Spawn {
 
 #[cfg(unix)]
 impl OpModel for Spawn {
-  type Item = std::io::Result<Pid>;
+  type Item = std::io::Result<crate::api::Pid>;
 
   fn action(&mut self) -> Action {
     Action::Io(Op::Spawn { spec: self.spec.clone() })
@@ -2062,7 +2034,7 @@ impl OpModel for Spawn {
     let result = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
-      Ok(Pid::from_raw(completion.result as i64))
+      Ok(crate::api::Pid::from_raw(completion.result as i64))
     };
     OpResult::Done(result)
   }
@@ -2090,7 +2062,7 @@ impl OpModelContract for Spawn {
     vec![ContractStep::new(
       |action| matches!(action, Action::Io(Op::Spawn { .. })),
       Completion::new(1234),
-      |result: &OpResult<std::io::Result<Pid>>| matches!(result, OpResult::Done(Ok(pid)) if pid.as_raw() == 1234),
+      |result: &OpResult<std::io::Result<crate::api::Pid>>| matches!(result, OpResult::Done(Ok(pid)) if pid.as_raw() == 1234),
     )]
   }
 }

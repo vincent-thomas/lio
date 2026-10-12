@@ -155,6 +155,7 @@ macro_rules! doc_op {
     };
 }
 
+#[cfg(unix)]
 macro_rules! syscall {
   (raw $fn: ident ( $($arg: expr),* $(,)* ) ? ) => {{
       let val = syscall!(raw $fn ($($arg),*));

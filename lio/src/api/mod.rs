@@ -34,7 +34,8 @@
 
 pub mod io;
 pub mod op;
-pub mod op_contract;
+#[cfg(test)]
+mod op_contract;
 pub mod ops;
 pub mod pid;
 pub mod resource;
