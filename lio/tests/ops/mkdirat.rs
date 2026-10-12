@@ -38,9 +38,10 @@ fn mkdir(lio: &mut Lio, path: CString) -> Result<(), std::io::Error> {
 }
 
 fn unlink_dir(lio: &mut Lio, path: CString) {
-  let mut receiver = api::unlinkat(&Resource::cwd(), path, libc::AT_REMOVEDIR)
-    .with_lio(lio)
-    .send();
+  let mut receiver =
+    api::unlinkat(&Resource::cwd(), path, api::UnlinkKind::Directory)
+      .with_lio(lio)
+      .send();
   common::poll_recv(lio, &mut receiver).unwrap();
 }
 

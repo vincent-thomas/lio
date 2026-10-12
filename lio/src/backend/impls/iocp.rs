@@ -204,7 +204,9 @@ impl Iocp {
     match op {
       Op::Socket { domain, ty, proto } => {
         let (domain, ty, proto) =
-          match crate::backend::op::socket_to_raw(*domain, *ty, *proto) {
+          match crate::backend::impls::sockaddr::socket_to_raw(
+            *domain, *ty, *proto,
+          ) {
             Ok(raw) => raw,
             Err(errno) => return -(errno as isize),
           };

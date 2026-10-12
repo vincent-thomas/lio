@@ -12,7 +12,7 @@ use std::{
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use crate::api::{
-  FileStat, FileType, ReadDirBuf,
+  FileStat, FileType, ReadDirBuf, UnlinkKind,
   io::Io,
   op::{Action, Completion, OneshotOpModel, OpModel, OpResult},
   ops,
@@ -538,7 +538,11 @@ impl RemoveDirAll {
           }
           Some(_) => {
             self.state = RemoveDirAllState::RemovingEntry {
-              op: ops::UnlinkAt::new(frame.fd.clone(), entry.name, 0),
+              op: ops::UnlinkAt::new(
+                frame.fd.clone(),
+                entry.name,
+                UnlinkKind::File,
+              ),
             };
           }
           None => {
@@ -563,7 +567,7 @@ impl RemoveDirAll {
 
       let frame = self.stack.pop().expect("remove_dir_all stack missing frame");
       self.state = RemoveDirAllState::RemovingDir {
-        op: ops::UnlinkAt::new(frame.parent, frame.name, libc::AT_REMOVEDIR),
+        op: ops::UnlinkAt::new(frame.parent, frame.name, UnlinkKind::Directory),
       };
       return OpResult::Again;
     }
@@ -644,7 +648,7 @@ impl OpModel for RemoveDirAll {
               }
             } else {
               RemoveDirAllState::RemovingEntry {
-                op: ops::UnlinkAt::new(parent, name, 0),
+                op: ops::UnlinkAt::new(parent, name, UnlinkKind::File),
               }
             };
             OpResult::Again
@@ -900,12 +904,12 @@ pub fn rename(
 
 /// Removes a file relative to the current working directory.
 pub fn remove_file(path: std::ffi::CString) -> Io<ops::UnlinkAt> {
-  crate::api::unlinkat(&Resource::cwd(), path, 0)
+  crate::api::unlinkat(&Resource::cwd(), path, UnlinkKind::File)
 }
 
 /// Removes an empty directory relative to the current working directory.
 pub fn remove_dir(path: std::ffi::CString) -> Io<ops::UnlinkAt> {
-  crate::api::unlinkat(&Resource::cwd(), path, libc::AT_REMOVEDIR)
+  crate::api::unlinkat(&Resource::cwd(), path, UnlinkKind::Directory)
 }
 
 /// Recursively removes a directory relative to the current working directory.

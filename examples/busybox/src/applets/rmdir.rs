@@ -37,9 +37,10 @@ impl Command for RmdirCommand {
       let cpath = CString::new(path.as_bytes()).map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidInput, "rmdir: invalid path")
       })?;
-      let mut receiver = api::unlinkat(&ctx.cwd(), cpath, libc::AT_REMOVEDIR)
-        .with_lio(ctx.lio())
-        .send();
+      let mut receiver =
+        api::unlinkat(&ctx.cwd(), cpath, api::UnlinkKind::Directory)
+          .with_lio(ctx.lio())
+          .send();
       io_util::run_recv(ctx.lio(), &mut receiver)?;
     }
     Ok(())

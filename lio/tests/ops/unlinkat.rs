@@ -60,7 +60,9 @@ fn test_unlinkat_file() {
   );
 
   let mut receiver =
-    api::unlinkat(&Resource::cwd(), path.clone(), 0).with_lio(&mut lio).send();
+    api::unlinkat(&Resource::cwd(), path.clone(), api::UnlinkKind::File)
+      .with_lio(&mut lio)
+      .send();
   common::poll_recv(&mut lio, &mut receiver).expect("unlinkat should succeed");
 
   let result = stat_path(&mut lio, path);
@@ -77,7 +79,7 @@ fn test_unlinkat_directory() {
   mkdir(&mut lio, path.clone());
 
   let mut receiver =
-    api::unlinkat(&Resource::cwd(), path.clone(), libc::AT_REMOVEDIR)
+    api::unlinkat(&Resource::cwd(), path.clone(), api::UnlinkKind::Directory)
       .with_lio(&mut lio)
       .send();
   common::poll_recv(&mut lio, &mut receiver)

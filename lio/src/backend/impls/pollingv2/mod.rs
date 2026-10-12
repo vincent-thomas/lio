@@ -34,10 +34,8 @@ use bumpalo::Bump;
 use crate::backend::{
   IoBackend, OpCompleted,
   impls::pollingv2::interest::Interest,
-  op::{
-    DirEntryRef, MsgRecv, MsgSend, Op, ReadDirResult,
-    file_type_from_dirent_dtype,
-  },
+  impls::unix_stat::{file_stat_from_raw, file_type_from_dirent_dtype},
+  op::{DirEntryRef, MsgRecv, MsgSend, Op, ReadDirResult},
 };
 use crate::slab::{Slab, SlabKey};
 mod interest;
@@ -964,7 +962,7 @@ impl Poller {
           let stat = unsafe { stat.assume_init() };
           // SAFETY: `out` points to caller-provided writable result storage.
           unsafe {
-            *out.as_ptr() = crate::backend::op::file_stat_from_raw(&stat);
+            *out.as_ptr() = file_stat_from_raw(&stat);
           }
         }
         result
@@ -1159,7 +1157,9 @@ impl Poller {
       }
 
       Op::Socket { domain, ty, proto } => {
-        match crate::backend::op::socket_to_raw(*domain, *ty, *proto) {
+        match crate::backend::impls::sockaddr::socket_to_raw(
+          *domain, *ty, *proto,
+        ) {
           Ok((domain, ty, proto)) => {
             let result = syscall!(raw socket(domain, ty, proto));
             if result < 0 {

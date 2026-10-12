@@ -52,7 +52,9 @@ fn write_all_at(lio: &mut Lio, fd: &Resource, bytes: &[u8], offset: u32) {
 
 fn unlink_file(lio: &mut Lio, path: std::ffi::CString) {
   let mut receiver =
-    api::unlinkat(&Resource::cwd(), path, 0).with_lio(lio).send();
+    api::unlinkat(&Resource::cwd(), path, api::UnlinkKind::File)
+      .with_lio(lio)
+      .send();
   common::poll_recv(lio, &mut receiver).unwrap();
 }
 

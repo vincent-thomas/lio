@@ -106,12 +106,6 @@ pub enum UnlinkKind {
   Directory,
 }
 
-impl From<i32> for UnlinkKind {
-  fn from(flags: i32) -> Self {
-    if flags == libc::AT_REMOVEDIR { Self::Directory } else { Self::File }
-  }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShutdownHow {
   Read,
@@ -218,124 +212,28 @@ pub fn socket_addr_from_buf(buf: &SocketAddrBuf) -> io::Result<SocketAddr> {
       buf.flowinfo,
       buf.scope_id,
     ))),
-    SocketAddrFamily::Unspecified => {
-      Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
-    }
-    SocketAddrFamily::Unix => {
-      Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
-    }
+    SocketAddrFamily::Unspecified | SocketAddrFamily::Unix => Err(
+      io::Error::new(io::ErrorKind::Unsupported, "not an IP socket address"),
+    ),
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Abstract type → raw OS constant conversion (platform-independent contract)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Translates abstract socket domain/type/proto to raw OS constants.
-pub fn socket_to_raw(
+/// Returns whether `domain`, `ty` and `proto` describe a socket lio supports.
+///
+/// Unix sockets only accept [`SockProto::DEFAULT`], streams only TCP and
+/// datagrams only UDP. Backends reject other combinations with `EINVAL`.
+pub fn is_supported_socket(
   domain: SockDomain,
   ty: SockType,
   proto: SockProto,
-) -> Result<(i32, i32, i32), i32> {
-  if matches!(domain, SockDomain::UNIX) && !matches!(proto, SockProto::DEFAULT)
-  {
-    return Err(libc::EINVAL);
+) -> bool {
+  match (domain, ty, proto) {
+    (_, _, SockProto::DEFAULT) => true,
+    (SockDomain::UNIX, _, _) => false,
+    (_, SockType::STREAM, SockProto::TCP) => true,
+    (_, SockType::DGRAM, SockProto::UDP) => true,
+    _ => false,
   }
-
-  let domain = match domain {
-    SockDomain::IPV4 => raw_af_inet(),
-    SockDomain::IPV6 => raw_af_inet6(),
-    SockDomain::UNIX => raw_af_unix()?,
-    _ => return Err(libc::EAFNOSUPPORT),
-  };
-
-  let (ty, proto) = match (ty, proto) {
-    (SockType::STREAM, SockProto::DEFAULT) => {
-      (raw_sock_stream(), raw_proto_default())
-    }
-    (SockType::STREAM, SockProto::TCP) => (raw_sock_stream(), raw_proto_tcp()),
-    (SockType::DGRAM, SockProto::DEFAULT) => {
-      (raw_sock_dgram(), raw_proto_default())
-    }
-    (SockType::DGRAM, SockProto::UDP) => (raw_sock_dgram(), raw_proto_udp()),
-    _ => return Err(libc::EINVAL),
-  };
-
-  Ok((domain, ty, proto))
-}
-
-#[cfg(unix)]
-const fn raw_af_inet() -> i32 {
-  libc::AF_INET
-}
-
-#[cfg(windows)]
-const fn raw_af_inet() -> i32 {
-  windows_sys::Win32::Networking::WinSock::AF_INET
-}
-
-#[cfg(unix)]
-const fn raw_af_inet6() -> i32 {
-  libc::AF_INET6
-}
-
-#[cfg(windows)]
-const fn raw_af_inet6() -> i32 {
-  windows_sys::Win32::Networking::WinSock::AF_INET6
-}
-
-#[cfg(unix)]
-const fn raw_af_unix() -> Result<i32, i32> {
-  Ok(libc::AF_UNIX)
-}
-
-#[cfg(windows)]
-const fn raw_af_unix() -> Result<i32, i32> {
-  Ok(windows_sys::Win32::Networking::WinSock::AF_UNIX)
-}
-
-#[cfg(unix)]
-const fn raw_sock_stream() -> i32 {
-  libc::SOCK_STREAM
-}
-
-#[cfg(windows)]
-const fn raw_sock_stream() -> i32 {
-  windows_sys::Win32::Networking::WinSock::SOCK_STREAM
-}
-
-#[cfg(unix)]
-const fn raw_sock_dgram() -> i32 {
-  libc::SOCK_DGRAM
-}
-
-#[cfg(windows)]
-const fn raw_sock_dgram() -> i32 {
-  windows_sys::Win32::Networking::WinSock::SOCK_DGRAM
-}
-
-const fn raw_proto_default() -> i32 {
-  0
-}
-
-#[cfg(unix)]
-const fn raw_proto_tcp() -> i32 {
-  libc::IPPROTO_TCP
-}
-
-#[cfg(windows)]
-const fn raw_proto_tcp() -> i32 {
-  windows_sys::Win32::Networking::WinSock::IPPROTO_TCP
-}
-
-#[cfg(unix)]
-const fn raw_proto_udp() -> i32 {
-  libc::IPPROTO_UDP
-}
-
-#[cfg(windows)]
-const fn raw_proto_udp() -> i32 {
-  windows_sys::Win32::Networking::WinSock::IPPROTO_UDP
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -653,46 +551,6 @@ impl FileStat {
 pub enum StatTarget {
   Path { dir_fd: Resource, path: OsString, follow_symlinks: bool },
   Fd { fd: Resource },
-}
-
-#[cfg(all(feature = "backend_impls", unix))]
-#[allow(clippy::useless_conversion)]
-pub(crate) fn file_stat_from_raw(stat: &libc::stat) -> FileStat {
-  let file_type = match stat.st_mode & libc::S_IFMT {
-    libc::S_IFREG => FileType::File,
-    libc::S_IFDIR => FileType::Directory,
-    libc::S_IFLNK => FileType::Symlink,
-    libc::S_IFBLK => FileType::BlockDevice,
-    libc::S_IFCHR => FileType::CharDevice,
-    libc::S_IFIFO => FileType::Fifo,
-    libc::S_IFSOCK => FileType::Socket,
-    _ => FileType::Unknown,
-  };
-
-  FileStat {
-    file_type,
-    size: stat.st_size as u64,
-    permissions: (stat.st_mode & 0o7777).into(),
-    mode: stat.st_mode.into(),
-    nlink: stat.st_nlink.into(),
-    uid: stat.st_uid,
-    gid: stat.st_gid,
-  }
-}
-
-#[cfg(unix)]
-pub(crate) fn file_type_from_dirent_dtype(dtype: u8) -> Option<FileType> {
-  match dtype {
-    libc::DT_BLK => Some(FileType::BlockDevice),
-    libc::DT_CHR => Some(FileType::CharDevice),
-    libc::DT_DIR => Some(FileType::Directory),
-    libc::DT_FIFO => Some(FileType::Fifo),
-    libc::DT_LNK => Some(FileType::Symlink),
-    libc::DT_REG => Some(FileType::File),
-    libc::DT_SOCK => Some(FileType::Socket),
-    libc::DT_UNKNOWN => None,
-    _ => None,
-  }
 }
 
 // pub struct IoSlice(libc::iovec);

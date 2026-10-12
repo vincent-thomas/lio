@@ -1374,7 +1374,12 @@ pub unsafe extern "C" fn lio_unlinkat(
   // SAFETY: caller guarantees dir_fd is valid per fn contract
   let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::unlinkat(&dir_res, path_cstr, flags)
+  let kind = if flags & libc::AT_REMOVEDIR != 0 {
+    api::UnlinkKind::Directory
+  } else {
+    api::UnlinkKind::File
+  };
+  api::unlinkat(&dir_res, path_cstr, kind)
     .with_lio(&unsafe { handle(lio) }.inner)
     .when_done(move |res| {
       callback(match res {

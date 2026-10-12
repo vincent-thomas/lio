@@ -2314,7 +2314,7 @@ impl DSBackend {
         OpAction::Complete(self.allocate_pid() as isize)
       }
       Op::Socket { domain, ty, proto } => {
-        if op::socket_to_raw(domain, ty, proto).is_err() {
+        if !op::is_supported_socket(domain, ty, proto) {
           return OpAction::Complete(-(libc::EINVAL as isize));
         }
         OpAction::Complete(
@@ -3443,7 +3443,7 @@ impl DSTBackend {
   fn network_complete_op(&mut self, id: u64, op: Op) {
     match op {
       Op::Socket { domain, ty, proto } => {
-        if op::socket_to_raw(domain, ty, proto).is_err() {
+        if !op::is_supported_socket(domain, ty, proto) {
           self
             .node
             .borrow_mut()
