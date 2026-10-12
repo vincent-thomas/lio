@@ -89,7 +89,7 @@ pub mod impls {
   #[cfg(windows)]
   pub use iocp::*;
 
-  pub(crate) mod sockaddr;
+  pub(crate) use super::sockaddr;
   #[cfg(unix)]
   pub(crate) mod unix_stat;
 
@@ -116,6 +116,12 @@ pub mod impls {
 }
 
 pub(crate) mod store;
+
+/// OS socket-address conversions. Lives with the backend implementations but
+/// is also needed by `net` when no backend implementations are compiled in.
+#[path = "impls/sockaddr.rs"]
+#[cfg_attr(not(feature = "backend_impls"), allow(dead_code))]
+pub(crate) mod sockaddr;
 
 use std::io;
 use std::time::Duration;

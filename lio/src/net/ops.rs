@@ -19,8 +19,6 @@
 //!   create/connect operations, also used for Unix domain sockets
 //! - [`UnixAccept`]: Accept operation that returns a [`UnixStream`]
 
-#[cfg(unix)]
-use std::os::fd::FromRawFd;
 use std::{io, marker::PhantomData, net::SocketAddr};
 
 #[allow(unused_imports)] // TcpListener used in doc links
@@ -113,24 +111,11 @@ impl OpModel for SocketNew {
       )));
     }
 
-    #[cfg(unix)]
-    {
-      // SAFETY: successful socket creation returns a live file descriptor
-      // owned by this operation.
-      let resource = unsafe {
-        crate::api::resource::Resource::from_raw_fd(completion.result as _)
-      };
-      OpResult::Done(Ok(Socket::from_resource(resource)))
-    }
-
-    #[cfg(windows)]
-    {
-      // SAFETY: successful socket creation returns a valid socket handle.
-      let resource = unsafe {
-        crate::api::resource::Resource::from_raw_handle(completion.result as _)
-      };
-      OpResult::Done(Ok(Socket::from_resource(resource)))
-    }
+    // SAFETY: a successful socket completion carries a new owned socket.
+    let resource = unsafe {
+      crate::api::resource::Resource::from_completion(completion.result)
+    };
+    OpResult::Done(Ok(Socket::from_resource(resource)))
   }
 }
 

@@ -95,49 +95,6 @@ impl FromResource for Socket {
 }
 
 impl Socket {
-  fn query_addr<F>(&self, query: F) -> std::io::Result<SocketAddr>
-  where
-    F: FnOnce(i32, *mut libc::sockaddr, *mut libc::socklen_t) -> libc::c_int,
-  {
-    use std::os::fd::AsRawFd;
-
-    let fd = self.0.as_raw_fd();
-    // SAFETY: sockaddr_storage is a C struct safe to zero-initialize
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len =
-      std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-
-    let ret =
-      query(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len);
-
-    if ret < 0 {
-      return Err(std::io::Error::last_os_error());
-    }
-
-    match storage.ss_family as libc::c_int {
-      libc::AF_INET => {
-        // SAFETY: ss_family == AF_INET guarantees storage contains sockaddr_in
-        let addr: &libc::sockaddr_in =
-          unsafe { &*(&storage as *const _ as *const _) };
-        let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
-        let port = u16::from_be(addr.sin_port);
-        Ok(SocketAddr::from((ip, port)))
-      }
-      libc::AF_INET6 => {
-        // SAFETY: ss_family == AF_INET6 guarantees storage contains sockaddr_in6
-        let addr: &libc::sockaddr_in6 =
-          unsafe { &*(&storage as *const _ as *const _) };
-        let ip = std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
-        let port = u16::from_be(addr.sin6_port);
-        Ok(SocketAddr::from((ip, port)))
-      }
-      _ => Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "unsupported address family",
-      )),
-    }
-  }
-
   /// Creates a new socket with the specified domain, type, and protocol.
   ///
   /// This is a low-level operation that directly wraps the `socket(2)` system call.
@@ -402,11 +359,11 @@ impl Socket {
 
   /// Returns the local address this socket is bound to.
   pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-    self.query_addr(|fd, addr, len| unsafe { libc::getsockname(fd, addr, len) })
+    crate::backend::sockaddr::socket_name(&self.0, false)
   }
 
   /// Returns the remote address this socket is connected to.
   pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-    self.query_addr(|fd, addr, len| unsafe { libc::getpeername(fd, addr, len) })
+    crate::backend::sockaddr::socket_name(&self.0, true)
   }
 }

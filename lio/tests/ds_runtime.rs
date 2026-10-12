@@ -1,3 +1,6 @@
+// Drives raw Unix descriptors directly; Windows is covered by the backend
+// contract suite in `backends`.
+#![cfg(unix)]
 use std::{
   collections::BTreeSet,
   env,

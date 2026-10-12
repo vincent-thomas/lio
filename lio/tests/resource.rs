@@ -1,3 +1,6 @@
+// Drives raw Unix descriptors directly; Windows is covered by the backend
+// contract suite in `backends`.
+#![cfg(unix)]
 use lio::api::resource::Resource;
 use std::{ffi::CString, os::fd::FromRawFd};
 

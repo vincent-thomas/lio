@@ -11,6 +11,13 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
+/// Open flag requesting a directory. Windows opens directories without a
+/// dedicated flag.
+#[cfg(unix)]
+const O_DIRECTORY: i32 = libc::O_DIRECTORY;
+#[cfg(not(unix))]
+const O_DIRECTORY: i32 = 0;
+
 use crate::api::{
   FileStat, FileType, ReadDirBuf, UnlinkKind,
   io::Io,
@@ -97,7 +104,7 @@ impl Directory {
       inner: ops::OpenAt::new(
         Resource::cwd(),
         path,
-        libc::O_RDONLY | libc::O_DIRECTORY,
+        libc::O_RDONLY | O_DIRECTORY,
         0,
       ),
     })
@@ -347,7 +354,7 @@ impl OpenReadDir {
       state: OpenReadDirState::Opening(ops::OpenAt::new(
         Resource::cwd(),
         path,
-        libc::O_RDONLY | libc::O_DIRECTORY,
+        libc::O_RDONLY | O_DIRECTORY,
         0,
       )),
       parent,
@@ -506,7 +513,7 @@ impl RemoveDirAll {
         op: ops::OpenAt::new(
           parent.clone(),
           path.clone(),
-          libc::O_RDONLY | libc::O_DIRECTORY,
+          libc::O_RDONLY | O_DIRECTORY,
           0,
         ),
         parent,
@@ -529,7 +536,7 @@ impl RemoveDirAll {
               op: ops::OpenAt::new(
                 frame.fd.clone(),
                 entry.name.clone(),
-                libc::O_RDONLY | libc::O_DIRECTORY,
+                libc::O_RDONLY | O_DIRECTORY,
                 0,
               ),
               parent: frame.fd.clone(),
@@ -640,7 +647,7 @@ impl OpModel for RemoveDirAll {
                 op: ops::OpenAt::new(
                   parent.clone(),
                   name.clone(),
-                  libc::O_RDONLY | libc::O_DIRECTORY,
+                  libc::O_RDONLY | O_DIRECTORY,
                   0,
                 ),
                 parent,

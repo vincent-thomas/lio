@@ -340,6 +340,52 @@ fn socket_addr_v6(addr: &sys::SockaddrIn6) -> SocketAddrV6 {
   )
 }
 
+/// Looks up the local (`peer == false`) or remote address of a socket.
+pub(crate) fn socket_name(
+  socket: &crate::api::resource::Resource,
+  peer: bool,
+) -> io::Result<SocketAddr> {
+  let mut storage = zeroed_storage();
+  let mut len = mem::size_of::<Storage>() as SockLen;
+  let addr = (&mut storage as *mut Storage).cast();
+
+  #[cfg(unix)]
+  // SAFETY: `storage`/`len` are valid output storage for the call.
+  let rc = unsafe {
+    use std::os::fd::AsRawFd;
+    let fd = socket.as_raw_fd();
+    if peer {
+      libc::getpeername(fd, addr, &mut len)
+    } else {
+      libc::getsockname(fd, addr, &mut len)
+    }
+  };
+  #[cfg(windows)]
+  // SAFETY: `storage`/`len` are valid output storage for the call.
+  let rc = unsafe {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Networking::WinSock as ws;
+    let s = socket.as_raw_handle() as ws::SOCKET;
+    if peer {
+      ws::getpeername(s, addr, &mut len)
+    } else {
+      ws::getsockname(s, addr, &mut len)
+    }
+  };
+
+  if rc != 0 {
+    #[cfg(windows)]
+    // SAFETY: reads the calling thread's last Winsock error.
+    return Err(io::Error::from_raw_os_error(unsafe {
+      windows_sys::Win32::Networking::WinSock::WSAGetLastError()
+    }));
+    #[cfg(unix)]
+    return Err(io::Error::last_os_error());
+  }
+  let buf = socket_addr_buf_from_storage(&storage, len)?;
+  crate::backend::op::socket_addr_from_buf(&buf)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -371,7 +417,10 @@ mod tests {
       unsafe { mem::zeroed::<sys::SockaddrUn>() }.sun_path.len();
     let path = vec![b'x'; sun_path_len];
     if let Ok(buf) = unix_socket_addr_buf(&path) {
-      let err = socket_addr_buf_to_storage(&buf).unwrap_err();
+      // `Storage` is not `Debug` on every platform, so no `expect_err`.
+      let Err(err) = socket_addr_buf_to_storage(&buf) else {
+        panic!("oversized unix path must be rejected");
+      };
       assert_eq!(err.raw_os_error(), Some(sys::ENAMETOOLONG));
     }
   }
