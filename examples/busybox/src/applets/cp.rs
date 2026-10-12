@@ -330,7 +330,7 @@ fn copy_file_lio(
     lio::api::openat(
       &ctx.cwd(),
       fs_util::path_to_cstring(source)?,
-      libc::O_RDONLY,
+      lio::api::OpenFlags::READ,
       0,
     )
     .with_lio(ctx.lio())
@@ -341,7 +341,9 @@ fn copy_file_lio(
     lio::api::openat(
       &ctx.cwd(),
       fs_util::path_to_cstring(dest)?,
-      libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+      lio::api::OpenFlags::WRITE
+        | lio::api::OpenFlags::CREATE
+        | lio::api::OpenFlags::TRUNCATE,
       mode & 0o7777,
     )
     .with_lio(ctx.lio())

@@ -256,13 +256,13 @@ doc_op! {
     pub fn openat(
         dir_res: &impl AsResource,
         path: std::ffi::CString,
-        flags: impl Into<OpenFlags>,
+        flags: OpenFlags,
         mode: impl Into<FileMode>
     ) -> Io<ops::OpenAt> {
         Io::from_op(ops::OpenAt::new(
             dir_res.as_resource().clone(),
             path,
-            flags.into(),
+            flags,
             mode.into()
         ))
     }

@@ -123,7 +123,9 @@ fn test_concurrent_file_writes_256() {
     api::openat(
       &cwd,
       temp.path.clone(),
-      libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+      lio::api::OpenFlags::WRITE
+        | lio::api::OpenFlags::CREATE
+        | lio::api::OpenFlags::TRUNCATE,
       0o666,
     )
     .with_lio(&mut lio)

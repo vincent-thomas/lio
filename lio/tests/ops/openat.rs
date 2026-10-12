@@ -15,13 +15,6 @@ use lio::{
 };
 use std::ffi::CString;
 
-/// `O_DIRECTORY` as the simulation backend interprets it. Windows' CRT has no
-/// such flag; the simulator uses the Linux value there.
-#[cfg(unix)]
-const O_DIRECTORY: i32 = libc::O_DIRECTORY;
-#[cfg(not(unix))]
-const O_DIRECTORY: i32 = 0o200000;
-
 fn new_ds_lio() -> Lio {
   Lio::new_with_backend(
     DSBackend::with_config(DSConfig { fault_every: 0, ..DSConfig::default() }),
@@ -34,7 +27,7 @@ fn open_file(
   lio: &mut Lio,
   dir: &impl lio::api::resource::AsResource,
   path: CString,
-  flags: i32,
+  flags: lio::api::OpenFlags,
   mode: u32,
 ) -> Result<Resource, std::io::Error> {
   let mut receiver = api::openat(dir, path, flags, mode).with_lio(lio).send();
@@ -103,7 +96,7 @@ fn test_openat_with_directory_fd() {
     &mut lio,
     &Resource::cwd(),
     dir_path.clone(),
-    libc::O_RDONLY | O_DIRECTORY,
+    lio::api::OpenFlags::READ | lio::api::OpenFlags::DIRECTORY,
     0,
   )
   .expect("Failed to open synthetic directory");
@@ -113,7 +106,10 @@ fn test_openat_with_directory_fd() {
     &mut lio,
     &dir_res,
     file_path,
-    libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+    lio::api::OpenFlags::READ
+      | lio::api::OpenFlags::WRITE
+      | lio::api::OpenFlags::CREATE
+      | lio::api::OpenFlags::TRUNCATE,
     0o666,
   )
   .expect("Failed to open file with directory fd");
@@ -137,7 +133,10 @@ fn test_openat_concurrent() {
       &mut lio,
       &Resource::cwd(),
       path.clone(),
-      libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+      lio::api::OpenFlags::READ
+        | lio::api::OpenFlags::WRITE
+        | lio::api::OpenFlags::CREATE
+        | lio::api::OpenFlags::TRUNCATE,
       0o666,
     )
     .expect("Failed to open file");
@@ -163,7 +162,10 @@ fn test_openat_append_mode() {
     &mut lio,
     &Resource::cwd(),
     path.clone(),
-    libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+    lio::api::OpenFlags::READ
+      | lio::api::OpenFlags::WRITE
+      | lio::api::OpenFlags::CREATE
+      | lio::api::OpenFlags::TRUNCATE,
     0o644,
   )
   .unwrap();
@@ -173,15 +175,20 @@ fn test_openat_append_mode() {
     &mut lio,
     &Resource::cwd(),
     path.clone(),
-    libc::O_WRONLY | libc::O_APPEND,
+    lio::api::OpenFlags::WRITE | lio::api::OpenFlags::APPEND,
     0,
   )
   .expect("Failed to open append mode file");
   write_all_at(&mut lio, &append_fd, b"World", 0);
 
-  let reader =
-    open_file(&mut lio, &Resource::cwd(), path.clone(), libc::O_RDONLY, 0)
-      .unwrap();
+  let reader = open_file(
+    &mut lio,
+    &Resource::cwd(),
+    path.clone(),
+    lio::api::OpenFlags::READ,
+    0,
+  )
+  .unwrap();
   let read_back = read_exact_at(&mut lio, &reader, 10, 0);
   assert_eq!(read_back, b"HelloWorld");
 
@@ -197,17 +204,20 @@ fn test_openat_excl_flag() {
     &mut lio,
     &Resource::cwd(),
     path.clone(),
-    libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+    lio::api::OpenFlags::READ | lio::api::OpenFlags::WRITE | lio::api::OpenFlags::CREATE | lio::api::OpenFlags::EXCLUSIVE,
     0o666,
   )
-  .expect("First O_EXCL create should succeed");
+  .expect("First lio::api::OpenFlags::READ | lio::api::OpenFlags::EXCLUSIVE create should succeed");
   drop(fd);
 
   let result = open_file(
     &mut lio,
     &Resource::cwd(),
     path.clone(),
-    libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+    lio::api::OpenFlags::READ
+      | lio::api::OpenFlags::WRITE
+      | lio::api::OpenFlags::CREATE
+      | lio::api::OpenFlags::EXCLUSIVE,
     0o666,
   );
   assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EEXIST));
@@ -224,7 +234,7 @@ fn test_openat_directory() {
     &mut lio,
     &Resource::cwd(),
     path,
-    libc::O_RDONLY | O_DIRECTORY,
+    lio::api::OpenFlags::READ | lio::api::OpenFlags::DIRECTORY,
     0,
   )
   .expect("Failed to open directory");
@@ -239,7 +249,10 @@ fn test_openat_directory_flag_on_file() {
     &mut lio,
     &Resource::cwd(),
     path.clone(),
-    libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+    lio::api::OpenFlags::READ
+      | lio::api::OpenFlags::WRITE
+      | lio::api::OpenFlags::CREATE
+      | lio::api::OpenFlags::TRUNCATE,
     0o644,
   )
   .unwrap();
@@ -248,7 +261,7 @@ fn test_openat_directory_flag_on_file() {
     &mut lio,
     &Resource::cwd(),
     path.clone(),
-    libc::O_RDONLY | O_DIRECTORY,
+    lio::api::OpenFlags::READ | lio::api::OpenFlags::DIRECTORY,
     0,
   );
   assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOTDIR));

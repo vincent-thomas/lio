@@ -65,7 +65,7 @@ impl Command for HeadCommand {
     for path in &self.files {
       let cpath = CString::new(path.as_str())?;
       open_receivers.push(
-        api::openat(&ctx.cwd(), cpath, libc::O_RDONLY, 0)
+        api::openat(&ctx.cwd(), cpath, lio::api::OpenFlags::READ, 0)
           .with_lio(ctx.lio())
           .send(),
       );

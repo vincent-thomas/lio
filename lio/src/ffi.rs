@@ -1186,6 +1186,10 @@ pub unsafe extern "C" fn lio_openat(
   let dir_resource = unsafe { fd_to_borrowed_resource(dir_fd) };
   #[allow(clippy::unnecessary_cast)]
   let mode = mode as u32;
+  let Some(flags) = open_flags_from_posix(flags) else {
+    callback(-libc::EINVAL as libc::intptr_t);
+    return;
+  };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::openat(&dir_resource, path_owned, flags, mode)
     .with_lio(&unsafe { handle(lio) }.inner)
@@ -2253,6 +2257,34 @@ mod sockaddr_tests {
       libc::close(fd);
     }
   }
+}
+
+/// Translates POSIX `O_*` open flags from C callers to [`api::OpenFlags`].
+///
+/// Returns `None` for flags lio does not model, so they are rejected rather
+/// than silently dropped. `O_CLOEXEC` is accepted; lio always sets it.
+fn open_flags_from_posix(bits: libc::c_int) -> Option<api::OpenFlags> {
+  use api::OpenFlags;
+  let mut flags = match bits & libc::O_ACCMODE {
+    libc::O_RDONLY => OpenFlags::READ,
+    libc::O_WRONLY => OpenFlags::WRITE,
+    libc::O_RDWR => OpenFlags::READ | OpenFlags::WRITE,
+    _ => return None,
+  };
+  let mut rest = bits & !libc::O_ACCMODE & !libc::O_CLOEXEC;
+  for (native, flag) in [
+    (libc::O_APPEND, OpenFlags::APPEND),
+    (libc::O_CREAT, OpenFlags::CREATE),
+    (libc::O_TRUNC, OpenFlags::TRUNCATE),
+    (libc::O_EXCL, OpenFlags::EXCLUSIVE),
+    (libc::O_DIRECTORY, OpenFlags::DIRECTORY),
+  ] {
+    if rest & native != 0 {
+      flags |= flag;
+      rest &= !native;
+    }
+  }
+  (rest == 0).then_some(flags)
 }
 
 #[cfg(test)]

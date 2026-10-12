@@ -57,6 +57,15 @@ typedef struct CompletionFlags CompletionFlags;
  */
 typedef struct Interest Interest;
 
+/**
+ * How [`Op::OpenAt`] opens a path. Combine flags with `|`.
+ *
+ * At least one of [`READ`](Self::READ), [`WRITE`](Self::WRITE) or
+ * [`APPEND`](Self::APPEND) is required; backends reject an open without an
+ * access mode as invalid input. Backends translate these to their native
+ * flags, and never let the opened resource leak into child processes
+ * (`O_CLOEXEC` on Unix).
+ */
 typedef struct OpenFlags OpenFlags;
 
 typedef struct SockDomain SockDomain;

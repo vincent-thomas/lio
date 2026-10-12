@@ -2070,7 +2070,9 @@ fn append_to_path(
     lio::api::openat(
       &ctx.cwd(),
       cpath,
-      libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+      lio::api::OpenFlags::WRITE
+        | lio::api::OpenFlags::APPEND
+        | lio::api::OpenFlags::CREATE,
       0o666,
     )
     .with_lio(ctx.lio())

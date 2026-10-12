@@ -38,7 +38,7 @@ impl Command for Base32Command {
         api::openat(
           &ctx.cwd(),
           std::ffi::CString::new(path)?,
-          libc::O_RDONLY,
+          lio::api::OpenFlags::READ,
           0,
         )
         .with_lio(ctx.lio())
@@ -74,7 +74,7 @@ mod tests {
       api::openat(
         &ctx.cwd(),
         CString::new(input_path.to_str().unwrap()).unwrap(),
-        libc::O_RDONLY,
+        lio::api::OpenFlags::READ,
         0,
       )
       .with_lio(ctx.lio())

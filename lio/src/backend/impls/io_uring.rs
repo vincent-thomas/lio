@@ -859,6 +859,9 @@ impl IoUring {
           .err()
           .map(|errno| -(errno as isize))
       }
+      Op::OpenAt { flags, .. } => crate::backend::native::open_flags(*flags)
+        .err()
+        .map(|errno| -(errno as isize)),
       _ => None,
     }
   }
@@ -867,7 +870,8 @@ impl IoUring {
     match op {
       Op::OpenAt { dir_fd, flags, mode, .. } => {
         OpenAt::new(dir_fd.as_raw_fd(), state.path1.as_ptr())
-          .flags(flags.bits())
+          // Invalid flags were rejected by `validate_op`.
+          .flags(crate::backend::native::open_flags(*flags).unwrap_or(0))
           .mode(mode.bits() as libc::mode_t)
           .build()
       }

@@ -40,7 +40,7 @@ where
       api::openat(
         &Resource::cwd(),
         CString::new(path.as_str())?,
-        libc::O_RDONLY,
+        lio::api::OpenFlags::READ,
         0,
       )
       .with_lio(lio)

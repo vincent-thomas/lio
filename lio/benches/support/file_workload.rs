@@ -23,7 +23,7 @@ impl Workload {
     let mut receiver = api::openat(
       &api::resource::Resource::cwd(),
       CString::new(path.to_str().unwrap()).unwrap(),
-      api::OpenFlags::EMPTY,
+      api::OpenFlags::READ,
       api::FileMode::default(),
     )
     .with_lio(&lio)

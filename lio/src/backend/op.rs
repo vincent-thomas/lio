@@ -60,24 +60,65 @@ op_flags!(WriteFlags);
 op_flags!(RecvFlags);
 op_flags!(SendFlags);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct OpenFlags(i32);
+/// How [`Op::OpenAt`] opens a path. Combine flags with `|`.
+///
+/// At least one of [`READ`](Self::READ), [`WRITE`](Self::WRITE) or
+/// [`APPEND`](Self::APPEND) is required; backends reject an open without an
+/// access mode as invalid input. Backends translate these to their native
+/// flags, and never let the opened resource leak into child processes
+/// (`O_CLOEXEC` on Unix).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct OpenFlags(u32);
 
 impl OpenFlags {
-  pub const EMPTY: Self = Self(0);
+  /// Open for reading.
+  pub const READ: Self = Self(1 << 0);
+  /// Open for writing.
+  pub const WRITE: Self = Self(1 << 1);
+  /// Open for writing, with every write appended to the end (implies
+  /// writing).
+  pub const APPEND: Self = Self(1 << 2);
+  /// Create the file if it does not exist.
+  pub const CREATE: Self = Self(1 << 3);
+  /// Truncate an existing file to zero length (requires writing).
+  pub const TRUNCATE: Self = Self(1 << 4);
+  /// With [`CREATE`](Self::CREATE): fail if the file already exists.
+  pub const EXCLUSIVE: Self = Self(1 << 5);
+  /// Fail unless the path is a directory.
+  pub const DIRECTORY: Self = Self(1 << 6);
 
-  pub const fn from_bits(bits: i32) -> Self {
-    Self(bits)
+  /// No flags; combine with others.
+  pub const fn empty() -> Self {
+    Self(0)
   }
 
-  pub const fn bits(self) -> i32 {
-    self.0
+  /// Whether every flag in `other` is set.
+  pub const fn contains(self, other: Self) -> bool {
+    self.0 & other.0 == other.0
+  }
+
+  /// Whether the open reads.
+  pub const fn reads(self) -> bool {
+    self.contains(Self::READ)
+  }
+
+  /// Whether the open writes (`WRITE` or `APPEND`).
+  pub const fn writes(self) -> bool {
+    self.contains(Self::WRITE) || self.contains(Self::APPEND)
   }
 }
 
-impl From<i32> for OpenFlags {
-  fn from(bits: i32) -> Self {
-    Self::from_bits(bits)
+impl std::ops::BitOr for OpenFlags {
+  type Output = Self;
+
+  fn bitor(self, rhs: Self) -> Self {
+    Self(self.0 | rhs.0)
+  }
+}
+
+impl std::ops::BitOrAssign for OpenFlags {
+  fn bitor_assign(&mut self, rhs: Self) {
+    self.0 |= rhs.0;
   }
 }
 

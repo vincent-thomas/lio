@@ -92,7 +92,7 @@ impl Command for CommCommand {
       api::openat(
         &ctx.cwd(),
         std::ffi::CString::new(self.left_path.as_str())?,
-        libc::O_RDONLY,
+        lio::api::OpenFlags::READ,
         0,
       )
       .with_lio(ctx.lio())
@@ -103,7 +103,7 @@ impl Command for CommCommand {
       api::openat(
         &ctx.cwd(),
         std::ffi::CString::new(self.right_path.as_str())?,
-        libc::O_RDONLY,
+        lio::api::OpenFlags::READ,
         0,
       )
       .with_lio(ctx.lio())
