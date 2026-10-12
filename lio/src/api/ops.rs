@@ -124,7 +124,7 @@ impl OpModel for Socket {
     }
 
     // SAFETY: a successful socket completion carries a new owned socket.
-    OpResult::Done(Ok(unsafe { Resource::from_completion(completion.result) }))
+    OpResult::Done(Ok(unsafe { Resource::from_completion(&completion) }))
   }
 }
 
@@ -226,7 +226,7 @@ impl Accept {
     }
 
     // SAFETY: a successful accept completion carries a new owned socket.
-    Ok(unsafe { Resource::from_completion(completion.result) })
+    Ok(unsafe { Resource::from_completion(&completion) })
   }
 }
 
@@ -1402,7 +1402,7 @@ impl OpModel for OpenAt {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
       // SAFETY: a successful open completion carries a new owned handle.
-      Ok(unsafe { Resource::from_completion(completion.result) })
+      Ok(unsafe { Resource::from_completion(&completion) })
     };
     OpResult::Done(res)
   }

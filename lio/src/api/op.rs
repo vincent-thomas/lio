@@ -1,5 +1,6 @@
 //! Type-safe operation traits for bridging user types to backend execution.
 
+use crate::api::resource::CloseFn;
 use crate::backend::op::Op;
 use std::time::Duration;
 
@@ -8,17 +9,54 @@ use std::time::Duration;
 pub struct Completion {
   pub result: isize,
   pub flags: CompletionFlags,
+  /// How a resource carried by `result` is closed: the producing backend's
+  /// close function.
+  resource_close: ResourceClose,
 }
 
 impl Completion {
+  /// A completion whose resources (if any) are native OS descriptors/handles.
   pub const fn new(result: isize) -> Self {
-    Self { result, flags: CompletionFlags::empty() }
+    Self::with_flags(result, CompletionFlags::empty())
   }
 
   pub const fn with_flags(result: isize, flags: CompletionFlags) -> Self {
-    Self { result, flags }
+    Self {
+      result,
+      flags,
+      resource_close: ResourceClose(crate::backend::native::close),
+    }
+  }
+
+  /// Sets how a resource carried by this completion is closed.
+  pub(crate) const fn with_resource_close(mut self, close: CloseFn) -> Self {
+    self.resource_close = ResourceClose(close);
+    self
+  }
+
+  /// How a resource carried by this completion is closed.
+  pub(crate) const fn resource_close(&self) -> CloseFn {
+    self.resource_close.0
   }
 }
+
+/// A [`CloseFn`] compared by address.
+#[derive(Clone, Copy)]
+struct ResourceClose(CloseFn);
+
+impl std::fmt::Debug for ResourceClose {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("ResourceClose")
+  }
+}
+
+impl PartialEq for ResourceClose {
+  fn eq(&self, other: &Self) -> bool {
+    std::ptr::fn_addr_eq(self.0, other.0)
+  }
+}
+
+impl Eq for ResourceClose {}
 
 /// Completion flags understood by higher-level operation models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

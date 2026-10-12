@@ -48,6 +48,10 @@ use crate::{Lio, install_global};
 #[cfg(windows)]
 const WINDOWS_CWD_KEY: i32 = -100;
 
+/// Resources from the simulation are synthetic numbers, not OS descriptors:
+/// dropping them must not close anything real.
+unsafe fn close_simulated(_raw: crate::api::resource::RawResource) {}
+
 /// Mode and open-flag bits the simulation interprets.
 ///
 /// Callers pass the platform's native `O_*` bits; where the platform has no
@@ -1428,7 +1432,7 @@ impl DSBackend {
       GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
     let handle = resource.as_raw_handle();
-    if handle == crate::api::resource::CWD_HANDLE {
+    if handle == crate::backend::native::CWD {
       return WINDOWS_CWD_KEY;
     }
     for (key, which) in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
@@ -2573,6 +2577,10 @@ impl DSBackend {
 }
 
 impl IoBackend for DSBackend {
+  fn resource_close(&self) -> crate::api::resource::CloseFn {
+    close_simulated
+  }
+
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.cap = cap;
     self.initialized = true;
@@ -3843,6 +3851,10 @@ impl DSTBackend {
 }
 
 impl IoBackend for DSTBackend {
+  fn resource_close(&self) -> crate::api::resource::CloseFn {
+    close_simulated
+  }
+
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self
       .local

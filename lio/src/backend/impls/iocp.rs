@@ -47,11 +47,12 @@ use windows_sys::Win32::System::IO::{
   PostQueuedCompletionStatus,
 };
 
-use crate::api::resource::{CWD_HANDLE, Resource};
+use crate::api::resource::Resource;
 use crate::backend::impls::sockaddr::{
   SockLen, Storage, socket_addr_buf_from_storage, socket_addr_buf_to_storage,
   socket_addr_to_storage, socket_to_raw,
 };
+use crate::backend::native::CWD as CWD_HANDLE;
 use crate::backend::op::{
   DirEntryRef, FileStat, FileType, LinkKind, MsgRecv, MsgSend, Op,
   OpaqueDropFn, RawBuf, ReadDirResult, ShutdownHow, SocketAddrBuf,
