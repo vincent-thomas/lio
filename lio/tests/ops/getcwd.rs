@@ -44,5 +44,8 @@ fn test_getcwd_small_buffer_fails() {
 
   let mut receiver = api::getcwd(vec![0; 1]).with_lio(&mut lio).send();
   let (result, _buf) = common::poll_recv(&mut lio, &mut receiver);
-  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ERANGE));
+  assert_eq!(
+    result.unwrap_err().raw_os_error(),
+    Some(common::BUFFER_TOO_SMALL)
+  );
 }

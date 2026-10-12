@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
   collections::BTreeSet,
   env,
@@ -676,7 +678,9 @@ fn assert_event_invariants(seed: u64, event: &Event) {
         assert!(
           matches!(
             err.raw_os_error(),
-            Some(libc::ERANGE) | Some(libc::ENOENT) | Some(libc::EINVAL)
+            Some(common::BUFFER_TOO_SMALL)
+              | Some(libc::ENOENT)
+              | Some(libc::EINVAL)
           ),
           "seed {seed} produced invalid path-buffer error: {err:?}"
         );
