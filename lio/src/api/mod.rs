@@ -403,9 +403,8 @@ doc_op! {
 }
 
 doc_op! {
-    short: "Spawns a new process using posix_spawn().",
+    short: "Spawns a new process; `argv[0]` is the conventional program name.",
 
-    #[cfg(unix)]
     pub fn spawn(
         path: std::ffi::CString,
         argv: Vec<std::ffi::CString>,

@@ -1,8 +1,5 @@
 //! Stress tests for high-concurrency scenarios.
 
-// Drives raw Unix descriptors directly; Windows is covered by the backend
-// contract suite in `backends`.
-#![cfg(unix)]
 #![allow(clippy::expect_fun_call, clippy::unnecessary_mut_passed)]
 
 mod common;
@@ -10,7 +7,6 @@ mod common;
 use common::{TempFile, poll_until_recv, setup_tcp_pair};
 use lio::api::resource::Resource;
 use lio::{Lio, api};
-use std::os::fd::FromRawFd;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -114,7 +110,7 @@ fn test_concurrent_nop_10000() {
 fn test_concurrent_file_writes_256() {
   let mut lio = Lio::new(512).unwrap();
 
-  let cwd = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+  let cwd = Resource::cwd();
   let (sender_open, receiver_open) = mpsc::channel();
   let (sender_write, receiver_write) = mpsc::channel();
 

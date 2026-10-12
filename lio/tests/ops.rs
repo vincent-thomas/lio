@@ -20,7 +20,6 @@ mod ops {
   mod shutdown;
   mod sleep;
   mod socket;
-  #[cfg(unix)]
   mod spawn;
   mod unlinkat;
 }
