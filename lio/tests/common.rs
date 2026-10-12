@@ -376,11 +376,19 @@ pub fn path_to_cstring(path: &std::path::Path) -> CString {
     .expect("test paths have no NUL bytes")
 }
 
-/// Utility function to create a unique temporary file path for proptest tests.
-/// Returns a CString path that includes the process ID and a unique value to avoid conflicts.
+/// A unique path in the *simulation* backend's synthetic filesystem, for
+/// tests that run on `DSBackend`. The simulator models Unix-style absolute
+/// paths, so this is `/tmp/...` on every platform; use [`temp_path`] for tests
+/// that touch the real filesystem.
 #[allow(dead_code)]
 pub fn make_temp_path(test_name: &str, unique_value: u64) -> CString {
-  temp_cpath(&format!("{test_name}_{unique_value}.txt"))
+  CString::new(format!(
+    "/tmp/lio_test_{}_{}_{}.txt",
+    test_name,
+    std::process::id(),
+    unique_value
+  ))
+  .expect("Failed to create CString path")
 }
 
 /// A connected TCP client-server pair.
