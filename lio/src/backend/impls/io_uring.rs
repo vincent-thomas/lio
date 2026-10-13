@@ -29,6 +29,8 @@ const STATX_BASIC_STATS: u32 = 0x0000_07ff;
 /// `user_data` of cancellation requests. Their completions are not
 /// operations, and no slab key decodes to it.
 const CANCEL_USER_DATA: u64 = u64::MAX;
+/// How long dropping the backend waits for cancelled operations to finish.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
 const LINUX_DIRENT64_NAME_OFFSET: usize = 19;
 type CurrentDirent<'a> = (u64, u8, usize, &'a [u8]);
 
@@ -524,6 +526,7 @@ struct IoUringProfile {
 
 impl Drop for IoUring {
   fn drop(&mut self) {
+    self.drain();
     let Some(profile) = &self.profile else {
       return;
     };
@@ -605,6 +608,55 @@ impl IoUring {
 
   pub fn new() -> Self {
     Self::default()
+  }
+
+  /// Cancels every operation still in the kernel and waits for their
+  /// completions. Closing the ring alone does not wait: a request running on
+  /// an io-wq worker (blocking file or pipe I/O) could still write into op
+  /// memory after its owner freed it.
+  fn drain(&mut self) {
+    if self.ring.is_none() || self.in_flight == 0 {
+      return;
+    }
+    let keys: Vec<SlabKey> = self.pending.keys_where(|_| true).collect();
+    for key in keys {
+      let ring = self.ring();
+      if ring.sq_space_left() == 0 && ring.submit().is_err() {
+        break;
+      }
+      let entry = AsyncCancel::new(key.as_u64()).build();
+      // SAFETY: a cancellation request references no memory.
+      if unsafe { ring.push(entry, CANCEL_USER_DATA) }.is_err() {
+        break;
+      }
+    }
+
+    let deadline = Instant::now() + DRAIN_GRACE;
+    let mut discarded = Vec::new();
+    while self.in_flight > 0 {
+      let remaining = deadline.saturating_duration_since(Instant::now());
+      if remaining.is_zero() || self.ring().submit().is_err() {
+        break;
+      }
+      match self.ring().wait_timeout(remaining.min(Duration::from_millis(100)))
+      {
+        Ok(Some(completion)) => {
+          self.reap(completion.user_data(), completion.result(), &mut discarded)
+        }
+        Ok(None) => continue,
+        Err(_) => break,
+      }
+      while let Ok(Some(completion)) = self.ring().try_wait() {
+        self.reap(completion.user_data(), completion.result(), &mut discarded);
+      }
+      discarded.clear();
+    }
+
+    if self.in_flight > 0 {
+      // Some request outlived the grace period. Keep the state it points
+      // into alive rather than free it under the kernel.
+      mem::forget(mem::replace(&mut self.pending, Slab::new(0)));
+    }
   }
 
   #[inline]
@@ -1460,7 +1512,8 @@ impl IoBackend for IoUring {
         .push(OpCompleted::new(id, -(libc::ECANCELED as isize)));
       return;
     }
-    let Some(key) = self.pending.find_key(|entry| entry.registration_id == id)
+    let Some(key) =
+      self.pending.keys_where(|entry| entry.registration_id == id).next()
     else {
       return;
     };

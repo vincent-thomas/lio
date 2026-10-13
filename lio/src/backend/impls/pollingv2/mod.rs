@@ -1285,7 +1285,8 @@ impl IoBackend for Poller {
     }
     // This backend performs the I/O itself once the descriptor is ready, so
     // nothing outside it uses the op's memory: it can be dropped right away.
-    let Some(key) = self.pending.find_key(|entry| entry.registration_id == id)
+    let Some(key) =
+      self.pending.keys_where(|entry| entry.registration_id == id).next()
     else {
       return;
     };

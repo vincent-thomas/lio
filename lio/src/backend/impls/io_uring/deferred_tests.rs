@@ -293,3 +293,45 @@ fn nonblocking_waits_make_progress_on_file_completions() {
   backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
   assert!(completed.is_empty());
 }
+
+#[test]
+fn drop_waits_for_operations_in_the_kernel() {
+  use std::io::Write;
+  let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+  // SAFETY: transfers the descriptor to its sole Resource owner.
+  let reader = unsafe { Resource::from_raw_fd(reader.into_raw_fd()) };
+  let mut backend = IoUring::new();
+  backend.init(8).unwrap();
+  let mut arena = Bump::new();
+  let mut buf = [0u8; 4];
+  // SAFETY: `buf` outlives every use of the backend below.
+  let raw = unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
+  backend.push(
+    1,
+    Op::Read {
+      fd: reader.clone(),
+      iovecs: NonNull::from(&raw),
+      iov_count: 1,
+      offset: -1,
+      flags: ReadFlags::EMPTY,
+    },
+    &mut arena,
+  );
+  backend.flush().unwrap();
+  let mut completed = Vec::new();
+  backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+  assert!(completed.is_empty(), "the read waits for data");
+  assert_eq!(backend.in_flight, 1);
+
+  let start = Instant::now();
+  backend.drain();
+  assert!(start.elapsed() < Duration::from_secs(1), "cancelled promptly");
+  assert_eq!(backend.in_flight, 0, "nothing is left in the kernel");
+  assert_eq!(backend.pending.len(), 0);
+
+  // Data arriving afterwards no longer reaches the buffer.
+  writer.write_all(b"late").unwrap();
+  std::thread::sleep(Duration::from_millis(50));
+  drop(backend);
+  assert_eq!(buf, [0; 4]);
+}
