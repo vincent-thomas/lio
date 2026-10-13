@@ -338,20 +338,20 @@ pub struct OpenReadDir {
 }
 
 enum OpenReadDirState {
+  /// The path could not be represented; completes with `InvalidInput`.
+  InvalidPath,
   Opening(ops::OpenAt),
-  Reading { fd: Resource, op: ops::ReadDir },
+  Reading {
+    fd: Resource,
+    op: ops::ReadDir,
+  },
   Done,
 }
 
 impl OpenReadDir {
-  fn new(path: CString, parent: PathBuf) -> Self {
+  fn new(state: OpenReadDirState, parent: PathBuf) -> Self {
     Self {
-      state: OpenReadDirState::Opening(ops::OpenAt::new(
-        Resource::cwd(),
-        path,
-        OpenFlags::READ | OpenFlags::DIRECTORY,
-        0,
-      )),
+      state,
       parent,
       buf: Some(ReadDirBuf::with_capacity(
         DEFAULT_READ_DIR_SCRATCH_BYTES,
@@ -367,6 +367,7 @@ impl OpModel for OpenReadDir {
 
   fn action(&mut self) -> Action {
     match &mut self.state {
+      OpenReadDirState::InvalidPath => Action::Io(crate::backend::op::Op::Nop),
       OpenReadDirState::Opening(op) => op.action(),
       OpenReadDirState::Reading { op, .. } => op.action(),
       OpenReadDirState::Done => {
@@ -377,6 +378,9 @@ impl OpModel for OpenReadDir {
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, OpenReadDirState::Done) {
+      OpenReadDirState::InvalidPath => {
+        OpResult::Done(Err(ops::nul_path_error()))
+      }
       OpenReadDirState::Opening(mut op) => match op.complete(completion) {
         OpResult::Done(Ok(fd)) => {
           let buf = self.buf.take().expect("read_dir buffer missing");
@@ -701,6 +705,8 @@ pub struct ReadLink {
 }
 
 enum ReadLinkState {
+  /// The path could not be represented; completes with `InvalidInput`.
+  InvalidPath,
   Reading(ops::ReadlinkAt<Vec<u8>>),
   Done,
 }
@@ -723,6 +729,7 @@ impl OpModel for ReadLink {
 
   fn action(&mut self) -> Action {
     match &mut self.state {
+      ReadLinkState::InvalidPath => Action::Io(crate::backend::op::Op::Nop),
       ReadLinkState::Reading(op) => op.action(),
       ReadLinkState::Done => panic!("ReadLink polled after completion"),
     }
@@ -730,6 +737,7 @@ impl OpModel for ReadLink {
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, ReadLinkState::Done) {
+      ReadLinkState::InvalidPath => OpResult::Done(Err(ops::nul_path_error())),
       ReadLinkState::Reading(mut op) => match op.complete(completion) {
         OpResult::Done((Ok(n), buf)) if n as usize == buf.capacity() => {
           let next_len = buf.capacity().saturating_mul(2).max(1);
@@ -765,8 +773,13 @@ pub struct ReadToString {
 
 #[allow(clippy::large_enum_variant)]
 enum ReadToStringState {
+  /// The path could not be represented; completes with `InvalidInput`.
+  InvalidPath,
   Opening(ops::OpenAt),
-  Reading { fd: Resource, op: ops::Read<Vec<u8>> },
+  Reading {
+    fd: Resource,
+    op: ops::Read<Vec<u8>>,
+  },
   Done,
 }
 
@@ -789,6 +802,7 @@ impl OpModel for ReadToString {
 
   fn action(&mut self) -> Action {
     match &mut self.state {
+      ReadToStringState::InvalidPath => Action::Io(crate::backend::op::Op::Nop),
       ReadToStringState::Opening(op) => op.action(),
       ReadToStringState::Reading { op, .. } => op.action(),
       ReadToStringState::Done => panic!("ReadToString polled after completion"),
@@ -797,6 +811,9 @@ impl OpModel for ReadToString {
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, ReadToStringState::Done) {
+      ReadToStringState::InvalidPath => {
+        OpResult::Done(Err(ops::nul_path_error()))
+      }
       ReadToStringState::Opening(mut op) => match op.complete(completion) {
         OpResult::Done(Ok(fd)) => {
           self.state = ReadToStringState::Reading {
@@ -847,26 +864,40 @@ impl OpModel for ReadToString {
 impl OneshotOpModel for ReadToString {}
 
 /// Opens a directory reader relative to the current working directory.
+///
+/// A path containing a NUL byte fails with [`io::ErrorKind::InvalidInput`].
 pub fn read_dir<P: AsRef<Path>>(path: P) -> Io<OpenReadDir> {
   let parent = path.as_ref().to_path_buf();
-  let path = path_to_cstring(path.as_ref())
-    .expect("lio::fs::read_dir path must not contain interior NUL bytes");
-  Io::from_op(OpenReadDir::new(path, parent))
+  let state = match path_to_cstring(path.as_ref()) {
+    Some(path) => OpenReadDirState::Opening(ops::OpenAt::new(
+      Resource::cwd(),
+      path,
+      OpenFlags::READ | OpenFlags::DIRECTORY,
+      0,
+    )),
+    None => OpenReadDirState::InvalidPath,
+  };
+  Io::from_op(OpenReadDir::new(state, parent))
 }
 
 /// Reads metadata for a path relative to the current working directory, following symlinks.
+///
+/// A path containing a NUL byte fails with [`io::ErrorKind::InvalidInput`].
 pub fn metadata<P: AsRef<Path>>(path: P) -> Io<ops::Stat> {
-  let path = path_to_cstring(path.as_ref())
-    .expect("lio::fs::metadata path must not contain interior NUL bytes");
-  metadata_cstring(path, true)
+  match path_to_cstring(path.as_ref()) {
+    Some(path) => metadata_cstring(path, true),
+    None => Io::from_op(ops::Stat::invalid_path()),
+  }
 }
 
 /// Reads metadata for a path relative to the current working directory, without following symlinks.
+///
+/// A path containing a NUL byte fails with [`io::ErrorKind::InvalidInput`].
 pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> Io<ops::Stat> {
-  let path = path_to_cstring(path.as_ref()).expect(
-    "lio::fs::symlink_metadata path must not contain interior NUL bytes",
-  );
-  metadata_cstring(path, false)
+  match path_to_cstring(path.as_ref()) {
+    Some(path) => metadata_cstring(path, false),
+    None => Io::from_op(ops::Stat::invalid_path()),
+  }
 }
 
 /// Reads metadata for a C string path relative to the current working directory.
@@ -878,17 +909,27 @@ pub fn metadata_cstring(
 }
 
 /// Reads the target of a symbolic link relative to the current working directory.
+///
+/// A path containing a NUL byte fails with [`io::ErrorKind::InvalidInput`].
 pub fn read_link<P: AsRef<Path>>(path: P) -> Io<ReadLink> {
-  let path = path_to_cstring(path.as_ref())
-    .expect("lio::fs::read_link path must not contain interior NUL bytes");
-  Io::from_op(ReadLink::new(path))
+  Io::from_op(match path_to_cstring(path.as_ref()) {
+    Some(path) => ReadLink::new(path),
+    None => {
+      ReadLink { path: CString::default(), state: ReadLinkState::InvalidPath }
+    }
+  })
 }
 
 /// Reads a UTF-8 file into a string relative to the current working directory.
+///
+/// A path containing a NUL byte fails with [`io::ErrorKind::InvalidInput`].
 pub fn read_to_string<P: AsRef<Path>>(path: P) -> Io<ReadToString> {
-  let path = path_to_cstring(path.as_ref())
-    .expect("lio::fs::read_to_string path must not contain interior NUL bytes");
-  Io::from_op(ReadToString::new(path))
+  Io::from_op(match path_to_cstring(path.as_ref()) {
+    Some(path) => ReadToString::new(path),
+    None => {
+      ReadToString { state: ReadToStringState::InvalidPath, bytes: Vec::new() }
+    }
+  })
 }
 
 /// Creates a directory relative to the current working directory.
@@ -934,8 +975,7 @@ fn os_string_from_bytes(bytes: &[u8]) -> OsString {
   }
 }
 
-fn path_to_cstring(path: &std::path::Path) -> io::Result<CString> {
-  CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
-    io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte")
-  })
+/// `None` if the path contains a NUL byte.
+fn path_to_cstring(path: &std::path::Path) -> Option<CString> {
+  CString::new(path.as_os_str().as_encoded_bytes()).ok()
 }
