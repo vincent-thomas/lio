@@ -568,19 +568,22 @@ impl Lio {
     drop(inner);
     batch.current = Some(id);
     let result = timed!(PROFILE, stats, completion_on_completion_time, {
-      // SAFETY: the registration was alive above. User code can only remove
-      // it through a handle to its operation: a callback has none, and a
-      // waker runs last in the handler, after its payload is no longer used.
+      // SAFETY: the registration was alive above, and stays alive until
+      // removed below: dropping its consumer only marks it cancelled. For a
+      // cancelled operation the op model still sees the result, so what it
+      // produced (an accepted socket, say) is released, but nobody is woken.
       unsafe { handler.complete(completion, &mut waker) }
     });
     batch.current = None;
     let mut inner = self.inner.borrow_mut();
 
     let inner_ref = &mut *inner;
-    // User code may have cancelled the operation meanwhile; then there is
-    // nothing left to resubmit or remove.
     if let Some(reg) = inner_ref.store.get_mut(id) {
-      match result.next_action {
+      // A cancelled operation takes no further step; its consumer may also
+      // have been dropped by the wake-up just now.
+      let next_action =
+        if reg.is_cancelled() { None } else { result.next_action };
+      match next_action {
         Some(action) => {
           if let Some(waker) = waker {
             reg.restore_waker(waker);
@@ -612,15 +615,27 @@ impl Lio {
     }
   }
 
-  /// Cancel an in-flight streaming operation.
+  /// Cancels an operation whose consumer (a future or stream) was dropped.
   ///
-  /// This is called when a stream is dropped to stop multishot operations.
+  /// A pending timer is simply removed. An I/O operation may still be in the
+  /// backend, using memory owned by its registration, so the registration
+  /// stays until the operation's completion arrives; the backend is asked to
+  /// finish it early, and the completion is discarded.
   pub(crate) fn cancel_stream(&self, id: u64) {
     let waiters = {
       let mut inner = self.inner.borrow_mut();
-      inner.time.remove(id);
-      inner.store.remove(id);
-      Self::release_capacity(&mut inner)
+      let inner = &mut *inner;
+      let Some(reg) = inner.store.get_mut(id) else {
+        return;
+      };
+      if inner.time.remove(id) {
+        inner.store.remove_known(id);
+      } else {
+        reg.cancel();
+        inner.io.cancel(id);
+        return;
+      }
+      Self::release_capacity(inner)
     };
     for waker in waiters {
       waker.wake();

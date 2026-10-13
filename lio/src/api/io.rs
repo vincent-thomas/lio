@@ -531,8 +531,10 @@ where
   T: OpModel,
 {
   fn drop(&mut self) {
-    if let IoStreamFutureState::Inflight { id, .. } = self.state {
-      self.lio.cancel_stream(id);
+    if let IoStreamFutureState::Inflight { id, slot } = &self.state {
+      // The operation may still complete; nobody is left to wake then.
+      slot.borrow_mut().waker = None;
+      self.lio.cancel_stream(*id);
     }
   }
 }

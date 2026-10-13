@@ -1274,6 +1274,29 @@ impl IoBackend for Poller {
     Ok(())
   }
 
+  fn cancel(&mut self, id: u64) {
+    const CANCELED: isize = -(libc::ECANCELED as isize);
+    if let Some(index) =
+      self.backlog.iter().position(|entry| entry.registration_id == id)
+    {
+      self.backlog.swap_remove(index);
+      self.queued_completed.push(OpCompleted::new(id, CANCELED));
+      return;
+    }
+    // This backend performs the I/O itself once the descriptor is ready, so
+    // nothing outside it uses the op's memory: it can be dropped right away.
+    let Some(key) = self.pending.find_key(|entry| entry.registration_id == id)
+    else {
+      return;
+    };
+    let entry = self.pending.remove_value(key).expect("found above");
+    let (fd, interest) = self.extract_fd_interest(&entry.op);
+    if !interest.is_none() {
+      let _ = self.sys().delete(fd);
+    }
+    self.queued_completed.push(OpCompleted::new(id, CANCELED));
+  }
+
   fn wait(
     &mut self,
     timeout: Option<Duration>,

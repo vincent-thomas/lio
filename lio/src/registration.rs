@@ -310,6 +310,10 @@ impl RawHandler {
 // NOTE: Registration should **NEVER** impl Sync.
 pub struct Registration {
   state: State,
+  /// Set when the operation's consumer is gone while the operation may still
+  /// be in the backend. The registration (and the memory the backend uses)
+  /// stays alive until the operation's completion arrives.
+  cancelled: bool,
 }
 
 /// Unified state machine for I/O operations.
@@ -341,6 +345,7 @@ impl Registration {
         waker: Some(waker),
         handler: WakerResultHandler::new_in(arena, sender, op_model),
       },
+      cancelled: false,
     }
   }
 
@@ -357,6 +362,7 @@ impl Registration {
   {
     Self {
       state: State::Callback(OpCallback::new_in(arena, callback, op_model)),
+      cancelled: false,
     }
   }
 
@@ -425,6 +431,23 @@ impl Registration {
 
   /// Returns a waker that a completion did not consume, unless the task has
   /// registered a newer one meanwhile.
+  /// Marks the operation as abandoned by its consumer, which will not be
+  /// woken again. Its completion is still processed, so the op model can
+  /// release what it produced, but leads to no further step.
+  #[inline]
+  pub(crate) fn cancel(&mut self) {
+    self.cancelled = true;
+    if let State::Waker { waker, .. } = &mut self.state {
+      *waker = None;
+    }
+  }
+
+  /// Whether the operation was abandoned by its consumer.
+  #[inline]
+  pub(crate) fn is_cancelled(&self) -> bool {
+    self.cancelled
+  }
+
   #[inline]
   pub(crate) fn restore_waker(&mut self, waker: Waker) {
     if let State::Waker { waker: slot @ None, .. } = &mut self.state {

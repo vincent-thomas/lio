@@ -34,8 +34,9 @@ use std::time::{Duration, Instant};
 use bumpalo::Bump;
 use windows_sys::Win32::Foundation::{
   CloseHandle, ERROR_BROKEN_PIPE, ERROR_DIRECTORY, ERROR_HANDLE_EOF,
-  ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_NOT_SUPPORTED, FALSE,
-  GetLastError, HANDLE, INVALID_HANDLE_VALUE, NO_ERROR, TRUE, WAIT_TIMEOUT,
+  ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_NOT_SUPPORTED,
+  ERROR_OPERATION_ABORTED, FALSE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+  NO_ERROR, TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock as ws;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -982,6 +983,28 @@ impl IoBackend for Iocp {
       }
     }
     Ok(())
+  }
+
+  fn cancel(&mut self, id: u64) {
+    if let Some(index) = self.backlog.iter().position(|queued| queued.id == id)
+    {
+      self.backlog.swap_remove(index);
+      self.ready.push(OpCompleted::new(id, neg(ERROR_OPERATION_ABORTED)));
+      return;
+    }
+    // SAFETY: every pointer in `in_flight` is a live boxed `Overlapped`.
+    let found = self
+      .in_flight
+      .iter()
+      .map(|&ptr| ptr as *const Overlapped)
+      .find(|&state| unsafe { (*state).id } == id);
+    if let Some(state) = found {
+      // The operation stays in flight: the kernel reports it, aborted or
+      // finished, through the port like any other completion. A job on the
+      // blocking pool is not found here; it runs to completion.
+      // SAFETY: `state` is a live in-flight operation.
+      unsafe { CancelIoEx((*state).socket as HANDLE, &(*state).ov) };
+    }
   }
 
   fn wait(

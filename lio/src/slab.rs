@@ -250,6 +250,17 @@ impl<T> Slab<T> {
   pub fn len(&self) -> usize {
     self.pool.len()
   }
+
+  /// Finds the key of the first value matching `pred`, by a linear scan of
+  /// the slots in use so far. Meant for rare lookups, such as cancellation.
+  pub fn find_key(&self, mut pred: impl FnMut(&T) -> bool) -> Option<SlabKey> {
+    let used = &self.pool.slots[..self.pool.next_slot as usize];
+    used.iter().enumerate().find_map(|(index, slot)| {
+      // SAFETY: occupied slots always contain an initialized value.
+      (slot.occupied && pred(unsafe { slot.state.assume_init_ref() }))
+        .then_some(SlabKey { slot: index as u32, generation: slot.generation })
+    })
+  }
 }
 
 impl<T> Drop for Slab<T> {

@@ -12,9 +12,9 @@ use bumpalo::Bump;
 use lio_uring::{
   Entry, LioUring,
   operation::{
-    Accept, Bind, Connect, Fsync, LinkAt, Listen, MkDirAt, Nop, OpenAt, Readv,
-    Recv, RecvMsg, RenameAt, Send, SendMsg, Shutdown, Socket, Statx, SymlinkAt,
-    UnlinkAt, Writev,
+    Accept, AsyncCancel, Bind, Connect, Fsync, LinkAt, Listen, MkDirAt, Nop,
+    OpenAt, Readv, Recv, RecvMsg, RenameAt, Send, SendMsg, Shutdown, Socket,
+    Statx, SymlinkAt, UnlinkAt, Writev,
   },
 };
 
@@ -26,6 +26,9 @@ use crate::backend::{
 use crate::slab::{Slab, SlabKey};
 
 const STATX_BASIC_STATS: u32 = 0x0000_07ff;
+/// `user_data` of cancellation requests. Their completions are not
+/// operations, and no slab key decodes to it.
+const CANCEL_USER_DATA: u64 = u64::MAX;
 const LINUX_DIRENT64_NAME_OFFSET: usize = 19;
 type CurrentDirent<'a> = (u64, u8, usize, &'a [u8]);
 
@@ -602,6 +605,27 @@ impl IoUring {
 
   pub fn new() -> Self {
     Self::default()
+  }
+
+  #[inline]
+  fn reap(
+    &mut self,
+    user_data: u64,
+    result: i32,
+    completed: &mut Vec<OpCompleted>,
+  ) {
+    if user_data == CANCEL_USER_DATA {
+      // The cancelled operation reports through its own completion.
+      return;
+    }
+    self.in_flight = self.in_flight.saturating_sub(1);
+    if let Some(pending) =
+      self.pending.remove_value(SlabKey::from_u64(user_data))
+    {
+      pending.lowered.finalize(result);
+      completed
+        .push(OpCompleted::new(pending.registration_id, result as isize));
+    }
   }
 
   #[inline]
@@ -1426,6 +1450,34 @@ impl IoBackend for IoUring {
     Ok(())
   }
 
+  fn cancel(&mut self, id: u64) {
+    if let Some(index) =
+      self.backlog.iter().position(|entry| entry.registration_id == id)
+    {
+      self.backlog.swap_remove(index);
+      self
+        .queued_completed
+        .push(OpCompleted::new(id, -(libc::ECANCELED as isize)));
+      return;
+    }
+    let Some(key) = self.pending.find_key(|entry| entry.registration_id == id)
+    else {
+      return;
+    };
+    // The kernel may be using the op's buffers: it stays pending, and its
+    // own completion (`-ECANCELED`, or its result if it won the race)
+    // finishes it as usual.
+    let ring = self.ring();
+    if ring.sq_space_left() == 0 && ring.submit().is_err() {
+      return; // The operation completes on its own instead.
+    }
+    let entry = AsyncCancel::new(key.as_u64()).build();
+    // SAFETY: a cancellation request references no memory.
+    if unsafe { ring.push(entry, CANCEL_USER_DATA) }.is_ok() {
+      self.needs_submit = true;
+    }
+  }
+
   fn wait(
     &mut self,
     timeout: Option<Duration>,
@@ -1465,21 +1517,9 @@ impl IoBackend for IoUring {
     };
 
     if let Some(completion) = first {
-      self.in_flight = self.in_flight.saturating_sub(1);
-      let key = SlabKey::from_u64(completion.user_data());
-      let result = completion.result() as isize;
-      if let Some(pending) = self.pending.remove_value(key) {
-        pending.lowered.finalize(completion.result());
-        completed.push(OpCompleted::new(pending.registration_id, result));
-      }
+      self.reap(completion.user_data(), completion.result(), completed);
       while let Some(completion) = self.ring().try_wait()? {
-        self.in_flight = self.in_flight.saturating_sub(1);
-        let key = SlabKey::from_u64(completion.user_data());
-        let result = completion.result() as isize;
-        if let Some(pending) = self.pending.remove_value(key) {
-          pending.lowered.finalize(completion.result());
-          completed.push(OpCompleted::new(pending.registration_id, result));
-        }
+        self.reap(completion.user_data(), completion.result(), completed);
       }
     }
 
