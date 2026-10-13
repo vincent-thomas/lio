@@ -1425,6 +1425,8 @@ enum StatModelTarget {
     fd: Resource,
   },
   /// The path could not be represented; completes with `InvalidInput`.
+  // Only `lio::fs` (feature `high`) takes paths that can contain NUL bytes.
+  #[cfg_attr(not(feature = "high"), allow(dead_code))]
   InvalidPath,
 }
 
@@ -1453,6 +1455,7 @@ impl Stat {
   }
 
   /// A stat that fails with `InvalidInput` without touching the file system.
+  #[cfg_attr(not(feature = "high"), allow(dead_code))]
   pub(crate) fn invalid_path() -> Self {
     Self { target: StatModelTarget::InvalidPath, out: FileStat::zeroed() }
   }
