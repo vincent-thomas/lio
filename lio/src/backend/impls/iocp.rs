@@ -87,6 +87,11 @@ type ConnectExFn = unsafe extern "system" fn(
   *mut OVERLAPPED,
 ) -> i32;
 
+/// How long dropping the backend waits for cancelled operations to finish.
+/// Cancelled socket operations report back at once; this only bounds I/O
+/// the kernel is still busy with.
+const DRAIN_GRACE: Duration = Duration::from_millis(500);
+
 /// State for one in-flight overlapped operation.
 ///
 /// `ov` must stay the first field: completion entries hand back a pointer to
@@ -925,12 +930,17 @@ impl Drop for Iocp {
     // done with their memory before it is freed. Anything left after the
     // grace period is leaked rather than freed while possibly in use.
     let mut completed = Vec::new();
-    let mut rounds = 0;
-    while !self.in_flight.is_empty() && rounds < 50 {
-      if self.reap(100, &mut completed).is_err() {
+    let deadline = Instant::now() + DRAIN_GRACE;
+    while !self.in_flight.is_empty() {
+      let remaining = deadline.saturating_duration_since(Instant::now());
+      if remaining.is_zero() {
         break;
       }
-      rounds += 1;
+      let ms = remaining.as_millis().clamp(1, 100) as u32;
+      if self.reap(ms, &mut completed).is_err() {
+        break;
+      }
+      completed.clear();
     }
     // Free results the workers posted that were never reaped.
     while self.reap(0, &mut completed).unwrap_or(false) {}
