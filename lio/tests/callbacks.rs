@@ -1,0 +1,208 @@
+//! User code that runs on completion (callbacks and task wake-ups) must be
+//! free to use the same `Lio`: schedule follow-ups, drop operations, or drive
+//! the loop.
+
+use std::cell::{Cell, RefCell};
+use std::future::{Future, IntoFuture};
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
+
+use lio::{Lio, api};
+
+/// Runs the loop until `done` is set, failing after a generous deadline.
+fn run_until(lio: &Lio, done: &Cell<bool>) {
+  for _ in 0..1000 {
+    if done.get() {
+      return;
+    }
+    lio.run_timeout(Duration::from_millis(5)).unwrap();
+  }
+  panic!("operation never completed");
+}
+
+#[test]
+fn timer_callback_schedules_a_follow_up() {
+  let lio = Lio::new(8).unwrap();
+  let done = Rc::new(Cell::new(false));
+
+  let (inner_lio, inner_done) = (lio.clone(), done.clone());
+  api::sleep(Duration::from_millis(1)).with_lio(&lio).when_done(move |_| {
+    let done = inner_done.clone();
+    api::sleep(Duration::from_millis(1))
+      .with_lio(&inner_lio)
+      .when_done(move |_| done.set(true));
+  });
+
+  run_until(&lio, &done);
+}
+
+#[test]
+fn io_callback_schedules_a_follow_up() {
+  let lio = Lio::new(8).unwrap();
+  let done = Rc::new(Cell::new(false));
+
+  let (inner_lio, inner_done) = (lio.clone(), done.clone());
+  api::nop().with_lio(&lio).when_done(move |_| {
+    let done = inner_done.clone();
+    api::nop().with_lio(&inner_lio).when_done(move |_| done.set(true));
+  });
+
+  run_until(&lio, &done);
+}
+
+#[test]
+fn callback_drives_the_loop_itself() {
+  let lio = Lio::new(8).unwrap();
+  let done = Rc::new(Cell::new(false));
+
+  let (inner_lio, inner_done) = (lio.clone(), done.clone());
+  api::nop().with_lio(&lio).when_done(move |_| {
+    let done = inner_done.clone();
+    api::nop().with_lio(&inner_lio).when_done(move |_| done.set(true));
+    // A nested run completes the follow-up before this callback returns.
+    while !inner_done.get() {
+      inner_lio.run_timeout(Duration::from_millis(5)).unwrap();
+    }
+  });
+
+  run_until(&lio, &done);
+}
+
+#[test]
+fn callback_drops_an_in_flight_future() {
+  let lio = Lio::new(8).unwrap();
+  let done = Rc::new(Cell::new(false));
+
+  // A future that has submitted its operation but will never be polled again.
+  let pending = Rc::new(RefCell::new(Some(Box::pin(
+    api::sleep(Duration::from_secs(60)).with_lio(&lio).into_future(),
+  ))));
+  let waker = Waker::noop();
+  let mut cx = Context::from_waker(waker);
+  let poll = pending.borrow_mut().as_mut().unwrap().as_mut().poll(&mut cx);
+  assert!(poll.is_pending());
+
+  let inner_done = done.clone();
+  api::nop().with_lio(&lio).when_done(move |_| {
+    // Dropping it cancels the operation through the same `Lio`.
+    drop(pending.borrow_mut().take());
+    inner_done.set(true);
+  });
+
+  run_until(&lio, &done);
+}
+
+/// A waker that schedules more work on the `Lio` when woken.
+struct SchedulingWaker {
+  lio: Lio,
+  done: Rc<Cell<bool>>,
+}
+
+// SAFETY: the test drives everything on one thread.
+unsafe impl Send for SchedulingWaker {}
+// SAFETY: as above.
+unsafe impl Sync for SchedulingWaker {}
+
+impl Wake for SchedulingWaker {
+  fn wake(self: Arc<Self>) {
+    let done = self.done.clone();
+    api::nop().with_lio(&self.lio).when_done(move |_| done.set(true));
+  }
+}
+
+#[test]
+fn waker_schedules_work_when_woken() {
+  let lio = Lio::new(8).unwrap();
+  let done = Rc::new(Cell::new(false));
+
+  let waker = Waker::from(Arc::new(SchedulingWaker {
+    lio: lio.clone(),
+    done: done.clone(),
+  }));
+  let mut cx = Context::from_waker(&waker);
+  let mut future: Pin<Box<_>> =
+    Box::pin(api::nop().with_lio(&lio).into_future());
+  assert!(future.as_mut().poll(&mut cx).is_pending());
+
+  run_until(&lio, &done);
+  assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(_)));
+}
+
+#[test]
+fn panicking_callback_frees_its_slot() {
+  // Capacity 1: if the panicking registration leaked, nothing more could be
+  // scheduled.
+  let lio = Lio::new(1).unwrap();
+
+  api::nop().with_lio(&lio).when_done(|_| panic!("callback failure"));
+  let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    lio.run_timeout(Duration::from_millis(50)).unwrap();
+  }));
+  assert!(run.is_err(), "the callback panic propagates to the caller");
+
+  let done = Rc::new(Cell::new(false));
+  let inner_done = done.clone();
+  api::nop().with_lio(&lio).when_done(move |_| inner_done.set(true));
+  run_until(&lio, &done);
+}
+
+/// Completes every queued no-op on the next wait, in submission order.
+#[derive(Default)]
+struct InOrderBackend {
+  queued: Vec<u64>,
+}
+
+impl lio::backend::IoBackend for InOrderBackend {
+  fn init(&mut self, _cap: usize) -> std::io::Result<()> {
+    Ok(())
+  }
+
+  fn push(
+    &mut self,
+    id: u64,
+    _op: lio::backend::op::Op,
+    _step_bump: &mut bumpalo::Bump,
+  ) {
+    self.queued.push(id);
+  }
+
+  fn flush(&mut self) -> std::io::Result<()> {
+    Ok(())
+  }
+
+  fn wait(
+    &mut self,
+    _timeout: Option<Duration>,
+    completed: &mut Vec<lio::backend::OpCompleted>,
+  ) -> std::io::Result<()> {
+    completed.clear();
+    completed.extend(
+      self.queued.drain(..).map(|id| lio::backend::OpCompleted::new(id, 0)),
+    );
+    Ok(())
+  }
+}
+
+#[test]
+fn panic_does_not_lose_the_rest_of_the_batch() {
+  let lio = Lio::new_with_backend(InOrderBackend::default(), 4).unwrap();
+  let done = Rc::new(Cell::new(false));
+
+  // Both complete in the same run, the panicking one first.
+  api::nop().with_lio(&lio).when_done(|_| panic!("callback failure"));
+  let inner_done = done.clone();
+  api::nop().with_lio(&lio).when_done(move |_| inner_done.set(true));
+
+  let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    lio.try_run().unwrap();
+  }));
+  assert!(run.is_err());
+  assert!(!done.get(), "the second callback is after the panic");
+
+  // The next run delivers the completion the panicking run did not reach.
+  lio.try_run().unwrap();
+  assert!(done.get());
+}

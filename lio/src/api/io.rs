@@ -164,7 +164,12 @@ where
       let _ = sender.send(res);
     });
   }
+
   /// Registers a callback to be invoked when the operation completes.
+  ///
+  /// The callback runs during [`Lio::run`](crate::Lio::run) (or a sibling),
+  /// without the driver locked: it may schedule follow-up operations on the
+  /// same `Lio`, drop other in-flight operations, or drive the loop itself.
   ///
   /// # Example
   ///
