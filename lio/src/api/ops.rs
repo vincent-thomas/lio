@@ -1416,8 +1416,24 @@ pub struct Stat {
 }
 
 enum StatModelTarget {
-  Path { dir_res: Resource, pathname: CString, follow_symlinks: bool },
-  Fd { fd: Resource },
+  Path {
+    dir_res: Resource,
+    pathname: CString,
+    follow_symlinks: bool,
+  },
+  Fd {
+    fd: Resource,
+  },
+  /// The path could not be represented; completes with `InvalidInput`.
+  InvalidPath,
+}
+
+/// The error for a path that contains a NUL byte, as `std::fs` reports it.
+pub(crate) fn nul_path_error() -> std::io::Error {
+  std::io::Error::new(
+    std::io::ErrorKind::InvalidInput,
+    "path contains an interior NUL byte",
+  )
 }
 
 impl Stat {
@@ -1435,6 +1451,11 @@ impl Stat {
   pub(crate) fn new_fd(fd: Resource) -> Self {
     Self { target: StatModelTarget::Fd { fd }, out: FileStat::zeroed() }
   }
+
+  /// A stat that fails with `InvalidInput` without touching the file system.
+  pub(crate) fn invalid_path() -> Self {
+    Self { target: StatModelTarget::InvalidPath, out: FileStat::zeroed() }
+  }
 }
 
 impl OpModel for Stat {
@@ -1450,12 +1471,15 @@ impl OpModel for Stat {
         }
       }
       StatModelTarget::Fd { fd } => StatTarget::Fd { fd: fd.clone() },
+      StatModelTarget::InvalidPath => return Action::Io(Op::Nop),
     };
     Action::Io(Op::Stat { target, out: NonNull::from(&mut self.out) })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let res = if completion.result < 0 {
+    let res = if matches!(self.target, StatModelTarget::InvalidPath) {
+      Err(nul_path_error())
+    } else if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
       Ok(self.out)
