@@ -8,8 +8,6 @@
 //!   `IoBackend` contract.
 //! - [`test_op_model_contract!`] validates generic `OpModel`-style state
 //!   machines that implement [`OpModelContract`].
-//! - [`test_serial_op_model_contract!`] validates the serial illustration
-//!   models described through [`serial_op_contract::OpModelContract`].
 //!
 //! Typical usage from a consumer crate:
 //!
@@ -21,19 +19,11 @@
 //!   mod my_model_contract {
 //!     use super::*;
 //!
-//!     lio_test::test_serial_op_model_contract!(MyModel);
+//!     lio_test::test_op_model_contract!(MyModel);
 //!   }
 //! }
 //! ```
-//!
-//! The single-argument `test_serial_op_model_contract!` form assumes the
-//! calling crate exposes itself as `lio` with `extern crate self as lio;`.
-//! Other crates can use the two-argument form and pass their crate identifier:
-//!
-//! ```ignore
-//! lio_test::test_serial_op_model_contract!(my_crate, MyModel);
-//! ```
-//!
+
 /// Shared contract tests for [`IoBackend`](crate::backend::IoBackend)
 /// implementations.
 ///
@@ -2987,86 +2977,6 @@ macro_rules! test_op_model_contract {
               "stream model contract must produce at least one Yield or Done"
             );
           }
-        }
-      }
-    }
-  };
-}
-
-pub mod serial_op_contract {
-  /// One scripted contract step for a serial `OpModel`.
-  pub struct ContractStep<M: OpModelContract> {
-    pub assert_op: fn(&M::Op) -> bool,
-    pub before_complete: fn(&mut M),
-    pub completion: M::Completion,
-    pub assert_result: fn(&M::Result) -> bool,
-  }
-
-  impl<M: OpModelContract> ContractStep<M> {
-    pub fn new(
-      assert_op: fn(&M::Op) -> bool,
-      completion: M::Completion,
-      assert_result: fn(&M::Result) -> bool,
-    ) -> Self {
-      Self { assert_op, before_complete: |_| {}, completion, assert_result }
-    }
-
-    pub fn with_setup(
-      assert_op: fn(&M::Op) -> bool,
-      before_complete: fn(&mut M),
-      completion: M::Completion,
-      assert_result: fn(&M::Result) -> bool,
-    ) -> Self {
-      Self { assert_op, before_complete, completion, assert_result }
-    }
-  }
-
-  /// Test fixture for generating serial `OpModel` contract tests per type.
-  pub trait OpModelContract: Sized {
-    type Op;
-    type Completion;
-    type Result;
-
-    fn contract_model() -> Self;
-    fn contract_steps() -> Vec<ContractStep<Self>>;
-  }
-}
-
-/// Shared contract tests for serial `OpModel` illustrations described through
-/// [`lio_test::serial_op_contract::OpModelContract`].
-#[macro_export]
-macro_rules! test_serial_op_model_contract {
-  ($model_ty:ty) => {
-    lio_test::test_serial_op_model_contract!(lio, $model_ty);
-  };
-  ($lio:ident, $model_ty:ty) => {
-    mod op_model_contract {
-      use super::*;
-      use lio_test::serial_op_contract::OpModelContract;
-      use $lio::api::op_contract::OpModel as LioTestOpModel;
-
-      #[test]
-      fn scripted_contract() {
-        let mut model = <$model_ty as OpModelContract>::contract_model();
-        let steps = <$model_ty as OpModelContract>::contract_steps();
-        assert!(!steps.is_empty(), "contract script must not be empty");
-
-        for step in steps {
-          let op = <$model_ty as LioTestOpModel>::op(&mut model);
-          assert!(
-            (step.assert_op)(&op),
-            "op() did not satisfy the model contract: {:?}",
-            op
-          );
-          (step.before_complete)(&mut model);
-          let result = <$model_ty as LioTestOpModel>::complete(
-            &mut model,
-            step.completion,
-          );
-          assert!(
-            (step.assert_result)(&result),
-            "complete() did not satisfy the model contract"
-          );
         }
       }
     }
