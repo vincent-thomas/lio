@@ -160,6 +160,12 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     removed
   }
 
+  /// Whether `allocate` would succeed.
+  #[inline]
+  pub(crate) fn has_free_slot(&self) -> bool {
+    self.free_head != u32::MAX || self.next_slot < self.capacity
+  }
+
   // Only the Unix backend implementations use the slab.
   #[cfg_attr(any(windows, not(feature = "backend_impls")), allow(dead_code))]
   #[inline]

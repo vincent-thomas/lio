@@ -208,11 +208,10 @@ where
     F: Fn(T::Item) + 'static,
   {
     let (lio, stream_op) = self.into_lio();
-    lio
-      .schedule_with(move |arena| {
-        Registration::new_callback_in::<T, F>(arena, f, stream_op)
-      })
-      .expect("lio error: lio should handle this");
+    // Over capacity, the operation waits in a queue (see `Lio::is_full`).
+    lio.schedule_or_queue(move |arena| {
+      Registration::new_callback_in::<T, F>(arena, f, stream_op)
+    });
   }
 }
 
@@ -472,6 +471,12 @@ where
 
     match std::mem::replace(&mut this.state, IoStreamFutureState::Done) {
       IoStreamFutureState::Pending(stream_op) => {
+        if this.lio.is_full() {
+          // Wait for a slot; the driver wakes us when one frees up.
+          this.lio.wait_for_capacity(cx.waker());
+          this.state = IoStreamFutureState::Pending(stream_op);
+          return Poll::Pending;
+        }
         let slot = Rc::new(RefCell::new(LocalFutureSlot {
           item: None,
           waker: Some(cx.waker().clone()),
@@ -493,7 +498,7 @@ where
               stream_op,
             )
           })
-          .expect("lio error: failed to schedule operation");
+          .expect("lio rejected an operation it had capacity for");
 
         this.state = IoStreamFutureState::Inflight { id, slot };
         Poll::Pending
@@ -658,17 +663,16 @@ where
       }
     };
 
-    lio
-      .schedule_with(move |arena| {
-        Registration::new_callback_in(
-          arena,
-          move |item| {
-            let _ = sender.send(item);
-          },
-          op,
-        )
-      })
-      .expect("lio error: failed to schedule stream operation");
+    // Over capacity, the operation waits in a queue (see `Lio::is_full`).
+    lio.schedule_or_queue(move |arena| {
+      Registration::new_callback_in(
+        arena,
+        move |item| {
+          let _ = sender.send(item);
+        },
+        op,
+      )
+    });
   }
 }
 
@@ -689,21 +693,23 @@ impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
 
     match std::mem::replace(&mut stream.state, IoStreamState::Done) {
       IoStreamState::Pending(stream_op) => {
+        let lio = stream.handle.lio();
+        if lio.is_full() {
+          // Wait for a slot; the driver wakes us when one frees up.
+          lio.wait_for_capacity(cx.waker());
+          stream.state = IoStreamState::Pending(stream_op);
+          return Poll::Pending;
+        }
         // First poll - create channel and schedule operation
         let (tx, rx) = std::sync::mpsc::channel();
 
-        match stream.handle.lio().schedule_with(move |arena| {
-          Registration::new_waker_in(arena, cx.waker().clone(), tx, stream_op)
-        }) {
-          Ok(id) => {
-            stream.state = IoStreamState::Inflight { id, receiver: rx };
-            Poll::Pending
-          }
-          Err(_) => {
-            stream.state = IoStreamState::Done;
-            Poll::Ready(None)
-          }
-        }
+        let id = lio
+          .schedule_with(move |arena| {
+            Registration::new_waker_in(arena, cx.waker().clone(), tx, stream_op)
+          })
+          .expect("lio rejected an operation it had capacity for");
+        stream.state = IoStreamState::Inflight { id, receiver: rx };
+        Poll::Pending
       }
 
       IoStreamState::Inflight { id, receiver } => {
