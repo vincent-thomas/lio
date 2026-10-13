@@ -30,7 +30,9 @@ const STATX_BASIC_STATS: u32 = 0x0000_07ff;
 /// operations, and no slab key decodes to it.
 const CANCEL_USER_DATA: u64 = u64::MAX;
 /// How long dropping the backend waits for cancelled operations to finish.
-const DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// Requests parked on readiness (accept, socket reads) are cancelled at
+/// once; this only bounds I/O a kernel worker is still busy with.
+const DRAIN_GRACE: Duration = Duration::from_millis(500);
 const LINUX_DIRENT64_NAME_OFFSET: usize = 19;
 type CurrentDirent<'a> = (u64, u8, usize, &'a [u8]);
 
