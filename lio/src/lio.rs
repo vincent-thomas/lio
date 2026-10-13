@@ -6,7 +6,7 @@ use crate::{
 };
 
 use std::{
-  cell::RefCell,
+  cell::{RefCell, RefMut},
   io,
   rc::Rc,
   task::Waker,
@@ -89,6 +89,10 @@ struct LioInner {
   // Reused scratch vectors for `run_inner`.
   completed: Vec<OpCompleted>,
   expired_timers: Vec<u64>,
+  /// Completions and timers a panicking run did not get to; the next run
+  /// processes them.
+  carry_completed: Vec<OpCompleted>,
+  carry_timers: Vec<u64>,
   profile: Option<LioProfile>,
 }
 
@@ -111,6 +115,42 @@ struct LioProfile {
   timer_loop_time: Duration,
   dispatch_time: Duration,
   remove_time: Duration,
+}
+
+impl LioProfile {
+  fn merge(&mut self, run: &LioProfile) {
+    self.run_inner_calls += 1;
+    self.completions_returned += run.completions_returned;
+    self.stale_completions += run.stale_completions;
+    self.timer_expirations += run.timer_expirations;
+    self.dispatch_count += run.dispatch_count;
+    self.remove_count += run.remove_count;
+    self.flush_time += run.flush_time;
+    self.next_deadline_time += run.next_deadline_time;
+    self.wait_time += run.wait_time;
+    self.completion_loop_time += run.completion_loop_time;
+    self.completion_store_lookup_time += run.completion_store_lookup_time;
+    self.completion_on_completion_time += run.completion_on_completion_time;
+    self.completion_is_finished_time += run.completion_is_finished_time;
+    self.timer_poll_time += run.timer_poll_time;
+    self.timer_loop_time += run.timer_loop_time;
+    self.dispatch_time += run.dispatch_time;
+    self.remove_time += run.remove_time;
+  }
+}
+
+/// Times `$body` into `$stats.$field` when `$profile` (a const) is set.
+macro_rules! timed {
+  ($profile:expr, $stats:expr, $field:ident, $body:expr) => {{
+    if $profile {
+      let started = Instant::now();
+      let value = $body;
+      $stats.$field += started.elapsed();
+      value
+    } else {
+      $body
+    }
+  }};
 }
 
 impl Drop for LioInner {
@@ -210,6 +250,8 @@ impl Lio {
       time: TimeManager::with_capacity(cap),
       completed: Vec::with_capacity(cap),
       expired_timers: Vec::with_capacity(cap),
+      carry_completed: Vec::new(),
+      carry_timers: Vec::new(),
       profile: std::env::var_os("LIO_PROFILE").map(|_| LioProfile::default()),
     };
     Ok(Self { inner: Rc::new(RefCell::new(inner)) })
@@ -262,61 +304,38 @@ impl Lio {
     self.run_inner(Some(timeout))
   }
 
-  #[inline]
   fn run_inner(&self, timeout: Option<Duration>) -> io::Result<usize> {
-    let mut inner = self.inner.borrow_mut();
-    match (inner.profile.is_some(), !inner.time.is_empty()) {
-      (true, true) => Self::run_inner_impl::<true, true>(&mut inner, timeout),
-      (true, false) => Self::run_inner_impl::<true, false>(&mut inner, timeout),
-      (false, true) => Self::run_inner_impl::<false, true>(&mut inner, timeout),
-      (false, false) => {
-        Self::run_inner_impl::<false, false>(&mut inner, timeout)
-      }
+    let inner = self.inner.borrow_mut();
+    if inner.profile.is_some() {
+      self.run_with::<true>(inner, timeout)
+    } else {
+      self.run_with::<false>(inner, timeout)
     }
   }
 
-  #[inline]
-  fn run_inner_impl<const PROFILE: bool, const HAS_TIMERS: bool>(
-    inner: &mut LioInner,
+  /// One driver turn.
+  ///
+  /// Submitting and waiting run under the borrow. Routing completions holds
+  /// it only for bookkeeping: each handler runs with it released, because
+  /// handlers run user code (callbacks, and wakers that may poll inline)
+  /// which may schedule, drop or drive operations on this `Lio`.
+  fn run_with<'a, const PROFILE: bool>(
+    &'a self,
+    mut inner: RefMut<'a, LioInner>,
     timeout: Option<Duration>,
   ) -> io::Result<usize> {
-    let profiling_enabled = PROFILE;
-    let mut flush_time = Duration::ZERO;
-    let mut next_deadline_time = Duration::ZERO;
-    let mut wait_time = Duration::ZERO;
-    let mut completion_loop_time = Duration::ZERO;
-    let mut completion_store_lookup_time = Duration::ZERO;
-    let mut completion_on_completion_time = Duration::ZERO;
-    let completion_is_finished_time = Duration::ZERO;
-    let mut timer_poll_time = Duration::ZERO;
-    let mut timer_loop_time = Duration::ZERO;
-    let mut dispatch_time = Duration::ZERO;
-    let mut remove_time = Duration::ZERO;
-    let mut stale_completions = 0usize;
-    let mut timer_expirations = 0usize;
-    let mut dispatch_count = 0usize;
-    let mut remove_count = 0usize;
+    let mut stats = LioProfile::default();
+    let inner_ref = &mut *inner;
 
-    if profiling_enabled {
-      let started = Instant::now();
-      inner.io.flush()?;
-      flush_time += started.elapsed();
-    } else {
-      inner.io.flush()?;
-    }
+    timed!(PROFILE, stats, flush_time, inner_ref.io.flush())?;
 
     // Compute effective timeout: min of user timeout and next timer deadline.
     // Avoid touching the clock on the common pure-I/O path.
-    let has_timers = HAS_TIMERS;
-    let next_deadline = if !has_timers {
-      None
-    } else if profiling_enabled {
-      let started = Instant::now();
-      let deadline = inner.time.next_deadline();
-      next_deadline_time += started.elapsed();
-      deadline
+    let has_timers = !inner_ref.time.is_empty();
+    let next_deadline = if has_timers {
+      timed!(PROFILE, stats, next_deadline_time, inner_ref.time.next_deadline())
     } else {
-      inner.time.next_deadline()
+      None
     };
     let effective_timeout = match (timeout, next_deadline) {
       (Some(user), Some(timer)) => Some(user.min(timer)),
@@ -325,158 +344,151 @@ impl Lio {
       (None, None) => None,
     };
 
-    inner.completed.clear();
+    inner_ref.completed.clear();
+    let (io, completed) = (&mut inner_ref.io, &mut inner_ref.completed);
+    timed!(PROFILE, stats, wait_time, io.wait(effective_timeout, completed))?;
 
-    if profiling_enabled {
-      let started = Instant::now();
-      let (io, completed) = (&mut inner.io, &mut inner.completed);
-      io.wait(effective_timeout, completed)?;
-      wait_time += started.elapsed();
+    // The lists leave `inner` while being routed: a nested run (from user
+    // code) gets fresh ones instead of clobbering them.
+    let mut completed = std::mem::take(&mut inner_ref.completed);
+    if !inner_ref.carry_completed.is_empty() {
+      completed.append(&mut inner_ref.carry_completed);
+    }
+    let carried_timers = !inner_ref.carry_timers.is_empty();
+    let mut timers = if has_timers || carried_timers {
+      let mut timers = std::mem::take(&mut inner_ref.expired_timers);
+      timers.clear();
+      timers.append(&mut inner_ref.carry_timers);
+      timers
     } else {
-      let (io, completed) = (&mut inner.io, &mut inner.completed);
-      io.wait(effective_timeout, completed)?;
-    }
-
-    let mut num_completed = 0;
-    let resource_close = inner.resource_close;
-
-    let completion_loop_started =
-      if profiling_enabled { Some(Instant::now()) } else { None };
-    for index in 0..inner.completed.len() {
-      let c = inner.completed[index];
-      let id = c.registration_id();
-      let result = c.result();
-
-      let store_lookup_started =
-        if profiling_enabled { Some(Instant::now()) } else { None };
-      let Some(op) = inner.store.get_mut(id) else {
-        if let Some(started) = store_lookup_started {
-          completion_store_lookup_time += started.elapsed();
-          stale_completions += 1;
-        }
-        continue;
-      };
-      if let Some(started) = store_lookup_started {
-        completion_store_lookup_time += started.elapsed();
-      }
-
-      let on_completion_started =
-        if profiling_enabled { Some(Instant::now()) } else { None };
-      let completion_result = op.on_driver_completion(
-        Completion::new(result).with_resource_close(resource_close),
-      );
-      if let Some(started) = on_completion_started {
-        completion_on_completion_time += started.elapsed();
-      }
-
-      let finished = completion_result.is_done();
-      if let Some(next_action) = completion_result.next_action {
-        let started =
-          if profiling_enabled { Some(Instant::now()) } else { None };
-        Self::dispatch_action(inner, id, next_action);
-        if let Some(started) = started {
-          dispatch_time += started.elapsed();
-        }
-        dispatch_count += 1;
-      }
-      if finished {
-        let remove_started =
-          if profiling_enabled { Some(Instant::now()) } else { None };
-        inner.store.remove_known(id);
-        if let Some(started) = remove_started {
-          remove_time += started.elapsed();
-        }
-        remove_count += 1;
-      }
-
-      num_completed += 1;
-    }
-    if let Some(started) = completion_loop_started {
-      completion_loop_time += started.elapsed();
-    }
-
-    // Process expired timers. `has_timers` also includes fired timers waiting
-    // to be drained, so an empty clock is safe to skip entirely.
-    let mut expired_timer_count = 0;
+      Vec::new()
+    };
+    // `has_timers` also includes fired timers waiting to be drained, so an
+    // empty clock is safe to skip entirely.
     if has_timers {
-      let mut expired_timers = std::mem::take(&mut inner.expired_timers);
-      expired_timers.clear();
+      timed!(
+        PROFILE,
+        stats,
+        timer_poll_time,
+        timers.extend(inner_ref.time.poll_expired())
+      );
+      stats.timer_expirations += timers.len();
+    }
+    let resource_close = inner_ref.resource_close;
 
-      if profiling_enabled {
-        let started = Instant::now();
-        expired_timers.extend(inner.time.poll_expired());
-        timer_poll_time += started.elapsed();
-        timer_expirations += expired_timers.len();
+    let loop_started = PROFILE.then(Instant::now);
+    let mut batch = Batch {
+      lio: self,
+      completed,
+      timers,
+      next_io: 0,
+      next_timer: 0,
+      current: None,
+      finished: false,
+    };
+    let mut processed = 0;
+    while let Some(&c) = batch.completed.get(batch.next_io) {
+      batch.next_io += 1;
+      let completion =
+        Completion::new(c.result()).with_resource_close(resource_close);
+      let routed;
+      (inner, routed) = self.route::<PROFILE>(
+        inner,
+        &mut batch,
+        c.registration_id(),
+        completion,
+        false,
+        &mut stats,
+      );
+      if routed {
+        processed += 1;
       } else {
-        expired_timers.extend(inner.time.poll_expired());
+        stats.stale_completions += 1;
       }
-      expired_timer_count = expired_timers.len();
-      let timer_loop_started =
-        if profiling_enabled { Some(Instant::now()) } else { None };
-      for &timer_id in &expired_timers {
-        let mut next_action = None;
-        let mut finished = false;
-
-        if let Some(reg) = inner.store.get_mut(timer_id) {
-          let result = reg.on_driver_completion(Completion::with_flags(
-            SLEEP_RESULT,
-            crate::api::op::CompletionFlags::TIMER,
-          ));
-          finished = result.is_done();
-          next_action = result.next_action;
-        }
-
-        inner.time.remove(timer_id);
-
-        if let Some(action) = next_action {
-          let started =
-            if profiling_enabled { Some(Instant::now()) } else { None };
-          Self::dispatch_action(inner, timer_id, action);
-          if let Some(started) = started {
-            dispatch_time += started.elapsed();
-          }
-          dispatch_count += 1;
-        }
-
-        if finished {
-          let remove_started =
-            if profiling_enabled { Some(Instant::now()) } else { None };
-          inner.store.remove_known(timer_id);
-          if let Some(started) = remove_started {
-            remove_time += started.elapsed();
-          }
-          remove_count += 1;
-        }
-      }
-      if let Some(started) = timer_loop_started {
-        timer_loop_time += started.elapsed();
-      }
-
-      expired_timers.clear();
-      inner.expired_timers = expired_timers;
+    }
+    while let Some(&id) = batch.timers.get(batch.next_timer) {
+      batch.next_timer += 1;
+      let completion = Completion::with_flags(
+        SLEEP_RESULT,
+        crate::api::op::CompletionFlags::TIMER,
+      );
+      (inner, _) = self
+        .route::<PROFILE>(inner, &mut batch, id, completion, true, &mut stats);
+      processed += 1;
+    }
+    if let Some(started) = loop_started {
+      stats.completion_loop_time += started.elapsed();
     }
 
+    batch.finish(&mut inner);
     if PROFILE && let Some(profile) = inner.profile.as_mut() {
-      profile.run_inner_calls += 1;
-      profile.completions_returned += num_completed;
-      profile.stale_completions += stale_completions;
-      profile.timer_expirations += timer_expirations;
-      profile.dispatch_count += dispatch_count;
-      profile.remove_count += remove_count;
-      profile.flush_time += flush_time;
-      profile.next_deadline_time += next_deadline_time;
-      profile.wait_time += wait_time;
-      profile.completion_loop_time += completion_loop_time;
-      profile.completion_store_lookup_time += completion_store_lookup_time;
-      profile.completion_on_completion_time += completion_on_completion_time;
-      profile.completion_is_finished_time += completion_is_finished_time;
-      profile.timer_poll_time += timer_poll_time;
-      profile.timer_loop_time += timer_loop_time;
-      profile.dispatch_time += dispatch_time;
-      profile.remove_time += remove_time;
+      stats.completions_returned = processed;
+      profile.merge(&stats);
     }
+    Ok(processed)
+  }
 
-    Ok(num_completed + expired_timer_count)
+  /// Routes one completion to its registration, releasing `inner` only while
+  /// the registration's handler runs. Returns the reacquired borrow and
+  /// whether the registration still existed.
+  #[inline(always)]
+  fn route<'a, const PROFILE: bool>(
+    &'a self,
+    mut inner: RefMut<'a, LioInner>,
+    batch: &mut Batch<'_>,
+    id: u64,
+    completion: Completion,
+    timer: bool,
+    stats: &mut LioProfile,
+  ) -> (RefMut<'a, LioInner>, bool) {
+    if timer {
+      inner.time.remove(id);
+    }
+    let begun = timed!(
+      PROFILE,
+      stats,
+      completion_store_lookup_time,
+      inner.store.get_mut(id).map(|reg| reg.begin_completion())
+    );
+    let Some((handler, mut waker)) = begun else {
+      return (inner, false);
+    };
+
+    drop(inner);
+    batch.current = Some(id);
+    let result = timed!(PROFILE, stats, completion_on_completion_time, {
+      // SAFETY: the registration was alive above. User code can only remove
+      // it through a handle to its operation: a callback has none, and a
+      // waker runs last in the handler, after its payload is no longer used.
+      unsafe { handler.complete(completion, &mut waker) }
+    });
+    batch.current = None;
+    let mut inner = self.inner.borrow_mut();
+
+    let inner_ref = &mut *inner;
+    // User code may have cancelled the operation meanwhile; then there is
+    // nothing left to resubmit or remove.
+    if let Some(reg) = inner_ref.store.get_mut(id) {
+      match result.next_action {
+        Some(action) => {
+          if let Some(waker) = waker {
+            reg.restore_waker(waker);
+          }
+          timed!(
+            PROFILE,
+            stats,
+            dispatch_time,
+            Self::dispatch_action(inner_ref, id, action)
+          );
+          stats.dispatch_count += 1;
+        }
+        None => {
+          timed!(PROFILE, stats, remove_time, inner_ref.store.remove_known(id));
+          stats.remove_count += 1;
+        }
+      }
+    }
+    (inner, true)
   }
 
   // NOTE: check_done and check_stream_done are no longer needed with the channel-based
@@ -496,5 +508,53 @@ impl Lio {
     let mut inner = self.inner.borrow_mut();
     inner.time.remove(id);
     inner.store.remove(id);
+  }
+}
+
+/// The completions and expired timers of one run, consumed in order.
+///
+/// `finish` hands the lists back for reuse. If a handler panics instead,
+/// dropping the batch removes that handler's registration (its state is
+/// unknown) and carries the entries it did not reach over to the next run, so
+/// their operations still complete.
+struct Batch<'a> {
+  lio: &'a Lio,
+  completed: Vec<OpCompleted>,
+  timers: Vec<u64>,
+  next_io: usize,
+  next_timer: usize,
+  /// The registration whose handler is running.
+  current: Option<u64>,
+  finished: bool,
+}
+
+impl Batch<'_> {
+  fn finish(&mut self, inner: &mut LioInner) {
+    self.finished = true;
+    self.completed.clear();
+    self.timers.clear();
+    // A nested run may have put back lists of its own; keep the larger.
+    if inner.completed.capacity() < self.completed.capacity() {
+      inner.completed = std::mem::take(&mut self.completed);
+    }
+    if inner.expired_timers.capacity() < self.timers.capacity() {
+      inner.expired_timers = std::mem::take(&mut self.timers);
+    }
+  }
+}
+
+impl Drop for Batch<'_> {
+  fn drop(&mut self) {
+    if self.finished {
+      return;
+    }
+    let Ok(mut inner) = self.lio.inner.try_borrow_mut() else {
+      return;
+    };
+    if let Some(id) = self.current.take() {
+      inner.store.remove(id);
+    }
+    inner.carry_completed.extend_from_slice(&self.completed[self.next_io..]);
+    inner.carry_timers.extend_from_slice(&self.timers[self.next_timer..]);
   }
 }

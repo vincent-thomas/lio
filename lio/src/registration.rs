@@ -22,6 +22,7 @@ impl ProcessResult {
     Self { next_action: None }
   }
 
+  #[cfg(test)]
   #[inline]
   pub(crate) fn is_done(&self) -> bool {
     self.next_action.is_none()
@@ -75,6 +76,7 @@ impl WakerResultHandler {
   /// Process a completion result.
   ///
   /// Returns whether the operation is done and optionally an operation to resubmit.
+  #[cfg(test)]
   #[inline]
   fn on_completion(
     &self,
@@ -191,6 +193,7 @@ impl OpCallback {
   /// Process a completion: call complete() on OpModel and invoke callback with item.
   ///
   /// Returns whether the operation is done and optionally an operation to resubmit.
+  #[cfg(test)]
   #[inline]
   fn on_completion(&self, completion: Completion) -> ProcessResult {
     (self.on_completion_fn)(self.payload, completion)
@@ -251,6 +254,55 @@ impl OpCallback {
 impl Drop for OpCallback {
   fn drop(&mut self) {
     (self.drop_fn)(self.payload);
+  }
+}
+
+/// A copy of a registration's completion handler that can run without access
+/// to the registration itself.
+///
+/// The handler's payload (op model, channel or user callback) lives in the
+/// registration's arena, whose memory never moves. The driver copies the
+/// handler out, releases its own borrow, and only then runs it, because the
+/// handler may run user code (a callback, or a waker that polls inline) that
+/// schedules, drops or drives operations on the same `Lio`.
+#[derive(Clone, Copy)]
+pub(crate) enum RawHandler {
+  Waker {
+    payload: *mut (),
+    on_completion_fn:
+      fn(*mut (), Completion, &mut Option<Waker>) -> ProcessResult,
+  },
+  Callback {
+    payload: *mut (),
+    on_completion_fn: fn(*mut (), Completion) -> ProcessResult,
+  },
+}
+
+impl RawHandler {
+  /// Processes one completion: advances the op model and delivers any item
+  /// (sending it and waking `waker`, or calling the user callback).
+  ///
+  /// `waker` is left in place when the operation continues without an item;
+  /// the caller hands it back to the registration.
+  ///
+  /// # Safety
+  ///
+  /// The registration this handler was copied from must be alive, and must
+  /// not be processed concurrently.
+  #[inline]
+  pub(crate) unsafe fn complete(
+    self,
+    completion: Completion,
+    waker: &mut Option<Waker>,
+  ) -> ProcessResult {
+    match self {
+      Self::Waker { payload, on_completion_fn } => {
+        on_completion_fn(payload, completion, waker)
+      }
+      Self::Callback { payload, on_completion_fn } => {
+        on_completion_fn(payload, completion)
+      }
+    }
   }
 }
 
@@ -347,16 +399,40 @@ impl Registration {
     result
   }
 
-  /// Processes a driver-owned completion without materializing the terminal
-  /// state, because the driver immediately removes terminal registrations.
+  /// Starts processing a completion: returns the handler to run (outside
+  /// any driver borrow) and takes the task's waker, if any.
   #[inline]
-  pub(crate) fn on_driver_completion(
-    &mut self,
-    completion: Completion,
-  ) -> ProcessResult {
-    self.process_completion(completion)
+  pub(crate) fn begin_completion(&mut self) -> (RawHandler, Option<Waker>) {
+    match &mut self.state {
+      State::Waker { waker, handler } => (
+        RawHandler::Waker {
+          payload: handler.payload,
+          on_completion_fn: handler.on_completion_fn,
+        },
+        waker.take(),
+      ),
+      State::Callback(cb) => (
+        RawHandler::Callback {
+          payload: cb.payload,
+          on_completion_fn: cb.on_completion_fn,
+        },
+        None,
+      ),
+      #[cfg(test)]
+      State::Done => unreachable!("completed a finished registration"),
+    }
   }
 
+  /// Returns a waker that a completion did not consume, unless the task has
+  /// registered a newer one meanwhile.
+  #[inline]
+  pub(crate) fn restore_waker(&mut self, waker: Waker) {
+    if let State::Waker { waker: slot @ None, .. } = &mut self.state {
+      *slot = Some(waker);
+    }
+  }
+
+  #[cfg(test)]
   #[inline]
   fn process_completion(&mut self, completion: Completion) -> ProcessResult {
     match &mut self.state {
