@@ -85,17 +85,26 @@ impl OpStore {
     Ok(key.as_u64())
   }
 
+  /// Whether every slot is occupied.
+  #[inline]
+  pub fn is_full(&self) -> bool {
+    !self.slots.has_free_slot()
+  }
+
   /// Inserts an operation and returns everything needed for its initial dispatch.
   ///
   /// Keeping the just-allocated slot borrowed avoids looking it up again by its
   /// generational ID. Fresh slots are empty, and reused slots were reset by
   /// `remove`, so initial dispatch does not need another arena reset.
+  ///
+  /// The caller must have checked [`is_full`](Self::is_full) first.
   #[inline]
   pub fn insert_with_action(
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> (u64, Option<Action>, &mut Bump) {
-    let (key, slot) = self.slots.allocate().expect("at capacity");
+    let (key, slot) =
+      self.slots.allocate().expect("insert_with_action on a full store");
     slot.model_bump.reset();
     slot.step_bump.reset();
     let registration = slot.registration.write(init(&mut slot.model_bump));

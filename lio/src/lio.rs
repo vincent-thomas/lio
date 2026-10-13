@@ -7,6 +7,7 @@ use crate::{
 
 use std::{
   cell::{RefCell, RefMut},
+  collections::VecDeque,
   io,
   rc::Rc,
   task::Waker,
@@ -93,8 +94,16 @@ struct LioInner {
   /// processes them.
   carry_completed: Vec<OpCompleted>,
   carry_timers: Vec<u64>,
+  /// Submissions made while every slot was taken, scheduled in order as
+  /// slots free up. Only allocates when the driver is over capacity.
+  overflow: VecDeque<PendingSubmission>,
+  /// Futures waiting for a free slot.
+  capacity_waiters: Vec<Waker>,
   profile: Option<LioProfile>,
 }
+
+/// A registration to build once a slot is free.
+type PendingSubmission = Box<dyn FnOnce(&mut Bump) -> Registration>;
 
 #[derive(Debug, Default)]
 struct LioProfile {
@@ -217,7 +226,13 @@ impl Lio {
   ///
   /// # Arguments
   ///
-  /// * `cap` - The maximum number of concurrent operations
+  /// * `cap` - The number of operations that can be in flight at once
+  ///
+  /// All memory for `cap` operations is reserved up front, so a driver sized
+  /// for its peak load does not allocate per operation. Beyond `cap`, futures
+  /// wait for a free slot, while [`Io::when_done`](crate::api::Io::when_done)
+  /// and [`Io::send`](crate::api::Io::send) queue the operation, which
+  /// allocates; see [`Lio::is_full`].
   ///
   /// # Example
   ///
@@ -236,7 +251,8 @@ impl Lio {
   /// # Arguments
   ///
   /// * `backend` - The I/O backend implementation (e.g., io_uring, epoll/kqueue)
-  /// * `cap` - The maximum number of concurrent operations
+  /// * `cap` - The number of operations that can be in flight at once; see
+  ///   [`Lio::new`]
   pub fn new_with_backend<D>(mut backend: D, cap: usize) -> io::Result<Self>
   where
     D: IoBackend + 'static,
@@ -252,6 +268,8 @@ impl Lio {
       expired_timers: Vec::with_capacity(cap),
       carry_completed: Vec::new(),
       carry_timers: Vec::new(),
+      overflow: VecDeque::new(),
+      capacity_waiters: Vec::new(),
       profile: std::env::var_os("LIO_PROFILE").map(|_| LioProfile::default()),
     };
     Ok(Self { inner: Rc::new(RefCell::new(inner)) })
@@ -259,25 +277,114 @@ impl Lio {
 
   /// Schedule a registration built inside the store slot's persistent bump arena.
   #[inline]
-  pub(crate) fn schedule_with(
+  pub(crate) fn schedule_with<F>(&self, init: F) -> io::Result<u64>
+  where
+    F: FnOnce(&mut Bump) -> Registration,
+  {
+    let mut inner = self.inner.borrow_mut();
+    // Queued submissions go first.
+    if !inner.overflow.is_empty() || inner.store.is_full() {
+      return Err(Self::full_error());
+    }
+    Self::schedule_now(&mut inner, init)
+  }
+
+  /// Schedules `init` now, or queues it until a slot frees up.
+  #[inline]
+  pub(crate) fn schedule_or_queue(
     &self,
+    init: impl FnOnce(&mut Bump) -> Registration + 'static,
+  ) {
+    let mut inner = self.inner.borrow_mut();
+    if inner.overflow.is_empty() && !inner.store.is_full() {
+      // An op without a first action is dropped; only `schedule_with` can
+      // report that.
+      let _ = Self::schedule_now(&mut inner, init);
+    } else {
+      Self::enqueue(&mut inner, init);
+    }
+  }
+
+  /// Queues a submission until a slot frees up. Kept out of line: it only
+  /// runs when the driver is over capacity.
+  #[cold]
+  #[inline(never)]
+  fn enqueue(
+    inner: &mut LioInner,
+    init: impl FnOnce(&mut Bump) -> Registration + 'static,
+  ) {
+    inner.overflow.push_back(Box::new(init));
+  }
+
+  /// Inserts a registration and dispatches its first action. The store must
+  /// have a free slot.
+  #[inline]
+  fn schedule_now(
+    inner: &mut LioInner,
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> io::Result<u64> {
-    let mut inner = self.inner.borrow_mut();
-    let inner = &mut *inner;
     let (store, io, time) = (&mut inner.store, &mut inner.io, &mut inner.time);
     let (id, action, step_bump) = store.insert_with_action(init);
-    let action = action.ok_or_else(|| {
-      io::Error::new(
+    let Some(action) = action else {
+      store.remove(id);
+      return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "OpModel returned no action on first call",
-      )
-    })?;
+      ));
+    };
     match action {
       Action::Io(op) => io.push(id, op, step_bump),
       Action::Sleep(duration) => time.schedule(id, duration),
     }
     Ok(id)
+  }
+
+  fn full_error() -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, "lio is at capacity")
+  }
+
+  /// Whether a new operation would have to wait for a free slot.
+  ///
+  /// [`Lio::new`] reserves capacity for `cap` operations in flight at once.
+  /// Futures over capacity wait for a slot; [`Io::when_done`],
+  /// [`Io::send`] and [`Io::send_with`] queue the operation instead, which
+  /// allocates. Callers that want strict, allocation-free backpressure can
+  /// check this before submitting.
+  ///
+  /// [`Io::when_done`]: crate::api::Io::when_done
+  /// [`Io::send`]: crate::api::Io::send
+  /// [`Io::send_with`]: crate::api::Io::send_with
+  pub fn is_full(&self) -> bool {
+    let inner = self.inner.borrow();
+    !inner.overflow.is_empty() || inner.store.is_full()
+  }
+
+  /// Wakes `waker` once a slot frees up.
+  pub(crate) fn wait_for_capacity(&self, waker: &Waker) {
+    let mut inner = self.inner.borrow_mut();
+    if !inner.capacity_waiters.iter().any(|w| w.will_wake(waker)) {
+      inner.capacity_waiters.push(waker.clone());
+    }
+  }
+
+  /// Hands freed slots to queued submissions, then (if slots remain) returns
+  /// the futures waiting for capacity, to be woken without the borrow.
+  fn release_capacity(inner: &mut LioInner) -> Vec<Waker> {
+    if inner.overflow.is_empty() && inner.capacity_waiters.is_empty() {
+      return Vec::new();
+    }
+    while !inner.store.is_full()
+      && let Some(init) = inner.overflow.pop_front()
+    {
+      // An op without a first action is dropped, as `schedule_with` reports
+      // for direct submissions.
+      let _ = Self::schedule_now(inner, init);
+    }
+    if inner.store.is_full() {
+      Vec::new()
+    } else {
+      std::mem::take(&mut inner.capacity_waiters)
+    }
   }
 
   /// Non-blocking poll for completed operations.
@@ -306,11 +413,15 @@ impl Lio {
 
   fn run_inner(&self, timeout: Option<Duration>) -> io::Result<usize> {
     let inner = self.inner.borrow_mut();
-    if inner.profile.is_some() {
-      self.run_with::<true>(inner, timeout)
+    let (processed, waiters) = if inner.profile.is_some() {
+      self.run_with::<true>(inner, timeout)?
     } else {
-      self.run_with::<false>(inner, timeout)
+      self.run_with::<false>(inner, timeout)?
+    };
+    for waker in waiters {
+      waker.wake();
     }
+    Ok(processed)
   }
 
   /// One driver turn.
@@ -323,7 +434,7 @@ impl Lio {
     &'a self,
     mut inner: RefMut<'a, LioInner>,
     timeout: Option<Duration>,
-  ) -> io::Result<usize> {
+  ) -> io::Result<(usize, Vec<Waker>)> {
     let mut stats = LioProfile::default();
     let inner_ref = &mut *inner;
 
@@ -425,7 +536,7 @@ impl Lio {
       stats.completions_returned = processed;
       profile.merge(&stats);
     }
-    Ok(processed)
+    Ok((processed, Self::release_capacity(&mut inner)))
   }
 
   /// Routes one completion to its registration, releasing `inner` only while
@@ -505,9 +616,15 @@ impl Lio {
   ///
   /// This is called when a stream is dropped to stop multishot operations.
   pub(crate) fn cancel_stream(&self, id: u64) {
-    let mut inner = self.inner.borrow_mut();
-    inner.time.remove(id);
-    inner.store.remove(id);
+    let waiters = {
+      let mut inner = self.inner.borrow_mut();
+      inner.time.remove(id);
+      inner.store.remove(id);
+      Self::release_capacity(&mut inner)
+    };
+    for waker in waiters {
+      waker.wake();
+    }
   }
 }
 
