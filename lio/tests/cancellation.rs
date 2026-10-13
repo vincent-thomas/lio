@@ -1,0 +1,225 @@
+//! Dropping a future or stream whose operation is still in the backend must
+//! not free the memory that operation uses: the registration (op model,
+//! buffers, arenas) lives until the backend reports the operation done.
+
+mod common;
+
+use std::cell::RefCell;
+use std::future::{Future, IntoFuture};
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Wake, Waker};
+use std::time::Duration;
+
+use lio::api::op::{
+  Action, Completion, OneshotOpModel, OpModel, OpResult, StreamOpModel,
+};
+use lio::api::{Io, IoStream};
+use lio::backend::op::Op;
+use lio::backend::{IoBackend, OpCompleted};
+use lio::{Lio, api};
+
+/// Holds every operation until the test completes it, and records
+/// cancellation requests.
+#[derive(Default)]
+struct Held {
+  pushed: Vec<u64>,
+  cancelled: Vec<u64>,
+  complete: Vec<OpCompleted>,
+}
+
+#[derive(Clone, Default)]
+struct HoldingBackend(Rc<RefCell<Held>>);
+
+impl IoBackend for HoldingBackend {
+  fn init(&mut self, _cap: usize) -> std::io::Result<()> {
+    Ok(())
+  }
+
+  fn push(&mut self, id: u64, _op: Op, _step_bump: &mut bumpalo::Bump) {
+    self.0.borrow_mut().pushed.push(id);
+  }
+
+  fn flush(&mut self) -> std::io::Result<()> {
+    Ok(())
+  }
+
+  fn cancel(&mut self, id: u64) {
+    self.0.borrow_mut().cancelled.push(id);
+  }
+
+  fn wait(
+    &mut self,
+    _timeout: Option<Duration>,
+    completed: &mut Vec<OpCompleted>,
+  ) -> std::io::Result<()> {
+    completed.clear();
+    completed.append(&mut self.0.borrow_mut().complete);
+    Ok(())
+  }
+}
+
+/// An op model that reports what happens to it.
+struct Tracked {
+  dropped: Arc<AtomicBool>,
+  completions: Arc<AtomicUsize>,
+}
+
+impl OpModel for Tracked {
+  type Item = isize;
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::Nop)
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<isize> {
+    self.completions.fetch_add(1, Ordering::SeqCst);
+    OpResult::Done(completion.result)
+  }
+}
+
+impl OneshotOpModel for Tracked {}
+
+impl Drop for Tracked {
+  fn drop(&mut self) {
+    self.dropped.store(true, Ordering::SeqCst);
+  }
+}
+
+#[test]
+fn dropped_future_keeps_its_op_alive_until_completion() {
+  let backend = HoldingBackend::default();
+  let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
+  let dropped = Arc::new(AtomicBool::new(false));
+  let completions = Arc::new(AtomicUsize::new(0));
+
+  let mut future = Box::pin(
+    Io::from_op(Tracked {
+      dropped: dropped.clone(),
+      completions: completions.clone(),
+    })
+    .with_lio(&lio)
+    .into_future(),
+  );
+  let mut cx = Context::from_waker(Waker::noop());
+  assert!(future.as_mut().poll(&mut cx).is_pending());
+  lio.try_run().unwrap();
+  let id = backend.0.borrow().pushed[0];
+
+  drop(future);
+  assert_eq!(backend.0.borrow().cancelled, vec![id], "the backend is asked");
+  assert!(
+    !dropped.load(Ordering::SeqCst),
+    "the op's memory must outlive its operation in the backend"
+  );
+  assert!(lio.is_full(), "its slot stays taken until then");
+
+  backend.0.borrow_mut().complete.push(OpCompleted::new(id, -1));
+  lio.try_run().unwrap();
+  assert!(dropped.load(Ordering::SeqCst), "freed once the backend is done");
+  assert_eq!(
+    completions.load(Ordering::SeqCst),
+    1,
+    "the op model still sees the result, to release what it produced"
+  );
+  assert!(!lio.is_full());
+}
+
+#[test]
+fn dropped_sleep_is_removed_at_once() {
+  let backend = HoldingBackend::default();
+  let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
+
+  let mut future =
+    Box::pin(api::sleep(Duration::from_secs(60)).with_lio(&lio).into_future());
+  let mut cx = Context::from_waker(Waker::noop());
+  assert!(future.as_mut().poll(&mut cx).is_pending());
+  drop(future);
+
+  // Timers live in the driver, not the backend.
+  assert!(backend.0.borrow().cancelled.is_empty());
+  assert!(!lio.is_full());
+}
+
+/// Yields a value for every completion, forever.
+struct Endless;
+
+impl OpModel for Endless {
+  type Item = ();
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::Nop)
+  }
+
+  fn complete(&mut self, _: Completion) -> OpResult<()> {
+    OpResult::Yield(())
+  }
+}
+
+impl StreamOpModel for Endless {}
+
+/// Drops the stream it holds when woken.
+struct DropOnWake(RefCell<Option<IoStream<Endless>>>);
+
+// SAFETY: the test drives everything on one thread.
+unsafe impl Send for DropOnWake {}
+// SAFETY: as above.
+unsafe impl Sync for DropOnWake {}
+
+impl Wake for DropOnWake {
+  fn wake(self: Arc<Self>) {
+    drop(self.0.borrow_mut().take());
+  }
+}
+
+#[test]
+fn stream_dropped_by_its_wake_up_is_not_resubmitted() {
+  let backend = HoldingBackend::default();
+  let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
+
+  let holder = Arc::new(DropOnWake(RefCell::new(None)));
+  let waker = Waker::from(holder.clone());
+  let mut cx = Context::from_waker(&waker);
+  let mut stream = IoStream::from_op(Endless).with_lio(&lio);
+  {
+    let mut next = Box::pin(stream.next());
+    assert!(next.as_mut().poll(&mut cx).is_pending());
+  }
+  *holder.0.borrow_mut() = Some(stream);
+  lio.try_run().unwrap();
+  let id = backend.0.borrow().pushed[0];
+
+  // The completion wakes the task, which drops the stream mid-delivery.
+  backend.0.borrow_mut().complete.push(OpCompleted::new(id, 0));
+  lio.try_run().unwrap();
+  assert!(holder.0.borrow().is_none(), "the wake-up dropped the stream");
+  assert_eq!(backend.0.borrow().pushed, vec![id], "no next step is pushed");
+  assert!(!lio.is_full(), "its slot is free");
+}
+
+#[test]
+fn dropped_accept_frees_its_slot() {
+  // A real backend: an accept with no client never completes on its own.
+  let lio = Lio::new(1).unwrap();
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+  listener.set_nonblocking(true).unwrap();
+  let listener = common::socket_resource(listener);
+
+  let mut accept: Pin<Box<_>> =
+    Box::pin(api::accept(&listener).with_lio(&lio).into_future());
+  let mut cx = Context::from_waker(Waker::noop());
+  assert!(accept.as_mut().poll(&mut cx).is_pending());
+  lio.run_timeout(Duration::from_millis(10)).unwrap();
+  assert!(accept.as_mut().poll(&mut cx).is_pending());
+  drop(accept);
+
+  for _ in 0..200 {
+    if !lio.is_full() {
+      return;
+    }
+    lio.run_timeout(Duration::from_millis(5)).unwrap();
+  }
+  panic!("the cancelled accept never released its slot");
+}

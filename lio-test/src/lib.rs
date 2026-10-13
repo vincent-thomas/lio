@@ -882,6 +882,94 @@ macro_rules! test_io_backend {
       }
     }
 
+    mod cancel {
+      use super::*;
+
+      /// Collects completions for a while, to check none arrive.
+      fn drain_for(
+        backend: &mut impl IoBackend,
+        period: Duration,
+      ) -> Vec<__lio_test_lio::backend::OpCompleted> {
+        let deadline = Instant::now() + period;
+        let mut all = Vec::new();
+        while Instant::now() < deadline {
+          all.extend(wait_completions(backend, Some(Duration::from_millis(10))));
+        }
+        all
+      }
+
+      #[test]
+      fn cancel_finishes_a_pending_recv_exactly_once() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let (read_res, write_res) = socket_pair();
+        let mut buf = [0_u8; 4];
+        let bufs = [MsgBufMut::from_slice(&mut buf)];
+        push_op(&mut backend,
+          97,
+          Op::Recv { fd: read_res.clone(), msg: MsgRecv::new(&bufs), flags: recv_flags(0) },
+        );
+        backend.flush().unwrap();
+        assert!(
+          wait_completions(&mut backend, Some(Duration::ZERO)).is_empty(),
+          "recv without data must stay pending"
+        );
+
+        backend.cancel(97);
+        let completed = wait_for_single_completion(&mut backend);
+        assert_eq!(completed.registration_id(), 97);
+        assert!(
+          completed.result() < 0,
+          "a cancelled recv reports an error, got {}",
+          completed.result()
+        );
+
+        // Data arriving afterwards belongs to no operation.
+        assert_eq!(send_payload(&write_res, b"late"), 4);
+        let extra = drain_for(&mut backend, Duration::from_millis(100));
+        assert!(extra.is_empty(), "cancelled op completed again: {extra:?}");
+        drop(bufs);
+        assert_eq!(buf, [0; 4], "a cancelled recv must not fill its buffer");
+      }
+
+      #[test]
+      fn cancel_before_flush_completes_the_op() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let (read_res, _write_res) = socket_pair();
+        let mut buf = [0_u8; 4];
+        let bufs = [MsgBufMut::from_slice(&mut buf)];
+        push_op(&mut backend,
+          98,
+          Op::Recv { fd: read_res.clone(), msg: MsgRecv::new(&bufs), flags: recv_flags(0) },
+        );
+        backend.cancel(98);
+        backend.flush().unwrap();
+
+        let completed = wait_for_single_completion(&mut backend);
+        assert_eq!(completed.registration_id(), 98);
+        assert!(completed.result() < 0, "got {}", completed.result());
+        let extra = drain_for(&mut backend, Duration::from_millis(50));
+        assert!(extra.is_empty(), "cancelled op completed again: {extra:?}");
+      }
+
+      #[test]
+      fn cancel_of_an_unknown_id_is_ignored() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        backend.cancel(12_345);
+        push_op(&mut backend, 99, Op::Nop);
+        backend.flush().unwrap();
+        let completed = wait_for_single_completion(&mut backend);
+        assert_exact_result(&completed, 99, 0);
+        let extra = drain_for(&mut backend, Duration::from_millis(50));
+        assert!(extra.is_empty(), "unexpected completions: {extra:?}");
+      }
+    }
+
     mod nop {
       use super::*;
 

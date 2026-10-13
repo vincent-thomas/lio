@@ -216,6 +216,24 @@ pub trait IoBackend {
   /// Submit all queued operations to kernel.
   fn flush(&mut self) -> io::Result<()>;
 
+  /// Asks the backend to finish operation `id` early: its consumer is gone.
+  ///
+  /// The operation must still produce exactly one completion, from a later
+  /// `wait()`: a cancellation error, or its own result if it finished
+  /// first. Until then the memory its [`Op`] points to stays valid, so the
+  /// backend must not consider the operation gone before it reports it.
+  ///
+  /// `id` may be unknown to the backend (already completed, or not an I/O
+  /// operation); that is not an error.
+  ///
+  /// The default does nothing: the operation runs to completion, and its
+  /// slot is freed then. Override it so operations that may never complete
+  /// on their own (an accept, a read from an idle socket) do not keep their
+  /// slot forever.
+  fn cancel(&mut self, id: u64) {
+    let _ = id;
+  }
+
   /// Wait for completions with optional timeout.
   ///
   /// - `None` = block until at least one completion

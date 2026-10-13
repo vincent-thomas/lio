@@ -57,10 +57,10 @@ const WINDOWS_CWD_KEY: i32 = -100;
 pub mod errno {
   #[cfg(unix)]
   pub use libc::{
-    EACCES, EADDRINUSE, EAGAIN, EBADF, ECONNABORTED, ECONNREFUSED, ECONNRESET,
-    EDESTADDRREQ, EEXIST, EFBIG, EHOSTUNREACH, EINVAL, EIO, EISCONN, EMFILE,
-    ENFILE, ENOENT, ENOSPC, ENOTCONN, ENOTDIR, ENOTSOCK, ENOTSUP, EOPNOTSUPP,
-    EPIPE, EPROTOTYPE, ERANGE, ESPIPE, ETIMEDOUT,
+    EACCES, EADDRINUSE, EAGAIN, EBADF, ECANCELED, ECONNABORTED, ECONNREFUSED,
+    ECONNRESET, EDESTADDRREQ, EEXIST, EFBIG, EHOSTUNREACH, EINVAL, EIO,
+    EISCONN, EMFILE, ENFILE, ENOENT, ENOSPC, ENOTCONN, ENOTDIR, ENOTSOCK,
+    ENOTSUP, EOPNOTSUPP, EPIPE, EPROTOTYPE, ERANGE, ESPIPE, ETIMEDOUT,
   };
 
   /// `ERROR_ACCESS_DENIED`
@@ -75,6 +75,9 @@ pub mod errno {
   /// `ERROR_INVALID_HANDLE`
   #[cfg(windows)]
   pub const EBADF: i32 = 6;
+  /// `ERROR_OPERATION_ABORTED`
+  #[cfg(windows)]
+  pub const ECANCELED: i32 = 995;
   /// `WSAECONNABORTED`
   #[cfg(windows)]
   pub const ECONNABORTED: i32 = 10053;
@@ -2695,6 +2698,25 @@ impl IoBackend for DSBackend {
     self.queued.push((id, op));
   }
 
+  fn cancel(&mut self, id: u64) {
+    let queued = self.queued.iter().position(|(queued, _)| *queued == id);
+    let removed = if let Some(index) = queued {
+      self.queued.remove(index);
+      true
+    } else if let Some(index) =
+      self.world.pending.iter().position(|(pending, _)| *pending == id)
+    {
+      self.world.pending.remove(index);
+      true
+    } else {
+      false
+    };
+    if removed {
+      self.record_trace(format!("tick={} cancel id={}", self.world.tick, id));
+      self.schedule_completion(id, -(errno::ECANCELED as isize));
+    }
+  }
+
   fn flush(&mut self) -> io::Result<()> {
     self.assert_initialized();
     let queued = mem::take(&mut self.queued);
@@ -3169,6 +3191,24 @@ impl DSTBackend {
 
   fn queue_network_op(&mut self, id: u64, op: Op) {
     self.queued.push((id, op));
+  }
+
+  /// Removes a network operation that has not completed yet.
+  fn cancel_network_op(&mut self, id: u64) -> bool {
+    if let Some(index) =
+      self.queued.iter().position(|(queued, _)| *queued == id)
+    {
+      self.queued.remove(index);
+      return true;
+    }
+    let mut node = self.node.borrow_mut();
+    let Some(index) =
+      node.pending.iter().position(|(pending, _)| *pending == id)
+    else {
+      return false;
+    };
+    node.pending.remove(index);
+    true
   }
 
   fn synthetic_peer_addr(
@@ -3999,6 +4039,15 @@ impl IoBackend for DSTBackend {
         .as_mut()
         .expect("non-network DST backend push requires local backend")
         .push(id, op, step_bump);
+    }
+  }
+
+  fn cancel(&mut self, id: u64) {
+    if self.cancel_network_op(id) {
+      let result = -(errno::ECANCELED as isize);
+      self.node.borrow_mut().ready.push(OpCompleted::new(id, result));
+    } else if let Some(local) = self.local.as_mut() {
+      local.cancel(id);
     }
   }
 
