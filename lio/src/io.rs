@@ -23,14 +23,15 @@
 //! ```
 
 use std::io;
+use std::mem::MaybeUninit;
 
-use crate::IoBufVec;
 use crate::api::{
   io::Io,
   op::{Action, Completion, OneshotOpModel, OpModel, OpResult},
   ops,
   resource::{AsResource, Resource},
 };
+use crate::{IoBuf, IoBufMut, IoBufVec};
 
 /// Default buffer size for I/O operations (64 KB).
 const DEFAULT_BUF_SIZE: usize = 64 * 1024;
@@ -141,7 +142,7 @@ pub struct Copy {
 }
 
 enum CopyState {
-  Reading(ops::Read<Vec<u8>>),
+  Reading(ops::Read<CappedBuf>),
   Writing(ops::Write<Vec<u8>>),
   Done,
 }
@@ -152,12 +153,13 @@ impl Copy {
   }
   fn new_with_limit(reader: Resource, writer: Resource, limit: u64) -> Self {
     let initial = limit.min(DEFAULT_BUF_SIZE as u64) as usize;
+    let buf = CappedBuf::new(Vec::with_capacity(initial), initial);
     Self {
       reader: reader.clone(),
       writer: writer.clone(),
       total: 0,
       limit,
-      state: CopyState::Reading(ops::Read::new(reader, vec![0u8; initial], -1)),
+      state: CopyState::Reading(ops::Read::new(reader, buf, -1)),
     }
   }
 
@@ -185,10 +187,9 @@ impl OpModel for Copy {
     match std::mem::replace(&mut self.state, CopyState::Done) {
       CopyState::Reading(mut read) => match read.complete(completion) {
         OpResult::Done((Ok(0), _buf)) => OpResult::Done(Ok(self.total)),
-        OpResult::Done((Ok(n), mut buf)) => {
-          let n = n as usize;
+        OpResult::Done((Ok(n), buf)) => {
           self.total += n as u64;
-          buf.truncate(n);
+          let buf = buf.into_inner();
           self.state =
             CopyState::Writing(ops::Write::new(self.writer.clone(), buf, -1));
           OpResult::Again
@@ -214,7 +215,8 @@ impl OpModel for Copy {
           if self.total >= self.limit {
             OpResult::Done(Ok(self.total))
           } else {
-            buf.resize(self.next_read_len(), 0);
+            buf.clear();
+            let buf = CappedBuf::new(buf, self.next_read_len());
             self.state =
               CopyState::Reading(ops::Read::new(self.reader.clone(), buf, -1));
             OpResult::Again
@@ -229,6 +231,45 @@ impl OpModel for Copy {
 }
 
 impl OneshotOpModel for Copy {}
+
+/// A read buffer whose writable region is capped below the `Vec`'s capacity.
+///
+/// A `Vec<u8>` lends reads its whole capacity, so reusing one allocation for
+/// a shorter read would let the read overrun the remaining limit.
+struct CappedBuf {
+  buf: Vec<u8>,
+  cap: usize,
+}
+
+impl CappedBuf {
+  fn new(buf: Vec<u8>, cap: usize) -> Self {
+    let cap = cap.min(buf.capacity());
+    Self { buf, cap }
+  }
+
+  fn into_inner(self) -> Vec<u8> {
+    self.buf
+  }
+}
+
+impl IoBuf for CappedBuf {
+  fn as_slice(&self) -> &[u8] {
+    &self.buf
+  }
+}
+
+impl IoBufMut for CappedBuf {
+  fn as_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+    let cap = self.cap;
+    &mut self.buf.as_uninit_mut()[..cap]
+  }
+
+  unsafe fn set_len(&mut self, len: usize) {
+    // SAFETY: `len <= self.cap <= capacity`, and the caller guarantees the
+    // first `len` bytes are initialized.
+    unsafe { IoBufMut::set_len(&mut self.buf, len) }
+  }
+}
 
 #[cfg(test)]
 mod tests {
