@@ -54,7 +54,7 @@ impl<B: IoBufVec> WriteCursor<B> {
 
   pub fn advance(&mut self, mut written: usize) {
     while written > 0 && self.chunk_idx < self.inner.buf_count() {
-      let (_, len) = self.inner.buf(self.chunk_idx);
+      let len = self.inner.buf(self.chunk_idx).len();
       let remaining = len.saturating_sub(self.chunk_offset);
       if written < remaining {
         self.chunk_offset += written;
@@ -72,11 +72,10 @@ impl<B: IoBufVec> IoBufVec for WriteCursor<B> {
     self.inner.buf_count().saturating_sub(self.chunk_idx)
   }
 
-  fn buf(&self, i: usize) -> (*const u8, usize) {
-    let idx = self.chunk_idx + i;
-    let (ptr, len) = self.inner.buf(idx);
+  fn buf(&self, i: usize) -> &[u8] {
+    let buf = self.inner.buf(self.chunk_idx + i);
     let offset = if i == 0 { self.chunk_offset } else { 0 };
-    (ptr.wrapping_add(offset), len.saturating_sub(offset))
+    buf.get(offset..).unwrap_or_default()
   }
 }
 
@@ -237,9 +236,7 @@ mod tests {
   use crate::IoBufVec;
 
   fn buf_bytes<B: IoBufVec>(bufs: &B, idx: usize) -> Vec<u8> {
-    let (ptr, len) = bufs.buf(idx);
-    // SAFETY: test helper only reads the exact bytes exposed by IoBufVec.
-    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+    bufs.buf(idx).to_vec()
   }
 
   #[test]

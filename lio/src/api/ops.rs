@@ -12,7 +12,7 @@ use std::ptr::{self, NonNull};
 use std::time::Duration;
 
 use crate::{
-  BufResult, IoBufMutVec, IoBufVec,
+  BufResult, IoBufMutVec, IoBufVec, IoSlicesMut,
   api::{
     op::{
       Action, Completion, CompletionFlags, OneshotOpModel, OpModel, OpResult,
@@ -517,6 +517,46 @@ impl OpModelContract for Nop {
   }
 }
 
+/// Lowers the writable regions of `buf` into `out` with `to_raw`, returning
+/// how many there are.
+///
+/// The regions stay valid in place for as long as the caller leaves `buf`
+/// untouched.
+fn collect_regions<B: IoBufMutVec, T>(
+  buf: &mut B,
+  out: &mut [T; MAX_IOV_COUNT],
+  mut to_raw: impl FnMut(NonNull<u8>, usize) -> T,
+) -> usize {
+  let mut regions = IoSlicesMut::new();
+  buf.bufs_mut(&mut regions);
+  let count = regions.len();
+  for (slot, region) in out.iter_mut().zip(regions) {
+    let len = region.len();
+    *slot = to_raw(NonNull::from(region).cast(), len);
+  }
+  count
+}
+
+#[cfg(test)]
+fn stage_into<B: IoBufMutVec>(buf: &mut B, bytes: &[u8]) {
+  let mut regions = IoSlicesMut::new();
+  buf.bufs_mut(&mut regions);
+  let mut copied = 0usize;
+
+  for region in regions {
+    let n = (bytes.len() - copied).min(region.len());
+    for (dst, src) in region.iter_mut().zip(&bytes[copied..copied + n]) {
+      dst.write(*src);
+    }
+    copied += n;
+    if copied == bytes.len() {
+      break;
+    }
+  }
+
+  assert_eq!(copied, bytes.len(), "staged bytes exceed total buffer capacity");
+}
+
 // ============================================================================
 // Read
 // ============================================================================
@@ -525,6 +565,7 @@ pub struct Read<B: IoBufMutVec> {
   res: Resource,
   buf: Option<B>,
   raws: [RawBuf; MAX_IOV_COUNT],
+  iov_count: usize,
   offset: i64,
 }
 
@@ -536,35 +577,14 @@ impl<B: IoBufMutVec> Read<B> {
       // SAFETY: `RawBuf` is a plain pointer/length pair and is immediately
       // overwritten before submission.
       raws: unsafe { mem::zeroed() },
+      iov_count: 0,
       offset,
     }
   }
 
   #[cfg(test)]
   fn stage_read_data(&mut self, bytes: &[u8]) {
-    let buf = self.buf.as_mut().expect("buffer not available");
-    let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
-    let mut copied = 0usize;
-
-    for i in 0..buf_count {
-      let (ptr, cap) = buf.buf_mut(i);
-      let n = (bytes.len() - copied).min(cap);
-      // SAFETY: each `ptr` points into model-owned mutable buffer storage, and we
-      // copy at most the reported capacity for that segment.
-      unsafe {
-        std::ptr::copy_nonoverlapping(bytes[copied..].as_ptr(), ptr, n);
-      }
-      copied += n;
-      if copied == bytes.len() {
-        break;
-      }
-    }
-
-    assert_eq!(
-      copied,
-      bytes.len(),
-      "staged bytes exceed total buffer capacity"
-    );
+    stage_into(self.buf.as_mut().expect("buffer not available"), bytes);
   }
 }
 
@@ -573,19 +593,16 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
 
   fn action(&mut self) -> Action {
     let buf = self.buf.as_mut().expect("buffer not available");
-    let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
-
-    for i in 0..buf_count {
-      let (ptr, len) = buf.buf_mut(i);
-      // SAFETY: the pointer/capacity pair refers to model-owned mutable storage
-      // that remains valid until `complete()` consumes the buffers.
-      self.raws[i] = unsafe { RawBuf::from_raw_parts(ptr, len) };
-    }
+    self.iov_count = collect_regions(buf, &mut self.raws, |ptr, len| {
+      // SAFETY: the region is model-owned storage that stays valid in place
+      // until `complete()` consumes the buffer.
+      unsafe { RawBuf::from_raw_parts(ptr.as_ptr(), len) }
+    });
 
     Action::Io(Op::Read {
       fd: self.res.clone(),
       iovecs: NonNull::from(&mut self.raws[0]),
-      iov_count: buf_count,
+      iov_count: self.iov_count,
       offset: self.offset,
       flags: ReadFlags::EMPTY,
     })
@@ -593,16 +610,17 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     let mut buf = self.buf.take().expect("buffer not available");
-    let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
     let result = if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
       let mut remaining = completion.result as usize;
-      for i in 0..buf_count {
-        let (_, cap) = buf.buf_mut(i);
+      for i in 0..self.iov_count {
+        let cap = self.raws[i].len;
         let len = remaining.min(cap);
-        buf.set_buf_len(i, len);
+        // SAFETY: the kernel filled the regions submitted in `action()` in
+        // order, so the first `len <= cap` bytes of region `i` are initialized.
+        unsafe { buf.set_buf_len(i, len) };
         remaining = remaining.saturating_sub(cap);
       }
       Ok(completion.result as i32)
@@ -718,10 +736,7 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
     let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
     for i in 0..buf_count {
-      let (ptr, len) = buf.buf(i);
-      // SAFETY: `IoBufVec` guarantees each segment is valid for `len`
-      // initialized bytes until completion.
-      self.raws[i] = unsafe { RawBuf::from_raw_parts(ptr.cast_mut(), len) };
+      self.raws[i] = RawBuf::new(buf.buf(i));
     }
 
     Action::Io(Op::Write {
@@ -825,6 +840,7 @@ struct RecvCore<B: IoBufMutVec + std::marker::Send + Sync> {
   res: Resource,
   buf: Option<B>,
   bufs: [MsgBufMut; MAX_IOV_COUNT],
+  iov_count: usize,
   flags: RecvFlags,
   from: Option<SocketAddrBuf>,
 }
@@ -843,6 +859,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
       // `action()` installs real buffer slices.
       bufs: [unsafe { MsgBufMut::from_raw_parts(NonNull::dangling(), 0) };
         MAX_IOV_COUNT],
+      iov_count: 0,
       flags: flags.unwrap_or(RecvFlags::EMPTY),
       from: with_from.then(SocketAddrBuf::unspecified),
     }
@@ -850,18 +867,12 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
 
   fn action(&mut self) -> Action {
     let buf = self.buf.as_mut().expect("buffer not available");
-    let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
-
-    for i in 0..buf_count {
-      let (ptr, len) = buf.buf_mut(i);
-      // SAFETY: `buf_mut(i)` returns a valid writable region for this buffer slot.
-      self.bufs[i] = unsafe {
-        MsgBufMut::from_raw_parts(
-          NonNull::new(ptr).expect("IoBufMutVec returned null ptr"),
-          len,
-        )
-      };
-    }
+    let buf_count = collect_regions(buf, &mut self.bufs, |ptr, len| {
+      // SAFETY: the region is model-owned storage that stays valid in place
+      // until `complete_buf()` consumes the buffer.
+      unsafe { MsgBufMut::from_raw_parts(ptr, len) }
+    });
+    self.iov_count = buf_count;
 
     let msg = match self.from.as_mut() {
       Some(addr) => {
@@ -878,16 +889,17 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
     completion: Completion,
   ) -> (std::io::Result<i32>, B) {
     let mut buf = self.buf.take().expect("buffer not available");
-    let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
     let result = if completion.result < 0 {
       Err(io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
       let mut remaining = completion.result as usize;
-      for i in 0..buf_count {
-        let (_, cap) = buf.buf_mut(i);
+      for i in 0..self.iov_count {
+        let cap = self.bufs[i].len;
         let len = remaining.min(cap);
-        buf.set_buf_len(i, len);
+        // SAFETY: the kernel filled the regions submitted in `action()` in
+        // order, so the first `len <= cap` bytes of region `i` are initialized.
+        unsafe { buf.set_buf_len(i, len) };
         remaining = remaining.saturating_sub(cap);
       }
       Ok(completion.result as i32)
@@ -898,28 +910,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
 
   #[cfg(test)]
   fn stage_recv_data(&mut self, bytes: &[u8]) {
-    let buf = self.buf.as_mut().expect("buffer not available");
-    let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
-    let mut copied = 0usize;
-
-    for i in 0..buf_count {
-      let (ptr, cap) = buf.buf_mut(i);
-      let n = (bytes.len() - copied).min(cap);
-      // SAFETY: each `ptr` points into model-owned mutable receive storage.
-      unsafe {
-        std::ptr::copy_nonoverlapping(bytes[copied..].as_ptr(), ptr, n);
-      }
-      copied += n;
-      if copied == bytes.len() {
-        break;
-      }
-    }
-
-    assert_eq!(
-      copied,
-      bytes.len(),
-      "staged bytes exceed total buffer capacity"
-    );
+    stage_into(self.buf.as_mut().expect("buffer not available"), bytes);
   }
 
   #[cfg(test)]
@@ -1138,14 +1129,7 @@ impl<B: IoBufVec + std::marker::Send + Sync> Send<B> {
     let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
     for i in 0..buf_count {
-      let (ptr, len) = buf.buf(i);
-      // SAFETY: `buf(i)` returns a valid readable region for this buffer slot.
-      self.bufs[i] = unsafe {
-        MsgBuf::from_raw_parts(
-          NonNull::new(ptr.cast_mut()).expect("IoBufVec returned null ptr"),
-          len,
-        )
-      };
+      self.bufs[i] = MsgBuf::from_slice(buf.buf(i));
     }
 
     MsgSend::new(&self.bufs[..buf_count], self.addr)
@@ -1918,15 +1902,20 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
 
   fn action(&mut self) -> Action {
     let buf = self.buf.as_mut().expect("buffer not available");
-    let (ptr, len) = buf.buf_mut(0);
-    // SAFETY: `buf_mut(0)` returns a valid writable region for the op lifetime.
-    self.raw = unsafe { RawBuf::from_raw_parts(ptr, len) };
+    let mut regions = IoSlicesMut::new();
+    buf.bufs_mut(&mut regions);
+    let region = regions.into_iter().next().expect("readlink needs a buffer");
+    let len = region.len();
+    let ptr = NonNull::from(region).cast::<u8>();
+    // SAFETY: the region is model-owned storage that stays in place until
+    // `complete()` consumes the buffer.
+    self.raw = unsafe { RawBuf::from_raw_parts(ptr.as_ptr(), len) };
     self.raw_len = len;
 
     Action::Io(Op::ReadlinkAt {
       dir_fd: self.dir_res.clone(),
       path: cstring_to_osstring(&self.pathname),
-      buf: NonNull::new(ptr).expect("readlink buffer pointer must be non-null"),
+      buf: ptr,
       buf_len: self.raw_len,
     })
   }
@@ -1936,7 +1925,10 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
     let result = if completion.result < 0 {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
-      buf.set_buf_len(0, completion.result as usize);
+      let len = (completion.result as usize).min(self.raw_len);
+      // SAFETY: the kernel wrote `len <= raw_len` bytes into the region
+      // submitted in `action()`.
+      unsafe { buf.set_buf_len(0, len) };
       Ok(completion.result as i32)
     };
     OpResult::Done((result, buf))
@@ -1973,18 +1965,22 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
     } else {
       let bytes = self.out.as_encoded_bytes();
 
-      let (ptr, cap) = buf.buf_mut(0);
-      if bytes.len() > cap {
-        Err(std::io::Error::from_raw_os_error(
+      let mut regions = IoSlicesMut::new();
+      buf.bufs_mut(&mut regions);
+      let first = regions.into_iter().next();
+      match first {
+        Some(region) if bytes.len() <= region.len() => {
+          for (dst, src) in region.iter_mut().zip(bytes) {
+            dst.write(*src);
+          }
+          // SAFETY: the first `bytes.len()` bytes of region 0 were just
+          // initialized above.
+          unsafe { buf.set_buf_len(0, bytes.len()) };
+          Ok(bytes.len() as i32)
+        }
+        _ => Err(std::io::Error::from_raw_os_error(
           crate::backend::native::BUFFER_TOO_SMALL,
-        ))
-      } else {
-        // SAFETY: `ptr` points to writable storage of at least `cap` bytes.
-        unsafe {
-          std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len())
-        };
-        buf.set_buf_len(0, bytes.len());
-        Ok(bytes.len() as i32)
+        )),
       }
     };
     OpResult::Done((result, buf))
