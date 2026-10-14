@@ -300,7 +300,8 @@ impl std::os::fd::FromRawFd for Resource {
 }
 
 impl Resource {
-  /// Takes ownership of the descriptor/handle in a successful completion.
+  /// Takes ownership of the descriptor/handle a resource-creating
+  /// operation completed with.
   ///
   /// The resource is closed with the close function of the backend that
   /// produced the completion.
@@ -312,11 +313,15 @@ impl Resource {
   ///
   /// # Errors
   ///
-  /// Returns [`io::ErrorKind::InvalidData`] when the result is negative or
-  /// does not fit a [`RawResource`], instead of adopting a truncated value.
+  /// A negative result is the operation's error code. A non-negative result
+  /// that does not fit a [`RawResource`] is reported as
+  /// [`io::ErrorKind::InvalidData`] instead of being truncated.
   pub(crate) unsafe fn from_completion(
     completion: &crate::api::op::Completion,
   ) -> io::Result<Self> {
+    if completion.result < 0 {
+      return Err(io::Error::from_raw_os_error((-completion.result) as i32));
+    }
     let raw = raw_from_result(completion.result).ok_or_else(|| {
       io::Error::new(
         io::ErrorKind::InvalidData,

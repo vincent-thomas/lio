@@ -105,12 +105,6 @@ impl OpModel for SocketNew {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    if completion.result < 0 {
-      return OpResult::Done(Err(io::Error::from_raw_os_error(
-        (-completion.result) as i32,
-      )));
-    }
-
     // SAFETY: a successful socket completion carries a new owned socket.
     let resource =
       unsafe { crate::api::resource::Resource::from_completion(&completion) };
