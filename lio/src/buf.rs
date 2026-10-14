@@ -116,7 +116,6 @@ impl IoBufMut for Vec<u8> {
   }
 }
 
-#[cfg(feature = "nightly")]
 impl IoBuf for Box<[u8]> {
   fn as_slice(&self) -> &[u8] {
     self
