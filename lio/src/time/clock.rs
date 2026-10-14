@@ -23,26 +23,38 @@ struct WheelEntry {
 #[derive(Debug)]
 struct Wheel<const SIZE: usize> {
   slots: [Vec<WheelEntry>; SIZE],
+  /// Entries across all slots, so advancing can skip empty levels.
+  len: usize,
 }
 
 impl<const SIZE: usize> Wheel<SIZE> {
   fn new() -> Self {
-    Self { slots: std::array::from_fn(|_| Vec::new()) }
+    Self { slots: std::array::from_fn(|_| Vec::new()), len: 0 }
   }
 
   fn insert(&mut self, slot: usize, entry: WheelEntry) {
     self.slots[slot].push(entry);
+    self.len += 1;
   }
 
   fn take_slot(&mut self, slot: usize) -> Vec<WheelEntry> {
-    std::mem::take(&mut self.slots[slot])
+    let entries = std::mem::take(&mut self.slots[slot]);
+    self.len -= entries.len();
+    entries
   }
 
+  /// Gives a drained slot's allocation back for reuse.
   fn restore_slot(&mut self, slot: usize, entries: Vec<WheelEntry>) {
+    debug_assert!(entries.is_empty());
     let slot = &mut self.slots[slot];
     if slot.is_empty() {
       *slot = entries;
     }
+  }
+
+  fn clear_slot(&mut self, slot: usize) {
+    self.len -= self.slots[slot].len();
+    self.slots[slot].clear();
   }
 }
 
@@ -224,8 +236,33 @@ impl Clock {
   #[inline]
   pub fn advance_to(&mut self, now_ticks: u64) {
     while self.current_tick < now_ticks {
+      // Ticks before the next one that processes a non-empty slot change
+      // nothing, so skip them instead of stepping one millisecond at a time.
+      let Some(next) = self.next_busy_tick() else {
+        self.current_tick = now_ticks;
+        return;
+      };
+      if next > now_ticks {
+        self.current_tick = now_ticks;
+        return;
+      }
+      self.current_tick = next - 1;
       self.tick();
     }
+  }
+
+  /// The first tick after the current one whose [`tick`](Self::tick)
+  /// processes a slot that holds entries, or `None` if the wheel is empty.
+  ///
+  /// `tick` processes the level-0 slot every tick and a level-`k` slot only
+  /// when the tick is a multiple of `256^k`, so with the lower levels empty
+  /// nothing happens before the next such multiple.
+  fn next_busy_tick(&self) -> Option<u64> {
+    let lens =
+      [self.level0.len, self.level1.len, self.level2.len, self.level3.len];
+    let level = lens.iter().position(|&len| len != 0)?;
+    let period = 1u64 << (LEVEL_BITS * level as u32);
+    Some((self.current_tick / period).saturating_add(1).saturating_mul(period))
   }
 
   #[inline]
@@ -377,7 +414,7 @@ impl Clock {
   fn expire_level0_slot(&mut self, slot: usize) {
     let mut expired_count = 0;
     let current_tick = self.current_tick;
-    let entries = &mut self.level0.slots[slot];
+    let entries = &self.level0.slots[slot];
     let timers = &mut self.timers;
     let pending_fire = &mut self.pending_fire;
 
@@ -398,7 +435,7 @@ impl Clock {
       expired_count += 1;
       pending_fire.push(PendingTimer { id: entry.id });
     }
-    entries.clear();
+    self.level0.clear_slot(slot);
 
     if expired_count != 0 {
       self.decrement_active_deadline_by(current_tick, expired_count);
@@ -697,5 +734,51 @@ mod tests {
     assert!(collect_expired(&mut clock).is_empty());
     clock.advance_by(1);
     assert_eq!(collect_expired(&mut clock), vec![1]);
+  }
+
+  /// Every wheel level, and the boundaries between them, fire exactly on the
+  /// deadline when the clock skips idle ticks.
+  #[test]
+  fn skipping_idle_ticks_fires_every_level_on_time() {
+    let deadlines: [u64; 10] = [
+      1,
+      255,
+      256,
+      257,
+      65_535,
+      65_536,
+      70_000,
+      (1 << 24) + 5,
+      (1 << 32) + 7,
+      (1 << 33) + 300,
+    ];
+    let mut clock = Clock::new();
+    for (id, &deadline) in deadlines.iter().enumerate() {
+      clock.schedule_at(id as TimerId, deadline);
+    }
+    let mut sorted: Vec<(u64, TimerId)> = deadlines
+      .iter()
+      .enumerate()
+      .map(|(id, &deadline)| (deadline, id as TimerId))
+      .collect();
+    sorted.sort();
+    for (deadline, id) in sorted {
+      clock.advance_to(deadline - 1);
+      assert!(collect_expired(&mut clock).is_empty(), "{id} fired early");
+      clock.advance_to(deadline);
+      assert_eq!(collect_expired(&mut clock), vec![id], "at {deadline}");
+    }
+  }
+
+  #[test]
+  fn idle_gap_is_skipped_not_stepped() {
+    let mut clock = Clock::new();
+    let day = 24 * 60 * 60 * 1000 / super::TICK_MS;
+    let start = std::time::Instant::now();
+    clock.advance_to(day);
+    clock.schedule(1, Duration::from_millis(5));
+    clock.advance_to(day * 2);
+    assert_eq!(collect_expired(&mut clock), vec![1]);
+    assert!(start.elapsed() < Duration::from_millis(100));
   }
 }
