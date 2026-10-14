@@ -175,6 +175,39 @@ mod immediate_sockets {
     assert_eq!(peer.read(&mut drain).unwrap(), 5);
     assert_eq!(&drain[..5], b"hello");
   }
+
+  #[test]
+  fn read_with_more_iovecs_than_the_native_array_is_rejected() {
+    use crate::backend::op::{RawBuf, ReadFlags};
+    use std::ptr::NonNull;
+
+    let (socket, mut peer) = pair(true);
+    peer.write_all(b"hello").unwrap();
+    let mut buffers = [[0u8; 4]; crate::buf::MAX_IOV_COUNT + 1];
+    let raws: Vec<RawBuf> = buffers
+      .iter_mut()
+      // SAFETY: the buffers outlive every use of the backend below.
+      .map(|buf| unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) })
+      .collect();
+    let mut backend = backend();
+    backend.push(
+      18,
+      Op::Read {
+        fd: socket,
+        iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
+        iov_count: raws.len(),
+        offset: -1,
+        flags: ReadFlags::EMPTY,
+      },
+      &mut Bump::new(),
+    );
+    backend.flush().unwrap();
+    let mut completed = Vec::new();
+    backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].result(), -(libc::EINVAL as isize));
+    assert!(buffers.iter().flatten().all(|&byte| byte == 0));
+  }
 }
 
 /// RAII wrapper for a socket file descriptor

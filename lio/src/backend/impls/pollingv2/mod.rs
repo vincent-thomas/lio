@@ -400,6 +400,11 @@ impl Poller {
     iovecs: std::ptr::NonNull<crate::backend::op::RawBuf>,
     iov_count: usize,
   ) -> Option<[libc::iovec; crate::buf::MAX_IOV_COUNT]> {
+    // The native iovec array is fixed-size; a longer list would make the
+    // kernel read past it.
+    if iov_count > crate::buf::MAX_IOV_COUNT {
+      return None;
+    }
     // SAFETY: `iovecs` points to `iov_count` valid `RawBuf` entries.
     let raws =
       unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) };
@@ -414,6 +419,11 @@ impl Poller {
   }
 
   fn lower_recv_msg(msg: &MsgRecv) -> Option<LoweredMsg> {
+    // The native iovec array is fixed-size; a longer list would make the
+    // kernel read past it.
+    if msg.buf_count.get() > crate::buf::MAX_IOV_COUNT {
+      return None;
+    }
     // SAFETY: `msg.bufs` points to `msg.buf_count` valid `MsgBufMut` items.
     let bufs = unsafe {
       std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
@@ -450,6 +460,11 @@ impl Poller {
   }
 
   fn lower_send_msg(msg: &MsgSend) -> Option<LoweredMsg> {
+    // The native iovec array is fixed-size; a longer list would make the
+    // kernel read past it.
+    if msg.buf_count.get() > crate::buf::MAX_IOV_COUNT {
+      return None;
+    }
     // SAFETY: `msg.bufs` points to `msg.buf_count` valid `MsgBuf` items.
     let bufs = unsafe {
       std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
@@ -1046,10 +1061,6 @@ impl Poller {
       Op::Spawn { spec } => {
         use std::os::unix::ffi::OsStrExt;
 
-        unsafe extern "C" {
-          static mut environ: *mut *mut libc::c_char;
-        }
-
         let path = match std::ffi::CString::new(spec.program.as_bytes()) {
           Ok(path) => path,
           Err(_) => return -(libc::EINVAL as isize),
@@ -1068,32 +1079,17 @@ impl Poller {
           .map(|arg| arg.as_ptr().cast_mut())
           .chain(std::iter::once(std::ptr::null_mut()))
           .collect();
-        let env = match spec.env.as_ref().map(|env| {
-          env
-            .iter()
-            .map(|var| std::ffi::CString::new(var.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-        }) {
-          Some(Ok(env)) => Some(env),
-          Some(Err(_)) => return -(libc::EINVAL as isize),
-          None => None,
+        let Some(env) = crate::backend::native::spawn_env(spec.env.as_deref())
+        else {
+          return -(libc::EINVAL as isize);
         };
-        let mut env_ptrs = env.as_ref().map(|env| {
-          env
-            .iter()
-            .map(|var| var.as_ptr().cast_mut())
-            .chain(std::iter::once(std::ptr::null_mut()))
-            .collect::<Vec<_>>()
-        });
+        let mut env_ptrs: Vec<*mut libc::c_char> = env
+          .iter()
+          .map(|var| var.as_ptr().cast_mut())
+          .chain(std::iter::once(std::ptr::null_mut()))
+          .collect();
 
         let mut pid: libc::pid_t = 0;
-        let envp = env_ptrs
-          .as_mut()
-          .map(|vars| vars.as_mut_ptr().cast_const())
-          .unwrap_or_else(|| {
-            // SAFETY: `environ` is the process-global environment vector.
-            unsafe { environ as *const *mut libc::c_char }
-          });
         // SAFETY: native C strings and pointer arrays remain alive for this call.
         let result = unsafe {
           libc::posix_spawn(
@@ -1102,7 +1098,7 @@ impl Poller {
             std::ptr::null(),
             std::ptr::null(),
             argv_ptrs.as_mut_ptr().cast_const(),
-            envp,
+            env_ptrs.as_mut_ptr().cast_const(),
           )
         };
         if result != 0 { -(result as isize) } else { pid as isize }

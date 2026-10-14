@@ -295,6 +295,41 @@ fn nonblocking_waits_make_progress_on_file_completions() {
 }
 
 #[test]
+fn read_with_more_iovecs_than_the_native_array_is_rejected() {
+  use std::io::Write;
+  let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+  writer.write_all(b"hello").unwrap();
+  // SAFETY: transfers the descriptor to its sole Resource owner.
+  let reader = unsafe { Resource::from_raw_fd(reader.into_raw_fd()) };
+  let mut backend = IoUring::new();
+  backend.init(8).unwrap();
+  let mut arena = Bump::new();
+  let mut buffers = [[0u8; 4]; crate::buf::MAX_IOV_COUNT + 1];
+  let raws: Vec<RawBuf> = buffers
+    .iter_mut()
+    // SAFETY: the buffers outlive every use of the backend below.
+    .map(|buf| unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) })
+    .collect();
+  backend.push(
+    1,
+    Op::Read {
+      fd: reader,
+      iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
+      iov_count: raws.len(),
+      offset: -1,
+      flags: ReadFlags::EMPTY,
+    },
+    &mut arena,
+  );
+  backend.flush().unwrap();
+  let mut completed = Vec::new();
+  backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
+  assert_eq!(completed.len(), 1);
+  assert_eq!(completed[0].result(), -(libc::EINVAL as isize));
+  assert!(buffers.iter().flatten().all(|&byte| byte == 0));
+}
+
+#[test]
 fn drop_waits_for_operations_in_the_kernel() {
   use std::io::Write;
   let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();

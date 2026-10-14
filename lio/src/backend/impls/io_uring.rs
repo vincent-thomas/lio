@@ -28,7 +28,7 @@ use crate::slab::{Slab, SlabKey};
 const STATX_BASIC_STATS: u32 = 0x0000_07ff;
 /// `user_data` of cancellation requests. Their completions are not
 /// operations, and no slab key decodes to it.
-const CANCEL_USER_DATA: u64 = u64::MAX;
+const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 /// How long dropping the backend waits for cancelled operations to finish.
 /// Requests parked on readiness (accept, socket reads) are cancelled at
 /// once; this only bounds I/O a kernel worker is still busy with.
@@ -65,6 +65,11 @@ struct NativePathState {
 
 impl NativeMsgState {
   fn from_recv(msg: &crate::backend::op::MsgRecv) -> Option<Self> {
+    // The native iovec array is fixed-size; a longer list would make the
+    // kernel read past it.
+    if msg.buf_count.get() > crate::buf::MAX_IOV_COUNT {
+      return None;
+    }
     // SAFETY: `MsgRecv` validation guarantees `bufs` points to `buf_count`
     // live `RawBuf` entries for the duration of lowering.
     let bufs = unsafe {
@@ -99,6 +104,11 @@ impl NativeMsgState {
   }
 
   fn from_send(msg: &crate::backend::op::MsgSend) -> Option<Self> {
+    // The native iovec array is fixed-size; a longer list would make the
+    // kernel read past it.
+    if msg.buf_count.get() > crate::buf::MAX_IOV_COUNT {
+      return None;
+    }
     // SAFETY: `MsgSend` validation guarantees `bufs` points to `buf_count`
     // live `RawBuf` entries for the duration of lowering.
     let bufs = unsafe {
@@ -169,6 +179,11 @@ impl NativeRwState {
     iovecs: std::ptr::NonNull<crate::backend::op::RawBuf>,
     iov_count: usize,
   ) -> Option<Self> {
+    // The native iovec array is fixed-size; a longer list would make the
+    // kernel read past it.
+    if iov_count > crate::buf::MAX_IOV_COUNT {
+      return None;
+    }
     // SAFETY: op validation guarantees `iovecs` references `iov_count`
     // contiguous `RawBuf` entries that stay live through lowering.
     let raws =
@@ -300,12 +315,12 @@ impl LoweredState {
     Ok(match op {
       Op::Read { iovecs, iov_count, .. } => {
         let state = NativeRwState::from_raws(*iovecs, *iov_count)
-          .expect("validated read op must have iovecs");
+          .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         Self::Rw(NonNull::from(arena.alloc(state)))
       }
       Op::Write { iovecs, iov_count, .. } => {
         let state = NativeRwState::from_raws(*iovecs, *iov_count)
-          .expect("validated read/write op must have iovecs");
+          .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         Self::Rw(NonNull::from(arena.alloc(state)))
       }
       Op::Recv { msg, .. } => {
@@ -320,7 +335,7 @@ impl LoweredState {
           return Ok(Self::SingleMsg { ptr: buf.ptr, len: buf.len as u32 });
         }
         let state = NativeMsgState::from_recv(msg)
-          .expect("validated recv op must have native message state");
+          .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         Self::Msg(NonNull::from(arena.alloc(state)))
       }
       Op::Send { msg, .. } => {
@@ -335,7 +350,7 @@ impl LoweredState {
           return Ok(Self::SingleMsg { ptr: buf.ptr, len: buf.len as u32 });
         }
         let state = NativeMsgState::from_send(msg)
-          .expect("validated send op must have native message state");
+          .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         Self::Msg(NonNull::from(arena.alloc(state)))
       }
       Op::Accept { addr, .. } => Self::Socket(NonNull::from(
@@ -1250,10 +1265,6 @@ impl IoUring {
       Op::Spawn { spec } => {
         use std::os::unix::ffi::OsStrExt;
 
-        unsafe extern "C" {
-          static mut environ: *mut *mut libc::c_char;
-        }
-
         let path = match std::ffi::CString::new(spec.program.as_bytes()) {
           Ok(path) => path,
           Err(_) => {
@@ -1276,35 +1287,17 @@ impl IoUring {
           .map(|arg| arg.as_ptr().cast_mut())
           .chain(std::iter::once(std::ptr::null_mut()))
           .collect();
-        let env = match spec.env.as_ref().map(|env| {
-          env
-            .iter()
-            .map(|var| std::ffi::CString::new(var.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-        }) {
-          Some(Ok(env)) => Some(env),
-          Some(Err(_)) => {
-            return Some(Err(io::Error::from_raw_os_error(libc::EINVAL)));
-          }
-          None => None,
+        let Some(env) = crate::backend::native::spawn_env(spec.env.as_deref())
+        else {
+          return Some(Err(io::Error::from_raw_os_error(libc::EINVAL)));
         };
-        let mut env_ptrs = env.as_ref().map(|env| {
-          env
-            .iter()
-            .map(|var| var.as_ptr().cast_mut())
-            .chain(std::iter::once(std::ptr::null_mut()))
-            .collect::<Vec<_>>()
-        });
+        let mut env_ptrs: Vec<*mut libc::c_char> = env
+          .iter()
+          .map(|var| var.as_ptr().cast_mut())
+          .chain(std::iter::once(std::ptr::null_mut()))
+          .collect();
 
         let mut pid: libc::pid_t = 0;
-        let envp = env_ptrs
-          .as_mut()
-          .map(|vars| vars.as_mut_ptr().cast_const())
-          .unwrap_or_else(|| {
-            // SAFETY: `environ` is the process-global environment pointer
-            // provided by libc and is valid to read here.
-            unsafe { environ as *const *mut libc::c_char }
-          });
         // SAFETY: native C strings and pointer arrays remain alive for this call.
         let result = unsafe {
           libc::posix_spawn(
@@ -1313,7 +1306,7 @@ impl IoUring {
             std::ptr::null(),
             std::ptr::null(),
             argv_ptrs.as_mut_ptr().cast_const(),
-            envp,
+            env_ptrs.as_mut_ptr().cast_const(),
           )
         };
         Some(if result != 0 {

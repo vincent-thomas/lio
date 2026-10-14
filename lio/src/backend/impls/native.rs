@@ -118,3 +118,34 @@ pub(crate) fn open_flags(flags: OpenFlags) -> Result<i32, i32> {
   }
   Ok(bits)
 }
+
+/// The `KEY=VALUE` environment for a spawned child: `env` when given,
+/// otherwise a snapshot of this process's environment.
+///
+/// The snapshot goes through [`std::env::vars_os`], which holds std's
+/// environment lock while copying, instead of handing the global `environ`
+/// to the kernel while another thread may be calling `set_var`.
+///
+/// Returns `None` when an entry contains a NUL byte.
+#[cfg(unix)]
+#[cfg_attr(not(feature = "backend_impls"), allow(dead_code))]
+pub(crate) fn spawn_env(
+  env: Option<&[std::ffi::OsString]>,
+) -> Option<Vec<std::ffi::CString>> {
+  use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+  match env {
+    Some(env) => env
+      .iter()
+      .map(|var| std::ffi::CString::new(var.as_bytes()).ok())
+      .collect(),
+    None => std::env::vars_os()
+      .map(|(key, value)| {
+        let mut var = key.into_vec();
+        var.push(b'=');
+        var.extend_from_slice(value.as_bytes());
+        std::ffi::CString::new(var).ok()
+      })
+      .collect(),
+  }
+}

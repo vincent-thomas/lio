@@ -75,6 +75,7 @@
 //! }
 //! ```
 
+use std::io;
 use std::sync::Arc;
 
 macro_rules! impl_native_convervions {
@@ -127,6 +128,20 @@ pub type RawResource = std::os::windows::io::RawHandle;
 use std::os::windows::io::RawHandle;
 
 type Inner = RawResource;
+
+/// Converts a successful completion result into the descriptor it carries,
+/// rejecting values that are negative or out of range.
+#[cfg(unix)]
+fn raw_from_result(result: isize) -> Option<RawResource> {
+  RawResource::try_from(result).ok().filter(|fd| *fd >= 0)
+}
+
+/// Converts a successful completion result into the handle it carries,
+/// rejecting the null and pseudo-handle range.
+#[cfg(windows)]
+fn raw_from_result(result: isize) -> Option<RawResource> {
+  (result > 0).then_some(result as RawResource)
+}
 
 /// Closes a [`RawResource`] its caller owns.
 ///
@@ -292,19 +307,23 @@ impl Resource {
   ///
   /// # Safety
   ///
-  /// `completion.result` must be non-negative and carry a newly created
+  /// A non-negative `completion.result` must carry a newly created
   /// descriptor/handle owned by the caller.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`io::ErrorKind::InvalidData`] when the result is negative or
+  /// does not fit a [`RawResource`], instead of adopting a truncated value.
   pub(crate) unsafe fn from_completion(
     completion: &crate::api::op::Completion,
-  ) -> Self {
-    debug_assert!(
-      completion.result >= 0,
-      "completion result must carry a resource"
-    );
-    Resource(Arc::new(InnerResource::new(
-      completion.result as Inner,
-      completion.resource_close(),
-    )))
+  ) -> io::Result<Self> {
+    let raw = raw_from_result(completion.result).ok_or_else(|| {
+      io::Error::new(
+        io::ErrorKind::InvalidData,
+        "backend completed with an invalid resource",
+      )
+    })?;
+    Ok(Resource(Arc::new(InnerResource::new(raw, completion.resource_close()))))
   }
 
   /// Creates a Resource that borrows a file descriptor without taking ownership.
