@@ -101,18 +101,22 @@ impl TimeManager {
   ///
   /// Timers that already expired (moved out of the wheel by an earlier
   /// [`schedule`](Self::schedule)) but were not polled yet are due now.
+  ///
+  /// While paused, time only moves when advanced explicitly, so no wait
+  /// makes a future deadline due: only timers already due count.
   pub fn next_deadline(&self) -> Option<Duration> {
     if self.clock.has_expired() {
       return Some(Duration::ZERO);
     }
-    self.clock.earliest_active_deadline().map(|deadline_ticks| {
-      let now_ticks = self.now_ticks();
-      if deadline_ticks <= now_ticks {
-        Duration::ZERO
-      } else {
-        Duration::from_millis((deadline_ticks - now_ticks) * TICK_MS)
-      }
-    })
+    let deadline_ticks = self.clock.earliest_active_deadline()?;
+    let now_ticks = self.now_ticks();
+    if deadline_ticks <= now_ticks {
+      Some(Duration::ZERO)
+    } else if self.is_paused() {
+      None
+    } else {
+      Some(Duration::from_millis((deadline_ticks - now_ticks) * TICK_MS))
+    }
   }
 
   /// Polls for expired timers.
@@ -154,7 +158,6 @@ impl TimeManager {
     }
   }
 
-  #[allow(dead_code)]
   pub fn is_paused(&self) -> bool {
     matches!(self.state, TimeState::Paused)
   }

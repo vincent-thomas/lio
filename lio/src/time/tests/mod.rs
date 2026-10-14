@@ -33,6 +33,21 @@ fn pause_and_resume_freezes_wall_clock_progress() {
 }
 
 #[test]
+fn paused_time_gives_no_wait_deadline() {
+  let mut time = TimeManager::new();
+  time.schedule(1, Duration::from_millis(10));
+  assert!(time.next_deadline().is_some());
+
+  // Waiting cannot make a paused timer due, so the driver must not wake up
+  // for it.
+  time.pause();
+  assert_eq!(time.next_deadline(), None);
+
+  time.resume();
+  assert!(time.next_deadline().is_some());
+}
+
+#[test]
 fn public_pause_resume_helpers_toggle_lio_time() {
   let lio = Lio::new(8).unwrap();
   time::pause(&lio);
