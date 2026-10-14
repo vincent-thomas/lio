@@ -98,7 +98,13 @@ impl TimeManager {
   }
 
   /// Returns the duration until the next timer fires, if any.
+  ///
+  /// Timers that already expired (moved out of the wheel by an earlier
+  /// [`schedule`](Self::schedule)) but were not polled yet are due now.
   pub fn next_deadline(&self) -> Option<Duration> {
+    if self.clock.has_expired() {
+      return Some(Duration::ZERO);
+    }
     self.clock.earliest_active_deadline().map(|deadline_ticks| {
       let now_ticks = self.now_ticks();
       if deadline_ticks <= now_ticks {

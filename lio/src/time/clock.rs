@@ -296,6 +296,12 @@ impl Clock {
     self.timer_count == 0
   }
 
+  /// Returns whether timers have expired but not been handed out by
+  /// [`poll_expired`](Self::poll_expired) yet.
+  pub(crate) fn has_expired(&self) -> bool {
+    self.pending_index < self.pending_fire.len()
+  }
+
   pub(crate) fn earliest_active_deadline(&self) -> Option<u64> {
     self.earliest_deadline.map(|(deadline, _)| deadline)
   }
