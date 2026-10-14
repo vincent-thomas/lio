@@ -460,3 +460,34 @@ fn accuracy_within_five_milliseconds() {
     "a sleep overshot by more than its own duration: overshoots {overshoots:?}",
   );
 }
+
+/// A timer that expired while another one was being scheduled must still
+/// bound the driver's wait, not be left for the next unrelated wakeup.
+#[test]
+fn timer_expired_during_schedule_is_delivered_promptly() {
+  use std::cell::Cell;
+  use std::future::IntoFuture;
+  use std::rc::Rc;
+  use std::task::{Context, Poll, Waker};
+
+  let lio = Lio::new(8).unwrap();
+  let fired = Rc::new(Cell::new(false));
+  let flag = fired.clone();
+  api::sleep(Duration::from_millis(5))
+    .with_lio(&lio)
+    .when_done(move |_| flag.set(true));
+  std::thread::sleep(Duration::from_millis(20));
+
+  // Scheduling a second timer moves the expired one out of the wheel.
+  let mut later =
+    Box::pin(api::sleep(Duration::from_secs(60)).with_lio(&lio).into_future());
+  let mut cx = Context::from_waker(Waker::noop());
+  assert!(matches!(later.as_mut().poll(&mut cx), Poll::Pending));
+  // Leave no other timer that would wake the driver.
+  drop(later);
+
+  let start = Instant::now();
+  lio.run_timeout(Duration::from_secs(2)).unwrap();
+  assert!(fired.get(), "the expired timer was delivered");
+  assert!(start.elapsed() < Duration::from_secs(1), "without waiting");
+}
