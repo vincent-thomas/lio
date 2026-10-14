@@ -234,6 +234,22 @@ pub trait IoBackend {
     let _ = id;
   }
 
+  /// Cancels every operation still running and waits, for a bounded time,
+  /// until none is left.
+  ///
+  /// Returns whether nothing can touch the memory of a pushed [`Op`] any
+  /// more: no request is left in the kernel or on a backend thread. The
+  /// driver calls this when it is dropped, before freeing that memory, and
+  /// leaks the memory and the backend instead when it returns `false`.
+  /// Completions for the drained operations are discarded.
+  ///
+  /// The default returns `true`, which is right for a backend that only
+  /// performs I/O inside its own calls. A backend that leaves work in the
+  /// kernel or on other threads between calls must override it.
+  fn drain(&mut self) -> bool {
+    true
+  }
+
   /// Wait for completions with optional timeout.
   ///
   /// - `None` = block until at least one completion

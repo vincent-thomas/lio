@@ -76,12 +76,13 @@ impl OpStore {
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> Result<u64, StoreAtCapacity> {
-    let Some((key, slot)) = self.slots.allocate() else {
+    let Some((key, _)) = self.slots.allocate_with(|slot| {
+      slot.model_bump.reset();
+      slot.step_bump.reset();
+      slot.registration.write(init(&mut slot.model_bump));
+    }) else {
       return Err(StoreAtCapacity);
     };
-
-    // Fresh slots are empty, and reused slots were reset by `remove`.
-    slot.registration.write(init(&mut slot.model_bump));
     Ok(key.as_u64())
   }
 
@@ -94,8 +95,8 @@ impl OpStore {
   /// Inserts an operation and returns everything needed for its initial dispatch.
   ///
   /// Keeping the just-allocated slot borrowed avoids looking it up again by its
-  /// generational ID. Fresh slots are empty, and reused slots were reset by
-  /// `remove`, so initial dispatch does not need another arena reset.
+  /// generational ID. The slot is only claimed once `init` returns, so a
+  /// panicking `init` leaves the store unchanged.
   ///
   /// The caller must have checked [`is_full`](Self::is_full) first.
   #[inline]
@@ -103,39 +104,51 @@ impl OpStore {
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> (u64, Option<Action>, &mut Bump) {
-    let (key, slot) =
-      self.slots.allocate().expect("insert_with_action on a full store");
-    slot.model_bump.reset();
-    slot.step_bump.reset();
-    let registration = slot.registration.write(init(&mut slot.model_bump));
+    let (key, slot) = self
+      .slots
+      .allocate_with(|slot| {
+        slot.model_bump.reset();
+        slot.step_bump.reset();
+        slot.registration.write(init(&mut slot.model_bump));
+      })
+      .expect("insert_with_action on a full store");
+    // SAFETY: `allocate_with` returned, so `init` wrote the registration.
+    let registration = unsafe { slot.registration.assume_init_mut() };
     let action = registration.action();
     (key.as_u64(), action, &mut slot.step_bump)
   }
 
   /// Removes an operation from the store.
+  ///
+  /// The registration is moved out and its slot released before it is
+  /// dropped, so a panicking destructor (user model, callback) cannot leave
+  /// an occupied slot around a dropped registration. Its arenas are reset
+  /// when the slot is next allocated, which keeps them valid for the drop.
   #[inline]
   pub fn remove(&mut self, id: u64) -> bool {
     let key = SlabKey::from_u64(id);
     self
       .slots
       .remove_with(key, |slot| {
-        // SAFETY: occupied slots always contain an initialized registration.
-        unsafe { slot.registration.assume_init_drop() };
-        slot.model_bump.reset();
-        slot.step_bump.reset();
+        // SAFETY: occupied slots always contain an initialized registration,
+        // and the slot no longer counts as initialized once this returns.
+        unsafe { slot.registration.assume_init_read() }
       })
+      .map(drop)
       .is_some()
   }
 
   /// Removes an operation whose ID was already validated by `get_mut` under
-  /// the same exclusive store borrow.
+  /// the same exclusive store borrow. Drops it as [`remove`](Self::remove)
+  /// does.
   #[inline]
   pub fn remove_known(&mut self, id: u64) {
     let key = SlabKey::from_u64(id);
-    self.slots.remove_known_with(key, |slot| {
-      // SAFETY: occupied slots always contain an initialized registration.
-      unsafe { slot.registration.assume_init_drop() };
+    let registration = self.slots.remove_known_with(key, |slot| {
+      // SAFETY: as in `remove`.
+      unsafe { slot.registration.assume_init_read() }
     });
+    drop(registration);
   }
 
   /// Gets mutable access to an operation's registration.
@@ -153,6 +166,21 @@ impl OpStore {
     let key = SlabKey::from_u64(id);
     let slot = self.slots.get_mut(key)?;
     Some(&mut slot.step_bump)
+  }
+}
+
+impl Drop for OpStore {
+  /// Drops the registrations still in the store: their buffers, resources
+  /// and callbacks. Runs before the slots' arenas, which they point into.
+  ///
+  /// The driver only lets this run once its backend reported that no
+  /// operation can touch this memory any more; otherwise it leaks the store.
+  fn drop(&mut self) {
+    self.slots.for_each_occupied(|slot| {
+      // SAFETY: occupied slots always contain an initialized registration,
+      // and the store is never used again.
+      unsafe { slot.registration.assume_init_drop() };
+    });
   }
 }
 
@@ -270,6 +298,59 @@ mod tests {
       store.insert_with(dummy_stored_op);
     }));
     assert!(result.is_err());
+  }
+
+  #[test]
+  fn panicking_init_leaves_the_slot_free() {
+    let mut store = OpStore::with_capacity(1);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      store.insert_with(|_| panic!("init"))
+    }));
+    assert!(result.is_err());
+    assert!(!store.is_full(), "the slot was never claimed");
+    let id = store.insert_with(dummy_stored_op);
+    assert!(store.remove(id));
+  }
+
+  /// Panics when dropped.
+  struct PanicOnDrop;
+
+  impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+      panic!("drop");
+    }
+  }
+
+  #[test]
+  fn panicking_drop_on_remove_still_releases_the_slot() {
+    let mut store = OpStore::with_capacity(1);
+    let id = store.insert_with(|arena| {
+      let bomb = PanicOnDrop;
+      Registration::new_callback_in(
+        arena,
+        move |_| {
+          let _ = &bomb;
+        },
+        Nop,
+      )
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      store.remove(id)
+    }));
+    assert!(result.is_err());
+    assert!(store.get_mut(id).is_none(), "the stale id no longer resolves");
+    assert!(!store.is_full(), "the slot is free again");
+  }
+
+  #[test]
+  fn dropping_the_store_drops_its_registrations() {
+    let (tx, rx) = mpsc::channel::<std::io::Result<()>>();
+    let mut store = OpStore::new();
+    store.insert_with(|arena| {
+      Registration::new_waker_in(arena, dummy_waker(), tx, Nop)
+    });
+    drop(store);
+    assert!(rx.recv().is_err(), "the registration's sender was dropped");
   }
 
   #[test]

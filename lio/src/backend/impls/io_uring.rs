@@ -543,7 +543,7 @@ struct IoUringProfile {
 
 impl Drop for IoUring {
   fn drop(&mut self) {
-    self.drain();
+    self.drain_in_flight();
     let Some(profile) = &self.profile else {
       return;
     };
@@ -631,9 +631,11 @@ impl IoUring {
   /// completions. Closing the ring alone does not wait: a request running on
   /// an io-wq worker (blocking file or pipe I/O) could still write into op
   /// memory after its owner freed it.
-  fn drain(&mut self) {
+  ///
+  /// Returns whether nothing is left in the kernel.
+  fn drain_in_flight(&mut self) -> bool {
     if self.ring.is_none() || self.in_flight == 0 {
-      return;
+      return true;
     }
     let keys: Vec<SlabKey> = self.pending.keys_where(|_| true).collect();
     for key in keys {
@@ -673,7 +675,9 @@ impl IoUring {
       // Some request outlived the grace period. Keep the state it points
       // into alive rather than free it under the kernel.
       mem::forget(mem::replace(&mut self.pending, Slab::new(0)));
+      return false;
     }
+    true
   }
 
   #[inline]
@@ -1548,6 +1552,10 @@ impl IoBackend for IoUring {
     if unsafe { ring.push(entry, CANCEL_USER_DATA) }.is_ok() {
       self.needs_submit = true;
     }
+  }
+
+  fn drain(&mut self) -> bool {
+    self.drain_in_flight()
   }
 
   fn wait(

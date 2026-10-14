@@ -9,6 +9,7 @@ use std::{
   cell::{RefCell, RefMut},
   collections::VecDeque,
   io,
+  mem::ManuallyDrop,
   rc::Rc,
   task::Waker,
   time::{Duration, Instant},
@@ -74,11 +75,11 @@ pub(crate) fn get_global() -> Option<Lio> {
 }
 
 struct LioInner {
-  // Field order is drop order: the backend must shut down (finishing or
-  // cancelling in-flight work) before `store` frees the buffers that work
-  // still points into.
-  io: Box<dyn IoBackend>,
-  store: OpStore,
+  // Dropped by hand in `Drop`: the backend must drain in-flight work before
+  // `store` frees the memory that work points into, and both are leaked
+  // when it cannot.
+  io: ManuallyDrop<Box<dyn IoBackend>>,
+  store: ManuallyDrop<OpStore>,
   /// The backend's close for resources its completions carry.
   resource_close: crate::api::resource::CloseFn,
   time: TimeManager,
@@ -162,6 +163,19 @@ macro_rules! timed {
 
 impl Drop for LioInner {
   fn drop(&mut self) {
+    if self.io.drain() {
+      // SAFETY: neither field is used again. The backend goes first: it may
+      // still hold `Op`s pointing into the store.
+      unsafe {
+        ManuallyDrop::drop(&mut self.io);
+        ManuallyDrop::drop(&mut self.store);
+      }
+    }
+    // Otherwise an operation may still be running in the kernel or on a
+    // backend thread, writing into buffers and lowered state owned by the
+    // store. Leaking both keeps that memory valid, and keeps the backend
+    // from waiting again in its own `Drop`.
+
     let Some(profile) = &self.profile else {
       return;
     };
@@ -259,8 +273,8 @@ impl Lio {
 
     let inner = LioInner {
       resource_close: backend.resource_close(),
-      io: Box::new(backend),
-      store: OpStore::with_capacity(cap),
+      io: ManuallyDrop::new(Box::new(backend)),
+      store: ManuallyDrop::new(OpStore::with_capacity(cap)),
       time: TimeManager::with_capacity(cap),
       completed: Vec::with_capacity(cap),
       ready_io: VecDeque::with_capacity(cap),

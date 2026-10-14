@@ -83,19 +83,33 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
 
   #[inline]
   pub(crate) fn allocate(&mut self) -> Option<(SlabKey, &mut T)> {
-    let slot_idx = if self.free_head != u32::MAX {
-      let slot_idx = self.free_head;
-      self.free_head = self.slots[slot_idx as usize].next_free;
-      slot_idx
-    } else {
-      if self.next_slot >= self.capacity {
-        return None;
-      }
-      let slot_idx = self.next_slot;
-      self.next_slot += 1;
-      slot_idx
-    };
+    self.allocate_with(|_| {})
+  }
 
+  /// Allocates a slot after `init` has prepared its state.
+  ///
+  /// The slot is only marked occupied once `init` returns, so a panicking
+  /// `init` leaves the pool unchanged instead of holding an occupied slot
+  /// whose state was never initialized.
+  #[inline]
+  pub(crate) fn allocate_with(
+    &mut self,
+    init: impl FnOnce(&mut T),
+  ) -> Option<(SlabKey, &mut T)> {
+    let slot_idx = if self.free_head != u32::MAX {
+      self.free_head
+    } else if self.next_slot < self.capacity {
+      self.next_slot
+    } else {
+      return None;
+    };
+    init(&mut self.slots[slot_idx as usize].state);
+
+    if self.free_head == slot_idx {
+      self.free_head = self.slots[slot_idx as usize].next_free;
+    } else {
+      self.next_slot += 1;
+    }
     let slot = &mut self.slots[slot_idx as usize];
     debug_assert!(!slot.occupied);
     slot.occupied = true;
@@ -116,6 +130,11 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     }
   }
 
+  /// Removes the slot `key` names, handing its state to `on_remove`.
+  ///
+  /// `on_remove` runs before the slot is released, so it must not panic.
+  /// Move the value out and drop it after this returns: a destructor that
+  /// panicked here would leave the slot occupied around a dropped value.
   #[inline]
   pub(crate) fn remove_with<R>(
     &mut self,
@@ -139,7 +158,8 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
   }
 
   /// Removes a slot whose generational key was already validated under the
-  /// same exclusive pool borrow.
+  /// same exclusive pool borrow. `on_remove` must not panic, as for
+  /// [`remove_with`](Self::remove_with).
   #[inline]
   pub(crate) fn remove_known_with<R>(
     &mut self,
@@ -171,6 +191,15 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
   #[inline]
   pub(crate) fn len(&self) -> usize {
     self.len as usize
+  }
+
+  /// Calls `f` on the state of every occupied slot.
+  pub(crate) fn for_each_occupied(&mut self, mut f: impl FnMut(&mut T)) {
+    for slot in &mut self.slots[..self.next_slot as usize] {
+      if slot.occupied {
+        f(&mut slot.state);
+      }
+    }
   }
 }
 
@@ -218,13 +247,8 @@ impl<T> Slab<T> {
   /// Returns `true` if removed, `false` if key was invalid or stale.
   #[inline]
   pub fn remove(&mut self, key: SlabKey) -> bool {
-    self
-      .pool
-      .remove_with(key, |slot| {
-        // SAFETY: occupied slots always contain an initialized value.
-        unsafe { slot.assume_init_drop() };
-      })
-      .is_some()
+    // Drop the value only once its slot is released.
+    self.remove_value(key).is_some()
   }
 
   /// Remove a value by key and return it.
