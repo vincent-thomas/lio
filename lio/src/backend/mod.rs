@@ -191,7 +191,44 @@ impl OpCompleted {
 /// backend.flush()?;                       // Submit to kernel
 /// let done = backend.wait(timeout)?;      // Get completions
 /// ```
-pub trait IoBackend {
+///
+/// # Safety
+///
+/// The driver hands each completion's result to the operation's
+/// [`OpModel`](crate::api::op::OpModel), which trusts it: a read's byte count
+/// is taken as the number of bytes now initialized in its buffers, a
+/// non-negative result of an operation that produces a descriptor is taken
+/// as a fresh descriptor the operation now owns, and output written through
+/// an `Op`'s pointers is read back. Implementations must therefore report
+/// exactly what the operation did (or a negated error code), report each
+/// operation exactly once, and never access an `Op`'s memory after reporting
+/// it or after [`cancel`](Self::cancel) has led to its completion.
+///
+/// A safe implementation is rejected:
+///
+/// ```compile_fail,E0200
+/// use lio::backend::{IoBackend, OpCompleted, op::Op};
+///
+/// struct Backend;
+///
+/// impl IoBackend for Backend {
+///   fn init(&mut self, _: usize) -> std::io::Result<()> {
+///     Ok(())
+///   }
+///   fn push(&mut self, _: u64, _: Op, _: &mut bumpalo::Bump) {}
+///   fn flush(&mut self) -> std::io::Result<()> {
+///     Ok(())
+///   }
+///   fn wait(
+///     &mut self,
+///     _: Option<std::time::Duration>,
+///     _: &mut Vec<OpCompleted>,
+///   ) -> std::io::Result<()> {
+///     Ok(())
+///   }
+/// }
+/// ```
+pub unsafe trait IoBackend {
   /// Initialize backend with capacity for `cap` concurrent operations.
   ///
   /// Pre-allocates all resources for zero-allocation runtime.

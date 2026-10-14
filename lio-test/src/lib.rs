@@ -176,8 +176,8 @@ macro_rules! test_io_backend {
       IoBackend,
       op::{
         FileMode, FileStat, LinkKind, MsgBuf, MsgBufMut, MsgRecv, MsgSend,
-        Op, OpenFlags, RawBuf, ReadFlags, RecvFlags, SendFlags, SpawnSpec,
-        UnlinkKind, WriteFlags,
+        Op, OpPtr, OpenFlags, RawBuf, ReadFlags, RecvFlags, SendFlags,
+        SpawnSpec, UnlinkKind, WriteFlags,
       },
     };
     use std::ptr::NonNull;
@@ -198,12 +198,39 @@ macro_rules! test_io_backend {
       });
     }
 
-    fn nonnull<T>(ptr: *mut T) -> NonNull<T> {
-      NonNull::new(ptr).expect("test pointer must be non-null")
+    // Every contract test keeps the memory an op describes alive, and does
+    // not otherwise touch what the op writes, until the op has completed or
+    // the backend has been dropped: what `OpPtr` requires.
+
+    fn op_ptr<T>(ptr: NonNull<T>) -> OpPtr<T> {
+      // SAFETY: see the test invariant above.
+      unsafe { OpPtr::new(ptr) }
     }
 
-    fn nonnull_const<T>(ptr: *const T) -> NonNull<T> {
-      NonNull::new(ptr.cast_mut()).expect("test pointer must be non-null")
+    fn nonnull<T>(ptr: *mut T) -> OpPtr<T> {
+      op_ptr(NonNull::new(ptr).expect("test pointer must be non-null"))
+    }
+
+    fn nonnull_const<T>(ptr: *const T) -> OpPtr<T> {
+      op_ptr(NonNull::new(ptr.cast_mut()).expect("test pointer must be non-null"))
+    }
+
+    fn recv_message(bufs: &[MsgBufMut]) -> MsgRecv {
+      // SAFETY: see the test invariant above.
+      unsafe { MsgRecv::new(bufs) }
+    }
+
+    fn recv_message_from(
+      bufs: &[MsgBufMut],
+      from: NonNull<__lio_test_lio::backend::op::SocketAddrBuf>,
+    ) -> MsgRecv {
+      // SAFETY: see the test invariant above.
+      unsafe { MsgRecv::with_from(bufs, from) }
+    }
+
+    fn send_message(bufs: &[MsgBuf], to: Option<std::net::SocketAddr>) -> MsgSend {
+      // SAFETY: see the test invariant above.
+      unsafe { MsgSend::new(bufs, to) }
     }
 
     fn raw_buf_from_mut_slice(buf: &mut [u8]) -> RawBuf {
@@ -908,7 +935,7 @@ macro_rules! test_io_backend {
         let bufs = [MsgBufMut::from_slice(&mut buf)];
         push_op(&mut backend,
           97,
-          Op::Recv { fd: read_res.clone(), msg: MsgRecv::new(&bufs), flags: recv_flags(0) },
+          Op::Recv { fd: read_res.clone(), msg: recv_message(&bufs), flags: recv_flags(0) },
         );
         backend.flush().unwrap();
         assert!(
@@ -943,7 +970,7 @@ macro_rules! test_io_backend {
         let bufs = [MsgBufMut::from_slice(&mut buf)];
         push_op(&mut backend,
           98,
-          Op::Recv { fd: read_res.clone(), msg: MsgRecv::new(&bufs), flags: recv_flags(0) },
+          Op::Recv { fd: read_res.clone(), msg: recv_message(&bufs), flags: recv_flags(0) },
         );
         backend.cancel(98);
         backend.flush().unwrap();
@@ -1546,7 +1573,7 @@ macro_rules! test_io_backend {
             id,
             Op::Recv {
               fd: read_res.clone(),
-              msg: MsgRecv::new(&bufs),
+              msg: recv_message(&bufs),
               flags: recv_flags(0),
             },
           );
@@ -1577,7 +1604,7 @@ macro_rules! test_io_backend {
           56,
           Op::Recv {
             fd: read_res.clone(),
-            msg: MsgRecv::new(&bufs),
+            msg: recv_message(&bufs),
             flags: recv_flags(0),
           },
         );
@@ -1610,7 +1637,7 @@ macro_rules! test_io_backend {
             id,
             Op::Recv {
               fd: read_res.clone(),
-              msg: MsgRecv::new(&bufs),
+              msg: recv_message(&bufs),
               flags: recv_flags(0),
             },
           );
@@ -1642,7 +1669,7 @@ macro_rules! test_io_backend {
           561,
           Op::Recv {
             fd: read_res.clone(),
-            msg: MsgRecv::new(&bufs),
+            msg: recv_message(&bufs),
             flags: recv_flags(0),
           },
         );
@@ -1695,7 +1722,7 @@ macro_rules! test_io_backend {
             id,
             Op::Recv {
               fd: read_res.clone(),
-              msg: MsgRecv::new(&bufs),
+              msg: recv_message(&bufs),
               flags: recv_flags(0),
             },
           );
@@ -1727,7 +1754,7 @@ macro_rules! test_io_backend {
           57,
           Op::Recv {
             fd: read_res.clone(),
-            msg: MsgRecv::new(&bufs),
+            msg: recv_message(&bufs),
             flags: recv_flags(0),
           },
         );
@@ -1750,7 +1777,7 @@ macro_rules! test_io_backend {
           49,
           Op::Recv {
             fd: invalid_fd_resource(),
-            msg: MsgRecv::new(&bufs),
+            msg: recv_message(&bufs),
             flags: recv_flags(0),
           },
         );
@@ -1780,7 +1807,7 @@ macro_rules! test_io_backend {
             id,
             Op::Send {
               fd: write_res.clone(),
-              msg: MsgSend::new(&bufs, None),
+              msg: send_message(&bufs, None),
               flags: send_flags(0),
             },
           );
@@ -1824,7 +1851,7 @@ macro_rules! test_io_backend {
             id,
             Op::Send {
               fd: write_res.clone(),
-              msg: MsgSend::new(&bufs, None),
+              msg: send_message(&bufs, None),
               flags: send_flags(0),
             },
           );
@@ -1858,7 +1885,7 @@ macro_rules! test_io_backend {
           50,
           Op::Send {
             fd: invalid_fd_resource(),
-            msg: MsgSend::new(&bufs, None),
+            msg: send_message(&bufs, None),
             flags: send_flags(0),
           },
         );
@@ -1886,7 +1913,7 @@ macro_rules! test_io_backend {
           52,
           Op::Accept {
             fd: listener_res,
-            addr: NonNull::from(&mut storage),
+            addr: op_ptr(NonNull::from(&mut storage)),
           },
         );
         backend.flush().unwrap();
@@ -1919,7 +1946,7 @@ macro_rules! test_io_backend {
           58,
           Op::Accept {
             fd: listener_res,
-            addr: NonNull::from(&mut storage),
+            addr: op_ptr(NonNull::from(&mut storage)),
           },
         );
         backend.flush().unwrap();
@@ -1955,7 +1982,7 @@ macro_rules! test_io_backend {
           51,
           Op::Accept {
             fd: invalid_fd_resource(),
-            addr: NonNull::from(&mut storage),
+            addr: op_ptr(NonNull::from(&mut storage)),
           },
         );
         backend.flush().unwrap();

@@ -1,6 +1,6 @@
 use super::*;
 use crate::api::resource::Resource;
-use crate::backend::op::{RawBuf, ReadFlags};
+use crate::backend::op::{OpPtr, RawBuf, ReadFlags};
 use std::os::fd::{FromRawFd, IntoRawFd};
 
 mod contract {
@@ -88,7 +88,8 @@ fn trace_read_batches() {
     inner: IoUring,
     stats: Rc<RefCell<Stats>>,
   }
-  impl IoBackend for Observed {
+  // SAFETY: forwards every call to `IoUring`, reporting its results as is.
+  unsafe impl IoBackend for Observed {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
@@ -262,7 +263,8 @@ fn nonblocking_waits_make_progress_on_file_completions() {
       id as u64,
       Op::Read {
         fd: file.clone(),
-        iovecs: NonNull::from(raw),
+        // SAFETY: the buffers outlive every read, all of which complete below.
+        iovecs: unsafe { OpPtr::new(NonNull::from(raw)) },
         iov_count: 1,
         offset: 0,
         flags: ReadFlags::EMPTY,
@@ -310,7 +312,8 @@ fn drop_waits_for_operations_in_the_kernel() {
     1,
     Op::Read {
       fd: reader.clone(),
-      iovecs: NonNull::from(&raw),
+      // SAFETY: `raw` and `buf` outlive the backend, which is dropped below.
+      iovecs: unsafe { OpPtr::new(NonNull::from(&raw)) },
       iov_count: 1,
       offset: -1,
       flags: ReadFlags::EMPTY,

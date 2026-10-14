@@ -22,7 +22,8 @@ struct InOrderBackend {
   queued: Vec<u64>,
 }
 
-impl IoBackend for InOrderBackend {
+// SAFETY: the tests submit only no-ops; each is reported once with 0 and no op memory is touched.
+unsafe impl IoBackend for InOrderBackend {
   fn init(&mut self, _cap: usize) -> std::io::Result<()> {
     Ok(())
   }

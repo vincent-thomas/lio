@@ -21,10 +21,10 @@ use crate::{
     resource::Resource,
   },
   backend::op::{
-    FileMode, FileStat, MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, OpenFlags,
-    RawBuf, ReadDirBuf, ReadFlags, RecvFlags, SendFlags, ShutdownHow,
-    SockDomain, SockProto, SockType, SocketAddrBuf, StatTarget, UnlinkKind,
-    WriteFlags, socket_addr_from_buf, socket_addr_into_buf,
+    FileMode, FileStat, MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, OpPtr,
+    OpenFlags, RawBuf, ReadDirBuf, ReadFlags, RecvFlags, SendFlags,
+    ShutdownHow, SockDomain, SockProto, SockType, SocketAddrBuf, StatTarget,
+    UnlinkKind, WriteFlags, socket_addr_from_buf, socket_addr_into_buf,
   },
   buf::MAX_IOV_COUNT,
 };
@@ -196,7 +196,8 @@ impl OpModel for Accept {
   fn action(&mut self) -> Action {
     Action::Io(Op::Accept {
       fd: self.res.clone(),
-      addr: NonNull::from(&mut self.addr),
+      // SAFETY: `addr` is a field of this model; the driver keeps this model in place until the op completes.
+      addr: unsafe { OpPtr::new(NonNull::from(&mut self.addr)) },
     })
   }
 
@@ -601,7 +602,9 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
 
     Action::Io(Op::Read {
       fd: self.res.clone(),
-      iovecs: NonNull::from(&mut self.raws[0]),
+      // SAFETY: `raws` is a field of this model describing regions of the
+      // buffer it owns; the driver keeps this model in place until the op completes.
+      iovecs: unsafe { OpPtr::new(NonNull::from(&mut self.raws[0])) },
       iov_count: self.iov_count,
       offset: self.offset,
       flags: ReadFlags::EMPTY,
@@ -741,7 +744,9 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
 
     Action::Io(Op::Write {
       fd: self.res.clone(),
-      iovecs: NonNull::from(&mut self.raws[0]),
+      // SAFETY: `raws` is a field of this model describing regions of the
+      // buffer it owns; the driver keeps this model in place until the op completes.
+      iovecs: unsafe { OpPtr::new(NonNull::from(&mut self.raws[0])) },
       iov_count: buf_count,
       offset: self.offset,
       flags: WriteFlags::EMPTY,
@@ -874,11 +879,15 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
     });
     self.iov_count = buf_count;
 
-    let msg = match self.from.as_mut() {
-      Some(addr) => {
-        MsgRecv::with_from(&self.bufs[..buf_count], NonNull::from(addr))
+    // SAFETY: `bufs` and `from` are fields of this model, and `bufs`
+    // describes regions of the buffer it owns; the driver keeps this model in place until the op completes.
+    let msg = unsafe {
+      match self.from.as_mut() {
+        Some(addr) => {
+          MsgRecv::with_from(&self.bufs[..buf_count], NonNull::from(addr))
+        }
+        None => MsgRecv::new(&self.bufs[..buf_count]),
       }
-      None => MsgRecv::new(&self.bufs[..buf_count]),
     };
 
     Action::Io(Op::Recv { fd: self.res.clone(), msg, flags: self.flags })
@@ -1132,7 +1141,9 @@ impl<B: IoBufVec + std::marker::Send + Sync> Send<B> {
       self.bufs[i] = MsgBuf::from_slice(buf.buf(i));
     }
 
-    MsgSend::new(&self.bufs[..buf_count], self.addr)
+    // SAFETY: `bufs` is a field of this model describing regions of the
+    // buffer it owns; the driver keeps this model in place until the op completes.
+    unsafe { MsgSend::new(&self.bufs[..buf_count], self.addr) }
   }
 }
 
@@ -1460,7 +1471,9 @@ impl OpModel for Stat {
       StatModelTarget::Fd { fd } => StatTarget::Fd { fd: fd.clone() },
       StatModelTarget::InvalidPath => return Action::Io(Op::Nop),
     };
-    Action::Io(Op::Stat { target, out: NonNull::from(&mut self.out) })
+    // SAFETY: `out` is a field of this model; the driver keeps this model in place until the op completes.
+    let out = unsafe { OpPtr::new(NonNull::from(&mut self.out)) };
+    Action::Io(Op::Stat { target, out })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -1492,17 +1505,23 @@ impl OpModel for ReadDir {
   type Item = std::io::Result<ReadDirBuf>;
 
   fn action(&mut self) -> Action {
-    Action::Io(Op::ReadDir {
-      fd: self.fd.clone(),
-      raw_buf: NonNull::new(self.buf.raw.as_mut_ptr()).expect("raw buffer"),
-      raw_cap: self.buf.raw.len(),
-      entries: NonNull::new(self.buf.entries.as_mut_ptr())
-        .expect("entry buffer"),
-      entries_cap: self.buf.entries.len(),
-      opaque: NonNull::from(&mut self.buf.opaque),
-      opaque_drop: NonNull::from(&mut self.buf.opaque_drop),
-      out: NonNull::from(&mut self.buf.result),
-    })
+    let buf = &mut self.buf;
+    let raw_buf = NonNull::new(buf.raw.as_mut_ptr()).expect("raw buffer");
+    let entries = NonNull::new(buf.entries.as_mut_ptr()).expect("entry buffer");
+    // SAFETY: every pointer is into `buf`, which this model owns, with the
+    // stated capacities; the driver keeps this model in place until the op completes.
+    unsafe {
+      Action::Io(Op::ReadDir {
+        fd: self.fd.clone(),
+        raw_buf: OpPtr::new(raw_buf),
+        raw_cap: buf.raw.len(),
+        entries: OpPtr::new(entries),
+        entries_cap: buf.entries.len(),
+        opaque: OpPtr::new(NonNull::from(&mut buf.opaque)),
+        opaque_drop: OpPtr::new(NonNull::from(&mut buf.opaque_drop)),
+        out: OpPtr::new(NonNull::from(&mut buf.result)),
+      })
+    }
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -1915,7 +1934,9 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
     Action::Io(Op::ReadlinkAt {
       dir_fd: self.dir_res.clone(),
       path: cstring_to_osstring(&self.pathname),
-      buf: ptr,
+      // SAFETY: `ptr` is a region of the buffer this model owns, writable for
+      // `raw_len` bytes; the driver keeps this model in place until the op completes.
+      buf: unsafe { OpPtr::new(ptr) },
       buf_len: self.raw_len,
     })
   }
@@ -1955,7 +1976,9 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
   type Item = BufResult<i32, B>;
 
   fn action(&mut self) -> Action {
-    Action::Io(Op::GetCwd { out: NonNull::from(&mut self.out) })
+    // SAFETY: `out` is a field of this model; the driver keeps this model in place until the op completes.
+    let out = unsafe { OpPtr::new(NonNull::from(&mut self.out)) };
+    Action::Io(Op::GetCwd { out })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {

@@ -58,7 +58,7 @@ use crate::backend::impls::sockaddr::{
 };
 use crate::backend::native::CWD as CWD_HANDLE;
 use crate::backend::op::{
-  DirEntryRef, FileStat, FileType, LinkKind, MsgRecv, MsgSend, Op,
+  DirEntryRef, FileStat, FileType, LinkKind, MsgRecv, MsgSend, Op, OpPtr,
   OpaqueDropFn, OpenFlags, RawBuf, ReadDirResult, ShutdownHow, SocketAddrBuf,
   SocketAddrFamily, SpawnSpec, StatTarget, UnlinkKind,
 };
@@ -436,7 +436,8 @@ impl Iocp {
           return Some(code);
         }
         let bufs = recv_bufs(&msg);
-        self.start_recv(id, &fd, bufs, flags.bits() as u32, msg.from)
+        let from = msg.from.map(OpPtr::as_non_null);
+        self.start_recv(id, &fd, bufs, flags.bits() as u32, from)
       }
       Op::Send { fd, msg, flags } => {
         let socket = socket_of(&fd);
@@ -446,7 +447,7 @@ impl Iocp {
         let bufs = send_bufs(&msg);
         self.start_send(id, &fd, bufs, flags.bits() as u32, msg.to)
       }
-      Op::Accept { fd, addr } => self.start_accept(id, &fd, addr),
+      Op::Accept { fd, addr } => self.start_accept(id, &fd, addr.as_non_null()),
       Op::Connect { fd, addr } => self.start_connect(id, &fd, &addr),
       Op::Socket { domain, ty, proto } => {
         Some(match socket_to_raw(domain, ty, proto) {
@@ -949,7 +950,8 @@ impl Drop for Iocp {
   }
 }
 
-impl IoBackend for Iocp {
+// SAFETY: each result is what the kernel or the blocking worker reported for that op, once; op memory is released only after its packet is dequeued.
+unsafe impl IoBackend for Iocp {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     ensure_wsa()?;
     // SAFETY: creating a fresh completion port.

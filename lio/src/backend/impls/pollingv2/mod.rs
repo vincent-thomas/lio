@@ -397,7 +397,7 @@ impl Poller {
   }
 
   fn lower_raw_iovecs(
-    iovecs: std::ptr::NonNull<crate::backend::op::RawBuf>,
+    iovecs: crate::backend::op::OpPtr<crate::backend::op::RawBuf>,
     iov_count: usize,
   ) -> Option<[libc::iovec; crate::buf::MAX_IOV_COUNT]> {
     // SAFETY: `iovecs` points to `iov_count` valid `RawBuf` entries.
@@ -1157,7 +1157,8 @@ impl Poller {
   }
 }
 
-impl IoBackend for Poller {
+// SAFETY: each result is the return value of the syscall run for that op, reported once; ops are not touched after they are reported.
+unsafe impl IoBackend for Poller {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.sys = Some(sys::OsPoller::new()?);
     self.events = Events::with_capacity(cap.min(4096));

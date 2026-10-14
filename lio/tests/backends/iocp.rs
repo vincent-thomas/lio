@@ -32,7 +32,10 @@ fn drop_cancels_a_blocked_pipe_read() {
     1,
     Op::Read {
       fd: reader,
-      iovecs: std::ptr::NonNull::from(&mut raw),
+      // SAFETY: `raw` and `buf` outlive the backend, which is dropped below.
+      iovecs: unsafe {
+        lio::backend::op::OpPtr::new(std::ptr::NonNull::from(&mut raw))
+      },
       iov_count: 1,
       offset: -1,
       flags: ReadFlags::from_bits(0).unwrap(),

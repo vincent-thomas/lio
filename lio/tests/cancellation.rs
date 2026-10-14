@@ -33,7 +33,8 @@ struct Held {
 #[derive(Clone, Default)]
 struct HoldingBackend(Rc<RefCell<Held>>);
 
-impl IoBackend for HoldingBackend {
+// SAFETY: the tests submit only pointer-free ops and report each once, with results the models here accept; no op memory is touched.
+unsafe impl IoBackend for HoldingBackend {
   fn init(&mut self, _cap: usize) -> std::io::Result<()> {
     Ok(())
   }
@@ -76,7 +77,7 @@ impl OpModel for Tracked {
 
   fn complete(&mut self, completion: Completion) -> OpResult<isize> {
     self.completions.fetch_add(1, Ordering::SeqCst);
-    OpResult::Done(completion.result)
+    OpResult::Done(completion.result())
   }
 }
 

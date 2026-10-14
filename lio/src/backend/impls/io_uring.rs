@@ -75,7 +75,7 @@ impl NativeMsgState {
         crate::buf::MAX_IOV_COUNT],
       iov_count: bufs.len(),
       addr: None,
-      from_out: msg.from,
+      from_out: msg.from.map(crate::backend::op::OpPtr::as_non_null),
       // SAFETY: `libc::msghdr` is a plain C struct and zero is a valid
       // sentinel initialization before we fill its pointer fields.
       hdr: unsafe { mem::zeroed() },
@@ -299,12 +299,12 @@ impl LoweredState {
   fn lower_in(op: &Op, arena: &Bump, single_socket: bool) -> io::Result<Self> {
     Ok(match op {
       Op::Read { iovecs, iov_count, .. } => {
-        let state = NativeRwState::from_raws(*iovecs, *iov_count)
+        let state = NativeRwState::from_raws(iovecs.as_non_null(), *iov_count)
           .expect("validated read op must have iovecs");
         Self::Rw(NonNull::from(arena.alloc(state)))
       }
       Op::Write { iovecs, iov_count, .. } => {
-        let state = NativeRwState::from_raws(*iovecs, *iov_count)
+        let state = NativeRwState::from_raws(iovecs.as_non_null(), *iov_count)
           .expect("validated read/write op must have iovecs");
         Self::Rw(NonNull::from(arena.alloc(state)))
       }
@@ -339,7 +339,7 @@ impl LoweredState {
         Self::Msg(NonNull::from(arena.alloc(state)))
       }
       Op::Accept { addr, .. } => Self::Socket(NonNull::from(
-        arena.alloc(NativeSocketState::from_accept(*addr)),
+        arena.alloc(NativeSocketState::from_accept(addr.as_non_null())),
       )),
       // The kernel copies the address at submission time, so it has to live
       // in the arena rather than on the stack of `create_entry`.
@@ -350,10 +350,10 @@ impl LoweredState {
         let state = match target {
           crate::backend::op::StatTarget::Path { path, .. } => {
             let path_cstr = Self::os_path_to_cstring(path)?;
-            NativeStatState::with_path(*out, path_cstr)
+            NativeStatState::with_path(out.as_non_null(), path_cstr)
           }
           crate::backend::op::StatTarget::Fd { .. } => {
-            NativeStatState::new(*out)
+            NativeStatState::new(out.as_non_null())
           }
         };
         Self::Stat(NonNull::from(arena.alloc(state)))
@@ -1327,7 +1327,8 @@ impl IoUring {
   }
 }
 
-impl IoBackend for IoUring {
+// SAFETY: each result is the kernel's CQE result for that op, reported once; the op's memory is released only after its CQE.
+unsafe impl IoBackend for IoUring {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.ring = Some(if self.deferred_completions {
       Self::create_ring_with(cap as u32, LioUring::with_params)?

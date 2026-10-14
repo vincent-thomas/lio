@@ -6,6 +6,27 @@ use crate::backend::op::{
 use std::net::UdpSocket;
 use std::os::fd::{FromRawFd, IntoRawFd};
 
+// Every test completes an op before the buffers it describes go out of
+// scope, which is what `OpPtr` requires.
+
+fn recv_message(bufs: &[MsgBufMut]) -> MsgRecv {
+  // SAFETY: see the test invariant above.
+  unsafe { MsgRecv::new(bufs) }
+}
+
+fn recv_message_from(
+  bufs: &[MsgBufMut],
+  from: NonNull<SocketAddrBuf>,
+) -> MsgRecv {
+  // SAFETY: see the test invariant above.
+  unsafe { MsgRecv::with_from(bufs, from) }
+}
+
+fn send_message(bufs: &[MsgBuf], to: Option<std::net::SocketAddr>) -> MsgSend {
+  // SAFETY: see the test invariant above.
+  unsafe { MsgSend::new(bufs, to) }
+}
+
 fn pair() -> (Resource, UdpSocket) {
   let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
   let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -43,7 +64,7 @@ fn lowering_selects_single_buffers_without_arena_allocation() {
   let recv = [MsgBufMut::from_slice(&mut data)];
   let op = Op::Recv {
     fd: fd.clone(),
-    msg: MsgRecv::new(&recv),
+    msg: recv_message(&recv),
     flags: RecvFlags::from_bits(0).unwrap(),
   };
   assert!(matches!(
@@ -53,7 +74,7 @@ fn lowering_selects_single_buffers_without_arena_allocation() {
   let send = [MsgBuf::from_slice(&data)];
   let op = Op::Send {
     fd,
-    msg: MsgSend::new(&send, None),
+    msg: send_message(&send, None),
     flags: SendFlags::from_bits(0).unwrap(),
   };
   assert!(matches!(
@@ -76,7 +97,7 @@ fn lowering_preserves_general_path_and_unsupported_kernel_fallback() {
   ] {
     let op = Op::Send {
       fd: fd.clone(),
-      msg: MsgSend::new(bufs, to),
+      msg: send_message(bufs, to),
       flags: SendFlags::from_bits(0).unwrap(),
     };
     assert!(matches!(
@@ -89,7 +110,7 @@ fn lowering_preserves_general_path_and_unsupported_kernel_fallback() {
   let mut from = SocketAddrBuf::unspecified();
   let op = Op::Recv {
     fd: fd.clone(),
-    msg: MsgRecv::with_from(&recv, NonNull::from(&mut from)),
+    msg: recv_message_from(&recv, NonNull::from(&mut from)),
     flags: RecvFlags::from_bits(0).unwrap(),
   };
   assert!(matches!(
@@ -98,7 +119,7 @@ fn lowering_preserves_general_path_and_unsupported_kernel_fallback() {
   ));
   let op = Op::Recv {
     fd,
-    msg: MsgRecv::new(&recv),
+    msg: recv_message(&recv),
     flags: RecvFlags::from_bits(0).unwrap(),
   };
   assert!(matches!(
@@ -117,7 +138,7 @@ fn oversized_buffers_are_not_truncated_to_u32() {
   let bufs = [MsgBuf { ptr: NonNull::dangling(), len }];
   let op = Op::Send {
     fd: fd.clone(),
-    msg: MsgSend::new(&bufs, None),
+    msg: send_message(&bufs, None),
     flags: SendFlags::from_bits(0).unwrap(),
   };
   assert!(matches!(
@@ -127,7 +148,7 @@ fn oversized_buffers_are_not_truncated_to_u32() {
   let bufs = [MsgBufMut { ptr: NonNull::dangling(), len }];
   let op = Op::Recv {
     fd,
-    msg: MsgRecv::new(&bufs),
+    msg: recv_message(&bufs),
     flags: RecvFlags::from_bits(0).unwrap(),
   };
   assert!(matches!(
@@ -152,7 +173,7 @@ fn udp_peek_truncation_and_zero_length_match_general_path() {
       let bufs = [MsgBufMut::from_slice(&mut data)];
       let op = Op::Recv {
         fd: fd.clone(),
-        msg: MsgRecv::new(&bufs),
+        msg: recv_message(&bufs),
         flags: RecvFlags::from_bits(flags).unwrap(),
       };
       assert_eq!(complete(&mut backend, &mut arena, op), expected);
@@ -162,7 +183,7 @@ fn udp_peek_truncation_and_zero_length_match_general_path() {
     let bufs = [MsgBuf::from_slice(&[])];
     let op = Op::Send {
       fd: fd.clone(),
-      msg: MsgSend::new(&bufs, None),
+      msg: send_message(&bufs, None),
       flags: SendFlags::from_bits(0).unwrap(),
     };
     assert_eq!(complete(&mut backend, &mut arena, op), 0);
@@ -172,7 +193,7 @@ fn udp_peek_truncation_and_zero_length_match_general_path() {
     let bufs = [MsgBufMut::from_slice(&mut empty)];
     let op = Op::Recv {
       fd,
-      msg: MsgRecv::new(&bufs),
+      msg: recv_message(&bufs),
       flags: RecvFlags::from_bits(0).unwrap(),
     };
     assert_eq!(complete(&mut backend, &mut arena, op), 0);

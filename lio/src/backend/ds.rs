@@ -27,6 +27,7 @@ use std::env;
 use std::fmt;
 use std::io;
 use std::mem;
+#[cfg(test)]
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::time::Duration;
@@ -37,9 +38,10 @@ use crate::api::resource::Resource;
 #[cfg(test)]
 use crate::backend::op::SendFlags;
 use crate::backend::op::{
-  self, DirEntryRef, FileStat, FileType, MsgRecv, MsgSend, Op, OpaqueDropFn,
-  OpenFlags, RawBuf, ReadDirResult, ReadFlags, RecvFlags, ShutdownHow,
-  SockDomain, SockProto, SockType, SocketAddrBuf, SocketAddrFamily, UnlinkKind,
+  self, DirEntryRef, FileStat, FileType, MsgRecv, MsgSend, Op, OpPtr,
+  OpaqueDropFn, OpenFlags, RawBuf, ReadDirResult, ReadFlags, RecvFlags,
+  ShutdownHow, SockDomain, SockProto, SockType, SocketAddrBuf,
+  SocketAddrFamily, UnlinkKind,
 };
 use crate::backend::{IoBackend, OpCompleted};
 use crate::{Lio, install_global};
@@ -364,13 +366,13 @@ enum ScheduledEvent {
 
 #[derive(Clone, Copy)]
 struct ReadDirTargets {
-  raw_buf: NonNull<u8>,
+  raw_buf: OpPtr<u8>,
   raw_cap: usize,
-  entries: NonNull<DirEntryRef>,
+  entries: OpPtr<DirEntryRef>,
   entries_cap: usize,
-  out: NonNull<ReadDirResult>,
-  opaque: NonNull<*mut ()>,
-  opaque_drop: NonNull<Option<OpaqueDropFn>>,
+  out: OpPtr<ReadDirResult>,
+  opaque: OpPtr<*mut ()>,
+  opaque_drop: OpPtr<Option<OpaqueDropFn>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1654,7 +1656,7 @@ impl DSBackend {
   }
 
   fn write_c_string_bytes(
-    buf: NonNull<u8>,
+    buf: OpPtr<u8>,
     buf_len: usize,
     bytes: &[u8],
   ) -> isize {
@@ -1677,7 +1679,7 @@ impl DSBackend {
     out.copy_from_slice(src);
   }
 
-  fn extract_iovec_bytes(iovecs: NonNull<RawBuf>, iov_count: usize) -> Vec<u8> {
+  fn extract_iovec_bytes(iovecs: OpPtr<RawBuf>, iov_count: usize) -> Vec<u8> {
     if iov_count == 0 {
       return Vec::new();
     }
@@ -1697,7 +1699,7 @@ impl DSBackend {
   }
 
   fn write_to_iovecs(
-    iovecs: NonNull<RawBuf>,
+    iovecs: OpPtr<RawBuf>,
     iov_count: usize,
     bytes: &[u8],
   ) -> usize {
@@ -2677,7 +2679,8 @@ impl DSBackend {
   }
 }
 
-impl IoBackend for DSBackend {
+// SAFETY: the simulation writes only the outputs it reports, reports each op once, and never touches an op after reporting it.
+unsafe impl IoBackend for DSBackend {
   fn resource_close(&self) -> crate::api::resource::CloseFn {
     close_simulated
   }
@@ -3355,7 +3358,7 @@ impl DSTBackend {
   fn process_network_read(
     node: &mut DSTNodeState,
     fd: &Resource,
-    iovecs: NonNull<RawBuf>,
+    iovecs: OpPtr<RawBuf>,
     iov_count: usize,
     offset: i64,
     flags: ReadFlags,
@@ -3433,7 +3436,7 @@ impl DSTBackend {
   fn process_network_accept(
     node: &mut DSTNodeState,
     fd: &Resource,
-    addr: NonNull<SocketAddrBuf>,
+    addr: OpPtr<SocketAddrBuf>,
   ) -> PendingAction {
     let raw = DSBackend::resource_key(fd);
     let Some(listener) = node.sockets.get_mut(&raw) else {
@@ -3987,7 +3990,8 @@ impl DSTBackend {
   }
 }
 
-impl IoBackend for DSTBackend {
+// SAFETY: the simulation writes only the outputs it reports, reports each op once, and never touches an op after reporting it.
+unsafe impl IoBackend for DSTBackend {
   fn resource_close(&self) -> crate::api::resource::CloseFn {
     close_simulated
   }
@@ -4094,6 +4098,27 @@ mod tests {
   use super::*;
   use crate::backend::op::{MsgBufMut, MsgRecv};
   use std::net::SocketAddr;
+
+  // Every test completes (or drops the backend holding) an op before the
+  // memory it describes goes out of scope, which is what `OpPtr` requires.
+
+  fn op_ptr<T>(ptr: NonNull<T>) -> OpPtr<T> {
+    // SAFETY: see the test invariant above.
+    unsafe { OpPtr::new(ptr) }
+  }
+
+  fn recv_message(bufs: &[MsgBufMut]) -> MsgRecv {
+    // SAFETY: see the test invariant above.
+    unsafe { MsgRecv::new(bufs) }
+  }
+
+  fn send_message(
+    bufs: &[crate::backend::op::MsgBuf],
+    to: Option<SocketAddr>,
+  ) -> MsgSend {
+    // SAFETY: see the test invariant above.
+    unsafe { MsgSend::new(bufs, to) }
+  }
 
   fn dst_test_socket(node: &Rc<RefCell<DSTNodeState>>, fd: i32) {
     let mut socket =
@@ -4266,7 +4291,7 @@ mod tests {
     let mut step_bump = Bump::new();
     backend.push(
       1,
-      Op::GetCwd { out: NonNull::from(&mut out) },
+      Op::GetCwd { out: op_ptr(NonNull::from(&mut out)) },
       &mut step_bump,
     );
     backend.flush().unwrap();
@@ -4294,7 +4319,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
-    let msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
+    let msg = recv_message(std::slice::from_mut(&mut msg_buf));
     let mut step_bump = Bump::new();
     backend.push(
       1,
@@ -4328,7 +4353,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
-    let msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
+    let msg = recv_message(std::slice::from_mut(&mut msg_buf));
     let mut step_bump = Bump::new();
     backend.push(
       1,
@@ -4384,7 +4409,7 @@ mod tests {
 
     let payload = b"ping".to_vec();
     let send_buf = crate::backend::op::MsgBuf::from_slice(&payload);
-    let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
+    let send_msg = send_message(std::slice::from_ref(&send_buf), None);
     let mut send_bump = Bump::new();
     backend.push(
       1,
@@ -4401,7 +4426,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
+    let recv_msg = recv_message(std::slice::from_mut(&mut recv_buf));
     let mut recv_bump = Bump::new();
     backend.push(
       2,
@@ -4460,7 +4485,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
+    let recv_msg = recv_message(std::slice::from_mut(&mut recv_buf));
     let mut recv_bump = Bump::new();
     backend.push(
       1,
@@ -4478,7 +4503,7 @@ mod tests {
 
     let payload = b"ping".to_vec();
     let send_buf = crate::backend::op::MsgBuf::from_slice(&payload);
-    let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
+    let send_msg = send_message(std::slice::from_ref(&send_buf), None);
     let mut send_bump = Bump::new();
     backend.push(
       2,
@@ -4543,7 +4568,7 @@ mod tests {
       1,
       Op::Accept {
         fd: listener,
-        addr: NonNull::new(&mut accepted_addr).unwrap(),
+        addr: op_ptr(NonNull::new(&mut accepted_addr).unwrap()),
       },
       &mut accept_bump,
     );
@@ -4618,7 +4643,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
+    let recv_msg = recv_message(std::slice::from_mut(&mut recv_buf));
     let before = backend.progress_snapshot();
 
     let mut recv_bump = Bump::new();
@@ -4677,7 +4702,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
+    let recv_msg = recv_message(std::slice::from_mut(&mut recv_buf));
     let mut recv_bump = Bump::new();
     backend.push(
       1,
@@ -4687,7 +4712,7 @@ mod tests {
 
     let payload = b"ping".to_vec();
     let send_buf = crate::backend::op::MsgBuf::from_slice(&payload);
-    let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
+    let send_msg = send_message(std::slice::from_ref(&send_buf), None);
     let mut send_bump = Bump::new();
     backend.push(
       2,
@@ -4752,7 +4777,7 @@ mod tests {
 
       for (id, payload) in payloads.iter().enumerate() {
         let send_buf = crate::backend::op::MsgBuf::from_slice(payload);
-        let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
+        let send_msg = send_message(std::slice::from_ref(&send_buf), None);
         sender.network_complete_op(
           id as u64 + 1,
           Op::Send {
@@ -4811,7 +4836,7 @@ mod tests {
       [b"alpha".as_slice(), b"beta".as_slice()].into_iter().enumerate()
     {
       let send_buf = crate::backend::op::MsgBuf::from_slice(payload);
-      let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
+      let send_msg = send_message(std::slice::from_ref(&send_buf), None);
       sender.network_complete_op(
         id as u64 + 1,
         Op::Send {
@@ -4830,7 +4855,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
+    let recv_msg = recv_message(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       10,
       Op::Recv { fd: dst_resource(22), msg: recv_msg, flags: RecvFlags::EMPTY },
@@ -4842,7 +4867,7 @@ mod tests {
 
     let mut buf = [0_u8; 16];
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
+    let recv_msg = recv_message(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       11,
       Op::Recv { fd: dst_resource(22), msg: recv_msg, flags: RecvFlags::EMPTY },
@@ -4880,7 +4905,7 @@ mod tests {
 
     let mut buf = [0_u8; 8];
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
+    let recv_msg = recv_message(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       1,
       Op::Recv { fd: dst_resource(22), msg: recv_msg, flags: RecvFlags::EMPTY },
@@ -4933,7 +4958,7 @@ mod tests {
 
     let mut recv_buf = [0_u8; 8];
     let mut msg_buf = MsgBufMut::from_slice(&mut recv_buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
+    let recv_msg = recv_message(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       1,
       Op::Recv { fd: dst_resource(22), msg: recv_msg, flags: RecvFlags::EMPTY },
@@ -4956,7 +4981,7 @@ mod tests {
     assert_eq!(receiver_ready[0].result(), -(errno::ECONNRESET as isize));
 
     let send_buf = crate::backend::op::MsgBuf::from_slice(b"hello");
-    let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
+    let send_msg = send_message(std::slice::from_ref(&send_buf), None);
     receiver.network_complete_op(
       2,
       Op::Send { fd: dst_resource(22), msg: send_msg, flags: SendFlags::EMPTY },
@@ -5045,8 +5070,9 @@ mod tests {
       20,
       Op::Accept {
         fd: listener,
-        addr: NonNull::new(Box::leak(Box::new(SocketAddrBuf::unspecified())))
-          .unwrap(),
+        addr: op_ptr(NonNull::from(Box::leak(Box::new(
+          SocketAddrBuf::unspecified(),
+        )))),
       },
     );
     let listener_ready = dst_take_ready(&listener_backend.node);
@@ -5082,7 +5108,7 @@ mod tests {
     assert_eq!(ready[0].result(), -(errno::EINVAL as isize));
 
     let send_buf = crate::backend::op::MsgBuf::from_slice(b"hello");
-    let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
+    let send_msg = send_message(std::slice::from_ref(&send_buf), None);
     backend.network_complete_op(
       3,
       Op::Send { fd: stream.clone(), msg: send_msg, flags: SendFlags::EMPTY },
@@ -5110,13 +5136,14 @@ mod tests {
 
     let mut recv_buf = [0_u8; 8];
     let mut msg_buf = MsgBufMut::from_slice(&mut recv_buf);
-    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
+    let recv_msg = recv_message(std::slice::from_mut(&mut msg_buf));
     backend.network_complete_op(
       6,
       Op::Accept {
         fd: dgram,
-        addr: NonNull::new(Box::leak(Box::new(SocketAddrBuf::unspecified())))
-          .unwrap(),
+        addr: op_ptr(NonNull::from(Box::leak(Box::new(
+          SocketAddrBuf::unspecified(),
+        )))),
       },
     );
     let ready = dst_take_ready(&backend.node);

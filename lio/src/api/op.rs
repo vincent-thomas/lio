@@ -5,22 +5,46 @@ use crate::backend::op::Op;
 use std::time::Duration;
 
 /// Completion metadata routed from the backend to one `OpModel`.
+///
+/// Only the driver creates completions, from backend results, so an
+/// [`OpModel`] can trust what one reports. Outside the crate they cannot be
+/// forged:
+///
+/// ```compile_fail,E0624
+/// let forged = lio::api::op::Completion::new(1 << 20);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Completion {
-  pub result: isize,
-  pub flags: CompletionFlags,
+  pub(crate) result: isize,
+  pub(crate) flags: CompletionFlags,
   /// How a resource carried by `result` is closed: the producing backend's
   /// close function.
   resource_close: ResourceClose,
 }
 
 impl Completion {
+  /// The raw result: a non-negative value on success (such as a byte count
+  /// or a descriptor), or a negated native error code.
+  #[inline]
+  pub const fn result(&self) -> isize {
+    self.result
+  }
+
+  /// Flags describing the completion.
+  #[inline]
+  pub const fn flags(&self) -> CompletionFlags {
+    self.flags
+  }
+
   /// A completion whose resources (if any) are native OS descriptors/handles.
-  pub const fn new(result: isize) -> Self {
+  pub(crate) const fn new(result: isize) -> Self {
     Self::with_flags(result, CompletionFlags::empty())
   }
 
-  pub const fn with_flags(result: isize, flags: CompletionFlags) -> Self {
+  pub(crate) const fn with_flags(
+    result: isize,
+    flags: CompletionFlags,
+  ) -> Self {
     Self {
       result,
       flags,
@@ -124,6 +148,38 @@ impl From<Duration> for Action {
 
 /// Contract for the execution of one or many [`Action`]s. See [`OpResult`] for
 /// complete contract.
+///
+/// Implementing this trait is safe: an `Op` that hands the kernel a pointer
+/// can only be built from an [`OpPtr`], whose creation is `unsafe`. Models
+/// built from the provided operations need no `unsafe` code at all.
+///
+/// Completions passed to [`complete`](Self::complete) come from an
+/// [`IoBackend`] and follow its contract.
+///
+/// ```
+/// use lio::api::op::{Action, Completion, OneshotOpModel, OpModel, OpResult};
+/// use lio::backend::op::Op;
+///
+/// /// Completes on the next turn of the event loop.
+/// struct Yield;
+///
+/// impl OpModel for Yield {
+///   type Item = ();
+///
+///   fn action(&mut self) -> Action {
+///     Action::Io(Op::Nop)
+///   }
+///
+///   fn complete(&mut self, _: Completion) -> OpResult<()> {
+///     OpResult::Done(())
+///   }
+/// }
+///
+/// impl OneshotOpModel for Yield {}
+/// ```
+///
+/// [`OpPtr`]: crate::backend::op::OpPtr
+/// [`IoBackend`]: crate::backend::IoBackend
 pub trait OpModel: Send + 'static {
   /// The item yielded or completed by this logical operation.
   type Item: Send;

@@ -278,6 +278,98 @@ pub fn is_supported_socket(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// OpPtr - the only way a pointer reaches the backend
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A pointer an [`Op`] hands to the backend, which (and the kernel behind it)
+/// reads or writes through it without further checks.
+///
+/// Every pointer reachable from an `Op` is an `OpPtr`, either directly or
+/// inside [`MsgSend`] / [`MsgRecv`], and creating one is `unsafe`. That
+/// keeps safe code, including custom [`OpModel`]s, from giving the kernel a
+/// dangling or arbitrary pointer.
+///
+/// So this, which would let the kernel write into a dead stack slot, does
+/// not compile:
+///
+/// ```compile_fail,E0133
+/// use lio::backend::op::{FileStat, OpPtr};
+/// use std::ptr::NonNull;
+///
+/// let mut out = FileStat::zeroed();
+/// let out = OpPtr::new(NonNull::from(&mut out));
+/// ```
+///
+/// and neither does describing borrowed buffers for a receive without
+/// `unsafe`:
+///
+/// ```compile_fail,E0133
+/// use lio::backend::op::{MsgBufMut, MsgRecv};
+///
+/// let mut buf = [0u8; 16];
+/// let bufs = [MsgBufMut::from_slice(&mut buf)];
+/// let msg = MsgRecv::new(&bufs);
+/// ```
+///
+/// [`OpModel`]: crate::api::op::OpModel
+#[repr(transparent)]
+pub struct OpPtr<T>(NonNull<T>);
+
+impl<T> OpPtr<T> {
+  /// Wraps a pointer for use in an [`Op`].
+  ///
+  /// # Safety
+  ///
+  /// Until the operation using it completes, `ptr` must be valid for the
+  /// accesses its `Op` field describes (for example writable, for the stated
+  /// length, for a read), and so must any memory it in turn describes (the
+  /// regions of a [`RawBuf`] or [`MsgBufMut`] array). Nothing else may access
+  /// memory the operation writes to meanwhile.
+  #[inline]
+  pub const unsafe fn new(ptr: NonNull<T>) -> Self {
+    Self(ptr)
+  }
+
+  /// The wrapped pointer.
+  #[inline]
+  pub const fn as_non_null(self) -> NonNull<T> {
+    self.0
+  }
+}
+
+impl<T> std::ops::Deref for OpPtr<T> {
+  type Target = NonNull<T>;
+
+  #[inline]
+  fn deref(&self) -> &NonNull<T> {
+    &self.0
+  }
+}
+
+impl<T> Clone for OpPtr<T> {
+  #[inline]
+  fn clone(&self) -> Self {
+    *self
+  }
+}
+
+impl<T> Copy for OpPtr<T> {}
+
+impl<T> std::fmt::Debug for OpPtr<T> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    self.0.fmt(f)
+  }
+}
+
+impl<T> PartialEq for OpPtr<T> {
+  fn eq(&self, other: &Self) -> bool {
+    self.0 == other.0
+  }
+}
+
+impl<T> Eq for OpPtr<T> {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ErasedBuffer - Type-erased buffer storage
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -380,18 +472,24 @@ unsafe impl Sync for MsgBufMut {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MsgSend {
-  pub bufs: NonNull<MsgBuf>,
+  pub bufs: OpPtr<MsgBuf>,
   pub buf_count: NonZeroUsize,
   pub to: Option<SocketAddr>,
 }
 
 impl MsgSend {
+  /// Describes `bufs` for a send.
+  ///
+  /// # Safety
+  ///
+  /// `bufs`, and the memory each [`MsgBuf`] describes, must stay valid for
+  /// reads until the operation completes (see [`OpPtr::new`]).
   #[inline]
-  pub fn new(bufs: &[MsgBuf], to: Option<SocketAddr>) -> Self {
+  pub unsafe fn new(bufs: &[MsgBuf], to: Option<SocketAddr>) -> Self {
     let buf_count = NonZeroUsize::new(bufs.len())
       .expect("MsgSend must contain at least one buffer");
-    let bufs = NonNull::new(bufs.as_ptr().cast_mut())
-      .expect("buffer slice pointer must be non-null");
+    // SAFETY: the caller keeps `bufs` and their memory alive and readable.
+    let bufs = unsafe { OpPtr::new(NonNull::from(bufs).cast()) };
     Self { bufs, buf_count, to }
   }
 }
@@ -403,25 +501,43 @@ unsafe impl Sync for MsgSend {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MsgRecv {
-  pub bufs: NonNull<MsgBufMut>,
+  pub bufs: OpPtr<MsgBufMut>,
   pub buf_count: NonZeroUsize,
-  pub from: Option<NonNull<SocketAddrBuf>>,
+  pub from: Option<OpPtr<SocketAddrBuf>>,
 }
 
 impl MsgRecv {
+  /// Describes `bufs` for a receive.
+  ///
+  /// # Safety
+  ///
+  /// `bufs` must stay valid for reads, and the memory each [`MsgBufMut`]
+  /// describes valid for writes and otherwise unused, until the operation
+  /// completes (see [`OpPtr::new`]).
   #[inline]
-  pub fn new(bufs: &[MsgBufMut]) -> Self {
+  pub unsafe fn new(bufs: &[MsgBufMut]) -> Self {
     let buf_count = NonZeroUsize::new(bufs.len())
       .expect("MsgRecv must contain at least one buffer");
-    let bufs = NonNull::new(bufs.as_ptr().cast_mut())
-      .expect("buffer slice pointer must be non-null");
+    // SAFETY: the caller keeps `bufs` and their memory alive and writable.
+    let bufs = unsafe { OpPtr::new(NonNull::from(bufs).cast()) };
     Self { bufs, buf_count, from: None }
   }
 
+  /// Like [`new`](Self::new), also storing the sender's address in `from`.
+  ///
+  /// # Safety
+  ///
+  /// As for [`new`](Self::new), and `from` must stay valid for writes until
+  /// the operation completes.
   #[inline]
-  pub fn with_from(bufs: &[MsgBufMut], from: NonNull<SocketAddrBuf>) -> Self {
-    let mut msg = Self::new(bufs);
-    msg.from = Some(from);
+  pub unsafe fn with_from(
+    bufs: &[MsgBufMut],
+    from: NonNull<SocketAddrBuf>,
+  ) -> Self {
+    // SAFETY: forwarded to the caller.
+    let mut msg = unsafe { Self::new(bufs) };
+    // SAFETY: the caller keeps `from` alive and writable.
+    msg.from = Some(unsafe { OpPtr::new(from) });
     msg
   }
 }
@@ -617,7 +733,7 @@ pub enum Op {
     /// File descriptor to read from
     fd: Resource,
     /// Scatter buffers
-    iovecs: NonNull<RawBuf>,
+    iovecs: OpPtr<RawBuf>,
     /// Number of iovecs
     iov_count: usize,
     /// File offset (-1 for current position)
@@ -640,7 +756,7 @@ pub enum Op {
     /// File descriptor to write to
     fd: Resource,
     /// Gather buffers
-    iovecs: NonNull<RawBuf>,
+    iovecs: OpPtr<RawBuf>,
     /// Number of iovecs
     iov_count: usize,
     /// File offset (-1 for current position)
@@ -690,7 +806,7 @@ pub enum Op {
     /// Stat target, either a path-based lookup or direct fd query.
     target: StatTarget,
     /// Portable metadata output storage.
-    out: NonNull<FileStat>,
+    out: OpPtr<FileStat>,
   },
   /// Read directory entries from an open directory resource.
   ///
@@ -704,19 +820,19 @@ pub enum Op {
     /// Open directory resource.
     fd: Resource,
     /// Caller-owned opaque scratch memory.
-    raw_buf: NonNull<u8>,
+    raw_buf: OpPtr<u8>,
     /// Size of `raw_buf`.
     raw_cap: usize,
     /// Caller-owned parsed entry refs.
-    entries: NonNull<DirEntryRef>,
+    entries: OpPtr<DirEntryRef>,
     /// Max number of entry refs the backend may write.
     entries_cap: usize,
     /// Caller-owned opaque backend state slot used across repeated calls.
-    opaque: NonNull<*mut ()>,
+    opaque: OpPtr<*mut ()>,
     /// Caller-owned opaque destructor slot for backend state.
-    opaque_drop: NonNull<Option<OpaqueDropFn>>,
+    opaque_drop: OpPtr<Option<OpaqueDropFn>>,
     /// Batch result metadata.
-    out: NonNull<ReadDirResult>,
+    out: OpPtr<ReadDirResult>,
   },
 
   // ═══════════════════════════════════════════════════════════════════════════════
@@ -738,7 +854,7 @@ pub enum Op {
     /// Listening socket to accept from.
     fd: Resource,
     /// Peer address output storage.
-    addr: NonNull<SocketAddrBuf>,
+    addr: OpPtr<SocketAddrBuf>,
   },
   /// Initiate a connection on a socket.
   ///
@@ -834,14 +950,14 @@ pub enum Op {
     /// Null-terminated pathname pointer.
     path: OsString,
     /// Output buffer pointer.
-    buf: NonNull<u8>,
+    buf: OpPtr<u8>,
     /// Output buffer length.
     buf_len: usize,
   },
   /// Read the current working directory as a platform-native string.
   GetCwd {
     /// Output storage for the platform-native current working directory.
-    out: NonNull<OsString>,
+    out: OpPtr<OsString>,
   },
   /// Spawn a new process.
   ///

@@ -34,7 +34,8 @@ struct ImmediateBackend {
   ready: Vec<u64>,
 }
 
-impl IoBackend for ImmediateBackend {
+// SAFETY: it only accepts `Op::Nop`, reports each once with 0, and never touches op memory.
+unsafe impl IoBackend for ImmediateBackend {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.queued.reserve(cap);
     self.ready.reserve(cap);
