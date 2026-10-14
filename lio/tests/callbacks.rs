@@ -149,7 +149,11 @@ fn panicking_callback_frees_its_slot() {
   run_until(&lio, &done);
 }
 
+const MAX_BLOCK: Duration = Duration::from_secs(2);
+
 /// Completes every queued no-op on the next wait, in submission order.
+/// With nothing queued, a wait blocks for its timeout (at most two seconds)
+/// like a real backend would.
 #[derive(Default)]
 struct InOrderBackend {
   queued: Vec<u64>,
@@ -175,10 +179,13 @@ impl lio::backend::IoBackend for InOrderBackend {
 
   fn wait(
     &mut self,
-    _timeout: Option<Duration>,
+    timeout: Option<Duration>,
     completed: &mut Vec<lio::backend::OpCompleted>,
   ) -> std::io::Result<()> {
     completed.clear();
+    if self.queued.is_empty() {
+      std::thread::sleep(timeout.unwrap_or(Duration::MAX).min(MAX_BLOCK));
+    }
     completed.extend(
       self.queued.drain(..).map(|id| lio::backend::OpCompleted::new(id, 0)),
     );
@@ -205,4 +212,27 @@ fn panic_does_not_lose_the_rest_of_the_batch() {
   // The next run delivers the completion the panicking run did not reach.
   lio.try_run().unwrap();
   assert!(done.get());
+}
+
+#[test]
+fn blocking_run_delivers_what_a_panic_left_behind() {
+  let lio = Lio::new_with_backend(InOrderBackend::default(), 4).unwrap();
+  let done = Rc::new(Cell::new(false));
+
+  // Both complete in the same run, the panicking one first.
+  api::nop().with_lio(&lio).when_done(|_| panic!("callback failure"));
+  let inner_done = done.clone();
+  api::nop().with_lio(&lio).when_done(move |_| inner_done.set(true));
+  let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    lio.try_run().unwrap();
+  }));
+  assert!(run.is_err());
+  assert!(!done.get(), "the second callback is after the panic");
+
+  // Nothing is left in the backend: the carried completion alone must not
+  // leave a blocking run waiting.
+  let start = std::time::Instant::now();
+  lio.run().unwrap();
+  assert!(done.get());
+  assert!(start.elapsed() < Duration::from_secs(1), "without waiting");
 }
