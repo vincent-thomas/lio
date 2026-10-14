@@ -117,12 +117,6 @@ impl OpModel for Socket {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    if completion.result < 0 {
-      return OpResult::Done(Err(io::Error::from_raw_os_error(
-        (-completion.result) as i32,
-      )));
-    }
-
     // SAFETY: a successful socket completion carries a new owned socket.
     OpResult::Done(unsafe { Resource::from_completion(&completion) })
   }
@@ -221,10 +215,6 @@ impl Accept {
     &mut self,
     completion: Completion,
   ) -> io::Result<Resource> {
-    if completion.result < 0 {
-      return Err(io::Error::from_raw_os_error((-completion.result) as i32));
-    }
-
     // SAFETY: a successful accept completion carries a new owned socket.
     unsafe { Resource::from_completion(&completion) }
   }
@@ -1382,13 +1372,8 @@ impl OpModel for OpenAt {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let res = if completion.result < 0 {
-      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
-    } else {
-      // SAFETY: a successful open completion carries a new owned handle.
-      unsafe { Resource::from_completion(&completion) }
-    };
-    OpResult::Done(res)
+    // SAFETY: a successful open completion carries a new owned handle.
+    OpResult::Done(unsafe { Resource::from_completion(&completion) })
   }
 }
 

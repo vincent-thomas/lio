@@ -1265,6 +1265,10 @@ impl IoUring {
       Op::Spawn { spec } => {
         use std::os::unix::ffi::OsStrExt;
 
+        unsafe extern "C" {
+          static mut environ: *mut *mut libc::c_char;
+        }
+
         let path = match std::ffi::CString::new(spec.program.as_bytes()) {
           Ok(path) => path,
           Err(_) => {
@@ -1287,17 +1291,37 @@ impl IoUring {
           .map(|arg| arg.as_ptr().cast_mut())
           .chain(std::iter::once(std::ptr::null_mut()))
           .collect();
-        let Some(env) = crate::backend::native::spawn_env(spec.env.as_deref())
-        else {
-          return Some(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+        let env = match spec.env.as_ref().map(|env| {
+          env
+            .iter()
+            .map(|var| std::ffi::CString::new(var.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+        }) {
+          Some(Ok(env)) => Some(env),
+          Some(Err(_)) => {
+            return Some(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+          }
+          None => None,
         };
-        let mut env_ptrs: Vec<*mut libc::c_char> = env
-          .iter()
-          .map(|var| var.as_ptr().cast_mut())
-          .chain(std::iter::once(std::ptr::null_mut()))
-          .collect();
+        let mut env_ptrs = env.as_ref().map(|env| {
+          env
+            .iter()
+            .map(|var| var.as_ptr().cast_mut())
+            .chain(std::iter::once(std::ptr::null_mut()))
+            .collect::<Vec<_>>()
+        });
 
         let mut pid: libc::pid_t = 0;
+        let envp = env_ptrs
+          .as_mut()
+          .map(|vars| vars.as_mut_ptr().cast_const())
+          .unwrap_or_else(|| {
+            // SAFETY: `environ` is libc's process-global environment vector.
+            // Mutating it while another thread reads it is ruled out by the
+            // contract of `std::env::set_var`/`remove_var`, which are
+            // `unsafe` in Rust 2024 for exactly this reason.
+            unsafe { environ as *const *mut libc::c_char }
+          });
         // SAFETY: native C strings and pointer arrays remain alive for this call.
         let result = unsafe {
           libc::posix_spawn(
@@ -1306,7 +1330,7 @@ impl IoUring {
             std::ptr::null(),
             std::ptr::null(),
             argv_ptrs.as_mut_ptr().cast_const(),
-            env_ptrs.as_mut_ptr().cast_const(),
+            envp,
           )
         };
         Some(if result != 0 {
