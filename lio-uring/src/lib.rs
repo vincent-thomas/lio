@@ -339,7 +339,8 @@ impl LioUring {
     unsafe {
       (*sqe) = entry.into_sqe();
       (*sqe).user_data = user_data;
-      (*sqe).flags = flags.bits()
+      // Keep flags the entry builder set, such as `BUFFER_SELECT`.
+      (*sqe).flags |= flags.bits()
     }
 
     Ok(())

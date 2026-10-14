@@ -124,7 +124,7 @@ impl OpModel for Socket {
     }
 
     // SAFETY: a successful socket completion carries a new owned socket.
-    OpResult::Done(Ok(unsafe { Resource::from_completion(&completion) }))
+    OpResult::Done(unsafe { Resource::from_completion(&completion) })
   }
 }
 
@@ -226,7 +226,7 @@ impl Accept {
     }
 
     // SAFETY: a successful accept completion carries a new owned socket.
-    Ok(unsafe { Resource::from_completion(&completion) })
+    unsafe { Resource::from_completion(&completion) }
   }
 }
 
@@ -601,7 +601,7 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
 
     Action::Io(Op::Read {
       fd: self.res.clone(),
-      iovecs: NonNull::from(&mut self.raws[0]),
+      iovecs: NonNull::from(&mut self.raws).cast(),
       iov_count: self.iov_count,
       offset: self.offset,
       flags: ReadFlags::EMPTY,
@@ -741,7 +741,7 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
 
     Action::Io(Op::Write {
       fd: self.res.clone(),
-      iovecs: NonNull::from(&mut self.raws[0]),
+      iovecs: NonNull::from(&mut self.raws).cast(),
       iov_count: buf_count,
       offset: self.offset,
       flags: WriteFlags::EMPTY,
@@ -1386,7 +1386,7 @@ impl OpModel for OpenAt {
       Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
     } else {
       // SAFETY: a successful open completion carries a new owned handle.
-      Ok(unsafe { Resource::from_completion(&completion) })
+      unsafe { Resource::from_completion(&completion) }
     };
     OpResult::Done(res)
   }

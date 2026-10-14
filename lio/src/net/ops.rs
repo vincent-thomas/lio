@@ -114,7 +114,7 @@ impl OpModel for SocketNew {
     // SAFETY: a successful socket completion carries a new owned socket.
     let resource =
       unsafe { crate::api::resource::Resource::from_completion(&completion) };
-    OpResult::Done(Ok(Socket::from_resource(resource)))
+    OpResult::Done(resource.map(Socket::from_resource))
   }
 }
 
