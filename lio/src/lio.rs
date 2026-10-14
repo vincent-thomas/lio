@@ -454,6 +454,12 @@ impl Lio {
       (None, Some(timer)) => Some(timer),
       (None, None) => None,
     };
+    // Work a panicking handler left undelivered is ready now; don't block
+    // waiting for the backend before routing it.
+    let carried = !inner_ref.carry_completed.is_empty()
+      || !inner_ref.carry_timers.is_empty();
+    let effective_timeout =
+      if carried { Some(Duration::ZERO) } else { effective_timeout };
 
     inner_ref.completed.clear();
     let (io, completed) = (&mut inner_ref.io, &mut inner_ref.completed);
