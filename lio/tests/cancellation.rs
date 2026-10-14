@@ -28,6 +28,8 @@ struct Held {
   pushed: Vec<u64>,
   cancelled: Vec<u64>,
   complete: Vec<OpCompleted>,
+  /// Makes `drain` report operations still running.
+  stuck: bool,
 }
 
 #[derive(Clone, Default)]
@@ -48,6 +50,10 @@ impl IoBackend for HoldingBackend {
 
   fn cancel(&mut self, id: u64) {
     self.0.borrow_mut().cancelled.push(id);
+  }
+
+  fn drain(&mut self) -> bool {
+    !self.0.borrow().stuck
   }
 
   fn wait(
@@ -125,6 +131,44 @@ fn dropped_future_keeps_its_op_alive_until_completion() {
     "the op model still sees the result, to release what it produced"
   );
   assert!(!lio.is_full());
+}
+
+/// Submits a `Tracked` op, drops its future, then drops the driver.
+fn drop_driver_with_op_in_flight(backend: &HoldingBackend) -> Arc<AtomicBool> {
+  let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
+  let dropped = Arc::new(AtomicBool::new(false));
+  let mut future = Box::pin(
+    Io::from_op(Tracked {
+      dropped: dropped.clone(),
+      completions: Arc::new(AtomicUsize::new(0)),
+    })
+    .with_lio(&lio)
+    .into_future(),
+  );
+  let mut cx = Context::from_waker(Waker::noop());
+  assert!(future.as_mut().poll(&mut cx).is_pending());
+  lio.try_run().unwrap();
+  drop(future);
+  drop(lio);
+  dropped
+}
+
+#[test]
+fn dropping_the_driver_frees_ops_the_backend_drained() {
+  let backend = HoldingBackend::default();
+  let dropped = drop_driver_with_op_in_flight(&backend);
+  assert!(dropped.load(Ordering::SeqCst), "the store releases the op");
+}
+
+#[test]
+fn dropping_the_driver_leaks_ops_the_backend_could_not_drain() {
+  let backend = HoldingBackend::default();
+  backend.0.borrow_mut().stuck = true;
+  let dropped = drop_driver_with_op_in_flight(&backend);
+  assert!(
+    !dropped.load(Ordering::SeqCst),
+    "memory an operation may still write into must not be freed"
+  );
 }
 
 #[test]

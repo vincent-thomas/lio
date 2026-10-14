@@ -917,6 +917,22 @@ impl Drop for Iocp {
     if self.port.is_null() {
       return;
     }
+    self.drain_in_flight();
+    // SAFETY: the port is owned by this backend.
+    unsafe { CloseHandle(self.port) };
+  }
+}
+
+impl Iocp {
+  /// Stops the worker pool, cancels every overlapped operation and waits,
+  /// for at most `DRAIN_GRACE`, for their packets. Anything left after that
+  /// is leaked rather than freed while possibly in use.
+  ///
+  /// Returns whether nothing is left in the kernel or on a worker.
+  fn drain_in_flight(&mut self) -> bool {
+    if self.port.is_null() {
+      return true;
+    }
     // Workers write into op memory; stop them first.
     if let Some(mut pool) = self.pool.take() {
       pool.shutdown();
@@ -927,8 +943,7 @@ impl Drop for Iocp {
       unsafe { CancelIoEx((*state).socket as HANDLE, &(*state).ov) };
     }
     // Cancelled operations still post a packet; drain them so the kernel is
-    // done with their memory before it is freed. Anything left after the
-    // grace period is leaked rather than freed while possibly in use.
+    // done with their memory before it is freed.
     let mut completed = Vec::new();
     let deadline = Instant::now() + DRAIN_GRACE;
     while !self.in_flight.is_empty() {
@@ -944,8 +959,7 @@ impl Drop for Iocp {
     }
     // Free results the workers posted that were never reaped.
     while self.reap(0, &mut completed).unwrap_or(false) {}
-    // SAFETY: the port is owned by this backend.
-    unsafe { CloseHandle(self.port) };
+    self.in_flight.is_empty()
   }
 }
 
@@ -1015,6 +1029,10 @@ impl IoBackend for Iocp {
       // SAFETY: `state` is a live in-flight operation.
       unsafe { CancelIoEx((*state).socket as HANDLE, &(*state).ov) };
     }
+  }
+
+  fn drain(&mut self) -> bool {
+    self.drain_in_flight()
   }
 
   fn wait(
