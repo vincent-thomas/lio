@@ -245,6 +245,11 @@ impl LioHandle {
 /// Provides blocking and non-blocking methods to receive operation results.
 /// This is used for callback-based I/O completions where results are sent
 /// via a channel.
+///
+/// If the [`Lio`] is dropped before the operation completes, the operation
+/// never completes: [`try_recv`](Self::try_recv) and
+/// [`recv_timeout`](Self::recv_timeout) keep returning `None`, and
+/// [`recv`](Self::recv) panics instead of blocking forever.
 pub struct Receiver<T> {
   recv: Option<std_mpsc::Receiver<T>>,
 }
@@ -257,12 +262,13 @@ impl<T> Receiver<T> {
   ///
   /// # Panics
   ///
-  /// Panics if the sender is dropped without sending a result (internal error).
+  /// Panics if the [`Lio`] is dropped before the operation completes, since
+  /// the result can then never arrive.
   pub fn recv(mut self) -> T {
     match self.get_inner() {
       Some(value) => value
         .recv()
-        .expect("internal lio error: Sender dropped without sending"),
+        .expect("lio: the Lio was dropped before the operation completed"),
       None => unreachable!(),
     }
   }
@@ -297,7 +303,13 @@ impl<T> Receiver<T> {
             self.set_inner(value);
             None
           }
-          std_mpsc::RecvTimeoutError::Disconnected => unreachable!(),
+          // The Lio was dropped, so the operation never completes: wait out
+          // the timeout like any operation still in flight would.
+          std_mpsc::RecvTimeoutError::Disconnected => {
+            std::thread::sleep(duration);
+            self.set_inner(value);
+            None
+          }
         },
       },
       None => panic!(
@@ -340,13 +352,13 @@ impl<T> Receiver<T> {
       Some(receiver) => match receiver.try_recv() {
         Ok(value) => Some(value),
         Err(err) => match err {
-          std_mpsc::TryRecvError::Empty => {
+          // `Disconnected`: the Lio was dropped, so the operation never
+          // completes.
+          std_mpsc::TryRecvError::Empty
+          | std_mpsc::TryRecvError::Disconnected => {
             self.set_inner(receiver);
             None
           }
-          std_mpsc::TryRecvError::Disconnected => panic!(
-            "internal lio error: sender didn't send before getting dropped."
-          ),
         },
       },
       None => panic!(

@@ -172,6 +172,28 @@ fn dropping_the_driver_leaks_ops_the_backend_could_not_drain() {
 }
 
 #[test]
+fn receiver_outliving_its_driver_never_completes() {
+  let lio = Lio::new(4).unwrap();
+  let mut receiver = api::sleep(Duration::from_secs(60)).with_lio(&lio).send();
+  drop(lio);
+
+  // The operation can no longer complete; that is not a lio bug.
+  assert!(receiver.try_recv().is_none());
+  assert!(receiver.try_recv().is_none(), "and keeps not completing");
+  assert!(receiver.recv_timeout(Duration::from_millis(1)).is_none());
+
+  let recv = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let _ = receiver.recv();
+  }));
+  let message = recv.unwrap_err();
+  let message = message.downcast_ref::<&str>().map_or_else(
+    || message.downcast_ref::<String>().cloned().unwrap_or_default(),
+    |m| m.to_string(),
+  );
+  assert!(message.contains("dropped before the operation completed"));
+}
+
+#[test]
 fn dropped_sleep_is_removed_at_once() {
   let backend = HoldingBackend::default();
   let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
