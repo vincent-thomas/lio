@@ -501,9 +501,14 @@ where
             Registration::new_callback_in(
               arena,
               move |item| {
-                let mut slot = callback_slot.borrow_mut();
-                slot.item = Some(item);
-                if let Some(waker) = slot.waker.take() {
+                let waker = {
+                  let mut slot = callback_slot.borrow_mut();
+                  slot.item = Some(item);
+                  slot.waker.take()
+                };
+                // Wake with the slot released: the waker may poll or drop
+                // this future inline, and both borrow the slot.
+                if let Some(waker) = waker {
                   waker.wake();
                 }
               },

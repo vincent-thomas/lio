@@ -131,6 +131,54 @@ fn waker_schedules_work_when_woken() {
   assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(_)));
 }
 
+type NopFuture = Pin<Box<dyn Future<Output = std::io::Result<()>>>>;
+
+/// A waker that polls its future inline when woken, as an executor running
+/// tasks from `wake` would.
+struct PollingWaker {
+  future: RefCell<Option<NopFuture>>,
+  done: Rc<Cell<bool>>,
+}
+
+// SAFETY: the test drives everything on one thread.
+unsafe impl Send for PollingWaker {}
+// SAFETY: as above.
+unsafe impl Sync for PollingWaker {}
+
+impl Wake for PollingWaker {
+  fn wake(self: Arc<Self>) {
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut future = self.future.borrow_mut();
+    if let Some(f) = future.as_mut()
+      && f.as_mut().poll(&mut cx).is_ready()
+    {
+      *future = None;
+      self.done.set(true);
+    }
+  }
+}
+
+#[test]
+fn waker_may_poll_its_future_inline() {
+  let lio = Lio::new(8).unwrap();
+  let done = Rc::new(Cell::new(false));
+  let polling = Arc::new(PollingWaker {
+    future: RefCell::new(Some(Box::pin(
+      api::nop().with_lio(&lio).into_future(),
+    ))),
+    done: done.clone(),
+  });
+
+  // The first poll submits the op and stores this waker.
+  let waker = Waker::from(polling.clone());
+  let mut cx = Context::from_waker(&waker);
+  let pending =
+    polling.future.borrow_mut().as_mut().unwrap().as_mut().poll(&mut cx);
+  assert!(pending.is_pending());
+
+  run_until(&lio, &done);
+}
+
 #[test]
 fn panicking_callback_frees_its_slot() {
   // Capacity 1: if the panicking registration leaked, nothing more could be
