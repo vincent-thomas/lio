@@ -13,6 +13,7 @@ use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 
 use crate::Lio;
+use crate::api::op::{Completion, CompletionFlags};
 use clock::TICK_MS;
 pub use clock::{Clock, TimerId};
 
@@ -119,10 +120,39 @@ impl TimeManager {
     }
   }
 
+  /// How long the driver may block for I/O without missing a timer: the
+  /// caller's `timeout` (`None` for no limit), shortened to the next timer
+  /// deadline.
+  ///
+  /// Doesn't read the clock when no timer is tracked, the common pure-I/O
+  /// case.
+  pub fn wait_timeout(&self, timeout: Option<Duration>) -> Option<Duration> {
+    if self.is_empty() {
+      return timeout;
+    }
+    match (timeout, self.next_deadline()) {
+      (Some(user), Some(timer)) => Some(user.min(timer)),
+      (user, timer) => user.or(timer),
+    }
+  }
+
   /// Polls for expired timers.
+  ///
+  /// Doesn't read the clock when no timer is tracked, including fired ones
+  /// waiting to be drained.
   pub fn poll_expired(&mut self) -> impl Iterator<Item = TimerId> + '_ {
-    self.sync_to_now();
+    if !self.is_empty() {
+      self.sync_to_now();
+    }
     self.clock.poll_expired()
+  }
+
+  /// The completion a fired timer is delivered with.
+  ///
+  /// Its result is always `0`: expiry is normalized here so op models never
+  /// interpret OS-specific values for it.
+  pub fn fired_completion() -> Completion {
+    Completion::with_flags(0, CompletionFlags::TIMER)
   }
 
   /// Removes a timer from tracking.
