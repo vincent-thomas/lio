@@ -56,6 +56,16 @@ impl<const SIZE: usize> Wheel<SIZE> {
     self.len -= self.slots[slot].len();
     self.slots[slot].clear();
   }
+
+  /// Keeps only the entries `live` accepts.
+  fn retain(&mut self, mut live: impl FnMut(&WheelEntry) -> bool) {
+    for slot in &mut self.slots {
+      if !slot.is_empty() {
+        slot.retain(&mut live);
+      }
+    }
+    self.len = self.slots.iter().map(Vec::len).sum();
+  }
 }
 
 /// Timer metadata for O(1) lookup.
@@ -194,6 +204,8 @@ impl Clock {
         self.activate_timer_slot();
       } else {
         self.replace_active_timer(previous.entry.deadline_ticks);
+        // The previous deadline's wheel entry is stale now.
+        self.compact_if_mostly_stale();
       }
     } else if self.pending_is_undelivered(previous.id, previous_state) {
       self.pending_has_stale = true;
@@ -287,10 +299,38 @@ impl Clock {
     self.timer_count -= 1;
     if timer.entry.pending_index == ACTIVE_TIMER {
       self.decrement_active_deadline(timer.entry.deadline_ticks);
+      // Its wheel entry stays behind until its slot comes round.
+      self.compact_if_mostly_stale();
     } else if self.pending_is_undelivered(timer.id, timer.entry.pending_index) {
       self.pending_has_stale = true;
     }
     true
+  }
+
+  /// Wheel entries of removed or rescheduled timers stay in their slot until
+  /// it is processed, which for a long timeout can be far off. Drop them
+  /// once they outnumber the timers still tracked, so memory stays bounded
+  /// by the live timers. The sweep costs about the entries plus the slots, so
+  /// spread over the removals that triggered it, each costs O(1).
+  fn compact_if_mostly_stale(&mut self) {
+    const FLOOR: usize = 4 * LEVEL_SIZE;
+    let entries =
+      self.level0.len + self.level1.len + self.level2.len + self.level3.len;
+    if entries <= 2 * self.timer_count + FLOOR {
+      return;
+    }
+    let timers = &self.timers;
+    let live = |entry: &WheelEntry| {
+      timers.get(entry.id as u32 as usize).is_some_and(|timer| {
+        timer.id == entry.id
+          && timer.entry.pending_index == ACTIVE_TIMER
+          && timer.entry.deadline_ticks == entry.deadline_ticks
+      })
+    };
+    self.level0.retain(live);
+    self.level1.retain(live);
+    self.level2.retain(live);
+    self.level3.retain(live);
   }
 
   pub(crate) fn current_tick(&self) -> u64 {
@@ -805,5 +845,39 @@ mod tests {
     assert_eq!(clock.timers.len(), len);
     clock.advance_by(5);
     assert_eq!(collect_expired(&mut clock), vec![9]);
+  }
+
+  /// Cancelled long timers must not pile up in the wheel until their
+  /// deadline; the ones still scheduled keep firing on time.
+  #[test]
+  fn cancelled_timers_do_not_accumulate_in_the_wheel() {
+    let mut clock = Clock::new();
+    let entries = |clock: &Clock| {
+      clock.level0.len + clock.level1.len + clock.level2.len + clock.level3.len
+    };
+    // Twice the tracked timers plus the sweep's floor, and one entry that
+    // may have been inserted after the last sweep.
+    let bound = |timers: usize| 2 * timers + 4 * super::LEVEL_SIZE + 1;
+    // One long timer that stays, behind many that are cancelled.
+    clock.schedule(0, Duration::from_secs(600));
+    for round in 0..20u64 {
+      for slot in 1..1000u64 {
+        let id = (round << 32) | slot;
+        clock.schedule(id, Duration::from_secs(600));
+        assert!(clock.remove(id));
+      }
+    }
+    assert!(entries(&clock) <= bound(1), "{}", entries(&clock));
+
+    // Rescheduling leaves a stale entry behind too.
+    for n in 0..5000u64 {
+      clock.schedule(1, Duration::from_secs(600 + n));
+    }
+    assert!(entries(&clock) <= bound(2), "{}", entries(&clock));
+
+    clock.advance_to(600_000 - 1);
+    assert!(collect_expired(&mut clock).is_empty());
+    clock.advance_to(600_000);
+    assert_eq!(collect_expired(&mut clock), vec![0]);
   }
 }
