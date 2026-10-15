@@ -95,6 +95,58 @@ fn callback_drops_an_in_flight_future() {
   run_until(&lio, &done);
 }
 
+/// A sleep future that has submitted its operation and is never polled again.
+fn submitted_sleep(lio: &Lio) -> Pin<Box<impl Future + use<>>> {
+  let mut sleep =
+    Box::pin(api::sleep(Duration::from_secs(60)).with_lio(lio).into_future());
+  let mut cx = Context::from_waker(Waker::noop());
+  assert!(sleep.as_mut().poll(&mut cx).is_pending());
+  sleep
+}
+
+#[test]
+fn dropping_a_finished_callback_may_cancel_through_the_lio() {
+  // Capacity 2: both slots must come back.
+  let lio = Lio::new(2).unwrap();
+  let sleep = submitted_sleep(&lio);
+  let done = Rc::new(Cell::new(false));
+
+  // The closure owns the in-flight sleep. Dropping the closure, when its own
+  // operation finishes, cancels the sleep through the same `Lio`.
+  let inner_done = done.clone();
+  api::nop().with_lio(&lio).when_done(move |_| {
+    let _ = &sleep;
+    inner_done.set(true);
+  });
+  run_until(&lio, &done);
+
+  assert!(!lio.is_full(), "both operations were released");
+  let again = Rc::new(Cell::new(false));
+  let (a, b) = (again.clone(), again.clone());
+  api::nop().with_lio(&lio).when_done(move |_| a.set(true));
+  api::nop().with_lio(&lio).when_done(move |_| b.set(true));
+  run_until(&lio, &again);
+}
+
+#[test]
+fn panicking_callback_that_owns_an_in_flight_future_does_not_abort() {
+  let lio = Lio::new(2).unwrap();
+  let sleep = submitted_sleep(&lio);
+
+  api::nop().with_lio(&lio).when_done(move |_| {
+    let _ = &sleep;
+    panic!("callback failure");
+  });
+  let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    lio.run_timeout(Duration::from_millis(50)).unwrap();
+  }));
+  assert!(run.is_err(), "the callback panic propagates");
+
+  // The next run drops the panicked registration, and with it the sleep.
+  lio.try_run().unwrap();
+  assert!(!lio.is_full(), "both operations were released");
+}
+
 /// A waker that schedules more work on the `Lio` when woken.
 struct SchedulingWaker {
   lio: Lio,

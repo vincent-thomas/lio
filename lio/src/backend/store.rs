@@ -122,37 +122,56 @@ impl OpStore {
     (key.as_u64(), action, &mut slot.step_bump)
   }
 
-  /// Removes an operation from the store.
+  /// Removes an operation from the store and drops it.
   ///
-  /// The registration is moved out and its slot released before it is
-  /// dropped, so a panicking destructor (user model, callback) cannot leave
-  /// an occupied slot around a dropped registration. Its arenas are reset
-  /// when the slot is next allocated, which keeps them valid for the drop.
-  #[inline]
+  /// The driver uses [`detach`](Self::detach) instead, to drop registrations
+  /// without itself borrowed.
+  #[cfg(test)]
   pub fn remove(&mut self, id: u64) -> bool {
-    let key = SlabKey::from_u64(id);
-    self
-      .slots
-      .remove_with(key, |slot| {
-        // SAFETY: occupied slots always contain an initialized registration,
-        // and the slot no longer counts as initialized once this returns.
-        unsafe { slot.registration.assume_init_read() }
-      })
-      .map(drop)
-      .is_some()
+    let Some(Detached { registration, slot }) = self.detach(id) else {
+      return false;
+    };
+    // Nothing can allocate the slot while `self` is borrowed here, so it can
+    // be released first, which a panicking drop then cannot skip.
+    self.release(slot);
+    drop(registration);
+    true
   }
 
-  /// Removes an operation whose ID was already validated by `get_mut` under
-  /// the same exclusive store borrow. Drops it as [`remove`](Self::remove)
-  /// does.
+  /// Takes an operation out of the store without freeing its slot.
+  ///
+  /// `id` stops resolving at once, but the slot is not reused, and its arenas
+  /// (which the registration points into) are not reset, until it is
+  /// [`release`](Self::release)d. That lets the caller drop the registration
+  /// later, outside its own borrow of the store: dropping it runs user code.
   #[inline]
-  pub fn remove_known(&mut self, id: u64) {
+  pub fn detach(&mut self, id: u64) -> Option<Detached> {
     let key = SlabKey::from_u64(id);
-    let registration = self.slots.remove_known_with(key, |slot| {
-      // SAFETY: as in `remove`.
+    let registration = self.slots.retire_with(key, |slot| {
+      // SAFETY: occupied slots always contain an initialized registration,
+      // and the slot no longer counts as initialized once this returns.
+      unsafe { slot.registration.assume_init_read() }
+    })?;
+    Some(Detached { registration, slot: key.slot() })
+  }
+
+  /// [`detach`](Self::detach) for an ID already validated by `get_mut`
+  /// under the same exclusive store borrow.
+  #[inline]
+  pub fn detach_known(&mut self, id: u64) -> Detached {
+    let key = SlabKey::from_u64(id);
+    let registration = self.slots.retire_known_with(key, |slot| {
+      // SAFETY: as in `detach`.
       unsafe { slot.registration.assume_init_read() }
     });
-    drop(registration);
+    Detached { registration, slot: key.slot() }
+  }
+
+  /// Makes a slot whose registration was [`detach`](Self::detach)ed and
+  /// dropped available again.
+  #[inline]
+  pub fn release(&mut self, slot: u32) {
+    self.slots.release(slot);
   }
 
   /// Gets mutable access to an operation's registration.
@@ -188,6 +207,13 @@ impl Drop for DropOnUnwind<'_> {
       unsafe { std::ptr::drop_in_place(self.registration) };
     }
   }
+}
+
+/// A registration taken out of the store whose slot stays reserved until
+/// [`OpStore::release`]: the registration points into that slot's arenas.
+pub(crate) struct Detached {
+  pub registration: Registration,
+  pub slot: u32,
 }
 
 impl Drop for OpStore {

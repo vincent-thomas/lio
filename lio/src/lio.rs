@@ -1,6 +1,9 @@
 use crate::{
   api::op::{Action, Completion},
-  backend::{IoBackend, OpCompleted, store::OpStore},
+  backend::{
+    IoBackend, OpCompleted,
+    store::{Detached, OpStore},
+  },
   registration::Registration,
   time::TimeManager,
 };
@@ -93,6 +96,9 @@ struct LioInner {
   /// still queued for the next run.
   ready_io: VecDeque<OpCompleted>,
   ready_timers: VecDeque<u64>,
+  /// Registrations removed while the driver was borrowed, to be dropped
+  /// once it is not (see [`Lio::bury`]). Their slots stay reserved until then.
+  dying: Vec<Detached>,
   /// Submissions made while every slot was taken, scheduled in order as
   /// slots free up. Only allocates when the driver is over capacity.
   overflow: VecDeque<PendingSubmission>,
@@ -163,6 +169,8 @@ macro_rules! timed {
 
 impl Drop for LioInner {
   fn drop(&mut self) {
+    // They point into the store's arenas, so they go before it.
+    drop(std::mem::take(&mut self.dying));
     if self.io.drain() {
       // SAFETY: neither field is used again. The backend goes first: it may
       // still hold `Op`s pointing into the store.
@@ -279,6 +287,7 @@ impl Lio {
       completed: Vec::with_capacity(cap),
       ready_io: VecDeque::with_capacity(cap),
       ready_timers: VecDeque::new(),
+      dying: Vec::new(),
       overflow: VecDeque::new(),
       capacity_waiters: Vec::new(),
       profile: std::env::var_os("LIO_PROFILE").map(|_| LioProfile::default()),
@@ -297,7 +306,12 @@ impl Lio {
     if !inner.overflow.is_empty() || inner.store.is_full() {
       return Err(Self::full_error());
     }
-    Self::schedule_now(&mut inner, init)
+    let scheduled = Self::schedule_now(&mut inner, init);
+    drop(inner);
+    if scheduled.is_err() {
+      self.bury_and_wake();
+    }
+    scheduled
   }
 
   /// Schedules `init` now, or queues it until a slot frees up.
@@ -310,7 +324,11 @@ impl Lio {
     if inner.overflow.is_empty() && !inner.store.is_full() {
       // An op without a first action is dropped; only `schedule_with` can
       // report that.
-      let _ = Self::schedule_now(&mut inner, init);
+      let scheduled = Self::schedule_now(&mut inner, init);
+      drop(inner);
+      if scheduled.is_err() {
+        self.bury_and_wake();
+      }
     } else {
       Self::enqueue(&mut inner, init);
     }
@@ -337,7 +355,8 @@ impl Lio {
     let (store, io, time) = (&mut inner.store, &mut inner.io, &mut inner.time);
     let (id, action, step_bump) = store.insert_with_action(init);
     let Some(action) = action else {
-      store.remove(id);
+      let detached = store.detach_known(id);
+      inner.dying.push(detached);
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "OpModel returned no action on first call",
@@ -424,15 +443,51 @@ impl Lio {
 
   fn run_inner(&self, timeout: Option<Duration>) -> io::Result<usize> {
     let inner = self.inner.borrow_mut();
-    let (processed, waiters) = if inner.profile.is_some() {
-      self.run_with::<true>(inner, timeout)?
+    let ran = if inner.profile.is_some() {
+      self.run_with::<true>(inner, timeout)
     } else {
-      self.run_with::<false>(inner, timeout)?
+      self.run_with::<false>(inner, timeout)
     };
+    // Also after an error: what this run removed is dropped either way.
+    self.bury_and_wake();
+    let (processed, waiters) = ran?;
     for waker in waiters {
       waker.wake();
     }
     Ok(processed)
+  }
+
+  /// Drops the registrations removed while the driver was borrowed, then
+  /// hands the slots that frees to queued submissions and wakes the futures
+  /// waiting for capacity.
+  ///
+  /// Dropping a registration runs user code (its op model, callback and
+  /// buffers), which may use this `Lio`, so it happens with the driver not
+  /// borrowed. Each slot is released only after its registration is gone: the
+  /// registration points into the slot's arenas, which reuse would reset.
+  fn bury_and_wake(&self) {
+    loop {
+      let mut buried = false;
+      loop {
+        let next = self.inner.borrow_mut().dying.pop();
+        let Some(Detached { registration, slot }) = next else {
+          break;
+        };
+        // Released even if the drop panics.
+        let _release = ReleaseSlot { lio: self, slot };
+        drop(registration);
+        buried = true;
+      }
+      if !buried {
+        return;
+      }
+      // Scheduling queued submissions may remove ops without a first action,
+      // so go around again until nothing is left to bury.
+      let waiters = Self::release_capacity(&mut self.inner.borrow_mut());
+      for waker in waiters {
+        waker.wake();
+      }
+    }
   }
 
   /// One driver turn.
@@ -581,7 +636,11 @@ impl Lio {
           stats.dispatch_count += 1;
         }
         None => {
-          timed!(PROFILE, stats, remove_time, inner_ref.store.remove_known(id));
+          // Dropped by `bury_and_wake` once the driver is not borrowed.
+          timed!(PROFILE, stats, remove_time, {
+            let detached = inner_ref.store.detach_known(id);
+            inner_ref.dying.push(detached);
+          });
           stats.remove_count += 1;
         }
       }
@@ -606,32 +665,32 @@ impl Lio {
   /// stays until the operation's completion arrives; the backend is asked to
   /// finish it early, and the completion is discarded.
   pub(crate) fn cancel_stream(&self, id: u64) {
-    let waiters = {
+    {
       let mut inner = self.inner.borrow_mut();
       let inner = &mut *inner;
       let Some(reg) = inner.store.get_mut(id) else {
         return;
       };
       if inner.time.remove(id) {
-        inner.store.remove_known(id);
+        let detached = inner.store.detach_known(id);
+        inner.dying.push(detached);
       } else {
         reg.cancel();
         inner.io.cancel(id);
         return;
       }
-      Self::release_capacity(inner)
-    };
-    for waker in waiters {
-      waker.wake();
     }
+    self.bury_and_wake();
   }
 }
 
 /// Tracks the registration whose handler is running during a run.
 ///
 /// If the handler panics, dropping the batch removes that registration: its
-/// state is unknown. The entries the run did not reach stay queued in
-/// `LioInner`, so their operations still complete on the next run.
+/// state is unknown. It is dropped on the next run rather than during the
+/// unwind, where a second panic would abort. The entries the run did not
+/// reach stay queued in `LioInner`, so their operations still complete on the
+/// next run.
 struct Batch<'a> {
   lio: &'a Lio,
   /// The registration whose handler is running.
@@ -643,8 +702,24 @@ impl Drop for Batch<'_> {
     let Some(id) = self.current.take() else {
       return;
     };
+    if let Ok(mut inner) = self.lio.inner.try_borrow_mut()
+      && let Some(detached) = inner.store.detach(id)
+    {
+      inner.dying.push(detached);
+    }
+  }
+}
+
+/// Releases a buried registration's slot, also if dropping it panicked.
+struct ReleaseSlot<'a> {
+  lio: &'a Lio,
+  slot: u32,
+}
+
+impl Drop for ReleaseSlot<'_> {
+  fn drop(&mut self) {
     if let Ok(mut inner) = self.lio.inner.try_borrow_mut() {
-      inner.store.remove(id);
+      inner.store.release(self.slot);
     }
   }
 }

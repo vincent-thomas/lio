@@ -141,33 +141,37 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     key: SlabKey,
     on_remove: impl FnOnce(&mut T) -> R,
   ) -> Option<R> {
+    let removed = self.retire_with(key, on_remove)?;
+    self.release(key.slot());
+    Some(removed)
+  }
+
+  /// Like [`remove_with`](Self::remove_with), but the slot is not reused
+  /// until [`release`](Self::release)d: `key` stops resolving at once, while
+  /// the slot's state stays untouched by allocation in the meantime.
+  #[inline]
+  pub(crate) fn retire_with<R>(
+    &mut self,
+    key: SlabKey,
+    on_remove: impl FnOnce(&mut T) -> R,
+  ) -> Option<R> {
     let slot = self.slots.get_mut(key.slot() as usize)?;
     if slot.generation != key.generation() || !slot.occupied {
       return None;
     }
-
-    let removed = on_remove(&mut slot.state);
-    slot.occupied = false;
-    if TRACK_LEN {
-      self.len -= 1;
-    }
-    slot.generation = slot.generation.wrapping_add(1);
-    slot.next_free = self.free_head;
-    self.free_head = key.slot();
-    Some(removed)
+    Some(self.retire_known_with(key, on_remove))
   }
 
-  /// Removes a slot whose generational key was already validated under the
-  /// same exclusive pool borrow. `on_remove` must not panic, as for
-  /// [`remove_with`](Self::remove_with).
+  /// [`retire_with`](Self::retire_with) for a key already validated under
+  /// the same exclusive pool borrow. `on_remove` must not panic.
   #[inline]
-  pub(crate) fn remove_known_with<R>(
+  pub(crate) fn retire_known_with<R>(
     &mut self,
     key: SlabKey,
     on_remove: impl FnOnce(&mut T) -> R,
   ) -> R {
     let slot = &mut self.slots[key.slot() as usize];
-    debug_assert!(slot.generation == key.generation() && slot.occupied);
+    assert!(slot.generation == key.generation() && slot.occupied);
 
     let removed = on_remove(&mut slot.state);
     slot.occupied = false;
@@ -175,9 +179,17 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
       self.len -= 1;
     }
     slot.generation = slot.generation.wrapping_add(1);
-    slot.next_free = self.free_head;
-    self.free_head = key.slot();
     removed
+  }
+
+  /// Makes a slot retired by [`retire_with`](Self::retire_with) available
+  /// for allocation again.
+  #[inline]
+  pub(crate) fn release(&mut self, slot_idx: u32) {
+    let slot = &mut self.slots[slot_idx as usize];
+    debug_assert!(!slot.occupied);
+    slot.next_free = self.free_head;
+    self.free_head = slot_idx;
   }
 
   /// Whether `allocate` would succeed.
