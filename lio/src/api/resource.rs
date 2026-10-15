@@ -320,7 +320,7 @@ impl Resource {
     completion: &crate::api::op::Completion,
   ) -> io::Result<Self> {
     if completion.result < 0 {
-      return Err(io::Error::from_raw_os_error((-completion.result) as i32));
+      return Err(completion.os_error());
     }
     let raw = raw_from_result(completion.result).ok_or_else(|| {
       io::Error::new(

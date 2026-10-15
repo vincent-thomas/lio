@@ -237,9 +237,7 @@ impl<T: FromResource + std::marker::Send + 'static> OpModel
       BindListenerState::Bind { resource } => {
         if completion.result < 0 {
           self.state = BindListenerState::Done;
-          OpResult::Done(Err(io::Error::from_raw_os_error(
-            (-completion.result) as i32,
-          )))
+          OpResult::Done(Err(completion.os_error()))
         } else {
           let resource = resource.clone();
           self.state = BindListenerState::Listen { resource };
@@ -250,9 +248,7 @@ impl<T: FromResource + std::marker::Send + 'static> OpModel
         let resource = resource.clone();
         self.state = BindListenerState::Done;
         if completion.result < 0 {
-          OpResult::Done(Err(io::Error::from_raw_os_error(
-            (-completion.result) as i32,
-          )))
+          OpResult::Done(Err(completion.os_error()))
         } else {
           OpResult::Done(Ok(T::from_resource(resource)))
         }
@@ -357,9 +353,7 @@ impl<T: FromResource + std::marker::Send + 'static> OpModel
         let resource = resource.clone();
         self.state = StreamConnectState::Done;
         if completion.result < 0 {
-          OpResult::Done(Err(io::Error::from_raw_os_error(
-            (-completion.result) as i32,
-          )))
+          OpResult::Done(Err(completion.os_error()))
         } else {
           OpResult::Done(Ok(T::from_resource(resource)))
         }
@@ -467,9 +461,7 @@ impl OpModel for UdpBindSocket {
         let resource = resource.clone();
         self.state = UdpBindState::Done;
         if completion.result < 0 {
-          OpResult::Done(Err(io::Error::from_raw_os_error(
-            (-completion.result) as i32,
-          )))
+          OpResult::Done(Err(completion.os_error()))
         } else {
           OpResult::Done(Ok(UdpSocket::from_resource(resource)))
         }
@@ -547,9 +539,7 @@ impl OpModel for UdpConnectSocket {
         let resource = resource.clone();
         self.state = UdpConnectState::Done;
         if completion.result < 0 {
-          OpResult::Done(Err(io::Error::from_raw_os_error(
-            (-completion.result) as i32,
-          )))
+          OpResult::Done(Err(completion.os_error()))
         } else {
           OpResult::Done(Ok(UdpSocket::from_resource(resource)))
         }
