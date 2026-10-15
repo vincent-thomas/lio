@@ -113,9 +113,10 @@ impl OpStore {
         slot.model_bump.reset();
         slot.step_bump.reset();
         let registration = slot.registration.write(init(&mut slot.model_bump));
-        let guard = DropOnUnwind(registration);
-        action = guard.0.action();
-        std::mem::forget(guard);
+        let mut guard = DropOnUnwind { registration, armed: true };
+        action = guard.registration.action();
+        // It returned: the slot gets claimed and owns the registration now.
+        guard.armed = false;
       })
       .expect("insert_with_action on a full store");
     (key.as_u64(), action, &mut slot.step_bump)
@@ -173,14 +174,19 @@ impl OpStore {
 }
 
 /// Drops a registration that was written into a slot not claimed yet, if
-/// whatever runs before the claim panics.
-struct DropOnUnwind<'a>(&'a mut Registration);
+/// whatever runs before the claim panics. Disarmed once that code returned.
+struct DropOnUnwind<'a> {
+  registration: &'a mut Registration,
+  armed: bool,
+}
 
 impl Drop for DropOnUnwind<'_> {
   fn drop(&mut self) {
-    // SAFETY: only reached while unwinding out of `insert_with_action`. The
-    // slot was never claimed, so nothing else will drop or read this value.
-    unsafe { std::ptr::drop_in_place(self.0) };
+    if self.armed {
+      // SAFETY: still armed, so `insert_with_action` is unwinding. The slot
+      // was never claimed, so nothing else will drop or read this value.
+      unsafe { std::ptr::drop_in_place(self.registration) };
+    }
   }
 }
 
