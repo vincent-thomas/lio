@@ -180,7 +180,9 @@ impl Clock {
 
     let slot_index = id as u32 as usize;
     if slot_index >= self.timers.len() {
-      self.grow_timer_slots(slot_index + 1);
+      // Checked: on 32-bit targets `u32::MAX + 1` would wrap to 0.
+      let required = slot_index.checked_add(1).expect("timer id out of range");
+      self.grow_timer_slots(required);
     }
     let entry = TimerEntry { deadline_ticks, pending_index: ACTIVE_TIMER };
     let previous =
@@ -203,7 +205,10 @@ impl Clock {
   #[cold]
   #[inline(never)]
   fn grow_timer_slots(&mut self, required_len: usize) {
-    self.timers.resize(required_len, TimerSlot::EMPTY);
+    // Never shrinks: wheel and pending entries index slots unchecked.
+    if required_len > self.timers.len() {
+      self.timers.resize(required_len, TimerSlot::EMPTY);
+    }
   }
 
   #[cold]
@@ -786,5 +791,19 @@ mod tests {
     clock.advance_to(day * 2);
     assert_eq!(collect_expired(&mut clock), vec![1]);
     assert!(start.elapsed() < Duration::from_millis(100));
+  }
+
+  /// Wheel entries index timer slots unchecked, so asking for fewer slots
+  /// must never drop any.
+  #[test]
+  fn timer_slots_never_shrink() {
+    let mut clock = Clock::new();
+    clock.schedule(9, Duration::from_millis(5));
+    let len = clock.timers.len();
+    assert!(len >= 10);
+    clock.grow_timer_slots(1);
+    assert_eq!(clock.timers.len(), len);
+    clock.advance_by(5);
+    assert_eq!(collect_expired(&mut clock), vec![9]);
   }
 }
