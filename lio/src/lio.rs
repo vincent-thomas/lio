@@ -270,6 +270,10 @@ impl Lio {
   /// and [`Io::send`](crate::api::Io::send) queue the operation, which
   /// allocates; see [`Lio::is_full`].
   ///
+  /// # Errors
+  ///
+  /// As for [`Lio::new_with_backend`]; in particular `cap` must not be zero.
+  ///
   /// # Example
   ///
   /// ```
@@ -289,10 +293,22 @@ impl Lio {
   /// * `backend` - The I/O backend implementation (e.g., io_uring, epoll/kqueue)
   /// * `cap` - The number of operations that can be in flight at once; see
   ///   [`Lio::new`]
+  ///
+  /// # Errors
+  ///
+  /// [`io::ErrorKind::InvalidInput`] if `cap` is zero: such a driver could
+  /// never run an operation. Otherwise, whatever initializing the backend
+  /// reports.
   pub fn new_with_backend<D>(mut backend: D, cap: usize) -> io::Result<Self>
   where
     D: IoBackend + 'static,
   {
+    if cap == 0 {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "lio capacity must be at least 1",
+      ));
+    }
     backend.init(cap)?;
 
     let inner = LioInner {
