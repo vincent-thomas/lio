@@ -242,3 +242,9 @@ fn panicking_first_action_does_not_keep_its_slot() {
   lio.try_run().unwrap();
   assert!(done.get());
 }
+
+#[test]
+fn zero_capacity_is_rejected() {
+  let err = Lio::new_with_backend(InOrderBackend::default(), 0).err();
+  assert_eq!(err.map(|e| e.kind()), Some(std::io::ErrorKind::InvalidInput));
+}
