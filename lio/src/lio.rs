@@ -16,11 +16,6 @@ use std::{
 
 use bumpalo::Bump;
 
-/// Result code returned to userspace when a sleep timer fires.
-/// Always `0` — the driver normalizes timer expiry before routing
-/// to models, so models never need to interpret OS-specific errno values.
-const SLEEP_RESULT: isize = 0;
-
 thread_local! {
   static GLOBAL_LIO: RefCell<Option<Lio>> = const { RefCell::new(None) };
 }
@@ -442,25 +437,19 @@ impl Lio {
 
     timed!(PROFILE, stats, flush_time, inner_ref.io.flush())?;
 
-    // Compute effective timeout: min of user timeout and next timer deadline.
-    // Avoid touching the clock on the common pure-I/O path.
-    let has_timers = !inner_ref.time.is_empty();
-    let next_deadline = if has_timers {
-      timed!(PROFILE, stats, next_deadline_time, inner_ref.time.next_deadline())
-    } else {
-      None
-    };
-    let effective_timeout = match (timeout, next_deadline) {
-      (Some(user), Some(timer)) => Some(user.min(timer)),
-      (Some(user), None) => Some(user),
-      (None, Some(timer)) => Some(timer),
-      (None, None) => None,
-    };
     // Work already queued is ready now; don't block on the backend first.
     let queued =
       !inner_ref.ready_io.is_empty() || !inner_ref.ready_timers.is_empty();
-    let effective_timeout =
-      if queued { Some(Duration::ZERO) } else { effective_timeout };
+    let effective_timeout = if queued {
+      Some(Duration::ZERO)
+    } else {
+      timed!(
+        PROFILE,
+        stats,
+        next_deadline_time,
+        inner_ref.time.wait_timeout(timeout)
+      )
+    };
 
     inner_ref.completed.clear();
     let (io, completed) = (&mut inner_ref.io, &mut inner_ref.completed);
@@ -471,18 +460,14 @@ impl Lio {
     inner_ref.ready_io.extend(inner_ref.completed.drain(..));
     waited?;
 
-    // `has_timers` also includes fired timers waiting to be drained, so an
-    // empty clock is safe to skip entirely.
-    if has_timers {
-      let before = inner_ref.ready_timers.len();
-      timed!(
-        PROFILE,
-        stats,
-        timer_poll_time,
-        inner_ref.ready_timers.extend(inner_ref.time.poll_expired())
-      );
-      stats.timer_expirations += inner_ref.ready_timers.len() - before;
-    }
+    let before = inner_ref.ready_timers.len();
+    timed!(
+      PROFILE,
+      stats,
+      timer_poll_time,
+      inner_ref.ready_timers.extend(inner_ref.time.poll_expired())
+    );
+    stats.timer_expirations += inner_ref.ready_timers.len() - before;
     let resource_close = inner_ref.resource_close;
 
     // Route what is queued now, not what nested runs queue meanwhile, so
@@ -499,11 +484,7 @@ impl Lio {
           Completion::new(c.result()).with_resource_close(resource_close);
         (c.registration_id(), completion, false)
       } else if let Some(id) = inner.ready_timers.pop_front() {
-        let completion = Completion::with_flags(
-          SLEEP_RESULT,
-          crate::api::op::CompletionFlags::TIMER,
-        );
-        (id, completion, true)
+        (id, TimeManager::fired_completion(), true)
       } else {
         // A nested run routed the rest.
         break;
