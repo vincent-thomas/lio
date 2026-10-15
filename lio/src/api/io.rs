@@ -549,6 +549,11 @@ where
 {
   fn drop(&mut self) {
     if let IoStreamFutureState::Inflight { id, slot } = &self.state {
+      // The callback shares the slot. Once the registration (and with it the
+      // callback) is gone, `id` is stale: a later operation may reuse it.
+      if Rc::strong_count(slot) == 1 {
+        return;
+      }
       // The operation may still complete; nobody is left to wake then.
       slot.borrow_mut().waker = None;
       self.lio.cancel_stream(*id);
@@ -607,8 +612,9 @@ where
 {
   /// Not yet submitted - waiting for first `next()` call.
   Pending(T),
-  /// Submitted and awaiting completion.
-  Inflight { id: u64, receiver: std::sync::mpsc::Receiver<T::Item> },
+  /// Submitted and awaiting completion, on the driver resolved at submission:
+  /// `id` only means something there, even if the global `Lio` changes.
+  Inflight { id: u64, receiver: std::sync::mpsc::Receiver<T::Item>, lio: Lio },
   /// Stream is done, no more items.
   Done,
 }
@@ -727,22 +733,22 @@ impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
             Registration::new_waker_in(arena, cx.waker().clone(), tx, stream_op)
           })
           .expect("lio rejected an operation it had capacity for");
-        stream.state = IoStreamState::Inflight { id, receiver: rx };
+        stream.state = IoStreamState::Inflight { id, receiver: rx, lio };
         Poll::Pending
       }
 
-      IoStreamState::Inflight { id, receiver } => {
+      IoStreamState::Inflight { id, receiver, lio } => {
         // Try to receive typed result from channel
         match receiver.try_recv() {
           Ok(item) => {
             // Got a result! Stay in Inflight for next call (multishot)
-            stream.state = IoStreamState::Inflight { id, receiver };
+            stream.state = IoStreamState::Inflight { id, receiver, lio };
             Poll::Ready(Some(item))
           }
           Err(std::sync::mpsc::TryRecvError::Empty) => {
             // No result yet, update waker and stay in Inflight
-            stream.handle.lio().set_waker(id, cx.waker().clone());
-            stream.state = IoStreamState::Inflight { id, receiver };
+            lio.set_waker(id, cx.waker().clone());
+            stream.state = IoStreamState::Inflight { id, receiver, lio };
             Poll::Pending
           }
           Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -762,8 +768,15 @@ impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
 impl<T: OpModel> Drop for IoStream<T> {
   fn drop(&mut self) {
     // If the stream is inflight, cancel the operation
-    if let IoStreamState::Inflight { id, .. } = self.state {
-      self.handle.lio().cancel_stream(id);
+    if let IoStreamState::Inflight { id, receiver, lio } = &self.state {
+      // The registration holds the sender. Once it is gone, `id` is stale: a
+      // later operation may reuse it.
+      if let Err(std::sync::mpsc::TryRecvError::Disconnected) =
+        receiver.try_recv()
+      {
+        return;
+      }
+      lio.cancel_stream(*id);
     }
   }
 }
