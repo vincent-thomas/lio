@@ -419,7 +419,7 @@ impl OpModel for Connect {
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
-      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       Ok(())
     })
@@ -476,7 +476,7 @@ impl OpModel for Bind {
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
-      Err(io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       Ok(())
     })
@@ -509,7 +509,7 @@ impl OpModel for Listen {
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
-      Err(io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       Ok(())
     })
@@ -542,7 +542,7 @@ impl OpModel for Shutdown {
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
-      Err(io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       Ok(())
     })
@@ -574,7 +574,7 @@ impl OpModel for Fsync {
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
-      Err(io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       Ok(())
     })
@@ -739,7 +739,7 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
     let mut buf = self.buf.take().expect("buffer not available");
 
     let result = if completion.result < 0 {
-      Err(io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       let mut remaining = completion.result as usize;
       for i in 0..self.iov_count {
@@ -878,7 +878,7 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     let buf = self.buf.take().expect("buffer not available");
     let result = if completion.result < 0 {
-      Err(io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       Ok(completion.result as i32)
     };
@@ -1018,7 +1018,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
     let mut buf = self.buf.take().expect("buffer not available");
 
     let result = if completion.result < 0 {
-      Err(io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       let mut remaining = completion.result as usize;
       for i in 0..self.iov_count {
@@ -1274,7 +1274,7 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Send<B> {
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     let buf = self.buf.take().expect("buffer not available");
     let result = if completion.result < 0 {
-      Err(io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       Ok(completion.result as i32)
     };
@@ -1379,11 +1379,8 @@ impl OpModel for Sleep {
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     debug_assert!(completion.flags.contains(CompletionFlags::TIMER));
 
-    let result = if completion.result == 0 {
-      Ok(())
-    } else {
-      Err(io::Error::from_raw_os_error(completion.result.abs() as i32))
-    };
+    let result =
+      if completion.result == 0 { Ok(()) } else { Err(completion.os_error()) };
 
     OpResult::Done(result)
   }
@@ -1439,11 +1436,8 @@ impl OpModel for Interval {
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     debug_assert!(completion.flags.contains(CompletionFlags::TIMER));
 
-    let result = if completion.result == 0 {
-      Ok(())
-    } else {
-      Err(io::Error::from_raw_os_error(completion.result.abs() as i32))
-    };
+    let result =
+      if completion.result == 0 { Ok(()) } else { Err(completion.os_error()) };
 
     OpResult::Yield(result)
   }
@@ -1589,7 +1583,7 @@ impl OpModel for Stat {
     let res = if matches!(self.target, StatModelTarget::InvalidPath) {
       Err(nul_path_error())
     } else if completion.result < 0 {
-      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       Ok(self.out)
     };
@@ -1629,7 +1623,7 @@ impl OpModel for ReadDir {
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
-      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       Ok(std::mem::take(&mut self.buf))
     };
@@ -1755,11 +1749,8 @@ impl OpModel for UnlinkAt {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let res = if completion.result < 0 {
-      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
-    } else {
-      Ok(())
-    };
+    let res =
+      if completion.result < 0 { Err(completion.os_error()) } else { Ok(()) };
     OpResult::Done(res)
   }
 }
@@ -1826,11 +1817,8 @@ impl OpModel for RenameAt {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let res = if completion.result < 0 {
-      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
-    } else {
-      Ok(())
-    };
+    let res =
+      if completion.result < 0 { Err(completion.os_error()) } else { Ok(()) };
     OpResult::Done(res)
   }
 }
@@ -1890,11 +1878,8 @@ impl OpModel for MkdirAt {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let res = if completion.result < 0 {
-      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
-    } else {
-      Ok(())
-    };
+    let res =
+      if completion.result < 0 { Err(completion.os_error()) } else { Ok(()) };
     OpResult::Done(res)
   }
 }
@@ -1959,11 +1944,8 @@ impl OpModel for LinkAt {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let res = if completion.result < 0 {
-      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
-    } else {
-      Ok(())
-    };
+    let res =
+      if completion.result < 0 { Err(completion.os_error()) } else { Ok(()) };
     OpResult::Done(res)
   }
 }
@@ -2045,7 +2027,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     let mut buf = self.buf.take().expect("buffer not available");
     let result = if completion.result < 0 {
-      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       let len = (completion.result as usize).min(self.raw_len);
       // SAFETY: the kernel wrote `len <= raw_len` bytes into the region
@@ -2083,7 +2065,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     let mut buf = self.buf.take().expect("buffer not available");
     let result = if completion.result < 0 {
-      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       let bytes = self.out.as_encoded_bytes();
 
@@ -2174,7 +2156,7 @@ impl OpModel for Spawn {
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     let result = if completion.result < 0 {
-      Err(std::io::Error::from_raw_os_error((-completion.result) as i32))
+      Err(completion.os_error())
     } else {
       Ok(crate::api::Pid::from_raw(completion.result as i64))
     };
