@@ -202,7 +202,7 @@ impl OpModel for Copy {
           OpResult::Done(Err(Self::write_zero()))
         }
         OpResult::Done((Ok(n), mut buf)) => {
-          let written = n as usize;
+          let written = n;
           if written < buf.len() {
             let remaining = buf.len() - written;
             buf.copy_within(written.., 0);

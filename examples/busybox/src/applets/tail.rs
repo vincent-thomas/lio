@@ -284,7 +284,7 @@ fn read_chunk(
   let (result, returned_buf) = io_util::run(ctx.lio(), rx);
   *buf = returned_buf;
 
-  let n = result? as usize;
+  let n = result?;
   if n == 0 && buf.len() != 8192 {
     buf.resize(8192, 0);
   }
@@ -439,7 +439,7 @@ fn tail_last_lines_fd(
     let (result, returned_buf) = io_util::run(ctx.lio(), rx);
     buf = returned_buf;
 
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }
@@ -483,7 +483,7 @@ fn tail_last_bytes_fd(
     let (result, returned_buf) = io_util::run(ctx.lio(), rx);
     buf = returned_buf;
 
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }
@@ -519,7 +519,7 @@ fn tail_lines_from_start_fd(
     let (result, returned_buf) = io_util::run(ctx.lio(), rx);
     buf = returned_buf;
 
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }
@@ -560,7 +560,7 @@ fn tail_lines_from_start_stream(
     let (result, returned_buf) = io_util::run(ctx.lio(), rx);
     buf = returned_buf;
 
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }
@@ -606,7 +606,7 @@ fn tail_bytes_from_start_stream(
     let (result, returned_buf) = io_util::run(ctx.lio(), rx);
     buf = returned_buf;
 
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }
@@ -641,7 +641,7 @@ fn read_all_fd(
     let (result, returned_buf) = io_util::run(ctx.lio(), rx);
     buf = returned_buf;
 
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }
@@ -663,7 +663,7 @@ fn stream_all_fd(
     let (result, returned_buf) = io_util::run(ctx.lio(), rx);
     buf = returned_buf;
 
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }

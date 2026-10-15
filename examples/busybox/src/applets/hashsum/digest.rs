@@ -76,7 +76,7 @@ where
     let rx = api::read(fd, buf).with_lio(lio).send();
     let (result, returned_buf) = io_util::run(lio, rx);
     buf = returned_buf;
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }

@@ -72,7 +72,7 @@ fn write_all_at(
         .send();
 
     let (result, returned_buf) = common::poll_recv(lio, &mut receiver);
-    let bytes_written = result.unwrap() as usize;
+    let bytes_written = result.unwrap();
 
     assert!(bytes_written <= returned_buf.len());
     assert_eq!(returned_buf, chunk);
@@ -87,7 +87,7 @@ fn write_all_at(
 fn read_once(lio: &mut Lio, fd: &Resource, len: usize) -> (usize, Vec<u8>) {
   let mut receiver = api::read(fd, vec![0u8; len]).with_lio(lio).send();
   let (result, buf) = common::poll_recv(lio, &mut receiver);
-  (result.unwrap() as usize, buf)
+  (result.unwrap(), buf)
 }
 
 fn read_once_at(
@@ -99,7 +99,7 @@ fn read_once_at(
   let mut receiver =
     api::read_at(fd, vec![0u8; len], offset).with_lio(lio).send();
   let (result, buf) = common::poll_recv(lio, &mut receiver);
-  (result.unwrap() as usize, buf)
+  (result.unwrap(), buf)
 }
 
 fn read_exact(lio: &mut Lio, fd: &Resource, len: usize) -> Vec<u8> {

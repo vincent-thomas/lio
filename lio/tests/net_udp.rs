@@ -13,7 +13,7 @@ use lio::{
 struct ReceiverNode {
   socket_rx: Option<Receiver<std::io::Result<UdpSocket>>>,
   socket: Option<UdpSocket>,
-  recv_rx: Option<Receiver<(std::io::Result<i32>, Vec<u8>)>>,
+  recv_rx: Option<Receiver<(std::io::Result<usize>, Vec<u8>)>>,
   recv_done: Rc<RefCell<Option<Vec<u8>>>>,
 }
 
@@ -44,7 +44,7 @@ impl ReceiverNode {
     if let Some((result, buf)) =
       self.recv_rx.as_mut().and_then(Receiver::try_recv)
     {
-      let len = result.unwrap() as usize;
+      let len = result.unwrap();
       *self.recv_done.borrow_mut() = Some(buf[..len].to_vec());
       self.recv_rx = None;
     }
@@ -55,7 +55,7 @@ struct DatagramReceiverNode {
   socket_rx: Option<Receiver<std::io::Result<UdpSocket>>>,
   socket: Option<UdpSocket>,
   recv_rx:
-    Option<Receiver<(std::io::Result<i32>, Vec<u8>, Option<SocketAddr>)>>,
+    Option<Receiver<(std::io::Result<usize>, Vec<u8>, Option<SocketAddr>)>>,
   recv_done: Rc<RefCell<Option<(Vec<u8>, Option<SocketAddr>)>>>,
 }
 
@@ -88,7 +88,7 @@ impl DatagramReceiverNode {
     if let Some((result, buf, peer_addr)) =
       self.recv_rx.as_mut().and_then(Receiver::try_recv)
     {
-      let len = result.unwrap() as usize;
+      let len = result.unwrap();
       *self.recv_done.borrow_mut() = Some((buf[..len].to_vec(), peer_addr));
       self.recv_rx = None;
     }
@@ -98,7 +98,7 @@ impl DatagramReceiverNode {
 struct SenderNode {
   socket_rx: Option<Receiver<std::io::Result<UdpSocket>>>,
   socket: Option<UdpSocket>,
-  send_rx: Option<Receiver<(std::io::Result<i32>, Vec<u8>)>>,
+  send_rx: Option<Receiver<(std::io::Result<usize>, Vec<u8>)>>,
   send_done: Rc<RefCell<bool>>,
 }
 
@@ -129,7 +129,7 @@ impl SenderNode {
     if let Some((result, buf)) =
       self.send_rx.as_mut().and_then(Receiver::try_recv)
     {
-      assert_eq!(result.unwrap(), buf.len() as i32);
+      assert_eq!(result.unwrap(), buf.len());
       *self.send_done.borrow_mut() = true;
       self.send_rx = None;
     }
@@ -139,7 +139,7 @@ impl SenderNode {
 struct DatagramSenderNode {
   socket_rx: Option<Receiver<std::io::Result<UdpSocket>>>,
   socket: Option<UdpSocket>,
-  send_rx: Option<Receiver<(std::io::Result<i32>, Vec<u8>)>>,
+  send_rx: Option<Receiver<(std::io::Result<usize>, Vec<u8>)>>,
   send_done: Rc<RefCell<bool>>,
 }
 
@@ -170,7 +170,7 @@ impl DatagramSenderNode {
     if let Some((result, buf)) =
       self.send_rx.as_mut().and_then(Receiver::try_recv)
     {
-      assert_eq!(result.unwrap(), buf.len() as i32);
+      assert_eq!(result.unwrap(), buf.len());
       *self.send_done.borrow_mut() = true;
       self.send_rx = None;
     }

@@ -46,7 +46,7 @@ fn stream_round_trip() {
 
   let mut recv = server.recv(vec![0u8; 16]).with_lio(&lio).send();
   let (read, buf) = poll_recv(&mut lio, &mut recv);
-  assert_eq!(&buf[..read.unwrap() as usize], b"ping");
+  assert_eq!(&buf[..read.unwrap()], b"ping");
 }
 
 #[test]

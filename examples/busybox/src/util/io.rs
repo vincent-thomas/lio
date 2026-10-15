@@ -59,7 +59,7 @@ pub fn write_once(
   lio: &Lio,
   fd: &Resource,
   buf: Vec<u8>,
-) -> (std::io::Result<i32>, Vec<u8>) {
+) -> (std::io::Result<usize>, Vec<u8>) {
   let rx = api::write(fd, buf).with_lio(lio).send();
   run(lio, rx)
 }
@@ -76,7 +76,7 @@ pub fn write_all_reusing_buffer(
 ) -> io::Result<Vec<u8>> {
   while !buf.is_empty() {
     let (result, mut returned_buf) = write_once(lio, fd, buf);
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       return Err(io::Error::new(
         io::ErrorKind::WriteZero,
@@ -117,7 +117,7 @@ pub fn read_to_bytes_fd(lio: &Lio, input: &Resource) -> io::Result<Vec<u8>> {
     let (result, returned_buf) = run(lio, rx);
     buf = returned_buf;
 
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }

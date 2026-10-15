@@ -80,7 +80,7 @@ fn basic() {
     .send();
 
   let (bytes_sent, returned_buf) = poll_recv(&mut lio, &mut sender_op);
-  let bytes_sent = bytes_sent.expect("sendto failed") as usize;
+  let bytes_sent = bytes_sent.expect("sendto failed");
 
   assert_eq!(bytes_sent, data.len());
   assert_eq!(returned_buf, data);
@@ -104,7 +104,7 @@ fn multiple() {
       .send_with(sender_send);
 
     let (bytes_sent, returned_buf) = poll_until_recv(&mut lio, &receiver_send);
-    let bytes_sent = bytes_sent.expect("sendto failed") as usize;
+    let bytes_sent = bytes_sent.expect("sendto failed");
 
     assert_eq!(bytes_sent, expected.len());
     assert_eq!(returned_buf, expected);
@@ -155,7 +155,7 @@ fn large_data() {
     api::sendto(&sender, data, receiver_addr, None).with_lio(&mut lio).send();
 
   let (bytes_sent, returned_buf) = poll_recv(&mut lio, &mut sender_op);
-  let bytes_sent = bytes_sent.expect("sendto large_data failed") as usize;
+  let bytes_sent = bytes_sent.expect("sendto large_data failed");
 
   assert_eq!(bytes_sent, expected.len());
   assert_eq!(returned_buf, expected);
@@ -181,7 +181,7 @@ fn tcp_stream() {
 
   match bytes_sent {
     Ok(n) => {
-      assert_eq!(n as usize, data.len());
+      assert_eq!(n, data.len());
       assert_eq!(recv_all(&accepted_fd, data.len()), data);
     }
     Err(err) => {
