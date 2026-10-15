@@ -95,8 +95,10 @@ impl OpStore {
   /// Inserts an operation and returns everything needed for its initial dispatch.
   ///
   /// Keeping the just-allocated slot borrowed avoids looking it up again by its
-  /// generational ID. The slot is only claimed once `init` returns, so a
-  /// panicking `init` leaves the store unchanged.
+  /// generational ID. The slot is only claimed once `init` and the first
+  /// [`action`](Registration::action) return, so if either panics the store
+  /// is left unchanged: a panicking `action` drops the registration instead of
+  /// leaving it in a slot nothing would ever free.
   ///
   /// The caller must have checked [`is_full`](Self::is_full) first.
   #[inline]
@@ -104,17 +106,18 @@ impl OpStore {
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> (u64, Option<Action>, &mut Bump) {
+    let mut action = None;
     let (key, slot) = self
       .slots
       .allocate_with(|slot| {
         slot.model_bump.reset();
         slot.step_bump.reset();
-        slot.registration.write(init(&mut slot.model_bump));
+        let registration = slot.registration.write(init(&mut slot.model_bump));
+        let guard = DropOnUnwind(registration);
+        action = guard.0.action();
+        std::mem::forget(guard);
       })
       .expect("insert_with_action on a full store");
-    // SAFETY: `allocate_with` returned, so `init` wrote the registration.
-    let registration = unsafe { slot.registration.assume_init_mut() };
-    let action = registration.action();
     (key.as_u64(), action, &mut slot.step_bump)
   }
 
@@ -166,6 +169,18 @@ impl OpStore {
     let key = SlabKey::from_u64(id);
     let slot = self.slots.get_mut(key)?;
     Some(&mut slot.step_bump)
+  }
+}
+
+/// Drops a registration that was written into a slot not claimed yet, if
+/// whatever runs before the claim panics.
+struct DropOnUnwind<'a>(&'a mut Registration);
+
+impl Drop for DropOnUnwind<'_> {
+  fn drop(&mut self) {
+    // SAFETY: only reached while unwinding out of `insert_with_action`. The
+    // slot was never claimed, so nothing else will drop or read this value.
+    unsafe { std::ptr::drop_in_place(self.0) };
   }
 }
 

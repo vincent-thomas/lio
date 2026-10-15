@@ -1,7 +1,7 @@
 //! Going over `Lio::new(cap)` must not panic: futures wait for a free slot,
 //! and `when_done` / `send` / `send_with` queue the operation.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -199,4 +199,46 @@ fn stream_over_capacity_waits_instead_of_ending() {
     }
   }
   panic!("the stream never produced its item");
+}
+
+/// Panics in its first `action`; records being dropped.
+struct PanicsOnAction(Arc<AtomicBool>);
+
+impl Drop for PanicsOnAction {
+  fn drop(&mut self) {
+    self.0.store(true, Ordering::SeqCst);
+  }
+}
+
+impl OpModel for PanicsOnAction {
+  type Item = ();
+
+  fn action(&mut self) -> Action {
+    panic!("no action for you");
+  }
+
+  fn complete(&mut self, _: Completion) -> OpResult<()> {
+    OpResult::Done(())
+  }
+}
+
+#[test]
+fn panicking_first_action_does_not_keep_its_slot() {
+  // Capacity 1: if the panicking op kept its slot, nothing more would run.
+  let lio = lio(1);
+  let dropped = Arc::new(AtomicBool::new(false));
+  let op = PanicsOnAction(dropped.clone());
+
+  let submit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    Io::from_op(op).with_lio(&lio).when_done(|_| {});
+  }));
+  assert!(submit.is_err(), "the panic reaches the submitter");
+  assert!(dropped.load(Ordering::SeqCst), "the op was released");
+  assert!(!lio.is_full(), "and its slot with it");
+
+  let done = Rc::new(Cell::new(false));
+  let set = done.clone();
+  api::nop().with_lio(&lio).when_done(move |_| set.set(true));
+  lio.try_run().unwrap();
+  assert!(done.get());
 }
