@@ -13,7 +13,7 @@ use std::{
   collections::VecDeque,
   io,
   mem::ManuallyDrop,
-  rc::Rc,
+  rc::{Rc, Weak},
   task::Waker,
   time::{Duration, Instant},
 };
@@ -26,17 +26,32 @@ thread_local! {
 
 /// Guard returned by [`install_global`].
 ///
-/// Dropping the guard uninstalls the thread-local global [`Lio`].
+/// Dropping the guard uninstalls the thread-local global [`Lio`] it
+/// installed. If that one was already uninstalled, and possibly replaced by
+/// another, the guard leaves the global alone.
 #[must_use = "Dropping the guard immediately uninstalls the global Lio"]
 pub struct GlobalLioGuard {
-  installed: bool,
+  /// The driver this guard installed, without keeping it alive.
+  installed: Weak<RefCell<LioInner>>,
 }
 
 impl Drop for GlobalLioGuard {
   fn drop(&mut self) {
-    if self.installed {
-      let _ = uninstall_global();
-    }
+    // The thread-local may already be gone if this runs during thread exit.
+    let ours = GLOBAL_LIO.try_with(|global| {
+      let mut global = global.borrow_mut();
+      let installed = &self.installed;
+      if global.as_ref().is_some_and(|lio| {
+        std::ptr::eq(Rc::as_ptr(&lio.inner), installed.as_ptr())
+      }) {
+        global.take()
+      } else {
+        None
+      }
+    });
+    // Dropped outside the thread-local's borrow: if this was the last
+    // handle, tearing the driver down runs user code that may look it up.
+    drop(ours);
   }
 }
 
@@ -58,9 +73,10 @@ pub fn install_global(lio: Lio) -> GlobalLioGuard {
         "Global Lio already installed on this thread. Drop the existing GlobalLioGuard or call uninstall_global() first."
       );
     }
+    let installed = Rc::downgrade(&lio.inner);
     *global = Some(lio);
-  });
-  GlobalLioGuard { installed: true }
+    GlobalLioGuard { installed }
+  })
 }
 
 /// Uninstalls the global Lio instance for the current thread.
