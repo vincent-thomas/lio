@@ -236,3 +236,54 @@ fn blocking_run_delivers_what_a_panic_left_behind() {
   assert!(done.get());
   assert!(start.elapsed() < Duration::from_secs(1), "without waiting");
 }
+
+#[test]
+fn nested_run_routes_the_rest_of_the_outer_batch() {
+  let lio = Lio::new_with_backend(InOrderBackend::default(), 4).unwrap();
+  let second_ran = Rc::new(Cell::new(false));
+
+  // Both complete in the same run. The first drives the loop itself until
+  // the second has run, which only a nested run can make happen.
+  let (nested, seen) = (lio.clone(), second_ran.clone());
+  api::nop().with_lio(&lio).when_done(move |_| {
+    for _ in 0..3 {
+      if seen.get() {
+        return;
+      }
+      nested.run().unwrap();
+    }
+    panic!("the nested runs never routed the second completion");
+  });
+  let set = second_ran.clone();
+  api::nop().with_lio(&lio).when_done(move |_| set.set(true));
+
+  let start = std::time::Instant::now();
+  lio.try_run().unwrap();
+  assert!(second_ran.get());
+  assert!(start.elapsed() < Duration::from_secs(1), "without waiting");
+}
+
+#[test]
+fn nested_run_through_the_global_lio_routes_the_rest() {
+  let lio = Lio::new_with_backend(InOrderBackend::default(), 4).unwrap();
+  let _guard = lio::install_global(lio.clone());
+  let second_ran = Rc::new(Cell::new(false));
+
+  // Submitted through the global; driven through the handle that was
+  // installed, which is the same driver.
+  let (nested, seen) = (lio.clone(), second_ran.clone());
+  api::nop().when_done(move |_| {
+    for _ in 0..3 {
+      if seen.get() {
+        return;
+      }
+      nested.run().unwrap();
+    }
+    panic!("the nested runs never routed the second completion");
+  });
+  let set = second_ran.clone();
+  api::nop().when_done(move |_| set.set(true));
+
+  lio.try_run().unwrap();
+  assert!(second_ran.get());
+}
