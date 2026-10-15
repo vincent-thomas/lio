@@ -8,6 +8,7 @@ use std::ffi::{CString, OsString};
 use std::io;
 use std::mem;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::time::Duration;
 
@@ -23,8 +24,9 @@ use crate::{
   backend::op::{
     FileMode, FileStat, MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, OpenFlags,
     RawBuf, ReadDirBuf, ReadFlags, RecvFlags, SendFlags, ShutdownHow,
-    SockDomain, SockProto, SockType, SocketAddrBuf, StatTarget, UnlinkKind,
-    WriteFlags, socket_addr_from_buf, socket_addr_into_buf,
+    SockDomain, SockProto, SockType, SocketAddrBuf, SocketAddrFamily,
+    StatTarget, UnlinkKind, WriteFlags, socket_addr_from_buf,
+    socket_addr_into_buf,
   },
   buf::MAX_IOV_COUNT,
 };
@@ -37,6 +39,18 @@ use lio_test::{ContractKind, ContractStep, OpModelContract};
 const TEST_RECV_FLAG: i32 = 0x40;
 #[cfg(test)]
 const TEST_SEND_FLAG: i32 = 0x4000;
+
+fn os_string_from_bytes(bytes: &[u8]) -> OsString {
+  #[cfg(unix)]
+  {
+    use std::os::unix::ffi::OsStringExt;
+    OsString::from_vec(bytes.to_vec())
+  }
+  #[cfg(not(unix))]
+  {
+    OsString::from(String::from_utf8_lossy(bytes).into_owned())
+  }
+}
 
 fn cstring_to_osstring(path: &CString) -> OsString {
   #[cfg(unix)]
@@ -202,7 +216,12 @@ impl OpModel for Accept {
 
     let addr = match socket_addr_from_buf(&self.addr) {
       Ok(addr) => addr,
-      Err(err) => return OpResult::Done(Err(err)),
+      Err(_) => {
+        return OpResult::Done(Err(io::Error::new(
+          io::ErrorKind::Unsupported,
+          "not an IP socket address; use `accept_unix` for UNIX listeners",
+        )));
+      }
     };
 
     OpResult::Done(Ok((resource, addr)))
@@ -221,6 +240,124 @@ impl Accept {
 }
 
 impl OneshotOpModel for Accept {}
+
+// ============================================================================
+// AcceptUnix
+// ============================================================================
+
+/// The address of a UNIX-domain socket: a filesystem path, or unnamed.
+///
+/// A client that connects without binding first is unnamed, so that is what
+/// [`accept_unix`](crate::api::accept_unix) usually reports for the peer.
+/// Linux abstract-namespace addresses are reported as unnamed too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnixAddr {
+  path: Option<PathBuf>,
+}
+
+impl UnixAddr {
+  /// The filesystem path, or `None` if the address is unnamed.
+  pub fn as_pathname(&self) -> Option<&Path> {
+    self.path.as_deref()
+  }
+
+  /// Whether the socket has no filesystem path.
+  pub fn is_unnamed(&self) -> bool {
+    self.path.is_none()
+  }
+
+  /// Decodes an address a backend reported. A backend that reported none is
+  /// treated as unnamed; an IP address is an error.
+  pub(crate) fn from_buf(buf: &SocketAddrBuf) -> io::Result<Self> {
+    match buf.family {
+      SocketAddrFamily::Unix => {
+        let len = (buf.unix_path_len as usize).min(buf.unix_path.len());
+        let bytes = &buf.unix_path[..len];
+        // The kernel may count the terminating NUL; an abstract address
+        // starts with one.
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let path =
+          (end > 0).then(|| PathBuf::from(os_string_from_bytes(&bytes[..end])));
+        Ok(Self { path })
+      }
+      SocketAddrFamily::Unspecified => Ok(Self { path: None }),
+      SocketAddrFamily::Ipv4 | SocketAddrFamily::Ipv6 => Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "not a UNIX socket address; use `accept` for IP listeners",
+      )),
+    }
+  }
+}
+
+/// [`Accept`] on a UNIX-domain listener, reporting the peer's [`UnixAddr`].
+pub struct AcceptUnix {
+  inner: Accept,
+}
+
+impl AcceptUnix {
+  pub(crate) fn new(res: Resource) -> Self {
+    Self { inner: Accept::new(res) }
+  }
+}
+
+impl OpModel for AcceptUnix {
+  type Item = io::Result<(Resource, UnixAddr)>;
+
+  fn action(&mut self) -> Action {
+    OpModel::action(&mut self.inner)
+  }
+
+  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    let resource = match self.inner.complete_resource(completion) {
+      Ok(resource) => resource,
+      Err(err) => return OpResult::Done(Err(err)),
+    };
+    OpResult::Done(
+      UnixAddr::from_buf(&self.inner.addr).map(|addr| (resource, addr)),
+    )
+  }
+}
+
+impl OneshotOpModel for AcceptUnix {}
+
+#[cfg(test)]
+impl OpModelContract for AcceptUnix {
+  impl_op_model_contract_runtime!();
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::stdin())
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action| matches!(action, Action::Io(Op::Accept { .. })),
+      |model| {
+        model.inner.addr =
+          crate::backend::op::unix_socket_addr_buf(b"/tmp/peer.sock").unwrap();
+      },
+      #[cfg(unix)]
+      // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
+      Completion::new(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
+      #[cfg(windows)]
+      Completion::new({
+        use std::os::windows::io::IntoRawSocket;
+        // A fresh owned socket for the resulting `Resource` to take over.
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into_raw_socket()
+          as isize
+      }),
+      |result| {
+        matches!(
+          result,
+          OpResult::Done(Ok((_res, addr)))
+            if addr.as_pathname() == Some(Path::new("/tmp/peer.sock"))
+        )
+      },
+    )]
+  }
+}
 
 #[cfg(test)]
 impl OpModelContract for Accept {
@@ -2212,6 +2349,12 @@ mod tests {
     use super::*;
 
     lio_test::test_op_model_contract!(Accept);
+  }
+
+  mod accept_unix_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(AcceptUnix);
   }
 
   mod connect_contract {
