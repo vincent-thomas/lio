@@ -114,7 +114,11 @@ impl WakerResultHandler {
         return ProcessResult::continue_with(next_action);
       }
       OpResult::Yield(item) => {
-        let _ = sender.send(item);
+        if sender.send(item).is_err() {
+          // Every receiver is gone, so nothing can take another item: stop
+          // instead of resubmitting forever.
+          return ProcessResult::done();
+        }
         let next_action = op_model.action();
         ProcessResult::continue_with(next_action)
       }
@@ -343,6 +347,26 @@ impl Registration {
     Self {
       state: State::Waker {
         waker: Some(waker),
+        handler: WakerResultHandler::new_in(arena, sender, op_model),
+      },
+      cancelled: false,
+    }
+  }
+
+  /// Create a registration that only sends results through `sender`, with
+  /// nobody to wake. It stops once every receiver is gone.
+  #[inline]
+  pub fn new_sender_in<T>(
+    arena: &mut Bump,
+    sender: mpsc::Sender<T::Item>,
+    op_model: T,
+  ) -> Self
+  where
+    T: OpModel,
+  {
+    Self {
+      state: State::Waker {
+        waker: None,
         handler: WakerResultHandler::new_in(arena, sender, op_model),
       },
       cancelled: false,
