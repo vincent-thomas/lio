@@ -661,6 +661,8 @@ where
   }
 
   /// Convert the stream into a channel receiver.
+  ///
+  /// Dropping the receiver stops the operation at its next item.
   pub fn send(self) -> StreamReceiver<T::Item>
   where
     T::Item: Send,
@@ -671,6 +673,9 @@ where
   }
 
   /// Sends each stream item through a provided channel sender.
+  ///
+  /// The operation stops at the first item that cannot be delivered because
+  /// every receiver was dropped.
   pub fn send_with(mut self, sender: std_mpsc::Sender<T::Item>)
   where
     T::Item: Send,
@@ -689,14 +694,9 @@ where
     };
 
     // Over capacity, the operation waits in a queue (see `Lio::is_full`).
+    // It stops once every receiver of `sender` is dropped.
     lio.schedule_or_queue(move |arena| {
-      Registration::new_callback_in(
-        arena,
-        move |item| {
-          let _ = sender.send(item);
-        },
-        op,
-      )
+      Registration::new_sender_in(arena, sender, op)
     });
   }
 }
