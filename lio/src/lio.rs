@@ -87,13 +87,16 @@ struct LioInner {
   /// The backend's close for resources its completions carry.
   resource_close: crate::api::resource::CloseFn,
   time: TimeManager,
-  // Reused scratch vectors for `run_inner`.
+  /// Reused buffer the backend reports completions into.
   completed: Vec<OpCompleted>,
-  expired_timers: Vec<u64>,
-  /// Completions and timers a panicking run did not get to; the next run
-  /// processes them.
-  carry_completed: Vec<OpCompleted>,
-  carry_timers: Vec<u64>,
+  /// Completions and expired timers waiting to be routed, in order.
+  ///
+  /// They live here rather than in the run that collected them so that a
+  /// nested run (from a handler) routes the rest instead of waiting on the
+  /// backend, and so that what a panicking handler left behind is simply
+  /// still queued for the next run.
+  ready_io: VecDeque<OpCompleted>,
+  ready_timers: VecDeque<u64>,
   /// Submissions made while every slot was taken, scheduled in order as
   /// slots free up. Only allocates when the driver is over capacity.
   overflow: VecDeque<PendingSubmission>,
@@ -265,9 +268,8 @@ impl Lio {
       store: OpStore::with_capacity(cap),
       time: TimeManager::with_capacity(cap),
       completed: Vec::with_capacity(cap),
-      expired_timers: Vec::with_capacity(cap),
-      carry_completed: Vec::new(),
-      carry_timers: Vec::new(),
+      ready_io: VecDeque::with_capacity(cap),
+      ready_timers: VecDeque::new(),
       overflow: VecDeque::new(),
       capacity_waiters: Vec::new(),
       profile: std::env::var_os("LIO_PROFILE").map(|_| LioProfile::default()),
@@ -454,90 +456,71 @@ impl Lio {
       (None, Some(timer)) => Some(timer),
       (None, None) => None,
     };
-    // Work a panicking handler left undelivered is ready now; don't block
-    // waiting for the backend before routing it.
-    let carried = !inner_ref.carry_completed.is_empty()
-      || !inner_ref.carry_timers.is_empty();
+    // Work already queued is ready now; don't block on the backend first.
+    let queued =
+      !inner_ref.ready_io.is_empty() || !inner_ref.ready_timers.is_empty();
     let effective_timeout =
-      if carried { Some(Duration::ZERO) } else { effective_timeout };
+      if queued { Some(Duration::ZERO) } else { effective_timeout };
 
     inner_ref.completed.clear();
     let (io, completed) = (&mut inner_ref.io, &mut inner_ref.completed);
-    timed!(PROFILE, stats, wait_time, io.wait(effective_timeout, completed))?;
+    let waited =
+      timed!(PROFILE, stats, wait_time, io.wait(effective_timeout, completed));
+    // Queue what the backend reported even if it then failed, so those
+    // operations are not lost.
+    inner_ref.ready_io.extend(inner_ref.completed.drain(..));
+    waited?;
 
-    // The lists leave `inner` while being routed: a nested run (from user
-    // code) gets fresh ones instead of clobbering them.
-    let mut completed = std::mem::take(&mut inner_ref.completed);
-    if !inner_ref.carry_completed.is_empty() {
-      completed.append(&mut inner_ref.carry_completed);
-    }
-    let carried_timers = !inner_ref.carry_timers.is_empty();
-    let mut timers = if has_timers || carried_timers {
-      let mut timers = std::mem::take(&mut inner_ref.expired_timers);
-      timers.clear();
-      timers.append(&mut inner_ref.carry_timers);
-      timers
-    } else {
-      Vec::new()
-    };
     // `has_timers` also includes fired timers waiting to be drained, so an
     // empty clock is safe to skip entirely.
     if has_timers {
+      let before = inner_ref.ready_timers.len();
       timed!(
         PROFILE,
         stats,
         timer_poll_time,
-        timers.extend(inner_ref.time.poll_expired())
+        inner_ref.ready_timers.extend(inner_ref.time.poll_expired())
       );
-      stats.timer_expirations += timers.len();
+      stats.timer_expirations += inner_ref.ready_timers.len() - before;
     }
     let resource_close = inner_ref.resource_close;
 
+    // Route what is queued now, not what nested runs queue meanwhile, so
+    // handlers that keep producing work cannot keep this run going forever.
+    let mut budget = inner_ref.ready_io.len() + inner_ref.ready_timers.len();
     let loop_started = PROFILE.then(Instant::now);
-    let mut batch = Batch {
-      lio: self,
-      completed,
-      timers,
-      next_io: 0,
-      next_timer: 0,
-      current: None,
-      finished: false,
-    };
+    let mut batch = Batch { lio: self, current: None };
     let mut processed = 0;
-    while let Some(&c) = batch.completed.get(batch.next_io) {
-      batch.next_io += 1;
-      let completion =
-        Completion::new(c.result()).with_resource_close(resource_close);
+    while budget > 0 {
+      budget -= 1;
+      let (id, completion, timer) = if let Some(c) = inner.ready_io.pop_front()
+      {
+        let completion =
+          Completion::new(c.result()).with_resource_close(resource_close);
+        (c.registration_id(), completion, false)
+      } else if let Some(id) = inner.ready_timers.pop_front() {
+        let completion = Completion::with_flags(
+          SLEEP_RESULT,
+          crate::api::op::CompletionFlags::TIMER,
+        );
+        (id, completion, true)
+      } else {
+        // A nested run routed the rest.
+        break;
+      };
       let routed;
-      (inner, routed) = self.route::<PROFILE>(
-        inner,
-        &mut batch,
-        c.registration_id(),
-        completion,
-        false,
-        &mut stats,
-      );
+      (inner, routed) = self
+        .route::<PROFILE>(inner, &mut batch, id, completion, timer, &mut stats);
       if routed {
         processed += 1;
       } else {
         stats.stale_completions += 1;
       }
     }
-    while let Some(&id) = batch.timers.get(batch.next_timer) {
-      batch.next_timer += 1;
-      let completion = Completion::with_flags(
-        SLEEP_RESULT,
-        crate::api::op::CompletionFlags::TIMER,
-      );
-      (inner, _) = self
-        .route::<PROFILE>(inner, &mut batch, id, completion, true, &mut stats);
-      processed += 1;
-    }
     if let Some(started) = loop_started {
       stats.completion_loop_time += started.elapsed();
     }
 
-    batch.finish(&mut inner);
     if PROFILE && let Some(profile) = inner.profile.as_mut() {
       stats.completions_returned = processed;
       profile.merge(&stats);
@@ -649,50 +632,24 @@ impl Lio {
   }
 }
 
-/// The completions and expired timers of one run, consumed in order.
+/// Tracks the registration whose handler is running during a run.
 ///
-/// `finish` hands the lists back for reuse. If a handler panics instead,
-/// dropping the batch removes that handler's registration (its state is
-/// unknown) and carries the entries it did not reach over to the next run, so
-/// their operations still complete.
+/// If the handler panics, dropping the batch removes that registration: its
+/// state is unknown. The entries the run did not reach stay queued in
+/// `LioInner`, so their operations still complete on the next run.
 struct Batch<'a> {
   lio: &'a Lio,
-  completed: Vec<OpCompleted>,
-  timers: Vec<u64>,
-  next_io: usize,
-  next_timer: usize,
   /// The registration whose handler is running.
   current: Option<u64>,
-  finished: bool,
-}
-
-impl Batch<'_> {
-  fn finish(&mut self, inner: &mut LioInner) {
-    self.finished = true;
-    self.completed.clear();
-    self.timers.clear();
-    // A nested run may have put back lists of its own; keep the larger.
-    if inner.completed.capacity() < self.completed.capacity() {
-      inner.completed = std::mem::take(&mut self.completed);
-    }
-    if inner.expired_timers.capacity() < self.timers.capacity() {
-      inner.expired_timers = std::mem::take(&mut self.timers);
-    }
-  }
 }
 
 impl Drop for Batch<'_> {
   fn drop(&mut self) {
-    if self.finished {
-      return;
-    }
-    let Ok(mut inner) = self.lio.inner.try_borrow_mut() else {
+    let Some(id) = self.current.take() else {
       return;
     };
-    if let Some(id) = self.current.take() {
+    if let Ok(mut inner) = self.lio.inner.try_borrow_mut() {
       inner.store.remove(id);
     }
-    inner.carry_completed.extend_from_slice(&self.completed[self.next_io..]);
-    inner.carry_timers.extend_from_slice(&self.timers[self.next_timer..]);
   }
 }
