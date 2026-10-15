@@ -289,3 +289,29 @@ fn dropped_accept_frees_its_slot() {
   }
   panic!("the cancelled accept never released its slot");
 }
+
+#[test]
+fn stream_on_the_global_lio_cancels_on_the_driver_it_ran_on() {
+  let first = Lio::new(1).unwrap();
+  let guard = lio::install_global(first.clone());
+  // Submitted through the global, so on `first`.
+  let mut stream = api::interval(Duration::from_secs(3600));
+  let mut next = Box::pin(stream.next());
+  let mut cx = Context::from_waker(Waker::noop());
+  assert!(next.as_mut().poll(&mut cx).is_pending());
+  drop(next);
+  assert!(first.is_full());
+
+  // Another driver becomes the global; its first op gets the same id.
+  drop(guard);
+  let second = Lio::new(1).unwrap();
+  let _guard = lio::install_global(second.clone());
+  let mut sleep = Box::pin(
+    api::sleep(Duration::from_secs(60)).with_lio(&second).into_future(),
+  );
+  assert!(sleep.as_mut().poll(&mut cx).is_pending());
+
+  drop(stream);
+  assert!(!first.is_full(), "the stream's own operation was cancelled");
+  assert!(second.is_full(), "the other driver's operation was left alone");
+}
