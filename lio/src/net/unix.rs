@@ -37,6 +37,8 @@ use crate::{
   net::ops::{BindListener, StreamConnect, UnixAccept},
 };
 
+pub use crate::api::UnixAddr;
+
 use super::socket::Socket;
 
 /// Socket-create/bind/listen operation that returns a [`UnixListener`].
@@ -166,6 +168,32 @@ mod tests {
     let long = "x".repeat(200);
     let err = path_to_addr(Path::new(&long)).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+  }
+
+  #[test]
+  fn unix_addr_decodes_paths_and_unnamed_peers() {
+    let named =
+      UnixAddr::from_buf(&path_to_addr(Path::new("/tmp/a.sock")).unwrap());
+    assert_eq!(named.unwrap().as_pathname(), Some(Path::new("/tmp/a.sock")));
+
+    // Counted terminating NUL.
+    let mut with_nul = unix_socket_addr_buf(b"/tmp/b.sock\0").unwrap();
+    with_nul.unix_path_len = 12;
+    let decoded = UnixAddr::from_buf(&with_nul).unwrap();
+    assert_eq!(decoded.as_pathname(), Some(Path::new("/tmp/b.sock")));
+
+    for unnamed in [
+      unix_socket_addr_buf(b"").unwrap(),
+      unix_socket_addr_buf(b"\0abstract").unwrap(),
+      SocketAddrBuf::unspecified(),
+    ] {
+      assert!(UnixAddr::from_buf(&unnamed).unwrap().is_unnamed());
+    }
+
+    let ip =
+      crate::backend::op::socket_addr_into_buf("127.0.0.1:1".parse().unwrap());
+    let err = UnixAddr::from_buf(&ip).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
   }
 
   #[test]
