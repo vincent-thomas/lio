@@ -44,6 +44,7 @@ pub use crate::backend::op::{
   SockDomain, SockProto, SockType, UnlinkKind, WriteFlags,
 };
 pub use io::{Io, IoStream, Receiver, StreamReceiver};
+pub use ops::UnixAddr;
 pub use pid::Pid;
 
 use crate::{IoBufMutVec, IoBufVec};
@@ -201,6 +202,16 @@ doc_op! {
         res: &impl AsResource,
     ) -> Io<ops::Accept> {
         Io::from_op(ops::Accept::new(res.as_resource().clone()))
+    }
+}
+
+doc_op! {
+    short: "Accepts a single incoming connection from a UNIX-domain listening socket, with the peer's address.",
+
+    pub fn accept_unix(
+        res: &impl AsResource,
+    ) -> Io<ops::AcceptUnix> {
+        Io::from_op(ops::AcceptUnix::new(res.as_resource().clone()))
     }
 }
 
