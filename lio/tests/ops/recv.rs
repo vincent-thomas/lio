@@ -30,7 +30,7 @@ fn basic() {
     api::recv(&accepted_fd, vec![0u8; 1024], None).with_lio(&mut lio).send();
 
   let (bytes_received, received_buf) = poll_recv(&mut lio, &mut receiver);
-  let bytes_received = bytes_received.expect("Failed to receive data") as usize;
+  let bytes_received = bytes_received.expect("Failed to receive data");
 
   assert_eq!(bytes_received, data.len());
   assert_eq!(&received_buf[..bytes_received], data.as_slice());
@@ -55,7 +55,7 @@ fn large_data() {
 
     let (bytes_received, received_buf) =
       poll_until_recv(&mut lio, &receiver_recv);
-    let bytes_received = bytes_received.expect("Failed to receive") as usize;
+    let bytes_received = bytes_received.expect("Failed to receive");
 
     if bytes_received == 0 {
       break;
@@ -84,7 +84,7 @@ fn multiple() {
 
     let (bytes_received, received_buf) =
       poll_until_recv(&mut lio, &receiver_recv);
-    let bytes_received = bytes_received.expect("Failed to receive") as usize;
+    let bytes_received = bytes_received.expect("Failed to receive");
 
     assert_eq!(bytes_received, data.len());
     assert_eq!(&received_buf[..bytes_received], data.as_slice());
@@ -107,8 +107,7 @@ fn with_flags() {
 
   let (bytes_received, received_buf) =
     poll_until_recv(&mut lio, &receiver_recv);
-  let bytes_received =
-    bytes_received.expect("Failed to receive with flags") as usize;
+  let bytes_received = bytes_received.expect("Failed to receive with flags");
 
   assert_eq!(bytes_received, data.len());
   assert_eq!(&received_buf[..bytes_received], data.as_slice());
@@ -149,7 +148,7 @@ fn partial_buffer() {
 
   let (bytes_received, received_buf) =
     poll_until_recv(&mut lio, &receiver_recv);
-  let bytes_received = bytes_received.expect("Failed to receive") as usize;
+  let bytes_received = bytes_received.expect("Failed to receive");
 
   assert!(bytes_received <= 10);
   assert_eq!(&received_buf[..bytes_received], &data[..bytes_received]);
@@ -182,7 +181,7 @@ fn concurrent_pairs() {
 
   for (message, receiver) in expected.iter().zip(receivers.iter()) {
     let (res, buf) = poll_until_recv(&mut lio, receiver);
-    let bytes = res.expect("Recv should succeed") as usize;
+    let bytes = res.expect("Recv should succeed");
     assert_eq!(&buf[..bytes], message.as_slice());
   }
 }

@@ -57,7 +57,7 @@ fn write_all_at(lio: &mut Lio, fd: &Resource, bytes: &[u8], offset: u32) {
         .with_lio(lio)
         .send();
     let (result, returned_buf) = common::poll_recv(lio, &mut receiver);
-    let bytes_written = result.unwrap() as usize;
+    let bytes_written = result.unwrap();
     assert!(bytes_written > 0);
     assert!(bytes_written <= returned_buf.len());
     written_total += bytes_written;
@@ -77,7 +77,7 @@ fn read_exact_at(
         .with_lio(lio)
         .send();
     let (result, buf) = common::poll_recv(lio, &mut receiver);
-    let bytes_read = result.unwrap() as usize;
+    let bytes_read = result.unwrap();
     assert!(bytes_read > 0, "read_at returned EOF before expected bytes");
     out.extend_from_slice(&buf[..bytes_read]);
   }

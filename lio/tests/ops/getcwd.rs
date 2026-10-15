@@ -34,7 +34,7 @@ fn test_getcwd_basic() {
 
   let mut receiver = api::getcwd(vec![0; 512]).with_lio(&mut lio).send();
   let (result, buf) = common::poll_recv(&mut lio, &mut receiver);
-  let bytes = result.unwrap() as usize;
+  let bytes = result.unwrap();
   assert_eq!(&buf[..bytes], expected.as_slice());
 }
 

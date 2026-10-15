@@ -43,11 +43,11 @@ pub struct DdStats {
 
 enum DdPending {
   Read {
-    rx: api::io::Receiver<(io::Result<i32>, Vec<u8>)>,
+    rx: api::io::Receiver<(io::Result<usize>, Vec<u8>)>,
     output_offset: usize,
   },
   Write {
-    rx: api::io::Receiver<(io::Result<i32>, Vec<u8>)>,
+    rx: api::io::Receiver<(io::Result<usize>, Vec<u8>)>,
     expected: usize,
   },
 }
@@ -128,7 +128,7 @@ pub fn dd_copy_sequential(
       io_util::run(lio, api::read(input, buf).with_lio(lio).send())
     };
 
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }
@@ -148,7 +148,7 @@ pub fn dd_copy_sequential(
           .with_lio(lio)
           .send(),
       );
-      let written = write_result? as usize;
+      let written = write_result?;
       if written != n {
         return Err(io::Error::new(
           io::ErrorKind::WriteZero,
@@ -261,7 +261,7 @@ pub fn dd_copy_file_to_file(
         DdPending::Read { mut rx, output_offset } => {
           if let Some((result, mut buf)) = rx.try_recv() {
             made_progress = true;
-            let n = result? as usize;
+            let n = result?;
             if n == 0 {
               eof_seen = true;
               continue;
@@ -282,7 +282,7 @@ pub fn dd_copy_file_to_file(
         DdPending::Write { mut rx, expected } => {
           if let Some((result, _buf)) = rx.try_recv() {
             made_progress = true;
-            let written = result? as usize;
+            let written = result?;
             if written != expected {
               return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -335,7 +335,7 @@ fn discard_stdin_prefix(
     let buf = vec![0u8; remaining.min(8192)];
     let (result, _) =
       io_util::run(lio, api::read(input, buf).with_lio(lio).send());
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }
@@ -575,7 +575,7 @@ where
     let rx = api::read(input, buf).with_lio(lio).send();
     let (result, returned_buf) = io_util::run(lio, rx);
     buf = returned_buf;
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }

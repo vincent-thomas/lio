@@ -127,7 +127,7 @@ fn test_shutdown_read() {
     api::send(&client_sock, data.clone(), None).with_lio(&mut lio).send();
 
   let (bytes_sent, _) = poll_recv(&mut lio, &mut send_recv);
-  assert_eq!(bytes_sent.expect("Send should succeed") as usize, data.len());
+  assert_eq!(bytes_sent.expect("Send should succeed"), data.len());
 
   // Server can receive
   let buf = vec![0u8; 100];
@@ -135,7 +135,7 @@ fn test_shutdown_read() {
     api::recv(&server_client_fd, buf, None).with_lio(&mut lio).send();
 
   let (bytes_received, received_buf) = poll_recv(&mut lio, &mut recv_recv);
-  let bytes_received = bytes_received.expect("Recv should succeed") as usize;
+  let bytes_received = bytes_received.expect("Recv should succeed");
   assert_eq!(bytes_received, data.len());
   assert_eq!(&received_buf[..bytes_received], data.as_slice());
 
@@ -372,7 +372,7 @@ fn test_shutdown_sequential_directions() {
     api::recv(&client_sock, buf, None).with_lio(&mut lio).send();
 
   let (bytes_received, received_buf) = poll_recv(&mut lio, &mut recv_recv);
-  let bytes_received = bytes_received.unwrap() as usize;
+  let bytes_received = bytes_received.unwrap();
   assert_eq!(&received_buf[..bytes_received], b"From server");
 
   // Now shutdown read
@@ -590,7 +590,7 @@ fn test_shutdown_with_pending_data() {
     api::recv(&server_client_fd, buf, None).with_lio(&mut lio).send();
 
   let (bytes_received, received_buf) = poll_recv(&mut lio, &mut recv_recv);
-  let bytes_received = bytes_received.expect("Recv should succeed") as usize;
+  let bytes_received = bytes_received.expect("Recv should succeed");
 
   // Should receive the data followed by EOF
   if bytes_received > 0 {

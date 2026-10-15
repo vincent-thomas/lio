@@ -739,7 +739,7 @@ impl OpModel for ReadLink {
     match std::mem::replace(&mut self.state, ReadLinkState::Done) {
       ReadLinkState::InvalidPath => OpResult::Done(Err(ops::nul_path_error())),
       ReadLinkState::Reading(mut op) => match op.complete(completion) {
-        OpResult::Done((Ok(n), buf)) if n as usize == buf.capacity() => {
+        OpResult::Done((Ok(n), buf)) if n == buf.capacity() => {
           let next_len = buf.capacity().saturating_mul(2).max(1);
           self.state = ReadLinkState::Reading(ops::ReadlinkAt::new(
             Resource::cwd(),
@@ -839,7 +839,7 @@ impl OpModel for ReadToString {
             )
           }
           OpResult::Done((Ok(n), buf)) => {
-            self.bytes.extend_from_slice(&buf[..n as usize]);
+            self.bytes.extend_from_slice(&buf[..n]);
             self.state = ReadToStringState::Reading {
               fd: fd.clone(),
               op: ops::Read::new(fd, buf, -1),
