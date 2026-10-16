@@ -257,11 +257,14 @@ impl Harness {
   }
 }
 
+/// Miri runs each step thousands of times slower.
+const STEPS: usize = if cfg!(miri) { 16 } else { 80 };
+
 proptest! {
   #[test]
   fn driver_delivers_every_operation_once(
     cap in 1..5usize,
-    steps in prop::collection::vec(step(), 0..80),
+    steps in prop::collection::vec(step(), 0..STEPS),
   ) {
     let mut harness = Harness::new(cap);
     for step in steps {

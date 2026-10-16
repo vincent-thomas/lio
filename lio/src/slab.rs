@@ -639,11 +639,14 @@ mod tests {
       }
     }
 
+    /// Miri runs each step thousands of times slower.
+    const STEPS: usize = if cfg!(miri) { 24 } else { 200 };
+
     proptest! {
       #[test]
       fn pool_matches_model(
         cap in 1..8usize,
-        steps in prop::collection::vec(step(), 0..200),
+        steps in prop::collection::vec(step(), 0..STEPS),
       ) {
         run(cap, steps);
       }

@@ -88,6 +88,7 @@ fn future_over_capacity_waits_for_a_slot() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "needs a real backend")]
 fn cancelling_a_future_frees_its_slot_for_a_waiter() {
   let lio = Lio::new(1).unwrap();
   let woken = Arc::new(Flag::default());

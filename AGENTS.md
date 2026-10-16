@@ -36,3 +36,12 @@ contract (`backend::op`) stays pure data.
   `lio-test` backend contract macro as well as `lio` unit/integration tests.
   `cargo test -p lio --lib` is not sufficient; run full `cargo test` to compile
   integration tests and doctests that instantiate raw `Op` values.
+- Core bookkeeping is tested without I/O through `lio::backend::testing`
+  (`ScriptedBackend`, `Checked`). Tests that need a real backend are marked
+  `#[cfg_attr(miri, ignore = "needs a real backend")]`; `scripts/test-miri.sh`
+  runs the rest under Miri.
+- Search sizes: `PROPTEST_CASES` (model tests) and `LIO_LIFECYCLE_DEPTH`
+  (lifecycle enumeration). CI runs them small on PRs and large nightly
+  (`.github/workflows/deep.yaml`), along with every cargo-mutants mutant of
+  the files `.cargo/mutants.toml` lists. A surviving mutant in a PR's diff
+  fails CI: add a test that kills it.
