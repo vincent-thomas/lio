@@ -79,9 +79,6 @@ enum Kind {
   Sleep,
 }
 
-const KINDS: [Kind; 4] =
-  [Kind::Callback, Kind::Future, Kind::Stream, Kind::Sleep];
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
   Submit(usize),
@@ -457,19 +454,50 @@ fn depth() -> Option<usize> {
   }
 }
 
-#[test]
-fn every_lifecycle_ordering_of_two_operations() {
+/// Every ordering for one pairing of consumer kinds, at both capacities.
+fn every_ordering(first: Kind, second: Kind) {
   let Some(depth) = depth() else {
     eprintln!("skipped under Miri: set LIO_LIFECYCLE_DEPTH to run it");
     return;
   };
   let mut runs = 0;
-  for first in KINDS {
-    for second in KINDS {
-      for cap in [1, 2] {
-        explore(&[first, second], cap, &mut Vec::new(), depth, &mut runs);
-      }
-    }
+  for cap in [1, 2] {
+    explore(&[first, second], cap, &mut Vec::new(), depth, &mut runs);
   }
   eprintln!("checked {runs} orderings at depth {depth}");
+}
+
+/// One test per pairing, so the runner spreads them across cores: under
+/// Miri the whole enumeration on one thread takes many minutes.
+macro_rules! every_ordering_of {
+  ($($name:ident: $first:ident, $second:ident;)*) => {
+    mod every_ordering_of {
+      use super::*;
+      $(
+        #[test]
+        fn $name() {
+          every_ordering(Kind::$first, Kind::$second);
+        }
+      )*
+    }
+  };
+}
+
+every_ordering_of! {
+  callback_then_callback: Callback, Callback;
+  callback_then_future: Callback, Future;
+  callback_then_stream: Callback, Stream;
+  callback_then_sleep: Callback, Sleep;
+  future_then_callback: Future, Callback;
+  future_then_future: Future, Future;
+  future_then_stream: Future, Stream;
+  future_then_sleep: Future, Sleep;
+  stream_then_callback: Stream, Callback;
+  stream_then_future: Stream, Future;
+  stream_then_stream: Stream, Stream;
+  stream_then_sleep: Stream, Sleep;
+  sleep_then_callback: Sleep, Callback;
+  sleep_then_future: Sleep, Future;
+  sleep_then_stream: Sleep, Stream;
+  sleep_then_sleep: Sleep, Sleep;
 }
