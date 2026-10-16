@@ -257,14 +257,24 @@ impl Clock {
       // nothing, so skip them instead of stepping one millisecond at a time.
       let Some(next) = self.next_busy_tick() else {
         self.current_tick = now_ticks;
-        return;
+        break;
       };
       if next > now_ticks {
         self.current_tick = now_ticks;
-        return;
+        break;
       }
       self.current_tick = next - 1;
       self.tick();
+    }
+    // Every timer due by now has fired, so its deadline is no longer
+    // counted. One still counted lost its wheel entry and never will.
+    if let Some((deadline, count)) = self.earliest_deadline {
+      assert!(
+        deadline > self.current_tick,
+        "clock: {count} timers due at tick {deadline} did not fire by tick \
+         {}: their wheel entry is lost",
+        self.current_tick
+      );
     }
   }
 
@@ -964,5 +974,16 @@ mod tests {
         }
       }
     }
+  }
+
+  #[test]
+  #[should_panic(
+    expected = "did not fire by tick 10: their wheel entry is lost"
+  )]
+  fn a_timer_lost_from_the_wheel_panics_once_due() {
+    let mut clock = Clock::new();
+    clock.schedule_at(1, 5);
+    clock.level0.clear_slot(5);
+    clock.advance_to(10);
   }
 }

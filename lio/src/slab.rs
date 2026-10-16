@@ -79,6 +79,8 @@ pub(crate) struct SlotPool<T, const TRACK_LEN: bool = true> {
   capacity: u32,
   /// Number of occupied slots
   len: u32,
+  /// Number of retired slots
+  retired: u32,
 }
 
 impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
@@ -96,7 +98,14 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
         status: Status::Free,
       });
     }
-    Self { slots, free_head: u32::MAX, next_slot: 0, capacity, len: 0 }
+    Self {
+      slots,
+      free_head: u32::MAX,
+      next_slot: 0,
+      capacity,
+      len: 0,
+      retired: 0,
+    }
   }
 
   #[inline]
@@ -202,6 +211,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
 
     let removed = on_remove(&mut slot.state);
     slot.status = Status::Retired;
+    self.retired += 1;
     if TRACK_LEN {
       self.len -= 1;
     }
@@ -221,8 +231,15 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
        twice, or while in use)"
     );
     slot.status = Status::Free;
+    self.retired -= 1;
     slot.next_free = self.free_head;
     self.free_head = slot_idx;
+  }
+
+  /// Number of slots retired and not released yet.
+  #[inline]
+  pub(crate) fn retired(&self) -> usize {
+    self.retired as usize
   }
 
   /// Whether `allocate` would succeed.
