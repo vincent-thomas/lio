@@ -29,18 +29,18 @@ jobs:
           LIO_LIFECYCLE_DEPTH: "8"
         run: cargo test -p lio --release --lib -- model lifecycle
 
+  # One job per borrow model and seed, so they run side by side: one job
+  # running every seed in turn took close to an hour.
   miri:
-    name: miri-${{ matrix.borrows }}
+    name: miri-${{ matrix.borrows }}-seed-${{ matrix.seed }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - borrows: stacked
-            flags: ""
-          - borrows: tree
-            flags: -Zmiri-tree-borrows
+        borrows: [stacked, tree]
+        # Each seed changes allocation addresses and scheduling choices.
+        seed: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -54,12 +54,13 @@ jobs:
         with:
           tool: cargo-nextest
 
-      # Each seed changes allocation addresses and scheduling choices.
-      - name: miri (core bookkeeping), many seeds
+      - name: miri (core bookkeeping)
         env:
-          MIRIFLAGS: ${{ matrix.flags }} -Zmiri-many-seeds=0..4
+          MIRIFLAGS: >-
+            -Zmiri-seed=${{ matrix.seed }}
+            ${{ matrix.borrows == 'tree' && '-Zmiri-tree-borrows' || '' }}
           PROPTEST_CASES: "16"
-          # Each ordering is a fresh driver; depth 2 already takes minutes.
+          # Each ordering is a fresh driver, so keep it shallow under Miri.
           LIO_LIFECYCLE_DEPTH: "2"
           RUSTFLAGS: ""
         run: scripts/test-miri.sh
