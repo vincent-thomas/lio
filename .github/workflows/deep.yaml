@@ -29,18 +29,20 @@ jobs:
           LIO_LIFECYCLE_DEPTH: "8"
         run: cargo test -p lio --release --lib -- model lifecycle
 
-  # One job per borrow model and seed, so they run side by side: one job
-  # running every seed in turn took close to an hour.
+  # Each borrow model's tests run in two halves, each under two seeds, all
+  # side by side. `slice` deals the sorted tests out in turn, so the heavy
+  # lifecycle pairings split evenly between the halves. The seeds move on with every run, so nightly runs keep
+  # trying new ones instead of repeating the same few.
   miri:
-    name: miri-${{ matrix.borrows }}-seed-${{ matrix.seed }}
+    name: miri-${{ matrix.borrows }}-part-${{ matrix.part }}-seed-${{ matrix.seed }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         borrows: [stacked, tree]
-        # Each seed changes allocation addresses and scheduling choices.
-        seed: [0, 1, 2, 3]
+        part: [1, 2]
+        seed: [0, 1]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -56,23 +58,27 @@ jobs:
 
       - name: miri (core bookkeeping)
         env:
-          MIRIFLAGS: >-
-            -Zmiri-seed=${{ matrix.seed }}
-            ${{ matrix.borrows == 'tree' && '-Zmiri-tree-borrows' || '' }}
+          BORROWS: ${{ matrix.borrows == 'tree' && '-Zmiri-tree-borrows' || '' }}
+          RUN: ${{ github.run_number }}
+          SLOT: ${{ matrix.seed }}
           PROPTEST_CASES: "16"
           # Each ordering is a fresh driver, so keep it shallow under Miri.
           LIO_LIFECYCLE_DEPTH: "2"
           RUSTFLAGS: ""
-        run: scripts/test-miri.sh
+        run: |
+          SEED=$(( RUN * 2 + SLOT ))
+          echo "Miri seed $SEED"
+          MIRIFLAGS="-Zmiri-seed=$SEED $BORROWS" \
+            scripts/test-miri.sh --partition slice:${{ matrix.part }}/2
 
   mutants:
     name: mutants-${{ matrix.shard }}
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -85,14 +91,21 @@ jobs:
         with:
           tool: cargo-mutants,cargo-nextest
 
-      - name: every core mutant, shard ${{ matrix.shard }} of 8
+      - name: every core mutant, shard ${{ matrix.shard }} of 10
         env:
           NEXTEST_PROFILE: mutants
+          # A mutant is almost always caught within a few cases; the deep
+          # search job runs the large searches.
+          PROPTEST_CASES: "64"
+          LIO_LIFECYCLE_DEPTH: "4"
+          # Each mutant is a rebuild; debug info only slows compiling and
+          # linking.
+          CARGO_PROFILE_DEV_DEBUG: "0"
         # A mutant can loop while allocating. Capping each process's address
         # space (8 GiB) makes that test fail instead of taking the runner down.
         run: |
           ulimit -v 8388608
-          cargo mutants --shard ${{ matrix.shard }}/8 --no-shuffle --jobs 2
+          cargo mutants --shard ${{ matrix.shard }}/10 --no-shuffle --jobs 2
 
       - uses: actions/upload-artifact@v4
         if: always()

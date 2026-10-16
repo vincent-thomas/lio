@@ -3,5 +3,6 @@
 # test, which counts as caught, rather than time out the whole run: a test
 # still running keeps a failed run from ending.
 [profile.mutants]
-slow-timeout = { period = "30s", terminate-after = 2 }
+# The slowest core test takes about a second, so 20s means it hangs.
+slow-timeout = { period = "10s", terminate-after = 2 }
 fail-fast = true
