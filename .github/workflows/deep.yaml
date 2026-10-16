@@ -29,18 +29,19 @@ jobs:
           LIO_LIFECYCLE_DEPTH: "8"
         run: cargo test -p lio --release --lib -- model lifecycle
 
-  # One job per borrow model and seed, so they run side by side: one job
-  # running every seed in turn took close to an hour.
+  # Each borrow model's tests run in two halves, each under two seeds, all
+  # side by side. The seeds move on with every run, so nightly runs keep
+  # trying new ones instead of repeating the same few.
   miri:
-    name: miri-${{ matrix.borrows }}-seed-${{ matrix.seed }}
+    name: miri-${{ matrix.borrows }}-part-${{ matrix.part }}-seed-${{ matrix.seed }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         borrows: [stacked, tree]
-        # Each seed changes allocation addresses and scheduling choices.
-        seed: [0, 1, 2, 3]
+        part: [1, 2]
+        seed: [0, 1]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -56,19 +57,23 @@ jobs:
 
       - name: miri (core bookkeeping)
         env:
-          MIRIFLAGS: >-
-            -Zmiri-seed=${{ matrix.seed }}
-            ${{ matrix.borrows == 'tree' && '-Zmiri-tree-borrows' || '' }}
+          BORROWS: ${{ matrix.borrows == 'tree' && '-Zmiri-tree-borrows' || '' }}
+          RUN: ${{ github.run_number }}
+          SLOT: ${{ matrix.seed }}
           PROPTEST_CASES: "16"
           # Each ordering is a fresh driver, so keep it shallow under Miri.
           LIO_LIFECYCLE_DEPTH: "2"
           RUSTFLAGS: ""
-        run: scripts/test-miri.sh
+        run: |
+          SEED=$(( RUN * 2 + SLOT ))
+          echo "Miri seed $SEED"
+          MIRIFLAGS="-Zmiri-seed=$SEED $BORROWS" \
+            scripts/test-miri.sh --partition hash:${{ matrix.part }}/2
 
   mutants:
     name: mutants-${{ matrix.shard }}
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
