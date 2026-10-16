@@ -500,6 +500,51 @@ mod tests {
     assert_eq!(wait(&mut checked), vec![1, 2]);
   }
 
+  /// A read of one byte into `into`.
+  fn read_into(into: &mut u8, iovec: &mut RawBuf) -> Op {
+    *iovec = RawBuf { ptr: into, len: 1 };
+    Op::Read {
+      fd: crate::api::resource::Resource::stdout(),
+      iovecs: ptr::NonNull::from(&*iovec),
+      iov_count: 1,
+      offset: -1,
+      flags: Default::default(),
+    }
+  }
+
+  #[test]
+  fn records_its_capacity() {
+    let (backend, _checked) = init(4);
+    assert_eq!(backend.capacity(), Some(4));
+    assert_eq!(ScriptedBackend::new().capacity(), None);
+  }
+
+  #[test]
+  fn drain_poisons_unless_told_not_to() {
+    for poison in [true, false] {
+      let backend = ScriptedBackend::new();
+      let mut backend = if poison { backend } else { backend.without_poison() };
+      backend.init(1).unwrap();
+      let (mut into, mut iovec) =
+        (0u8, RawBuf { ptr: ptr::null_mut(), len: 0 });
+      backend.push(1, read_into(&mut into, &mut iovec), &mut Bump::new());
+      assert!(backend.drain());
+      assert_eq!(into, if poison { POISON } else { 0 }, "poison: {poison}");
+    }
+  }
+
+  #[test]
+  fn without_poison_completes_without_touching_buffers() {
+    let backend = ScriptedBackend::new().without_poison();
+    let mut driver = backend.clone();
+    driver.init(1).unwrap();
+    let (mut into, mut iovec) = (0u8, RawBuf { ptr: ptr::null_mut(), len: 0 });
+    driver.push(1, read_into(&mut into, &mut iovec), &mut Bump::new());
+    backend.complete(1, 1);
+    assert_eq!(into, 0);
+    assert_eq!(wait(&mut driver), vec![1]);
+  }
+
   #[test]
   fn records_cancels_and_drains() {
     let (backend, mut checked) = init(2);

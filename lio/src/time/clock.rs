@@ -1041,22 +1041,35 @@ mod tests {
     }
     let mut clock = Clock::new();
     let live = 100;
+    // Live timers on level 1 and removed ones on level 0, so every level's
+    // entries count.
     for id in 0..live {
-      clock.schedule_at(id, 1_000_000);
+      clock.schedule_at(id, 1_000);
     }
     // Removed timers leave their entries until they outnumber twice the
     // live timers plus a floor of four levels' slots.
     let bound = 2 * live as usize + 4 * super::LEVEL_SIZE;
     let mut id = live;
     for _ in live as usize..bound {
-      clock.schedule_at(id, 1_000_000);
+      clock.schedule_at(id, 100);
       assert!(clock.remove(id));
       id += 1;
     }
     assert_eq!(entries(&clock), bound, "swept before the bound");
-    clock.schedule_at(id, 1_000_000);
+    clock.schedule_at(id, 100);
     assert!(clock.remove(id));
     assert_eq!(entries(&clock), live as usize, "not swept past the bound");
+  }
+
+  #[test]
+  fn a_timer_replaced_in_its_slot_fires_as_the_newer_one() {
+    let (older, newer) = (1, (1 << 32) | 1);
+    let mut clock = Clock::new();
+    // Same slot and deadline, on level 1: only the generation differs.
+    clock.schedule_at(older, 512);
+    clock.schedule_at(newer, 512);
+    clock.advance_to(512);
+    assert_eq!(collect_expired(&mut clock), vec![newer]);
   }
 
   #[test]
@@ -1183,7 +1196,15 @@ mod tests {
           Step::Poll(limit) => {
             let got: Vec<TimerId> = match limit {
               Some(limit) => clock.poll_expired().take(limit).collect(),
-              None => clock.poll_expired().collect(),
+              // `for_each` takes the iterator's `fold`, as the driver does;
+              // bounded, so a broken one fails rather than runs forever.
+              None => {
+                let mut got = Vec::new();
+                let tracked = clock.len();
+                crate::time::at_most(tracked, clock.poll_expired())
+                  .for_each(|id| got.push(id));
+                got
+              }
             };
             for &id in &got {
               let timer = timers
