@@ -164,6 +164,46 @@ pub trait OneshotOpModel: OpModel {}
 pub trait StreamOpModel: OpModel {}
 
 #[cfg(test)]
+mod completion_tests {
+  use super::{Completion, CompletionFlags};
+
+  const FLAGS: [CompletionFlags; 5] = [
+    CompletionFlags::MORE,
+    CompletionFlags::CANCELLED,
+    CompletionFlags::TERMINAL,
+    CompletionFlags::TIMEOUT,
+    CompletionFlags::TIMER,
+  ];
+
+  #[test]
+  fn flags_are_distinct_bits() {
+    let empty = CompletionFlags::empty();
+    for (i, a) in FLAGS.into_iter().enumerate() {
+      assert_ne!(a, empty);
+      assert!(a.contains(a));
+      assert!(a.contains(empty));
+      assert!(!empty.contains(a));
+      assert_eq!(a | a, a);
+      for b in FLAGS.into_iter().skip(i + 1) {
+        assert_ne!(a, b);
+        assert!(!a.contains(b) && !b.contains(a));
+        assert!((a | b).contains(a) && (a | b).contains(b));
+        assert!(!a.contains(a | b));
+      }
+    }
+  }
+
+  #[test]
+  fn completions_compare_their_resource_close() {
+    fn other(_: crate::api::resource::RawResource) {}
+    let native = Completion::new(3);
+    assert_eq!(native, Completion::new(3));
+    assert_ne!(native, native.with_resource_close(other));
+    assert!(format!("{native:?}").contains("resource_close: ResourceClose"));
+  }
+}
+
+#[cfg(test)]
 mod os_error_tests {
   use super::Completion;
 

@@ -848,6 +848,24 @@ mod tests {
   }
 
   #[test]
+  fn dropping_a_registration_drops_its_payload() {
+    let (tx, rx) = mpsc::channel::<std::io::Result<()>>();
+    let (_arena, reg) = new_waker_reg(Waker::noop().clone(), tx, Nop);
+    drop(reg);
+    assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+
+    let (tx, rx) = mpsc::channel::<()>();
+    let (_arena, reg) = new_callback_reg(
+      move |_| {
+        let _ = &tx;
+      },
+      Nop,
+    );
+    drop(reg);
+    assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+  }
+
+  #[test]
   #[should_panic(expected = "waker set after cancellation")]
   fn setting_a_waker_after_cancellation_panics() {
     let (_arena, mut reg) = new_callback_reg(|_| {}, Nop);

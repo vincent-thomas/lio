@@ -6,7 +6,13 @@ pub type TimerId = u64;
 
 /// Time resolution: 1ms per tick.
 pub(crate) const TICK_MS: u64 = 1;
-const TICK_NS: u128 = TICK_MS as u128 * 1_000_000;
+pub(crate) const TICK_NS: u128 = TICK_MS as u128 * 1_000_000;
+
+/// The time `ticks` ticks span.
+#[inline]
+pub(crate) fn ticks_duration(ticks: u64) -> Duration {
+  Duration::from_millis(ticks * TICK_MS)
+}
 
 const ACTIVE_TIMER: usize = usize::MAX;
 const EMPTY_TIMER: usize = usize::MAX - 1;
@@ -240,7 +246,7 @@ impl Clock {
       if deadline_ticks <= self.current_tick {
         Duration::ZERO
       } else {
-        Duration::from_millis((deadline_ticks - self.current_tick) * TICK_MS)
+        ticks_duration(deadline_ticks - self.current_tick)
       }
     })
   }
@@ -358,6 +364,11 @@ impl Clock {
 
   pub(crate) fn is_empty(&self) -> bool {
     self.timer_count == 0
+  }
+
+  /// Number of timers tracked: scheduled, or fired and not removed yet.
+  pub(crate) fn len(&self) -> usize {
+    self.timer_count
   }
 
   /// Returns whether timers have expired but not been handed out by
@@ -644,6 +655,7 @@ impl Iterator for ExpiredIterator<'_> {
 mod tests {
   use std::time::Duration;
 
+  use super::{TICK_MS, Wheel};
   use crate::time::{Clock, TimerId};
 
   fn collect_expired(clock: &mut Clock) -> Vec<TimerId> {
@@ -869,6 +881,36 @@ mod tests {
     }
   }
 
+  /// Each level counts exactly the entries its slots hold.
+  fn assert_wheel_counts(clock: &Clock) {
+    fn held<const N: usize>(wheel: &Wheel<N>) -> usize {
+      wheel.slots.iter().map(Vec::len).sum()
+    }
+    let counted =
+      [clock.level0.len, clock.level1.len, clock.level2.len, clock.level3.len];
+    let held = [
+      held(&clock.level0),
+      held(&clock.level1),
+      held(&clock.level2),
+      held(&clock.level3),
+    ];
+    assert_eq!(counted, held, "wheel entry counts");
+  }
+
+  #[test]
+  fn a_drained_slot_keeps_its_allocation() {
+    let mut clock = Clock::new();
+    // Due at tick 300: level 1, slot 1, until tick 256 moves it down.
+    clock.schedule(1, Duration::from_millis(300 * TICK_MS));
+    clock.advance_to(256);
+    assert_wheel_counts(&clock);
+    assert!(clock.level1.slots[1].is_empty());
+    assert!(clock.level1.slots[1].capacity() > 0, "reused, not freed");
+    clock.advance_to(300);
+    assert_wheel_counts(&clock);
+    assert_eq!(collect_expired(&mut clock), vec![1]);
+  }
+
   #[test]
   fn idle_gap_is_skipped_not_stepped() {
     let mut clock = Clock::new();
@@ -878,7 +920,11 @@ mod tests {
     clock.schedule(1, Duration::from_millis(5));
     clock.advance_to(day * 2);
     assert_eq!(collect_expired(&mut clock), vec![1]);
-    assert!(start.elapsed() < Duration::from_millis(100));
+    // Miri runs every step thousands of times slower, so no time bound
+    // tells a skipped gap from a stepped one there.
+    if !cfg!(miri) {
+      assert!(start.elapsed() < Duration::from_millis(100));
+    }
   }
 
   /// Wheel entries index timer slots unchecked, so asking for fewer slots
@@ -986,6 +1032,70 @@ mod tests {
     clock.schedule_at(1, 5);
     clock.level0.clear_slot(5);
     clock.advance_to(10);
+  }
+
+  #[test]
+  fn stale_wheel_entries_are_swept_just_past_their_bound() {
+    fn entries(clock: &Clock) -> usize {
+      clock.level0.len + clock.level1.len + clock.level2.len + clock.level3.len
+    }
+    let mut clock = Clock::new();
+    let live = 100;
+    for id in 0..live {
+      clock.schedule_at(id, 1_000_000);
+    }
+    // Removed timers leave their entries until they outnumber twice the
+    // live timers plus a floor of four levels' slots.
+    let bound = 2 * live as usize + 4 * super::LEVEL_SIZE;
+    let mut id = live;
+    for _ in live as usize..bound {
+      clock.schedule_at(id, 1_000_000);
+      assert!(clock.remove(id));
+      id += 1;
+    }
+    assert_eq!(entries(&clock), bound, "swept before the bound");
+    clock.schedule_at(id, 1_000_000);
+    assert!(clock.remove(id));
+    assert_eq!(entries(&clock), live as usize, "not swept past the bound");
+  }
+
+  #[test]
+  fn a_rescheduled_timer_does_not_fire_at_its_old_deadline() {
+    let mut clock = Clock::new();
+    // Level 1, due exactly when its slot comes round at tick 512.
+    clock.schedule_at(1, 512);
+    clock.schedule_at(1, 2_000);
+    clock.advance_to(512);
+    assert!(collect_expired(&mut clock).is_empty(), "fired at 512");
+    clock.advance_to(2_000);
+    assert_eq!(collect_expired(&mut clock), vec![1]);
+  }
+
+  #[test]
+  #[cfg_attr(not(debug_assertions), ignore = "checked by a `debug_assert`")]
+  #[should_panic(expected = "which is not marked stale")]
+  fn delivering_an_unmarked_stale_timer_panics() {
+    let mut clock = Clock::new();
+    clock.schedule_at(1, 5);
+    clock.advance_to(5);
+    // Rescheduled after firing and before delivery: the fired entry is
+    // stale, but the flag saying so is lost.
+    clock.schedule_at(1, 50);
+    clock.pending_has_stale = false;
+    collect_expired(&mut clock);
+  }
+
+  #[test]
+  fn timers_already_delivered_leave_delivery_on_its_fast_path() {
+    let mut clock = Clock::new();
+    clock.schedule_at(1, 5);
+    clock.schedule_at(2, 5);
+    clock.advance_to(5);
+    assert_eq!(collect_expired(&mut clock), vec![1, 2]);
+    // Delivered, then removed or rescheduled: nothing pending goes stale.
+    assert!(clock.remove(1));
+    clock.schedule_at(2, 50);
+    assert!(!clock.pending_has_stale);
   }
 
   /// Random step sequences against a reference model of the wheel.
@@ -1110,6 +1220,7 @@ mod tests {
           }
         }
 
+        assert_wheel_counts(&clock);
         assert_eq!(clock.is_empty(), timers.is_empty());
         for timer in timers.values() {
           assert!(clock.contains(timer.id), "{:#x} is tracked", timer.id);

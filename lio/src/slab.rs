@@ -441,6 +441,19 @@ mod tests {
   }
 
   #[test]
+  fn keys_where_finds_only_matching_live_values() {
+    let mut slab: Slab<i32> = Slab::new(4);
+    let removed = slab.insert(1).unwrap();
+    let k2 = slab.insert(2).unwrap();
+    let k3 = slab.insert(3).unwrap();
+    slab.remove(removed);
+    // The predicates ignore their argument: a removed slot holds no value.
+    assert_eq!(slab.keys_where(|_| true).collect::<Vec<_>>(), [k2, k3]);
+    assert_eq!(slab.keys_where(|_| false).count(), 0);
+    assert_eq!(slab.keys_where(|&v| v == 3).collect::<Vec<_>>(), [k3]);
+  }
+
+  #[test]
   fn test_key_packing() {
     let key = SlabKey { slot: 0xDEAD, generation: 0xBEEF };
     let packed = key.as_u64();

@@ -405,7 +405,11 @@ mod tests {
       Registration::new_waker_in(arena, dummy_waker(), tx, Nop)
     });
     drop(store);
-    assert!(rx.recv().is_err(), "the registration's sender was dropped");
+    // `try_recv`: a store that leaked it would make `recv` block forever.
+    assert!(
+      matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+      "the registration's sender was dropped"
+    );
   }
 
   #[test]

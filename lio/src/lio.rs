@@ -151,6 +151,28 @@ struct LioProfile {
 }
 
 impl LioProfile {
+  fn count_timer_expirations(&mut self, before: usize, after: usize) {
+    self.timer_expirations += after - before;
+  }
+
+  fn count_stale_completion(&mut self) {
+    self.stale_completions += 1;
+  }
+
+  fn count_dispatch(&mut self) {
+    self.dispatch_count += 1;
+  }
+
+  fn count_remove(&mut self) {
+    self.remove_count += 1;
+  }
+
+  fn end_completion_loop(&mut self, started: Option<Instant>) {
+    if let Some(started) = started {
+      self.completion_loop_time += started.elapsed();
+    }
+  }
+
   fn merge(&mut self, run: &LioProfile) {
     self.run_inner_calls += 1;
     self.completions_returned += run.completions_returned;
@@ -615,7 +637,7 @@ impl Lio {
       timer_poll_time,
       inner_ref.ready_timers.extend(inner_ref.time.poll_expired())
     );
-    stats.timer_expirations += inner_ref.ready_timers.len() - before;
+    stats.count_timer_expirations(before, inner_ref.ready_timers.len());
     let resource_close = inner_ref.resource_close;
 
     // Route what is queued now, not what nested runs queue meanwhile, so
@@ -643,12 +665,10 @@ impl Lio {
       if routed {
         processed += 1;
       } else {
-        stats.stale_completions += 1;
+        stats.count_stale_completion();
       }
     }
-    if let Some(started) = loop_started {
-      stats.completion_loop_time += started.elapsed();
-    }
+    stats.end_completion_loop(loop_started);
 
     if PROFILE && let Some(profile) = inner.profile.as_mut() {
       stats.completions_returned = processed;
@@ -721,12 +741,12 @@ impl Lio {
           dispatch_time,
           Self::dispatch_action(inner_ref, id, action)
         );
-        stats.dispatch_count += 1;
+        stats.count_dispatch();
       }
       None => {
         // Dropped by `bury_and_wake` once the driver is not borrowed.
         timed!(PROFILE, stats, remove_time, Self::retire(inner_ref, id));
-        stats.remove_count += 1;
+        stats.count_remove();
       }
     }
     (inner, true)
@@ -862,6 +882,23 @@ mod tests {
   }
 
   #[test]
+  #[should_panic(expected = "so a slot is never released")]
+  fn releasing_a_slot_checks_every_retired_slot_is_tracked() {
+    let (backend, lio) = lio(2);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let (lost, other) = (backend.pushed()[0], backend.pushed()[1]);
+    {
+      let mut inner = lio.inner.borrow_mut();
+      drop(inner.store.detach(lost).unwrap().registration);
+      // Queued for release without the check `retire` makes.
+      let detached = inner.store.detach(other).unwrap();
+      inner.dying.push(detached);
+    }
+    lio.bury_and_wake();
+  }
+
+  #[test]
   fn retiring_while_a_registration_is_dropped_keeps_slots_accounted() {
     use std::future::{Future, IntoFuture};
     use std::task::Context;
@@ -947,6 +984,139 @@ mod tests {
   fn waiting_for_capacity_with_a_free_slot_panics() {
     let (_, lio) = lio(1);
     lio.wait_for_capacity(Waker::noop());
+  }
+
+  /// Takes one more step, then finishes.
+  struct TwoSteps(bool);
+
+  impl crate::api::op::OpModel for TwoSteps {
+    type Item = ();
+
+    fn action(&mut self) -> Action {
+      Action::Io(crate::backend::op::Op::Nop)
+    }
+
+    fn complete(&mut self, _: Completion) -> crate::api::op::OpResult<()> {
+      if std::mem::replace(&mut self.0, true) {
+        crate::api::op::OpResult::Done(())
+      } else {
+        crate::api::op::OpResult::Again
+      }
+    }
+  }
+
+  impl crate::api::op::OneshotOpModel for TwoSteps {}
+
+  /// Counts its wakes.
+  #[derive(Default)]
+  struct Wakes(std::sync::atomic::AtomicUsize);
+
+  impl std::task::Wake for Wakes {
+    fn wake(self: std::sync::Arc<Self>) {
+      self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+  }
+
+  #[test]
+  fn scheduling_on_a_full_driver_is_refused() {
+    let (_, lio) = lio(1);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let refused = lio.schedule_with(|arena| {
+      Registration::new_callback_in(arena, |_| {}, crate::api::ops::Nop)
+    });
+    assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+  }
+
+  #[test]
+  fn a_step_without_an_item_keeps_the_waker_for_the_last() {
+    use std::future::{Future, IntoFuture};
+    use std::task::Context;
+
+    let (backend, lio) = lio(1);
+    let wakes = std::sync::Arc::new(Wakes::default());
+    let waker = Waker::from(wakes.clone());
+    let mut future =
+      crate::api::Io::from_op(TwoSteps(false)).with_lio(&lio).into_future();
+    let mut cx = Context::from_waker(&waker);
+    assert!(std::pin::Pin::new(&mut future).poll(&mut cx).is_pending());
+    for _ in 0..2 {
+      backend.complete_all(0);
+      lio.try_run().unwrap();
+    }
+    assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(std::pin::Pin::new(&mut future).poll(&mut cx).is_ready());
+  }
+
+  /// Records where each step's first lowering allocation lands.
+  #[derive(Clone, Default)]
+  struct Lowering {
+    inner: ScriptedBackend,
+    first_allocs: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+  }
+
+  impl IoBackend for Lowering {
+    fn init(&mut self, cap: usize) -> io::Result<()> {
+      self.inner.init(cap)
+    }
+    fn push(&mut self, id: u64, op: crate::backend::op::Op, bump: &mut Bump) {
+      let at = bump.alloc(0u64) as *mut u64 as usize;
+      self.first_allocs.borrow_mut().push(at);
+      self.inner.push(id, op, bump);
+    }
+    fn flush(&mut self) -> io::Result<()> {
+      self.inner.flush()
+    }
+    fn drain(&mut self) -> bool {
+      self.inner.drain()
+    }
+    fn wait(
+      &mut self,
+      timeout: Option<Duration>,
+      completed: &mut Vec<OpCompleted>,
+    ) -> io::Result<()> {
+      self.inner.wait(timeout, completed)
+    }
+  }
+
+  #[test]
+  fn every_step_lowers_into_its_slot_s_reset_arena() {
+    let backend = Lowering::default();
+    let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
+    crate::api::Io::from_op(TwoSteps(false)).with_lio(&lio).when_done(|_| {});
+    backend.inner.complete_all(0);
+    lio.try_run().unwrap();
+    let allocs = backend.first_allocs.borrow().clone();
+    assert_eq!(allocs.len(), 2);
+    assert_eq!(allocs[0], allocs[1], "the second step reused the slot's arena");
+  }
+
+  #[test]
+  fn a_run_routes_only_what_was_queued_when_it_started() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let (backend, lio) = lio(3);
+    let delivered = Rc::new(RefCell::new(Vec::new()));
+    // A's handler completes B and C, then runs the driver itself; B's
+    // handler panics there, leaving C queued.
+    let (nested, inner_backend) = (lio.clone(), backend.clone());
+    crate::api::nop().with_lio(&lio).when_done(move |_| {
+      inner_backend.complete_all(0);
+      let run = std::panic::AssertUnwindSafe(|| nested.try_run());
+      assert!(std::panic::catch_unwind(run).is_err());
+    });
+    crate::api::nop().with_lio(&lio).when_done(|_| panic!("handler B"));
+    let log = delivered.clone();
+    crate::api::nop()
+      .with_lio(&lio)
+      .when_done(move |_| log.borrow_mut().push('C'));
+
+    let a = backend.in_flight()[0];
+    backend.complete(a, 0);
+    assert_eq!(lio.try_run().unwrap(), 1, "only A was queued");
+    assert!(delivered.borrow().is_empty(), "C waits for the next run");
+    assert_eq!(lio.try_run().unwrap(), 1);
+    assert_eq!(*delivered.borrow(), ['C']);
   }
 
   #[test]
