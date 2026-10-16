@@ -1129,4 +1129,92 @@ mod tests {
     let (_, lio) = lio(1);
     Lio::enqueue(&mut lio.inner.borrow_mut(), |_| unreachable!());
   }
+
+  #[test]
+  fn pause_and_resume_stop_and_restart_the_drivers_clock() {
+    let (_, lio) = lio(1);
+    crate::time::pause(&lio);
+    assert!(lio.inner.borrow().time.is_paused());
+    crate::time::resume(&lio);
+    assert!(!lio.inner.borrow().time.is_paused());
+  }
+
+  #[test]
+  fn uninstalling_the_global_returns_it() {
+    let (_, lio) = lio(1);
+    let guard = crate::install_global(lio.clone());
+    let global = crate::uninstall_global().expect("it was installed");
+    assert!(Rc::ptr_eq(&global.inner, &lio.inner));
+    assert!(crate::uninstall_global().is_none(), "and is gone");
+    drop(guard);
+  }
+
+  #[test]
+  fn run_reports_how_many_completions_it_routed() {
+    let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 4).unwrap();
+    for _ in 0..2 {
+      crate::api::nop().with_lio(&lio).when_done(|_| {});
+    }
+    assert_eq!(lio.run().unwrap(), 2);
+  }
+
+  /// Completes every op on flush, and records each wait's timeout.
+  struct Recording {
+    inner: ScriptedBackend,
+    timeouts: Rc<RefCell<Vec<Option<Duration>>>>,
+  }
+
+  impl IoBackend for Recording {
+    fn init(&mut self, cap: usize) -> io::Result<()> {
+      self.inner.init(cap)
+    }
+    fn resource_close(&self) -> crate::api::resource::CloseFn {
+      self.inner.resource_close()
+    }
+    fn push(&mut self, id: u64, op: crate::backend::op::Op, bump: &mut Bump) {
+      self.inner.push(id, op, bump);
+    }
+    fn flush(&mut self) -> io::Result<()> {
+      self.inner.flush()
+    }
+    fn wait(
+      &mut self,
+      timeout: Option<Duration>,
+      completed: &mut Vec<OpCompleted>,
+    ) -> io::Result<()> {
+      self.timeouts.borrow_mut().push(timeout);
+      self.inner.wait(timeout, completed)
+    }
+  }
+
+  #[test]
+  fn queued_completions_do_not_wait_on_the_backend() {
+    let timeouts = Rc::new(RefCell::new(Vec::new()));
+    let backend =
+      Recording { inner: ScriptedBackend::auto(0), timeouts: timeouts.clone() };
+    let lio = Lio::new_with_backend(backend, 4).unwrap();
+    crate::api::nop().with_lio(&lio).when_done(|_| panic!("handler failure"));
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      lio.try_run().unwrap();
+    }));
+    assert!(first.is_err());
+
+    // The second completion is still queued, so even a blocking run must
+    // not block on the backend to route it.
+    lio.run().unwrap();
+    assert_eq!(timeouts.borrow().last(), Some(&Some(Duration::ZERO)));
+  }
+
+  #[test]
+  fn a_panicking_handler_still_frees_its_slot() {
+    let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 1).unwrap();
+    crate::api::nop().with_lio(&lio).when_done(|_| panic!("handler failure"));
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      lio.try_run().unwrap();
+    }));
+    assert!(run.is_err());
+    lio.try_run().unwrap();
+    assert!(!lio.is_full(), "the panicking op's slot is released");
+  }
 }

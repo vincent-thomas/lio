@@ -30,7 +30,8 @@ jobs:
         run: cargo test -p lio --release --lib -- model lifecycle
 
   # Each borrow model's tests run in two halves, each under two seeds, all
-  # side by side. The seeds move on with every run, so nightly runs keep
+  # side by side. `slice` deals the sorted tests out in turn, so the heavy
+  # lifecycle pairings split evenly between the halves. The seeds move on with every run, so nightly runs keep
   # trying new ones instead of repeating the same few.
   miri:
     name: miri-${{ matrix.borrows }}-part-${{ matrix.part }}-seed-${{ matrix.seed }}
@@ -68,7 +69,7 @@ jobs:
           SEED=$(( RUN * 2 + SLOT ))
           echo "Miri seed $SEED"
           MIRIFLAGS="-Zmiri-seed=$SEED $BORROWS" \
-            scripts/test-miri.sh --partition hash:${{ matrix.part }}/2
+            scripts/test-miri.sh --partition slice:${{ matrix.part }}/2
 
   mutants:
     name: mutants-${{ matrix.shard }}
@@ -77,7 +78,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -90,14 +91,21 @@ jobs:
         with:
           tool: cargo-mutants,cargo-nextest
 
-      - name: every core mutant, shard ${{ matrix.shard }} of 8
+      - name: every core mutant, shard ${{ matrix.shard }} of 10
         env:
           NEXTEST_PROFILE: mutants
+          # A mutant is almost always caught within a few cases; the deep
+          # search job runs the large searches.
+          PROPTEST_CASES: "64"
+          LIO_LIFECYCLE_DEPTH: "4"
+          # Each mutant is a rebuild; debug info only slows compiling and
+          # linking.
+          CARGO_PROFILE_DEV_DEBUG: "0"
         # A mutant can loop while allocating. Capping each process's address
         # space (8 GiB) makes that test fail instead of taking the runner down.
         run: |
           ulimit -v 8388608
-          cargo mutants --shard ${{ matrix.shard }}/8 --no-shuffle --jobs 2
+          cargo mutants --shard ${{ matrix.shard }}/10 --no-shuffle --jobs 2
 
       - uses: actions/upload-artifact@v4
         if: always()
