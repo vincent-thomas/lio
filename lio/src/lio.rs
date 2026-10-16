@@ -115,6 +115,9 @@ struct LioInner {
   /// Registrations removed while the driver was borrowed, to be dropped
   /// once it is not (see [`Lio::bury`]). Their slots stay reserved until then.
   dying: Vec<Detached>,
+  /// Registrations taken from `dying` and being dropped right now; their
+  /// slots are released once they are gone.
+  burying: usize,
   /// Submissions made while every slot was taken, scheduled in order as
   /// slots free up. Only allocates when the driver is over capacity.
   overflow: VecDeque<PendingSubmission>,
@@ -320,6 +323,7 @@ impl Lio {
       ready_io: VecDeque::with_capacity(cap),
       ready_timers: VecDeque::new(),
       dying: Vec::new(),
+      burying: 0,
       overflow: VecDeque::new(),
       capacity_waiters: Vec::new(),
       profile: std::env::var_os("LIO_PROFILE").map(|_| LioProfile::default()),
@@ -414,6 +418,23 @@ impl Lio {
     );
     let detached = inner.store.detach_known(id);
     inner.dying.push(detached);
+    Self::assert_retired_slots_tracked(inner);
+  }
+
+  /// Every retired slot belongs to a registration waiting in `dying` or
+  /// being dropped by [`bury_and_wake`](Self::bury_and_wake). One that
+  /// belongs to neither was detached without being queued for release, and
+  /// is never reused.
+  #[inline]
+  fn assert_retired_slots_tracked(inner: &LioInner) {
+    let tracked = inner.dying.len() + inner.burying;
+    assert_eq!(
+      inner.store.retired(),
+      tracked,
+      "driver: {} slots are retired, but {tracked} registrations are waiting \
+       to be dropped, so a slot is never released",
+      inner.store.retired()
+    );
   }
 
   fn full_error() -> io::Error {
@@ -522,7 +543,12 @@ impl Lio {
     loop {
       let mut buried = false;
       loop {
-        let next = self.inner.borrow_mut().dying.pop();
+        let next = {
+          let mut inner = self.inner.borrow_mut();
+          let next = inner.dying.pop();
+          inner.burying += usize::from(next.is_some());
+          next
+        };
         let Some(Detached { registration, slot }) = next else {
           break;
         };
@@ -654,6 +680,13 @@ impl Lio {
       inner.store.get_mut(id).map(|reg| reg.begin_completion())
     );
     let Some((handler, mut waker)) = begun else {
+      // An earlier handler may have cancelled a sleep whose timer already
+      // fired. An I/O registration, though, lives until its completion
+      // arrives: one without it was completed twice, or never pushed.
+      assert!(
+        timer,
+        "driver: backend completed operation {id}, which is not in flight"
+      );
       return (inner, false);
     };
 
@@ -670,29 +703,30 @@ impl Lio {
     let mut inner = self.inner.borrow_mut();
 
     let inner_ref = &mut *inner;
-    if let Some(reg) = inner_ref.store.get_mut(id) {
-      // A cancelled operation takes no further step; its consumer may also
-      // have been dropped by the wake-up just now.
-      let next_action =
-        if reg.is_cancelled() { None } else { result.next_action };
-      match next_action {
-        Some(action) => {
-          if let Some(waker) = waker {
-            reg.restore_waker(waker);
-          }
-          timed!(
-            PROFILE,
-            stats,
-            dispatch_time,
-            Self::dispatch_action(inner_ref, id, action)
-          );
-          stats.dispatch_count += 1;
+    let Some(reg) = inner_ref.store.get_mut(id) else {
+      panic!("driver: registration {id} was removed while its handler ran");
+    };
+    // A cancelled operation takes no further step; its consumer may also
+    // have been dropped by the wake-up just now.
+    let next_action =
+      if reg.is_cancelled() { None } else { result.next_action };
+    match next_action {
+      Some(action) => {
+        if let Some(waker) = waker {
+          reg.restore_waker(waker);
         }
-        None => {
-          // Dropped by `bury_and_wake` once the driver is not borrowed.
-          timed!(PROFILE, stats, remove_time, Self::retire(inner_ref, id));
-          stats.remove_count += 1;
-        }
+        timed!(
+          PROFILE,
+          stats,
+          dispatch_time,
+          Self::dispatch_action(inner_ref, id, action)
+        );
+        stats.dispatch_count += 1;
+      }
+      None => {
+        // Dropped by `bury_and_wake` once the driver is not borrowed.
+        timed!(PROFILE, stats, remove_time, Self::retire(inner_ref, id));
+        stats.remove_count += 1;
       }
     }
     (inner, true)
@@ -767,8 +801,21 @@ struct ReleaseSlot<'a> {
 
 impl Drop for ReleaseSlot<'_> {
   fn drop(&mut self) {
-    if let Ok(mut inner) = self.lio.inner.try_borrow_mut() {
-      inner.store.release(self.slot);
+    let panicking = std::thread::panicking();
+    let Ok(mut inner) = self.lio.inner.try_borrow_mut() else {
+      // The slot leaks. Only a panic, already reporting a bug, can leave
+      // the driver borrowed here; panicking again would abort.
+      assert!(
+        panicking,
+        "driver: slot {} is never released: the driver is borrowed",
+        self.slot
+      );
+      return;
+    };
+    inner.store.release(self.slot);
+    inner.burying -= 1;
+    if !panicking {
+      Lio::assert_retired_slots_tracked(&inner);
     }
   }
 }
@@ -792,6 +839,99 @@ mod tests {
     let mut inner = lio.inner.borrow_mut();
     inner.time.schedule(id, Duration::from_secs(60));
     Lio::retire(&mut inner, id);
+  }
+
+  #[test]
+  #[should_panic(expected = "so a slot is never released")]
+  fn a_slot_detached_without_release_panics() {
+    let (backend, lio) = lio(2);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let (lost, other) = (backend.pushed()[0], backend.pushed()[1]);
+    let mut inner = lio.inner.borrow_mut();
+    drop(inner.store.detach(lost).unwrap().registration);
+    Lio::retire(&mut inner, other);
+  }
+
+  #[test]
+  fn retiring_while_a_registration_is_dropped_keeps_slots_accounted() {
+    use std::future::{Future, IntoFuture};
+    use std::task::Context;
+
+    let (backend, lio) = lio(2);
+    let mut sleep = Box::pin(
+      crate::api::sleep(Duration::from_secs(60)).with_lio(&lio).into_future(),
+    );
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(sleep.as_mut().poll(&mut cx).is_pending());
+    // Dropping the callback drops the sleep, whose cancellation retires its
+    // registration while the callback's slot is still being released.
+    crate::api::nop().with_lio(&lio).when_done(move |_| {
+      let _ = &sleep;
+    });
+    backend.complete_all(0);
+    lio.try_run().unwrap();
+    assert!(!lio.is_full(), "both slots are free again");
+  }
+
+  /// Reports a completion for every pushed op, twice.
+  #[derive(Default)]
+  struct Twice(Vec<u64>);
+
+  impl IoBackend for Twice {
+    fn init(&mut self, _: usize) -> io::Result<()> {
+      Ok(())
+    }
+    fn push(&mut self, id: u64, _: crate::backend::op::Op, _: &mut Bump) {
+      self.0.extend([id, id]);
+    }
+    fn flush(&mut self) -> io::Result<()> {
+      Ok(())
+    }
+    fn wait(
+      &mut self,
+      _: Option<Duration>,
+      completed: &mut Vec<OpCompleted>,
+    ) -> io::Result<()> {
+      completed.clear();
+      completed.extend(self.0.drain(..).map(|id| OpCompleted::new(id, 0)));
+      Ok(())
+    }
+  }
+
+  #[test]
+  #[should_panic(expected = "which is not in flight")]
+  fn a_second_completion_for_an_operation_panics() {
+    let lio = Lio::new_with_backend(Twice::default(), 1).unwrap();
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    lio.try_run().unwrap();
+  }
+
+  #[test]
+  fn a_timer_firing_after_its_sleep_was_cancelled_is_ignored() {
+    use std::cell::RefCell;
+    use std::future::{Future, IntoFuture};
+    use std::rc::Rc;
+    use std::task::Context;
+
+    let (_, lio) = lio(2);
+    crate::time::pause(&lio);
+    let later = Rc::new(RefCell::new(Some(Box::pin(
+      crate::api::sleep(Duration::from_millis(2)).with_lio(&lio).into_future(),
+    ))));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+      later.borrow_mut().as_mut().unwrap().as_mut().poll(&mut cx).is_pending()
+    );
+    // Fires first, in the same run, and drops the later sleep.
+    let first = later.clone();
+    crate::api::sleep(Duration::from_millis(1))
+      .with_lio(&lio)
+      .when_done(move |_| drop(first.borrow_mut().take()));
+    lio.advance_time_by_ticks(5);
+    lio.try_run().unwrap();
+    assert!(later.borrow().is_none());
+    assert!(!lio.is_full());
   }
 
   #[test]

@@ -169,6 +169,12 @@ impl OpStore {
 
   /// Makes a slot whose registration was [`detach`](Self::detach)ed and
   /// dropped available again.
+  /// Number of detached registrations whose slot is not released yet.
+  #[inline]
+  pub fn retired(&self) -> usize {
+    self.slots.retired()
+  }
+
   #[inline]
   pub fn release(&mut self, slot: u32) {
     self.slots.release(slot);
