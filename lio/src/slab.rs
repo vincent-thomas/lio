@@ -208,6 +208,11 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
       "slot pool: retired slot {}, which its key does not occupy",
       key.slot()
     );
+    // Before `on_remove` takes the value: a wrapped generation would let a
+    // key from 2^32 reuses ago resolve to whatever occupies the slot next.
+    let Some(generation) = slot.generation.checked_add(1) else {
+      panic!("slot pool: slot {} exhausted its generations", key.slot());
+    };
 
     let removed = on_remove(&mut slot.state);
     slot.status = Status::Retired;
@@ -215,7 +220,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     if TRACK_LEN {
       self.len -= 1;
     }
-    slot.generation = slot.generation.wrapping_add(1);
+    slot.generation = generation;
     removed
   }
 
@@ -495,5 +500,41 @@ mod tests {
     pool.release(key.slot());
     let (again, _) = pool.allocate().unwrap();
     assert_eq!((again.slot(), again.generation()), (0, 1));
+  }
+
+  #[test]
+  #[should_panic(expected = "slot 0 exhausted its generations")]
+  fn wrapping_a_generation_panics() {
+    let mut pool: SlotPool<()> = SlotPool::with_capacity(1, || ());
+    pool.slots[0].generation = u32::MAX;
+    let (key, _) = pool.allocate().unwrap();
+    pool.remove_with(key, |_| ()).unwrap();
+  }
+
+  #[test]
+  fn the_last_generation_is_usable() {
+    let mut pool: SlotPool<u32> = SlotPool::with_capacity(1, || 0);
+    pool.slots[0].generation = u32::MAX - 1;
+    let (key, _) = pool.allocate().unwrap();
+    pool.remove_with(key, |_| ()).unwrap();
+    let (last, value) = pool.allocate().unwrap();
+    *value = 7;
+    assert_eq!(last.generation(), u32::MAX);
+    assert_eq!(pool.get_mut(last), Some(&mut 7));
+    assert_eq!(pool.get_mut(key), None, "the previous key stays stale");
+  }
+
+  #[test]
+  fn a_panicking_wrap_leaves_the_value_in_place() {
+    let mut slab: Slab<Box<u32>> = Slab::new(1);
+    slab.pool.slots[0].generation = u32::MAX;
+    let key = slab.insert(Box::new(7)).unwrap();
+    let removed =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        slab.remove(key);
+      }));
+    assert!(removed.is_err());
+    // Still occupied with its value, dropped once with the slab.
+    assert_eq!(slab.get_mut(key).map(|v| **v), Some(7));
   }
 }
