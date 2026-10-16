@@ -986,4 +986,151 @@ mod tests {
     clock.level0.clear_slot(5);
     clock.advance_to(10);
   }
+
+  /// Random step sequences against a reference model of the wheel.
+  mod model {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashMap;
+
+    #[derive(Clone, Debug)]
+    enum Step {
+      Schedule {
+        slot: u32,
+        generation: u32,
+        delay: u64,
+      },
+      Remove {
+        slot: u32,
+        generation: u32,
+      },
+      Advance(u64),
+      /// Takes at most this many expired timers, or all of them.
+      Poll(Option<usize>),
+    }
+
+    /// Delays and advances spanning every wheel level.
+    fn ticks() -> impl Strategy<Value = u64> {
+      prop_oneof![
+        4 => 0..300u64,
+        2 => 0..70_000u64,
+        1 => 0..(1u64 << 26),
+      ]
+    }
+
+    fn step() -> impl Strategy<Value = Step> {
+      prop_oneof![
+        4 => (0..8u32, 0..3u32, ticks()).prop_map(|(slot, generation, delay)| {
+          Step::Schedule { slot, generation, delay }
+        }),
+        2 => (0..8u32, 0..3u32)
+          .prop_map(|(slot, generation)| Step::Remove { slot, generation }),
+        3 => ticks().prop_map(Step::Advance),
+        2 => prop::option::of(0..4usize).prop_map(Step::Poll),
+      ]
+    }
+
+    fn id(slot: u32, generation: u32) -> TimerId {
+      (u64::from(generation) << 32) | u64::from(slot)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct Timer {
+      id: TimerId,
+      deadline: u64,
+      delivered: bool,
+    }
+
+    fn run(steps: Vec<Step>) {
+      // Smaller than the slots used, so the timer table grows.
+      let mut clock = Clock::with_capacity(4);
+      let mut timers: HashMap<u32, Timer> = HashMap::new();
+      let mut now = 0u64;
+
+      for step in steps {
+        match step {
+          Step::Schedule { slot, generation, delay } => {
+            let id = id(slot, generation);
+            clock.schedule_at(id, now + delay);
+            // A newer timer in the same slot replaces the older one.
+            let deadline = (now + delay).max(now + 1);
+            timers.insert(slot, Timer { id, deadline, delivered: false });
+          }
+          Step::Remove { slot, generation } => {
+            let id = id(slot, generation);
+            let tracked = timers.get(&slot).is_some_and(|t| t.id == id);
+            assert_eq!(clock.remove(id), tracked, "remove({id:#x})");
+            if tracked {
+              timers.remove(&slot);
+            }
+          }
+          Step::Advance(by) => {
+            now += by;
+            clock.advance_by(by);
+            assert_eq!(clock.current_tick(), now);
+          }
+          Step::Poll(limit) => {
+            let got: Vec<TimerId> = match limit {
+              Some(limit) => clock.poll_expired().take(limit).collect(),
+              None => clock.poll_expired().collect(),
+            };
+            for &id in &got {
+              let timer = timers
+                .get_mut(&(id as u32))
+                .filter(|t| t.id == id)
+                .unwrap_or_else(|| panic!("delivered untracked timer {id:#x}"));
+              assert!(timer.deadline <= now, "{id:#x} delivered early");
+              assert!(!timer.delivered, "{id:#x} delivered twice");
+              timer.delivered = true;
+            }
+            let latest = got
+              .iter()
+              .map(|id| timers[&(*id as u32)].deadline)
+              .max()
+              .unwrap_or(0);
+            let due: Vec<_> = timers
+              .values()
+              .filter(|t| t.deadline <= now && !t.delivered)
+              .collect();
+            for timer in &due {
+              assert!(
+                timer.deadline >= latest,
+                "{:#x} due at {} still pending after one due at {latest}",
+                timer.id,
+                timer.deadline
+              );
+            }
+            if limit.is_none() {
+              assert!(
+                due.is_empty(),
+                "polling everything leaves none: {due:?}"
+              );
+            }
+          }
+        }
+
+        assert_eq!(clock.is_empty(), timers.is_empty());
+        for timer in timers.values() {
+          assert!(clock.contains(timer.id), "{:#x} is tracked", timer.id);
+        }
+        let active = timers.values().filter(|t| t.deadline > now);
+        assert_eq!(
+          clock.earliest_active_deadline(),
+          active.map(|t| t.deadline).min()
+        );
+        if timers.values().any(|t| t.deadline <= now && !t.delivered) {
+          assert!(clock.has_expired(), "an undelivered timer is due");
+        }
+      }
+    }
+
+    proptest! {
+      #[test]
+      fn clock_matches_model(
+        steps in prop::collection::vec(step(), 0..120),
+      ) {
+        run(steps);
+      }
+    }
+  }
 }
