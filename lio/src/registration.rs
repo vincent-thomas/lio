@@ -472,6 +472,15 @@ impl Registration {
     self.cancelled
   }
 
+  /// Panics if the registration's state is inconsistent.
+  pub(crate) fn check_invariants(&self) {
+    if self.cancelled
+      && let State::Waker { waker: Some(_), .. } = &self.state
+    {
+      panic!("registration: cancelled, but still holds a waker");
+    }
+  }
+
   #[inline]
   pub(crate) fn restore_waker(&mut self, waker: Waker) {
     if let State::Waker { waker: slot @ None, .. } = &mut self.state {

@@ -10,7 +10,7 @@ use crate::{
 
 use std::{
   cell::{RefCell, RefMut},
-  collections::VecDeque,
+  collections::{HashSet, VecDeque},
   io,
   mem::ManuallyDrop,
   rc::{Rc, Weak},
@@ -421,6 +421,62 @@ impl Lio {
     !inner.overflow.is_empty() || inner.store.is_full()
   }
 
+  /// Panics if the driver's bookkeeping is inconsistent.
+  ///
+  /// For tests: call it between runs, not from a handler, while the driver
+  /// is running. It walks every slot and timer, so it is not cheap.
+  #[doc(hidden)]
+  pub fn check_invariants(&self) {
+    let inner = self
+      .inner
+      .try_borrow()
+      .expect("check_invariants called while the driver is running");
+
+    let mut cancelled = Vec::new();
+    let retired = inner.store.check_invariants(|id, registration| {
+      if registration.is_cancelled() {
+        cancelled.push(id);
+      }
+    });
+    let mut dying: Vec<u32> = inner.dying.iter().map(|d| d.slot).collect();
+    dying.sort_unstable();
+    assert!(
+      dying.windows(2).all(|pair| pair[0] != pair[1]),
+      "driver: a slot is waiting to be released twice"
+    );
+    assert_eq!(
+      retired, dying,
+      "driver: retired slots differ from the registrations waiting to be \
+       dropped, so a slot is never released or is released while in use"
+    );
+
+    inner.time.check_invariants();
+    let timers: HashSet<u64> = inner.time.timer_ids().collect();
+    for &id in &timers {
+      assert!(
+        inner.store.contains(id),
+        "driver: timer {id} outlives its registration"
+      );
+    }
+    for id in cancelled {
+      assert!(
+        !timers.contains(&id),
+        "driver: cancelled registration {id} still has a timer"
+      );
+    }
+
+    let full = inner.store.is_full();
+    assert!(
+      inner.overflow.is_empty() || full,
+      "driver: submissions are queued while a slot is free"
+    );
+    assert!(
+      inner.capacity_waiters.is_empty() || full || !inner.overflow.is_empty(),
+      "driver: futures wait for capacity while a slot is free, and will not \
+       be woken"
+    );
+  }
+
   /// Wakes `waker` once a slot frees up.
   pub(crate) fn wait_for_capacity(&self, waker: &Waker) {
     let mut inner = self.inner.borrow_mut();
@@ -753,5 +809,60 @@ impl Drop for ReleaseSlot<'_> {
     if let Ok(mut inner) = self.lio.inner.try_borrow_mut() {
       inner.store.release(self.slot);
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::backend::testing::ScriptedBackend;
+
+  fn lio(cap: usize) -> (ScriptedBackend, Lio) {
+    let backend = ScriptedBackend::new();
+    (backend.clone(), Lio::new_with_backend(backend, cap).unwrap())
+  }
+
+  #[test]
+  fn invariants_hold_through_a_full_and_drained_driver() {
+    let (backend, lio) = lio(2);
+    for _ in 0..4 {
+      crate::api::nop().with_lio(&lio).when_done(|_| {});
+      lio.check_invariants();
+    }
+    for _ in 0..3 {
+      lio.try_run().unwrap();
+      lio.check_invariants();
+      backend.complete_all(0);
+    }
+    lio.try_run().unwrap();
+    lio.check_invariants();
+    assert!(!lio.is_full());
+  }
+
+  #[test]
+  #[should_panic(expected = "retired slots differ")]
+  fn a_slot_that_is_never_released_is_caught() {
+    let (backend, lio) = lio(1);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let id = backend.pushed()[0];
+    let detached = lio.inner.borrow_mut().store.detach(id).unwrap();
+    drop(detached.registration);
+    lio.check_invariants();
+  }
+
+  #[test]
+  #[should_panic(expected = "will not be woken")]
+  fn a_lost_capacity_wake_up_is_caught() {
+    let (_, lio) = lio(1);
+    lio.inner.borrow_mut().capacity_waiters.push(Waker::noop().clone());
+    lio.check_invariants();
+  }
+
+  #[test]
+  #[should_panic(expected = "outlives its registration")]
+  fn a_timer_without_a_registration_is_caught() {
+    let (_, lio) = lio(1);
+    lio.inner.borrow_mut().time.schedule(7, Duration::from_secs(60));
+    lio.check_invariants();
   }
 }
