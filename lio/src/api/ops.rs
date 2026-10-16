@@ -95,7 +95,7 @@ macro_rules! impl_op_model_contract_runtime {
 pub use crate::backend::op::LinkKind;
 
 #[cfg(test)]
-type TwoVecBufResult = BufResult<i32, (Vec<u8>, Vec<u8>)>;
+type TwoVecBufResult = BufResult<usize, (Vec<u8>, Vec<u8>)>;
 #[cfg(test)]
 type TwoVecOpResult = OpResult<TwoVecBufResult>;
 
@@ -716,7 +716,7 @@ impl<B: IoBufMutVec> Read<B> {
 }
 
 impl<B: IoBufMutVec> OpModel for Read<B> {
-  type Item = BufResult<i32, B>;
+  type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
     let buf = self.buf.as_mut().expect("buffer not available");
@@ -750,7 +750,7 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
         unsafe { buf.set_buf_len(i, len) };
         remaining = remaining.saturating_sub(cap);
       }
-      Ok(completion.result as i32)
+      Ok(completion.result as usize)
     };
 
     OpResult::Done((result, buf))
@@ -856,7 +856,7 @@ impl<B: IoBufVec + std::marker::Send + Sync> Write<B> {
 }
 
 impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
-  type Item = BufResult<i32, B>;
+  type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
     let buf = self.buf.as_ref().expect("buffer not available");
@@ -880,7 +880,7 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
     let result = if completion.result < 0 {
       Err(completion.os_error())
     } else {
-      Ok(completion.result as i32)
+      Ok(completion.result as usize)
     };
     OpResult::Done((result, buf))
   }
@@ -916,7 +916,7 @@ impl OpModelContract for Write<Vec<u8>> {
         )
       },
       Completion::new(4),
-      |result: &OpResult<BufResult<i32, Vec<u8>>>| match result {
+      |result: &OpResult<BufResult<usize, Vec<u8>>>| match result {
         OpResult::Done((Ok(4), buf)) => buf.as_slice() == b"pong",
         _ => false,
       },
@@ -1014,7 +1014,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
   fn complete_buf(
     &mut self,
     completion: Completion,
-  ) -> (std::io::Result<i32>, B) {
+  ) -> (std::io::Result<usize>, B) {
     let mut buf = self.buf.take().expect("buffer not available");
 
     let result = if completion.result < 0 {
@@ -1029,7 +1029,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
         unsafe { buf.set_buf_len(i, len) };
         remaining = remaining.saturating_sub(cap);
       }
-      Ok(completion.result as i32)
+      Ok(completion.result as usize)
     };
 
     (result, buf)
@@ -1060,7 +1060,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> Recv<B> {
 }
 
 impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Recv<B> {
-  type Item = BufResult<i32, B>;
+  type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
     self.core.action()
@@ -1084,7 +1084,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvFrom<B> {
 }
 
 impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for RecvFrom<B> {
-  type Item = (std::io::Result<i32>, B, Option<SocketAddr>);
+  type Item = (std::io::Result<usize>, B, Option<SocketAddr>);
 
   fn action(&mut self) -> Action {
     self.core.action()
@@ -1126,7 +1126,7 @@ impl OpModelContract for Recv<Vec<u8>> {
       },
       |model| model.core.stage_recv_data(b"recv"),
       Completion::new(4),
-      |result: &OpResult<BufResult<i32, Vec<u8>>>| match result {
+      |result: &OpResult<BufResult<usize, Vec<u8>>>| match result {
         OpResult::Done((Ok(4), buf)) => buf.as_slice() == b"recv",
         _ => false,
       },
@@ -1264,7 +1264,7 @@ impl<B: IoBufVec + std::marker::Send + Sync> Send<B> {
 }
 
 impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Send<B> {
-  type Item = BufResult<i32, B>;
+  type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
     let msg = self.hydrate_msg();
@@ -1276,7 +1276,7 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Send<B> {
     let result = if completion.result < 0 {
       Err(completion.os_error())
     } else {
-      Ok(completion.result as i32)
+      Ok(completion.result as usize)
     };
     OpResult::Done((result, buf))
   }
@@ -1310,7 +1310,7 @@ impl OpModelContract for Send<Vec<u8>> {
         _ => false,
       },
       Completion::new(4),
-      |result: &OpResult<BufResult<i32, Vec<u8>>>| match result {
+      |result: &OpResult<BufResult<usize, Vec<u8>>>| match result {
         OpResult::Done((Ok(4), buf)) => buf.as_slice() == b"send",
         _ => false,
       },
@@ -2002,7 +2002,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> ReadlinkAt<B> {
 }
 
 impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
-  type Item = BufResult<i32, B>;
+  type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
     let buf = self.buf.as_mut().expect("buffer not available");
@@ -2033,7 +2033,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
       // SAFETY: the kernel wrote `len <= raw_len` bytes into the region
       // submitted in `action()`.
       unsafe { buf.set_buf_len(0, len) };
-      Ok(completion.result as i32)
+      Ok(completion.result as usize)
     };
     OpResult::Done((result, buf))
   }
@@ -2056,7 +2056,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> GetCwd<B> {
 }
 
 impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
-  type Item = BufResult<i32, B>;
+  type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
     Action::Io(Op::GetCwd { out: NonNull::from(&mut self.out) })
@@ -2080,7 +2080,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
           // SAFETY: the first `bytes.len()` bytes of region 0 were just
           // initialized above.
           unsafe { buf.set_buf_len(0, bytes.len()) };
-          Ok(bytes.len() as i32)
+          Ok(bytes.len())
         }
         _ => Err(std::io::Error::from_raw_os_error(
           crate::backend::native::BUFFER_TOO_SMALL,

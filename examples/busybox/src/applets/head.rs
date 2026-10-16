@@ -127,7 +127,7 @@ fn head_fd_lines(
     let (result, returned_buf) = io_util::run(ctx.lio(), rx);
     buf = returned_buf;
 
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       if !pending.is_empty() && lines_printed < num_lines {
         io_util::write_all(ctx.lio(), &stdout, std::mem::take(&mut pending))?;
@@ -171,7 +171,7 @@ fn head_fd_bytes(
     let (result, returned_buf) = io_util::run(ctx.lio(), rx);
     buf = returned_buf;
 
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }

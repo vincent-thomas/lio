@@ -50,7 +50,7 @@ impl Workload {
       let buf = slot.borrow_mut().take().unwrap();
       api::recv(&pair.receiver, buf, None).with_lio(&self.lio).when_done(
         move |(result, buf)| {
-          assert_eq!(result.unwrap() as usize, bytes);
+          assert_eq!(result.unwrap(), bytes);
           assert!(buf.iter().all(|&byte| byte == 7));
           *slot.borrow_mut() = Some(buf);
           done.set(done.get() + 1);
@@ -61,7 +61,7 @@ impl Workload {
       let buf = slot.borrow_mut().take().unwrap();
       api::send(&pair.sender, buf, None).with_lio(&self.lio).when_done(
         move |(result, buf)| {
-          assert_eq!(result.unwrap() as usize, bytes);
+          assert_eq!(result.unwrap(), bytes);
           *slot.borrow_mut() = Some(buf);
           done.set(done.get() + 1);
         },

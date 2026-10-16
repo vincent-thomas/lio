@@ -324,7 +324,7 @@ fn copy_file_lio(
       api::read(&source_fd, buf).with_lio(ctx.lio()).send(),
     );
     buf = returned_buf;
-    let n = read_result? as usize;
+    let n = read_result?;
     if n == 0 {
       break;
     }

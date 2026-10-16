@@ -61,11 +61,11 @@ fn basic() {
     api::recvfrom(&receiver, vec![0u8; 1024], None).with_lio(&mut lio).send();
 
   let (bytes_received, received_buf, from_addr): (
-    std::io::Result<i32>,
+    std::io::Result<usize>,
     Vec<u8>,
     Option<SocketAddr>,
   ) = poll_recv(&mut lio, &mut receiver_op);
-  let bytes_received = bytes_received.expect("recvfrom failed") as usize;
+  let bytes_received = bytes_received.expect("recvfrom failed");
 
   assert_eq!(bytes_received, data.len());
   assert_eq!(&received_buf[..bytes_received], data.as_slice());
@@ -87,11 +87,11 @@ fn multiple() {
       .send_with(sender_recv);
 
     let (bytes_received, received_buf, from_addr): (
-      std::io::Result<i32>,
+      std::io::Result<usize>,
       Vec<u8>,
       Option<SocketAddr>,
     ) = poll_until_recv(&mut lio, &receiver_recv);
-    let bytes_received = bytes_received.expect("recvfrom failed") as usize;
+    let bytes_received = bytes_received.expect("recvfrom failed");
 
     assert_eq!(bytes_received, data.len());
     assert_eq!(&received_buf[..bytes_received], data.as_slice());
@@ -113,11 +113,11 @@ fn partial_buffer() {
     .send_with(sender_recv);
 
   let (bytes_received, received_buf, from_addr): (
-    std::io::Result<i32>,
+    std::io::Result<usize>,
     Vec<u8>,
     Option<SocketAddr>,
   ) = poll_until_recv(&mut lio, &receiver_recv);
-  let bytes_received = bytes_received.expect("recvfrom failed") as usize;
+  let bytes_received = bytes_received.expect("recvfrom failed");
 
   assert!(bytes_received <= 10);
   assert_eq!(&received_buf[..bytes_received], &data[..bytes_received]);
@@ -138,12 +138,11 @@ fn with_flags() {
     .send_with(sender_recv);
 
   let (bytes_received, received_buf, from_addr): (
-    std::io::Result<i32>,
+    std::io::Result<usize>,
     Vec<u8>,
     Option<SocketAddr>,
   ) = poll_until_recv(&mut lio, &receiver_recv);
-  let bytes_received =
-    bytes_received.expect("recvfrom with flags failed") as usize;
+  let bytes_received = bytes_received.expect("recvfrom with flags failed");
 
   assert_eq!(bytes_received, data.len());
   assert_eq!(&received_buf[..bytes_received], data.as_slice());
@@ -164,11 +163,11 @@ fn tcp_stream() {
     .send();
 
   let (bytes_received, received_buf, from_addr): (
-    std::io::Result<i32>,
+    std::io::Result<usize>,
     Vec<u8>,
     Option<SocketAddr>,
   ) = poll_recv(&mut lio, &mut receiver_op);
-  let bytes_received = bytes_received.expect("recvfrom failed on TCP") as usize;
+  let bytes_received = bytes_received.expect("recvfrom failed on TCP");
 
   assert_eq!(bytes_received, data.len());
   assert_eq!(&received_buf[..bytes_received], data.as_slice());
@@ -188,12 +187,11 @@ fn unix_dgram() {
     api::recvfrom(&receiver, vec![0u8; 1024], None).with_lio(&mut lio).send();
 
   let (bytes_received, received_buf, from_addr): (
-    std::io::Result<i32>,
+    std::io::Result<usize>,
     Vec<u8>,
     Option<SocketAddr>,
   ) = poll_recv(&mut lio, &mut receiver_op);
-  let bytes_received =
-    bytes_received.expect("recvfrom failed on Unix dgram") as usize;
+  let bytes_received = bytes_received.expect("recvfrom failed on Unix dgram");
 
   assert_eq!(bytes_received, data.len());
   assert_eq!(&received_buf[..bytes_received], data.as_slice());

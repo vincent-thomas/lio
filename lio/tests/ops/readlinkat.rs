@@ -32,7 +32,7 @@ fn test_readlinkat_basic() {
     .send_with(sender);
 
   let (result, buf) = poll_until_recv(&mut lio, &receiver);
-  let bytes = result.unwrap() as usize;
+  let bytes = result.unwrap();
   assert_eq!(&buf[..bytes], target.as_os_str().as_encoded_bytes());
 
   fs::remove_file(&link).ok();

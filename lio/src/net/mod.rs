@@ -50,7 +50,7 @@
 //!
 //! // Send data (buffer is consumed and returned)
 //! let (result, buffer) = socket.send(buffer).await;
-//! let bytes_sent = result? as usize;
+//! let bytes_sent = result?;
 //!
 //! // Buffer can be reused for another operation
 //! let buffer2 = b"Another message!".to_vec();

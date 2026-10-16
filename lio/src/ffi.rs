@@ -157,6 +157,14 @@ pub unsafe extern "C" fn lio_buf_free(buf: *mut u8, len: usize) {
   }
 }
 
+/// A byte count as the C API's `int` result code.
+///
+/// A count above `INT_MAX` cannot be represented and saturates; callbacks
+/// that hand a buffer back still report its real length in `len`.
+fn ffi_count(n: usize) -> i32 {
+  i32::try_from(n).unwrap_or(i32::MAX)
+}
+
 /// Free a socket address allocated by lio, such as the address returned by
 /// [`lio_accept`] or [`lio_recvfrom`].
 ///
@@ -598,7 +606,7 @@ pub unsafe extern "C" fn lio_write_at(
   op.with_lio(&unsafe { handle(lio) }.inner).when_done(
     move |(res, mut buf)| {
       let code = match res {
-        Ok(n) => n,
+        Ok(n) => ffi_count(n),
         Err(e) => -e.raw_os_error().unwrap_or(1),
       };
       let ptr = buf.as_mut_ptr();
@@ -643,7 +651,7 @@ pub unsafe extern "C" fn lio_read_at(
   op.with_lio(&unsafe { handle(lio) }.inner).when_done(
     move |(res, mut buf)| {
       let code = match res {
-        Ok(n) => n,
+        Ok(n) => ffi_count(n),
         Err(e) => -e.raw_os_error().unwrap_or(1),
       };
       let ptr = buf.as_mut_ptr();
@@ -826,7 +834,7 @@ pub unsafe extern "C" fn lio_send(
   .with_lio(&unsafe { handle(lio) }.inner)
   .when_done(move |(res, mut buf)| {
     let code = match res {
-      Ok(n) => n,
+      Ok(n) => ffi_count(n),
       Err(e) => -e.raw_os_error().unwrap_or(1),
     };
     let ptr = buf.as_mut_ptr();
@@ -870,7 +878,7 @@ pub unsafe extern "C" fn lio_recv(
   .with_lio(&unsafe { handle(lio) }.inner)
   .when_done(move |(res, mut buf)| {
     let code = match res {
-      Ok(n) => n,
+      Ok(n) => ffi_count(n),
       Err(e) => -e.raw_os_error().unwrap_or(1),
     };
     let ptr = buf.as_mut_ptr();
@@ -920,7 +928,7 @@ pub unsafe extern "C" fn lio_recvfrom(
                 as *const _
             })
             .unwrap_or(ptr::null());
-          (n, addr_ptr)
+          (ffi_count(n), addr_ptr)
         }
         Err(e) => (-e.raw_os_error().unwrap_or(1), ptr::null()),
       };
@@ -1097,7 +1105,7 @@ pub unsafe extern "C" fn lio_sendto(
   .with_lio(&unsafe { handle(lio) }.inner)
   .when_done(move |(res, mut buf)| {
     let code = match res {
-      Ok(n) => n,
+      Ok(n) => ffi_count(n),
       Err(e) => -e.raw_os_error().unwrap_or(1),
     };
     let ptr = buf.as_mut_ptr();
@@ -1229,7 +1237,7 @@ pub unsafe extern "C" fn lio_read(
   api::read(&resource, vec).with_lio(&unsafe { handle(lio) }.inner).when_done(
     move |(res, mut buf)| {
       let code = match res {
-        Ok(n) => n,
+        Ok(n) => ffi_count(n),
         Err(e) => -e.raw_os_error().unwrap_or(1),
       };
       let ptr = buf.as_mut_ptr();
@@ -1264,7 +1272,7 @@ pub unsafe extern "C" fn lio_write(
   api::write(&resource, vec).with_lio(&unsafe { handle(lio) }.inner).when_done(
     move |(res, mut buf)| {
       let code = match res {
-        Ok(n) => n,
+        Ok(n) => ffi_count(n),
         Err(e) => -e.raw_os_error().unwrap_or(1),
       };
       let ptr = buf.as_mut_ptr();
@@ -1544,7 +1552,7 @@ pub unsafe extern "C" fn lio_readlinkat(
     .with_lio(&unsafe { handle(lio) }.inner)
     .when_done(move |(res, mut buf)| {
       let code = match res {
-        Ok(n) => n,
+        Ok(n) => ffi_count(n),
         Err(e) => -e.raw_os_error().unwrap_or(1),
       };
       let ptr = buf.as_mut_ptr();
@@ -1572,7 +1580,7 @@ pub unsafe extern "C" fn lio_getcwd(
   api::getcwd(vec).with_lio(&unsafe { handle(lio) }.inner).when_done(
     move |(res, mut buf)| {
       let code = match res {
-        Ok(n) => n,
+        Ok(n) => ffi_count(n),
         Err(e) => -e.raw_os_error().unwrap_or(1),
       };
       let ptr = buf.as_mut_ptr();

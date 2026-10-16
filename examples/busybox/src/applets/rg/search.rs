@@ -98,7 +98,7 @@ struct BufferedContextLine {
 
 enum StreamFileEvent {
   Open { id: usize, result: io::Result<lio::api::resource::Resource> },
-  Read { id: usize, result: io::Result<i32>, returned_buf: Vec<u8> },
+  Read { id: usize, result: io::Result<usize>, returned_buf: Vec<u8> },
 }
 
 #[derive(Debug)]
@@ -112,7 +112,7 @@ struct PendingBatchFileRead {
 
 enum BatchFileEvent {
   Open { index: usize, result: io::Result<lio::api::resource::Resource> },
-  Read { index: usize, result: io::Result<i32>, returned_buf: Vec<u8> },
+  Read { index: usize, result: io::Result<usize>, returned_buf: Vec<u8> },
 }
 
 pub(super) struct WorkerFilePipeline {
@@ -294,7 +294,7 @@ fn handle_batch_file_event(
         file.buf = returned_buf;
 
         let n = match result {
-          Ok(n) => n as usize,
+          Ok(n) => n,
           Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
             file.bytes.clear();
             file.skipped = true;
@@ -1247,7 +1247,7 @@ impl SearchEngine {
   ) -> io::Result<bool> {
     enum FileEvent {
       Open { index: usize, result: io::Result<lio::api::resource::Resource> },
-      Read { index: usize, result: io::Result<i32>, returned_buf: Vec<u8> },
+      Read { index: usize, result: io::Result<usize>, returned_buf: Vec<u8> },
     }
 
     if files.is_empty() {
@@ -1330,7 +1330,7 @@ impl SearchEngine {
               file.buf = returned_buf;
 
               let n = match result {
-                Ok(n) => n as usize,
+                Ok(n) => n,
                 Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
                   file.done = true;
                   finished = true;
@@ -1555,7 +1555,7 @@ impl SearchEngine {
             file.buf = returned_buf;
 
             let n = match result {
-              Ok(n) => n as usize,
+              Ok(n) => n,
               Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
                 file.done = true;
                 finished = true;

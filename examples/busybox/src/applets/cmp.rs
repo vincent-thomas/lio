@@ -104,8 +104,8 @@ fn compare_streams(
     left_buf = returned_left;
     right_buf = returned_right;
 
-    let left_n = left_result? as usize;
-    let right_n = right_result? as usize;
+    let left_n = left_result?;
+    let right_n = right_result?;
 
     if left_n == 0 && right_n == 0 {
       return Ok(None);
