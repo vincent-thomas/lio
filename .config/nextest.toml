@@ -1,0 +1,7 @@
+# Used by cargo-mutants (`NEXTEST_PROFILE=mutants` in CI). A mutant that
+# hangs one test (an infinite loop, a channel never closed) must fail that
+# test, which counts as caught, rather than time out the whole run: a test
+# still running keeps a failed run from ending.
+[profile.mutants]
+slow-timeout = { period = "30s", terminate-after = 2 }
+fail-fast = true

@@ -124,8 +124,13 @@ jobs:
       # Every mutant of a changed line in the core must make a test fail;
       # `.cargo/mutants.toml` says which files count as core.
       - name: mutate the lines this PR changes
+        env:
+          NEXTEST_PROFILE: mutants
         run: |
           git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
+          # A mutant can loop while allocating: cap each process's address
+          # space (8 GiB) so that test fails instead of the runner dying.
+          ulimit -v 8388608
           cargo mutants --in-diff pr.diff --no-shuffle --jobs 2
 
       - uses: actions/upload-artifact@v4
