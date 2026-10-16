@@ -41,7 +41,7 @@ fn basic() {
     api::send(&client_sock, data.clone(), None).with_lio(&mut lio).send();
 
   let (bytes_sent, returned_buf) = poll_recv(&mut lio, &mut sender);
-  let bytes_sent = bytes_sent.expect("Failed to send data") as usize;
+  let bytes_sent = bytes_sent.expect("Failed to send data");
 
   assert_eq!(bytes_sent, data.len());
   assert_eq!(returned_buf, data);
@@ -60,7 +60,7 @@ fn large_data() {
     api::send(&client_sock, large_data, None).with_lio(&mut lio).send();
 
   let (bytes_sent, returned_buf) = poll_recv(&mut lio, &mut sender);
-  let bytes_sent = bytes_sent.expect("Failed to send large data") as usize;
+  let bytes_sent = bytes_sent.expect("Failed to send large data");
 
   assert_eq!(bytes_sent, expected.len());
   assert_eq!(returned_buf, expected);
@@ -83,7 +83,7 @@ fn multiple() {
       .send_with(sender_send);
 
     let (bytes_sent, returned_buf) = poll_until_recv(&mut lio, &receiver_send);
-    let bytes_sent = bytes_sent.expect("Failed to send") as usize;
+    let bytes_sent = bytes_sent.expect("Failed to send");
 
     assert_eq!(bytes_sent, expected.len());
     assert_eq!(returned_buf, expected);
@@ -111,7 +111,7 @@ fn with_flags() {
   .send_with(sender_send);
 
   let (bytes_sent, returned_buf) = poll_until_recv(&mut lio, &receiver_send);
-  let bytes_sent = bytes_sent.expect("Failed to send with flags") as usize;
+  let bytes_sent = bytes_sent.expect("Failed to send with flags");
 
   assert_eq!(bytes_sent, expected.len());
   assert_eq!(returned_buf, expected);
@@ -142,7 +142,7 @@ fn concurrent_pairs() {
 
   for ((_, data), receiver) in expected.iter().zip(receivers.iter()) {
     let (res, returned) = poll_until_recv(&mut lio, receiver);
-    assert_eq!(res.expect("Send should succeed") as usize, data.len());
+    assert_eq!(res.expect("Send should succeed"), data.len());
     assert_eq!(&returned, data);
   }
 

@@ -18,7 +18,7 @@
 //!     let (result, _) = client.send(b"ping".to_vec()).await;
 //!     result?;
 //!     let (result, buf) = server.recv(vec![0u8; 4]).await;
-//!     assert_eq!(&buf[..result? as usize], b"ping");
+//!     assert_eq!(&buf[..result?], b"ping");
 //!     Ok(())
 //! }
 //! ```

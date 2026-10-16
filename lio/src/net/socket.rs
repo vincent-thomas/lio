@@ -43,7 +43,7 @@ use crate::{
 ///     // Receive data from the client
 ///     let buffer = vec![0u8; 1024];
 ///     let (result, buffer) = client_socket.recv(buffer).await;
-///     let bytes_read = result? as usize;
+///     let bytes_read = result?;
 ///
 ///     Ok(())
 /// }
@@ -66,7 +66,7 @@ use crate::{
 ///     // Send data
 ///     let data = b"Hello, server!".to_vec();
 ///     let (result, data) = socket.send(data).await;
-///     let bytes_sent = result? as usize;
+///     let bytes_sent = result?;
 ///
 ///     // Shutdown the write side
 ///     socket.shutdown(lio::api::ShutdownHow::Write).await?;
@@ -261,7 +261,7 @@ impl Socket {
   /// async fn example(socket: Socket) -> std::io::Result<()> {
   ///     let buffer = vec![0u8; 1024];
   ///     let (result, buffer) = socket.recv(buffer).await;
-  ///     let bytes_read = result? as usize;
+  ///     let bytes_read = result?;
   ///
   ///     println!("Received {} bytes", bytes_read);
   ///     println!("Data: {:?}", &buffer[..bytes_read]);
@@ -304,7 +304,7 @@ impl Socket {
   /// async fn example(socket: Socket) -> std::io::Result<()> {
   ///     let data = b"Hello, world!".to_vec();
   ///     let (result, data) = socket.send(data).await;
-  ///     let bytes_sent = result? as usize;
+  ///     let bytes_sent = result?;
   ///
   ///     println!("Sent {} bytes", bytes_sent);
   ///

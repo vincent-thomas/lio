@@ -50,7 +50,7 @@ impl Command for HexdumpCommand {
       let (result, returned_buf) = io_util::run(ctx.lio(), rx);
       buf = returned_buf;
 
-      let n = result? as usize;
+      let n = result?;
       if n == 0 {
         break;
       }

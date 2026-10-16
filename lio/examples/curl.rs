@@ -53,7 +53,7 @@ fn main() -> io::Result<()> {
     let ((result, returned_buf), ()) =
       (run(&lio, api::recv(&socket, buf, None).with_lio(&lio).send()), ());
     buf = returned_buf;
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       break;
     }
@@ -277,7 +277,7 @@ fn write_all(lio: &Lio, fd: &Resource, buf: Vec<u8>) -> io::Result<()> {
       lio,
       api::send(fd, buf[written..].to_vec(), None).with_lio(lio).send(),
     );
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       return Err(io::Error::new(
         io::ErrorKind::WriteZero,
@@ -296,7 +296,7 @@ fn write_all_stdout(lio: &Lio, fd: &Resource, buf: Vec<u8>) -> io::Result<()> {
       run(lio, api::write(fd, buf[written..].to_vec()).with_lio(lio).send()),
       (),
     );
-    let n = result? as usize;
+    let n = result?;
     if n == 0 {
       return Err(io::Error::new(
         io::ErrorKind::WriteZero,

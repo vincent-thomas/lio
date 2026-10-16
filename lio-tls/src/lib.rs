@@ -119,7 +119,7 @@ macro_rules! impl_tls_stream {
       async fn read_tls(&mut self) -> io::Result<()> {
         let buf = vec![0u8; 16384];
         let (result, buf) = self.tcp.recv(buf).await;
-        let n = result? as usize;
+        let n = result?;
 
         if n == 0 {
           return Err(io::Error::new(
@@ -150,7 +150,7 @@ macro_rules! impl_tls_stream {
           while written < buf.len() {
             let chunk = buf[written..].to_vec();
             let (result, _chunk) = self.tcp.send(chunk).await;
-            let n = result? as usize;
+            let n = result?;
             if n == 0 {
               return Err(io::Error::new(
                 io::ErrorKind::WriteZero,

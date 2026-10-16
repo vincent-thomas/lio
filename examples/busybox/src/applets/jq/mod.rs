@@ -243,7 +243,7 @@ fn read_file_batch(
       let file = &mut pending[index];
       file.buf = returned_buf;
 
-      let n = result? as usize;
+      let n = result?;
       if n == 0 {
         file.done = true;
         continue;

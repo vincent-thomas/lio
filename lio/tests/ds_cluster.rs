@@ -11,8 +11,8 @@ use lio::{
 };
 
 type MessageList = Rc<RefCell<Vec<Vec<u8>>>>;
-type SendReceiver = Receiver<(std::io::Result<i32>, Vec<u8>)>;
-type RecvReceiver = Receiver<(std::io::Result<i32>, Vec<u8>)>;
+type SendReceiver = Receiver<(std::io::Result<usize>, Vec<u8>)>;
+type RecvReceiver = Receiver<(std::io::Result<usize>, Vec<u8>)>;
 
 fn trace(line: impl AsRef<str>) {
   println!("{}", line.as_ref());
@@ -93,7 +93,7 @@ impl MessageExchange {
     if let Some(rx) = self.recv_rx.as_mut()
       && let Some((result, buf)) = rx.try_recv()
     {
-      let len = result.unwrap() as usize;
+      let len = result.unwrap();
       let bytes = buf[..len].to_vec();
       self.received.borrow_mut().push(bytes.clone());
       trace(format!(
@@ -108,7 +108,7 @@ impl MessageExchange {
     let mut send_idx = 0;
     while send_idx < self.send_rxs.len() {
       if let Some((result, buf)) = self.send_rxs[send_idx].try_recv() {
-        assert_eq!(result.unwrap(), buf.len() as i32);
+        assert_eq!(result.unwrap(), buf.len());
         trace(format!(
           "{}: send complete bytes={}",
           self.role,

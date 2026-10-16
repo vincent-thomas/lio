@@ -28,18 +28,18 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 #[derive(Debug)]
 enum Event {
   Nop { id: usize, result: io::Result<()> },
-  GetCwd { id: usize, result: io::Result<i32>, buf: Vec<u8> },
-  Read { id: usize, result: io::Result<i32>, buf: Vec<u8> },
-  Recv { id: usize, result: io::Result<i32>, buf: Vec<u8> },
-  Write { id: usize, result: io::Result<i32>, buf: Vec<u8> },
-  Send { id: usize, result: io::Result<i32>, buf: Vec<u8> },
+  GetCwd { id: usize, result: io::Result<usize>, buf: Vec<u8> },
+  Read { id: usize, result: io::Result<usize>, buf: Vec<u8> },
+  Recv { id: usize, result: io::Result<usize>, buf: Vec<u8> },
+  Write { id: usize, result: io::Result<usize>, buf: Vec<u8> },
+  Send { id: usize, result: io::Result<usize>, buf: Vec<u8> },
   Socket { id: usize, result: io::Result<Resource> },
   Bind { id: usize, result: io::Result<()> },
   Listen { id: usize, result: io::Result<()> },
   Shutdown { id: usize, result: io::Result<()> },
   OpenAt { id: usize, result: io::Result<Resource> },
   StatAt { id: usize, result: io::Result<FileStat> },
-  ReadlinkAt { id: usize, result: io::Result<i32>, buf: Vec<u8> },
+  ReadlinkAt { id: usize, result: io::Result<usize>, buf: Vec<u8> },
   MkdirAt { id: usize, result: io::Result<()> },
   UnlinkAt { id: usize, result: io::Result<()> },
   RenameAt { id: usize, result: io::Result<()> },
@@ -709,7 +709,7 @@ fn assert_event_invariants(seed: u64, event: &Event) {
       match result {
         Ok(len) => {
           assert!(
-            (*len as usize) <= buf.len(),
+            *len <= buf.len(),
             "seed {seed} returned byte count {} > {}",
             len,
             buf.len()
@@ -814,10 +814,9 @@ fn assert_event_invariants(seed: u64, event: &Event) {
   }
 }
 
-fn assert_buf_result(seed: u64, len: i32, buf: &[u8]) {
-  assert!(len >= 0, "seed {seed} returned negative success length {len}");
+fn assert_buf_result(seed: u64, len: usize, buf: &[u8]) {
   assert!(
-    (len as usize) <= buf.len(),
+    len <= buf.len(),
     "seed {seed} returned byte count {} > {}",
     len,
     buf.len()
