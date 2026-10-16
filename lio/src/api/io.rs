@@ -1156,6 +1156,44 @@ mod tests {
     assert_eq!(item, Poll::Ready(Some(1)));
   }
 
+  /// Takes a step without an item, then finishes with 7.
+  struct AgainThenDone(bool);
+
+  impl OpModel for AgainThenDone {
+    type Item = u32;
+
+    fn action(&mut self) -> Action {
+      Action::Io(crate::backend::op::Op::Nop)
+    }
+
+    fn complete(&mut self, _: Completion) -> OpResult<u32> {
+      if std::mem::replace(&mut self.0, true) {
+        OpResult::Done(7)
+      } else {
+        OpResult::Again
+      }
+    }
+  }
+
+  impl StreamOpModel for AgainThenDone {}
+
+  #[test]
+  fn a_stream_step_without_an_item_keeps_the_waker_for_the_next() {
+    let (backend, lio) = scripted(1);
+    let mut stream = IoStream::from_op(AgainThenDone(false)).with_lio(&lio);
+    let mut next = Box::pin(stream.next());
+    let counts = Arc::default();
+    let waker = counting_waker(&counts);
+    assert!(next.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+    for _ in 0..2 {
+      backend.complete_all(0);
+      lio.try_run().unwrap();
+    }
+    assert_eq!(counts.wakes.load(Ordering::SeqCst), 1, "woken for the item");
+    let item = next.as_mut().poll(&mut Context::from_waker(&waker));
+    assert_eq!(item, Poll::Ready(Some(7)));
+  }
+
   #[test]
   fn test_stream_send_uses_bound_lio() {
     let lio = Lio::new(64).unwrap();

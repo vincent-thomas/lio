@@ -631,11 +631,15 @@ impl Lio {
     waited?;
 
     let before = inner_ref.ready_timers.len();
+    let ready_timers = &mut inner_ref.ready_timers;
+    // `for_each` takes the expiry iterator's `fold`, which skips the
+    // per-timer staleness check when no fired timer went stale; `extend`
+    // would step it with `next`.
     timed!(
       PROFILE,
       stats,
       timer_poll_time,
-      inner_ref.ready_timers.extend(inner_ref.time.poll_expired())
+      inner_ref.time.poll_expired().for_each(|id| ready_timers.push_back(id))
     );
     stats.count_timer_expirations(before, inner_ref.ready_timers.len());
     let resource_close = inner_ref.resource_close;
