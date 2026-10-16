@@ -817,6 +817,10 @@ impl<T> StreamReceiver<T> {
 mod tests {
   use super::*;
   use crate::api;
+  use crate::api::op::{Action, Completion, OpResult, StreamOpModel};
+  use crate::backend::testing::ScriptedBackend;
+  use std::sync::Arc;
+  use std::sync::atomic::{AtomicUsize, Ordering};
   use std::task::{RawWaker, RawWakerVTable, Waker};
 
   #[test]
@@ -1009,6 +1013,147 @@ mod tests {
     let result = receiver.try_recv();
     assert!(result.is_some());
     assert!(result.unwrap().is_ok());
+  }
+
+  fn scripted(cap: usize) -> (ScriptedBackend, Lio) {
+    let backend = ScriptedBackend::new();
+    (backend.clone(), Lio::new_with_backend(backend, cap).unwrap())
+  }
+
+  /// Counts the clones and wakes of the wakers made by [`counting_waker`].
+  #[derive(Default)]
+  struct Counts {
+    clones: AtomicUsize,
+    wakes: AtomicUsize,
+  }
+
+  fn counting_waker(counts: &Arc<Counts>) -> Waker {
+    static VTABLE: RawWakerVTable =
+      RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+
+    /// # Safety
+    /// `data` came from `Arc::into_raw` on an `Arc<Counts>`.
+    unsafe fn counts_of<'a>(data: *const ()) -> &'a Counts {
+      // SAFETY: per the caller, `data` points to a live `Counts`.
+      unsafe { &*data.cast::<Counts>() }
+    }
+    unsafe fn clone(data: *const ()) -> RawWaker {
+      // SAFETY: the waker's data is an `Arc<Counts>` it holds a count of.
+      unsafe {
+        counts_of(data).clones.fetch_add(1, Ordering::SeqCst);
+        Arc::increment_strong_count(data.cast::<Counts>());
+      }
+      RawWaker::new(data, &VTABLE)
+    }
+    unsafe fn wake(data: *const ()) {
+      // SAFETY: as in `clone`; waking consumes the waker's count.
+      unsafe {
+        wake_by_ref(data);
+        drop(data);
+      }
+    }
+    unsafe fn wake_by_ref(data: *const ()) {
+      // SAFETY: as in `clone`.
+      unsafe { counts_of(data).wakes.fetch_add(1, Ordering::SeqCst) };
+    }
+    unsafe fn drop(data: *const ()) {
+      // SAFETY: as in `clone`; this releases the waker's count.
+      unsafe { Arc::decrement_strong_count(data.cast::<Counts>()) };
+    }
+
+    let data = Arc::into_raw(Arc::clone(counts)).cast::<()>();
+    // SAFETY: the vtable keeps one `Arc` count per waker.
+    unsafe { Waker::from_raw(RawWaker::new(data, &VTABLE)) }
+  }
+
+  #[test]
+  fn a_future_wakes_the_waker_it_was_last_polled_with() {
+    let (backend, lio) = scripted(1);
+    let mut future = api::nop().with_lio(&lio).into_future();
+    let (first, second) = (Arc::default(), Arc::default());
+    let a = counting_waker(&first);
+    assert!(
+      Pin::new(&mut future).poll(&mut Context::from_waker(&a)).is_pending()
+    );
+    let clones = first.clones.load(Ordering::SeqCst);
+    assert!(
+      Pin::new(&mut future).poll(&mut Context::from_waker(&a)).is_pending()
+    );
+    assert_eq!(
+      first.clones.load(Ordering::SeqCst),
+      clones,
+      "polled again with the same waker, the future keeps the one it has"
+    );
+
+    let b = counting_waker(&second);
+    assert!(
+      Pin::new(&mut future).poll(&mut Context::from_waker(&b)).is_pending()
+    );
+    backend.complete_all(0);
+    lio.try_run().unwrap();
+    assert_eq!(first.wakes.load(Ordering::SeqCst), 0);
+    assert_eq!(second.wakes.load(Ordering::SeqCst), 1);
+    assert!(
+      Pin::new(&mut future).poll(&mut Context::from_waker(&b)).is_ready()
+    );
+  }
+
+  #[test]
+  fn recv_timeout_returns_a_completed_result() {
+    let (backend, lio) = scripted(1);
+    let mut receiver = api::nop().with_lio(&lio).send();
+    assert!(receiver.recv_timeout(Duration::ZERO).is_none());
+    backend.complete_all(0);
+    lio.try_run().unwrap();
+    let result = receiver.recv_timeout(Duration::from_secs(5));
+    assert!(result.is_some_and(|result| result.is_ok()));
+  }
+
+  /// Yields 1 and 2, then finishes with 3.
+  struct Counter(u32);
+
+  impl OpModel for Counter {
+    type Item = u32;
+
+    fn action(&mut self) -> Action {
+      Action::Io(crate::backend::op::Op::Nop)
+    }
+
+    fn complete(&mut self, _: Completion) -> OpResult<u32> {
+      self.0 += 1;
+      if self.0 < 3 { OpResult::Yield(self.0) } else { OpResult::Done(self.0) }
+    }
+  }
+
+  impl StreamOpModel for Counter {}
+
+  #[test]
+  fn stream_receiver_iterates_every_item_until_the_stream_ends() {
+    let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 1).unwrap();
+    let receiver = IoStream::from_op(Counter(0)).with_lio(&lio).send();
+    for _ in 0..3 {
+      lio.try_run().unwrap();
+    }
+    assert_eq!(receiver.iter().collect::<Vec<_>>(), [1, 2, 3]);
+  }
+
+  #[test]
+  fn a_stream_wakes_the_waker_it_was_last_polled_with() {
+    let (backend, lio) = scripted(1);
+    let mut stream = IoStream::from_op(Counter(0)).with_lio(&lio);
+    let mut next = Box::pin(stream.next());
+    let (first, second) = (Arc::default(), Arc::default());
+    let a = counting_waker(&first);
+    assert!(next.as_mut().poll(&mut Context::from_waker(&a)).is_pending());
+    let b = counting_waker(&second);
+    assert!(next.as_mut().poll(&mut Context::from_waker(&b)).is_pending());
+
+    backend.complete_all(0);
+    lio.try_run().unwrap();
+    assert_eq!(first.wakes.load(Ordering::SeqCst), 0);
+    assert_eq!(second.wakes.load(Ordering::SeqCst), 1);
+    let item = next.as_mut().poll(&mut Context::from_waker(&b));
+    assert_eq!(item, Poll::Ready(Some(1)));
   }
 
   #[test]

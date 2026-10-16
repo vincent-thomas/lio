@@ -13,8 +13,31 @@ examine_globs = [
   "lio/src/api/io.rs",
   "lio/src/api/op.rs",
 ]
-# Profiling counters have no observable effect on the driver.
-exclude_re = ["LioProfile"]
+exclude_re = [
+  # Profiling counters have no observable effect on the driver.
+  "LioProfile",
+  # TICK_MS is 1, so multiplying and dividing by it are the same.
+  "replace \\* with / in ticks_duration",
+  # The generation sits above bit 32 and the slot below, so `|` and `^`
+  # pack the same key.
+  "replace \\| with \\^ in SlabKey::as_u64",
+  # Only called for a slot past the end, so the length never equals it.
+  "replace > with >= in Clock::grow_timer_slots",
+  # At the current tick the loop body changes nothing: the next busy tick
+  # is always later (short of tick 2^64, some 584 million years in).
+  "replace < with <= in Clock::advance_to",
+  # An equal deadline is handled by the arm before.
+  "replace < with <= in Clock::increment_active_deadline",
+  # A timer exactly one level's range away lands in the slot the clock just
+  # passed, which next comes round at its deadline rounded down to that
+  # level's granularity: when the next level up would hand it down too.
+  "replace < with <= in Clock::insert_timer",
+  "replace < with <= in Clock::insert_higher_timer",
+  # `CompletionFlags::MORE` is `1 << 0`, and `1 >> 0` is the same value.
+  "lio/src/api/op\\.rs:80:33: replace << with >>",
+]
 test_tool = "nextest"
-# A mutant can turn a loop infinite; the clean suite takes about 10s.
+# A mutant can turn a loop infinite. nextest stops a hung test after 60s
+# (`.config/nextest.toml`); this whole-run timeout is only the backstop.
 timeout_multiplier = 3.0
+minimum_test_timeout = 120

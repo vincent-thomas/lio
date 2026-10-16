@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use crate::Lio;
 use crate::api::op::{Completion, CompletionFlags};
-use clock::TICK_MS;
 pub use clock::{Clock, TimerId};
+use clock::{TICK_NS, ticks_duration};
 
 /// Runtime-facing time manager that adapts [`Clock`] to wall-clock time.
 #[derive(Debug)]
@@ -56,7 +56,7 @@ impl TimeManager {
   fn now_ticks(&self) -> u64 {
     match self.state {
       TimeState::Running { epoch } => {
-        epoch.elapsed().as_millis() as u64 / TICK_MS
+        (epoch.elapsed().as_nanos() / TICK_NS) as u64
       }
       TimeState::Paused => self.clock.current_tick(),
     }
@@ -65,7 +65,6 @@ impl TimeManager {
   fn deadline_ticks_after(&self, duration: Duration) -> u64 {
     match self.state {
       TimeState::Running { epoch } => {
-        const TICK_NS: u128 = TICK_MS as u128 * 1_000_000;
         let elapsed_ns = epoch.elapsed().as_nanos();
         let deadline_ticks = elapsed_ns
           .saturating_add(duration.as_nanos())
@@ -74,11 +73,8 @@ impl TimeManager {
         deadline_ticks.max(self.clock.current_tick().saturating_add(1))
       }
       TimeState::Paused => self.clock.current_tick().saturating_add(
-        duration
-          .as_nanos()
-          .div_ceil(TICK_MS as u128 * 1_000_000)
-          .max(1)
-          .min(u64::MAX as u128) as u64,
+        duration.as_nanos().div_ceil(TICK_NS).max(1).min(u64::MAX as u128)
+          as u64,
       ),
     }
   }
@@ -116,7 +112,7 @@ impl TimeManager {
     } else if self.is_paused() {
       None
     } else {
-      Some(Duration::from_millis((deadline_ticks - now_ticks) * TICK_MS))
+      Some(ticks_duration(deadline_ticks - now_ticks))
     }
   }
 
@@ -140,11 +136,15 @@ impl TimeManager {
   ///
   /// Doesn't read the clock when no timer is tracked, including fired ones
   /// waiting to be drained.
+  ///
+  /// A tracked timer fires at most once per poll, so a poll that yields more
+  /// timers than are tracked would never end; it panics instead.
   pub fn poll_expired(&mut self) -> impl Iterator<Item = TimerId> + '_ {
     if !self.is_empty() {
       self.sync_to_now();
     }
-    self.clock.poll_expired()
+    let tracked = self.clock.len();
+    at_most(tracked, self.clock.poll_expired())
   }
 
   /// The completion a fired timer is delivered with.
@@ -175,8 +175,7 @@ impl TimeManager {
       TimeState::Running { .. } => {
         self.sync_to_now();
         self.clock.advance_by(ticks);
-        let elapsed =
-          Duration::from_millis(self.clock.current_tick() * TICK_MS);
+        let elapsed = ticks_duration(self.clock.current_tick());
         self.state = TimeState::Running { epoch: Instant::now() - elapsed };
       }
     }
@@ -189,7 +188,7 @@ impl TimeManager {
 
   pub fn resume(&mut self) {
     if matches!(self.state, TimeState::Paused) {
-      let elapsed = Duration::from_millis(self.clock.current_tick() * TICK_MS);
+      let elapsed = ticks_duration(self.clock.current_tick());
       self.state = TimeState::Running { epoch: Instant::now() - elapsed };
     }
   }
@@ -197,6 +196,18 @@ impl TimeManager {
   pub fn is_paused(&self) -> bool {
     matches!(self.state, TimeState::Paused)
   }
+}
+
+/// Yields what `timers` does, panicking once it yields more than `max`.
+fn at_most(
+  max: usize,
+  timers: impl Iterator<Item = TimerId>,
+) -> impl Iterator<Item = TimerId> {
+  let mut left = max;
+  timers.inspect(move |_| {
+    assert!(left > 0, "clock: a poll fired more timers than the {max} tracked");
+    left -= 1;
+  })
 }
 
 /// Pause wall-clock advancement for the given [`Lio`] instance.
