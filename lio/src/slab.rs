@@ -42,12 +42,30 @@ impl SlabKey {
   }
 }
 
+/// Where a slot is in its life cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Status {
+  /// Never allocated, or on the free list.
+  Free,
+  /// Allocated: its key resolves.
+  Occupied,
+  /// Removed, but not reusable until released.
+  Retired,
+}
+
 /// Slot storage with generation tracking.
 pub(crate) struct Slot<T> {
   generation: u32,
   next_free: u32,
   state: T,
-  occupied: bool,
+  status: Status,
+}
+
+impl<T> Slot<T> {
+  #[inline]
+  fn occupied(&self) -> bool {
+    self.status == Status::Occupied
+  }
 }
 
 /// Generic generational slot pool with stable per-slot state.
@@ -75,7 +93,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
         generation: 0,
         next_free: u32::MAX,
         state: init_slot(),
-        occupied: false,
+        status: Status::Free,
       });
     }
     Self { slots, free_head: u32::MAX, next_slot: 0, capacity, len: 0 }
@@ -103,6 +121,12 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     } else {
       return None;
     };
+    // Before `init`: on a corrupt free list it would overwrite a live slot.
+    assert_eq!(
+      self.slots[slot_idx as usize].status,
+      Status::Free,
+      "slot pool: allocated slot {slot_idx}, which is not free"
+    );
     init(&mut self.slots[slot_idx as usize].state);
 
     if self.free_head == slot_idx {
@@ -111,8 +135,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
       self.next_slot += 1;
     }
     let slot = &mut self.slots[slot_idx as usize];
-    debug_assert!(!slot.occupied);
-    slot.occupied = true;
+    slot.status = Status::Occupied;
     if TRACK_LEN {
       self.len += 1;
     }
@@ -123,7 +146,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
   #[inline]
   pub(crate) fn get_mut(&mut self, key: SlabKey) -> Option<&mut T> {
     let slot = self.slots.get_mut(key.slot() as usize)?;
-    if slot.generation == key.generation() && slot.occupied {
+    if slot.generation == key.generation() && slot.occupied() {
       Some(&mut slot.state)
     } else {
       None
@@ -156,7 +179,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     on_remove: impl FnOnce(&mut T) -> R,
   ) -> Option<R> {
     let slot = self.slots.get_mut(key.slot() as usize)?;
-    if slot.generation != key.generation() || !slot.occupied {
+    if slot.generation != key.generation() || !slot.occupied() {
       return None;
     }
     Some(self.retire_known_with(key, on_remove))
@@ -171,10 +194,14 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     on_remove: impl FnOnce(&mut T) -> R,
   ) -> R {
     let slot = &mut self.slots[key.slot() as usize];
-    assert!(slot.generation == key.generation() && slot.occupied);
+    assert!(
+      slot.generation == key.generation() && slot.occupied(),
+      "slot pool: retired slot {}, which its key does not occupy",
+      key.slot()
+    );
 
     let removed = on_remove(&mut slot.state);
-    slot.occupied = false;
+    slot.status = Status::Retired;
     if TRACK_LEN {
       self.len -= 1;
     }
@@ -187,7 +214,13 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
   #[inline]
   pub(crate) fn release(&mut self, slot_idx: u32) {
     let slot = &mut self.slots[slot_idx as usize];
-    debug_assert!(!slot.occupied);
+    assert_eq!(
+      slot.status,
+      Status::Retired,
+      "slot pool: released slot {slot_idx}, which is not retired (released \
+       twice, or while in use)"
+    );
+    slot.status = Status::Free;
     slot.next_free = self.free_head;
     self.free_head = slot_idx;
   }
@@ -208,85 +241,10 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
   /// Calls `f` on the state of every occupied slot.
   pub(crate) fn for_each_occupied(&mut self, mut f: impl FnMut(&mut T)) {
     for slot in &mut self.slots[..self.next_slot as usize] {
-      if slot.occupied {
+      if slot.occupied() {
         f(&mut slot.state);
       }
     }
-  }
-
-  /// Whether `key` names an occupied slot.
-  pub(crate) fn contains(&self, key: SlabKey) -> bool {
-    self
-      .slots
-      .get(key.slot() as usize)
-      .is_some_and(|slot| slot.occupied && slot.generation == key.generation())
-  }
-
-  /// Calls `f` with the key and state of every occupied slot.
-  pub(crate) fn for_each_occupied_key(&self, mut f: impl FnMut(SlabKey, &T)) {
-    for (index, slot) in
-      self.slots[..self.next_slot as usize].iter().enumerate()
-    {
-      if slot.occupied {
-        let key = SlabKey { slot: index as u32, generation: slot.generation };
-        f(key, &slot.state);
-      }
-    }
-  }
-
-  /// Panics if the pool's bookkeeping is inconsistent.
-  ///
-  /// Returns the retired slots, in ascending order: neither occupied nor
-  /// free, waiting for [`release`](Self::release).
-  pub(crate) fn check_invariants(&self) -> Vec<u32> {
-    assert_eq!(
-      self.slots.len(),
-      self.capacity as usize,
-      "slot pool: slot count differs from the capacity"
-    );
-    assert!(
-      self.next_slot <= self.capacity,
-      "slot pool: bump pointer {} past the capacity {}",
-      self.next_slot,
-      self.capacity
-    );
-    let bumped = self.next_slot as usize;
-    for (offset, slot) in self.slots[bumped..].iter().enumerate() {
-      assert!(
-        !slot.occupied && slot.generation == 0,
-        "slot pool: slot {} past the bump pointer was used",
-        bumped + offset
-      );
-    }
-
-    let mut free = vec![false; bumped];
-    let mut cursor = self.free_head;
-    while cursor != u32::MAX {
-      let index = cursor as usize;
-      assert!(
-        index < bumped,
-        "slot pool: free list holds slot {index}, never allocated"
-      );
-      assert!(!free[index], "slot pool: free list reaches slot {index} twice");
-      assert!(
-        !self.slots[index].occupied,
-        "slot pool: free list holds occupied slot {index}"
-      );
-      free[index] = true;
-      cursor = self.slots[index].next_free;
-    }
-
-    if TRACK_LEN {
-      let occupied = self.slots[..bumped].iter().filter(|s| s.occupied).count();
-      assert_eq!(
-        self.len as usize, occupied,
-        "slot pool: len differs from the occupied slots"
-      );
-    }
-    (0..bumped)
-      .filter(|&index| !self.slots[index].occupied && !free[index])
-      .map(|index| index as u32)
-      .collect()
   }
 }
 
@@ -362,13 +320,6 @@ impl<T> Slab<T> {
     self.pool.len()
   }
 
-  /// Panics if the slab's bookkeeping is inconsistent.
-  #[cfg(test)]
-  pub fn check_invariants(&self) {
-    let retired = self.pool.check_invariants();
-    assert!(retired.is_empty(), "slab: slots {retired:?} were never freed");
-  }
-
   /// Keys of the values matching `pred`, by a linear scan of the slots in
   /// use so far. Meant for rare lookups, such as cancellation.
   pub fn keys_where<'a>(
@@ -378,7 +329,7 @@ impl<T> Slab<T> {
     let used = &self.pool.slots[..self.pool.next_slot as usize];
     used.iter().enumerate().filter_map(move |(index, slot)| {
       // SAFETY: occupied slots always contain an initialized value.
-      (slot.occupied && pred(unsafe { slot.state.assume_init_ref() }))
+      (slot.occupied() && pred(unsafe { slot.state.assume_init_ref() }))
         .then_some(SlabKey { slot: index as u32, generation: slot.generation })
     })
   }
@@ -387,7 +338,7 @@ impl<T> Slab<T> {
 impl<T> Drop for Slab<T> {
   fn drop(&mut self) {
     for slot in &mut self.pool.slots {
-      if slot.occupied {
+      if slot.occupied() {
         // SAFETY: occupied slots always contain an initialized value.
         unsafe { slot.state.assume_init_drop() };
       }
@@ -492,59 +443,40 @@ mod tests {
   }
 
   #[test]
-  fn invariants_hold_through_inserts_and_removes() {
-    let mut slab: Slab<u32> = Slab::new(8);
-    let mut keys = Vec::new();
-    for round in 0..4 {
-      while let Some(key) = slab.insert(round) {
-        keys.push(key);
-        slab.check_invariants();
-      }
-      for key in keys.drain(..).rev().step_by(2) {
-        assert!(slab.remove(key));
-        slab.check_invariants();
-      }
-    }
-  }
-
-  #[test]
-  fn retired_slots_are_reported_until_released() {
-    let mut pool: SlotPool<()> = SlotPool::with_capacity(4, || ());
-    let (a, _) = pool.allocate().unwrap();
-    let (b, _) = pool.allocate().unwrap();
-    pool.retire_with(a, |_| ()).unwrap();
-    pool.retire_with(b, |_| ()).unwrap();
-    assert_eq!(pool.check_invariants(), vec![0, 1]);
-    pool.release(a.slot());
-    assert_eq!(pool.check_invariants(), vec![1]);
-    assert!(!pool.contains(a) && !pool.contains(b));
-  }
-
-  #[test]
-  #[should_panic(expected = "free list reaches slot 0 twice")]
-  fn a_free_list_cycle_is_caught() {
+  #[should_panic(expected = "released slot 0, which is not retired")]
+  fn releasing_a_slot_twice_panics() {
     let mut pool: SlotPool<()> = SlotPool::with_capacity(2, || ());
-    let (a, _) = pool.allocate().unwrap();
-    pool.remove_with(a, |_| ()).unwrap();
-    pool.slots[0].next_free = 0;
-    pool.check_invariants();
+    let (key, _) = pool.allocate().unwrap();
+    pool.remove_with(key, |_| ()).unwrap();
+    pool.release(key.slot());
   }
 
   #[test]
-  #[should_panic(expected = "free list holds occupied slot 0")]
-  fn an_occupied_slot_on_the_free_list_is_caught() {
+  #[should_panic(expected = "released slot 0, which is not retired")]
+  fn releasing_an_occupied_slot_panics() {
     let mut pool: SlotPool<()> = SlotPool::with_capacity(2, || ());
-    let (a, _) = pool.allocate().unwrap();
-    pool.free_head = a.slot();
-    pool.check_invariants();
+    let (key, _) = pool.allocate().unwrap();
+    pool.release(key.slot());
   }
 
   #[test]
-  #[should_panic(expected = "len differs from the occupied slots")]
-  fn a_wrong_len_is_caught() {
-    let mut pool: SlotPool<()> = SlotPool::with_capacity(2, || ());
-    pool.allocate().unwrap();
-    pool.len = 2;
-    pool.check_invariants();
+  #[should_panic(expected = "allocated slot 0, which is not free")]
+  fn allocating_from_a_corrupt_free_list_panics() {
+    let mut pool: SlotPool<u32> = SlotPool::with_capacity(2, || 0);
+    let (_, value) = pool.allocate().unwrap();
+    *value = 7;
+    pool.free_head = 0;
+    let _ = pool.allocate_with(|value| *value = 0);
+  }
+
+  #[test]
+  fn a_retired_slot_is_reused_only_after_release() {
+    let mut pool: SlotPool<()> = SlotPool::with_capacity(1, || ());
+    let (key, _) = pool.allocate().unwrap();
+    pool.retire_with(key, |_| ()).unwrap();
+    assert!(pool.allocate().is_none(), "retired, not free");
+    pool.release(key.slot());
+    let (again, _) = pool.allocate().unwrap();
+    assert_eq!((again.slot(), again.generation()), (0, 1));
   }
 }

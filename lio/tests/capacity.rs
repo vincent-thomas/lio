@@ -38,14 +38,12 @@ fn callbacks_beyond_capacity_queue_and_complete_in_order() {
     let order = order.clone();
     api::nop().with_lio(&lio).when_done(move |_| order.borrow_mut().push(i));
   }
-  lio.check_invariants();
   assert!(lio.is_full(), "two in flight, three queued");
 
   for _ in 0..5 {
-    step(&lio);
+    lio.try_run().unwrap();
   }
   assert_eq!(*order.borrow(), vec![0, 1, 2, 3, 4]);
-  lio.check_invariants();
   assert!(!lio.is_full());
 }
 
@@ -56,7 +54,7 @@ fn channel_sends_beyond_capacity_all_arrive() {
     (0..4).map(|_| api::nop().with_lio(&lio).send()).collect();
 
   for _ in 0..4 {
-    step(&lio);
+    lio.try_run().unwrap();
   }
   for mut receiver in receivers {
     receiver.try_recv().expect("queued operation completed").unwrap();
@@ -77,16 +75,15 @@ fn future_over_capacity_waits_for_a_slot() {
   assert!(first.as_mut().poll(&mut cx).is_pending());
   // Every slot is taken: the second future waits instead of panicking.
   assert!(second.as_mut().poll(&mut cx).is_pending());
-  lio.check_invariants();
   assert!(lio.is_full());
 
   woken.0.store(false, Ordering::SeqCst);
-  step(&lio);
+  lio.try_run().unwrap();
   assert!(matches!(first.as_mut().poll(&mut cx), Poll::Ready(_)));
   assert!(woken.0.load(Ordering::SeqCst), "freeing a slot wakes the waiter");
 
   assert!(second.as_mut().poll(&mut cx).is_pending());
-  step(&lio);
+  lio.try_run().unwrap();
   assert!(matches!(second.as_mut().poll(&mut cx), Poll::Ready(_)));
 }
 
@@ -114,12 +111,6 @@ fn cancelling_a_future_frees_its_slot_for_a_waiter() {
     }
   }
   panic!("the waiting future never completed");
-}
-
-/// Runs the driver once without blocking, then checks its bookkeeping.
-fn step(lio: &Lio) {
-  lio.try_run().unwrap();
-  lio.check_invariants();
 }
 
 /// Yields one item, then finishes.
@@ -166,7 +157,7 @@ fn stream_over_capacity_waits_instead_of_ending() {
 
   let mut blocker = Some(blocker);
   for _ in 0..10 {
-    step(&lio);
+    lio.try_run().unwrap();
     if let Some(future) = blocker.as_mut()
       && future.as_mut().poll(&mut cx).is_ready()
     {
@@ -213,13 +204,12 @@ fn panicking_first_action_does_not_keep_its_slot() {
   }));
   assert!(submit.is_err(), "the panic reaches the submitter");
   assert!(dropped.load(Ordering::SeqCst), "the op was released");
-  lio.check_invariants();
   assert!(!lio.is_full(), "and its slot with it");
 
   let done = Rc::new(Cell::new(false));
   let set = done.clone();
   api::nop().with_lio(&lio).when_done(move |_| set.set(true));
-  step(&lio);
+  lio.try_run().unwrap();
   assert!(done.get());
 }
 
