@@ -134,7 +134,7 @@ fn with_flags() {
   .send_with(sender_send);
 
   let (bytes_sent, returned_buf) = poll_until_recv(&mut lio, &receiver_send);
-  let bytes_sent = bytes_sent.expect("sendto with flags failed") as usize;
+  let bytes_sent = bytes_sent.expect("sendto with flags failed");
 
   assert_eq!(bytes_sent, expected.len());
   assert_eq!(returned_buf, expected);

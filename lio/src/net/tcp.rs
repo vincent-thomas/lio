@@ -152,12 +152,12 @@ impl TcpListener {
 ///     // Send data
 ///     let data = b"Hello, server!".to_vec();
 ///     let (result, data) = socket.send(data).await;
-///     let bytes_sent = result? as usize;
+///     let bytes_sent = result?;
 ///
 ///     // Receive response
 ///     let buffer = vec![0u8; 1024];
 ///     let (result, buffer) = socket.recv(buffer).await;
-///     let bytes_read = result? as usize;
+///     let bytes_read = result?;
 ///
 ///     Ok(())
 /// }
@@ -179,7 +179,7 @@ impl TcpListener {
 ///     // Use the socket...
 ///     let buffer = vec![0u8; 1024];
 ///     let (result, buffer) = socket.recv(buffer).await;
-///     let bytes_read = result? as usize;
+///     let bytes_read = result?;
 ///
 ///     Ok(())
 /// }
@@ -254,7 +254,7 @@ impl TcpStream {
   ///
   ///     let buffer = vec![0u8; 1024];
   ///     let (result, buffer) = socket.recv(buffer).await;
-  ///     let bytes_read = result? as usize;
+  ///     let bytes_read = result?;
   ///
   ///     println!("Received {} bytes", bytes_read);
   ///     println!("Data: {:?}", &buffer[..bytes_read]);
@@ -293,7 +293,7 @@ impl TcpStream {
   ///
   ///     let data = b"Hello, server!".to_vec();
   ///     let (result, data) = socket.send(data).await;
-  ///     let bytes_sent = result? as usize;
+  ///     let bytes_sent = result?;
   ///
   ///     println!("Sent {} bytes", bytes_sent);
   ///
@@ -341,7 +341,7 @@ impl TcpStream {
   ///     // Can still receive the response
   ///     let buffer = vec![0u8; 4096];
   ///     let (result, buffer) = socket.recv(buffer).await;
-  ///     let bytes_read = result? as usize;
+  ///     let bytes_read = result?;
   ///
   ///     Ok(())
   /// }
