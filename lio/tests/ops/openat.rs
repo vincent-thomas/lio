@@ -7,13 +7,13 @@
 #[path = "../common.rs"]
 mod common;
 
+use common::raw_id;
 use lio::{
   Lio,
   api::{self, resource::Resource},
   backend::ds::{DSBackend, DSConfig},
 };
 use std::ffi::CString;
-use std::os::fd::{AsFd, AsRawFd};
 
 fn new_ds_lio() -> Lio {
   Lio::new_with_backend(
@@ -27,7 +27,7 @@ fn open_file(
   lio: &mut Lio,
   dir: &impl lio::api::resource::AsResource,
   path: CString,
-  flags: i32,
+  flags: lio::api::OpenFlags,
   mode: u32,
 ) -> Result<Resource, std::io::Error> {
   let mut receiver = api::openat(dir, path, flags, mode).with_lio(lio).send();
@@ -42,7 +42,9 @@ fn mkdir(lio: &mut Lio, path: CString) {
 
 fn unlink_file(lio: &mut Lio, path: CString) {
   let mut receiver =
-    api::unlinkat(&Resource::cwd(), path, 0).with_lio(lio).send();
+    api::unlinkat(&Resource::cwd(), path, api::UnlinkKind::File)
+      .with_lio(lio)
+      .send();
   common::poll_recv(lio, &mut receiver).unwrap();
 }
 
@@ -94,7 +96,7 @@ fn test_openat_with_directory_fd() {
     &mut lio,
     &Resource::cwd(),
     dir_path.clone(),
-    libc::O_RDONLY | libc::O_DIRECTORY,
+    lio::api::OpenFlags::READ | lio::api::OpenFlags::DIRECTORY,
     0,
   )
   .expect("Failed to open synthetic directory");
@@ -104,12 +106,15 @@ fn test_openat_with_directory_fd() {
     &mut lio,
     &dir_res,
     file_path,
-    libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+    lio::api::OpenFlags::READ
+      | lio::api::OpenFlags::WRITE
+      | lio::api::OpenFlags::CREATE
+      | lio::api::OpenFlags::TRUNCATE,
     0o666,
   )
   .expect("Failed to open file with directory fd");
 
-  assert!(fd.as_fd().as_raw_fd() >= 0);
+  let _ = raw_id(&fd);
 
   let child_path =
     CString::new(format!("{}/child.txt", dir_path.to_string_lossy())).unwrap();
@@ -128,16 +133,19 @@ fn test_openat_concurrent() {
       &mut lio,
       &Resource::cwd(),
       path.clone(),
-      libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+      lio::api::OpenFlags::READ
+        | lio::api::OpenFlags::WRITE
+        | lio::api::OpenFlags::CREATE
+        | lio::api::OpenFlags::TRUNCATE,
       0o666,
     )
     .expect("Failed to open file");
-    assert!(fd.as_fd().as_raw_fd() >= 0);
+    let _ = raw_id(&fd);
     fds.push(fd);
     unlink_file(&mut lio, path);
   }
 
-  let raw_fds: Vec<_> = fds.iter().map(|f| f.as_fd().as_raw_fd()).collect();
+  let raw_fds: Vec<_> = fds.iter().map(raw_id).collect();
   for i in 0..raw_fds.len() {
     for j in i + 1..raw_fds.len() {
       assert_ne!(raw_fds[i], raw_fds[j]);
@@ -154,7 +162,10 @@ fn test_openat_append_mode() {
     &mut lio,
     &Resource::cwd(),
     path.clone(),
-    libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+    lio::api::OpenFlags::READ
+      | lio::api::OpenFlags::WRITE
+      | lio::api::OpenFlags::CREATE
+      | lio::api::OpenFlags::TRUNCATE,
     0o644,
   )
   .unwrap();
@@ -164,15 +175,20 @@ fn test_openat_append_mode() {
     &mut lio,
     &Resource::cwd(),
     path.clone(),
-    libc::O_WRONLY | libc::O_APPEND,
+    lio::api::OpenFlags::WRITE | lio::api::OpenFlags::APPEND,
     0,
   )
   .expect("Failed to open append mode file");
   write_all_at(&mut lio, &append_fd, b"World", 0);
 
-  let reader =
-    open_file(&mut lio, &Resource::cwd(), path.clone(), libc::O_RDONLY, 0)
-      .unwrap();
+  let reader = open_file(
+    &mut lio,
+    &Resource::cwd(),
+    path.clone(),
+    lio::api::OpenFlags::READ,
+    0,
+  )
+  .unwrap();
   let read_back = read_exact_at(&mut lio, &reader, 10, 0);
   assert_eq!(read_back, b"HelloWorld");
 
@@ -188,20 +204,26 @@ fn test_openat_excl_flag() {
     &mut lio,
     &Resource::cwd(),
     path.clone(),
-    libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+    lio::api::OpenFlags::READ | lio::api::OpenFlags::WRITE | lio::api::OpenFlags::CREATE | lio::api::OpenFlags::EXCLUSIVE,
     0o666,
   )
-  .expect("First O_EXCL create should succeed");
+  .expect("First lio::api::OpenFlags::READ | lio::api::OpenFlags::EXCLUSIVE create should succeed");
   drop(fd);
 
   let result = open_file(
     &mut lio,
     &Resource::cwd(),
     path.clone(),
-    libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+    lio::api::OpenFlags::READ
+      | lio::api::OpenFlags::WRITE
+      | lio::api::OpenFlags::CREATE
+      | lio::api::OpenFlags::EXCLUSIVE,
     0o666,
   );
-  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EEXIST));
+  assert_eq!(
+    result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::EEXIST)
+  );
 
   unlink_file(&mut lio, path);
 }
@@ -215,11 +237,11 @@ fn test_openat_directory() {
     &mut lio,
     &Resource::cwd(),
     path,
-    libc::O_RDONLY | libc::O_DIRECTORY,
+    lio::api::OpenFlags::READ | lio::api::OpenFlags::DIRECTORY,
     0,
   )
   .expect("Failed to open directory");
-  assert!(fd.as_fd().as_raw_fd() >= 0);
+  let _ = raw_id(&fd);
 }
 
 #[test]
@@ -230,7 +252,10 @@ fn test_openat_directory_flag_on_file() {
     &mut lio,
     &Resource::cwd(),
     path.clone(),
-    libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+    lio::api::OpenFlags::READ
+      | lio::api::OpenFlags::WRITE
+      | lio::api::OpenFlags::CREATE
+      | lio::api::OpenFlags::TRUNCATE,
     0o644,
   )
   .unwrap();
@@ -239,10 +264,13 @@ fn test_openat_directory_flag_on_file() {
     &mut lio,
     &Resource::cwd(),
     path.clone(),
-    libc::O_RDONLY | libc::O_DIRECTORY,
+    lio::api::OpenFlags::READ | lio::api::OpenFlags::DIRECTORY,
     0,
   );
-  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOTDIR));
+  assert_eq!(
+    result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::ENOTDIR)
+  );
 
   unlink_file(&mut lio, path);
 }

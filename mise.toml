@@ -1,0 +1,14 @@
+[tools]
+"rust" = "1.94.1"
+"cargo:cargo-deny" = "latest"
+
+[tasks.lint]
+run = [
+  "cargo fmt --check",
+  "cargo check --all-features",
+  "cargo clippy --all-features",
+  "cargo deny check"
+]
+
+[tasks.cbuild]
+run = "cargo rustc -p lio --crate-type dylib,staticlib --features unstable_ffi --release"

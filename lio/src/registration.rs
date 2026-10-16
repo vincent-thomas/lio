@@ -22,6 +22,7 @@ impl ProcessResult {
     Self { next_action: None }
   }
 
+  #[cfg(test)]
   #[inline]
   pub(crate) fn is_done(&self) -> bool {
     self.next_action.is_none()
@@ -34,7 +35,8 @@ impl ProcessResult {
 /// yielded items to a channel while waking the associated task.
 pub(crate) struct WakerResultHandler {
   payload: *mut (),
-  on_completion_fn: fn(*mut (), Completion) -> ProcessResult,
+  on_completion_fn:
+    fn(*mut (), Completion, &mut Option<Waker>) -> ProcessResult,
   action_fn: fn(*mut ()) -> Action,
   drop_fn: fn(*mut ()),
 }
@@ -74,9 +76,14 @@ impl WakerResultHandler {
   /// Process a completion result.
   ///
   /// Returns whether the operation is done and optionally an operation to resubmit.
+  #[cfg(test)]
   #[inline]
-  fn on_completion(&self, completion: Completion) -> ProcessResult {
-    (self.on_completion_fn)(self.payload, completion)
+  fn on_completion(
+    &self,
+    completion: Completion,
+    waker: &mut Option<Waker>,
+  ) -> ProcessResult {
+    (self.on_completion_fn)(self.payload, completion, waker)
   }
 
   #[inline]
@@ -91,6 +98,7 @@ impl WakerResultHandler {
   fn on_completion_impl<T: OpModel>(
     payload_ptr: *mut (),
     completion: Completion,
+    waker: &mut Option<Waker>,
   ) -> ProcessResult {
     // SAFETY: `payload_ptr` is created from `WakerPayload<T>` in `new`/`new_in`
     // and remains valid while completions are dispatched.
@@ -98,13 +106,19 @@ impl WakerResultHandler {
     let sender = &payload.sender;
     let op_model = &mut payload.op_model;
 
-    match op_model.complete(completion) {
+    let result = match op_model.complete(completion) {
       OpResult::Again => {
         let next_action = op_model.action();
-        ProcessResult::continue_with(next_action)
+        // The driver resubmits internal steps. Preserve the consumer's waker
+        // until an item is available instead of making it poll an empty channel.
+        return ProcessResult::continue_with(next_action);
       }
       OpResult::Yield(item) => {
-        let _ = sender.send(item);
+        if sender.send(item).is_err() {
+          // Every receiver is gone, so nothing can take another item: stop
+          // instead of resubmitting forever.
+          return ProcessResult::done();
+        }
         let next_action = op_model.action();
         ProcessResult::continue_with(next_action)
       }
@@ -112,7 +126,11 @@ impl WakerResultHandler {
         let _ = sender.send(item);
         ProcessResult::done()
       }
+    };
+    if let Some(waker) = waker.take() {
+      waker.wake();
     }
+    result
   }
 
   fn drop_bump_impl<T: OpModel>(payload_ptr: *mut ()) {
@@ -179,6 +197,7 @@ impl OpCallback {
   /// Process a completion: call complete() on OpModel and invoke callback with item.
   ///
   /// Returns whether the operation is done and optionally an operation to resubmit.
+  #[cfg(test)]
   #[inline]
   fn on_completion(&self, completion: Completion) -> ProcessResult {
     (self.on_completion_fn)(self.payload, completion)
@@ -242,10 +261,63 @@ impl Drop for OpCallback {
   }
 }
 
+/// A copy of a registration's completion handler that can run without access
+/// to the registration itself.
+///
+/// The handler's payload (op model, channel or user callback) lives in the
+/// registration's arena, whose memory never moves. The driver copies the
+/// handler out, releases its own borrow, and only then runs it, because the
+/// handler may run user code (a callback, or a waker that polls inline) that
+/// schedules, drops or drives operations on the same `Lio`.
+#[derive(Clone, Copy)]
+pub(crate) enum RawHandler {
+  Waker {
+    payload: *mut (),
+    on_completion_fn:
+      fn(*mut (), Completion, &mut Option<Waker>) -> ProcessResult,
+  },
+  Callback {
+    payload: *mut (),
+    on_completion_fn: fn(*mut (), Completion) -> ProcessResult,
+  },
+}
+
+impl RawHandler {
+  /// Processes one completion: advances the op model and delivers any item
+  /// (sending it and waking `waker`, or calling the user callback).
+  ///
+  /// `waker` is left in place when the operation continues without an item;
+  /// the caller hands it back to the registration.
+  ///
+  /// # Safety
+  ///
+  /// The registration this handler was copied from must be alive, and must
+  /// not be processed concurrently.
+  #[inline]
+  pub(crate) unsafe fn complete(
+    self,
+    completion: Completion,
+    waker: &mut Option<Waker>,
+  ) -> ProcessResult {
+    match self {
+      Self::Waker { payload, on_completion_fn } => {
+        on_completion_fn(payload, completion, waker)
+      }
+      Self::Callback { payload, on_completion_fn } => {
+        on_completion_fn(payload, completion)
+      }
+    }
+  }
+}
+
 /// Registration for tracking in-flight I/O operations.
 // NOTE: Registration should **NEVER** impl Sync.
 pub struct Registration {
   state: State,
+  /// Set when the operation's consumer is gone while the operation may still
+  /// be in the backend. The registration (and the memory the backend uses)
+  /// stays alive until the operation's completion arrives.
+  cancelled: bool,
 }
 
 /// Unified state machine for I/O operations.
@@ -277,6 +349,27 @@ impl Registration {
         waker: Some(waker),
         handler: WakerResultHandler::new_in(arena, sender, op_model),
       },
+      cancelled: false,
+    }
+  }
+
+  /// Create a registration that only sends results through `sender`, with
+  /// nobody to wake. It stops once every receiver is gone.
+  #[inline]
+  pub fn new_sender_in<T>(
+    arena: &mut Bump,
+    sender: mpsc::Sender<T::Item>,
+    op_model: T,
+  ) -> Self
+  where
+    T: OpModel,
+  {
+    Self {
+      state: State::Waker {
+        waker: None,
+        handler: WakerResultHandler::new_in(arena, sender, op_model),
+      },
+      cancelled: false,
     }
   }
 
@@ -293,6 +386,7 @@ impl Registration {
   {
     Self {
       state: State::Callback(OpCallback::new_in(arena, callback, op_model)),
+      cancelled: false,
     }
   }
 
@@ -335,27 +429,62 @@ impl Registration {
     result
   }
 
-  /// Processes a driver-owned completion without materializing the terminal
-  /// state, because the driver immediately removes terminal registrations.
+  /// Starts processing a completion: returns the handler to run (outside
+  /// any driver borrow) and takes the task's waker, if any.
   #[inline]
-  pub(crate) fn on_driver_completion(
-    &mut self,
-    completion: Completion,
-  ) -> ProcessResult {
-    self.process_completion(completion)
+  pub(crate) fn begin_completion(&mut self) -> (RawHandler, Option<Waker>) {
+    match &mut self.state {
+      State::Waker { waker, handler } => (
+        RawHandler::Waker {
+          payload: handler.payload,
+          on_completion_fn: handler.on_completion_fn,
+        },
+        waker.take(),
+      ),
+      State::Callback(cb) => (
+        RawHandler::Callback {
+          payload: cb.payload,
+          on_completion_fn: cb.on_completion_fn,
+        },
+        None,
+      ),
+      #[cfg(test)]
+      State::Done => unreachable!("completed a finished registration"),
+    }
   }
 
+  /// Returns a waker that a completion did not consume, unless the task has
+  /// registered a newer one meanwhile.
+  /// Marks the operation as abandoned by its consumer, which will not be
+  /// woken again. Its completion is still processed, so the op model can
+  /// release what it produced, but leads to no further step.
+  #[inline]
+  pub(crate) fn cancel(&mut self) {
+    self.cancelled = true;
+    if let State::Waker { waker, .. } = &mut self.state {
+      *waker = None;
+    }
+  }
+
+  /// Whether the operation was abandoned by its consumer.
+  #[inline]
+  pub(crate) fn is_cancelled(&self) -> bool {
+    self.cancelled
+  }
+
+  #[inline]
+  pub(crate) fn restore_waker(&mut self, waker: Waker) {
+    if let State::Waker { waker: slot @ None, .. } = &mut self.state {
+      *slot = Some(waker);
+    }
+  }
+
+  #[cfg(test)]
   #[inline]
   fn process_completion(&mut self, completion: Completion) -> ProcessResult {
     match &mut self.state {
       State::Waker { waker, handler } => {
-        let result = handler.on_completion(completion);
-
-        if let Some(w) = waker.take() {
-          w.wake();
-        }
-
-        result
+        handler.on_completion(completion, waker)
       }
       State::Callback(cb) => cb.on_completion(completion),
       #[cfg(test)]
@@ -598,7 +727,7 @@ mod tests {
   }
 
   #[test]
-  fn waker_registration_again_then_done_wakes_and_sends_on_terminal_only() {
+  fn waker_registration_again_preserves_waker_until_done() {
     let wake_count = Arc::new(AtomicUsize::new(0));
     let waker = test_waker(Arc::clone(&wake_count));
     let (tx, rx) = mpsc::channel();
@@ -609,7 +738,7 @@ mod tests {
       reg.on_completion(Completion::new(0)).next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
-    assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+    assert_eq!(wake_count.load(Ordering::SeqCst), 0);
     assert!(rx.try_recv().is_err(), "Again must not send a terminal item");
     assert!(!reg.is_finished());
 
@@ -618,6 +747,46 @@ mod tests {
     let item = rx.try_recv().expect("Done result should be sent");
     assert_eq!(item, 7);
     assert!(reg.is_finished());
+  }
+
+  #[test]
+  fn waker_registration_repeated_again_preserves_waker_until_yield() {
+    struct AgainThenYield(usize);
+
+    impl OpModel for AgainThenYield {
+      type Item = i32;
+
+      fn action(&mut self) -> Action {
+        Action::Io(crate::backend::op::Op::Nop)
+      }
+
+      fn complete(&mut self, _: Completion) -> OpResult<i32> {
+        self.0 += 1;
+        match self.0 {
+          1..=8 => OpResult::Again,
+          9 => OpResult::Yield(11),
+          _ => OpResult::Done(17),
+        }
+      }
+    }
+
+    let wake_count = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = mpsc::channel();
+    let (_arena, mut reg) =
+      new_waker_reg(test_waker(Arc::clone(&wake_count)), tx, AgainThenYield(0));
+    for _ in 0..8 {
+      assert!(!reg.on_completion(Completion::new(0)).is_done());
+      assert_eq!(wake_count.load(Ordering::SeqCst), 0);
+      assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+    assert!(!reg.on_completion(Completion::new(0)).is_done());
+    assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+    assert_eq!(rx.try_recv().unwrap(), 11);
+
+    reg.set_waker(test_waker(Arc::clone(&wake_count)));
+    assert!(reg.on_completion(Completion::new(0)).is_done());
+    assert_eq!(wake_count.load(Ordering::SeqCst), 2);
+    assert_eq!(rx.try_recv().unwrap(), 17);
   }
 
   #[test]

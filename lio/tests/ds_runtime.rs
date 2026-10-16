@@ -1,10 +1,11 @@
+mod common;
+
 use std::{
   collections::BTreeSet,
   env,
   ffi::CString,
   io,
   net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-  os::fd::{AsFd, AsRawFd},
   sync::mpsc,
   time::Duration,
   time::SystemTime,
@@ -16,7 +17,10 @@ use lio::{
   api::resource::Resource,
   backend::{
     ds::{DSBackend, DSConfig, DSNetworkFaults, last_ds_trace_snapshot},
-    op::{FileStat, LinkKind, ShutdownHow, SockDomain, SockProto, SockType},
+    op::{
+      FileStat, LinkKind, ShutdownHow, SockDomain, SockProto, SockType,
+      UnlinkKind,
+    },
   },
 };
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -87,11 +91,11 @@ enum ScriptOp {
   ListenOn { res: Resource, backlog: i32 },
   Shutdown { how: ShutdownHow },
   ShutdownOn { res: Resource, how: ShutdownHow },
-  OpenAt { path: CString, flags: i32, mode: u32 },
+  OpenAt { path: CString, flags: lio::api::OpenFlags, mode: u32 },
   StatAt { path: CString, follow_symlinks: bool },
   ReadlinkAt { path: CString, len: usize },
   MkdirAt { path: CString, mode: u32 },
-  UnlinkAt { path: CString, flags: i32 },
+  UnlinkAt { path: CString, kind: UnlinkKind },
   RenameAt { old_path: CString, new_path: CString },
   LinkAt { source_path: CString, new_path: CString, kind: LinkKind },
   Spawn { path: CString, argv: Vec<CString> },
@@ -288,8 +292,11 @@ fn build_script(
       },
       10 => ScriptOp::OpenAt {
         path,
-        flags: [libc::O_RDONLY, libc::O_WRONLY, libc::O_RDWR]
-          [rng.range_usize(3)],
+        flags: [
+          lio::api::OpenFlags::READ,
+          lio::api::OpenFlags::WRITE,
+          lio::api::OpenFlags::READ | lio::api::OpenFlags::WRITE,
+        ][rng.range_usize(3)],
         mode: 0o600 + rng.range_usize(0o177) as u32,
       },
       11 => ScriptOp::StatAt { path, follow_symlinks: rng.next_bool() },
@@ -299,7 +306,11 @@ fn build_script(
       }
       14 => ScriptOp::UnlinkAt {
         path,
-        flags: if rng.next_bool() { 0 } else { libc::AT_REMOVEDIR },
+        kind: if rng.next_bool() {
+          UnlinkKind::File
+        } else {
+          UnlinkKind::Directory
+        },
       },
       15 => ScriptOp::RenameAt { old_path: path, new_path: alt_path },
       16 => ScriptOp::LinkAt {
@@ -501,9 +512,9 @@ fn schedule_script_op(
         tx.send(Event::MkdirAt { id, result }).unwrap();
       });
     }
-    ScriptOp::UnlinkAt { path, flags } => {
+    ScriptOp::UnlinkAt { path, kind } => {
       let tx = tx.clone();
-      api::unlinkat(&cwd, path, flags).with_lio(lio).when_done(move |result| {
+      api::unlinkat(&cwd, path, kind).with_lio(lio).when_done(move |result| {
         tx.send(Event::UnlinkAt { id, result }).unwrap();
       });
     }
@@ -667,7 +678,9 @@ fn assert_event_invariants(seed: u64, event: &Event) {
         assert!(
           matches!(
             err.raw_os_error(),
-            Some(libc::ERANGE) | Some(libc::ENOENT) | Some(libc::EINVAL)
+            Some(common::BUFFER_TOO_SMALL)
+              | Some(lio::backend::ds::errno::ENOENT)
+              | Some(lio::backend::ds::errno::EINVAL)
           ),
           "seed {seed} produced invalid path-buffer error: {err:?}"
         );
@@ -680,12 +693,12 @@ fn assert_event_invariants(seed: u64, event: &Event) {
           assert!(
             matches!(
               err.raw_os_error(),
-              Some(libc::EIO)
-                | Some(libc::EBADF)
-                | Some(libc::EINVAL)
-                | Some(libc::ENOTSUP)
-                | Some(libc::ECONNRESET)
-                | Some(libc::EAGAIN)
+              Some(lio::backend::ds::errno::EIO)
+                | Some(lio::backend::ds::errno::EBADF)
+                | Some(lio::backend::ds::errno::EINVAL)
+                | Some(lio::backend::ds::errno::ENOTSUP)
+                | Some(lio::backend::ds::errno::ECONNRESET)
+                | Some(lio::backend::ds::errno::EAGAIN)
             ),
             "seed {seed} produced invalid read-style error: {err:?}"
           );
@@ -706,14 +719,14 @@ fn assert_event_invariants(seed: u64, event: &Event) {
           assert!(
             matches!(
               err.raw_os_error(),
-              Some(libc::EIO)
-                | Some(libc::EBADF)
-                | Some(libc::EINVAL)
-                | Some(libc::EAGAIN)
-                | Some(libc::EPIPE)
-                | Some(libc::ECONNRESET)
-                | Some(libc::ENOSPC)
-                | Some(libc::EFBIG)
+              Some(lio::backend::ds::errno::EIO)
+                | Some(lio::backend::ds::errno::EBADF)
+                | Some(lio::backend::ds::errno::EINVAL)
+                | Some(lio::backend::ds::errno::EAGAIN)
+                | Some(lio::backend::ds::errno::EPIPE)
+                | Some(lio::backend::ds::errno::ECONNRESET)
+                | Some(lio::backend::ds::errno::ENOSPC)
+                | Some(lio::backend::ds::errno::EFBIG)
             ),
             "seed {seed} produced invalid write-style error: {err:?}"
           );
@@ -724,7 +737,7 @@ fn assert_event_invariants(seed: u64, event: &Event) {
     {
       Ok(resource) => {
         assert!(
-          resource.as_fd().as_raw_fd() >= 0,
+          resource_number(resource) >= 0,
           "seed {seed} returned negative synthetic resource"
         );
       }
@@ -732,11 +745,11 @@ fn assert_event_invariants(seed: u64, event: &Event) {
         assert!(
           matches!(
             err.raw_os_error(),
-            Some(libc::EMFILE)
-              | Some(libc::ENFILE)
-              | Some(libc::ENOENT)
-              | Some(libc::EACCES)
-              | Some(libc::EINVAL)
+            Some(lio::backend::ds::errno::EMFILE)
+              | Some(lio::backend::ds::errno::ENFILE)
+              | Some(lio::backend::ds::errno::ENOENT)
+              | Some(lio::backend::ds::errno::EACCES)
+              | Some(lio::backend::ds::errno::EINVAL)
           ),
           "seed {seed} produced invalid resource-creation error: {err:?}"
         );
@@ -753,12 +766,12 @@ fn assert_event_invariants(seed: u64, event: &Event) {
         assert!(
           matches!(
             err.raw_os_error(),
-            Some(libc::EADDRINUSE)
-              | Some(libc::EACCES)
-              | Some(libc::EINVAL)
-              | Some(libc::ENOTSOCK)
-              | Some(libc::ENOENT)
-              | Some(libc::EEXIST)
+            Some(lio::backend::ds::errno::EADDRINUSE)
+              | Some(lio::backend::ds::errno::EACCES)
+              | Some(lio::backend::ds::errno::EINVAL)
+              | Some(lio::backend::ds::errno::ENOTSOCK)
+              | Some(lio::backend::ds::errno::ENOENT)
+              | Some(lio::backend::ds::errno::EEXIST)
           ),
           "seed {seed} produced invalid unit-op error: {err:?}"
         );
@@ -774,7 +787,11 @@ fn assert_event_invariants(seed: u64, event: &Event) {
       }
       Err(err) => {
         assert!(
-          matches!(err.raw_os_error(), Some(libc::ENOENT) | Some(libc::EACCES)),
+          matches!(
+            err.raw_os_error(),
+            Some(lio::backend::ds::errno::ENOENT)
+              | Some(lio::backend::ds::errno::EACCES)
+          ),
           "seed {seed} produced invalid stat error: {err:?}"
         );
       }
@@ -785,7 +802,11 @@ fn assert_event_invariants(seed: u64, event: &Event) {
       }
       Err(err) => {
         assert!(
-          matches!(err.raw_os_error(), Some(libc::ENOENT) | Some(libc::EACCES)),
+          matches!(
+            err.raw_os_error(),
+            Some(lio::backend::ds::errno::ENOENT)
+              | Some(lio::backend::ds::errno::EACCES)
+          ),
           "seed {seed} produced invalid spawn error: {err:?}"
         );
       }
@@ -816,4 +837,18 @@ fn random_addr(rng: &mut Prng) -> SocketAddr {
 
 fn scripted_path(seed: u64, index: usize, tag: &str) -> CString {
   CString::new(format!("/tmp/lio-fuzz-{tag}-{seed:016x}-{index:04x}")).unwrap()
+}
+
+/// The simulated descriptor number behind a `Resource`.
+fn resource_number(resource: &lio::api::resource::Resource) -> i64 {
+  #[cfg(unix)]
+  {
+    use std::os::fd::AsRawFd;
+    resource.as_raw_fd() as i64
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::io::AsRawHandle;
+    resource.as_raw_handle() as i64
+  }
 }

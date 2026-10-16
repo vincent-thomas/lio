@@ -14,27 +14,21 @@ completions, and provide type-safe abstractions — nothing more.
 - **Allocation** (future goal) should follow the same pattern — outsourced to a
   pluggable allocator interface.
 
-### Current OS-dependent leakage (to be eliminated)
+### Remaining platform-specific code in the main crate
 
-These locations in the main `lio` crate contain platform-specific code that should
-be pushed into backend implementations or abstracted behind the contract:
+No `libc`/`windows-sys` calls remain outside `backend/` (the backend
+implementations plus `backend::native` and `backend::sockaddr`, the OS
+primitives they share) and the `unstable_ffi` C interface. What is left is
+inherent or confined:
 
-| Location | What depends on OS |
-|---|---|
-| `lio/src/macros.rs` | `syscall!` macro wraps `libc` directly |
-| `lio/src/lio.rs` | `SLEEP_RESULT` constant uses `libc::ETIME` / `libc::ETIMEDOUT` |
-| `lio/src/api/ops.rs` | Socket addr conversion uses `libc::sockaddr_*`; `MSG_DONTWAIT`, `MSG_NOSIGNAL`, `S_IFREG`, `ERANGE` constants; `libc::dup` / `libc::STDIN_FILENO` for pipe/tee models |
-| `lio/src/api/resource.rs` | `libc::STDIN_FILENO`, `STDOUT_FILENO`, `STDERR_FILENO`, `AT_FDCWD` |
-| `lio/src/fs.rs` | `libc::O_*` flags, `libc::AT_REMOVEDIR`, `libc::EINVAL` |
-| `lio/src/net/socket.rs` | `libc::sockaddr_storage`, `libc::getsockname`, `libc::getpeername` |
-| `lio/src/net/unix.rs` | `libc::AF_UNIX`, `libc::SOCK_STREAM`, `libc::fcntl`, `libc::bind`, `libc::listen`, `libc::connect`, `libc::sockaddr_un` |
-| `lio/src/platform/errno.rs` | `cfg(target_os)` for `__errno_location` / `__error` / `GetLastError` |
-| `lio/src/api/mod.rs` | Imports and re-exports `SockDomain`, `SockProto`, etc. from `backend::op` |
+- `Resource` implements the std raw descriptor/handle traits per platform
+  (`AsRawFd`/`FromRawFd`, `AsRawHandle`/`FromRawHandle`).
+- Lossless `OsString` <-> byte conversions use `std::os::unix::ffi` under
+  `cfg(unix)`.
+- Unit-test fixtures may create real descriptors with `libc`.
 
-Each of these must either:
-1. Be moved into a backend implementation, or
-2. Be lifted into a platform-independent abstraction in `backend::op` (pure data types)
-   with the OS-specific translation happening inside the backend.
+New code must keep it that way: OS primitives belong in `backend/`, and the
+contract (`backend::op`) stays pure data.
 
 ## Testing contract
 

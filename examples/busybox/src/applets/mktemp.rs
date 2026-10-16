@@ -225,7 +225,10 @@ fn create_candidate(
     let mut receiver = api::openat(
       &ctx.cwd(),
       cpath,
-      libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+      lio::api::OpenFlags::READ
+        | lio::api::OpenFlags::WRITE
+        | lio::api::OpenFlags::CREATE
+        | lio::api::OpenFlags::EXCLUSIVE,
       0o600,
     )
     .with_lio(ctx.lio())

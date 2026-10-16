@@ -24,7 +24,6 @@ pub(crate) mod tests;
 
 use std::{
   io,
-  net::SocketAddr,
   os::fd::{AsRawFd, RawFd},
   time::Duration,
 };
@@ -34,10 +33,8 @@ use bumpalo::Bump;
 use crate::backend::{
   IoBackend, OpCompleted,
   impls::pollingv2::interest::Interest,
-  op::{
-    DirEntryRef, MsgRecv, MsgSend, Op, ReadDirResult,
-    file_type_from_dirent_dtype,
-  },
+  impls::unix_stat::{file_stat_from_raw, file_type_from_dirent_dtype},
+  op::{DirEntryRef, MsgRecv, MsgSend, Op, ReadDirResult},
 };
 use crate::slab::{Slab, SlabKey};
 mod interest;
@@ -403,6 +400,11 @@ impl Poller {
     iovecs: std::ptr::NonNull<crate::backend::op::RawBuf>,
     iov_count: usize,
   ) -> Option<[libc::iovec; crate::buf::MAX_IOV_COUNT]> {
+    // The native iovec array is fixed-size; a longer list would make the
+    // kernel read past it.
+    if iov_count > crate::buf::MAX_IOV_COUNT {
+      return None;
+    }
     // SAFETY: `iovecs` points to `iov_count` valid `RawBuf` entries.
     let raws =
       unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) };
@@ -417,6 +419,11 @@ impl Poller {
   }
 
   fn lower_recv_msg(msg: &MsgRecv) -> Option<LoweredMsg> {
+    // The native iovec array is fixed-size; a longer list would make the
+    // kernel read past it.
+    if msg.buf_count.get() > crate::buf::MAX_IOV_COUNT {
+      return None;
+    }
     // SAFETY: `msg.bufs` points to `msg.buf_count` valid `MsgBufMut` items.
     let bufs = unsafe {
       std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
@@ -453,6 +460,11 @@ impl Poller {
   }
 
   fn lower_send_msg(msg: &MsgSend) -> Option<LoweredMsg> {
+    // The native iovec array is fixed-size; a longer list would make the
+    // kernel read past it.
+    if msg.buf_count.get() > crate::buf::MAX_IOV_COUNT {
+      return None;
+    }
     // SAFETY: `msg.bufs` points to `msg.buf_count` valid `MsgBuf` items.
     let bufs = unsafe {
       std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
@@ -478,51 +490,6 @@ impl Poller {
       msg_flags: 0,
     };
     Some((iovecs, hdr, addr))
-  }
-
-  fn debug_sendmsg_zero(fd: RawFd, hdr: &libc::msghdr) {
-    let mut so_error: i32 = 0;
-    let mut so_error_len = std::mem::size_of::<i32>() as libc::socklen_t;
-    let so_error_ret = syscall!(raw getsockopt(
-      fd,
-      libc::SOL_SOCKET,
-      libc::SO_ERROR,
-      (&mut so_error as *mut i32).cast(),
-      &mut so_error_len,
-    ));
-
-    let mut peer = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
-    let mut peer_len =
-      std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let peer_ret = syscall!(raw getpeername(
-      fd,
-      (&mut peer as *mut libc::sockaddr_storage).cast(),
-      &mut peer_len,
-    ));
-
-    let peer = if peer_ret >= 0 {
-      Self::raise_socket_addr(&peer, peer_len)
-        .and_then(|addr| crate::backend::op::socket_addr_from_buf(&addr))
-        .map(|addr| addr.to_string())
-        .unwrap_or_else(|err| format!("<decode-error:{err}>"))
-    } else {
-      format!("<getpeername:{}>", -peer_ret)
-    };
-
-    eprintln!(
-      "lio-debug sendmsg returned 0 fd={} msg_iovlen={} first_iov_len={} so_error_ret={} so_error={} peer={}",
-      fd,
-      hdr.msg_iovlen,
-      if hdr.msg_iovlen > 0 {
-        // SAFETY: msg_iovlen > 0 means msg_iov points to at least one iovec.
-        unsafe { (*hdr.msg_iov).iov_len }
-      } else {
-        0
-      },
-      so_error_ret,
-      so_error,
-      peer,
-    );
   }
 
   pub fn new() -> Self {
@@ -774,6 +741,31 @@ impl Poller {
   /// Try to execute an operation (non-blocking syscall)
   /// Returns positive on success (bytes transferred), negative on error (-errno)
   fn exec_op(op: &crate::backend::op::Op) -> isize {
+    Self::exec_op_with_socket_flags(op, 0)
+  }
+
+  /// Try nonblocking sockets before paying for readiness registration. Preserve
+  /// the existing behavior for externally supplied blocking descriptors.
+  fn try_socket_immediately(op: &Op) -> Option<isize> {
+    let fd = match op {
+      Op::Recv { fd, .. } | Op::Send { fd, .. } => fd.as_raw_fd(),
+      _ => return None,
+    };
+    let flags = syscall!(raw fcntl(fd, libc::F_GETFL));
+    if flags < 0 || flags & libc::O_NONBLOCK as isize == 0 {
+      return None;
+    }
+    // Also set the per-call flag so a concurrent change to O_NONBLOCK cannot
+    // turn this speculative attempt into a blocking call.
+    let result = Self::exec_op_with_socket_flags(op, libc::MSG_DONTWAIT);
+    if result == EAGAIN_NEG || result == EWOULDBLOCK_NEG {
+      None
+    } else {
+      Some(result)
+    }
+  }
+
+  fn exec_op_with_socket_flags(op: &Op, socket_flags: i32) -> isize {
     use crate::backend::op::Op;
 
     match op {
@@ -817,7 +809,8 @@ impl Poller {
           hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
           hdr.msg_namelen = *len;
         }
-        let result = syscall!(raw recvmsg(fd, &mut hdr, flags.bits()));
+        let result =
+          syscall!(raw recvmsg(fd, &mut hdr, flags.bits() | socket_flags));
         if result >= 0
           && let (Some(out), Some((storage, len))) = (msg.from, addr.as_ref())
           && let Ok(addr) = Self::raise_socket_addr(storage, *len)
@@ -841,11 +834,7 @@ impl Poller {
           hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
           hdr.msg_namelen = *len;
         }
-        let result = syscall!(raw sendmsg(fd, &mut hdr, flags.bits()));
-        if result == 0 && hdr.msg_iovlen > 0 {
-          Self::debug_sendmsg_zero(fd, &hdr);
-        }
-        result
+        syscall!(raw sendmsg(fd, &mut hdr, flags.bits() | socket_flags))
       }
 
       Op::Accept { fd, addr } => {
@@ -901,12 +890,15 @@ impl Poller {
         let Ok(path) = Self::os_path_to_cstring(path) else {
           return -(libc::EINVAL as isize);
         };
-        syscall!(raw openat(
-          dir_fd.as_raw_fd(),
-          path.as_ptr(),
-          flags.bits(),
-          mode.bits(),
-        ))
+        match crate::backend::native::open_flags(*flags) {
+          Ok(flags) => syscall!(raw openat(
+            dir_fd.as_raw_fd(),
+            path.as_ptr(),
+            flags,
+            mode.bits(),
+          )),
+          Err(errno) => -(errno as isize),
+        }
       }
       Op::Stat { target, out } => {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -937,7 +929,7 @@ impl Poller {
           let stat = unsafe { stat.assume_init() };
           // SAFETY: `out` points to caller-provided writable result storage.
           unsafe {
-            *out.as_ptr() = crate::backend::op::file_stat_from_raw(&stat);
+            *out.as_ptr() = file_stat_from_raw(&stat);
           }
         }
         result
@@ -1114,7 +1106,10 @@ impl Poller {
           .as_mut()
           .map(|vars| vars.as_mut_ptr().cast_const())
           .unwrap_or_else(|| {
-            // SAFETY: `environ` is the process-global environment vector.
+            // SAFETY: `environ` is libc's process-global environment vector.
+            // Mutating it while another thread reads it is ruled out by the
+            // contract of `std::env::set_var`/`remove_var`, which are
+            // `unsafe` in Rust 2024 for exactly this reason.
             unsafe { environ as *const *mut libc::c_char }
           });
         // SAFETY: native C strings and pointer arrays remain alive for this call.
@@ -1132,7 +1127,9 @@ impl Poller {
       }
 
       Op::Socket { domain, ty, proto } => {
-        match crate::backend::op::socket_to_raw(*domain, *ty, *proto) {
+        match crate::backend::impls::sockaddr::socket_to_raw(
+          *domain, *ty, *proto,
+        ) {
           Ok((domain, ty, proto)) => {
             let result = syscall!(raw socket(domain, ty, proto));
             if result < 0 {
@@ -1150,19 +1147,14 @@ impl Poller {
           Err(errno) => -(errno as isize),
         }
       }
-      Op::Bind { fd, addr } => {
-        let storage =
-          crate::backend::impls::sockaddr::std_socketaddr_into_libc(*addr);
-        let len = match addr {
-          SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>(),
-          SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>(),
-        } as libc::socklen_t;
-        syscall!(raw bind(
+      Op::Bind { fd, addr } => match Self::lower_socket_addr(addr) {
+        Ok((storage, len)) => syscall!(raw bind(
           fd.as_raw_fd(),
           (&storage as *const libc::sockaddr_storage).cast(),
           len
-        ))
-      }
+        )),
+        Err(err) => -(err.raw_os_error().unwrap_or(libc::EINVAL) as isize),
+      },
       Op::Listen { fd, backlog } => {
         syscall!(raw listen(fd.as_raw_fd(), *backlog))
       }
@@ -1232,6 +1224,13 @@ impl IoBackend for Poller {
         continue;
       }
 
+      if let Some(result) = Self::try_socket_immediately(&entry.op) {
+        self
+          .queued_completed
+          .push(OpCompleted::new(entry.registration_id, result));
+        continue;
+      }
+
       if let Op::Connect { fd, addr } = &entry.op {
         let Ok((storage, len)) = Self::lower_socket_addr(addr) else {
           self.queued_completed.push(OpCompleted::new(
@@ -1293,6 +1292,30 @@ impl IoBackend for Poller {
     Ok(())
   }
 
+  fn cancel(&mut self, id: u64) {
+    const CANCELED: isize = -(libc::ECANCELED as isize);
+    if let Some(index) =
+      self.backlog.iter().position(|entry| entry.registration_id == id)
+    {
+      self.backlog.swap_remove(index);
+      self.queued_completed.push(OpCompleted::new(id, CANCELED));
+      return;
+    }
+    // This backend performs the I/O itself once the descriptor is ready, so
+    // nothing outside it uses the op's memory: it can be dropped right away.
+    let Some(key) =
+      self.pending.keys_where(|entry| entry.registration_id == id).next()
+    else {
+      return;
+    };
+    let entry = self.pending.remove_value(key).expect("found above");
+    let (fd, interest) = self.extract_fd_interest(&entry.op);
+    if !interest.is_none() {
+      let _ = self.sys().delete(fd);
+    }
+    self.queued_completed.push(OpCompleted::new(id, CANCELED));
+  }
+
   fn wait(
     &mut self,
     timeout: Option<Duration>,
@@ -1301,13 +1324,28 @@ impl IoBackend for Poller {
     completed.clear();
     if !self.queued_completed.is_empty() {
       completed.append(&mut self.queued_completed);
-      return Ok(());
+      if self.pending.len() == 0 {
+        return Ok(());
+      }
     }
+
+    // Immediate socket completions must not starve previously registered I/O.
+    // Poll pending readiness too, without blocking delivery of ready results.
+    let timeout =
+      if completed.is_empty() { timeout } else { Some(Duration::ZERO) };
 
     let sys = self.sys.as_ref().unwrap();
 
     {
-      let event_count = sys.wait(self.events.as_buf(), timeout)?;
+      let event_count = match sys.wait(self.events.as_buf(), timeout) {
+        Ok(count) => count,
+        Err(err) => {
+          // The driver cannot consume `completed` on an error. Preserve any
+          // immediate results so its next call can still deliver them.
+          self.queued_completed.append(completed);
+          return Err(err);
+        }
+      };
       // SAFETY: `wait()` initialized exactly `event_count` events in the buffer.
       unsafe { self.events.set_len(event_count) };
     }

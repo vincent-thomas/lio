@@ -34,7 +34,6 @@
 
 pub mod io;
 pub mod op;
-pub mod op_contract;
 pub mod ops;
 pub mod pid;
 pub mod resource;
@@ -45,6 +44,7 @@ pub use crate::backend::op::{
   SockDomain, SockProto, SockType, UnlinkKind, WriteFlags,
 };
 pub use io::{Io, IoStream, Receiver, StreamReceiver};
+pub use ops::UnixAddr;
 pub use pid::Pid;
 
 use crate::{IoBufMutVec, IoBufVec};
@@ -206,6 +206,16 @@ doc_op! {
 }
 
 doc_op! {
+    short: "Accepts a single incoming connection from a UNIX-domain listening socket, with the peer's address.",
+
+    pub fn accept_unix(
+        res: &impl AsResource,
+    ) -> Io<ops::AcceptUnix> {
+        Io::from_op(ops::AcceptUnix::new(res.as_resource().clone()))
+    }
+}
+
+doc_op! {
     short: "Connects a socket resource to a remote address.",
 
     pub fn connect(
@@ -255,13 +265,13 @@ doc_op! {
     pub fn openat(
         dir_res: &impl AsResource,
         path: std::ffi::CString,
-        flags: impl Into<OpenFlags>,
+        flags: OpenFlags,
         mode: impl Into<FileMode>
     ) -> Io<ops::OpenAt> {
         Io::from_op(ops::OpenAt::new(
             dir_res.as_resource().clone(),
             path,
-            flags.into(),
+            flags,
             mode.into()
         ))
     }
@@ -313,12 +323,12 @@ doc_op! {
     pub fn unlinkat(
         dir_res: &impl AsResource,
         path: std::ffi::CString,
-        kind: impl Into<UnlinkKind>,
+        kind: UnlinkKind,
     ) -> Io<ops::UnlinkAt> {
         Io::from_op(ops::UnlinkAt::new(
             dir_res.as_resource().clone(),
             path,
-            kind.into(),
+            kind,
         ))
     }
 }
@@ -402,9 +412,8 @@ doc_op! {
 }
 
 doc_op! {
-    short: "Spawns a new process using posix_spawn().",
+    short: "Spawns a new process; `argv[0]` is the conventional program name.",
 
-    #[cfg(unix)]
     pub fn spawn(
         path: std::ffi::CString,
         argv: Vec<std::ffi::CString>,

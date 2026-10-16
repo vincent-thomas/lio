@@ -36,8 +36,9 @@ impl Command for UnlinkCommand {
     let cpath = CString::new(self.path.as_bytes()).map_err(|_| {
       io::Error::new(io::ErrorKind::InvalidInput, "unlink: invalid path")
     })?;
-    let mut receiver =
-      api::unlinkat(&ctx.cwd(), cpath, 0).with_lio(ctx.lio()).send();
+    let mut receiver = api::unlinkat(&ctx.cwd(), cpath, api::UnlinkKind::File)
+      .with_lio(ctx.lio())
+      .send();
     io_util::run_recv(ctx.lio(), &mut receiver)
   }
 }

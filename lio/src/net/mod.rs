@@ -84,7 +84,9 @@ mod ops;
 mod socket;
 mod tcp;
 mod udp;
+mod unix;
 
 pub use socket::*;
 pub use tcp::*;
 pub use udp::*;
+pub use unix::*;

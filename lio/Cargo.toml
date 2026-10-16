@@ -55,3 +55,11 @@ lio-test = { path = "../lio-test" }
 [[bench]]
 name = "bookkeeping"
 harness = false
+
+[[bench]]
+name = "socket_scheduling"
+harness = false
+
+[[bench]]
+name = "submission"
+harness = false

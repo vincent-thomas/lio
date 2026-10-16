@@ -8,8 +8,6 @@
 //!   `IoBackend` contract.
 //! - [`test_op_model_contract!`] validates generic `OpModel`-style state
 //!   machines that implement [`OpModelContract`].
-//! - [`test_serial_op_model_contract!`] validates the serial illustration
-//!   models described through [`serial_op_contract::OpModelContract`].
 //!
 //! Typical usage from a consumer crate:
 //!
@@ -21,19 +19,11 @@
 //!   mod my_model_contract {
 //!     use super::*;
 //!
-//!     lio_test::test_serial_op_model_contract!(MyModel);
+//!     lio_test::test_op_model_contract!(MyModel);
 //!   }
 //! }
 //! ```
-//!
-//! The single-argument `test_serial_op_model_contract!` form assumes the
-//! calling crate exposes itself as `lio` with `extern crate self as lio;`.
-//! Other crates can use the two-argument form and pass their crate identifier:
-//!
-//! ```ignore
-//! lio_test::test_serial_op_model_contract!(my_crate, MyModel);
-//! ```
-//!
+
 /// Shared contract tests for [`IoBackend`](crate::backend::IoBackend)
 /// implementations.
 ///
@@ -170,10 +160,15 @@ macro_rules! test_io_backend {
       collections::HashMap,
       time::{Duration, SystemTime, Instant},
       env, ffi::OsString, fs, mem, path::PathBuf, thread,
-      os::{
-        unix::{ffi::OsStrExt, net::{UnixListener, UnixStream}},
-        fd::{FromRawFd, IntoRawFd, RawFd}
-      },
+    };
+    #[cfg(unix)]
+    use std::os::{
+      unix::net::{UnixListener, UnixStream},
+      fd::{FromRawFd, IntoRawFd, RawFd},
+    };
+    #[cfg(windows)]
+    use std::os::windows::io::{
+      FromRawHandle, FromRawSocket, IntoRawHandle, IntoRawSocket, RawHandle,
     };
 
     use __lio_test_lio::api::resource::Resource;
@@ -233,12 +228,6 @@ macro_rules! test_io_backend {
       SendFlags::from_bits(bits).expect("send flags must be nonnegative")
     }
 
-    #[cfg(unix)]
-    fn send_payload(fd: RawFd, payload: &[u8]) -> isize {
-      // SAFETY: `fd` is expected to be a live socket in these tests and
-      // `payload` points to a stable readable buffer for this synchronous send.
-      unsafe { libc::send(fd, payload.as_ptr().cast(), payload.len(), 0) }
-    }
 
     fn new_backend() -> impl IoBackend {
       $backend_ctor
@@ -297,10 +286,8 @@ macro_rules! test_io_backend {
       );
     }
 
-    #[cfg(unix)]
     #[test]
     fn wait_none_blocks_until_completion() {
-      use std::os::fd::AsRawFd;
 
       let mut backend = new_backend();
       backend.init(64).unwrap();
@@ -324,7 +311,7 @@ macro_rules! test_io_backend {
 
       let writer = thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(20));
-        let wrote = send_payload(write_res.as_raw_fd(), &payload);
+        let wrote = send_payload(&write_res, &payload);
         assert_eq!(wrote, payload.len() as isize);
       });
 
@@ -358,7 +345,6 @@ macro_rules! test_io_backend {
       );
     }
 
-    #[cfg(unix)]
     #[test]
     fn pushed_work_is_not_observable_until_flush() {
       let mut backend = new_backend();
@@ -385,18 +371,15 @@ macro_rules! test_io_backend {
 
       let completed = wait_completions(&mut backend, Some(Duration::ZERO));
       assert_eq!(completed.len(), 1);
-      assert_exact_result(&completed[0], 90, -(libc::EBADF as isize));
+      assert_exact_result(&completed[0], 90, expect::BADF_SOCKET);
     }
 
-    #[cfg(unix)]
     #[test]
     fn flush_can_produce_immediate_completions_without_pending_work() {
       let mut backend = new_backend();
       backend.init(64).unwrap();
 
-      // SAFETY: this test intentionally constructs an invalid owned fd to
-      // verify backend error handling on bad descriptors.
-      let invalid_fd = unsafe { Resource::from_raw_fd(-1) };
+      let invalid_fd = invalid_fd_resource();
       // SAFETY: a null pointer with zero length is a valid empty raw buffer.
       let mut raw_buf = unsafe { RawBuf::from_raw_parts(std::ptr::null_mut(), 0) };
 
@@ -419,7 +402,7 @@ macro_rules! test_io_backend {
         1,
         "flush-produced completion must be surfaced on the next wait()"
       );
-      assert_exact_result(&completed[0], 91, -(libc::EINVAL as isize));
+      assert_exact_result(&completed[0], 91, expect::INVAL);
 
       let completed = wait_completions(&mut backend, Some(Duration::ZERO));
       assert!(
@@ -438,140 +421,381 @@ macro_rules! test_io_backend {
       push_op(&mut backend, 2, Op::Nop);
     }
 
+    /// Raw error codes a conforming backend reports. Windows backends report
+    /// Win32/Winsock codes (what `io::Error::from_raw_os_error` expects there).
+    #[allow(dead_code)]
+    mod expect {
+      #[cfg(unix)]
+      mod codes {
+        pub const BADF: i32 = libc::EBADF;
+        pub const BADF_SOCKET: i32 = libc::EBADF;
+        pub const INVAL: i32 = libc::EINVAL;
+        pub const INVAL_SOCKET: i32 = libc::EINVAL;
+        pub const NOTSUP: i32 = libc::ENOTSUP;
+        pub const NOENT: i32 = libc::ENOENT;
+        pub const EXIST: i32 = libc::EEXIST;
+        pub const CONNECT_MISSING: i32 = libc::ENOENT;
+        pub const SPAWN_MISSING: i32 = libc::ENOENT;
+      }
+
+      #[cfg(windows)]
+      mod codes {
+        /// `ERROR_INVALID_HANDLE`
+        pub const BADF: i32 = 6;
+        /// `WSAENOTSOCK`
+        pub const BADF_SOCKET: i32 = 10038;
+        /// `ERROR_INVALID_PARAMETER`
+        pub const INVAL: i32 = 87;
+        /// `WSAEINVAL`
+        pub const INVAL_SOCKET: i32 = 10022;
+        /// `ERROR_NOT_SUPPORTED`
+        pub const NOTSUP: i32 = 50;
+        /// `ERROR_FILE_NOT_FOUND`
+        pub const NOENT: i32 = 2;
+        /// `ERROR_ALREADY_EXISTS`
+        pub const EXIST: i32 = 183;
+        /// `WSAECONNREFUSED`
+        pub const CONNECT_MISSING: i32 = 10061;
+        /// `ERROR_PATH_NOT_FOUND`
+        pub const SPAWN_MISSING: i32 = 3;
+      }
+
+      pub const fn neg(code: i32) -> isize {
+        -(code as isize)
+      }
+
+      pub const BADF: isize = neg(codes::BADF);
+      pub const BADF_SOCKET: isize = neg(codes::BADF_SOCKET);
+      pub const INVAL: isize = neg(codes::INVAL);
+      pub const INVAL_SOCKET: isize = neg(codes::INVAL_SOCKET);
+      pub const NOTSUP: isize = neg(codes::NOTSUP);
+      pub const NOENT: isize = neg(codes::NOENT);
+      pub const EXIST: isize = neg(codes::EXIST);
+      pub const CONNECT_MISSING: isize = neg(codes::CONNECT_MISSING);
+      pub const SPAWN_MISSING: isize = neg(codes::SPAWN_MISSING);
+    }
+
+    /// Takes ownership of a raw descriptor/handle returned by the backend.
+    fn own_raw(raw: isize) -> Resource {
+      #[cfg(unix)]
+      // SAFETY: the backend hands out a fresh descriptor the test now owns.
+      return unsafe { Resource::from_raw_fd(raw as RawFd) };
+      #[cfg(windows)]
+      // SAFETY: the backend hands out a fresh handle the test now owns.
+      return unsafe { Resource::from_raw_handle(raw as RawHandle) };
+    }
+
+    /// Closes a raw descriptor/handle returned by the backend.
+    fn close_raw(raw: isize) {
+      drop(own_raw(raw));
+    }
+
     #[cfg(unix)]
-    fn socket_pair() -> (
-      __lio_test_lio::api::resource::Resource,
-      __lio_test_lio::api::resource::Resource,
-    ) {
+    fn send_payload(res: &Resource, payload: &[u8]) -> isize {
+      use std::os::fd::AsRawFd;
+      // SAFETY: `res` is a live socket and `payload` is readable for this
+      // synchronous send.
+      unsafe { libc::send(res.as_raw_fd(), payload.as_ptr().cast(), payload.len(), 0) }
+    }
+
+    #[cfg(windows)]
+    fn send_payload(res: &Resource, payload: &[u8]) -> isize {
+      use std::io::Write;
+      use std::os::windows::io::AsRawHandle;
+      // SAFETY: `res` owns the socket; `ManuallyDrop` keeps it open.
+      let mut stream = mem::ManuallyDrop::new(unsafe {
+        std::net::TcpStream::from_raw_socket(res.as_raw_handle() as u64)
+      });
+      match stream.write(payload) {
+        Ok(n) => n as isize,
+        Err(err) => -(err.raw_os_error().unwrap_or(0) as isize),
+      }
+    }
+
+    #[cfg(unix)]
+    fn recv_payload(res: &Resource, buf: &mut [u8]) -> isize {
+      use std::os::fd::AsRawFd;
+      // SAFETY: `res` is a live socket and `buf` is writable for this
+      // synchronous recv.
+      unsafe { libc::recv(res.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) }
+    }
+
+    #[cfg(windows)]
+    fn recv_payload(res: &Resource, buf: &mut [u8]) -> isize {
+      use std::io::Read;
+      use std::os::windows::io::AsRawHandle;
+      // SAFETY: `res` owns the socket; `ManuallyDrop` keeps it open.
+      let mut stream = mem::ManuallyDrop::new(unsafe {
+        std::net::TcpStream::from_raw_socket(res.as_raw_handle() as u64)
+      });
+      match stream.read(buf) {
+        Ok(n) => n as isize,
+        Err(err) => -(err.raw_os_error().unwrap_or(0) as isize),
+      }
+    }
+
+    #[cfg(unix)]
+    fn socket_pair() -> (Resource, Resource) {
       let mut fds = [0; 2];
       // SAFETY: `fds` points to two writable integers for `socketpair` to fill.
       let rc = unsafe {
-        libc::socketpair(
-          libc::AF_UNIX,
-          libc::SOCK_STREAM,
-          0,
-          fds.as_mut_ptr(),
-        )
+        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr())
       };
-      assert_eq!(
-        rc,
-        0,
-        "socketpair() failed: {}",
-        std::io::Error::last_os_error()
-      );
-
+      assert_eq!(rc, 0, "socketpair() failed: {}", std::io::Error::last_os_error());
       for &fd in &fds {
-        // SAFETY: `fd` is a live socket returned from `socketpair`.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        assert!(
-          flags >= 0,
-          "fcntl(F_GETFL) failed: {}",
-          std::io::Error::last_os_error()
-        );
-
-        // SAFETY: `fd` is a live socket returned from `socketpair`.
-        let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        assert_eq!(
-          rc,
-          0,
-          "fcntl(F_SETFL, O_NONBLOCK) failed: {}",
-          std::io::Error::last_os_error()
-        );
+        set_nonblocking(fd);
       }
+      (own_raw(fds[0] as isize), own_raw(fds[1] as isize))
+    }
 
-      // SAFETY: both fds were just returned by `pipe` and are uniquely owned here.
-      let read = unsafe {
-        <__lio_test_lio::api::resource::Resource as std::os::fd::FromRawFd>::from_raw_fd(fds[0])
-      };
-      // SAFETY: both fds were just returned by `pipe` and are uniquely owned here.
-      let write = unsafe {
-        <__lio_test_lio::api::resource::Resource as std::os::fd::FromRawFd>::from_raw_fd(fds[1])
-      };
-
-      (read, write)
+    /// A connected loopback TCP pair; Windows has no `socketpair`.
+    #[cfg(windows)]
+    fn socket_pair() -> (Resource, Resource) {
+      let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+      let client =
+        std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+      let (server, _) = listener.accept().unwrap();
+      client.set_nodelay(true).unwrap();
+      server.set_nodelay(true).unwrap();
+      (
+        own_raw(server.into_raw_socket() as isize),
+        own_raw(client.into_raw_socket() as isize),
+      )
     }
 
     #[cfg(unix)]
     fn set_nonblocking(fd: RawFd) {
       // SAFETY: `fd` is expected to be a live descriptor in these tests.
       let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-      assert!(
-        flags >= 0,
-        "fcntl(F_GETFL) failed: {}",
-        std::io::Error::last_os_error()
-      );
+      assert!(flags >= 0, "fcntl(F_GETFL) failed: {}", std::io::Error::last_os_error());
       // SAFETY: `fd` is expected to be a live descriptor in these tests.
       let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-      assert_eq!(
-        rc,
-        0,
-        "fcntl(F_SETFL, O_NONBLOCK) failed: {}",
-        std::io::Error::last_os_error()
-      );
+      assert_eq!(rc, 0, "fcntl(F_SETFL, O_NONBLOCK) failed: {}", std::io::Error::last_os_error());
     }
 
-    #[cfg(unix)]
-    fn unix_socket_path(prefix: &str) -> PathBuf {
+    fn unique_name(prefix: &str) -> String {
       let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("system time before UNIX epoch")
         .as_nanos();
-      let pid = std::process::id();
+      let mut name = format!("lio-{}-{:x}-{:x}", prefix, std::process::id(), now);
+      name.truncate(40);
+      name
+    }
+
+    fn unix_socket_path(prefix: &str) -> PathBuf {
       let mut path = env::temp_dir();
-      let mut name = format!("lio-{}-{:x}-{:x}", prefix, pid, now);
-      let max_name_len = 40;
-      if name.len() > max_name_len {
-        name.truncate(max_name_len);
-      }
-      path.push(&name);
-      // Ensure it is unique, append a compact suffix if necessary.
+      path.push(unique_name(prefix));
       let mut idx = 0u32;
       while path.exists() {
-        path.set_file_name(format!("{name}-{:x}", idx));
+        path.set_file_name(format!("{}-{:x}", unique_name(prefix), idx));
         idx += 1;
       }
-      let bytes = path.as_os_str().as_bytes();
-      // SAFETY: zeroed `sockaddr_storage` is a valid scratch buffer before we
-      // reinterpret it as a Unix-domain socket address.
-      let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
-      // SAFETY: `sockaddr_storage` is large enough and properly aligned for
-      // `sockaddr_un`, which we only use to inspect `sun_path` capacity.
-      let sun = unsafe { &mut *(std::ptr::addr_of_mut!(storage) as *mut libc::sockaddr_un) };
       assert!(
-        bytes.len() < sun.sun_path.len(),
-        "unix socket test path too long: {} >= {} ({})",
-        bytes.len(),
-        sun.sun_path.len(),
+        path.as_os_str().len() < 104,
+        "unix socket test path too long: {}",
         path.display()
       );
       path
     }
 
-    #[cfg(unix)]
     fn temp_path(prefix: &str) -> PathBuf {
       let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("system time before UNIX epoch")
         .as_nanos();
-      let pid = std::process::id();
       let mut path = env::temp_dir();
-      path.push(format!("lio-{}-{:x}-{:x}", prefix, pid, now));
+      path.push(format!("lio-{}-{:x}-{:x}", prefix, std::process::id(), now));
       path
     }
 
-    #[cfg(unix)]
     fn unix_sockaddr_un(
       path: &std::path::Path,
     ) -> __lio_test_lio::backend::op::SocketAddrBuf {
-      __lio_test_lio::backend::op::unix_socket_addr_buf(path.as_os_str().as_bytes())
+      __lio_test_lio::backend::op::unix_socket_addr_buf(path.as_os_str().as_encoded_bytes())
         .expect("path too long for unix socket test")
     }
 
+    /// An unconnected Unix-domain stream socket.
     #[cfg(unix)]
+    fn unix_stream_socket() -> Resource {
+      // SAFETY: plain socket creation.
+      let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+      assert!(fd >= 0, "socket() failed: {}", std::io::Error::last_os_error());
+      set_nonblocking(fd);
+      own_raw(fd as isize)
+    }
+
+    /// An unconnected overlapped stream socket of the given address family.
+    #[cfg(windows)]
+    fn windows_stream_socket(family: u16) -> Resource {
+      use windows_sys::Win32::Networking::WinSock as ws;
+      // Ensure Winsock is initialized before raw socket calls.
+      drop(std::net::UdpSocket::bind("127.0.0.1:0"));
+      // SAFETY: plain socket creation.
+      let socket = unsafe {
+        ws::WSASocketW(
+          family as i32,
+          ws::SOCK_STREAM,
+          0,
+          std::ptr::null(),
+          0,
+          ws::WSA_FLAG_OVERLAPPED | ws::WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+      };
+      assert_ne!(socket, ws::INVALID_SOCKET, "WSASocketW failed: {}", std::io::Error::last_os_error());
+      own_raw(socket as isize)
+    }
+
+    #[cfg(windows)]
+    fn unix_stream_socket() -> Resource {
+      windows_stream_socket(windows_sys::Win32::Networking::WinSock::AF_UNIX)
+    }
+
+    /// A listening stream socket plus helpers to connect to it: a Unix
+    /// socket where std supports one, loopback TCP on Windows.
+    struct LocalListener {
+      #[cfg(unix)]
+      path: PathBuf,
+      #[cfg(unix)]
+      listener: Option<UnixListener>,
+      #[cfg(windows)]
+      listener: Option<std::net::TcpListener>,
+      #[cfg(windows)]
+      addr: std::net::SocketAddr,
+    }
+
+    impl LocalListener {
+      #[cfg(unix)]
+      fn new(prefix: &str) -> Self {
+        let path = unix_socket_path(prefix);
+        fs::remove_file(&path).ok();
+        let listener = UnixListener::bind(&path).unwrap();
+        Self { path, listener: Some(listener) }
+      }
+
+      #[cfg(windows)]
+      fn new(_prefix: &str) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        Self { listener: Some(listener), addr }
+      }
+
+      /// Hands the listening socket to the backend under test.
+      fn resource(&mut self) -> Resource {
+        let listener = self.listener.take().expect("listener already taken");
+        listener.set_nonblocking(true).unwrap();
+        #[cfg(unix)]
+        return own_raw(listener.into_raw_fd() as isize);
+        #[cfg(windows)]
+        return own_raw(listener.into_raw_socket() as isize);
+      }
+
+      fn addr(&self) -> __lio_test_lio::backend::op::SocketAddrBuf {
+        #[cfg(unix)]
+        return unix_sockaddr_un(&self.path);
+        #[cfg(windows)]
+        return __lio_test_lio::backend::op::socket_addr_into_buf(self.addr);
+      }
+
+      /// An unconnected socket that can connect to this listener.
+      fn client_socket(&self) -> Resource {
+        #[cfg(unix)]
+        return unix_stream_socket();
+        #[cfg(windows)]
+        return windows_stream_socket(windows_sys::Win32::Networking::WinSock::AF_INET);
+      }
+
+      /// Connects a std client from another thread, then hangs up.
+      fn spawn_client(&self) -> thread::JoinHandle<()> {
+        #[cfg(unix)]
+        let target = self.path.clone();
+        #[cfg(windows)]
+        let target = self.addr;
+        thread::spawn(move || {
+          #[cfg(unix)]
+          drop(UnixStream::connect(&target).unwrap());
+          #[cfg(windows)]
+          drop(std::net::TcpStream::connect(target).unwrap());
+        })
+      }
+
+      /// Accepts one connection from another thread, then hangs up.
+      fn spawn_acceptor(&mut self) -> thread::JoinHandle<()> {
+        let listener = self.listener.take().expect("listener already taken");
+        thread::spawn(move || {
+          let (stream, _) = listener.accept().unwrap();
+          drop(stream);
+        })
+      }
+    }
+
+    #[cfg(unix)]
+    impl Drop for LocalListener {
+      fn drop(&mut self) {
+        fs::remove_file(&self.path).ok();
+      }
+    }
+
+    /// Opens a directory for `Op::ReadDir`.
+    fn open_dir(path: &std::path::Path) -> Resource {
+      #[cfg(unix)]
+      let dir = fs::File::open(path).unwrap();
+      #[cfg(windows)]
+      let dir = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Directories can only be opened with FILE_FLAG_BACKUP_SEMANTICS.
+        fs::OpenOptions::new()
+          .read(true)
+          .custom_flags(0x0200_0000)
+          .open(path)
+          .unwrap()
+      };
+      #[cfg(unix)]
+      return own_raw(dir.into_raw_fd() as isize);
+      #[cfg(windows)]
+      return own_raw(dir.into_raw_handle() as isize);
+    }
+
+    fn symlink_file(target: &std::path::Path, link: &std::path::Path) {
+      #[cfg(unix)]
+      std::os::unix::fs::symlink(target, link).unwrap();
+      #[cfg(windows)]
+      std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+
+    /// A spawn spec for a short-lived child that exits successfully.
+    fn success_spawn_spec() -> SpawnSpec {
+      #[cfg(unix)]
+      return SpawnSpec {
+        program: OsString::from("/bin/sh"),
+        args: vec![OsString::from("sh"), OsString::from("-c"), OsString::from("exit 0")],
+        env: None,
+      };
+      #[cfg(windows)]
+      return SpawnSpec {
+        program: OsString::from(r"C:\Windows\System32\cmd.exe"),
+        args: vec![OsString::from("cmd"), OsString::from("/C"), OsString::from("exit 0")],
+        env: None,
+      };
+    }
+
+    /// Waits for a spawned child so it does not linger.
+    fn reap_child(pid: isize) {
+      #[cfg(unix)]
+      // SAFETY: the pid comes from the backend and is waited on exactly once.
+      unsafe {
+        libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+      }
+      #[cfg(windows)]
+      let _ = pid;
+    }
+
     fn wait_for_single_completion(
       backend: &mut impl IoBackend,
     ) -> __lio_test_lio::backend::OpCompleted {
-      for _ in 0..20 {
+      // Generous deadline: returns as soon as a completion arrives.
+      for _ in 0..500 {
         let completed =
           wait_completions(backend, Some(Duration::from_millis(10)));
         if let Some(first) = completed.first() {
@@ -585,13 +809,15 @@ macro_rules! test_io_backend {
       panic!("backend did not produce a completion within the expected timeout");
     }
 
-    #[cfg(unix)]
     fn invalid_fd_resource() -> Resource {
-      // SAFETY: this intentionally uses an invalid fd to verify exact raw errno output.
-      unsafe { Resource::borrow(-1) }
+      #[cfg(unix)]
+      // SAFETY: this intentionally uses an invalid fd to verify raw errors.
+      return unsafe { Resource::borrow(-1) };
+      #[cfg(windows)]
+      // SAFETY: the null handle is never valid; it is borrowed, never closed.
+      return unsafe { Resource::borrow(std::ptr::null_mut()) };
     }
 
-    #[cfg(unix)]
     fn wait_for_positive_completion(
       backend: &mut impl IoBackend,
     ) -> __lio_test_lio::backend::OpCompleted {
@@ -602,6 +828,146 @@ macro_rules! test_io_backend {
         completed.result()
       );
       completed
+    }
+
+    mod pipe {
+      use super::*;
+      use std::io::Write;
+
+      /// An anonymous pipe as (`Resource` read end, std write end).
+      fn pipe() -> (Resource, std::io::PipeWriter) {
+        let (reader, writer) = std::io::pipe().expect("pipe() failed");
+        #[cfg(unix)]
+        let reader = own_raw(reader.into_raw_fd() as isize);
+        #[cfg(windows)]
+        let reader = own_raw(reader.into_raw_handle() as isize);
+        (reader, writer)
+      }
+
+      #[test]
+      fn read_without_data_does_not_block_the_loop() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let (reader, mut writer) = pipe();
+        let mut buf = [0_u8; 4];
+        let mut raw_buf = raw_buf_from_mut_slice(&mut buf);
+
+        push_op(&mut backend,
+          95,
+          Op::Read {
+            fd: reader.clone(),
+            iovecs: nonnull(&mut raw_buf),
+            iov_count: 1,
+            offset: -1,
+            flags: read_flags(0),
+          },
+        );
+
+        // Neither submitting nor polling may wait for the pipe.
+        let start = Instant::now();
+        backend.flush().unwrap();
+        let completed = wait_completions(&mut backend, Some(Duration::ZERO));
+        assert!(completed.is_empty(), "read on an empty pipe must stay pending");
+        assert!(
+          start.elapsed() < Duration::from_millis(500),
+          "flush/wait blocked on an empty pipe for {:?}",
+          start.elapsed()
+        );
+
+        writer.write_all(b"pipe").unwrap();
+        let completed = wait_for_single_completion(&mut backend);
+        assert_exact_result(&completed, 95, 4);
+        assert_eq!(&buf, b"pipe");
+      }
+    }
+
+    mod cancel {
+      use super::*;
+
+      /// Collects completions for a while, to check none arrive.
+      fn drain_for(
+        backend: &mut impl IoBackend,
+        period: Duration,
+      ) -> Vec<__lio_test_lio::backend::OpCompleted> {
+        let deadline = Instant::now() + period;
+        let mut all = Vec::new();
+        while Instant::now() < deadline {
+          all.extend(wait_completions(backend, Some(Duration::from_millis(10))));
+        }
+        all
+      }
+
+      #[test]
+      fn cancel_finishes_a_pending_recv_exactly_once() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let (read_res, write_res) = socket_pair();
+        let mut buf = [0_u8; 4];
+        let bufs = [MsgBufMut::from_slice(&mut buf)];
+        push_op(&mut backend,
+          97,
+          Op::Recv { fd: read_res.clone(), msg: MsgRecv::new(&bufs), flags: recv_flags(0) },
+        );
+        backend.flush().unwrap();
+        assert!(
+          wait_completions(&mut backend, Some(Duration::ZERO)).is_empty(),
+          "recv without data must stay pending"
+        );
+
+        backend.cancel(97);
+        let completed = wait_for_single_completion(&mut backend);
+        assert_eq!(completed.registration_id(), 97);
+        assert!(
+          completed.result() < 0,
+          "a cancelled recv reports an error, got {}",
+          completed.result()
+        );
+
+        // Data arriving afterwards belongs to no operation.
+        assert_eq!(send_payload(&write_res, b"late"), 4);
+        let extra = drain_for(&mut backend, Duration::from_millis(100));
+        assert!(extra.is_empty(), "cancelled op completed again: {extra:?}");
+        drop(bufs);
+        assert_eq!(buf, [0; 4], "a cancelled recv must not fill its buffer");
+      }
+
+      #[test]
+      fn cancel_before_flush_completes_the_op() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let (read_res, _write_res) = socket_pair();
+        let mut buf = [0_u8; 4];
+        let bufs = [MsgBufMut::from_slice(&mut buf)];
+        push_op(&mut backend,
+          98,
+          Op::Recv { fd: read_res.clone(), msg: MsgRecv::new(&bufs), flags: recv_flags(0) },
+        );
+        backend.cancel(98);
+        backend.flush().unwrap();
+
+        let completed = wait_for_single_completion(&mut backend);
+        assert_eq!(completed.registration_id(), 98);
+        assert!(completed.result() < 0, "got {}", completed.result());
+        let extra = drain_for(&mut backend, Duration::from_millis(50));
+        assert!(extra.is_empty(), "cancelled op completed again: {extra:?}");
+      }
+
+      #[test]
+      fn cancel_of_an_unknown_id_is_ignored() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        backend.cancel(12_345);
+        push_op(&mut backend, 99, Op::Nop);
+        backend.flush().unwrap();
+        let completed = wait_for_single_completion(&mut backend);
+        assert_exact_result(&completed, 99, 0);
+        let extra = drain_for(&mut backend, Duration::from_millis(50));
+        assert!(extra.is_empty(), "unexpected completions: {extra:?}");
+      }
     }
 
     mod nop {
@@ -627,10 +993,8 @@ macro_rules! test_io_backend {
       }
     }
 
-    #[cfg(unix)]
     mod read {
       use super::*;
-      use std::os::fd::AsRawFd;
 
       #[test]
       fn success_reports_raw_result_and_id() {
@@ -640,7 +1004,7 @@ macro_rules! test_io_backend {
         let (read_res, write_res) = socket_pair();
         let payload = *b"read";
         let mut buf = [0_u8; 4];
-        let wrote = send_payload(write_res.as_raw_fd(), &payload);
+        let wrote = send_payload(&write_res, &payload);
         assert_eq!(wrote, payload.len() as isize);
 
         let mut total = 0usize;
@@ -718,7 +1082,7 @@ macro_rules! test_io_backend {
           "read must remain pending across repeated zero-timeout waits"
         );
 
-        let wrote = send_payload(write_res.as_raw_fd(), &payload);
+        let wrote = send_payload(&write_res, &payload);
         assert_eq!(wrote, payload.len() as isize);
 
         let completed = wait_for_positive_completion(&mut backend);
@@ -791,7 +1155,7 @@ macro_rules! test_io_backend {
           "read without available data must remain pending"
         );
 
-        let wrote = send_payload(write_res.as_raw_fd(), &payload);
+        let wrote = send_payload(&write_res, &payload);
         assert_eq!(wrote, payload.len() as isize);
 
         let completed = wait_for_single_completion(&mut backend);
@@ -814,7 +1178,7 @@ macro_rules! test_io_backend {
 
         let (read_res, write_res) = socket_pair();
         let payload = *b"vector";
-        let wrote = send_payload(write_res.as_raw_fd(), &payload);
+        let wrote = send_payload(&write_res, &payload);
         assert_eq!(wrote, payload.len() as isize);
         let mut left = [0_u8; 3];
         let mut right = [0_u8; 3];
@@ -919,7 +1283,7 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 47, -(libc::EBADF as isize));
+        assert_exact_result(&completed, 47, expect::BADF);
       }
 
       #[test]
@@ -945,7 +1309,7 @@ macro_rules! test_io_backend {
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert_eq!(completed.len(), 1);
-        assert_exact_result(&completed[0], 69, -(libc::EINVAL as isize));
+        assert_exact_result(&completed[0], 69, expect::INVAL);
       }
 
       #[test]
@@ -971,15 +1335,13 @@ macro_rules! test_io_backend {
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert_eq!(completed.len(), 1);
-        assert_exact_result(&completed[0], 70, -(libc::ENOTSUP as isize));
+        assert_exact_result(&completed[0], 70, expect::NOTSUP);
       }
 
     }
 
-    #[cfg(unix)]
     mod write {
       use super::*;
-      use std::os::fd::AsRawFd;
 
       #[test]
       fn success_reports_raw_result_and_id() {
@@ -1028,18 +1390,7 @@ macro_rules! test_io_backend {
         assert_eq!(total, payload.len());
 
         let mut buf = [0_u8; 4];
-        // SAFETY: `read_res` is a live socket and `buf` is a valid writable
-        // buffer for this synchronous recv used by the test.
-        // SAFETY: `read_res` is a live socket and `buf` is a valid writable
-        // buffer for this synchronous recv used by the test.
-        let n = unsafe {
-          libc::recv(
-            read_res.as_raw_fd(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            0,
-          )
-        };
+        let n = recv_payload(&read_res, &mut buf);
         assert_eq!(n, payload.len() as isize);
         assert_eq!(&buf, &payload);
       }
@@ -1085,18 +1436,7 @@ macro_rules! test_io_backend {
         assert_eq!(total, 6);
 
         let mut buf = [0_u8; 6];
-        // SAFETY: `read_res` is a live socket and `buf` is a valid writable
-        // buffer for this synchronous recv used by the test.
-        // SAFETY: `read_res` is a live socket and `buf` is a valid writable
-        // buffer for this synchronous recv used by the test.
-        let n = unsafe {
-          libc::recv(
-            read_res.as_raw_fd(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            0,
-          )
-        };
+        let n = recv_payload(&read_res, &mut buf);
         assert_eq!(n, 6);
         assert_eq!(&buf, b"vector");
       }
@@ -1124,7 +1464,7 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 48, -(libc::EBADF as isize));
+        assert_exact_result(&completed, 48, expect::BADF);
       }
 
       #[test]
@@ -1151,7 +1491,7 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 72, -(libc::EINVAL as isize));
+        assert_exact_result(&completed, 72, expect::INVAL);
       }
 
       #[test]
@@ -1178,15 +1518,13 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 73, -(libc::ENOTSUP as isize));
+        assert_exact_result(&completed, 73, expect::NOTSUP);
       }
 
     }
 
-    #[cfg(unix)]
     mod recv {
       use super::*;
-      use std::os::fd::AsRawFd;
 
       #[test]
       fn success_reports_raw_result_and_id() {
@@ -1195,7 +1533,7 @@ macro_rules! test_io_backend {
 
         let (read_res, write_res) = socket_pair();
         let payload = *b"pong";
-        let wrote = send_payload(write_res.as_raw_fd(), &payload);
+        let wrote = send_payload(&write_res, &payload);
         assert_eq!(wrote, payload.len() as isize);
 
         let mut buf = [0_u8; 4];
@@ -1257,7 +1595,7 @@ macro_rules! test_io_backend {
           "recv must remain pending across repeated zero-timeout waits"
         );
 
-        let wrote = send_payload(write_res.as_raw_fd(), &payload);
+        let wrote = send_payload(&write_res, &payload);
         assert_eq!(wrote, payload.len() as isize);
 
         let completed = wait_for_positive_completion(&mut backend);
@@ -1315,7 +1653,7 @@ macro_rules! test_io_backend {
           "recv without available data must remain pending"
         );
 
-        let wrote = send_payload(write_res.as_raw_fd(), &payload);
+        let wrote = send_payload(&write_res, &payload);
         assert_eq!(wrote, payload.len() as isize);
 
         let completed = wait_for_single_completion(&mut backend);
@@ -1338,7 +1676,7 @@ macro_rules! test_io_backend {
 
         let (read_res, write_res) = socket_pair();
         let payload = *b"vector";
-        let wrote = send_payload(write_res.as_raw_fd(), &payload);
+        let wrote = send_payload(&write_res, &payload);
         assert_eq!(wrote, payload.len() as isize);
 
         let mut left = [0_u8; 3];
@@ -1419,14 +1757,12 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 49, -(libc::EBADF as isize));
+        assert_exact_result(&completed, 49, expect::BADF_SOCKET);
       }
     }
 
-    #[cfg(unix)]
     mod send {
       use super::*;
-      use std::os::fd::AsRawFd;
 
       #[test]
       fn success_reports_raw_result_and_id() {
@@ -1461,16 +1797,7 @@ macro_rules! test_io_backend {
         assert_eq!(total, payload.len());
 
         let mut buf = [0_u8; 4];
-        // SAFETY: `read_res` is a live socket and `buf` is a valid writable
-        // buffer for this synchronous recv used by the test.
-        let n = unsafe {
-          libc::recv(
-            read_res.as_raw_fd(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            0,
-          )
-        };
+        let n = recv_payload(&read_res, &mut buf);
         assert_eq!(n, payload.len() as isize);
         assert_eq!(&buf, &payload);
       }
@@ -1514,16 +1841,7 @@ macro_rules! test_io_backend {
         assert_eq!(total, 6);
 
         let mut buf = [0_u8; 6];
-        // SAFETY: `read_res` is a live socket and `buf` is a valid writable
-        // buffer for this synchronous recv used by the test.
-        let n = unsafe {
-          libc::recv(
-            read_res.as_raw_fd(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            0,
-          )
-        };
+        let n = recv_payload(&read_res, &mut buf);
         assert_eq!(n, 6);
         assert_eq!(&buf, b"vector");
       }
@@ -1547,11 +1865,10 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 50, -(libc::EBADF as isize));
+        assert_exact_result(&completed, 50, expect::BADF_SOCKET);
       }
     }
 
-    #[cfg(unix)]
     mod accept {
       use super::*;
 
@@ -1560,14 +1877,8 @@ macro_rules! test_io_backend {
         let mut backend = new_backend();
         backend.init(64).unwrap();
 
-        let path = unix_socket_path("accept-ok");
-        fs::remove_file(&path).ok();
-        let listener = UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let listener_fd = listener.into_raw_fd();
-        // SAFETY: `listener_fd` comes from `into_raw_fd`, so ownership is
-        // transferred to `Resource`.
-        let listener_res = unsafe { Resource::from_raw_fd(listener_fd) };
+        let mut listener = LocalListener::new("accept-ok");
+        let listener_res = listener.resource();
 
         let mut storage = __lio_test_lio::backend::op::SocketAddrBuf::unspecified();
 
@@ -1580,11 +1891,7 @@ macro_rules! test_io_backend {
         );
         backend.flush().unwrap();
 
-        let path_clone = path.clone();
-        let client = thread::spawn(move || {
-          let stream = UnixStream::connect(&path_clone).unwrap();
-          drop(stream);
-        });
+        let client = listener.spawn_client();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_eq!(completed.registration_id(), 52);
@@ -1595,12 +1902,7 @@ macro_rules! test_io_backend {
         );
 
         client.join().unwrap();
-        // SAFETY: the accepted fd is returned by the backend as a fresh owned
-        // descriptor and is closed exactly once here.
-        unsafe {
-          libc::close(completed.result() as libc::c_int);
-        }
-        fs::remove_file(&path).ok();
+        close_raw(completed.result());
       }
 
       #[test]
@@ -1608,14 +1910,8 @@ macro_rules! test_io_backend {
         let mut backend = new_backend();
         backend.init(64).unwrap();
 
-        let path = unix_socket_path("accept-pending");
-        fs::remove_file(&path).ok();
-        let listener = UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let listener_fd = listener.into_raw_fd();
-        // SAFETY: `listener_fd` comes from `into_raw_fd`, so ownership is
-        // transferred to `Resource`.
-        let listener_res = unsafe { Resource::from_raw_fd(listener_fd) };
+        let mut listener = LocalListener::new("accept-pending");
+        let listener_res = listener.resource();
 
         let mut storage = __lio_test_lio::backend::op::SocketAddrBuf::unspecified();
 
@@ -1634,11 +1930,7 @@ macro_rules! test_io_backend {
           "accept without a pending client must remain pending"
         );
 
-        let path_clone = path.clone();
-        let client = thread::spawn(move || {
-          let stream = UnixStream::connect(&path_clone).unwrap();
-          drop(stream);
-        });
+        let client = listener.spawn_client();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_eq!(completed.registration_id(), 58);
@@ -1649,12 +1941,7 @@ macro_rules! test_io_backend {
         );
 
         client.join().unwrap();
-        // SAFETY: the accepted fd is returned by the backend as a fresh owned
-        // descriptor and is closed exactly once here.
-        unsafe {
-          libc::close(completed.result() as libc::c_int);
-        }
-        fs::remove_file(&path).ok();
+        close_raw(completed.result());
       }
 
       #[test]
@@ -1674,11 +1961,10 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 51, -(libc::EBADF as isize));
+        assert_exact_result(&completed, 51, expect::BADF_SOCKET);
       }
     }
 
-    #[cfg(unix)]
     mod connect {
       use super::*;
 
@@ -1690,16 +1976,7 @@ macro_rules! test_io_backend {
         let path = unix_socket_path("connect");
         fs::remove_file(&path).ok();
 
-        // SAFETY: `socket` returns a fresh fd which this test immediately owns
-        // and configures before wrapping into `Resource`.
-        let client_fd = unsafe {
-          let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-          assert!(fd >= 0, "socket() failed: {}", std::io::Error::last_os_error());
-          set_nonblocking(fd);
-          fd
-        };
-        // SAFETY: `client_fd` is a fresh owned fd returned by `socket`.
-        let client_res = unsafe { Resource::from_raw_fd(client_fd) };
+        let client_res = unix_stream_socket();
         let storage = unix_sockaddr_un(&path);
 
         push_op(&mut backend,
@@ -1713,7 +1990,7 @@ macro_rules! test_io_backend {
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert_eq!(completed.len(), 1);
-        assert_exact_result(&completed[0], 46, -(libc::ENOENT as isize));
+        assert_exact_result(&completed[0], 46, expect::CONNECT_MISSING);
       }
 
       #[test]
@@ -1721,26 +1998,10 @@ macro_rules! test_io_backend {
         let mut backend = new_backend();
         backend.init(64).unwrap();
 
-        let path = unix_socket_path("connect-ok");
-        fs::remove_file(&path).ok();
-        let listener = UnixListener::bind(&path).unwrap();
-
-        let acceptor = thread::spawn(move || {
-          let (stream, _) = listener.accept().unwrap();
-          drop(stream);
-        });
-
-        // SAFETY: `socket` returns a fresh fd which this test immediately owns
-        // and configures before wrapping into `Resource`.
-        let client_fd = unsafe {
-          let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-          assert!(fd >= 0, "socket() failed: {}", std::io::Error::last_os_error());
-          set_nonblocking(fd);
-          fd
-        };
-        // SAFETY: `client_fd` is a fresh owned fd returned by `socket`.
-        let client_res = unsafe { Resource::from_raw_fd(client_fd) };
-        let storage = unix_sockaddr_un(&path);
+        let mut listener = LocalListener::new("connect-ok");
+        let acceptor = listener.spawn_acceptor();
+        let client_res = listener.client_socket();
+        let storage = listener.addr();
 
         push_op(&mut backend,
           53,
@@ -1755,7 +2016,6 @@ macro_rules! test_io_backend {
         assert_exact_result(&completed, 53, 0);
 
         acceptor.join().unwrap();
-        fs::remove_file(&path).ok();
       }
 
       #[test]
@@ -1776,7 +2036,7 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 59, -(libc::EBADF as isize));
+        assert_exact_result(&completed, 59, expect::BADF_SOCKET);
       }
 
       #[test]
@@ -1787,16 +2047,7 @@ macro_rules! test_io_backend {
         let path = unix_socket_path("connect-immediate");
         fs::remove_file(&path).ok();
 
-        // SAFETY: `socket` returns a fresh fd which this test immediately owns
-        // and configures before wrapping into `Resource`.
-        let client_fd = unsafe {
-          let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-          assert!(fd >= 0, "socket() failed: {}", std::io::Error::last_os_error());
-          set_nonblocking(fd);
-          fd
-        };
-        // SAFETY: `client_fd` is a fresh owned fd returned by `socket`.
-        let client_res = unsafe { Resource::from_raw_fd(client_fd) };
+        let client_res = unix_stream_socket();
         let storage = unix_sockaddr_un(&path);
 
         push_op(&mut backend,
@@ -1810,11 +2061,10 @@ macro_rules! test_io_backend {
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert_eq!(completed.len(), 1);
-        assert_exact_result(&completed[0], 63, -(libc::ENOENT as isize));
+        assert_exact_result(&completed[0], 63, expect::CONNECT_MISSING);
       }
     }
 
-    #[cfg(unix)]
     mod socket {
       use super::*;
 
@@ -1840,11 +2090,7 @@ macro_rules! test_io_backend {
           "socket must succeed with a nonnegative fd, got {}",
           completed.result()
         );
-        // SAFETY: the created socket fd is returned by the backend as a fresh
-        // owned descriptor and is closed exactly once here.
-        unsafe {
-          libc::close(completed.result() as RawFd);
-        }
+        close_raw(completed.result());
       }
 
       #[test]
@@ -1863,11 +2109,10 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 79, -(libc::EINVAL as isize));
+        assert_exact_result(&completed, 79, expect::INVAL_SOCKET);
       }
     }
 
-    #[cfg(unix)]
     mod openat {
       use super::*;
 
@@ -1878,15 +2123,13 @@ macro_rules! test_io_backend {
 
         let path = temp_path("openat-ok");
         fs::write(&path, b"hello").unwrap();
-        let c_path =
-          std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
 
         push_op(&mut backend,
           80,
           Op::OpenAt {
             dir_fd: Resource::cwd(),
             path: path.as_os_str().to_os_string(),
-            flags: OpenFlags::from_bits(libc::O_RDONLY),
+            flags: OpenFlags::READ,
             mode: FileMode::from_bits(0),
           },
         );
@@ -1899,11 +2142,7 @@ macro_rules! test_io_backend {
           "openat must succeed with a nonnegative fd, got {}",
           completed.result()
         );
-        // SAFETY: the opened fd is returned by the backend as a fresh owned
-        // descriptor and is closed exactly once here.
-        unsafe {
-          libc::close(completed.result() as RawFd);
-        }
+        close_raw(completed.result());
         fs::remove_file(path).ok();
       }
 
@@ -1913,26 +2152,23 @@ macro_rules! test_io_backend {
         backend.init(64).unwrap();
 
         let path = temp_path("openat-missing");
-        let c_path =
-          std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
 
         push_op(&mut backend,
           81,
           Op::OpenAt {
             dir_fd: Resource::cwd(),
             path: path.as_os_str().to_os_string(),
-            flags: OpenFlags::from_bits(libc::O_RDONLY),
+            flags: OpenFlags::READ,
             mode: FileMode::from_bits(0),
           },
         );
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 81, -(libc::ENOENT as isize));
+        assert_exact_result(&completed, 81, expect::NOENT);
       }
     }
 
-    #[cfg(unix)]
     mod stat {
       use super::*;
 
@@ -1943,8 +2179,6 @@ macro_rules! test_io_backend {
 
         let path = temp_path("stat-ok");
         fs::write(&path, b"hello").unwrap();
-        let c_path =
-          std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         let mut out = FileStat::zeroed();
 
         push_op(&mut backend,
@@ -1973,8 +2207,6 @@ macro_rules! test_io_backend {
         backend.init(64).unwrap();
 
         let path = temp_path("stat-missing");
-        let c_path =
-          std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         let mut out = FileStat::zeroed();
 
         push_op(&mut backend,
@@ -1991,7 +2223,7 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 83, -(libc::ENOENT as isize));
+        assert_exact_result(&completed, 83, expect::NOENT);
       }
 
       #[test]
@@ -2002,9 +2234,7 @@ macro_rules! test_io_backend {
         let target = temp_path("stat-target");
         let link = temp_path("stat-link");
         fs::write(&target, b"hello").unwrap();
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        let c_path =
-          std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+        symlink_file(&target, &link);
         let mut out = FileStat::zeroed();
 
         push_op(&mut backend,
@@ -2028,7 +2258,6 @@ macro_rules! test_io_backend {
       }
     }
 
-    #[cfg(unix)]
     mod readdir {
       use super::*;
 
@@ -2042,18 +2271,7 @@ macro_rules! test_io_backend {
         fs::write(dir.join("file.txt"), b"hello").unwrap();
         fs::create_dir(dir.join("nested")).unwrap();
 
-        // SAFETY: `open` returns a fresh owned directory fd which is wrapped
-        // immediately into `Resource` for RAII management in the test.
-        let dir_fd = unsafe {
-          Resource::from_raw_fd(
-            libc::open(
-              std::ffi::CString::new(dir.as_os_str().as_bytes())
-                .unwrap()
-                .as_ptr(),
-              libc::O_RDONLY | libc::O_DIRECTORY,
-            ),
-          )
-        };
+        let dir_fd = open_dir(&dir);
         let mut raw = vec![0u8; 4096];
         let mut out =
           vec![__lio_test_lio::backend::op::DirEntryRef::default(); 32];
@@ -2110,7 +2328,6 @@ macro_rules! test_io_backend {
       }
     }
 
-    #[cfg(unix)]
     mod unlinkat {
       use super::*;
 
@@ -2121,8 +2338,6 @@ macro_rules! test_io_backend {
 
         let path = temp_path("unlinkat-ok");
         fs::write(&path, b"hello").unwrap();
-        let c_path =
-          std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
 
         push_op(&mut backend,
           70,
@@ -2145,8 +2360,6 @@ macro_rules! test_io_backend {
         backend.init(64).unwrap();
 
         let path = temp_path("unlinkat-missing");
-        let c_path =
-          std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
 
         push_op(&mut backend,
           71,
@@ -2159,11 +2372,10 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 71, -(libc::ENOENT as isize));
+        assert_exact_result(&completed, 71, expect::NOENT);
       }
     }
 
-    #[cfg(unix)]
     mod renameat {
       use super::*;
 
@@ -2176,10 +2388,6 @@ macro_rules! test_io_backend {
         let dest = temp_path("renameat-dest");
         fs::write(&source, b"hello").unwrap();
         fs::remove_file(&dest).ok();
-        let c_source =
-          std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
-        let c_dest =
-          std::ffi::CString::new(dest.as_os_str().as_bytes()).unwrap();
 
         push_op(&mut backend,
           72,
@@ -2207,10 +2415,6 @@ macro_rules! test_io_backend {
         let source = temp_path("renameat-missing");
         let dest = temp_path("renameat-target");
         fs::remove_file(&dest).ok();
-        let c_source =
-          std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
-        let c_dest =
-          std::ffi::CString::new(dest.as_os_str().as_bytes()).unwrap();
 
         push_op(&mut backend,
           73,
@@ -2224,11 +2428,10 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 73, -(libc::ENOENT as isize));
+        assert_exact_result(&completed, 73, expect::NOENT);
       }
     }
 
-    #[cfg(unix)]
     mod mkdirat {
       use super::*;
 
@@ -2239,8 +2442,6 @@ macro_rules! test_io_backend {
 
         let path = temp_path("mkdirat-ok");
         fs::remove_dir(&path).ok();
-        let c_path =
-          std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
 
         push_op(&mut backend,
           74,
@@ -2265,8 +2466,6 @@ macro_rules! test_io_backend {
 
         let path = temp_path("mkdirat-exists");
         fs::create_dir(&path).unwrap();
-        let c_path =
-          std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
 
         push_op(&mut backend,
           75,
@@ -2279,12 +2478,11 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 75, -(libc::EEXIST as isize));
+        assert_exact_result(&completed, 75, expect::EXIST);
         fs::remove_dir(path).ok();
       }
     }
 
-    #[cfg(unix)]
     mod linkat {
       use super::*;
 
@@ -2297,10 +2495,6 @@ macro_rules! test_io_backend {
         let dest = temp_path("linkat-hard-dest");
         fs::write(&source, b"hello").unwrap();
         fs::remove_file(&dest).ok();
-        let c_source =
-          std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
-        let c_dest =
-          std::ffi::CString::new(dest.as_os_str().as_bytes()).unwrap();
 
         push_op(&mut backend,
           76,
@@ -2330,10 +2524,6 @@ macro_rules! test_io_backend {
         let dest = temp_path("linkat-soft-dest");
         fs::write(&source, b"hello").unwrap();
         fs::remove_file(&dest).ok();
-        let c_source =
-          std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
-        let c_dest =
-          std::ffi::CString::new(dest.as_os_str().as_bytes()).unwrap();
 
         push_op(&mut backend,
           77,
@@ -2365,10 +2555,6 @@ macro_rules! test_io_backend {
         let source = temp_path("linkat-missing-source");
         let dest = temp_path("linkat-missing-dest");
         fs::remove_file(&dest).ok();
-        let c_source =
-          std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
-        let c_dest =
-          std::ffi::CString::new(dest.as_os_str().as_bytes()).unwrap();
 
         push_op(&mut backend,
           78,
@@ -2383,11 +2569,10 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 78, -(libc::ENOENT as isize));
+        assert_exact_result(&completed, 78, expect::NOENT);
       }
     }
 
-    #[cfg(unix)]
     mod readlinkat {
       use super::*;
 
@@ -2399,9 +2584,7 @@ macro_rules! test_io_backend {
         let target = temp_path("readlinkat-target");
         let link = temp_path("readlinkat-link");
         fs::write(&target, b"hello").unwrap();
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        let c_link =
-          std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+        symlink_file(&target, &link);
         let mut buf = [0_u8; 512];
 
         push_op(&mut backend,
@@ -2416,10 +2599,10 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 79, target.as_os_str().as_bytes().len() as isize);
+        assert_exact_result(&completed, 79, target.as_os_str().as_encoded_bytes().len() as isize);
         assert_eq!(
-          &buf[..target.as_os_str().as_bytes().len()],
-          target.as_os_str().as_bytes()
+          &buf[..target.as_os_str().as_encoded_bytes().len()],
+          target.as_os_str().as_encoded_bytes()
         );
 
         fs::remove_file(link).ok();
@@ -2432,8 +2615,6 @@ macro_rules! test_io_backend {
         backend.init(64).unwrap();
 
         let link = temp_path("readlinkat-missing");
-        let c_link =
-          std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
         let mut buf = [0_u8; 64];
 
         push_op(&mut backend,
@@ -2448,11 +2629,10 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 80, -(libc::ENOENT as isize));
+        assert_exact_result(&completed, 80, expect::NOENT);
       }
     }
 
-    #[cfg(unix)]
     mod getcwd {
       use super::*;
 
@@ -2489,7 +2669,6 @@ macro_rules! test_io_backend {
       }
     }
 
-    #[cfg(unix)]
     mod spawn {
       use super::*;
 
@@ -2500,28 +2679,14 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           83,
-          Op::Spawn {
-            spec: SpawnSpec {
-              program: OsString::from("/bin/sh"),
-              args: vec![
-                OsString::from("sh"),
-                OsString::from("-c"),
-                OsString::from("exit 0"),
-              ],
-              env: None,
-            },
-          },
+          Op::Spawn { spec: success_spawn_spec() },
         );
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_eq!(completed.registration_id(), 83);
         assert!(completed.result() > 0, "spawn should return a positive pid");
-        // SAFETY: the child pid returned by the backend is waited on exactly
-        // once here to avoid leaving a zombie process in the test.
-        unsafe {
-          libc::waitpid(completed.result() as libc::pid_t, std::ptr::null_mut(), 0);
-        }
+        reap_child(completed.result());
       }
 
       #[test]
@@ -2542,11 +2707,10 @@ macro_rules! test_io_backend {
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 84, -(libc::ENOENT as isize));
+        assert_exact_result(&completed, 84, expect::SPAWN_MISSING);
       }
     }
 
-    #[cfg(unix)]
     mod batching {
       use super::*;
 
@@ -2585,8 +2749,8 @@ macro_rules! test_io_backend {
         completed.sort_by_key(|item| item.registration_id());
 
         assert_eq!(completed.len(), 2);
-        assert_exact_result(&completed[0], 60, -(libc::EBADF as isize));
-        assert_exact_result(&completed[1], 61, -(libc::EBADF as isize));
+        assert_exact_result(&completed[0], 60, expect::BADF_SOCKET);
+        assert_exact_result(&completed[1], 61, expect::BADF);
       }
 
       #[test]
@@ -2608,7 +2772,7 @@ macro_rules! test_io_backend {
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert_eq!(completed.len(), 1);
-        assert_exact_result(&completed[0], 62, -(libc::EBADF as isize));
+        assert_exact_result(&completed[0], 62, expect::BADF_SOCKET);
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert!(
@@ -2637,7 +2801,7 @@ macro_rules! test_io_backend {
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert_eq!(completed.len(), 1);
-        assert_exact_result(&completed[0], 63, -(libc::EBADF as isize));
+        assert_exact_result(&completed[0], 63, expect::BADF_SOCKET);
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert!(
@@ -2665,7 +2829,7 @@ macro_rules! test_io_backend {
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert_eq!(completed.len(), 1);
-        assert_exact_result(&completed[0], 64, -(libc::EBADF as isize));
+        assert_exact_result(&completed[0], 64, expect::BADF_SOCKET);
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert!(
@@ -2676,7 +2840,6 @@ macro_rules! test_io_backend {
 
       #[test]
       fn mixed_pending_batch_completes_each_registration_exactly_once() {
-        use std::os::fd::AsRawFd;
 
         let mut backend = new_backend();
         backend.init(64).unwrap();
@@ -2721,26 +2884,8 @@ macro_rules! test_io_backend {
           "pending reads must not complete before data arrives"
         );
 
-        // SAFETY: `write_a` is a valid socket and `payload_a` lives for the
-        // duration of this synchronous send.
-        let wrote_a = unsafe {
-          libc::send(
-            write_a.as_raw_fd(),
-            payload_a.as_ptr().cast(),
-            payload_a.len(),
-            0,
-          )
-        };
-        // SAFETY: `write_b` is a valid socket and `payload_b` lives for the
-        // duration of this synchronous send.
-        let wrote_b = unsafe {
-          libc::send(
-            write_b.as_raw_fd(),
-            payload_b.as_ptr().cast(),
-            payload_b.len(),
-            0,
-          )
-        };
+        let wrote_a = send_payload(&write_a, &payload_a);
+        let wrote_b = send_payload(&write_b, &payload_b);
         assert_eq!(wrote_a, payload_a.len() as isize);
         assert_eq!(wrote_b, payload_b.len() as isize);
 
@@ -2920,86 +3065,6 @@ macro_rules! test_op_model_contract {
               "stream model contract must produce at least one Yield or Done"
             );
           }
-        }
-      }
-    }
-  };
-}
-
-pub mod serial_op_contract {
-  /// One scripted contract step for a serial `OpModel`.
-  pub struct ContractStep<M: OpModelContract> {
-    pub assert_op: fn(&M::Op) -> bool,
-    pub before_complete: fn(&mut M),
-    pub completion: M::Completion,
-    pub assert_result: fn(&M::Result) -> bool,
-  }
-
-  impl<M: OpModelContract> ContractStep<M> {
-    pub fn new(
-      assert_op: fn(&M::Op) -> bool,
-      completion: M::Completion,
-      assert_result: fn(&M::Result) -> bool,
-    ) -> Self {
-      Self { assert_op, before_complete: |_| {}, completion, assert_result }
-    }
-
-    pub fn with_setup(
-      assert_op: fn(&M::Op) -> bool,
-      before_complete: fn(&mut M),
-      completion: M::Completion,
-      assert_result: fn(&M::Result) -> bool,
-    ) -> Self {
-      Self { assert_op, before_complete, completion, assert_result }
-    }
-  }
-
-  /// Test fixture for generating serial `OpModel` contract tests per type.
-  pub trait OpModelContract: Sized {
-    type Op;
-    type Completion;
-    type Result;
-
-    fn contract_model() -> Self;
-    fn contract_steps() -> Vec<ContractStep<Self>>;
-  }
-}
-
-/// Shared contract tests for serial `OpModel` illustrations described through
-/// [`lio_test::serial_op_contract::OpModelContract`].
-#[macro_export]
-macro_rules! test_serial_op_model_contract {
-  ($model_ty:ty) => {
-    lio_test::test_serial_op_model_contract!(lio, $model_ty);
-  };
-  ($lio:ident, $model_ty:ty) => {
-    mod op_model_contract {
-      use super::*;
-      use lio_test::serial_op_contract::OpModelContract;
-      use $lio::api::op_contract::OpModel as LioTestOpModel;
-
-      #[test]
-      fn scripted_contract() {
-        let mut model = <$model_ty as OpModelContract>::contract_model();
-        let steps = <$model_ty as OpModelContract>::contract_steps();
-        assert!(!steps.is_empty(), "contract script must not be empty");
-
-        for step in steps {
-          let op = <$model_ty as LioTestOpModel>::op(&mut model);
-          assert!(
-            (step.assert_op)(&op),
-            "op() did not satisfy the model contract: {:?}",
-            op
-          );
-          (step.before_complete)(&mut model);
-          let result = <$model_ty as LioTestOpModel>::complete(
-            &mut model,
-            step.completion,
-          );
-          assert!(
-            (step.assert_result)(&result),
-            "complete() did not satisfy the model contract"
-          );
         }
       }
     }

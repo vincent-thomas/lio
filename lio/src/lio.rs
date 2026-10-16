@@ -1,24 +1,24 @@
 use crate::{
   api::op::{Action, Completion},
-  backend::{IoBackend, OpCompleted, store::OpStore},
+  backend::{
+    IoBackend, OpCompleted,
+    store::{Detached, OpStore},
+  },
   registration::Registration,
   time::TimeManager,
 };
 
 use std::{
-  cell::RefCell,
+  cell::{RefCell, RefMut},
+  collections::VecDeque,
   io,
-  rc::Rc,
+  mem::ManuallyDrop,
+  rc::{Rc, Weak},
   task::Waker,
   time::{Duration, Instant},
 };
 
 use bumpalo::Bump;
-
-/// Result code returned to userspace when a sleep timer fires.
-/// Always `0` — the driver normalizes timer expiry before routing
-/// to models, so models never need to interpret OS-specific errno values.
-const SLEEP_RESULT: isize = 0;
 
 thread_local! {
   static GLOBAL_LIO: RefCell<Option<Lio>> = const { RefCell::new(None) };
@@ -26,17 +26,32 @@ thread_local! {
 
 /// Guard returned by [`install_global`].
 ///
-/// Dropping the guard uninstalls the thread-local global [`Lio`].
+/// Dropping the guard uninstalls the thread-local global [`Lio`] it
+/// installed. If that one was already uninstalled, and possibly replaced by
+/// another, the guard leaves the global alone.
 #[must_use = "Dropping the guard immediately uninstalls the global Lio"]
 pub struct GlobalLioGuard {
-  installed: bool,
+  /// The driver this guard installed, without keeping it alive.
+  installed: Weak<RefCell<LioInner>>,
 }
 
 impl Drop for GlobalLioGuard {
   fn drop(&mut self) {
-    if self.installed {
-      let _ = uninstall_global();
-    }
+    // The thread-local may already be gone if this runs during thread exit.
+    let ours = GLOBAL_LIO.try_with(|global| {
+      let mut global = global.borrow_mut();
+      let installed = &self.installed;
+      if global.as_ref().is_some_and(|lio| {
+        std::ptr::eq(Rc::as_ptr(&lio.inner), installed.as_ptr())
+      }) {
+        global.take()
+      } else {
+        None
+      }
+    });
+    // Dropped outside the thread-local's borrow: if this was the last
+    // handle, tearing the driver down runs user code that may look it up.
+    drop(ours);
   }
 }
 
@@ -58,9 +73,10 @@ pub fn install_global(lio: Lio) -> GlobalLioGuard {
         "Global Lio already installed on this thread. Drop the existing GlobalLioGuard or call uninstall_global() first."
       );
     }
+    let installed = Rc::downgrade(&lio.inner);
     *global = Some(lio);
-  });
-  GlobalLioGuard { installed: true }
+    GlobalLioGuard { installed }
+  })
 }
 
 /// Uninstalls the global Lio instance for the current thread.
@@ -78,14 +94,37 @@ pub(crate) fn get_global() -> Option<Lio> {
 }
 
 struct LioInner {
-  store: OpStore,
-  io: Box<dyn IoBackend>,
+  // Dropped by hand in `Drop`: the backend must drain in-flight work before
+  // `store` frees the memory that work points into, and both are leaked
+  // when it cannot.
+  io: ManuallyDrop<Box<dyn IoBackend>>,
+  store: ManuallyDrop<OpStore>,
+  /// The backend's close for resources its completions carry.
+  resource_close: crate::api::resource::CloseFn,
   time: TimeManager,
-  // Reused scratch vectors for `run_inner`.
+  /// Reused buffer the backend reports completions into.
   completed: Vec<OpCompleted>,
-  expired_timers: Vec<u64>,
+  /// Completions and expired timers waiting to be routed, in order.
+  ///
+  /// They live here rather than in the run that collected them so that a
+  /// nested run (from a handler) routes the rest instead of waiting on the
+  /// backend, and so that what a panicking handler left behind is simply
+  /// still queued for the next run.
+  ready_io: VecDeque<OpCompleted>,
+  ready_timers: VecDeque<u64>,
+  /// Registrations removed while the driver was borrowed, to be dropped
+  /// once it is not (see [`Lio::bury`]). Their slots stay reserved until then.
+  dying: Vec<Detached>,
+  /// Submissions made while every slot was taken, scheduled in order as
+  /// slots free up. Only allocates when the driver is over capacity.
+  overflow: VecDeque<PendingSubmission>,
+  /// Futures waiting for a free slot.
+  capacity_waiters: Vec<Waker>,
   profile: Option<LioProfile>,
 }
+
+/// A registration to build once a slot is free.
+type PendingSubmission = Box<dyn FnOnce(&mut Bump) -> Registration>;
 
 #[derive(Debug, Default)]
 struct LioProfile {
@@ -108,8 +147,59 @@ struct LioProfile {
   remove_time: Duration,
 }
 
+impl LioProfile {
+  fn merge(&mut self, run: &LioProfile) {
+    self.run_inner_calls += 1;
+    self.completions_returned += run.completions_returned;
+    self.stale_completions += run.stale_completions;
+    self.timer_expirations += run.timer_expirations;
+    self.dispatch_count += run.dispatch_count;
+    self.remove_count += run.remove_count;
+    self.flush_time += run.flush_time;
+    self.next_deadline_time += run.next_deadline_time;
+    self.wait_time += run.wait_time;
+    self.completion_loop_time += run.completion_loop_time;
+    self.completion_store_lookup_time += run.completion_store_lookup_time;
+    self.completion_on_completion_time += run.completion_on_completion_time;
+    self.completion_is_finished_time += run.completion_is_finished_time;
+    self.timer_poll_time += run.timer_poll_time;
+    self.timer_loop_time += run.timer_loop_time;
+    self.dispatch_time += run.dispatch_time;
+    self.remove_time += run.remove_time;
+  }
+}
+
+/// Times `$body` into `$stats.$field` when `$profile` (a const) is set.
+macro_rules! timed {
+  ($profile:expr, $stats:expr, $field:ident, $body:expr) => {{
+    if $profile {
+      let started = Instant::now();
+      let value = $body;
+      $stats.$field += started.elapsed();
+      value
+    } else {
+      $body
+    }
+  }};
+}
+
 impl Drop for LioInner {
   fn drop(&mut self) {
+    // They point into the store's arenas, so they go before it.
+    drop(std::mem::take(&mut self.dying));
+    if self.io.drain() {
+      // SAFETY: neither field is used again. The backend goes first: it may
+      // still hold `Op`s pointing into the store.
+      unsafe {
+        ManuallyDrop::drop(&mut self.io);
+        ManuallyDrop::drop(&mut self.store);
+      }
+    }
+    // Otherwise an operation may still be running in the kernel or on a
+    // backend thread, writing into buffers and lowered state owned by the
+    // store. Leaking both keeps that memory valid, and keeps the backend
+    // from waiting again in its own `Drop`.
+
     let Some(profile) = &self.profile else {
       return;
     };
@@ -172,7 +262,17 @@ impl Lio {
   ///
   /// # Arguments
   ///
-  /// * `cap` - The maximum number of concurrent operations
+  /// * `cap` - The number of operations that can be in flight at once
+  ///
+  /// All memory for `cap` operations is reserved up front, so a driver sized
+  /// for its peak load does not allocate per operation. Beyond `cap`, futures
+  /// wait for a free slot, while [`Io::when_done`](crate::api::Io::when_done)
+  /// and [`Io::send`](crate::api::Io::send) queue the operation, which
+  /// allocates; see [`Lio::is_full`].
+  ///
+  /// # Errors
+  ///
+  /// As for [`Lio::new_with_backend`]; in particular `cap` must not be zero.
   ///
   /// # Example
   ///
@@ -183,25 +283,7 @@ impl Lio {
   /// ```
   #[cfg(feature = "backend_impls")]
   pub fn new(cap: usize) -> io::Result<Self> {
-    #[cfg(any(
-      target_os = "macos",
-      target_os = "ios",
-      target_os = "tvos",
-      target_os = "watchos",
-      target_os = "freebsd",
-      target_os = "dragonfly",
-      target_os = "openbsd",
-      target_os = "netbsd"
-    ))]
-    {
-      use crate::backend::impls::Poller;
-      Self::new_with_backend(Poller::new(), cap)
-    }
-    #[cfg(target_os = "linux")]
-    {
-      use crate::backend::impls::IoUring;
-      Self::new_with_backend(IoUring::new(), cap)
-    }
+    Self::new_with_backend(crate::backend::impls::DefaultBackend::new(), cap)
   }
 
   /// Creates a new Lio driver with the specified backend and capacity.
@@ -209,19 +291,37 @@ impl Lio {
   /// # Arguments
   ///
   /// * `backend` - The I/O backend implementation (e.g., io_uring, epoll/kqueue)
-  /// * `cap` - The maximum number of concurrent operations
+  /// * `cap` - The number of operations that can be in flight at once; see
+  ///   [`Lio::new`]
+  ///
+  /// # Errors
+  ///
+  /// [`io::ErrorKind::InvalidInput`] if `cap` is zero: such a driver could
+  /// never run an operation. Otherwise, whatever initializing the backend
+  /// reports.
   pub fn new_with_backend<D>(mut backend: D, cap: usize) -> io::Result<Self>
   where
     D: IoBackend + 'static,
   {
+    if cap == 0 {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "lio capacity must be at least 1",
+      ));
+    }
     backend.init(cap)?;
 
     let inner = LioInner {
-      io: Box::new(backend),
-      store: OpStore::with_capacity(cap),
+      resource_close: backend.resource_close(),
+      io: ManuallyDrop::new(Box::new(backend)),
+      store: ManuallyDrop::new(OpStore::with_capacity(cap)),
       time: TimeManager::with_capacity(cap),
       completed: Vec::with_capacity(cap),
-      expired_timers: Vec::with_capacity(cap),
+      ready_io: VecDeque::with_capacity(cap),
+      ready_timers: VecDeque::new(),
+      dying: Vec::new(),
+      overflow: VecDeque::new(),
+      capacity_waiters: Vec::new(),
       profile: std::env::var_os("LIO_PROFILE").map(|_| LioProfile::default()),
     };
     Ok(Self { inner: Rc::new(RefCell::new(inner)) })
@@ -229,25 +329,124 @@ impl Lio {
 
   /// Schedule a registration built inside the store slot's persistent bump arena.
   #[inline]
-  pub(crate) fn schedule_with(
+  pub(crate) fn schedule_with<F>(&self, init: F) -> io::Result<u64>
+  where
+    F: FnOnce(&mut Bump) -> Registration,
+  {
+    let mut inner = self.inner.borrow_mut();
+    // Queued submissions go first.
+    if !inner.overflow.is_empty() || inner.store.is_full() {
+      return Err(Self::full_error());
+    }
+    let scheduled = Self::schedule_now(&mut inner, init);
+    drop(inner);
+    if scheduled.is_err() {
+      self.bury_and_wake();
+    }
+    scheduled
+  }
+
+  /// Schedules `init` now, or queues it until a slot frees up.
+  #[inline]
+  pub(crate) fn schedule_or_queue(
     &self,
+    init: impl FnOnce(&mut Bump) -> Registration + 'static,
+  ) {
+    let mut inner = self.inner.borrow_mut();
+    if inner.overflow.is_empty() && !inner.store.is_full() {
+      // An op without a first action is dropped; only `schedule_with` can
+      // report that.
+      let scheduled = Self::schedule_now(&mut inner, init);
+      drop(inner);
+      if scheduled.is_err() {
+        self.bury_and_wake();
+      }
+    } else {
+      Self::enqueue(&mut inner, init);
+    }
+  }
+
+  /// Queues a submission until a slot frees up. Kept out of line: it only
+  /// runs when the driver is over capacity.
+  #[cold]
+  #[inline(never)]
+  fn enqueue(
+    inner: &mut LioInner,
+    init: impl FnOnce(&mut Bump) -> Registration + 'static,
+  ) {
+    inner.overflow.push_back(Box::new(init));
+  }
+
+  /// Inserts a registration and dispatches its first action. The store must
+  /// have a free slot.
+  #[inline]
+  fn schedule_now(
+    inner: &mut LioInner,
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> io::Result<u64> {
-    let mut inner = self.inner.borrow_mut();
-    let inner = &mut *inner;
     let (store, io, time) = (&mut inner.store, &mut inner.io, &mut inner.time);
     let (id, action, step_bump) = store.insert_with_action(init);
-    let action = action.ok_or_else(|| {
-      io::Error::new(
+    let Some(action) = action else {
+      let detached = store.detach_known(id);
+      inner.dying.push(detached);
+      return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "OpModel returned no action on first call",
-      )
-    })?;
+      ));
+    };
     match action {
       Action::Io(op) => io.push(id, op, step_bump),
       Action::Sleep(duration) => time.schedule(id, duration),
     }
     Ok(id)
+  }
+
+  fn full_error() -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, "lio is at capacity")
+  }
+
+  /// Whether a new operation would have to wait for a free slot.
+  ///
+  /// [`Lio::new`] reserves capacity for `cap` operations in flight at once.
+  /// Futures over capacity wait for a slot; [`Io::when_done`],
+  /// [`Io::send`] and [`Io::send_with`] queue the operation instead, which
+  /// allocates. Callers that want strict, allocation-free backpressure can
+  /// check this before submitting.
+  ///
+  /// [`Io::when_done`]: crate::api::Io::when_done
+  /// [`Io::send`]: crate::api::Io::send
+  /// [`Io::send_with`]: crate::api::Io::send_with
+  pub fn is_full(&self) -> bool {
+    let inner = self.inner.borrow();
+    !inner.overflow.is_empty() || inner.store.is_full()
+  }
+
+  /// Wakes `waker` once a slot frees up.
+  pub(crate) fn wait_for_capacity(&self, waker: &Waker) {
+    let mut inner = self.inner.borrow_mut();
+    if !inner.capacity_waiters.iter().any(|w| w.will_wake(waker)) {
+      inner.capacity_waiters.push(waker.clone());
+    }
+  }
+
+  /// Hands freed slots to queued submissions, then (if slots remain) returns
+  /// the futures waiting for capacity, to be woken without the borrow.
+  fn release_capacity(inner: &mut LioInner) -> Vec<Waker> {
+    if inner.overflow.is_empty() && inner.capacity_waiters.is_empty() {
+      return Vec::new();
+    }
+    while !inner.store.is_full()
+      && let Some(init) = inner.overflow.pop_front()
+    {
+      // An op without a first action is dropped, as `schedule_with` reports
+      // for direct submissions.
+      let _ = Self::schedule_now(inner, init);
+    }
+    if inner.store.is_full() {
+      Vec::new()
+    } else {
+      std::mem::take(&mut inner.capacity_waiters)
+    }
   }
 
   /// Non-blocking poll for completed operations.
@@ -274,218 +473,211 @@ impl Lio {
     self.run_inner(Some(timeout))
   }
 
-  #[inline]
   fn run_inner(&self, timeout: Option<Duration>) -> io::Result<usize> {
-    let mut inner = self.inner.borrow_mut();
-    match (inner.profile.is_some(), !inner.time.is_empty()) {
-      (true, true) => Self::run_inner_impl::<true, true>(&mut inner, timeout),
-      (true, false) => Self::run_inner_impl::<true, false>(&mut inner, timeout),
-      (false, true) => Self::run_inner_impl::<false, true>(&mut inner, timeout),
-      (false, false) => {
-        Self::run_inner_impl::<false, false>(&mut inner, timeout)
+    let inner = self.inner.borrow_mut();
+    let ran = if inner.profile.is_some() {
+      self.run_with::<true>(inner, timeout)
+    } else {
+      self.run_with::<false>(inner, timeout)
+    };
+    // Also after an error: what this run removed is dropped either way.
+    self.bury_and_wake();
+    let (processed, waiters) = ran?;
+    for waker in waiters {
+      waker.wake();
+    }
+    Ok(processed)
+  }
+
+  /// Drops the registrations removed while the driver was borrowed, then
+  /// hands the slots that frees to queued submissions and wakes the futures
+  /// waiting for capacity.
+  ///
+  /// Dropping a registration runs user code (its op model, callback and
+  /// buffers), which may use this `Lio`, so it happens with the driver not
+  /// borrowed. Each slot is released only after its registration is gone: the
+  /// registration points into the slot's arenas, which reuse would reset.
+  fn bury_and_wake(&self) {
+    loop {
+      let mut buried = false;
+      loop {
+        let next = self.inner.borrow_mut().dying.pop();
+        let Some(Detached { registration, slot }) = next else {
+          break;
+        };
+        // Released even if the drop panics.
+        let _release = ReleaseSlot { lio: self, slot };
+        drop(registration);
+        buried = true;
+      }
+      if !buried {
+        return;
+      }
+      // Scheduling queued submissions may remove ops without a first action,
+      // so go around again until nothing is left to bury.
+      let waiters = Self::release_capacity(&mut self.inner.borrow_mut());
+      for waker in waiters {
+        waker.wake();
       }
     }
   }
 
-  #[inline]
-  fn run_inner_impl<const PROFILE: bool, const HAS_TIMERS: bool>(
-    inner: &mut LioInner,
+  /// One driver turn.
+  ///
+  /// Submitting and waiting run under the borrow. Routing completions holds
+  /// it only for bookkeeping: each handler runs with it released, because
+  /// handlers run user code (callbacks, and wakers that may poll inline)
+  /// which may schedule, drop or drive operations on this `Lio`.
+  fn run_with<'a, const PROFILE: bool>(
+    &'a self,
+    mut inner: RefMut<'a, LioInner>,
     timeout: Option<Duration>,
-  ) -> io::Result<usize> {
-    let profiling_enabled = PROFILE;
-    let mut flush_time = Duration::ZERO;
-    let mut next_deadline_time = Duration::ZERO;
-    let mut wait_time = Duration::ZERO;
-    let mut completion_loop_time = Duration::ZERO;
-    let mut completion_store_lookup_time = Duration::ZERO;
-    let mut completion_on_completion_time = Duration::ZERO;
-    let completion_is_finished_time = Duration::ZERO;
-    let mut timer_poll_time = Duration::ZERO;
-    let mut timer_loop_time = Duration::ZERO;
-    let mut dispatch_time = Duration::ZERO;
-    let mut remove_time = Duration::ZERO;
-    let mut stale_completions = 0usize;
-    let mut timer_expirations = 0usize;
-    let mut dispatch_count = 0usize;
-    let mut remove_count = 0usize;
+  ) -> io::Result<(usize, Vec<Waker>)> {
+    let mut stats = LioProfile::default();
+    let inner_ref = &mut *inner;
 
-    if profiling_enabled {
-      let started = Instant::now();
-      inner.io.flush()?;
-      flush_time += started.elapsed();
-    } else {
-      inner.io.flush()?;
-    }
+    timed!(PROFILE, stats, flush_time, inner_ref.io.flush())?;
 
-    // Compute effective timeout: min of user timeout and next timer deadline.
-    // Avoid touching the clock on the common pure-I/O path.
-    let has_timers = HAS_TIMERS;
-    let next_deadline = if !has_timers {
-      None
-    } else if profiling_enabled {
-      let started = Instant::now();
-      let deadline = inner.time.next_deadline();
-      next_deadline_time += started.elapsed();
-      deadline
+    // Work already queued is ready now; don't block on the backend first.
+    let queued =
+      !inner_ref.ready_io.is_empty() || !inner_ref.ready_timers.is_empty();
+    let effective_timeout = if queued {
+      Some(Duration::ZERO)
     } else {
-      inner.time.next_deadline()
-    };
-    let effective_timeout = match (timeout, next_deadline) {
-      (Some(user), Some(timer)) => Some(user.min(timer)),
-      (Some(user), None) => Some(user),
-      (None, Some(timer)) => Some(timer),
-      (None, None) => None,
+      timed!(
+        PROFILE,
+        stats,
+        next_deadline_time,
+        inner_ref.time.wait_timeout(timeout)
+      )
     };
 
-    inner.completed.clear();
+    inner_ref.completed.clear();
+    let (io, completed) = (&mut inner_ref.io, &mut inner_ref.completed);
+    let waited =
+      timed!(PROFILE, stats, wait_time, io.wait(effective_timeout, completed));
+    // Queue what the backend reported even if it then failed, so those
+    // operations are not lost.
+    inner_ref.ready_io.extend(inner_ref.completed.drain(..));
+    waited?;
 
-    if profiling_enabled {
-      let started = Instant::now();
-      let (io, completed) = (&mut inner.io, &mut inner.completed);
-      io.wait(effective_timeout, completed)?;
-      wait_time += started.elapsed();
-    } else {
-      let (io, completed) = (&mut inner.io, &mut inner.completed);
-      io.wait(effective_timeout, completed)?;
-    }
+    let before = inner_ref.ready_timers.len();
+    timed!(
+      PROFILE,
+      stats,
+      timer_poll_time,
+      inner_ref.ready_timers.extend(inner_ref.time.poll_expired())
+    );
+    stats.timer_expirations += inner_ref.ready_timers.len() - before;
+    let resource_close = inner_ref.resource_close;
 
-    let mut num_completed = 0;
-
-    let completion_loop_started =
-      if profiling_enabled { Some(Instant::now()) } else { None };
-    for index in 0..inner.completed.len() {
-      let c = inner.completed[index];
-      let id = c.registration_id();
-      let result = c.result();
-
-      let store_lookup_started =
-        if profiling_enabled { Some(Instant::now()) } else { None };
-      let Some(op) = inner.store.get_mut(id) else {
-        if let Some(started) = store_lookup_started {
-          completion_store_lookup_time += started.elapsed();
-          stale_completions += 1;
-        }
-        continue;
-      };
-      if let Some(started) = store_lookup_started {
-        completion_store_lookup_time += started.elapsed();
-      }
-
-      let on_completion_started =
-        if profiling_enabled { Some(Instant::now()) } else { None };
-      let completion_result = op.on_driver_completion(Completion::new(result));
-      if let Some(started) = on_completion_started {
-        completion_on_completion_time += started.elapsed();
-      }
-
-      let finished = completion_result.is_done();
-      if let Some(next_action) = completion_result.next_action {
-        let started =
-          if profiling_enabled { Some(Instant::now()) } else { None };
-        Self::dispatch_action(inner, id, next_action);
-        if let Some(started) = started {
-          dispatch_time += started.elapsed();
-        }
-        dispatch_count += 1;
-      }
-      if finished {
-        let remove_started =
-          if profiling_enabled { Some(Instant::now()) } else { None };
-        inner.store.remove_known(id);
-        if let Some(started) = remove_started {
-          remove_time += started.elapsed();
-        }
-        remove_count += 1;
-      }
-
-      num_completed += 1;
-    }
-    if let Some(started) = completion_loop_started {
-      completion_loop_time += started.elapsed();
-    }
-
-    // Process expired timers. `has_timers` also includes fired timers waiting
-    // to be drained, so an empty clock is safe to skip entirely.
-    let mut expired_timer_count = 0;
-    if has_timers {
-      let mut expired_timers = std::mem::take(&mut inner.expired_timers);
-      expired_timers.clear();
-
-      if profiling_enabled {
-        let started = Instant::now();
-        expired_timers.extend(inner.time.poll_expired());
-        timer_poll_time += started.elapsed();
-        timer_expirations += expired_timers.len();
+    // Route what is queued now, not what nested runs queue meanwhile, so
+    // handlers that keep producing work cannot keep this run going forever.
+    let mut budget = inner_ref.ready_io.len() + inner_ref.ready_timers.len();
+    let loop_started = PROFILE.then(Instant::now);
+    let mut batch = Batch { lio: self, current: None };
+    let mut processed = 0;
+    while budget > 0 {
+      budget -= 1;
+      let (id, completion, timer) = if let Some(c) = inner.ready_io.pop_front()
+      {
+        let completion =
+          Completion::new(c.result()).with_resource_close(resource_close);
+        (c.registration_id(), completion, false)
+      } else if let Some(id) = inner.ready_timers.pop_front() {
+        (id, TimeManager::fired_completion(), true)
       } else {
-        expired_timers.extend(inner.time.poll_expired());
+        // A nested run routed the rest.
+        break;
+      };
+      let routed;
+      (inner, routed) = self
+        .route::<PROFILE>(inner, &mut batch, id, completion, timer, &mut stats);
+      if routed {
+        processed += 1;
+      } else {
+        stats.stale_completions += 1;
       }
-      expired_timer_count = expired_timers.len();
-      let timer_loop_started =
-        if profiling_enabled { Some(Instant::now()) } else { None };
-      for &timer_id in &expired_timers {
-        let mut next_action = None;
-        let mut finished = false;
-
-        if let Some(reg) = inner.store.get_mut(timer_id) {
-          let result = reg.on_driver_completion(Completion::with_flags(
-            SLEEP_RESULT,
-            crate::api::op::CompletionFlags::TIMER,
-          ));
-          finished = result.is_done();
-          next_action = result.next_action;
-        }
-
-        inner.time.remove(timer_id);
-
-        if let Some(action) = next_action {
-          let started =
-            if profiling_enabled { Some(Instant::now()) } else { None };
-          Self::dispatch_action(inner, timer_id, action);
-          if let Some(started) = started {
-            dispatch_time += started.elapsed();
-          }
-          dispatch_count += 1;
-        }
-
-        if finished {
-          let remove_started =
-            if profiling_enabled { Some(Instant::now()) } else { None };
-          inner.store.remove_known(timer_id);
-          if let Some(started) = remove_started {
-            remove_time += started.elapsed();
-          }
-          remove_count += 1;
-        }
-      }
-      if let Some(started) = timer_loop_started {
-        timer_loop_time += started.elapsed();
-      }
-
-      expired_timers.clear();
-      inner.expired_timers = expired_timers;
+    }
+    if let Some(started) = loop_started {
+      stats.completion_loop_time += started.elapsed();
     }
 
     if PROFILE && let Some(profile) = inner.profile.as_mut() {
-      profile.run_inner_calls += 1;
-      profile.completions_returned += num_completed;
-      profile.stale_completions += stale_completions;
-      profile.timer_expirations += timer_expirations;
-      profile.dispatch_count += dispatch_count;
-      profile.remove_count += remove_count;
-      profile.flush_time += flush_time;
-      profile.next_deadline_time += next_deadline_time;
-      profile.wait_time += wait_time;
-      profile.completion_loop_time += completion_loop_time;
-      profile.completion_store_lookup_time += completion_store_lookup_time;
-      profile.completion_on_completion_time += completion_on_completion_time;
-      profile.completion_is_finished_time += completion_is_finished_time;
-      profile.timer_poll_time += timer_poll_time;
-      profile.timer_loop_time += timer_loop_time;
-      profile.dispatch_time += dispatch_time;
-      profile.remove_time += remove_time;
+      stats.completions_returned = processed;
+      profile.merge(&stats);
     }
+    Ok((processed, Self::release_capacity(&mut inner)))
+  }
 
-    Ok(num_completed + expired_timer_count)
+  /// Routes one completion to its registration, releasing `inner` only while
+  /// the registration's handler runs. Returns the reacquired borrow and
+  /// whether the registration still existed.
+  #[inline(always)]
+  fn route<'a, const PROFILE: bool>(
+    &'a self,
+    mut inner: RefMut<'a, LioInner>,
+    batch: &mut Batch<'_>,
+    id: u64,
+    completion: Completion,
+    timer: bool,
+    stats: &mut LioProfile,
+  ) -> (RefMut<'a, LioInner>, bool) {
+    if timer {
+      inner.time.remove(id);
+    }
+    let begun = timed!(
+      PROFILE,
+      stats,
+      completion_store_lookup_time,
+      inner.store.get_mut(id).map(|reg| reg.begin_completion())
+    );
+    let Some((handler, mut waker)) = begun else {
+      return (inner, false);
+    };
+
+    drop(inner);
+    batch.current = Some(id);
+    let result = timed!(PROFILE, stats, completion_on_completion_time, {
+      // SAFETY: the registration was alive above, and stays alive until
+      // removed below: dropping its consumer only marks it cancelled. For a
+      // cancelled operation the op model still sees the result, so what it
+      // produced (an accepted socket, say) is released, but nobody is woken.
+      unsafe { handler.complete(completion, &mut waker) }
+    });
+    batch.current = None;
+    let mut inner = self.inner.borrow_mut();
+
+    let inner_ref = &mut *inner;
+    if let Some(reg) = inner_ref.store.get_mut(id) {
+      // A cancelled operation takes no further step; its consumer may also
+      // have been dropped by the wake-up just now.
+      let next_action =
+        if reg.is_cancelled() { None } else { result.next_action };
+      match next_action {
+        Some(action) => {
+          if let Some(waker) = waker {
+            reg.restore_waker(waker);
+          }
+          timed!(
+            PROFILE,
+            stats,
+            dispatch_time,
+            Self::dispatch_action(inner_ref, id, action)
+          );
+          stats.dispatch_count += 1;
+        }
+        None => {
+          // Dropped by `bury_and_wake` once the driver is not borrowed.
+          timed!(PROFILE, stats, remove_time, {
+            let detached = inner_ref.store.detach_known(id);
+            inner_ref.dying.push(detached);
+          });
+          stats.remove_count += 1;
+        }
+      }
+    }
+    (inner, true)
   }
 
   // NOTE: check_done and check_stream_done are no longer needed with the channel-based
@@ -498,12 +690,68 @@ impl Lio {
     }
   }
 
-  /// Cancel an in-flight streaming operation.
+  /// Cancels an operation whose consumer (a future or stream) was dropped.
   ///
-  /// This is called when a stream is dropped to stop multishot operations.
+  /// A pending timer is simply removed. An I/O operation may still be in the
+  /// backend, using memory owned by its registration, so the registration
+  /// stays until the operation's completion arrives; the backend is asked to
+  /// finish it early, and the completion is discarded.
   pub(crate) fn cancel_stream(&self, id: u64) {
-    let mut inner = self.inner.borrow_mut();
-    inner.time.remove(id);
-    inner.store.remove(id);
+    {
+      let mut inner = self.inner.borrow_mut();
+      let inner = &mut *inner;
+      let Some(reg) = inner.store.get_mut(id) else {
+        return;
+      };
+      if inner.time.remove(id) {
+        let detached = inner.store.detach_known(id);
+        inner.dying.push(detached);
+      } else {
+        reg.cancel();
+        inner.io.cancel(id);
+        return;
+      }
+    }
+    self.bury_and_wake();
+  }
+}
+
+/// Tracks the registration whose handler is running during a run.
+///
+/// If the handler panics, dropping the batch removes that registration: its
+/// state is unknown. It is dropped on the next run rather than during the
+/// unwind, where a second panic would abort. The entries the run did not
+/// reach stay queued in `LioInner`, so their operations still complete on the
+/// next run.
+struct Batch<'a> {
+  lio: &'a Lio,
+  /// The registration whose handler is running.
+  current: Option<u64>,
+}
+
+impl Drop for Batch<'_> {
+  fn drop(&mut self) {
+    let Some(id) = self.current.take() else {
+      return;
+    };
+    if let Ok(mut inner) = self.lio.inner.try_borrow_mut()
+      && let Some(detached) = inner.store.detach(id)
+    {
+      inner.dying.push(detached);
+    }
+  }
+}
+
+/// Releases a buried registration's slot, also if dropping it panicked.
+struct ReleaseSlot<'a> {
+  lio: &'a Lio,
+  slot: u32,
+}
+
+impl Drop for ReleaseSlot<'_> {
+  fn drop(&mut self) {
+    if let Ok(mut inner) = self.lio.inner.try_borrow_mut() {
+      inner.store.release(self.slot);
+    }
   }
 }

@@ -60,24 +60,65 @@ op_flags!(WriteFlags);
 op_flags!(RecvFlags);
 op_flags!(SendFlags);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct OpenFlags(i32);
+/// How [`Op::OpenAt`] opens a path. Combine flags with `|`.
+///
+/// At least one of [`READ`](Self::READ), [`WRITE`](Self::WRITE) or
+/// [`APPEND`](Self::APPEND) is required; backends reject an open without an
+/// access mode as invalid input. Backends translate these to their native
+/// flags, and never let the opened resource leak into child processes
+/// (`O_CLOEXEC` on Unix).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct OpenFlags(u32);
 
 impl OpenFlags {
-  pub const EMPTY: Self = Self(0);
+  /// Open for reading.
+  pub const READ: Self = Self(1 << 0);
+  /// Open for writing.
+  pub const WRITE: Self = Self(1 << 1);
+  /// Open for writing, with every write appended to the end (implies
+  /// writing).
+  pub const APPEND: Self = Self(1 << 2);
+  /// Create the file if it does not exist.
+  pub const CREATE: Self = Self(1 << 3);
+  /// Truncate an existing file to zero length (requires writing).
+  pub const TRUNCATE: Self = Self(1 << 4);
+  /// With [`CREATE`](Self::CREATE): fail if the file already exists.
+  pub const EXCLUSIVE: Self = Self(1 << 5);
+  /// Fail unless the path is a directory.
+  pub const DIRECTORY: Self = Self(1 << 6);
 
-  pub const fn from_bits(bits: i32) -> Self {
-    Self(bits)
+  /// No flags; combine with others.
+  pub const fn empty() -> Self {
+    Self(0)
   }
 
-  pub const fn bits(self) -> i32 {
-    self.0
+  /// Whether every flag in `other` is set.
+  pub const fn contains(self, other: Self) -> bool {
+    self.0 & other.0 == other.0
+  }
+
+  /// Whether the open reads.
+  pub const fn reads(self) -> bool {
+    self.contains(Self::READ)
+  }
+
+  /// Whether the open writes (`WRITE` or `APPEND`).
+  pub const fn writes(self) -> bool {
+    self.contains(Self::WRITE) || self.contains(Self::APPEND)
   }
 }
 
-impl From<i32> for OpenFlags {
-  fn from(bits: i32) -> Self {
-    Self::from_bits(bits)
+impl std::ops::BitOr for OpenFlags {
+  type Output = Self;
+
+  fn bitor(self, rhs: Self) -> Self {
+    Self(self.0 | rhs.0)
+  }
+}
+
+impl std::ops::BitOrAssign for OpenFlags {
+  fn bitor_assign(&mut self, rhs: Self) {
+    self.0 |= rhs.0;
   }
 }
 
@@ -104,12 +145,6 @@ impl From<u32> for FileMode {
 pub enum UnlinkKind {
   File,
   Directory,
-}
-
-impl From<i32> for UnlinkKind {
-  fn from(flags: i32) -> Self {
-    if flags == libc::AT_REMOVEDIR { Self::Directory } else { Self::File }
-  }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,124 +253,28 @@ pub fn socket_addr_from_buf(buf: &SocketAddrBuf) -> io::Result<SocketAddr> {
       buf.flowinfo,
       buf.scope_id,
     ))),
-    SocketAddrFamily::Unspecified => {
-      Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
-    }
-    SocketAddrFamily::Unix => {
-      Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
-    }
+    SocketAddrFamily::Unspecified | SocketAddrFamily::Unix => Err(
+      io::Error::new(io::ErrorKind::Unsupported, "not an IP socket address"),
+    ),
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Abstract type → raw OS constant conversion (platform-independent contract)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Translates abstract socket domain/type/proto to raw OS constants.
-pub fn socket_to_raw(
+/// Returns whether `domain`, `ty` and `proto` describe a socket lio supports.
+///
+/// Unix sockets only accept [`SockProto::DEFAULT`], streams only TCP and
+/// datagrams only UDP. Backends reject other combinations with `EINVAL`.
+pub fn is_supported_socket(
   domain: SockDomain,
   ty: SockType,
   proto: SockProto,
-) -> Result<(i32, i32, i32), i32> {
-  if matches!(domain, SockDomain::UNIX) && !matches!(proto, SockProto::DEFAULT)
-  {
-    return Err(libc::EINVAL);
+) -> bool {
+  match (domain, ty, proto) {
+    (_, _, SockProto::DEFAULT) => true,
+    (SockDomain::UNIX, _, _) => false,
+    (_, SockType::STREAM, SockProto::TCP) => true,
+    (_, SockType::DGRAM, SockProto::UDP) => true,
+    _ => false,
   }
-
-  let domain = match domain {
-    SockDomain::IPV4 => raw_af_inet(),
-    SockDomain::IPV6 => raw_af_inet6(),
-    SockDomain::UNIX => raw_af_unix()?,
-    _ => return Err(libc::EAFNOSUPPORT),
-  };
-
-  let (ty, proto) = match (ty, proto) {
-    (SockType::STREAM, SockProto::DEFAULT) => {
-      (raw_sock_stream(), raw_proto_default())
-    }
-    (SockType::STREAM, SockProto::TCP) => (raw_sock_stream(), raw_proto_tcp()),
-    (SockType::DGRAM, SockProto::DEFAULT) => {
-      (raw_sock_dgram(), raw_proto_default())
-    }
-    (SockType::DGRAM, SockProto::UDP) => (raw_sock_dgram(), raw_proto_udp()),
-    _ => return Err(libc::EINVAL),
-  };
-
-  Ok((domain, ty, proto))
-}
-
-#[cfg(unix)]
-const fn raw_af_inet() -> i32 {
-  libc::AF_INET
-}
-
-#[cfg(windows)]
-const fn raw_af_inet() -> i32 {
-  windows_sys::Win32::Networking::WinSock::AF_INET
-}
-
-#[cfg(unix)]
-const fn raw_af_inet6() -> i32 {
-  libc::AF_INET6
-}
-
-#[cfg(windows)]
-const fn raw_af_inet6() -> i32 {
-  windows_sys::Win32::Networking::WinSock::AF_INET6
-}
-
-#[cfg(unix)]
-const fn raw_af_unix() -> Result<i32, i32> {
-  Ok(libc::AF_UNIX)
-}
-
-#[cfg(windows)]
-const fn raw_af_unix() -> Result<i32, i32> {
-  Ok(windows_sys::Win32::Networking::WinSock::AF_UNIX)
-}
-
-#[cfg(unix)]
-const fn raw_sock_stream() -> i32 {
-  libc::SOCK_STREAM
-}
-
-#[cfg(windows)]
-const fn raw_sock_stream() -> i32 {
-  windows_sys::Win32::Networking::WinSock::SOCK_STREAM
-}
-
-#[cfg(unix)]
-const fn raw_sock_dgram() -> i32 {
-  libc::SOCK_DGRAM
-}
-
-#[cfg(windows)]
-const fn raw_sock_dgram() -> i32 {
-  windows_sys::Win32::Networking::WinSock::SOCK_DGRAM
-}
-
-const fn raw_proto_default() -> i32 {
-  0
-}
-
-#[cfg(unix)]
-const fn raw_proto_tcp() -> i32 {
-  libc::IPPROTO_TCP
-}
-
-#[cfg(windows)]
-const fn raw_proto_tcp() -> i32 {
-  windows_sys::Win32::Networking::WinSock::IPPROTO_TCP
-}
-
-#[cfg(unix)]
-const fn raw_proto_udp() -> i32 {
-  libc::IPPROTO_UDP
-}
-
-#[cfg(windows)]
-const fn raw_proto_udp() -> i32 {
-  windows_sys::Win32::Networking::WinSock::IPPROTO_UDP
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -655,48 +594,6 @@ pub enum StatTarget {
   Fd { fd: Resource },
 }
 
-#[cfg(all(feature = "backend_impls", unix))]
-#[allow(clippy::useless_conversion)]
-pub(crate) fn file_stat_from_raw(stat: &libc::stat) -> FileStat {
-  let file_type = match stat.st_mode & libc::S_IFMT {
-    libc::S_IFREG => FileType::File,
-    libc::S_IFDIR => FileType::Directory,
-    libc::S_IFLNK => FileType::Symlink,
-    libc::S_IFBLK => FileType::BlockDevice,
-    libc::S_IFCHR => FileType::CharDevice,
-    libc::S_IFIFO => FileType::Fifo,
-    libc::S_IFSOCK => FileType::Socket,
-    _ => FileType::Unknown,
-  };
-
-  FileStat {
-    file_type,
-    size: stat.st_size as u64,
-    permissions: (stat.st_mode & 0o7777).into(),
-    mode: stat.st_mode.into(),
-    nlink: stat.st_nlink.into(),
-    uid: stat.st_uid,
-    gid: stat.st_gid,
-  }
-}
-
-#[cfg(unix)]
-pub(crate) fn file_type_from_dirent_dtype(dtype: u8) -> Option<FileType> {
-  match dtype {
-    libc::DT_BLK => Some(FileType::BlockDevice),
-    libc::DT_CHR => Some(FileType::CharDevice),
-    libc::DT_DIR => Some(FileType::Directory),
-    libc::DT_FIFO => Some(FileType::Fifo),
-    libc::DT_LNK => Some(FileType::Symlink),
-    libc::DT_REG => Some(FileType::File),
-    libc::DT_SOCK => Some(FileType::Socket),
-    libc::DT_UNKNOWN => None,
-    _ => None,
-  }
-}
-
-// pub struct IoSlice(libc::iovec);
-
 /// All I/O operations as pure data.
 ///
 /// Each variant contains only the data needed to execute the operation.
@@ -822,10 +719,9 @@ pub enum Op {
     out: NonNull<ReadDirResult>,
   },
 
-  //
-  // // ═══════════════════════════════════════════════════════════════════════════════
-  // // Socket operations
-  // // ═══════════════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // Socket operations
+  // ═══════════════════════════════════════════════════════════════════════════════
   /// Accept one incoming connection from a listening socket.
   ///
   /// Backends typically execute this with `accept(2)` or an equivalent platform
@@ -966,11 +862,15 @@ pub enum Op {
     /// Cross-platform semantic socket protocol.
     proto: SockProto,
   },
+  /// Bind a socket to a local address.
+  ///
+  /// This is an immediate operation on readiness backends: it should execute
+  /// during `flush()` and surface its completion on the next `wait()`.
   Bind {
     /// Socket resource to bind.
     fd: Resource,
-    /// Socket address to bind to.
-    addr: SocketAddr,
+    /// Local socket address (IP or Unix path).
+    addr: SocketAddrBuf,
   },
   Listen {
     /// Socket resource to mark listening.
@@ -994,229 +894,3 @@ pub enum Op {
   },
   Nop,
 }
-
-// /// Streaming accept - yields multiple connections from a single submission.
-// ///
-// /// On io_uring: Uses IORING_OP_ACCEPT with multishot flag.
-// /// On pollingv2: Auto-resubmits after each accept.
-// AcceptStream {
-//   fd: Resource,
-// },
-// // ═══════════════════════════════════════════════════════════════════════════════
-// // File operations
-// // ═══════════════════════════════════════════════════════════════════════════════
-// Close {
-//   /// Raw file descriptor - we do not hold a Resource here to avoid
-//   /// double-close (the op itself performs the close syscall).
-//   #[cfg(unix)]
-//   fd: RawFd,
-//   #[cfg(windows)]
-//   handle: std::os::windows::io::RawHandle,
-//   /// Whether this is a socket (use closesocket()) or a file handle (use CloseHandle())
-//   #[cfg(windows)]
-//   is_socket: bool,
-// },
-// Truncate {
-//   fd: Resource,
-//   size: u64,
-// },
-
-// // ═══════════════════════════════════════════════════════════════════════════════
-// // Link operations
-// // ═══════════════════════════════════════════════════════════════════════════════
-// LinkAt {
-//   old_dir_fd: Resource,
-//   old_path: *const c_char,
-//   new_dir_fd: Resource,
-//   new_path: *const c_char,
-// },
-// SymlinkAt {
-//   dir_fd: Resource,
-//   target: *const c_char,
-//   linkpath: *const c_char,
-// },
-// UnlinkAt {
-//   dir_fd: Resource,
-//   path: *const c_char,
-//   flags: i32,
-// },
-// RenameAt {
-//   old_dir_fd: Resource,
-//   old_path: *const c_char,
-//   new_dir_fd: Resource,
-//   new_path: *const c_char,
-// },
-// MkdirAt {
-//   dir_fd: Resource,
-//   path: *const c_char,
-//   mode: u32,
-// },
-
-// // ═══════════════════════════════════════════════════════════════════════════════
-// // Misc
-// // ═══════════════════════════════════════════════════════════════════════════════
-// #[cfg(target_os = "linux")]
-// Tee {
-//   fd_in: Resource,
-//   fd_out: Resource,
-//   size: u32,
-// },
-// /// Splice data between file descriptors via pipe (Linux only).
-// #[cfg(target_os = "linux")]
-// Splice {
-//   fd_in: Resource,
-//   off_in: i64,
-//   fd_out: Resource,
-//   off_out: i64,
-//   len: u32,
-//   flags: u32,
-// },
-// /// Send file data to a socket (Unix).
-// #[cfg(unix)]
-// SendFile {
-//   out_fd: Resource,
-//   in_fd: Resource,
-//   offset: i64,
-//   count: usize,
-// },
-// /// Copy data between files server-side (Linux only).
-// #[cfg(target_os = "linux")]
-// CopyFileRange {
-//   fd_in: Resource,
-//   off_in: i64,
-//   fd_out: Resource,
-//   off_out: i64,
-//   len: usize,
-//   flags: u32,
-// },
-// Sleep {
-//   duration: Duration,
-//   #[cfg(target_os = "linux")]
-//   timer_fd: Resource,
-//   #[cfg(target_os = "linux")]
-//   timespec: *const libc::timespec,
-// },
-// /// Wraps an inner operation with a timeout deadline.
-// ///
-// /// On io_uring: Uses IORING_OP_LINK_TIMEOUT for kernel-native timeout handling.
-// /// On pollingv2: Uses userspace timeout coordination via TimeManager.
-// ///
-// /// If the timeout fires first, the inner operation is cancelled.
-// /// If the inner operation completes first, the timeout is cancelled.
-// #[cfg(unix)]
-// Timeout {
-//   /// The wrapped operation
-//   inner: Box<Op>,
-//   /// Timeout duration
-//   duration: Duration,
-//   /// Pointer to timespec in the TypedOp (used by io_uring)
-//   #[cfg(target_os = "linux")]
-//   timespec: *const libc::timespec,
-// },
-// /// Watch a file or directory for changes.
-// ///
-// /// On BSD/macOS: Uses EVFILT_VNODE with kqueue.
-// /// On Linux: Uses inotify.
-// #[cfg(unix)]
-// Watch {
-//   /// Path to watch (C string, owned by TypedOp)
-//   path: *const c_char,
-//   /// Events to watch for (platform-specific flags)
-//   mask: u32,
-// },
-// // ═══════════════════════════════════════════════════════════════════════════════
-// // Process operations
-// // ═══════════════════════════════════════════════════════════════════════════════
-// /// Wait for a child process to change state.
-// ///
-// /// On Linux with io_uring 6.7+: Uses IORING_OP_WAITID.
-// /// On other platforms: Uses blocking waitid() syscall.
-// #[cfg(unix)]
-// Waitid {
-//   /// What type of ID to wait for (P_PID, P_PGID, P_ALL, P_PIDFD).
-//   idtype: libc::idtype_t,
-//   /// The ID value (pid, pgid, or pidfd depending on idtype).
-//   id: libc::id_t,
-//   /// Options (WEXITED, WSTOPPED, WCONTINUED, WNOHANG, WNOWAIT).
-//   options: libc::c_int,
-//   /// Pointer to siginfo_t storage in the TypedOp.
-//   infop: *mut libc::siginfo_t,
-// },
-
-// /// Spawn a new process.
-// ///
-// /// Uses posix_spawn() to create a new process.
-// #[cfg(unix)]
-// Spawn {
-//   /// Path to executable (C string, owned by TypedOp).
-//   path: *const c_char,
-//   /// Argument vector (null-terminated array, owned by TypedOp).
-//   argv: *const *const c_char,
-//   /// Environment vector (null-terminated array, owned by TypedOp).
-//   envp: *const *const c_char,
-//   /// Pointer to pid_t storage in the TypedOp.
-//   pid: *mut libc::pid_t,
-//   /// File actions for stdio redirection (null for inherit).
-//   file_actions: *const libc::posix_spawn_file_actions_t,
-// },
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Vectored I/O operations (scatter/gather)
-// ═══════════════════════════════════════════════════════════════════════════════
-// ReadVAt {
-//   fd: Resource,
-//   iovecs: *const libc::iovec,
-//   iov_count: usize,
-//   offset: i64,
-// },
-// WriteVAt {
-//   fd: Resource,
-//   iovecs: *const libc::iovec,
-//   iov_count: usize,
-//   offset: i64,
-// },
-
-// // ═══════════════════════════════════════════════════════════════════════════════
-// // File locking
-// // ═══════════════════════════════════════════════════════════════════════════════
-// /// Advisory file locking.
-// ///
-// /// # Platform-specific behavior
-// ///
-// /// This operation corresponds to `flock()` on Unix with `LOCK_SH`/`LOCK_EX`/`LOCK_UN`,
-// /// and `LockFileEx`/`UnlockFileEx` on Windows.
-// ///
-// /// - **Unix**: Advisory locking (other processes can ignore locks)
-// /// - **Windows**: Mandatory locking (OS enforces). Locking fails if file is opened
-// ///   only for append; open with `.read(true)` or `.write(true)`.
-// ///
-// /// Operations: `LOCK_SH` (shared), `LOCK_EX` (exclusive), `LOCK_UN` (unlock).
-// /// Can be combined with `LOCK_NB` for non-blocking behavior.
-// Flock {
-//   fd: Resource,
-//   /// Locking operation: LOCK_SH, LOCK_EX, LOCK_UN (optionally | LOCK_NB)
-//   operation: i32,
-// },
-
-// // ═══════════════════════════════════════════════════════════════════════════════
-// // Directory operations
-// // ═══════════════════════════════════════════════════════════════════════════════
-// /// Read directory entries (getdents64 on Linux, getdirentries on BSD).
-// #[cfg(unix)]
-// GetDents {
-//   fd: Resource,
-//   buf: RawBuf,
-// },
-
-// // ═══════════════════════════════════════════════════════════════════════════════
-// // Signal handling
-// // ═══════════════════════════════════════════════════════════════════════════════
-// /// Wait for a signal from the specified signal set.
-// ///
-// /// On Linux: Uses signalfd.
-// /// On BSD/macOS: Uses kqueue EVFILT_SIGNAL.
-// #[cfg(unix)]
-// Signal {
-//   /// Pointer to sigset_t in the TypedOp.
-//   sigset: *const libc::sigset_t,
-// },

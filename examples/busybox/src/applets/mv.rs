@@ -297,7 +297,7 @@ fn copy_file_lio(
     api::openat(
       &ctx.cwd(),
       fs_util::path_to_cstring(source)?,
-      libc::O_RDONLY,
+      lio::api::OpenFlags::READ,
       0,
     )
     .with_lio(ctx.lio())
@@ -308,7 +308,9 @@ fn copy_file_lio(
     api::openat(
       &ctx.cwd(),
       fs_util::path_to_cstring(dest)?,
-      libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+      lio::api::OpenFlags::WRITE
+        | lio::api::OpenFlags::CREATE
+        | lio::api::OpenFlags::TRUNCATE,
       mode & 0o7777,
     )
     .with_lio(ctx.lio())
@@ -355,9 +357,10 @@ fn copy_dir_recursive(
 
 fn remove_source_dir_tree(ctx: &AppContext, path: &Path) -> io::Result<()> {
   let cpath = path_to_cstring(path, "mv")?;
-  let mut receiver = api::unlinkat(&ctx.cwd(), cpath, libc::AT_REMOVEDIR)
-    .with_lio(ctx.lio())
-    .send();
+  let mut receiver =
+    api::unlinkat(&ctx.cwd(), cpath, api::UnlinkKind::Directory)
+      .with_lio(ctx.lio())
+      .send();
   io_util::run_recv(ctx.lio(), &mut receiver)
 }
 
@@ -370,8 +373,9 @@ fn mkdir_path(ctx: &AppContext, path: &Path, mode: u32) -> io::Result<()> {
 
 fn unlink_path(ctx: &AppContext, path: &Path) -> io::Result<()> {
   let cpath = path_to_cstring(path, "mv")?;
-  let mut receiver =
-    api::unlinkat(&ctx.cwd(), cpath, 0).with_lio(ctx.lio()).send();
+  let mut receiver = api::unlinkat(&ctx.cwd(), cpath, api::UnlinkKind::File)
+    .with_lio(ctx.lio())
+    .send();
   io_util::run_recv(ctx.lio(), &mut receiver)
 }
 

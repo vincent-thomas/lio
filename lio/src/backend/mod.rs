@@ -21,11 +21,11 @@
 //! # Example
 //!
 //! ```
-//! use lio::backend::{IoBackend, op::Op, impls::Poller};
+//! use lio::backend::{IoBackend, op::Op, impls::DefaultBackend};
 //! use std::time::Duration;
 //!
 //! // Create and initialize backend
-//! let mut backend = Poller::default();
+//! let mut backend = DefaultBackend::new();
 //! backend.init(1024).unwrap();  // Pre-allocate for 1024 concurrent ops
 //!
 //! // Submit a nop operation
@@ -49,9 +49,9 @@ pub mod test_macro;
 
 #[cfg(feature = "backend_impls")]
 pub mod impls {
-
-  // #[cfg(test)]
-  // pub mod dummy;
+  #[cfg(unix)]
+  #[macro_use]
+  pub(crate) mod syscall;
 
   #[cfg(target_os = "linux")]
   mod io_uring;
@@ -89,16 +89,50 @@ pub mod impls {
   #[cfg(windows)]
   pub use iocp::*;
 
-  pub(crate) mod sockaddr;
+  pub(crate) use super::sockaddr;
+  #[cfg(unix)]
+  pub(crate) mod unix_stat;
+
+  /// The backend [`Lio::new`](crate::Lio::new) uses on this platform.
+  #[cfg(target_os = "linux")]
+  pub type DefaultBackend = IoUring;
+
+  /// The backend [`Lio::new`](crate::Lio::new) uses on this platform.
+  #[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+  ))]
+  pub type DefaultBackend = Poller;
+
+  /// The backend [`Lio::new`](crate::Lio::new) uses on this platform.
+  #[cfg(windows)]
+  pub type DefaultBackend = Iocp;
 }
 
 pub(crate) mod store;
+
+/// The host OS's native close and standard handles.
+#[path = "impls/native.rs"]
+pub(crate) mod native;
+
+/// OS socket-address conversions. Lives with the backend implementations but
+/// is also needed by `net` when no backend implementations are compiled in.
+#[path = "impls/sockaddr.rs"]
+#[cfg_attr(not(feature = "backend_impls"), allow(dead_code))]
+pub(crate) mod sockaddr;
 
 use std::io;
 use std::time::Duration;
 
 use bumpalo::Bump;
 
+use crate::api::resource::CloseFn;
 use crate::backend::op::Op;
 
 /// Represents a completed I/O operation.
@@ -164,6 +198,16 @@ pub trait IoBackend {
   /// Must be called once before any other methods.
   fn init(&mut self, cap: usize) -> io::Result<()>;
 
+  /// How resources produced by this backend's completions are closed.
+  ///
+  /// The default closes them as native OS descriptors/handles. A backend
+  /// whose completions do not carry real OS resources (such as a simulation)
+  /// must override this, or dropping those resources would close unrelated
+  /// descriptors of the process.
+  fn resource_close(&self) -> CloseFn {
+    native::close
+  }
+
   /// Queue an operation for submission.
   ///
   /// Call `flush()` to submit queued operations.
@@ -171,6 +215,40 @@ pub trait IoBackend {
 
   /// Submit all queued operations to kernel.
   fn flush(&mut self) -> io::Result<()>;
+
+  /// Asks the backend to finish operation `id` early: its consumer is gone.
+  ///
+  /// The operation must still produce exactly one completion, from a later
+  /// `wait()`: a cancellation error, or its own result if it finished
+  /// first. Until then the memory its [`Op`] points to stays valid, so the
+  /// backend must not consider the operation gone before it reports it.
+  ///
+  /// `id` may be unknown to the backend (already completed, or not an I/O
+  /// operation); that is not an error.
+  ///
+  /// The default does nothing: the operation runs to completion, and its
+  /// slot is freed then. Override it so operations that may never complete
+  /// on their own (an accept, a read from an idle socket) do not keep their
+  /// slot forever.
+  fn cancel(&mut self, id: u64) {
+    let _ = id;
+  }
+
+  /// Cancels every operation still running and waits, for a bounded time,
+  /// until none is left.
+  ///
+  /// Returns whether nothing can touch the memory of a pushed [`Op`] any
+  /// more: no request is left in the kernel or on a backend thread. The
+  /// driver calls this when it is dropped, before freeing that memory, and
+  /// leaks the memory and the backend instead when it returns `false`.
+  /// Completions for the drained operations are discarded.
+  ///
+  /// The default returns `true`, which is right for a backend that only
+  /// performs I/O inside its own calls. A backend that leaves work in the
+  /// kernel or on other threads between calls must override it.
+  fn drain(&mut self) -> bool {
+    true
+  }
 
   /// Wait for completions with optional timeout.
   ///

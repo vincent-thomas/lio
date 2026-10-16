@@ -1,21 +1,13 @@
-use lio::api::resource::Resource;
-use std::{ffi::CString, os::fd::FromRawFd};
+mod common;
+
+use common::{file_resource, temp_path};
 
 #[test]
 fn will_close() {
-  let path = CString::new("/tmp/lio_test_close_basic.txt").unwrap();
+  let path = temp_path("close_basic.txt");
 
   // Open a file
-  let fd = unsafe {
-    libc::open(
-      path.as_ptr(),
-      libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
-      0o644,
-    )
-  };
-
-  // Close it
-  let resource = unsafe { Resource::from_raw_fd(fd) };
+  let resource = file_resource(std::fs::File::create(&path).unwrap());
 
   assert!(resource.will_close());
 
@@ -30,5 +22,5 @@ fn will_close() {
   drop(resource);
 
   // Cleanup
-  unsafe { libc::unlink(path.as_ptr()) };
+  std::fs::remove_file(&path).ok();
 }
