@@ -825,6 +825,10 @@ impl Drop for ReleaseSlot<'_> {
 mod model_tests;
 
 #[cfg(test)]
+#[path = "lio_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+#[cfg(test)]
 mod tests {
   use super::*;
   use crate::backend::testing::ScriptedBackend;
