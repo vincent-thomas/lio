@@ -4,7 +4,10 @@ use crate::{
   Lio,
   time::{self, TimeManager},
 };
-use std::{thread, time::Duration};
+use std::{
+  thread,
+  time::{Duration, Instant},
+};
 
 #[test]
 fn wall_clock_adapter_smoke() {
@@ -73,19 +76,37 @@ fn public_pause_resume_helpers_toggle_lio_time() {
 
 #[test]
 fn pause_preserves_remaining_sleep_time_across_real_time_gap() {
+  // Long enough that no scheduler delay makes it due during the test, so
+  // the bounds below come from measured time rather than sleep accuracy.
+  const TIMER: Duration = Duration::from_secs(10);
+  const GAP: Duration = Duration::from_millis(300);
+  // Deadlines round up to a tick and the clock reads down to one.
+  let slack = Duration::from_millis(2);
+
   let mut time = TimeManager::new();
-  time.schedule(1, Duration::from_millis(200));
-
-  thread::sleep(Duration::from_millis(100));
+  let started = Instant::now();
+  time.schedule(1, TIMER);
+  thread::sleep(Duration::from_millis(50));
   time.pause();
+  let ran_before = started.elapsed();
 
-  thread::sleep(Duration::from_millis(500));
-  assert!(time.poll_expired().collect::<Vec<_>>().is_empty());
+  thread::sleep(GAP);
+  assert!(time.poll_expired().next().is_none());
+  assert_eq!(time.next_deadline(), None, "paused time never comes due");
 
+  let resumed = Instant::now();
   time.resume();
-  assert!(time.poll_expired().collect::<Vec<_>>().is_empty());
+  let remaining = time.next_deadline().expect("the timer is still pending");
+  let ran = ran_before + resumed.elapsed();
 
-  thread::sleep(Duration::from_millis(120));
-  let expired: Vec<_> = time.poll_expired().collect();
-  assert_eq!(expired, vec![1]);
+  // Only the time the clock ran counts against the timer, never the gap.
+  assert!(
+    remaining + ran + slack >= TIMER,
+    "{remaining:?} left after running {ran:?}: the paused gap was counted"
+  );
+  assert!(
+    remaining <= TIMER - Duration::from_millis(50) + slack,
+    "{remaining:?} left: the time before the pause was not counted"
+  );
+  assert!(time.poll_expired().next().is_none());
 }

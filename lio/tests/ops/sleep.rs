@@ -403,12 +403,18 @@ fn many_concurrent() {
 
 #[test]
 fn pause_resume_preserves_remaining_duration() {
+  // Long next to the time before the pause, so scheduler delays cannot make
+  // it due early; the checks use measured time, not sleep accuracy.
+  const SLEEP: Duration = Duration::from_millis(500);
+  let slack = Duration::from_millis(2);
   let mut lio = new_ds_lio();
-  let mut recv =
-    api::sleep(Duration::from_millis(200)).with_lio(&mut lio).send();
+  let started = Instant::now();
+  let mut recv = api::sleep(SLEEP).with_lio(&mut lio).send();
 
-  std::thread::sleep(Duration::from_millis(100));
+  std::thread::sleep(Duration::from_millis(20));
   lio::time::pause(&lio);
+  let ran_before = started.elapsed();
+  assert!(ran_before < SLEEP, "the runner stalled for {ran_before:?}");
 
   std::thread::sleep(Duration::from_millis(250));
   lio.run_timeout(Duration::from_millis(10)).unwrap();
@@ -417,6 +423,7 @@ fn pause_resume_preserves_remaining_duration() {
     "sleep should not complete while lio time is paused"
   );
 
+  let resumed = Instant::now();
   lio::time::resume(&lio);
   lio.run_timeout(Duration::from_millis(10)).unwrap();
   assert!(
@@ -424,9 +431,14 @@ fn pause_resume_preserves_remaining_duration() {
     "sleep should still have remaining duration immediately after resume"
   );
 
-  let result = poll_recv_timeout(&mut lio, &mut recv, Duration::from_secs(1))
+  let result = poll_recv_timeout(&mut lio, &mut recv, Duration::from_secs(5))
     .expect("sleep should complete after resume and remaining duration");
   assert!(result.is_ok(), "sleep should succeed after resume: {result:?}");
+  let ran = ran_before + resumed.elapsed();
+  assert!(
+    ran + slack >= SLEEP,
+    "woke after running {ran:?}: the paused gap was counted"
+  );
 }
 
 #[test]
