@@ -241,6 +241,14 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     self.free_head = slot_idx;
   }
 
+  /// Whether `key` names an occupied slot.
+  #[cfg(test)]
+  pub(crate) fn contains(&self, key: SlabKey) -> bool {
+    self.slots.get(key.slot() as usize).is_some_and(|slot| {
+      slot.occupied() && slot.generation == key.generation()
+    })
+  }
+
   /// Number of slots retired and not released yet.
   #[inline]
   pub(crate) fn retired(&self) -> usize {
@@ -536,5 +544,109 @@ mod tests {
     assert!(removed.is_err());
     // Still occupied with its value, dropped once with the slab.
     assert_eq!(slab.get_mut(key).map(|v| **v), Some(7));
+  }
+
+  /// Random step sequences against a reference model of the pool.
+  mod model {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum Step {
+      Allocate(u32),
+      Remove(usize),
+      Retire(usize),
+      Release(usize),
+      Get(usize),
+      Stale(usize),
+    }
+
+    fn step() -> impl Strategy<Value = Step> {
+      prop_oneof![
+        4 => any::<u32>().prop_map(Step::Allocate),
+        2 => any::<usize>().prop_map(Step::Remove),
+        2 => any::<usize>().prop_map(Step::Retire),
+        2 => any::<usize>().prop_map(Step::Release),
+        1 => any::<usize>().prop_map(Step::Get),
+        1 => any::<usize>().prop_map(Step::Stale),
+      ]
+    }
+
+    #[derive(Default)]
+    struct Model {
+      live: Vec<(SlabKey, u32)>,
+      retired: Vec<u32>,
+      /// Every key ever handed out.
+      issued: Vec<SlabKey>,
+    }
+
+    fn run(cap: usize, steps: Vec<Step>) {
+      let mut pool: SlotPool<u32> = SlotPool::with_capacity(cap, || 0);
+      let mut model = Model::default();
+      for step in steps {
+        match step {
+          Step::Allocate(value) => {
+            let free = model.live.len() + model.retired.len() < cap;
+            let got = pool.allocate_with(|slot| *slot = value);
+            assert_eq!(got.is_some(), free, "allocates iff a slot is free");
+            if let Some((key, _)) = got {
+              assert!(!model.issued.contains(&key), "{key:?} handed out twice");
+              model.live.push((key, value));
+              model.issued.push(key);
+            }
+          }
+          Step::Remove(i) if !model.live.is_empty() => {
+            let (key, value) = model.live.remove(i % model.live.len());
+            assert_eq!(pool.remove_with(key, |slot| *slot), Some(value));
+          }
+          Step::Retire(i) if !model.live.is_empty() => {
+            let (key, value) = model.live.remove(i % model.live.len());
+            assert_eq!(pool.retire_with(key, |slot| *slot), Some(value));
+            model.retired.push(key.slot());
+          }
+          Step::Release(i) if !model.retired.is_empty() => {
+            pool.release(model.retired.remove(i % model.retired.len()));
+          }
+          Step::Get(i) if !model.live.is_empty() => {
+            let (key, mut value) = model.live[i % model.live.len()];
+            assert_eq!(pool.get_mut(key), Some(&mut value));
+          }
+          Step::Stale(i) => {
+            let stale: Vec<_> = model
+              .issued
+              .iter()
+              .filter(|key| !model.live.iter().any(|(live, _)| live == *key))
+              .collect();
+            if let Some(&&key) = stale.get(i % stale.len().max(1)) {
+              assert!(!pool.contains(key));
+              assert_eq!(pool.get_mut(key), None);
+              assert_eq!(pool.retire_with(key, |_| ()), None);
+            }
+          }
+          _ => {}
+        }
+
+        assert_eq!(pool.len(), model.live.len());
+        assert_eq!(pool.retired(), model.retired.len());
+        assert_eq!(
+          pool.has_free_slot(),
+          model.live.len() + model.retired.len() < cap
+        );
+        for &(key, mut value) in &model.live {
+          assert!(pool.contains(key));
+          assert_eq!(pool.get_mut(key), Some(&mut value));
+        }
+      }
+    }
+
+    proptest! {
+      #[test]
+      fn pool_matches_model(
+        cap in 1..8usize,
+        steps in prop::collection::vec(step(), 0..200),
+      ) {
+        run(cap, steps);
+      }
+    }
   }
 }
