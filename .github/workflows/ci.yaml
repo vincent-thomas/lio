@@ -72,6 +72,68 @@ jobs:
       - name: integration tests
         run: cargo test -p lio --features high --test '*'
 
+  miri:
+    name: miri-${{ matrix.borrows }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - borrows: stacked
+            flags: ""
+          - borrows: tree
+            flags: -Zmiri-tree-borrows
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: miri (core bookkeeping)
+        env:
+          MIRIFLAGS: ${{ matrix.flags }}
+          # Nightly adds lints before stable has them.
+          RUSTFLAGS: ""
+        run: scripts/test-miri.sh
+
+  mutants:
+    name: mutants
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      # Installs rustup; rust-toolchain.toml selects the toolchain.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants,cargo-nextest
+
+      # Every mutant of a changed line in the core must make a test fail;
+      # `.cargo/mutants.toml` says which files count as core.
+      - name: mutate the lines this PR changes
+        run: |
+          git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
+          cargo mutants --in-diff pr.diff --no-shuffle --jobs 2
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-out
+          path: mutants.out
+
   test-backend:
     name: backend-${{ matrix.backend }}-${{ matrix.os }}
     runs-on: ${{ matrix.os }}

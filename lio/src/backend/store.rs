@@ -277,10 +277,12 @@ mod tests {
 
   #[test]
   fn test_sequential_ids_are_unique() {
-    let mut store = OpStore::new();
+    // Miri runs each insert thousands of times slower.
+    let count = if cfg!(miri) { 64 } else { 1000 };
+    let mut store = OpStore::with_capacity(count);
     let mut ids = HashSet::new();
 
-    for _ in 0..1000 {
+    for _ in 0..count {
       let id = store.insert_with(dummy_stored_op);
       assert!(ids.insert(id), "Generated duplicate ID: {}", id);
     }

@@ -908,7 +908,8 @@ mod tests {
     let bound = |timers: usize| 2 * timers + 4 * super::LEVEL_SIZE + 1;
     // One long timer that stays, behind many that are cancelled.
     clock.schedule(0, Duration::from_secs(600));
-    for round in 0..20u64 {
+    // Under Miri, fewer rounds: still well past what forces a sweep.
+    for round in 0..if cfg!(miri) { 3 } else { 20u64 } {
       for slot in 1..1000u64 {
         let id = (round << 32) | slot;
         clock.schedule(id, Duration::from_secs(600));
@@ -918,7 +919,7 @@ mod tests {
     assert!(entries(&clock) <= bound(1), "{}", entries(&clock));
 
     // Rescheduling leaves a stale entry behind too.
-    for n in 0..5000u64 {
+    for n in 0..if cfg!(miri) { 1500 } else { 5000u64 } {
       clock.schedule(1, Duration::from_secs(600 + n));
     }
     assert!(entries(&clock) <= bound(2), "{}", entries(&clock));
@@ -956,7 +957,7 @@ mod tests {
       state
     };
     // Every step goes through the asserting bookkeeping.
-    for _ in 0..20_000 {
+    for _ in 0..if cfg!(miri) { 300 } else { 20_000 } {
       let roll = next();
       let id = (next() % 4) << 32 | (next() % 16);
       match roll % 5 {
@@ -1124,10 +1125,13 @@ mod tests {
       }
     }
 
+    /// Miri runs each step thousands of times slower.
+    const STEPS: usize = if cfg!(miri) { 16 } else { 120 };
+
     proptest! {
       #[test]
       fn clock_matches_model(
-        steps in prop::collection::vec(step(), 0..120),
+        steps in prop::collection::vec(step(), 0..STEPS),
       ) {
         run(steps);
       }

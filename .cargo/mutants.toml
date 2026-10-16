@@ -1,0 +1,20 @@
+# cargo-mutants: change lio's core bookkeeping one mutation at a time and
+# check that some test fails. Backends, the DS simulator and the C FFI are
+# left out: their behavior depends on the platform they run on, and their
+# own tests run there.
+examine_globs = [
+  "lio/src/slab.rs",
+  "lio/src/registration.rs",
+  "lio/src/lio.rs",
+  "lio/src/backend/store.rs",
+  "lio/src/backend/testing.rs",
+  "lio/src/time.rs",
+  "lio/src/time/clock.rs",
+  "lio/src/api/io.rs",
+  "lio/src/api/op.rs",
+]
+# Profiling counters have no observable effect on the driver.
+exclude_re = ["LioProfile"]
+test_tool = "nextest"
+# A mutant can turn a loop infinite; the clean suite takes about 10s.
+timeout_multiplier = 3.0

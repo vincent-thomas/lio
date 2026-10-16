@@ -9,7 +9,9 @@
 //! driver over `Checked<ScriptedBackend>`, so the contract checks, the
 //! driver's assertions and the backend's buffer poisoning run throughout.
 //!
-//! Depth is `LIO_LIFECYCLE_DEPTH` (default 6).
+//! Depth is `LIO_LIFECYCLE_DEPTH` (default 6). Under Miri every replay is
+//! thousands of times slower, so the test only runs there when the depth
+//! is set explicitly (the deep workflow does).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -447,15 +449,20 @@ fn explore(
   }
 }
 
-fn depth() -> usize {
-  std::env::var("LIO_LIFECYCLE_DEPTH")
-    .ok()
-    .map_or(6, |depth| depth.parse().expect("LIO_LIFECYCLE_DEPTH is a number"))
+fn depth() -> Option<usize> {
+  match std::env::var("LIO_LIFECYCLE_DEPTH") {
+    Ok(depth) => Some(depth.parse().expect("LIO_LIFECYCLE_DEPTH is a number")),
+    Err(_) if cfg!(miri) => None,
+    Err(_) => Some(6),
+  }
 }
 
 #[test]
 fn every_lifecycle_ordering_of_two_operations() {
-  let depth = depth();
+  let Some(depth) = depth() else {
+    eprintln!("skipped under Miri: set LIO_LIFECYCLE_DEPTH to run it");
+    return;
+  };
   let mut runs = 0;
   for first in KINDS {
     for second in KINDS {

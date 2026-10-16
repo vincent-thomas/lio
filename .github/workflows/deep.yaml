@@ -1,0 +1,94 @@
+name: Deep tests
+
+# The searches CI runs small on every PR, run large: more random cases,
+# deeper lifecycle orderings, Miri across many seeds, and every mutant of
+# the core rather than only those in a diff.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  search:
+    name: search
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      # Installs rustup; rust-toolchain.toml selects the toolchain.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: model and lifecycle tests, large
+        env:
+          PROPTEST_CASES: "20000"
+          LIO_LIFECYCLE_DEPTH: "8"
+        run: cargo test -p lio --release --lib -- model lifecycle
+
+  miri:
+    name: miri-${{ matrix.borrows }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - borrows: stacked
+            flags: ""
+          - borrows: tree
+            flags: -Zmiri-tree-borrows
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # Each seed changes allocation addresses and scheduling choices.
+      - name: miri (core bookkeeping), many seeds
+        env:
+          MIRIFLAGS: ${{ matrix.flags }} -Zmiri-many-seeds=0..4
+          PROPTEST_CASES: "16"
+          # Each ordering is a fresh driver; depth 2 already takes minutes.
+          LIO_LIFECYCLE_DEPTH: "2"
+          RUSTFLAGS: ""
+        run: scripts/test-miri.sh
+
+  mutants:
+    name: mutants-${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      # Installs rustup; rust-toolchain.toml selects the toolchain.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants,cargo-nextest
+
+      - name: every core mutant, shard ${{ matrix.shard }} of 8
+        run: cargo mutants --shard ${{ matrix.shard }}/8 --no-shuffle --jobs 2
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-out-${{ matrix.shard }}
+          path: mutants.out

@@ -115,6 +115,7 @@ fn dropping_the_driver_frees_ops_the_backend_drained() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "leaks on purpose, which Miri's leak check reports")]
 fn dropping_the_driver_leaks_ops_the_backend_could_not_drain() {
   let backend = ScriptedBackend::new();
   backend.set_stuck(true);
@@ -126,6 +127,7 @@ fn dropping_the_driver_leaks_ops_the_backend_could_not_drain() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "needs a real backend")]
 fn receiver_outliving_its_driver_never_completes() {
   let lio = Lio::new(4).unwrap();
   let mut receiver = api::sleep(Duration::from_secs(60)).with_lio(&lio).send();
@@ -220,6 +222,7 @@ fn stream_dropped_by_its_wake_up_is_not_resubmitted() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "needs a real backend")]
 fn dropped_accept_frees_its_slot() {
   // A real backend: an accept with no client never completes on its own.
   let lio = Lio::new(1).unwrap();
@@ -245,6 +248,7 @@ fn dropped_accept_frees_its_slot() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "needs a real backend")]
 fn stream_on_the_global_lio_cancels_on_the_driver_it_ran_on() {
   let first = Lio::new(1).unwrap();
   let guard = lio::install_global(first.clone());
