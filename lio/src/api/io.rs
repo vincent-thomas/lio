@@ -164,7 +164,12 @@ where
       let _ = sender.send(res);
     });
   }
+
   /// Registers a callback to be invoked when the operation completes.
+  ///
+  /// The callback runs during [`Lio::run`](crate::Lio::run) (or a sibling),
+  /// without the driver locked: it may schedule follow-up operations on the
+  /// same `Lio`, drop other in-flight operations, or drive the loop itself.
   ///
   /// # Example
   ///
@@ -197,16 +202,16 @@ where
   ///     Ok(())
   /// }
   /// ```
+  #[inline]
   pub fn when_done<F>(self, f: F)
   where
     F: Fn(T::Item) + 'static,
   {
     let (lio, stream_op) = self.into_lio();
-    lio
-      .schedule_with(move |arena| {
-        Registration::new_callback_in::<T, F>(arena, f, stream_op)
-      })
-      .expect("lio error: lio should handle this");
+    // Over capacity, the operation waits in a queue (see `Lio::is_full`).
+    lio.schedule_or_queue(move |arena| {
+      Registration::new_callback_in::<T, F>(arena, f, stream_op)
+    });
   }
 }
 
@@ -220,6 +225,7 @@ enum LioHandle {
 }
 
 impl LioHandle {
+  #[inline]
   fn into_lio(self) -> Lio {
     match self {
       LioHandle::GloballyInstalled => driver::get_global().expect(
@@ -239,6 +245,11 @@ impl LioHandle {
 /// Provides blocking and non-blocking methods to receive operation results.
 /// This is used for callback-based I/O completions where results are sent
 /// via a channel.
+///
+/// If the [`Lio`] is dropped before the operation completes, the operation
+/// never completes: [`try_recv`](Self::try_recv) and
+/// [`recv_timeout`](Self::recv_timeout) keep returning `None`, and
+/// [`recv`](Self::recv) panics instead of blocking forever.
 pub struct Receiver<T> {
   recv: Option<std_mpsc::Receiver<T>>,
 }
@@ -251,12 +262,13 @@ impl<T> Receiver<T> {
   ///
   /// # Panics
   ///
-  /// Panics if the sender is dropped without sending a result (internal error).
+  /// Panics if the [`Lio`] is dropped before the operation completes, since
+  /// the result can then never arrive.
   pub fn recv(mut self) -> T {
     match self.get_inner() {
       Some(value) => value
         .recv()
-        .expect("internal lio error: Sender dropped without sending"),
+        .expect("lio: the Lio was dropped before the operation completed"),
       None => unreachable!(),
     }
   }
@@ -291,7 +303,13 @@ impl<T> Receiver<T> {
             self.set_inner(value);
             None
           }
-          std_mpsc::RecvTimeoutError::Disconnected => unreachable!(),
+          // The Lio was dropped, so the operation never completes: wait out
+          // the timeout like any operation still in flight would.
+          std_mpsc::RecvTimeoutError::Disconnected => {
+            std::thread::sleep(duration);
+            self.set_inner(value);
+            None
+          }
         },
       },
       None => panic!(
@@ -334,13 +352,13 @@ impl<T> Receiver<T> {
       Some(receiver) => match receiver.try_recv() {
         Ok(value) => Some(value),
         Err(err) => match err {
-          std_mpsc::TryRecvError::Empty => {
+          // `Disconnected`: the Lio was dropped, so the operation never
+          // completes.
+          std_mpsc::TryRecvError::Empty
+          | std_mpsc::TryRecvError::Disconnected => {
             self.set_inner(receiver);
             None
           }
-          std_mpsc::TryRecvError::Disconnected => panic!(
-            "internal lio error: sender didn't send before getting dropped."
-          ),
         },
       },
       None => panic!(
@@ -370,6 +388,7 @@ where
   ///
   /// The returned Io has no Lio instance bound. You must call
   /// `.with_lio()` before consuming the operation.
+  #[inline]
   pub fn from_op(op: T) -> Self {
     Self { op, handle: LioHandle::GloballyInstalled }
   }
@@ -390,10 +409,12 @@ where
   ///     .with_lio(&lio)
   ///     .send();
   /// ```
+  #[inline]
   pub fn with_lio(self, lio: &Lio) -> Self {
     Io { op: self.op, handle: LioHandle::Custom(lio.clone()) }
   }
 
+  #[inline]
   fn into_lio(self) -> (Lio, T) {
     let lio = self.handle.into_lio();
     (lio, self.op)
@@ -462,6 +483,12 @@ where
 
     match std::mem::replace(&mut this.state, IoStreamFutureState::Done) {
       IoStreamFutureState::Pending(stream_op) => {
+        if this.lio.is_full() {
+          // Wait for a slot; the driver wakes us when one frees up.
+          this.lio.wait_for_capacity(cx.waker());
+          this.state = IoStreamFutureState::Pending(stream_op);
+          return Poll::Pending;
+        }
         let slot = Rc::new(RefCell::new(LocalFutureSlot {
           item: None,
           waker: Some(cx.waker().clone()),
@@ -474,16 +501,21 @@ where
             Registration::new_callback_in(
               arena,
               move |item| {
-                let mut slot = callback_slot.borrow_mut();
-                slot.item = Some(item);
-                if let Some(waker) = slot.waker.take() {
+                let waker = {
+                  let mut slot = callback_slot.borrow_mut();
+                  slot.item = Some(item);
+                  slot.waker.take()
+                };
+                // Wake with the slot released: the waker may poll or drop
+                // this future inline, and both borrow the slot.
+                if let Some(waker) = waker {
                   waker.wake();
                 }
               },
               stream_op,
             )
           })
-          .expect("lio error: failed to schedule operation");
+          .expect("lio rejected an operation it had capacity for");
 
         this.state = IoStreamFutureState::Inflight { id, slot };
         Poll::Pending
@@ -516,8 +548,15 @@ where
   T: OpModel,
 {
   fn drop(&mut self) {
-    if let IoStreamFutureState::Inflight { id, .. } = self.state {
-      self.lio.cancel_stream(id);
+    if let IoStreamFutureState::Inflight { id, slot } = &self.state {
+      // The callback shares the slot. Once the registration (and with it the
+      // callback) is gone, `id` is stale: a later operation may reuse it.
+      if Rc::strong_count(slot) == 1 {
+        return;
+      }
+      // The operation may still complete; nobody is left to wake then.
+      slot.borrow_mut().waker = None;
+      self.lio.cancel_stream(*id);
     }
   }
 }
@@ -573,8 +612,9 @@ where
 {
   /// Not yet submitted - waiting for first `next()` call.
   Pending(T),
-  /// Submitted and awaiting completion.
-  Inflight { id: u64, receiver: std::sync::mpsc::Receiver<T::Item> },
+  /// Submitted and awaiting completion, on the driver resolved at submission:
+  /// `id` only means something there, even if the global `Lio` changes.
+  Inflight { id: u64, receiver: std::sync::mpsc::Receiver<T::Item>, lio: Lio },
   /// Stream is done, no more items.
   Done,
 }
@@ -621,6 +661,8 @@ where
   }
 
   /// Convert the stream into a channel receiver.
+  ///
+  /// Dropping the receiver stops the operation at its next item.
   pub fn send(self) -> StreamReceiver<T::Item>
   where
     T::Item: Send,
@@ -631,6 +673,9 @@ where
   }
 
   /// Sends each stream item through a provided channel sender.
+  ///
+  /// The operation stops at the first item that cannot be delivered because
+  /// every receiver was dropped.
   pub fn send_with(mut self, sender: std_mpsc::Sender<T::Item>)
   where
     T::Item: Send,
@@ -648,17 +693,11 @@ where
       }
     };
 
-    lio
-      .schedule_with(move |arena| {
-        Registration::new_callback_in(
-          arena,
-          move |item| {
-            let _ = sender.send(item);
-          },
-          op,
-        )
-      })
-      .expect("lio error: failed to schedule stream operation");
+    // Over capacity, the operation waits in a queue (see `Lio::is_full`).
+    // It stops once every receiver of `sender` is dropped.
+    lio.schedule_or_queue(move |arena| {
+      Registration::new_sender_in(arena, sender, op)
+    });
   }
 }
 
@@ -679,35 +718,37 @@ impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
 
     match std::mem::replace(&mut stream.state, IoStreamState::Done) {
       IoStreamState::Pending(stream_op) => {
+        let lio = stream.handle.lio();
+        if lio.is_full() {
+          // Wait for a slot; the driver wakes us when one frees up.
+          lio.wait_for_capacity(cx.waker());
+          stream.state = IoStreamState::Pending(stream_op);
+          return Poll::Pending;
+        }
         // First poll - create channel and schedule operation
         let (tx, rx) = std::sync::mpsc::channel();
 
-        match stream.handle.lio().schedule_with(move |arena| {
-          Registration::new_waker_in(arena, cx.waker().clone(), tx, stream_op)
-        }) {
-          Ok(id) => {
-            stream.state = IoStreamState::Inflight { id, receiver: rx };
-            Poll::Pending
-          }
-          Err(_) => {
-            stream.state = IoStreamState::Done;
-            Poll::Ready(None)
-          }
-        }
+        let id = lio
+          .schedule_with(move |arena| {
+            Registration::new_waker_in(arena, cx.waker().clone(), tx, stream_op)
+          })
+          .expect("lio rejected an operation it had capacity for");
+        stream.state = IoStreamState::Inflight { id, receiver: rx, lio };
+        Poll::Pending
       }
 
-      IoStreamState::Inflight { id, receiver } => {
+      IoStreamState::Inflight { id, receiver, lio } => {
         // Try to receive typed result from channel
         match receiver.try_recv() {
           Ok(item) => {
             // Got a result! Stay in Inflight for next call (multishot)
-            stream.state = IoStreamState::Inflight { id, receiver };
+            stream.state = IoStreamState::Inflight { id, receiver, lio };
             Poll::Ready(Some(item))
           }
           Err(std::sync::mpsc::TryRecvError::Empty) => {
             // No result yet, update waker and stay in Inflight
-            stream.handle.lio().set_waker(id, cx.waker().clone());
-            stream.state = IoStreamState::Inflight { id, receiver };
+            lio.set_waker(id, cx.waker().clone());
+            stream.state = IoStreamState::Inflight { id, receiver, lio };
             Poll::Pending
           }
           Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -727,8 +768,15 @@ impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
 impl<T: OpModel> Drop for IoStream<T> {
   fn drop(&mut self) {
     // If the stream is inflight, cancel the operation
-    if let IoStreamState::Inflight { id, .. } = self.state {
-      self.handle.lio().cancel_stream(id);
+    if let IoStreamState::Inflight { id, receiver, lio } = &self.state {
+      // The registration holds the sender. Once it is gone, `id` is stale: a
+      // later operation may reuse it.
+      if let Err(std::sync::mpsc::TryRecvError::Disconnected) =
+        receiver.try_recv()
+      {
+        return;
+      }
+      lio.cancel_stream(*id);
     }
   }
 }

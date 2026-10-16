@@ -7,12 +7,8 @@
 #[path = "../common.rs"]
 mod common;
 
-use common::poll_until_recv;
-use lio::api::resource::Resource;
+use common::{file_resource, open_dir, poll_until_recv};
 use lio::{Lio, api};
-use std::ffi::CString;
-use std::os::fd::FromRawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::sync::mpsc;
 
 #[test]
@@ -31,12 +27,7 @@ fn test_readdir_basic() {
   std::fs::write(dir.join("file.txt"), b"hello").unwrap();
   std::fs::create_dir(dir.join("nested")).unwrap();
 
-  let dir_cstr = CString::new(dir.as_os_str().as_bytes()).unwrap();
-  let dir_fd = unsafe {
-    libc::open(dir_cstr.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
-  };
-  assert!(dir_fd >= 0, "failed to open temp directory");
-  let dir_res = unsafe { Resource::from_raw_fd(dir_fd) };
+  let dir_res = open_dir(&dir);
 
   let (sender, receiver) = mpsc::channel();
   api::readdir(&dir_res, lio::api::ReadDirBuf::with_capacity(4096, 32))
@@ -83,12 +74,7 @@ fn test_readdir_empty_directory() {
   ));
   std::fs::create_dir(&dir).unwrap();
 
-  let dir_cstr = CString::new(dir.as_os_str().as_bytes()).unwrap();
-  let dir_fd = unsafe {
-    libc::open(dir_cstr.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
-  };
-  assert!(dir_fd >= 0, "failed to open temp directory");
-  let dir_res = unsafe { Resource::from_raw_fd(dir_fd) };
+  let dir_res = open_dir(&dir);
 
   let (sender, receiver) = mpsc::channel();
   api::readdir(&dir_res, lio::api::ReadDirBuf::with_capacity(4096, 8))
@@ -120,12 +106,7 @@ fn test_readdir_small_entries_capacity_truncates() {
     std::fs::write(dir.join(format!("file_{i}.txt")), b"x").unwrap();
   }
 
-  let dir_cstr = CString::new(dir.as_os_str().as_bytes()).unwrap();
-  let dir_fd = unsafe {
-    libc::open(dir_cstr.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
-  };
-  assert!(dir_fd >= 0, "failed to open temp directory");
-  let dir_res = unsafe { Resource::from_raw_fd(dir_fd) };
+  let dir_res = open_dir(&dir);
 
   let (sender, receiver) = mpsc::channel();
   api::readdir(&dir_res, lio::api::ReadDirBuf::with_capacity(4096, 2))
@@ -167,12 +148,7 @@ fn test_readdir_small_raw_buffer_requires_continuation() {
     .unwrap();
   }
 
-  let dir_cstr = CString::new(dir.as_os_str().as_bytes()).unwrap();
-  let dir_fd = unsafe {
-    libc::open(dir_cstr.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
-  };
-  assert!(dir_fd >= 0, "failed to open temp directory");
-  let dir_res = unsafe { Resource::from_raw_fd(dir_fd) };
+  let dir_res = open_dir(&dir);
 
   let mut buf = lio::api::ReadDirBuf::with_capacity(192, 32);
   let mut names = std::collections::BTreeSet::new();
@@ -225,12 +201,7 @@ fn test_readdir_continuation_collects_all_entries() {
     std::fs::write(dir.join(format!("file_{i}.txt")), b"x").unwrap();
   }
 
-  let dir_cstr = CString::new(dir.as_os_str().as_bytes()).unwrap();
-  let dir_fd = unsafe {
-    libc::open(dir_cstr.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
-  };
-  assert!(dir_fd >= 0, "failed to open temp directory");
-  let dir_res = unsafe { Resource::from_raw_fd(dir_fd) };
+  let dir_res = open_dir(&dir);
 
   let mut buf = lio::api::ReadDirBuf::with_capacity(256, 2);
   let mut names = std::collections::BTreeSet::new();
@@ -273,10 +244,7 @@ fn test_readdir_non_directory_fd_fails() {
   ));
   std::fs::write(&path, b"hello").unwrap();
 
-  let file_cstr = CString::new(path.as_os_str().as_bytes()).unwrap();
-  let file_fd = unsafe { libc::open(file_cstr.as_ptr(), libc::O_RDONLY) };
-  assert!(file_fd >= 0, "failed to open temp file");
-  let file_res = unsafe { Resource::from_raw_fd(file_fd) };
+  let file_res = file_resource(std::fs::File::open(&path).unwrap());
 
   let (sender, receiver) = mpsc::channel();
   api::readdir(&file_res, lio::api::ReadDirBuf::with_capacity(4096, 8))

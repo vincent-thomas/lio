@@ -2,6 +2,7 @@ use std::{io, net::SocketAddr};
 
 use crate::{
   api::{
+    ShutdownHow,
     io::Io,
     ops::{Recv, RecvFrom, Send, Shutdown},
     resource::{AsResource, FromResource, IntoResource, Resource},
@@ -100,7 +101,7 @@ impl UdpSocket {
   }
 
   /// Shuts down part or all of the socket.
-  pub fn shutdown(&self, how: i32) -> Io<Shutdown> {
+  pub fn shutdown(&self, how: ShutdownHow) -> Io<Shutdown> {
     self.0.shutdown(how)
   }
 

@@ -317,10 +317,14 @@ fn prepare_destination(
 fn remove_path(ctx: &AppContext, path: &Path) -> io::Result<()> {
   let metadata = fs_util::stat_path(ctx, path, false)?
     .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-  let flags = if metadata.is_dir() { libc::AT_REMOVEDIR } else { 0 };
+  let kind = if metadata.is_dir() {
+    api::UnlinkKind::Directory
+  } else {
+    api::UnlinkKind::File
+  };
   let cpath = path_to_cstring(path, "ln")?;
   let mut receiver =
-    api::unlinkat(&ctx.cwd(), cpath, flags).with_lio(ctx.lio()).send();
+    api::unlinkat(&ctx.cwd(), cpath, kind).with_lio(ctx.lio()).send();
   io_util::run_recv(ctx.lio(), &mut receiver)
 }
 

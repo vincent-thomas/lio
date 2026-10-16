@@ -46,7 +46,11 @@ use std::{
 
 use crate::{
   Lio,
-  api::{self, ops::std_socketaddr_into_libc, resource::Resource},
+  api::{
+    self, FileStat, FileType, ReadDirBuf, RecvFlags, SendFlags, ShutdownHow,
+    SockDomain, SockProto, SockType, resource::Resource,
+  },
+  backend::impls::sockaddr::std_socketaddr_into_libc,
 };
 
 #[cfg(unix)]
@@ -64,6 +68,30 @@ pub const WATCH_DELETE: u32 = 4;
 pub const WATCH_RENAME: u32 = 8;
 /// Watch for file size extension (BSD/macOS)
 pub const WATCH_EXTEND: u32 = 16;
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct lio_file_stat_t {
+  pub file_type: libc::c_int,
+  pub size: u64,
+  pub permissions: u32,
+  pub mode: u32,
+  pub nlink: u64,
+  pub uid: u32,
+  pub gid: u32,
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct lio_dir_entry_t {
+  pub name_offset: u32,
+  pub name_len: u16,
+  pub file_type: libc::c_int,
+  pub has_ino: libc::c_int,
+  pub ino: u64,
+}
 
 // ─── Opaque handle ────────────────────────────────────────────────────────────
 
@@ -105,7 +133,115 @@ fn resource_to_fd(r: &Resource) -> libc::intptr_t {
   r.as_raw_fd() as libc::intptr_t
 }
 
-/// Converts a raw libc::sockaddr pointer and length into a safe std::net::SocketAddr.
+/// Allocate a buffer suitable for lio FFI read/write operations.
+///
+/// Buffers passed to lio read/write/send/recv functions must come from this
+/// function and must eventually be released with [`lio_buf_free`].
+#[unsafe(no_mangle)]
+pub extern "C" fn lio_buf_alloc(len: usize) -> *mut u8 {
+  let mut buf = vec![0_u8; len];
+  let ptr = buf.as_mut_ptr();
+  std::mem::forget(buf);
+  ptr
+}
+
+/// Free a buffer allocated by [`lio_buf_alloc`] or returned by an FFI callback.
+///
+/// # Safety
+/// `buf` must have been allocated by [`lio_buf_alloc`] with capacity `len` and
+/// must not be used after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_buf_free(buf: *mut u8, len: usize) {
+  if !buf.is_null() {
+    drop(unsafe { Vec::from_raw_parts(buf, 0, len) });
+  }
+}
+
+/// Free a socket address allocated by lio, such as the address returned by
+/// [`lio_accept`] or [`lio_recvfrom`].
+///
+/// # Safety
+/// `addr` must be a pointer returned by lio and must not be used after this
+/// call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_sockaddr_free(addr: *mut libc::sockaddr_storage) {
+  if !addr.is_null() {
+    drop(unsafe { Box::from_raw(addr) });
+  }
+}
+
+/// Free a directory entry array returned by [`lio_readdir`].
+///
+/// # Safety
+/// `entries` must be null or the pointer returned by [`lio_readdir`], and
+/// `len` must be the length returned with that pointer. The entries must not be
+/// used after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_dir_entries_free(
+  entries: *mut lio_dir_entry_t,
+  len: usize,
+) {
+  if !entries.is_null() {
+    // The returned boxed slice has exactly `len` elements.
+    drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(entries, len)) });
+  }
+}
+
+/// Export an exactly sized allocation for `lio_dir_entries_free`.
+fn readdir_entries_into_ffi(
+  entries: Vec<lio_dir_entry_t>,
+) -> (*mut lio_dir_entry_t, usize) {
+  let mut entries = entries.into_boxed_slice();
+  let len = entries.len();
+  let ptr = entries.as_mut_ptr();
+  mem::forget(entries);
+  (ptr, len)
+}
+
+/// Export an exactly sized allocation for `lio_buf_free(buf, len)`.
+/// The boxed slice has the same allocation layout as a Vec with capacity `len`.
+fn readdir_raw_into_ffi(raw: Vec<u8>) -> (*mut u8, usize) {
+  let mut raw = raw.into_boxed_slice();
+  let len = raw.len();
+  let ptr = raw.as_mut_ptr();
+  mem::forget(raw);
+  (ptr, len)
+}
+
+fn file_type_to_ffi(file_type: FileType) -> libc::c_int {
+  match file_type {
+    FileType::Unknown => 0,
+    FileType::File => 1,
+    FileType::Directory => 2,
+    FileType::Symlink => 3,
+    FileType::BlockDevice => 4,
+    FileType::CharDevice => 5,
+    FileType::Fifo => 6,
+    FileType::Socket => 7,
+  }
+}
+
+fn file_stat_to_ffi(stat: FileStat) -> lio_file_stat_t {
+  lio_file_stat_t {
+    file_type: file_type_to_ffi(stat.file_type),
+    size: stat.size,
+    permissions: stat.permissions,
+    mode: stat.mode,
+    nlink: stat.nlink,
+    uid: stat.uid,
+    gid: stat.gid,
+  }
+}
+
+unsafe fn cstr_to_owned(ptr: *const libc::c_char) -> Option<std::ffi::CString> {
+  if ptr.is_null() {
+    return None;
+  }
+  Some(unsafe { std::ffi::CStr::from_ptr(ptr) }.to_owned())
+}
+
+/// Decode a C address. Non-null pointers must be readable for addr_len bytes,
+/// but need not be aligned.
 fn sockaddr_to_socketaddr(
   raw_addr_ptr: *const libc::sockaddr,
   addr_len: libc::socklen_t,
@@ -114,8 +250,18 @@ fn sockaddr_to_socketaddr(
     return None;
   }
 
-  // SAFETY: Caller guarantees raw_addr_ptr is valid and non-null (checked above).
-  let family = unsafe { *raw_addr_ptr }.sa_family as i32;
+  // On some platforms sa_family is not the first byte (sa_len precedes it).
+  // Check the field's complete byte range before reading even the family.
+  let family_offset = mem::offset_of!(libc::sockaddr, sa_family);
+  if (addr_len as usize) < family_offset + mem::size_of::<libc::sa_family_t>() {
+    return None;
+  }
+  // SAFETY: The field lies within the caller-provided readable range. The
+  // address may be unaligned, so do not dereference a sockaddr reference.
+  let family = unsafe {
+    (raw_addr_ptr.cast::<u8>().add(family_offset) as *const libc::sa_family_t)
+      .read_unaligned()
+  } as i32;
 
   match family {
     libc::AF_INET => {
@@ -123,8 +269,8 @@ fn sockaddr_to_socketaddr(
         return None;
       }
       let raw_v4 = raw_addr_ptr as *const libc::sockaddr_in;
-      // SAFETY: We verified family == AF_INET and addr_len >= sizeof(sockaddr_in).
-      let sockaddr_v4 = unsafe { *raw_v4 };
+      // SAFETY: The full structure is readable, but alignment is not guaranteed.
+      let sockaddr_v4 = unsafe { raw_v4.read_unaligned() };
       let port = u16::from_be(sockaddr_v4.sin_port);
       let ipv4_addr = Ipv4Addr::from(u32::from_be(sockaddr_v4.sin_addr.s_addr));
       Some(SocketAddr::V4(SocketAddrV4::new(ipv4_addr, port)))
@@ -134,8 +280,8 @@ fn sockaddr_to_socketaddr(
         return None;
       }
       let raw_v6 = raw_addr_ptr as *const libc::sockaddr_in6;
-      // SAFETY: We verified family == AF_INET6 and addr_len >= sizeof(sockaddr_in6).
-      let sockaddr_v6 = unsafe { *raw_v6 };
+      // SAFETY: The full structure is readable, but alignment is not guaranteed.
+      let sockaddr_v6 = unsafe { raw_v6.read_unaligned() };
       let port = u16::from_be(sockaddr_v6.sin6_port);
       let ipv6_addr = Ipv6Addr::from(sockaddr_v6.sin6_addr.s6_addr);
       Some(SocketAddr::V6(SocketAddrV6::new(
@@ -195,6 +341,150 @@ pub unsafe extern "C" fn lio_tick(lio: *mut lio_handle_t) -> libc::c_int {
 }
 
 // ─── Socket / fd operations ───────────────────────────────────────────────────
+
+fn errno_result(res: std::io::Result<impl Sized>) -> libc::c_int {
+  match res {
+    Ok(_) => 0,
+    Err(e) => -e.raw_os_error().unwrap_or(1),
+  }
+}
+
+fn socket_parts_from_ffi(
+  domain: libc::c_int,
+  ty: libc::c_int,
+  proto: libc::c_int,
+) -> Result<(SockDomain, SockType, SockProto), libc::c_int> {
+  let domain = if domain == 1 || domain == libc::AF_INET {
+    SockDomain::IPV4
+  } else if domain == 2 || domain == libc::AF_INET6 {
+    SockDomain::IPV6
+  } else if domain == 3 || domain == libc::AF_UNIX {
+    SockDomain::UNIX
+  } else {
+    return Err(libc::EAFNOSUPPORT);
+  };
+  let ty = if ty == 1 || ty == libc::SOCK_STREAM {
+    SockType::STREAM
+  } else if ty == 2 || ty == libc::SOCK_DGRAM {
+    SockType::DGRAM
+  } else {
+    return Err(libc::EINVAL);
+  };
+  let proto = if proto == 0 {
+    SockProto::DEFAULT
+  } else if proto == 1 || proto == libc::IPPROTO_TCP {
+    SockProto::TCP
+  } else if proto == 2 || proto == libc::IPPROTO_UDP {
+    SockProto::UDP
+  } else {
+    return Err(libc::EPROTONOSUPPORT);
+  };
+
+  if matches!(domain, SockDomain::UNIX) && !matches!(proto, SockProto::DEFAULT)
+  {
+    return Err(libc::EINVAL);
+  }
+  if !matches!(
+    (ty, proto),
+    (SockType::STREAM, SockProto::DEFAULT)
+      | (SockType::STREAM, SockProto::TCP)
+      | (SockType::DGRAM, SockProto::DEFAULT)
+      | (SockType::DGRAM, SockProto::UDP)
+  ) {
+    return Err(libc::EINVAL);
+  }
+
+  Ok((domain, ty, proto))
+}
+
+/// Shut down part of a full-duplex connection.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `fd` must be a valid open socket that
+/// remains open until the operation completes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_shutdown(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  how: libc::c_int,
+  callback: extern "C" fn(libc::c_int),
+) {
+  let how = match how {
+    x if x == libc::SHUT_RD => ShutdownHow::Read,
+    x if x == libc::SHUT_WR => ShutdownHow::Write,
+    x if x == libc::SHUT_RDWR => ShutdownHow::Both,
+    _ => {
+      callback(-libc::EINVAL);
+      return;
+    }
+  };
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  api::shutdown(&resource, how)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| callback(errno_result(res)));
+}
+
+/// Synchronize a file's in-core state with the storage device.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `fd` must be a valid open file descriptor
+/// that remains open until the operation completes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_fsync(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  callback: extern "C" fn(libc::c_int),
+) {
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  api::fsync(&resource)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| callback(errno_result(res)));
+}
+
+/// Bind a socket to an address.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `fd` must be a valid open socket. If
+/// `sock` is non-null, it must point to a readable socket address of at least
+/// `sock_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_bind(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  sock: *const libc::sockaddr,
+  sock_len: libc::socklen_t,
+  callback: extern "C" fn(libc::c_int),
+) {
+  let addr = match sockaddr_to_socketaddr(sock, sock_len) {
+    Some(a) => a,
+    None => {
+      callback(-libc::EINVAL);
+      return;
+    }
+  };
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  api::bind(&resource, addr)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| callback(errno_result(res)));
+}
+
+/// Listen for connections on a socket.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `fd` must be a valid open socket that
+/// remains open until the operation completes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_listen(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  backlog: libc::c_int,
+  callback: extern "C" fn(libc::c_int),
+) {
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  api::listen(&resource, backlog)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| callback(errno_result(res)));
+}
 
 // /// Shut down part of a full-duplex connection.
 // ///
@@ -295,14 +585,18 @@ pub unsafe extern "C" fn lio_write_at(
   offset: i64,
   callback: extern "C" fn(libc::c_int, *mut u8, usize),
 ) {
-  // SAFETY: C caller transfers malloc ownership of buf with size buf_len
+  // SAFETY: C caller transfers ownership of a buffer allocated by lio_buf_alloc.
   let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
+  let op = if offset < 0 {
+    api::write(&resource, vec)
+  } else {
+    api::write_at(&resource, vec, offset as u32)
+  };
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::write_at(&resource, vec, offset as u32)
-    .with_lio(&unsafe { handle(lio) }.inner)
-    .when_done(move |(res, mut buf)| {
+  op.with_lio(&unsafe { handle(lio) }.inner).when_done(
+    move |(res, mut buf)| {
       let code = match res {
         Ok(n) => n,
         Err(e) => -e.raw_os_error().unwrap_or(1),
@@ -312,7 +606,8 @@ pub unsafe extern "C" fn lio_write_at(
       // Return buffer ownership to C - caller will free it
       std::mem::forget(buf);
       callback(code, ptr, len);
-    });
+    },
+  );
 }
 
 /// Read from `fd` at `offset` into `buf`.  Pass `offset = -1` for current
@@ -339,10 +634,14 @@ pub unsafe extern "C" fn lio_read_at(
   let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
+  let op = if offset < 0 {
+    api::read(&resource, vec)
+  } else {
+    api::read_at(&resource, vec, offset as u32)
+  };
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::read_at(&resource, vec, offset as u32)
-    .with_lio(&unsafe { handle(lio) }.inner)
-    .when_done(move |(res, mut buf)| {
+  op.with_lio(&unsafe { handle(lio) }.inner).when_done(
+    move |(res, mut buf)| {
       let code = match res {
         Ok(n) => n,
         Err(e) => -e.raw_os_error().unwrap_or(1),
@@ -352,7 +651,8 @@ pub unsafe extern "C" fn lio_read_at(
       // Return buffer ownership to C - caller will free it
       std::mem::forget(buf);
       callback(code, ptr, len);
-    });
+    },
+  );
 }
 
 /// Create a socket.
@@ -370,14 +670,13 @@ pub unsafe extern "C" fn lio_socket(
   proto: libc::c_int,
   callback: extern "C" fn(libc::intptr_t),
 ) {
-  let (domain, ty, proto) =
-    match crate::backend::op::socket_from_raw(domain, ty, proto) {
-      Ok(parts) => parts,
-      Err(errno) => {
-        callback(-(errno as libc::intptr_t));
-        return;
-      }
-    };
+  let (domain, ty, proto) = match socket_parts_from_ffi(domain, ty, proto) {
+    Ok(parts) => parts,
+    Err(errno) => {
+      callback(-(errno as libc::intptr_t));
+      return;
+    }
+  };
 
   // SAFETY: caller guarantees lio is valid per fn contract
   api::socket(domain, ty, proto)
@@ -519,19 +818,23 @@ pub unsafe extern "C" fn lio_send(
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::send(&resource, vec, Some(flags))
-    .with_lio(&unsafe { handle(lio) }.inner)
-    .when_done(move |(res, mut buf)| {
-      let code = match res {
-        Ok(n) => n,
-        Err(e) => -e.raw_os_error().unwrap_or(1),
-      };
-      let ptr = buf.as_mut_ptr();
-      let len = buf.len();
-      // Return buffer ownership to C - caller will free it
-      std::mem::forget(buf);
-      callback(code, ptr, len);
-    });
+  api::send(
+    &resource,
+    vec,
+    Some(SendFlags::from_bits(flags).unwrap_or(SendFlags::EMPTY)),
+  )
+  .with_lio(&unsafe { handle(lio) }.inner)
+  .when_done(move |(res, mut buf)| {
+    let code = match res {
+      Ok(n) => n,
+      Err(e) => -e.raw_os_error().unwrap_or(1),
+    };
+    let ptr = buf.as_mut_ptr();
+    let len = buf.len();
+    // Return buffer ownership to C - caller will free it
+    std::mem::forget(buf);
+    callback(code, ptr, len);
+  });
 }
 
 /// Receive data from a socket.
@@ -559,19 +862,73 @@ pub unsafe extern "C" fn lio_recv(
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::recv(&resource, vec, Some(flags))
-    .with_lio(&unsafe { handle(lio) }.inner)
-    .when_done(move |(res, mut buf)| {
-      let code = match res {
-        Ok(n) => n,
-        Err(e) => -e.raw_os_error().unwrap_or(1),
+  api::recv(
+    &resource,
+    vec,
+    Some(RecvFlags::from_bits(flags).unwrap_or(RecvFlags::EMPTY)),
+  )
+  .with_lio(&unsafe { handle(lio) }.inner)
+  .when_done(move |(res, mut buf)| {
+    let code = match res {
+      Ok(n) => n,
+      Err(e) => -e.raw_os_error().unwrap_or(1),
+    };
+    let ptr = buf.as_mut_ptr();
+    let len = buf.len();
+    // Return buffer ownership to C - caller will free it
+    std::mem::forget(buf);
+    callback(code, ptr, len);
+  });
+}
+
+/// Receive data and sender address from a socket.
+///
+/// Ownership of `buf` transfers to lio and is returned through `callback`.
+///
+/// # Safety
+/// `lio` must be a valid handle; `fd` must be a valid open socket; and `buf`
+/// must be a live buffer allocated by [`lio_buf_alloc`] with length `buf_len`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_recvfrom(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  buf: *mut u8,
+  buf_len: usize,
+  flags: libc::c_int,
+  callback: extern "C" fn(
+    libc::c_int,
+    *mut u8,
+    usize,
+    *const libc::sockaddr_storage,
+  ),
+) {
+  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  api::recvfrom(
+    &resource,
+    vec,
+    Some(RecvFlags::from_bits(flags).unwrap_or(RecvFlags::EMPTY)),
+  )
+  .with_lio(&unsafe { handle(lio) }.inner)
+  .when_done(move |(res, mut buf, addr)| {
+    let (code, addr_ptr): (libc::c_int, *const libc::sockaddr_storage) =
+      match res {
+        Ok(n) => {
+          let addr_ptr = addr
+            .map(|addr| {
+              Box::into_raw(Box::new(std_socketaddr_into_libc(addr)))
+                as *const _
+            })
+            .unwrap_or(ptr::null());
+          (n, addr_ptr)
+        }
+        Err(e) => (-e.raw_os_error().unwrap_or(1), ptr::null()),
       };
-      let ptr = buf.as_mut_ptr();
-      let len = buf.len();
-      // Return buffer ownership to C - caller will free it
-      std::mem::forget(buf);
-      callback(code, ptr, len);
-    });
+    let ptr = buf.as_mut_ptr();
+    let len = buf.len();
+    std::mem::forget(buf);
+    callback(code, ptr, len, addr_ptr);
+  });
 }
 
 // /// Close a file descriptor.
@@ -620,6 +977,26 @@ pub unsafe extern "C" fn lio_sleep(
         Err(e) => -e.raw_os_error().unwrap_or(1),
       });
     });
+}
+
+/// Runs an interval and invokes `callback` for every tick until the lio handle is destroyed.
+///
+/// # Safety
+/// `lio` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_interval(
+  lio: *mut lio_handle_t,
+  millis: libc::c_uint,
+  callback: extern "C" fn(libc::c_int),
+) {
+  let receiver = api::interval(Duration::from_millis(millis as u64))
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .send();
+  std::thread::spawn(move || {
+    while let Ok(res) = receiver.recv() {
+      callback(errno_result(res));
+    }
+  });
 }
 
 /// A no-op that completes immediately.
@@ -715,7 +1092,7 @@ pub unsafe extern "C" fn lio_sendto(
     resource.clone(),
     vec,
     Some(socket_addr),
-    Some(flags),
+    Some(SendFlags::from_bits(flags).unwrap_or(SendFlags::EMPTY)),
   ))
   .with_lio(&unsafe { handle(lio) }.inner)
   .when_done(move |(res, mut buf)| {
@@ -809,6 +1186,10 @@ pub unsafe extern "C" fn lio_openat(
   let dir_resource = unsafe { fd_to_borrowed_resource(dir_fd) };
   #[allow(clippy::unnecessary_cast)]
   let mode = mode as u32;
+  let Some(flags) = open_flags_from_posix(flags) else {
+    callback(-libc::EINVAL as libc::intptr_t);
+    return;
+  };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::openat(&dir_resource, path_owned, flags, mode)
     .with_lio(&unsafe { handle(lio) }.inner)
@@ -997,7 +1378,12 @@ pub unsafe extern "C" fn lio_unlinkat(
   // SAFETY: caller guarantees dir_fd is valid per fn contract
   let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::unlinkat(&dir_res, path_cstr, flags)
+  let kind = if flags & libc::AT_REMOVEDIR != 0 {
+    api::UnlinkKind::Directory
+  } else {
+    api::UnlinkKind::File
+  };
+  api::unlinkat(&dir_res, path_cstr, kind)
     .with_lio(&unsafe { handle(lio) }.inner)
     .when_done(move |res| {
       callback(match res {
@@ -1075,6 +1461,244 @@ pub unsafe extern "C" fn lio_mkdirat(
       callback(match res {
         Ok(_) => 0,
         Err(e) => -e.raw_os_error().unwrap_or(1),
+      });
+    });
+}
+
+/// Reads metadata for a path relative to a directory file descriptor.
+///
+/// # Safety
+/// `lio` must be a valid handle; `dir_fd` must be a valid open directory file
+/// descriptor; and a non-null `path` must point to a valid NUL-terminated
+/// string. The descriptor must remain open until the operation completes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_statat(
+  lio: *mut lio_handle_t,
+  dir_fd: libc::intptr_t,
+  path: *const libc::c_char,
+  follow_symlinks: libc::c_int,
+  callback: extern "C" fn(libc::c_int, lio_file_stat_t),
+) {
+  let Some(path) = (unsafe { cstr_to_owned(path) }) else {
+    callback(-libc::EINVAL, lio_file_stat_t::default());
+    return;
+  };
+  let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
+  api::statat(&dir_res, path, follow_symlinks != 0)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| match res {
+      Ok(stat) => callback(0, file_stat_to_ffi(stat)),
+      Err(e) => {
+        callback(-e.raw_os_error().unwrap_or(1), lio_file_stat_t::default())
+      }
+    });
+}
+
+/// Reads metadata for an open file descriptor.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `fd` must be a valid open file descriptor
+/// that remains open until the operation completes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_fstat(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  callback: extern "C" fn(libc::c_int, lio_file_stat_t),
+) {
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  api::fstat(&resource).with_lio(&unsafe { handle(lio) }.inner).when_done(
+    move |res| match res {
+      Ok(stat) => callback(0, file_stat_to_ffi(stat)),
+      Err(e) => {
+        callback(-e.raw_os_error().unwrap_or(1), lio_file_stat_t::default())
+      }
+    },
+  );
+}
+
+/// Reads the target of a symbolic link relative to a directory file descriptor.
+///
+/// Ownership of `buf` transfers to lio and is returned through `callback`.
+///
+/// # Safety
+/// `lio` must be a valid handle; `dir_fd` must be a valid open directory file
+/// descriptor; a non-null `path` must point to a valid NUL-terminated string;
+/// and `buf` must be a live buffer allocated by [`lio_buf_alloc`] with length
+/// `buf_len`. The descriptor must remain open until the operation completes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_readlinkat(
+  lio: *mut lio_handle_t,
+  dir_fd: libc::intptr_t,
+  path: *const libc::c_char,
+  buf: *mut u8,
+  buf_len: usize,
+  callback: extern "C" fn(libc::c_int, *mut u8, usize),
+) {
+  let Some(path) = (unsafe { cstr_to_owned(path) }) else {
+    callback(-libc::EINVAL, buf, buf_len);
+    return;
+  };
+  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
+  api::readlinkat(&dir_res, path, vec)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, mut buf)| {
+      let code = match res {
+        Ok(n) => n,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      };
+      let ptr = buf.as_mut_ptr();
+      let len = buf.len();
+      std::mem::forget(buf);
+      callback(code, ptr, len);
+    });
+}
+
+/// Reads the current working directory into a caller-provided buffer.
+///
+/// Ownership of `buf` transfers to lio and is returned through `callback`.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `buf` must be a live buffer allocated by
+/// [`lio_buf_alloc`] with length `buf_len`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_getcwd(
+  lio: *mut lio_handle_t,
+  buf: *mut u8,
+  buf_len: usize,
+  callback: extern "C" fn(libc::c_int, *mut u8, usize),
+) {
+  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  api::getcwd(vec).with_lio(&unsafe { handle(lio) }.inner).when_done(
+    move |(res, mut buf)| {
+      let code = match res {
+        Ok(n) => n,
+        Err(e) => -e.raw_os_error().unwrap_or(1),
+      };
+      let ptr = buf.as_mut_ptr();
+      let len = buf.len();
+      std::mem::forget(buf);
+      callback(code, ptr, len);
+    },
+  );
+}
+
+/// Reads one batch of directory entries from an open directory descriptor.
+///
+/// The buffers returned through `callback` must be released with
+/// [`lio_buf_free`] and [`lio_dir_entries_free`], respectively.
+///
+/// # Safety
+/// `lio` must be a valid handle, and `fd` must be a valid open directory file
+/// descriptor that remains open until the operation completes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_readdir(
+  lio: *mut lio_handle_t,
+  fd: libc::intptr_t,
+  raw_capacity: usize,
+  entries_capacity: usize,
+  callback: extern "C" fn(
+    libc::c_int,
+    *mut u8,
+    usize,
+    *mut lio_dir_entry_t,
+    usize,
+    libc::c_int,
+  ),
+) {
+  let resource = unsafe { fd_to_borrowed_resource(fd) };
+  api::readdir(
+    &resource,
+    ReadDirBuf::with_capacity(raw_capacity, entries_capacity),
+  )
+  .with_lio(&unsafe { handle(lio) }.inner)
+  .when_done(move |res| match res {
+    Ok(buf) => {
+      let entries: Vec<lio_dir_entry_t> = buf
+        .entries
+        .iter()
+        .take(buf.result.entries)
+        .map(|entry| lio_dir_entry_t {
+          name_offset: entry.name_offset,
+          name_len: entry.name_len,
+          file_type: entry.file_type.map(file_type_to_ffi).unwrap_or(0),
+          has_ino: i32::from(entry.ino.is_some()),
+          ino: entry.ino.unwrap_or(0),
+        })
+        .collect();
+      let (entries_ptr, entries_len) = readdir_entries_into_ffi(entries);
+
+      let eof = i32::from(buf.result.eof);
+      let (raw_ptr, raw_len) =
+        readdir_raw_into_ffi(buf.raw[..buf.result.raw_written].to_vec());
+      callback(0, raw_ptr, raw_len, entries_ptr, entries_len, eof);
+    }
+    Err(e) => callback(
+      -e.raw_os_error().unwrap_or(1),
+      ptr::null_mut(),
+      0,
+      ptr::null_mut(),
+      0,
+      1,
+    ),
+  });
+}
+
+/// Spawn a process.
+///
+/// # Safety
+/// `lio` must be a valid handle. A non-null `path` must point to a valid
+/// NUL-terminated string. `argv` and `envp` must each be null or point to a
+/// null-terminated array of pointers to valid NUL-terminated strings.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_spawn(
+  lio: *mut lio_handle_t,
+  path: *const libc::c_char,
+  argv: *const *const libc::c_char,
+  envp: *const *const libc::c_char,
+  callback: extern "C" fn(libc::intptr_t),
+) {
+  let Some(path) = (unsafe { cstr_to_owned(path) }) else {
+    callback(-libc::EINVAL as libc::intptr_t);
+    return;
+  };
+
+  unsafe fn collect_cstr_array(
+    ptrs: *const *const libc::c_char,
+  ) -> Option<Vec<std::ffi::CString>> {
+    if ptrs.is_null() {
+      return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+      let ptr = unsafe { *ptrs.add(i) };
+      if ptr.is_null() {
+        break;
+      }
+      out.push(unsafe { std::ffi::CStr::from_ptr(ptr) }.to_owned());
+      i += 1;
+    }
+    Some(out)
+  }
+
+  let Some(argv) = (unsafe { collect_cstr_array(argv) }) else {
+    callback(-libc::EINVAL as libc::intptr_t);
+    return;
+  };
+  let envp = if envp.is_null() {
+    None
+  } else {
+    Some(unsafe { collect_cstr_array(envp) }.unwrap_or_default())
+  };
+
+  api::spawn(path, argv, envp)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |res| {
+      callback(match res {
+        Ok(pid) => pid.as_raw() as libc::intptr_t,
+        Err(e) => -e.raw_os_error().unwrap_or(1) as libc::intptr_t,
       });
     });
 }
@@ -1497,5 +2121,211 @@ fn link_kind_from_ffi(kind: libc::c_int) -> Result<api::ops::LinkKind, ()> {
     0 => Ok(api::ops::LinkKind::Hard),
     1 => Ok(api::ops::LinkKind::Soft),
     _ => Err(()),
+  }
+}
+
+#[cfg(all(test, unix))]
+mod sockaddr_tests {
+  use super::*;
+  use std::sync::atomic::{AtomicI32, Ordering};
+
+  // Separate callback slots: these tests run concurrently by default.
+  const PENDING: libc::c_int = 12345;
+  static INVALID_ADDR_RESULT: AtomicI32 = AtomicI32::new(PENDING);
+  static BIND_ROUTE_RESULT: AtomicI32 = AtomicI32::new(PENDING);
+  extern "C" fn invalid_addr_callback(code: libc::c_int) {
+    INVALID_ADDR_RESULT.store(code, Ordering::SeqCst);
+  }
+  extern "C" fn invalid_sendto_callback(
+    code: libc::c_int,
+    buf: *mut u8,
+    len: usize,
+  ) {
+    assert!(buf.is_null());
+    assert_eq!(len, 0);
+    INVALID_ADDR_RESULT.store(code, Ordering::SeqCst);
+  }
+  extern "C" fn bind_route_callback(code: libc::c_int) {
+    BIND_ROUTE_RESULT.store(code, Ordering::SeqCst);
+  }
+
+  #[test]
+  fn short_and_unaligned_addresses() {
+    for addr in [
+      SocketAddr::from(([127, 0, 0, 1], 4321)),
+      SocketAddr::from((Ipv6Addr::LOCALHOST, 4321)),
+    ] {
+      let len = match addr {
+        SocketAddr::V4(_) => mem::size_of::<libc::sockaddr_in>(),
+        SocketAddr::V6(_) => mem::size_of::<libc::sockaddr_in6>(),
+      };
+      let storage = std_socketaddr_into_libc(addr);
+      let mut bytes = vec![0u8; len + 1];
+      // SAFETY: Both byte ranges are valid and do not overlap.
+      unsafe {
+        ptr::copy_nonoverlapping(
+          (&raw const storage).cast::<u8>(),
+          bytes.as_mut_ptr().add(1),
+          len,
+        );
+      }
+      let raw = unsafe { bytes.as_ptr().add(1) }.cast::<libc::sockaddr>();
+      assert_eq!(
+        sockaddr_to_socketaddr(raw, len as libc::socklen_t),
+        Some(addr)
+      );
+      let family_end = mem::offset_of!(libc::sockaddr, sa_family)
+        + mem::size_of::<libc::sa_family_t>();
+      for short in [0, family_end - 1, family_end, len - 1] {
+        assert_eq!(sockaddr_to_socketaddr(raw, short as libc::socklen_t), None);
+      }
+      assert_eq!(
+        sockaddr_to_socketaddr(ptr::null(), len as libc::socklen_t),
+        None
+      );
+
+      // The bind FFI path must reject truncated addresses before accessing the
+      // handle or fd, and preserve its EINVAL callback contract.
+      INVALID_ADDR_RESULT.store(PENDING, Ordering::SeqCst);
+      unsafe {
+        lio_bind(
+          ptr::null_mut(),
+          -1,
+          raw,
+          (len - 1) as _,
+          invalid_addr_callback,
+        )
+      };
+      assert_eq!(INVALID_ADDR_RESULT.load(Ordering::SeqCst), -libc::EINVAL);
+      INVALID_ADDR_RESULT.store(PENDING, Ordering::SeqCst);
+      unsafe {
+        lio_connect(
+          ptr::null_mut(),
+          -1,
+          raw,
+          (len - 1) as _,
+          invalid_addr_callback,
+        )
+      };
+      assert_eq!(INVALID_ADDR_RESULT.load(Ordering::SeqCst), -libc::EINVAL);
+      INVALID_ADDR_RESULT.store(PENDING, Ordering::SeqCst);
+      unsafe {
+        lio_sendto(
+          ptr::null_mut(),
+          -1,
+          ptr::null_mut(),
+          0,
+          0,
+          raw,
+          (len - 1) as _,
+          invalid_sendto_callback,
+        )
+      };
+      assert_eq!(INVALID_ADDR_RESULT.load(Ordering::SeqCst), -libc::EINVAL);
+    }
+  }
+
+  #[test]
+  fn unaligned_ipv4_bind_route() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let storage = std_socketaddr_into_libc(addr);
+    let len = mem::size_of::<libc::sockaddr_in>();
+    let mut bytes = vec![0u8; len + 1];
+    unsafe {
+      ptr::copy_nonoverlapping(
+        (&raw const storage).cast::<u8>(),
+        bytes.as_mut_ptr().add(1),
+        len,
+      );
+    }
+    let raw = unsafe { bytes.as_ptr().add(1) }.cast::<libc::sockaddr>();
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(fd >= 0);
+    let lio = lio_create(16);
+    assert!(!lio.is_null());
+    BIND_ROUTE_RESULT.store(PENDING, Ordering::SeqCst);
+    unsafe { lio_bind(lio, fd as _, raw, len as _, bind_route_callback) };
+    for _ in 0..1000 {
+      if BIND_ROUTE_RESULT.load(Ordering::SeqCst) != PENDING {
+        break;
+      }
+      unsafe { lio_tick(lio) };
+    }
+    assert_eq!(BIND_ROUTE_RESULT.load(Ordering::SeqCst), 0);
+    unsafe {
+      lio_destroy(lio);
+      libc::close(fd);
+    }
+  }
+}
+
+/// Translates POSIX `O_*` open flags from C callers to [`api::OpenFlags`].
+///
+/// Returns `None` for flags lio does not model, so they are rejected rather
+/// than silently dropped. `O_CLOEXEC` is accepted; lio always sets it.
+fn open_flags_from_posix(bits: libc::c_int) -> Option<api::OpenFlags> {
+  use api::OpenFlags;
+  let mut flags = match bits & libc::O_ACCMODE {
+    libc::O_RDONLY => OpenFlags::READ,
+    libc::O_WRONLY => OpenFlags::WRITE,
+    libc::O_RDWR => OpenFlags::READ | OpenFlags::WRITE,
+    _ => return None,
+  };
+  let mut rest = bits & !libc::O_ACCMODE & !libc::O_CLOEXEC;
+  for (native, flag) in [
+    (libc::O_APPEND, OpenFlags::APPEND),
+    (libc::O_CREAT, OpenFlags::CREATE),
+    (libc::O_TRUNC, OpenFlags::TRUNCATE),
+    (libc::O_EXCL, OpenFlags::EXCLUSIVE),
+    (libc::O_DIRECTORY, OpenFlags::DIRECTORY),
+  ] {
+    if rest & native != 0 {
+      flags |= flag;
+      rest &= !native;
+    }
+  }
+  (rest == 0).then_some(flags)
+}
+
+#[cfg(test)]
+mod readdir_ownership_tests {
+  use super::*;
+
+  #[test]
+  fn ffi_readdir_allocations_round_trip_for_multiple_lengths() {
+    // Spare Vec capacity must not affect deallocation by the reported length.
+    for len in [0, 1, 2, 3, 7, 32, 100, 1024] {
+      for _ in 0..16 {
+        let mut raw = Vec::with_capacity(len + 17);
+        raw.extend((0..len).map(|i| i as u8));
+        let (raw_ptr, raw_len) = readdir_raw_into_ffi(raw);
+        assert_eq!(raw_len, len);
+        assert_eq!(
+          unsafe { std::slice::from_raw_parts(raw_ptr, raw_len) },
+          (0..len).map(|i| i as u8).collect::<Vec<_>>()
+        );
+        unsafe { lio_buf_free(raw_ptr, raw_len) };
+
+        let mut entries = Vec::with_capacity(len + 17);
+        entries.resize(len, lio_dir_entry_t::default());
+        for (i, entry) in entries.iter_mut().enumerate() {
+          entry.name_offset = i as u32;
+        }
+        let (entries_ptr, entries_len) = readdir_entries_into_ffi(entries);
+        assert_eq!(entries_len, len);
+        for (i, entry) in
+          unsafe { std::slice::from_raw_parts(entries_ptr, entries_len) }
+            .iter()
+            .enumerate()
+        {
+          assert_eq!(entry.name_offset, i as u32);
+        }
+        unsafe { lio_dir_entries_free(entries_ptr, entries_len) };
+      }
+    }
+    unsafe {
+      lio_buf_free(ptr::null_mut(), 0);
+      lio_dir_entries_free(ptr::null_mut(), 0);
+    }
   }
 }

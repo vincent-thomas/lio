@@ -44,6 +44,146 @@ typedef struct sockaddr_storage sockaddr_storage;
 #define MAX_IOV_COUNT 16
 
 /**
+ * `ERROR_ACCESS_DENIED`
+ */
+#define EACCES 5
+
+/**
+ * `WSAEADDRINUSE`
+ */
+#define EADDRINUSE 10048
+
+/**
+ * `WSAEWOULDBLOCK`
+ */
+#define EAGAIN 10035
+
+/**
+ * `ERROR_INVALID_HANDLE`
+ */
+#define EBADF 6
+
+/**
+ * `WSAECONNABORTED`
+ */
+#define ECONNABORTED 10053
+
+/**
+ * `WSAECONNREFUSED`
+ */
+#define ECONNREFUSED 10061
+
+/**
+ * `WSAECONNRESET`
+ */
+#define ECONNRESET 10054
+
+/**
+ * `WSAEDESTADDRREQ`
+ */
+#define EDESTADDRREQ 10039
+
+/**
+ * `ERROR_ALREADY_EXISTS`
+ */
+#define EEXIST 183
+
+/**
+ * `ERROR_FILE_TOO_LARGE`
+ */
+#define EFBIG 223
+
+/**
+ * `WSAEHOSTUNREACH`
+ */
+#define EHOSTUNREACH 10065
+
+/**
+ * `ERROR_INVALID_PARAMETER`
+ */
+#define EINVAL 87
+
+/**
+ * `ERROR_IO_DEVICE`
+ */
+#define EIO 1117
+
+/**
+ * `WSAEISCONN`
+ */
+#define EISCONN 10056
+
+/**
+ * `ERROR_TOO_MANY_OPEN_FILES`
+ */
+#define EMFILE 4
+
+/**
+ * `ERROR_NO_SYSTEM_RESOURCES`
+ */
+#define ENFILE 1450
+
+/**
+ * `ERROR_FILE_NOT_FOUND`
+ */
+#define ENOENT 2
+
+/**
+ * `ERROR_DISK_FULL`
+ */
+#define ENOSPC 112
+
+/**
+ * `WSAENOTCONN`
+ */
+#define ENOTCONN 10057
+
+/**
+ * `ERROR_DIRECTORY`
+ */
+#define ENOTDIR 267
+
+/**
+ * `WSAENOTSOCK`
+ */
+#define ENOTSOCK 10038
+
+/**
+ * `ERROR_NOT_SUPPORTED`
+ */
+#define ENOTSUP 50
+
+/**
+ * `WSAEOPNOTSUPP`
+ */
+#define EOPNOTSUPP 10045
+
+/**
+ * `ERROR_BROKEN_PIPE`
+ */
+#define EPIPE 109
+
+/**
+ * `WSAEPROTOTYPE`
+ */
+#define EPROTOTYPE 10041
+
+/**
+ * `ERROR_INSUFFICIENT_BUFFER`
+ */
+#define ERANGE 122
+
+/**
+ * `ERROR_SEEK_ON_DEVICE`
+ */
+#define ESPIPE 132
+
+/**
+ * `WSAETIMEDOUT`
+ */
+#define ETIMEDOUT 10060
+
+/**
  * Completion flags understood by higher-level operation models.
  */
 typedef struct CompletionFlags CompletionFlags;
@@ -57,6 +197,17 @@ typedef struct CompletionFlags CompletionFlags;
  */
 typedef struct Interest Interest;
 
+/**
+ * How [`Op::OpenAt`] opens a path. Combine flags with `|`.
+ *
+ * At least one of [`READ`](Self::READ), [`WRITE`](Self::WRITE) or
+ * [`APPEND`](Self::APPEND) is required; backends reject an open without an
+ * access mode as invalid input. Backends translate these to their native
+ * flags, and never let the opened resource leak into child processes
+ * (`O_CLOEXEC` on Unix).
+ */
+typedef struct OpenFlags OpenFlags;
+
 typedef struct SockDomain SockDomain;
 
 typedef struct SockProto SockProto;
@@ -69,9 +220,64 @@ typedef struct SockType SockType;
  */
 typedef struct lio_handle_t lio_handle_t;
 
+typedef struct lio_dir_entry_t {
+  uint32_t name_offset;
+  uint16_t name_len;
+  int file_type;
+  int has_ino;
+  uint64_t ino;
+} lio_dir_entry_t;
+
+typedef struct lio_file_stat_t {
+  int file_type;
+  uint64_t size;
+  uint32_t permissions;
+  uint32_t mode;
+  uint64_t nlink;
+  uint32_t uid;
+  uint32_t gid;
+} lio_file_stat_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+/**
+ * Allocate a buffer suitable for lio FFI read/write operations.
+ *
+ * Buffers passed to lio read/write/send/recv functions must come from this
+ * function and must eventually be released with [`lio_buf_free`].
+ */
+uint8_t *lio_buf_alloc(uintptr_t len);
+
+/**
+ * Free a buffer allocated by [`lio_buf_alloc`] or returned by an FFI callback.
+ *
+ * # Safety
+ * `buf` must have been allocated by [`lio_buf_alloc`] with capacity `len` and
+ * must not be used after this call.
+ */
+void lio_buf_free(uint8_t *buf, uintptr_t len);
+
+/**
+ * Free a socket address allocated by lio, such as the address returned by
+ * [`lio_accept`] or [`lio_recvfrom`].
+ *
+ * # Safety
+ * `addr` must be a pointer returned by lio and must not be used after this
+ * call.
+ */
+void lio_sockaddr_free(sockaddr_storage *addr);
+
+/**
+ * Free a directory entry array returned by [`lio_readdir`].
+ *
+ * # Safety
+ * `entries` must be null or the pointer returned by [`lio_readdir`], and
+ * `len` must be the length returned with that pointer. The entries must not be
+ * used after this call.
+ */
+void lio_dir_entries_free(struct lio_dir_entry_t *entries, uintptr_t len);
 
 /**
  * Create a new lio driver with the given operation capacity.
@@ -102,6 +308,47 @@ void lio_destroy(struct lio_handle_t *lio);
  * `lio` must be a valid handle.
  */
 int lio_tick(struct lio_handle_t *lio);
+
+/**
+ * Shut down part of a full-duplex connection.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `fd` must be a valid open socket that
+ * remains open until the operation completes.
+ */
+void lio_shutdown(struct lio_handle_t *lio, intptr_t fd, int how, void (*callback)(int));
+
+/**
+ * Synchronize a file's in-core state with the storage device.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `fd` must be a valid open file descriptor
+ * that remains open until the operation completes.
+ */
+void lio_fsync(struct lio_handle_t *lio, intptr_t fd, void (*callback)(int));
+
+/**
+ * Bind a socket to an address.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `fd` must be a valid open socket. If
+ * `sock` is non-null, it must point to a readable socket address of at least
+ * `sock_len` bytes.
+ */
+void lio_bind(struct lio_handle_t *lio,
+              intptr_t fd,
+              const sockaddr *sock,
+              socklen_t sock_len,
+              void (*callback)(int));
+
+/**
+ * Listen for connections on a socket.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `fd` must be a valid open socket that
+ * remains open until the operation completes.
+ */
+void lio_listen(struct lio_handle_t *lio, intptr_t fd, int backlog, void (*callback)(int));
 
 /**
  * Write data to `fd` at `offset`.  Pass `offset = -1` for current position.
@@ -206,6 +453,22 @@ void lio_recv(struct lio_handle_t *lio,
               void (*callback)(int, uint8_t*, uintptr_t));
 
 /**
+ * Receive data and sender address from a socket.
+ *
+ * Ownership of `buf` transfers to lio and is returned through `callback`.
+ *
+ * # Safety
+ * `lio` must be a valid handle; `fd` must be a valid open socket; and `buf`
+ * must be a live buffer allocated by [`lio_buf_alloc`] with length `buf_len`.
+ */
+void lio_recvfrom(struct lio_handle_t *lio,
+                  intptr_t fd,
+                  uint8_t *buf,
+                  uintptr_t buf_len,
+                  int flags,
+                  void (*callback)(int, uint8_t*, uintptr_t, const sockaddr_storage*));
+
+/**
  * Wait for `millis` milliseconds.
  *
  * - `callback(result)`: 0 on success
@@ -214,6 +477,14 @@ void lio_recv(struct lio_handle_t *lio,
  * `lio` must be a valid handle.
  */
 void lio_sleep(struct lio_handle_t *lio, unsigned int millis, void (*callback)(int));
+
+/**
+ * Runs an interval and invokes `callback` for every tick until the lio handle is destroyed.
+ *
+ * # Safety
+ * `lio` must be a valid handle.
+ */
+void lio_interval(struct lio_handle_t *lio, unsigned int millis, void (*callback)(int));
 
 /**
  * A no-op that completes immediately.
@@ -386,6 +657,93 @@ void lio_mkdirat(struct lio_handle_t *lio,
                  const char *path,
                  mode_t mode,
                  void (*callback)(int));
+
+/**
+ * Reads metadata for a path relative to a directory file descriptor.
+ *
+ * # Safety
+ * `lio` must be a valid handle; `dir_fd` must be a valid open directory file
+ * descriptor; and a non-null `path` must point to a valid NUL-terminated
+ * string. The descriptor must remain open until the operation completes.
+ */
+void lio_statat(struct lio_handle_t *lio,
+                intptr_t dir_fd,
+                const char *path,
+                int follow_symlinks,
+                void (*callback)(int, struct lio_file_stat_t));
+
+/**
+ * Reads metadata for an open file descriptor.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `fd` must be a valid open file descriptor
+ * that remains open until the operation completes.
+ */
+void lio_fstat(struct lio_handle_t *lio,
+               intptr_t fd,
+               void (*callback)(int, struct lio_file_stat_t));
+
+/**
+ * Reads the target of a symbolic link relative to a directory file descriptor.
+ *
+ * Ownership of `buf` transfers to lio and is returned through `callback`.
+ *
+ * # Safety
+ * `lio` must be a valid handle; `dir_fd` must be a valid open directory file
+ * descriptor; a non-null `path` must point to a valid NUL-terminated string;
+ * and `buf` must be a live buffer allocated by [`lio_buf_alloc`] with length
+ * `buf_len`. The descriptor must remain open until the operation completes.
+ */
+void lio_readlinkat(struct lio_handle_t *lio,
+                    intptr_t dir_fd,
+                    const char *path,
+                    uint8_t *buf,
+                    uintptr_t buf_len,
+                    void (*callback)(int, uint8_t*, uintptr_t));
+
+/**
+ * Reads the current working directory into a caller-provided buffer.
+ *
+ * Ownership of `buf` transfers to lio and is returned through `callback`.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `buf` must be a live buffer allocated by
+ * [`lio_buf_alloc`] with length `buf_len`.
+ */
+void lio_getcwd(struct lio_handle_t *lio,
+                uint8_t *buf,
+                uintptr_t buf_len,
+                void (*callback)(int, uint8_t*, uintptr_t));
+
+/**
+ * Reads one batch of directory entries from an open directory descriptor.
+ *
+ * The buffers returned through `callback` must be released with
+ * [`lio_buf_free`] and [`lio_dir_entries_free`], respectively.
+ *
+ * # Safety
+ * `lio` must be a valid handle, and `fd` must be a valid open directory file
+ * descriptor that remains open until the operation completes.
+ */
+void lio_readdir(struct lio_handle_t *lio,
+                 intptr_t fd,
+                 uintptr_t raw_capacity,
+                 uintptr_t entries_capacity,
+                 void (*callback)(int, uint8_t*, uintptr_t, struct lio_dir_entry_t*, uintptr_t, int));
+
+/**
+ * Spawn a process.
+ *
+ * # Safety
+ * `lio` must be a valid handle. A non-null `path` must point to a valid
+ * NUL-terminated string. `argv` and `envp` must each be null or point to a
+ * null-terminated array of pointers to valid NUL-terminated strings.
+ */
+void lio_spawn(struct lio_handle_t *lio,
+               const char *path,
+               const char *const *argv,
+               const char *const *envp,
+               void (*callback)(intptr_t));
 
 #ifdef __cplusplus
 }  // extern "C"

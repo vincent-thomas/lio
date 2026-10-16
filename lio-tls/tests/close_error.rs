@@ -1,7 +1,7 @@
 mod common;
 
 use std::{
-  io::{self, Write},
+  io::{self, Read, Write},
   net::TcpListener,
   thread,
 };
@@ -18,7 +18,14 @@ fn handshake_fails_if_peer_closes_tcp_before_tls_handshake() -> io::Result<()> {
   let listener = TcpListener::bind("127.0.0.1:0")?;
   let addr = listener.local_addr()?;
   let server = thread::spawn(move || {
-    let (_tcp, _) = listener.accept()?;
+    let (mut tcp, _) = listener.accept()?;
+    // Take the whole ClientHello before closing. Closing with unread data
+    // sends a reset, which the client may see instead of the end of the
+    // stream, depending on timing.
+    let mut header = [0u8; 5];
+    tcp.read_exact(&mut header)?;
+    let mut body = vec![0u8; u16::from_be_bytes([header[3], header[4]]).into()];
+    tcp.read_exact(&mut body)?;
     Ok(())
   });
 

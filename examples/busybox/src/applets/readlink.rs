@@ -1,6 +1,4 @@
-use std::{ffi::CString, io, path::Path};
-
-use lio::api;
+use std::{io, path::Path};
 
 use crate::{
   app::AppContext,
@@ -106,17 +104,11 @@ pub(crate) fn read_link_target(
   ctx: &AppContext,
   path: &Path,
 ) -> io::Result<String> {
-  let cpath = CString::new(path.as_os_str().to_string_lossy().as_bytes())
-    .map_err(|_| {
-      io::Error::new(io::ErrorKind::InvalidInput, "readlink: invalid path")
-    })?;
-  let mut receiver = api::readlinkat(&ctx.cwd(), cpath, vec![0; 4096])
-    .with_lio(ctx.lio())
-    .send();
-  let (result, buf) = io_util::run_recv(ctx.lio(), &mut receiver);
-  let n = result? as usize;
-  String::from_utf8(buf[..n].to_vec())
-    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+  let target = io_util::run(
+    ctx.lio(),
+    lio::fs::read_link(path).with_lio(ctx.lio()).send(),
+  )?;
+  Ok(target.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]

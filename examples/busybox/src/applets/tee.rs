@@ -56,9 +56,13 @@ impl Command for TeeCommand {
     let mut open_receivers = Vec::with_capacity(self.files.len());
     for path in &self.files {
       let cpath = CString::new(path.as_str())?;
-      let flags = libc::O_WRONLY
-        | libc::O_CREAT
-        | if self.append { libc::O_APPEND } else { libc::O_TRUNC };
+      let flags = lio::api::OpenFlags::WRITE
+        | lio::api::OpenFlags::CREATE
+        | if self.append {
+          lio::api::OpenFlags::APPEND
+        } else {
+          lio::api::OpenFlags::TRUNCATE
+        };
       open_receivers.push(
         api::openat(&ctx.cwd(), cpath, flags, 0o666).with_lio(ctx.lio()).send(),
       );

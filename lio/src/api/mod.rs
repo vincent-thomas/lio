@@ -34,16 +34,17 @@
 
 pub mod io;
 pub mod op;
-pub mod op_contract;
 pub mod ops;
 pub mod pid;
 pub mod resource;
 
 pub use crate::backend::op::{
-  DirEntryRef, DirEntryView, FileStat, FileType, ReadDirBuf, ReadDirResult,
-  SockDomain, SockProto, SockType,
+  DirEntryRef, DirEntryView, FileMode, FileStat, FileType, OpenFlags,
+  ReadDirBuf, ReadDirResult, ReadFlags, RecvFlags, SendFlags, ShutdownHow,
+  SockDomain, SockProto, SockType, UnlinkKind, WriteFlags,
 };
 pub use io::{Io, IoStream, Receiver, StreamReceiver};
+pub use ops::UnixAddr;
 pub use pid::Pid;
 
 use crate::{IoBufMutVec, IoBufVec};
@@ -153,7 +154,7 @@ doc_op! {
     pub fn recv<B>(
         res: &impl AsResource,
         buf: B,
-        flags: Option<i32>,
+        flags: Option<RecvFlags>,
     ) -> Io<ops::Recv<B>>
     where
         B: IoBufMutVec + Send + Sync + 'static,
@@ -168,7 +169,7 @@ doc_op! {
     pub fn send<B>(
         res: &impl AsResource,
         buf: B,
-        flags: Option<i32>,
+        flags: Option<SendFlags>,
     ) -> Io<ops::Send<B>>
     where
         B: IoBufVec + Send + Sync + 'static,
@@ -185,7 +186,7 @@ doc_op! {
     pub fn recvfrom<B>(
         res: &impl AsResource,
         buf: B,
-        flags: Option<i32>,
+        flags: Option<RecvFlags>,
     ) -> Io<ops::RecvFrom<B>>
     where
         B: IoBufMutVec + Send + Sync + 'static,
@@ -201,6 +202,16 @@ doc_op! {
         res: &impl AsResource,
     ) -> Io<ops::Accept> {
         Io::from_op(ops::Accept::new(res.as_resource().clone()))
+    }
+}
+
+doc_op! {
+    short: "Accepts a single incoming connection from a UNIX-domain listening socket, with the peer's address.",
+
+    pub fn accept_unix(
+        res: &impl AsResource,
+    ) -> Io<ops::AcceptUnix> {
+        Io::from_op(ops::AcceptUnix::new(res.as_resource().clone()))
     }
 }
 
@@ -242,7 +253,7 @@ doc_op! {
 
     pub fn shutdown(
         res: &impl AsResource,
-        how: i32,
+        how: ShutdownHow,
     ) -> Io<ops::Shutdown> {
         Io::from_op(ops::Shutdown::new(res.as_resource().clone(), how))
     }
@@ -254,14 +265,14 @@ doc_op! {
     pub fn openat(
         dir_res: &impl AsResource,
         path: std::ffi::CString,
-        flags: i32,
-        mode: u32
+        flags: OpenFlags,
+        mode: impl Into<FileMode>
     ) -> Io<ops::OpenAt> {
         Io::from_op(ops::OpenAt::new(
             dir_res.as_resource().clone(),
             path,
             flags,
-            mode
+            mode.into()
         ))
     }
 }
@@ -312,12 +323,12 @@ doc_op! {
     pub fn unlinkat(
         dir_res: &impl AsResource,
         path: std::ffi::CString,
-        flags: i32,
+        kind: UnlinkKind,
     ) -> Io<ops::UnlinkAt> {
         Io::from_op(ops::UnlinkAt::new(
             dir_res.as_resource().clone(),
             path,
-            flags,
+            kind,
         ))
     }
 }
@@ -346,12 +357,12 @@ doc_op! {
     pub fn mkdirat(
         dir_res: &impl AsResource,
         path: std::ffi::CString,
-        mode: u32,
+        mode: impl Into<FileMode>,
     ) -> Io<ops::MkdirAt> {
         Io::from_op(ops::MkdirAt::new(
             dir_res.as_resource().clone(),
             path,
-            mode,
+            mode.into(),
         ))
     }
 }
@@ -401,9 +412,8 @@ doc_op! {
 }
 
 doc_op! {
-    short: "Spawns a new process using posix_spawn().",
+    short: "Spawns a new process; `argv[0]` is the conventional program name.",
 
-    #[cfg(unix)]
     pub fn spawn(
         path: std::ffi::CString,
         argv: Vec<std::ffi::CString>,
@@ -437,7 +447,7 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn sendto<B>(res: &impl AsResource, buf: B, addr: SocketAddr, flags: Option<i32>) -> Io<ops::Send<B>>
+    pub fn sendto<B>(res: &impl AsResource, buf: B, addr: SocketAddr, flags: Option<SendFlags>) -> Io<ops::Send<B>>
     where
         B: IoBufVec + Send + Sync + 'static,
     {

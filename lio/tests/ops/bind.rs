@@ -7,11 +7,7 @@
 use super::common::{self, poll_until_recv};
 use lio::Lio;
 use lio::api::bind;
-use std::{
-  net::SocketAddr,
-  os::fd::{AsFd, AsRawFd},
-  sync::mpsc,
-};
+use std::{net::SocketAddr, sync::mpsc};
 
 #[test]
 fn test_bind_ipv4_any_port() {
@@ -28,18 +24,8 @@ fn test_bind_ipv4_any_port() {
   poll_until_recv(&mut lio, &receiver_bind).expect("Failed to bind socket");
 
   // Verify binding by getting the socket name
-  unsafe {
-    let mut addr_storage =
-      std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let result = libc::getsockname(
-      sock.clone().as_fd().as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    assert_eq!(result, 0, "getsockname should succeed");
-  }
+  let bound = common::get_bound_addr(&sock);
+  assert!(bound.is_ipv4() && bound.port() != 0);
 }
 
 #[test]
@@ -58,18 +44,7 @@ fn test_bind_ipv4_specific_port() {
     .expect("Failed to bind to specific port");
 
   // Verify the port
-  unsafe {
-    let mut addr_storage = std::mem::MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    libc::getsockname(
-      sock.as_fd().as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    let sockaddr_in = addr_storage.assume_init();
-    assert_eq!(u16::from_be(sockaddr_in.sin_port), 19999);
-  }
+  assert_eq!(common::get_bound_addr(&sock).port(), 19999);
 }
 
 #[test]
@@ -88,18 +63,7 @@ fn test_bind_ipv6() {
     .expect("Failed to bind IPv6 socket");
 
   // Verify binding
-  unsafe {
-    let mut addr_storage =
-      std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let result = libc::getsockname(
-      sock.as_fd().as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    assert_eq!(result, 0);
-  }
+  assert!(common::get_bound_addr(&sock).is_ipv6());
 }
 
 #[test]
@@ -116,18 +80,7 @@ fn test_bind_udp() {
   poll_until_recv(&mut lio, &receiver_bind).expect("Failed to bind UDP socket");
 
   // Verify binding
-  unsafe {
-    let mut addr_storage =
-      std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let result = libc::getsockname(
-      sock.as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    assert_eq!(result, 0);
-  }
+  assert_ne!(common::get_bound_addr(&sock).port(), 0);
 }
 
 #[test]
@@ -149,28 +102,13 @@ fn test_bind_already_bound() {
     .expect("Failed to bind first socket");
 
   // Put socket in listening state to actually claim the port
-  unsafe {
-    libc::listen(sock1.as_raw_fd(), 1);
-  }
-
-  // Get the actual bound address
-  let bound_addr = unsafe {
-    let mut addr_storage = std::mem::MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    libc::getsockname(
-      sock1.as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    addr_storage.assume_init()
-  };
+  let (sender_listen, receiver_listen) = mpsc::channel();
+  lio::api::listen(&sock1, 1).with_lio(&mut lio).send_with(sender_listen);
+  poll_until_recv(&mut lio, &receiver_listen).expect("Failed to listen");
 
   // Try to bind another socket to the same address
   let sock2 = common::tcp_socket();
-
-  let port = u16::from_be(bound_addr.sin_port);
-  let addr2: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+  let addr2 = common::get_bound_addr(&sock1);
 
   let (sender_bind2, receiver_bind2) = mpsc::channel();
   bind(&sock2, addr2).with_lio(&mut lio).send_with(sender_bind2.clone());
@@ -212,16 +150,7 @@ fn test_bind_with_reuseaddr() {
   let sock1 = common::tcp_socket();
 
   // Enable SO_REUSEADDR on first socket
-  unsafe {
-    let reuse: i32 = 1;
-    libc::setsockopt(
-      sock1.as_raw_fd(),
-      libc::SOL_SOCKET,
-      libc::SO_REUSEADDR,
-      &reuse as *const _ as *const libc::c_void,
-      std::mem::size_of::<i32>() as libc::socklen_t,
-    );
-  }
+  common::set_reuse_addr(&sock1);
 
   let addr: SocketAddr = "127.0.0.1:18888".parse().unwrap();
 
@@ -236,16 +165,7 @@ fn test_bind_with_reuseaddr() {
   // Immediately bind another socket to the same address with SO_REUSEADDR
   let sock2 = common::tcp_socket();
 
-  unsafe {
-    let reuse: i32 = 1;
-    libc::setsockopt(
-      sock2.as_raw_fd(),
-      libc::SOL_SOCKET,
-      libc::SO_REUSEADDR,
-      &reuse as *const _ as *const libc::c_void,
-      std::mem::size_of::<i32>() as libc::socklen_t,
-    );
-  }
+  common::set_reuse_addr(&sock2);
 
   let (sender_bind2, receiver_bind2) = mpsc::channel();
   bind(&sock2, addr).with_lio(&mut lio).send_with(sender_bind2.clone());
@@ -270,19 +190,7 @@ fn test_bind_localhost() {
     .expect("Failed to bind to localhost");
 
   // Verify it's bound to localhost
-  unsafe {
-    let mut addr_storage = std::mem::MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut addr_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    libc::getsockname(
-      sock.as_raw_fd(),
-      addr_storage.as_mut_ptr() as *mut libc::sockaddr,
-      &mut addr_len,
-    );
-    let sockaddr_in = addr_storage.assume_init();
-    // 127.0.0.1 in network byte order
-    assert_eq!(u32::from_be(sockaddr_in.sin_addr.s_addr), 0x7f000001);
-  }
+  assert!(common::get_bound_addr(&sock).ip().is_loopback());
 }
 
 #[test]

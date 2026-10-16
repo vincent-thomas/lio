@@ -22,7 +22,12 @@ fn new_ds_lio() -> Lio {
   .unwrap()
 }
 
-fn open_file(lio: &mut Lio, path: CString, flags: i32, mode: u32) -> Resource {
+fn open_file(
+  lio: &mut Lio,
+  path: CString,
+  flags: lio::api::OpenFlags,
+  mode: u32,
+) -> Resource {
   let mut receiver =
     api::openat(&Resource::cwd(), path, flags, mode).with_lio(lio).send();
   common::poll_recv(lio, &mut receiver).unwrap()
@@ -55,16 +60,23 @@ fn test_unlinkat_file() {
   let _file = open_file(
     &mut lio,
     path.clone(),
-    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+    lio::api::OpenFlags::WRITE
+      | lio::api::OpenFlags::CREATE
+      | lio::api::OpenFlags::TRUNCATE,
     0o644,
   );
 
   let mut receiver =
-    api::unlinkat(&Resource::cwd(), path.clone(), 0).with_lio(&mut lio).send();
+    api::unlinkat(&Resource::cwd(), path.clone(), api::UnlinkKind::File)
+      .with_lio(&mut lio)
+      .send();
   common::poll_recv(&mut lio, &mut receiver).expect("unlinkat should succeed");
 
   let result = stat_path(&mut lio, path);
-  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+  assert_eq!(
+    result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::ENOENT)
+  );
 }
 
 #[test]
@@ -77,12 +89,15 @@ fn test_unlinkat_directory() {
   mkdir(&mut lio, path.clone());
 
   let mut receiver =
-    api::unlinkat(&Resource::cwd(), path.clone(), libc::AT_REMOVEDIR)
+    api::unlinkat(&Resource::cwd(), path.clone(), api::UnlinkKind::Directory)
       .with_lio(&mut lio)
       .send();
   common::poll_recv(&mut lio, &mut receiver)
     .expect("unlinkat AT_REMOVEDIR should succeed");
 
   let result = stat_path(&mut lio, path);
-  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+  assert_eq!(
+    result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::ENOENT)
+  );
 }

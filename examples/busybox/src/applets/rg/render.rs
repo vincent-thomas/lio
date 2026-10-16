@@ -1,6 +1,6 @@
 use super::*;
 use serde_json::{Map, Value, json};
-use std::io::{self, Write};
+use std::io;
 
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_PATH: &str = "\x1b[35m";
@@ -25,8 +25,7 @@ impl<'a> AppByteSink<'a> {
 
 impl ByteSink for AppByteSink<'_> {
   fn write_chunk(&mut self, bytes: Vec<u8>) -> io::Result<()> {
-    let _ = self.ctx;
-    std::io::stdout().write_all(&bytes)
+    crate::util::io::write_all(self.ctx.lio(), &self.ctx.stdout(), bytes)
   }
 }
 

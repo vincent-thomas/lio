@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use crate::{
   api::{
-    self,
+    self, ShutdownHow, SockDomain, SockProto, SockType,
     io::Io,
     ops::{Bind, Connect, Listen, Recv, RecvFrom, Send, Shutdown},
     resource::{AsResource, FromResource, IntoResource, Resource},
@@ -28,7 +28,7 @@ use crate::{
 ///
 /// async fn run_server() -> std::io::Result<()> {
 ///     // Create a new socket
-///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+///     let socket = Socket::new(lio::api::SockDomain::IPV4, lio::api::SockType::STREAM, lio::api::SockProto::DEFAULT).await?;
 ///
 ///     // Bind to an address
 ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
@@ -57,7 +57,7 @@ use crate::{
 ///
 /// async fn connect_to_server() -> std::io::Result<()> {
 ///     // Create a new socket
-///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+///     let socket = Socket::new(lio::api::SockDomain::IPV4, lio::api::SockType::STREAM, lio::api::SockProto::DEFAULT).await?;
 ///
 ///     // Connect to a server
 ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
@@ -69,7 +69,7 @@ use crate::{
 ///     let bytes_sent = result? as usize;
 ///
 ///     // Shutdown the write side
-///     socket.shutdown(libc::SHUT_WR).await?;
+///     socket.shutdown(lio::api::ShutdownHow::Write).await?;
 ///
 ///     Ok(())
 /// }
@@ -95,79 +95,36 @@ impl FromResource for Socket {
 }
 
 impl Socket {
-  fn query_addr<F>(&self, query: F) -> std::io::Result<SocketAddr>
-  where
-    F: FnOnce(i32, *mut libc::sockaddr, *mut libc::socklen_t) -> libc::c_int,
-  {
-    use std::os::fd::AsRawFd;
-
-    let fd = self.0.as_raw_fd();
-    // SAFETY: sockaddr_storage is a C struct safe to zero-initialize
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len =
-      std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-
-    let ret =
-      query(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len);
-
-    if ret < 0 {
-      return Err(std::io::Error::last_os_error());
-    }
-
-    match storage.ss_family as libc::c_int {
-      libc::AF_INET => {
-        // SAFETY: ss_family == AF_INET guarantees storage contains sockaddr_in
-        let addr: &libc::sockaddr_in =
-          unsafe { &*(&storage as *const _ as *const _) };
-        let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
-        let port = u16::from_be(addr.sin_port);
-        Ok(SocketAddr::from((ip, port)))
-      }
-      libc::AF_INET6 => {
-        // SAFETY: ss_family == AF_INET6 guarantees storage contains sockaddr_in6
-        let addr: &libc::sockaddr_in6 =
-          unsafe { &*(&storage as *const _ as *const _) };
-        let ip = std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
-        let port = u16::from_be(addr.sin6_port);
-        Ok(SocketAddr::from((ip, port)))
-      }
-      _ => Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "unsupported address family",
-      )),
-    }
-  }
-
   /// Creates a new socket with the specified domain, type, and protocol.
   ///
   /// This is a low-level operation that directly wraps the `socket(2)` system call.
   ///
   /// # Parameters
   ///
-  /// - `domain`: The communication domain (e.g., `AF_INET` for IPv4, `AF_INET6` for IPv6)
-  /// - `ty`: The socket type (e.g., `SOCK_STREAM` for TCP, `SOCK_DGRAM` for UDP)
-  /// - `proto`: The protocol to use (typically `0` for default protocol)
+  /// - `domain`: The communication domain (e.g., [`SockDomain::IPV4`], [`SockDomain::IPV6`])
+  /// - `ty`: The socket type (e.g., [`SockType::STREAM`], [`SockType::DGRAM`])
+  /// - `proto`: The protocol to use (typically [`SockProto::DEFAULT`])
   ///
   /// # Examples
   ///
   /// ```rust,no_run
-  /// use lio::net::Socket;
+  /// use lio::{api::{SockDomain, SockProto, SockType}, net::Socket};
   ///
   /// async fn example() -> std::io::Result<()> {
   ///     // Create a TCP socket for IPv4
-  ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+  ///     let socket = Socket::new(SockDomain::IPV4, SockType::STREAM, SockProto::DEFAULT).await?;
   ///
   ///     // Create a UDP socket for IPv6
-  ///     let udp_socket = Socket::new(libc::AF_INET6, libc::SOCK_DGRAM, 0).await?;
+  ///     let udp_socket = Socket::new(SockDomain::IPV6, SockType::DGRAM, SockProto::DEFAULT).await?;
   ///
   ///     Ok(())
   /// }
   /// ```
   #[allow(clippy::new_ret_no_self)]
   pub fn new(
-    domain: libc::c_int,
-    ty: libc::c_int,
-    proto: libc::c_int,
+    domain: SockDomain,
+    ty: SockType,
+    proto: SockProto,
   ) -> Io<SocketNew> {
     let socket_accept_op = SocketNew::new(domain, ty, proto);
     Io::from_op(socket_accept_op)
@@ -185,7 +142,7 @@ impl Socket {
   /// use lio::net::Socket;
   ///
   /// async fn example() -> std::io::Result<()> {
-  ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+  ///     let socket = Socket::new(lio::api::SockDomain::IPV4, lio::api::SockType::STREAM, lio::api::SockProto::DEFAULT).await?;
   ///
   ///     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
   ///     socket.bind(addr).await?;
@@ -209,7 +166,7 @@ impl Socket {
   /// use lio::net::Socket;
   ///
   /// async fn example() -> std::io::Result<()> {
-  ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+  ///     let socket = Socket::new(lio::api::SockDomain::IPV4, lio::api::SockType::STREAM, lio::api::SockProto::DEFAULT).await?;
   ///
   ///     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
   ///     socket.bind(addr).await?;
@@ -241,7 +198,7 @@ impl Socket {
   /// use lio::net::Socket;
   ///
   /// async fn example() -> std::io::Result<()> {
-  ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+  ///     let socket = Socket::new(lio::api::SockDomain::IPV4, lio::api::SockType::STREAM, lio::api::SockProto::DEFAULT).await?;
   ///
   ///     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
   ///     socket.bind(addr).await?;
@@ -270,7 +227,7 @@ impl Socket {
   /// use lio::net::Socket;
   ///
   /// async fn example() -> std::io::Result<()> {
-  ///     let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+  ///     let socket = Socket::new(lio::api::SockDomain::IPV4, lio::api::SockType::STREAM, lio::api::SockProto::DEFAULT).await?;
   ///
   ///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
   ///     socket.connect(addr).await?;
@@ -389,24 +346,24 @@ impl Socket {
   ///     // Send all data...
   ///
   ///     // Shutdown the write side to signal EOF to the peer
-  ///     socket.shutdown(libc::SHUT_WR).await?;
+  ///     socket.shutdown(lio::api::ShutdownHow::Write).await?;
   ///
   ///     // Can still receive data...
   ///
   ///     Ok(())
   /// }
   /// ```
-  pub fn shutdown(&self, how: i32) -> Io<Shutdown> {
+  pub fn shutdown(&self, how: ShutdownHow) -> Io<Shutdown> {
     api::shutdown(&self.0, how)
   }
 
   /// Returns the local address this socket is bound to.
   pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-    self.query_addr(|fd, addr, len| unsafe { libc::getsockname(fd, addr, len) })
+    crate::backend::sockaddr::socket_name(&self.0, false)
   }
 
   /// Returns the remote address this socket is connected to.
   pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-    self.query_addr(|fd, addr, len| unsafe { libc::getpeername(fd, addr, len) })
+    crate::backend::sockaddr::socket_name(&self.0, true)
   }
 }

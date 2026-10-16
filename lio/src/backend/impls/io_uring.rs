@@ -4,7 +4,6 @@
 
 use std::io;
 use std::mem;
-use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
@@ -13,21 +12,34 @@ use bumpalo::Bump;
 use lio_uring::{
   Entry, LioUring,
   operation::{
-    Accept, Bind, Connect, Fsync, LinkAt, Listen, MkDirAt, Nop, OpenAt, Readv,
-    RecvMsg, RenameAt, SendMsg, Shutdown, Socket, Statx, SymlinkAt, UnlinkAt,
-    Writev,
+    Accept, AsyncCancel, Bind, Connect, Fsync, LinkAt, Listen, MkDirAt, Nop,
+    OpenAt, Readv, Recv, RecvMsg, RenameAt, Send, SendMsg, Shutdown, Socket,
+    Statx, SymlinkAt, UnlinkAt, Writev,
   },
 };
 
 use crate::backend::{
   IoBackend, OpCompleted,
-  op::{DirEntryRef, LinkKind, Op, ReadDirResult, file_type_from_dirent_dtype},
+  impls::unix_stat::file_type_from_dirent_dtype,
+  op::{DirEntryRef, LinkKind, Op, ReadDirResult},
 };
 use crate::slab::{Slab, SlabKey};
 
 const STATX_BASIC_STATS: u32 = 0x0000_07ff;
+/// `user_data` of cancellation requests. Their completions are not
+/// operations, and no slab key decodes to it.
+const CANCEL_USER_DATA: u64 = u64::MAX - 1;
+/// How long dropping the backend waits for cancelled operations to finish.
+/// Requests parked on readiness (accept, socket reads) are cancelled at
+/// once; this only bounds I/O a kernel worker is still busy with.
+const DRAIN_GRACE: Duration = Duration::from_millis(500);
 const LINUX_DIRENT64_NAME_OFFSET: usize = 19;
 type CurrentDirent<'a> = (u64, u8, usize, &'a [u8]);
+
+#[cfg(test)]
+mod deferred_tests;
+#[cfg(test)]
+mod single_socket_tests;
 
 #[derive(Debug)]
 struct PendingOp {
@@ -45,8 +57,19 @@ struct NativeMsgState {
   hdr: libc::msghdr,
 }
 
+#[derive(Debug)]
+struct NativePathState {
+  path1: std::ffi::CString,
+  path2: Option<std::ffi::CString>,
+}
+
 impl NativeMsgState {
   fn from_recv(msg: &crate::backend::op::MsgRecv) -> Option<Self> {
+    // The native iovec array is fixed-size; a longer list would make the
+    // kernel read past it.
+    if msg.buf_count.get() > crate::buf::MAX_IOV_COUNT {
+      return None;
+    }
     // SAFETY: `MsgRecv` validation guarantees `bufs` points to `buf_count`
     // live `RawBuf` entries for the duration of lowering.
     let bufs = unsafe {
@@ -81,6 +104,11 @@ impl NativeMsgState {
   }
 
   fn from_send(msg: &crate::backend::op::MsgSend) -> Option<Self> {
+    // The native iovec array is fixed-size; a longer list would make the
+    // kernel read past it.
+    if msg.buf_count.get() > crate::buf::MAX_IOV_COUNT {
+      return None;
+    }
     // SAFETY: `MsgSend` validation guarantees `bufs` points to `buf_count`
     // live `RawBuf` entries for the duration of lowering.
     let bufs = unsafe {
@@ -90,7 +118,7 @@ impl NativeMsgState {
       iovecs: [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
         crate::buf::MAX_IOV_COUNT],
       iov_count: bufs.len(),
-      addr: msg.to.map(crate::backend::op::socket_addr_to_storage),
+      addr: msg.to.map(crate::backend::impls::sockaddr::socket_addr_to_storage),
       from_out: None,
       // SAFETY: `libc::msghdr` is a plain C struct and zero is a valid
       // sentinel initialization before we fill its pointer fields.
@@ -151,6 +179,11 @@ impl NativeRwState {
     iovecs: std::ptr::NonNull<crate::backend::op::RawBuf>,
     iov_count: usize,
   ) -> Option<Self> {
+    // The native iovec array is fixed-size; a longer list would make the
+    // kernel read past it.
+    if iov_count > crate::buf::MAX_IOV_COUNT {
+      return None;
+    }
     // SAFETY: op validation guarantees `iovecs` references `iov_count`
     // contiguous `RawBuf` entries that stay live through lowering.
     let raws =
@@ -169,8 +202,11 @@ impl NativeRwState {
 
 #[derive(Debug)]
 enum NativeSocketKind {
-  Accept { out: std::ptr::NonNull<crate::backend::op::SocketAddrBuf> },
-  Connect,
+  Accept {
+    out: std::ptr::NonNull<crate::backend::op::SocketAddrBuf>,
+  },
+  /// Address input for `bind`/`connect`; nothing to write back.
+  Addr,
 }
 
 #[derive(Debug)]
@@ -184,13 +220,23 @@ struct NativeSocketState {
 struct NativeStatState {
   statx: lio_uring::statx,
   out: std::ptr::NonNull<crate::backend::op::FileStat>,
+  path: Option<std::ffi::CString>,
 }
 
 impl NativeStatState {
   fn new(out: std::ptr::NonNull<crate::backend::op::FileStat>) -> Self {
     // SAFETY: `statx` is a POD output struct written by the kernel before
     // being read during finalize.
-    Self { statx: unsafe { mem::zeroed() }, out }
+    Self { statx: unsafe { mem::zeroed() }, out, path: None }
+  }
+
+  fn with_path(
+    out: std::ptr::NonNull<crate::backend::op::FileStat>,
+    path: std::ffi::CString,
+  ) -> Self {
+    // SAFETY: `statx` is a POD output struct written by the kernel before
+    // being read during finalize.
+    Self { statx: unsafe { mem::zeroed() }, out, path: Some(path) }
   }
 
   fn finalize(&self) {
@@ -238,54 +284,108 @@ impl NativeSocketState {
     }
   }
 
-  fn from_connect(
-    addr: &crate::backend::op::SocketAddrBuf,
-  ) -> io::Result<Self> {
-    let (storage, len) = crate::backend::op::socket_addr_buf_to_storage(addr)?;
-    Ok(Self { storage, len, kind: NativeSocketKind::Connect })
+  fn from_addr(addr: &crate::backend::op::SocketAddrBuf) -> io::Result<Self> {
+    let (storage, len) =
+      crate::backend::impls::sockaddr::socket_addr_buf_to_storage(addr)?;
+    Ok(Self { storage, len, kind: NativeSocketKind::Addr })
   }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum LoweredState {
   Plain,
+  SingleMsg { ptr: NonNull<u8>, len: u32 },
   Rw(NonNull<NativeRwState>),
   Msg(NonNull<NativeMsgState>),
   Socket(NonNull<NativeSocketState>),
   Stat(NonNull<NativeStatState>),
+  Path(NonNull<NativePathState>),
 }
 
 impl LoweredState {
-  fn lower_in(op: &Op, arena: &Bump) -> io::Result<Self> {
+  fn os_path_to_cstring(
+    path: &std::ffi::OsString,
+  ) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+      .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+  }
+
+  fn lower_in(op: &Op, arena: &Bump, single_socket: bool) -> io::Result<Self> {
     Ok(match op {
       Op::Read { iovecs, iov_count, .. } => {
         let state = NativeRwState::from_raws(*iovecs, *iov_count)
-          .expect("validated read op must have iovecs");
+          .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         Self::Rw(NonNull::from(arena.alloc(state)))
       }
       Op::Write { iovecs, iov_count, .. } => {
         let state = NativeRwState::from_raws(*iovecs, *iov_count)
-          .expect("validated read/write op must have iovecs");
+          .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         Self::Rw(NonNull::from(arena.alloc(state)))
       }
       Op::Recv { msg, .. } => {
+        // The non-vectored opcode needs no native msghdr or iovec storage.
+        // SAFETY: validated message descriptors remain live until completion.
+        if single_socket
+          && msg.buf_count.get() == 1
+          && msg.from.is_none()
+          && unsafe { msg.bufs.as_ref() }.len <= u32::MAX as usize
+        {
+          let buf = unsafe { msg.bufs.as_ref() };
+          return Ok(Self::SingleMsg { ptr: buf.ptr, len: buf.len as u32 });
+        }
         let state = NativeMsgState::from_recv(msg)
-          .expect("validated recv op must have native message state");
+          .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         Self::Msg(NonNull::from(arena.alloc(state)))
       }
       Op::Send { msg, .. } => {
+        // Keep addressed and oversized messages on the general sendmsg path.
+        // SAFETY: validated message descriptors remain live until completion.
+        if single_socket
+          && msg.buf_count.get() == 1
+          && msg.to.is_none()
+          && unsafe { msg.bufs.as_ref() }.len <= u32::MAX as usize
+        {
+          let buf = unsafe { msg.bufs.as_ref() };
+          return Ok(Self::SingleMsg { ptr: buf.ptr, len: buf.len as u32 });
+        }
         let state = NativeMsgState::from_send(msg)
-          .expect("validated send op must have native message state");
+          .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         Self::Msg(NonNull::from(arena.alloc(state)))
       }
       Op::Accept { addr, .. } => Self::Socket(NonNull::from(
         arena.alloc(NativeSocketState::from_accept(*addr)),
       )),
-      Op::Connect { addr, .. } => Self::Socket(NonNull::from(
-        arena.alloc(NativeSocketState::from_connect(addr)?),
-      )),
-      Op::Stat { out, .. } => {
-        Self::Stat(NonNull::from(arena.alloc(NativeStatState::new(*out))))
+      // The kernel copies the address at submission time, so it has to live
+      // in the arena rather than on the stack of `create_entry`.
+      Op::Connect { addr, .. } | Op::Bind { addr, .. } => Self::Socket(
+        NonNull::from(arena.alloc(NativeSocketState::from_addr(addr)?)),
+      ),
+      Op::Stat { target, out } => {
+        let state = match target {
+          crate::backend::op::StatTarget::Path { path, .. } => {
+            let path_cstr = Self::os_path_to_cstring(path)?;
+            NativeStatState::with_path(*out, path_cstr)
+          }
+          crate::backend::op::StatTarget::Fd { .. } => {
+            NativeStatState::new(*out)
+          }
+        };
+        Self::Stat(NonNull::from(arena.alloc(state)))
+      }
+      Op::OpenAt { path, .. }
+      | Op::UnlinkAt { path, .. }
+      | Op::MkdirAt { path, .. } => {
+        let path1 = Self::os_path_to_cstring(path)?;
+        Self::Path(NonNull::from(
+          arena.alloc(NativePathState { path1, path2: None }),
+        ))
+      }
+      Op::RenameAt { old_path, new_path, .. }
+      | Op::LinkAt { source_path: old_path, new_path, .. } => {
+        let path1 = Self::os_path_to_cstring(old_path)?;
+        let path2 = Some(Self::os_path_to_cstring(new_path)?);
+        Self::Path(NonNull::from(arena.alloc(NativePathState { path1, path2 })))
       }
       _ => Self::Plain,
     })
@@ -294,6 +394,19 @@ impl LoweredState {
   fn create_entry(self, op: &Op) -> Entry {
     match self {
       Self::Plain => IoUring::create_plain_entry(op),
+      Self::SingleMsg { ptr, len } => match op {
+        Op::Recv { fd, flags, .. } => {
+          Recv::new(fd.as_raw_fd(), ptr.as_ptr(), len)
+            .flags(flags.bits())
+            .build()
+        }
+        Op::Send { fd, flags, .. } => {
+          Send::new(fd.as_raw_fd(), ptr.as_ptr(), len)
+            .flags(flags.bits())
+            .build()
+        }
+        _ => unreachable!("single message requires send/recv op"),
+      },
       Self::Rw(state) => {
         // SAFETY: `state` points into the bump arena backing this lowered op
         // and remains valid until submission finishes.
@@ -314,6 +427,11 @@ impl LoweredState {
         // and remains valid until submission finishes.
         IoUring::create_stat_entry(op, unsafe { state.as_ref() })
       }
+      Self::Path(state) => {
+        // SAFETY: `state` points into the bump arena backing this lowered op
+        // and remains valid until submission finishes.
+        IoUring::create_path_entry(op, unsafe { state.as_ref() })
+      }
     }
   }
 
@@ -329,10 +447,12 @@ impl LoweredState {
         let NativeSocketKind::Accept { out } = state.kind else {
           return;
         };
-        if let Ok(addr) = crate::backend::op::socket_addr_buf_from_storage(
-          &state.storage,
-          state.len,
-        ) {
+        if let Ok(addr) =
+          crate::backend::impls::sockaddr::socket_addr_buf_from_storage(
+            &state.storage,
+            state.len,
+          )
+        {
           // SAFETY: `out` is caller-provided writable output storage that
           // remains valid until completion processing.
           unsafe {
@@ -345,7 +465,9 @@ impl LoweredState {
         if let (Some(out), Some((storage, len))) =
           (state.from_out, state.addr.as_ref())
           && let Ok(addr) =
-            crate::backend::op::socket_addr_buf_from_storage(storage, *len)
+            crate::backend::impls::sockaddr::socket_addr_buf_from_storage(
+              storage, *len,
+            )
         {
           unsafe {
             *out.as_ptr() = addr;
@@ -375,6 +497,8 @@ pub struct IoUring {
   capacity: usize,
   in_flight: usize,
   needs_submit: bool,
+  single_socket: bool,
+  deferred_completions: bool,
   backlog: Vec<PendingOp>,
   pending: Slab<PendingOp>,
   queued_completed: Vec<OpCompleted>,
@@ -388,6 +512,8 @@ impl Default for IoUring {
       capacity: 0,
       in_flight: 0,
       needs_submit: false,
+      single_socket: false,
+      deferred_completions: false,
       backlog: Vec::new(),
       pending: Slab::new(0),
       queued_completed: Vec::new(),
@@ -417,6 +543,7 @@ struct IoUringProfile {
 
 impl Drop for IoUring {
   fn drop(&mut self) {
+    self.drain_in_flight();
     let Some(profile) = &self.profile else {
       return;
     };
@@ -442,6 +569,50 @@ impl Drop for IoUring {
 }
 
 impl IoUring {
+  /// Create a backend optimized for batches of asynchronous completions.
+  ///
+  /// Completion work runs when the thread-local driver checks the ring rather
+  /// than interrupting submissions. This can help high-depth file I/O, but
+  /// may hurt small socket batches; [`Self::new`] retains the kernel default.
+  /// Nonblocking waits still make progress. Kernels older than Linux 6.1 fall
+  /// back to the default behavior. No polling thread or busy-wait is enabled.
+  ///
+  /// ```
+  /// use lio::{Lio, backend::impls::IoUring};
+  /// let lio = Lio::new_with_backend(IoUring::with_deferred_completions(), 256)?;
+  /// # Ok::<(), std::io::Error>(())
+  /// ```
+  ///
+  /// The backend cannot be transferred to another thread:
+  /// ```compile_fail
+  /// use lio::backend::impls::IoUring;
+  /// let backend = IoUring::with_deferred_completions();
+  /// std::thread::spawn(move || drop(backend));
+  /// ```
+  pub fn with_deferred_completions() -> Self {
+    let mut backend = Self::default();
+    backend.deferred_completions = true;
+    backend
+  }
+
+  fn create_ring_with(
+    cap: u32,
+    mut initialize: impl FnMut(lio_uring::Params) -> io::Result<LioUring>,
+  ) -> io::Result<LioUring> {
+    let params = lio_uring::Params { sq_entries: cap, ..Default::default() };
+    // The driver is thread-local. Defer completion work until it explicitly
+    // checks the ring, so a batch submission is not interrupted per completion.
+    initialize(params.clone().deferred_taskrun()).or_else(|err| {
+      // Old kernels reject unsupported setup flags. Preserve their original
+      // behavior, but do not mask resource/permission failures with retries.
+      if err.raw_os_error() == Some(libc::EINVAL) {
+        initialize(params)
+      } else {
+        Err(err)
+      }
+    })
+  }
+
   unsafe fn drop_read_dir_state(state: *mut ()) {
     if !state.is_null() {
       // SAFETY: `state` was allocated with `Box::into_raw` for `ReadDirState`
@@ -454,6 +625,80 @@ impl IoUring {
 
   pub fn new() -> Self {
     Self::default()
+  }
+
+  /// Cancels every operation still in the kernel and waits for their
+  /// completions. Closing the ring alone does not wait: a request running on
+  /// an io-wq worker (blocking file or pipe I/O) could still write into op
+  /// memory after its owner freed it.
+  ///
+  /// Returns whether nothing is left in the kernel.
+  fn drain_in_flight(&mut self) -> bool {
+    if self.ring.is_none() || self.in_flight == 0 {
+      return true;
+    }
+    let keys: Vec<SlabKey> = self.pending.keys_where(|_| true).collect();
+    for key in keys {
+      let ring = self.ring();
+      if ring.sq_space_left() == 0 && ring.submit().is_err() {
+        break;
+      }
+      let entry = AsyncCancel::new(key.as_u64()).build();
+      // SAFETY: a cancellation request references no memory.
+      if unsafe { ring.push(entry, CANCEL_USER_DATA) }.is_err() {
+        break;
+      }
+    }
+
+    let deadline = Instant::now() + DRAIN_GRACE;
+    let mut discarded = Vec::new();
+    while self.in_flight > 0 {
+      let remaining = deadline.saturating_duration_since(Instant::now());
+      if remaining.is_zero() || self.ring().submit().is_err() {
+        break;
+      }
+      match self.ring().wait_timeout(remaining.min(Duration::from_millis(100)))
+      {
+        Ok(Some(completion)) => {
+          self.reap(completion.user_data(), completion.result(), &mut discarded)
+        }
+        Ok(None) => continue,
+        Err(_) => break,
+      }
+      while let Ok(Some(completion)) = self.ring().try_wait() {
+        self.reap(completion.user_data(), completion.result(), &mut discarded);
+      }
+      discarded.clear();
+    }
+
+    if self.in_flight > 0 {
+      // Some request outlived the grace period. Keep the state it points
+      // into alive rather than free it under the kernel.
+      mem::forget(mem::replace(&mut self.pending, Slab::new(0)));
+      return false;
+    }
+    true
+  }
+
+  #[inline]
+  fn reap(
+    &mut self,
+    user_data: u64,
+    result: i32,
+    completed: &mut Vec<OpCompleted>,
+  ) {
+    if user_data == CANCEL_USER_DATA {
+      // The cancelled operation reports through its own completion.
+      return;
+    }
+    self.in_flight = self.in_flight.saturating_sub(1);
+    if let Some(pending) =
+      self.pending.remove_value(SlabKey::from_u64(user_data))
+    {
+      pending.lowered.finalize(result);
+      completed
+        .push(OpCompleted::new(pending.registration_id, result as isize));
+    }
   }
 
   #[inline]
@@ -676,7 +921,7 @@ impl IoUring {
         const ALL_KNOWN_FLAGS: i32 =
           RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
 
-        if flags & !ALL_KNOWN_FLAGS != 0 {
+        if flags.bits() & !ALL_KNOWN_FLAGS != 0 {
           return Some(-(libc::ENOTSUP as isize));
         }
 
@@ -694,73 +939,98 @@ impl IoUring {
         const ALL_KNOWN_FLAGS: i32 =
           RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
 
-        if flags & !ALL_KNOWN_FLAGS != 0 {
+        if flags.bits() & !ALL_KNOWN_FLAGS != 0 {
           return Some(-(libc::ENOTSUP as isize));
         }
 
         None
       }
-      Op::Connect { addr, .. } => {
-        crate::backend::op::socket_addr_buf_to_storage(addr)
+      Op::Connect { addr, .. } | Op::Bind { addr, .. } => {
+        crate::backend::impls::sockaddr::socket_addr_buf_to_storage(addr)
           .err()
           .and_then(|err| err.raw_os_error())
           .map(|errno| -(errno as isize))
       }
       Op::Socket { domain, ty, proto } => {
-        crate::backend::op::socket_to_raw(*domain, *ty, *proto)
+        crate::backend::impls::sockaddr::socket_to_raw(*domain, *ty, *proto)
           .err()
           .map(|errno| -(errno as isize))
       }
+      Op::OpenAt { flags, .. } => crate::backend::native::open_flags(*flags)
+        .err()
+        .map(|errno| -(errno as isize)),
       _ => None,
+    }
+  }
+
+  fn create_path_entry(op: &Op, state: &NativePathState) -> Entry {
+    match op {
+      Op::OpenAt { dir_fd, flags, mode, .. } => {
+        OpenAt::new(dir_fd.as_raw_fd(), state.path1.as_ptr())
+          // Invalid flags were rejected by `validate_op`.
+          .flags(crate::backend::native::open_flags(*flags).unwrap_or(0))
+          .mode(mode.bits() as libc::mode_t)
+          .build()
+      }
+      Op::UnlinkAt { dir_fd, kind, .. } => {
+        let flags = match kind {
+          crate::backend::op::UnlinkKind::File => 0,
+          crate::backend::op::UnlinkKind::Directory => libc::AT_REMOVEDIR,
+        };
+        UnlinkAt::new(dir_fd.as_raw_fd(), state.path1.as_ptr())
+          .flags(flags)
+          .build()
+      }
+      Op::RenameAt { old_dir_fd, new_dir_fd, .. } => {
+        let path2 = state.path2.as_ref().expect("RenameAt must have path2");
+        RenameAt::new(
+          old_dir_fd.as_raw_fd(),
+          state.path1.as_ptr(),
+          new_dir_fd.as_raw_fd(),
+          path2.as_ptr(),
+        )
+        .build()
+      }
+      Op::MkdirAt { dir_fd, mode, .. } => {
+        MkDirAt::new(dir_fd.as_raw_fd(), state.path1.as_ptr())
+          .mode(mode.bits() as libc::mode_t)
+          .build()
+      }
+      Op::LinkAt { kind, source_dir_fd, new_dir_fd, .. } => {
+        let path2 = state.path2.as_ref().expect("LinkAt must have path2");
+        match kind {
+          LinkKind::Hard => LinkAt::new(
+            source_dir_fd.as_raw_fd(),
+            state.path1.as_ptr(),
+            new_dir_fd.as_raw_fd(),
+            path2.as_ptr(),
+          )
+          .build(),
+          LinkKind::Soft => SymlinkAt::new(
+            new_dir_fd.as_raw_fd(),
+            state.path1.as_ptr(),
+            path2.as_ptr(),
+          )
+          .build(),
+        }
+      }
+      _ => unreachable!("create_path_entry called with non-path operation"),
     }
   }
 
   fn create_plain_entry(op: &Op) -> Entry {
     match op {
       Op::Nop => Nop::new().build(),
-      Op::OpenAt { dir_fd, path, flags, mode } => {
-        OpenAt::new(dir_fd.as_raw_fd(), path.as_ptr())
-          .flags(*flags)
-          .mode(*mode as libc::mode_t)
-          .build()
-      }
-      Op::UnlinkAt { dir_fd, path, flags } => {
-        UnlinkAt::new(dir_fd.as_raw_fd(), path.as_ptr()).flags(*flags).build()
-      }
-      Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
-        RenameAt::new(
-          old_dir_fd.as_raw_fd(),
-          old_path.as_ptr(),
-          new_dir_fd.as_raw_fd(),
-          new_path.as_ptr(),
-        )
-        .build()
-      }
-      Op::MkdirAt { dir_fd, path, mode } => {
-        MkDirAt::new(dir_fd.as_raw_fd(), path.as_ptr())
-          .mode(*mode as libc::mode_t)
-          .build()
-      }
-      Op::LinkAt { kind, source_dir_fd, source_path, new_dir_fd, new_path } => {
-        match kind {
-          LinkKind::Hard => LinkAt::new(
-            source_dir_fd.as_raw_fd(),
-            source_path.as_ptr(),
-            new_dir_fd.as_raw_fd(),
-            new_path.as_ptr(),
-          )
-          .build(),
-          LinkKind::Soft => SymlinkAt::new(
-            new_dir_fd.as_raw_fd(),
-            source_path.as_ptr(),
-            new_path.as_ptr(),
-          )
-          .build(),
-        }
+      Op::OpenAt { .. }
+      | Op::UnlinkAt { .. }
+      | Op::RenameAt { .. }
+      | Op::MkdirAt { .. }
+      | Op::LinkAt { .. } => {
+        unreachable!("path operations must use create_path_entry")
       }
       Op::Socket { domain, ty, proto } => {
         let (domain, ty, proto) =
-          crate::backend::op::socket_to_raw(*domain, *ty, *proto)
+          crate::backend::impls::sockaddr::socket_to_raw(*domain, *ty, *proto)
             .expect("socket op must be validated before entry creation");
         Socket::new(domain, ty, proto).build()
       }
@@ -774,23 +1044,20 @@ impl IoUring {
       Op::Spawn { .. } => {
         unreachable!("immediate-only op must not build an io_uring entry")
       }
-      Op::Bind { fd, addr } => {
-        let storage = crate::api::ops::std_socketaddr_into_libc(*addr);
-        let len = match addr {
-          SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>(),
-          SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>(),
-        } as libc::socklen_t;
-        Bind::new(
-          fd.as_raw_fd(),
-          (&storage as *const libc::sockaddr_storage).cast(),
-          len,
-        )
-        .build()
+      Op::Bind { .. } => {
+        unreachable!("bind must build its entry from lowered socket state")
       }
       Op::Listen { fd, backlog } => {
         Listen::new(fd.as_raw_fd(), *backlog).build()
       }
-      Op::Shutdown { fd, how } => Shutdown::new(fd.as_raw_fd(), *how).build(),
+      Op::Shutdown { fd, how } => {
+        let how = match how {
+          crate::backend::op::ShutdownHow::Read => libc::SHUT_RD,
+          crate::backend::op::ShutdownHow::Write => libc::SHUT_WR,
+          crate::backend::op::ShutdownHow::Both => libc::SHUT_RDWR,
+        };
+        Shutdown::new(fd.as_raw_fd(), how).build()
+      }
       Op::Fsync { fd } => Fsync::new(fd.as_raw_fd()).build(),
       Op::Read { .. }
       | Op::Write { .. }
@@ -808,7 +1075,7 @@ impl IoUring {
       Op::Read { fd, iov_count, offset, flags, .. } => {
         Readv::new(fd.as_raw_fd(), native_rw.iovecs.as_ptr(), *iov_count as u32)
           .offset(Self::io_offset(*offset))
-          .rw_flags(*flags)
+          .rw_flags(flags.bits())
           .build()
       }
       Op::Write { fd, iov_count, offset, flags, .. } => Writev::new(
@@ -817,7 +1084,7 @@ impl IoUring {
         *iov_count as u32,
       )
       .offset(Self::io_offset(*offset))
-      .rw_flags(*flags)
+      .rw_flags(flags.bits())
       .build(),
       _ => unreachable!("rw entry requires read/write op"),
     }
@@ -829,11 +1096,11 @@ impl IoUring {
         fd.as_raw_fd(),
         (&native_msg.hdr as *const libc::msghdr).cast_mut(),
       )
-      .flags(*flags as u32)
+      .flags(flags.bits() as u32)
       .build(),
       Op::Send { fd, flags, .. } => {
         SendMsg::new(fd.as_raw_fd(), &native_msg.hdr)
-          .flags(*flags as u32)
+          .flags(flags.bits() as u32)
           .build()
       }
       _ => unreachable!("msg entry requires recv/send op"),
@@ -856,7 +1123,13 @@ impl IoUring {
         native_socket.len,
       )
       .build(),
-      _ => unreachable!("socket entry requires accept/connect op"),
+      Op::Bind { fd, .. } => Bind::new(
+        fd.as_raw_fd(),
+        (&native_socket.storage as *const libc::sockaddr_storage).cast(),
+        native_socket.len,
+      )
+      .build(),
+      _ => unreachable!("socket entry requires accept/connect/bind op"),
     }
   }
 
@@ -865,14 +1138,19 @@ impl IoUring {
       Op::Stat { target, .. } => match target {
         crate::backend::op::StatTarget::Path {
           dir_fd,
-          path,
           follow_symlinks,
+          ..
         } => {
+          let path_ptr = native_stat
+            .path
+            .as_ref()
+            .expect("path-based stat must have path cstring")
+            .as_ptr();
           let flags =
             if *follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
           Statx::new(
             dir_fd.as_raw_fd(),
-            path.as_ptr().cast_const(),
+            path_ptr,
             (&native_stat.statx as *const lio_uring::statx).cast_mut(),
           )
           .flags(flags)
@@ -913,12 +1191,17 @@ impl IoUring {
   fn execute_immediate(op: &Op) -> Option<io::Result<isize>> {
     match op {
       Op::ReadlinkAt { dir_fd, path, buf, buf_len } => {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path_cstr) = std::ffi::CString::new(path.as_os_str().as_bytes())
+        else {
+          return Some(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+        };
         // SAFETY: pointers come directly from validated op arguments and remain
         // valid for the duration of this synchronous syscall.
         let result = unsafe {
           libc::readlinkat(
             dir_fd.as_raw_fd(),
-            path.as_ptr(),
+            path_cstr.as_ptr(),
             buf.as_ptr().cast::<libc::c_char>(),
             *buf_len,
           )
@@ -929,20 +1212,14 @@ impl IoUring {
           Ok(result as isize)
         })
       }
-      Op::GetCwd { buf, buf_len } => {
-        // SAFETY: `buf` is caller-provided writable storage of length
-        // `buf_len`, valid for this synchronous libc call.
-        let result = unsafe {
-          libc::getcwd(buf.as_ptr().cast::<libc::c_char>(), *buf_len)
-        };
-        Some(if result.is_null() {
-          Err(io::Error::last_os_error())
-        } else {
-          // SAFETY: `getcwd` returned a valid NUL-terminated pointer into
-          // `buf`, so `strlen` may read until the first terminator.
-          Ok(unsafe { libc::strlen(result) as isize })
-        })
-      }
+      Op::GetCwd { out } => Some(match std::env::current_dir() {
+        Ok(cwd) => {
+          // SAFETY: `out` points to operation-owned output storage.
+          unsafe { out.as_ptr().write(cwd.into_os_string()) };
+          Ok(0)
+        }
+        Err(err) => Err(err),
+      }),
       Op::ReadDir {
         fd,
         raw_buf,
@@ -989,27 +1266,74 @@ impl IoUring {
         )
       }
       #[cfg(unix)]
-      Op::Spawn { path, argv, envp } => {
+      Op::Spawn { spec } => {
+        use std::os::unix::ffi::OsStrExt;
+
         unsafe extern "C" {
           static mut environ: *mut *mut libc::c_char;
         }
-        let mut pid: libc::pid_t = 0;
-        let envp = if let Some(envp) = envp {
-          envp.as_ptr().cast_const()
-        } else {
-          // SAFETY: `environ` is the process-global environment pointer
-          // provided by libc and is valid to read here.
-          unsafe { environ as *const *mut libc::c_char }
+
+        let path = match std::ffi::CString::new(spec.program.as_bytes()) {
+          Ok(path) => path,
+          Err(_) => {
+            return Some(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+          }
         };
-        // SAFETY: all pointers are passed directly from validated op inputs and
-        // remain valid for this synchronous `posix_spawn` call.
+        let argv = match spec
+          .args
+          .iter()
+          .map(|arg| std::ffi::CString::new(arg.as_bytes()))
+          .collect::<Result<Vec<_>, _>>()
+        {
+          Ok(argv) => argv,
+          Err(_) => {
+            return Some(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+          }
+        };
+        let mut argv_ptrs: Vec<*mut libc::c_char> = argv
+          .iter()
+          .map(|arg| arg.as_ptr().cast_mut())
+          .chain(std::iter::once(std::ptr::null_mut()))
+          .collect();
+        let env = match spec.env.as_ref().map(|env| {
+          env
+            .iter()
+            .map(|var| std::ffi::CString::new(var.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+        }) {
+          Some(Ok(env)) => Some(env),
+          Some(Err(_)) => {
+            return Some(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+          }
+          None => None,
+        };
+        let mut env_ptrs = env.as_ref().map(|env| {
+          env
+            .iter()
+            .map(|var| var.as_ptr().cast_mut())
+            .chain(std::iter::once(std::ptr::null_mut()))
+            .collect::<Vec<_>>()
+        });
+
+        let mut pid: libc::pid_t = 0;
+        let envp = env_ptrs
+          .as_mut()
+          .map(|vars| vars.as_mut_ptr().cast_const())
+          .unwrap_or_else(|| {
+            // SAFETY: `environ` is libc's process-global environment vector.
+            // Mutating it while another thread reads it is ruled out by the
+            // contract of `std::env::set_var`/`remove_var`, which are
+            // `unsafe` in Rust 2024 for exactly this reason.
+            unsafe { environ as *const *mut libc::c_char }
+          });
+        // SAFETY: native C strings and pointer arrays remain alive for this call.
         let result = unsafe {
           libc::posix_spawn(
             &mut pid,
             path.as_ptr(),
             std::ptr::null(),
             std::ptr::null(),
-            argv.as_ptr().cast_const(),
+            argv_ptrs.as_mut_ptr().cast_const(),
             envp,
           )
         };
@@ -1026,7 +1350,13 @@ impl IoUring {
 
 impl IoBackend for IoUring {
   fn init(&mut self, cap: usize) -> io::Result<()> {
-    self.ring = Some(LioUring::new(cap as u32)?);
+    self.ring = Some(if self.deferred_completions {
+      Self::create_ring_with(cap as u32, LioUring::with_params)?
+    } else {
+      LioUring::new(cap as u32)?
+    });
+    self.single_socket =
+      self.ring().supports_opcodes(&[Send::CODE, Recv::CODE]);
     self.capacity = cap;
     self.in_flight = 0;
     self.needs_submit = false;
@@ -1045,16 +1375,17 @@ impl IoBackend for IoUring {
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
-    let lowered = match LoweredState::lower_in(&op, step_bump) {
-      Ok(lowered) => lowered,
-      Err(err) => {
-        self.queued_completed.push(OpCompleted::new(
-          id,
-          -(err.raw_os_error().unwrap_or(libc::EIO) as isize),
-        ));
-        return;
-      }
-    };
+    let lowered =
+      match LoweredState::lower_in(&op, step_bump, self.single_socket) {
+        Ok(lowered) => lowered,
+        Err(err) => {
+          self.queued_completed.push(OpCompleted::new(
+            id,
+            -(err.raw_os_error().unwrap_or(libc::EIO) as isize),
+          ));
+          return;
+        }
+      };
     self.backlog.push(PendingOp { registration_id: id, op, lowered });
   }
 
@@ -1194,6 +1525,39 @@ impl IoBackend for IoUring {
     Ok(())
   }
 
+  fn cancel(&mut self, id: u64) {
+    if let Some(index) =
+      self.backlog.iter().position(|entry| entry.registration_id == id)
+    {
+      self.backlog.swap_remove(index);
+      self
+        .queued_completed
+        .push(OpCompleted::new(id, -(libc::ECANCELED as isize)));
+      return;
+    }
+    let Some(key) =
+      self.pending.keys_where(|entry| entry.registration_id == id).next()
+    else {
+      return;
+    };
+    // The kernel may be using the op's buffers: it stays pending, and its
+    // own completion (`-ECANCELED`, or its result if it won the race)
+    // finishes it as usual.
+    let ring = self.ring();
+    if ring.sq_space_left() == 0 && ring.submit().is_err() {
+      return; // The operation completes on its own instead.
+    }
+    let entry = AsyncCancel::new(key.as_u64()).build();
+    // SAFETY: a cancellation request references no memory.
+    if unsafe { ring.push(entry, CANCEL_USER_DATA) }.is_ok() {
+      self.needs_submit = true;
+    }
+  }
+
+  fn drain(&mut self) -> bool {
+    self.drain_in_flight()
+  }
+
   fn wait(
     &mut self,
     timeout: Option<Duration>,
@@ -1233,21 +1597,9 @@ impl IoBackend for IoUring {
     };
 
     if let Some(completion) = first {
-      self.in_flight = self.in_flight.saturating_sub(1);
-      let key = SlabKey::from_u64(completion.user_data());
-      let result = completion.result() as isize;
-      if let Some(pending) = self.pending.remove_value(key) {
-        pending.lowered.finalize(completion.result());
-        completed.push(OpCompleted::new(pending.registration_id, result));
-      }
+      self.reap(completion.user_data(), completion.result(), completed);
       while let Some(completion) = self.ring().try_wait()? {
-        self.in_flight = self.in_flight.saturating_sub(1);
-        let key = SlabKey::from_u64(completion.user_data());
-        let result = completion.result() as isize;
-        if let Some(pending) = self.pending.remove_value(key) {
-          pending.lowered.finalize(completion.result());
-          completed.push(OpCompleted::new(pending.registration_id, result));
-        }
+        self.reap(completion.user_data(), completion.result(), completed);
       }
     }
 

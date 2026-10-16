@@ -1,4 +1,4 @@
-use std::{ffi::CString, io};
+use std::io;
 
 use lio::{
   Lio,
@@ -97,34 +97,16 @@ pub fn write_all_reusing_buffer(
 }
 
 pub fn read_to_string(lio: &Lio, path: Option<&str>) -> io::Result<String> {
-  String::from_utf8(read_to_bytes(lio, path)?)
-    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+  match path {
+    Some(path) => run(lio, lio::fs::read_to_string(path).with_lio(lio).send()),
+    None => String::from_utf8(read_to_bytes_fd(lio, &Resource::stdin())?)
+      .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err)),
+  }
 }
 
 pub fn read_to_string_fd(lio: &Lio, input: &Resource) -> io::Result<String> {
   String::from_utf8(read_to_bytes_fd(lio, input)?)
     .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
-}
-
-pub fn read_to_bytes(lio: &Lio, path: Option<&str>) -> io::Result<Vec<u8>> {
-  match path {
-    Some(path) => {
-      let cpath = CString::new(path)?;
-      let fd = run_all(
-        lio,
-        vec![
-          api::openat(&Resource::cwd(), cpath, libc::O_RDONLY, 0)
-            .with_lio(lio)
-            .send(),
-        ],
-      )
-      .into_iter()
-      .next()
-      .expect("missing open result")?;
-      read_to_bytes_fd(lio, &fd)
-    }
-    None => read_to_bytes_fd(lio, &Resource::stdin()),
-  }
 }
 
 pub fn read_to_bytes_fd(lio: &Lio, input: &Resource) -> io::Result<Vec<u8>> {

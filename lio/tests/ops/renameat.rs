@@ -22,7 +22,12 @@ fn new_ds_lio() -> Lio {
   .unwrap()
 }
 
-fn open_file(lio: &mut Lio, path: CString, flags: i32, mode: u32) -> Resource {
+fn open_file(
+  lio: &mut Lio,
+  path: CString,
+  flags: lio::api::OpenFlags,
+  mode: u32,
+) -> Resource {
   let mut receiver =
     api::openat(&Resource::cwd(), path, flags, mode).with_lio(lio).send();
   common::poll_recv(lio, &mut receiver).unwrap()
@@ -39,7 +44,9 @@ fn stat_path(
 
 fn unlink_file(lio: &mut Lio, path: CString) {
   let mut receiver =
-    api::unlinkat(&Resource::cwd(), path, 0).with_lio(lio).send();
+    api::unlinkat(&Resource::cwd(), path, api::UnlinkKind::File)
+      .with_lio(lio)
+      .send();
   common::poll_recv(lio, &mut receiver).unwrap();
 }
 
@@ -60,7 +67,9 @@ fn test_renameat_basic() {
   let _file = open_file(
     &mut lio,
     old_path.clone(),
-    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+    lio::api::OpenFlags::WRITE
+      | lio::api::OpenFlags::CREATE
+      | lio::api::OpenFlags::TRUNCATE,
     0o644,
   );
 
@@ -75,7 +84,10 @@ fn test_renameat_basic() {
   common::poll_recv(&mut lio, &mut receiver).expect("renameat should succeed");
 
   let old_result = stat_path(&mut lio, old_path);
-  assert_eq!(old_result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+  assert_eq!(
+    old_result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::ENOENT)
+  );
 
   let new_stat =
     stat_path(&mut lio, new_path.clone()).expect("new path should exist");
@@ -103,5 +115,8 @@ fn test_renameat_missing_source_fails() {
       .with_lio(&mut lio)
       .send();
   let result = common::poll_recv(&mut lio, &mut receiver);
-  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+  assert_eq!(
+    result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::ENOENT)
+  );
 }

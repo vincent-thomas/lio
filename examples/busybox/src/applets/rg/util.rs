@@ -74,7 +74,7 @@ pub(super) fn read_searchable_file(
   let cpath = fs_util::path_to_cstring(path)?;
   let fd = match io_util::run(
     lio,
-    api::openat(&Resource::cwd(), cpath, libc::O_RDONLY, 0)
+    api::openat(&Resource::cwd(), cpath, lio::api::OpenFlags::READ, 0)
       .with_lio(lio)
       .send(),
   ) {

@@ -123,3 +123,23 @@ fn pause_resume_stops_and_restores_ticks() {
     "interval tick after resume should succeed: {second:?}"
   );
 }
+
+#[test]
+fn dropping_the_receiver_stops_the_interval() {
+  let mut lio = Lio::new(1).unwrap();
+  let recv = api::interval(Duration::from_millis(5)).with_lio(&lio).send();
+  let first = run_until_recv(&mut lio, &recv, Duration::from_secs(1));
+  assert!(first.is_ok());
+  assert!(lio.is_full(), "the interval holds the only slot");
+
+  drop(recv);
+  // At its next tick it finds nobody to deliver to, and stops.
+  let start = Instant::now();
+  while lio.is_full() {
+    assert!(
+      start.elapsed() < Duration::from_secs(1),
+      "the interval kept going"
+    );
+    lio.run_timeout(Duration::from_millis(5)).unwrap();
+  }
+}

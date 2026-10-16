@@ -1,5 +1,6 @@
 //! Type-safe operation traits for bridging user types to backend execution.
 
+use crate::api::resource::CloseFn;
 use crate::backend::op::Op;
 use std::time::Duration;
 
@@ -8,17 +9,68 @@ use std::time::Duration;
 pub struct Completion {
   pub result: isize,
   pub flags: CompletionFlags,
+  /// How a resource carried by `result` is closed: the producing backend's
+  /// close function.
+  resource_close: ResourceClose,
 }
 
 impl Completion {
+  /// A completion whose resources (if any) are native OS descriptors/handles.
   pub const fn new(result: isize) -> Self {
-    Self { result, flags: CompletionFlags::empty() }
+    Self::with_flags(result, CompletionFlags::empty())
   }
 
   pub const fn with_flags(result: isize, flags: CompletionFlags) -> Self {
-    Self { result, flags }
+    Self {
+      result,
+      flags,
+      resource_close: ResourceClose(crate::backend::native::close),
+    }
+  }
+
+  /// Sets how a resource carried by this completion is closed.
+  pub(crate) const fn with_resource_close(mut self, close: CloseFn) -> Self {
+    self.resource_close = ResourceClose(close);
+    self
+  }
+
+  /// How a resource carried by this completion is closed.
+  pub(crate) const fn resource_close(&self) -> CloseFn {
+    self.resource_close.0
+  }
+  /// The error a failed completion (a negative `result`) reports.
+  ///
+  /// A result that is no OS error code, because negating it overflows or it
+  /// does not fit an `i32`, comes from a broken backend; it is reported as
+  /// such rather than wrapped into some other code.
+  pub(crate) fn os_error(&self) -> std::io::Error {
+    match self.result.checked_neg().and_then(|code| i32::try_from(code).ok()) {
+      Some(code) => std::io::Error::from_raw_os_error(code),
+      None => std::io::Error::other(format!(
+        "backend completed with an invalid error code {}",
+        self.result
+      )),
+    }
   }
 }
+
+/// A [`CloseFn`] compared by address.
+#[derive(Clone, Copy)]
+struct ResourceClose(CloseFn);
+
+impl std::fmt::Debug for ResourceClose {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("ResourceClose")
+  }
+}
+
+impl PartialEq for ResourceClose {
+  fn eq(&self, other: &Self) -> bool {
+    std::ptr::fn_addr_eq(self.0, other.0)
+  }
+}
+
+impl Eq for ResourceClose {}
 
 /// Completion flags understood by higher-level operation models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,3 +162,25 @@ pub trait OneshotOpModel: OpModel {}
 /// [`IoStream`](crate::api::IoStream) wrapper and
 /// are consumed through `.next().await`.
 pub trait StreamOpModel: OpModel {}
+
+#[cfg(test)]
+mod os_error_tests {
+  use super::Completion;
+
+  #[test]
+  fn negative_results_map_to_their_os_error() {
+    let err = Completion::new(-2).os_error();
+    assert_eq!(err.raw_os_error(), Some(2));
+  }
+
+  #[test]
+  fn out_of_range_results_are_not_wrapped() {
+    // Negates to one past `i32::MAX`, where `isize` is wide enough.
+    let past_i32 = isize::try_from(-i64::from(i32::MAX) - 2).ok();
+    for result in std::iter::once(isize::MIN).chain(past_i32) {
+      let err = Completion::new(result).os_error();
+      assert_eq!(err.raw_os_error(), None, "{result}");
+      assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    }
+  }
+}

@@ -4,34 +4,23 @@
   clippy::expect_fun_call
 )]
 
-use super::common::poll_until_recv;
+use super::common::{self, as_tcp_stream, poll_until_recv};
 use lio::api::resource::Resource;
 use lio::{Lio, api};
 use std::net::TcpListener;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::sync::mpsc;
 
-fn set_nonblocking(fd: i32) {
-  unsafe {
-    let flags = libc::fcntl(fd, libc::F_GETFL);
-    assert!(flags >= 0, "F_GETFL failed");
-    let result = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-    assert_eq!(result, 0, "F_SETFL O_NONBLOCK failed");
-  }
+fn nonblocking(sock: Resource) -> Resource {
+  as_tcp_stream(&sock).set_nonblocking(true).expect("failed to set O_NONBLOCK");
+  sock
 }
 
 fn tcp_socket_v4() -> Resource {
-  let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-  assert!(fd >= 0, "Failed to create IPv4 socket");
-  set_nonblocking(fd);
-  unsafe { Resource::from_raw_fd(fd) }
+  nonblocking(common::tcp_socket())
 }
 
 fn tcp_socket_v6() -> Resource {
-  let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
-  assert!(fd >= 0, "Failed to create IPv6 socket");
-  set_nonblocking(fd);
-  unsafe { Resource::from_raw_fd(fd) }
+  nonblocking(common::tcp6_socket())
 }
 
 fn setup_listener_v4() -> (TcpListener, std::net::SocketAddr) {
@@ -62,18 +51,9 @@ fn basic() {
   let (_accepted, _) =
     listener.accept().expect("Failed to accept connected client");
 
-  unsafe {
-    let mut peer_addr =
-      std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
-    let mut peer_len =
-      std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let result = libc::getpeername(
-      client_sock.as_fd().as_raw_fd(),
-      peer_addr.as_mut_ptr() as *mut libc::sockaddr,
-      &mut peer_len,
-    );
-    assert_eq!(result, 0, "Should be able to get peer name after connect");
-  }
+  as_tcp_stream(&client_sock)
+    .peer_addr()
+    .expect("Should be able to get peer name after connect");
 }
 
 #[test]
@@ -88,18 +68,7 @@ fn ipv6() {
 
   let (_accepted, _) = listener.accept().expect("Failed to accept IPv6 client");
 
-  unsafe {
-    let mut peer_addr =
-      std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
-    let mut peer_len =
-      std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let result = libc::getpeername(
-      client_sock.as_fd().as_raw_fd(),
-      peer_addr.as_mut_ptr() as *mut libc::sockaddr,
-      &mut peer_len,
-    );
-    assert_eq!(result, 0);
-  }
+  assert_eq!(as_tcp_stream(&client_sock).peer_addr().unwrap(), addr);
 }
 
 #[test]
@@ -193,16 +162,5 @@ fn localhost() {
   let (_accepted, _) =
     listener.accept().expect("Failed to accept connected client");
 
-  unsafe {
-    let mut peer_addr = std::mem::MaybeUninit::<libc::sockaddr_in>::zeroed();
-    let mut peer_len =
-      std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    libc::getpeername(
-      client_sock.as_fd().as_raw_fd(),
-      peer_addr.as_mut_ptr() as *mut libc::sockaddr,
-      &mut peer_len,
-    );
-    let sockaddr_in = peer_addr.assume_init();
-    assert_eq!(u32::from_be(sockaddr_in.sin_addr.s_addr), 0x7f000001);
-  }
+  assert!(as_tcp_stream(&client_sock).peer_addr().unwrap().ip().is_loopback());
 }

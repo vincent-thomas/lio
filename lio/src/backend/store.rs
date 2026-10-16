@@ -9,6 +9,7 @@ use std::mem::MaybeUninit;
 
 use bumpalo::Bump;
 
+use crate::api::op::Action;
 use crate::registration::Registration;
 use crate::slab::{SlabKey, SlotPool};
 
@@ -25,18 +26,21 @@ struct StoreSlot {
 /// - a persistent model-lifetime bump reset before slot reuse
 /// - a step-lifetime bump reserved for backend-lowered state
 pub(crate) struct OpStore {
-  slots: SlotPool<StoreSlot>,
+  slots: SlotPool<StoreSlot, false>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct StoreAtCapacity;
 
+#[cfg(test)]
 impl std::fmt::Display for StoreAtCapacity {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.write_str("StoreAtCapacity")
   }
 }
 
+#[cfg(test)]
 impl std::error::Error for StoreAtCapacity {}
 
 impl OpStore {
@@ -58,6 +62,7 @@ impl OpStore {
   }
 
   /// Inserts an operation built using the slot's model-lifetime bump arena.
+  #[cfg(test)]
   pub fn insert_with(
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
@@ -66,35 +71,111 @@ impl OpStore {
   }
 
   /// Inserts an operation built using the slot's model-lifetime bump arena.
+  #[cfg(test)]
   pub fn try_insert_with(
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> Result<u64, StoreAtCapacity> {
-    let Some((key, slot)) = self.slots.allocate() else {
+    let Some((key, _)) = self.slots.allocate_with(|slot| {
+      slot.model_bump.reset();
+      slot.step_bump.reset();
+      slot.registration.write(init(&mut slot.model_bump));
+    }) else {
       return Err(StoreAtCapacity);
     };
-
-    slot.model_bump.reset();
-    slot.step_bump.reset();
-    slot.registration.write(init(&mut slot.model_bump));
     Ok(key.as_u64())
   }
 
-  /// Removes an operation from the store.
-  pub fn remove(&mut self, id: u64) -> bool {
-    let key = SlabKey::from_u64(id);
-    self
+  /// Whether every slot is occupied.
+  #[inline]
+  pub fn is_full(&self) -> bool {
+    !self.slots.has_free_slot()
+  }
+
+  /// Inserts an operation and returns everything needed for its initial dispatch.
+  ///
+  /// Keeping the just-allocated slot borrowed avoids looking it up again by its
+  /// generational ID. The slot is only claimed once `init` and the first
+  /// [`action`](Registration::action) return, so if either panics the store
+  /// is left unchanged: a panicking `action` drops the registration instead of
+  /// leaving it in a slot nothing would ever free.
+  ///
+  /// The caller must have checked [`is_full`](Self::is_full) first.
+  #[inline]
+  pub fn insert_with_action(
+    &mut self,
+    init: impl FnOnce(&mut Bump) -> Registration,
+  ) -> (u64, Option<Action>, &mut Bump) {
+    let mut action = None;
+    let (key, slot) = self
       .slots
-      .remove_with(key, |slot| {
-        // SAFETY: occupied slots always contain an initialized registration.
-        unsafe { slot.registration.assume_init_drop() };
+      .allocate_with(|slot| {
         slot.model_bump.reset();
         slot.step_bump.reset();
+        let registration = slot.registration.write(init(&mut slot.model_bump));
+        let mut guard = DropOnUnwind { registration, armed: true };
+        action = guard.registration.action();
+        // It returned: the slot gets claimed and owns the registration now.
+        guard.armed = false;
       })
-      .is_some()
+      .expect("insert_with_action on a full store");
+    (key.as_u64(), action, &mut slot.step_bump)
+  }
+
+  /// Removes an operation from the store and drops it.
+  ///
+  /// The driver uses [`detach`](Self::detach) instead, to drop registrations
+  /// without itself borrowed.
+  #[cfg(test)]
+  pub fn remove(&mut self, id: u64) -> bool {
+    let Some(Detached { registration, slot }) = self.detach(id) else {
+      return false;
+    };
+    // Nothing can allocate the slot while `self` is borrowed here, so it can
+    // be released first, which a panicking drop then cannot skip.
+    self.release(slot);
+    drop(registration);
+    true
+  }
+
+  /// Takes an operation out of the store without freeing its slot.
+  ///
+  /// `id` stops resolving at once, but the slot is not reused, and its arenas
+  /// (which the registration points into) are not reset, until it is
+  /// [`release`](Self::release)d. That lets the caller drop the registration
+  /// later, outside its own borrow of the store: dropping it runs user code.
+  #[inline]
+  pub fn detach(&mut self, id: u64) -> Option<Detached> {
+    let key = SlabKey::from_u64(id);
+    let registration = self.slots.retire_with(key, |slot| {
+      // SAFETY: occupied slots always contain an initialized registration,
+      // and the slot no longer counts as initialized once this returns.
+      unsafe { slot.registration.assume_init_read() }
+    })?;
+    Some(Detached { registration, slot: key.slot() })
+  }
+
+  /// [`detach`](Self::detach) for an ID already validated by `get_mut`
+  /// under the same exclusive store borrow.
+  #[inline]
+  pub fn detach_known(&mut self, id: u64) -> Detached {
+    let key = SlabKey::from_u64(id);
+    let registration = self.slots.retire_known_with(key, |slot| {
+      // SAFETY: as in `detach`.
+      unsafe { slot.registration.assume_init_read() }
+    });
+    Detached { registration, slot: key.slot() }
+  }
+
+  /// Makes a slot whose registration was [`detach`](Self::detach)ed and
+  /// dropped available again.
+  #[inline]
+  pub fn release(&mut self, slot: u32) {
+    self.slots.release(slot);
   }
 
   /// Gets mutable access to an operation's registration.
+  #[inline]
   pub fn get_mut(&mut self, id: u64) -> Option<&mut Registration> {
     let key = SlabKey::from_u64(id);
     let slot = self.slots.get_mut(key)?;
@@ -103,10 +184,50 @@ impl OpStore {
   }
 
   /// Gets mutable access to an operation's per-step lowering arena.
+  #[inline]
   pub fn step_bump_mut(&mut self, id: u64) -> Option<&mut Bump> {
     let key = SlabKey::from_u64(id);
     let slot = self.slots.get_mut(key)?;
     Some(&mut slot.step_bump)
+  }
+}
+
+/// Drops a registration that was written into a slot not claimed yet, if
+/// whatever runs before the claim panics. Disarmed once that code returned.
+struct DropOnUnwind<'a> {
+  registration: &'a mut Registration,
+  armed: bool,
+}
+
+impl Drop for DropOnUnwind<'_> {
+  fn drop(&mut self) {
+    if self.armed {
+      // SAFETY: still armed, so `insert_with_action` is unwinding. The slot
+      // was never claimed, so nothing else will drop or read this value.
+      unsafe { std::ptr::drop_in_place(self.registration) };
+    }
+  }
+}
+
+/// A registration taken out of the store whose slot stays reserved until
+/// [`OpStore::release`]: the registration points into that slot's arenas.
+pub(crate) struct Detached {
+  pub registration: Registration,
+  pub slot: u32,
+}
+
+impl Drop for OpStore {
+  /// Drops the registrations still in the store: their buffers, resources
+  /// and callbacks. Runs before the slots' arenas, which they point into.
+  ///
+  /// The driver only lets this run once its backend reported that no
+  /// operation can touch this memory any more; otherwise it leaks the store.
+  fn drop(&mut self) {
+    self.slots.for_each_occupied(|slot| {
+      // SAFETY: occupied slots always contain an initialized registration,
+      // and the store is never used again.
+      unsafe { slot.registration.assume_init_drop() };
+    });
   }
 }
 
@@ -224,6 +345,59 @@ mod tests {
       store.insert_with(dummy_stored_op);
     }));
     assert!(result.is_err());
+  }
+
+  #[test]
+  fn panicking_init_leaves_the_slot_free() {
+    let mut store = OpStore::with_capacity(1);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      store.insert_with(|_| panic!("init"))
+    }));
+    assert!(result.is_err());
+    assert!(!store.is_full(), "the slot was never claimed");
+    let id = store.insert_with(dummy_stored_op);
+    assert!(store.remove(id));
+  }
+
+  /// Panics when dropped.
+  struct PanicOnDrop;
+
+  impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+      panic!("drop");
+    }
+  }
+
+  #[test]
+  fn panicking_drop_on_remove_still_releases_the_slot() {
+    let mut store = OpStore::with_capacity(1);
+    let id = store.insert_with(|arena| {
+      let bomb = PanicOnDrop;
+      Registration::new_callback_in(
+        arena,
+        move |_| {
+          let _ = &bomb;
+        },
+        Nop,
+      )
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      store.remove(id)
+    }));
+    assert!(result.is_err());
+    assert!(store.get_mut(id).is_none(), "the stale id no longer resolves");
+    assert!(!store.is_full(), "the slot is free again");
+  }
+
+  #[test]
+  fn dropping_the_store_drops_its_registrations() {
+    let (tx, rx) = mpsc::channel::<std::io::Result<()>>();
+    let mut store = OpStore::new();
+    store.insert_with(|arena| {
+      Registration::new_waker_in(arena, dummy_waker(), tx, Nop)
+    });
+    drop(store);
+    assert!(rx.recv().is_err(), "the registration's sender was dropped");
   }
 
   #[test]

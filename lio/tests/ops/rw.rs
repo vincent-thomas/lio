@@ -22,7 +22,7 @@ fn new_ds_lio() -> Lio {
 fn open_file(
   lio: &mut Lio,
   path: CString,
-  flags: i32,
+  flags: lio::api::OpenFlags,
   mode: u32,
 ) -> Result<Resource, std::io::Error> {
   let mut receiver =
@@ -31,17 +31,27 @@ fn open_file(
 }
 
 fn open_rw_file(lio: &mut Lio, path: CString) -> Resource {
-  open_file(lio, path, libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC, 0o644)
-    .unwrap()
+  open_file(
+    lio,
+    path,
+    lio::api::OpenFlags::READ
+      | lio::api::OpenFlags::WRITE
+      | lio::api::OpenFlags::CREATE
+      | lio::api::OpenFlags::TRUNCATE,
+    0o644,
+  )
+  .unwrap()
 }
 
 fn open_ro_file(lio: &mut Lio, path: CString) -> Resource {
-  open_file(lio, path, libc::O_RDONLY, 0).unwrap()
+  open_file(lio, path, lio::api::OpenFlags::READ, 0).unwrap()
 }
 
 fn unlink_file(lio: &mut Lio, path: CString) {
   let mut receiver =
-    api::unlinkat(&Resource::cwd(), path, 0).with_lio(lio).send();
+    api::unlinkat(&Resource::cwd(), path, api::UnlinkKind::File)
+      .with_lio(lio)
+      .send();
   common::poll_recv(lio, &mut receiver).unwrap();
 }
 
@@ -258,8 +268,9 @@ fn read_nonexistent_file() {
   let mut lio = new_ds_lio();
   let path =
     CString::new("/tmp/lio_test_nonexistent_12345_abcdef.txt").unwrap();
-  let err = open_file(&mut lio, path, libc::O_RDONLY, 0).unwrap_err();
-  assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+  let err =
+    open_file(&mut lio, path, lio::api::OpenFlags::READ, 0).unwrap_err();
+  assert_eq!(err.raw_os_error(), Some(lio::backend::ds::errno::ENOENT));
 }
 
 #[test]

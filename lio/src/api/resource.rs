@@ -6,13 +6,12 @@
 //! ```rust,no_run
 //! use std::ffi::CString;
 //! use lio::api::resource::Resource;
-//! use std::os::fd::FromRawFd;
 //!
 //! async fn example() -> std::io::Result<()> {
-//!     # let dir = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+//!     # let dir = Resource::cwd();
 //!     let path = CString::new("/tmp/test").unwrap();
 //!     let fd: Resource =
-//!         lio::api::openat(&dir, path, libc::O_RDONLY, 0).await?;
+//!         lio::api::openat(&dir, path, lio::api::OpenFlags::READ, 0).await?;
 //!
 //!     // Use the resource...
 //!     // Resource is automatically closed when dropped.
@@ -43,13 +42,12 @@
 //! ```rust,no_run
 //! use std::ffi::CString;
 //! use lio::api::resource::Resource;
-//! use std::os::fd::FromRawFd;
 //!
 //! async fn open_file() -> std::io::Result<Resource> {
-//!     # let dir = unsafe { Resource::from_raw_fd(libc::AT_FDCWD) };
+//!     # let dir = Resource::cwd();
 //!     let path = CString::new("/tmp/test").unwrap();
 //!     let resource: Resource =
-//!         lio::api::openat(&dir, path, libc::O_RDONLY, 0).await?;
+//!         lio::api::openat(&dir, path, lio::api::OpenFlags::READ, 0).await?;
 //!     Ok(resource)
 //! }
 //!
@@ -66,15 +64,18 @@
 //! Or from raw file descriptors (Unix):
 //!
 //! ```rust
+//! # #[cfg(unix)]
 //! use std::os::fd::{FromRawFd, RawFd};
 //! use lio::api::resource::Resource;
 //!
+//! # #[cfg(unix)]
 //! fn from_raw(raw_fd: RawFd) -> Resource {
 //!     // Safe if raw_fd is a valid, open file descriptor
 //!     unsafe { Resource::from_raw_fd(raw_fd) }
 //! }
 //! ```
 
+use std::io;
 use std::sync::Arc;
 
 macro_rules! impl_native_convervions {
@@ -97,6 +98,7 @@ macro_rules! impl_native_convervions {
     #[cfg(windows)]
     impl std::os::windows::io::AsHandle for $nice {
       fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        // SAFETY: the handle stays open for as long as `self` is borrowed.
         unsafe {
           std::os::windows::io::BorrowedHandle::borrow_raw(self.0.inner)
         }
@@ -112,43 +114,79 @@ macro_rules! impl_native_convervions {
   };
 }
 
+/// The native value behind a [`Resource`]: a file descriptor on Unix, a
+/// handle (or socket) on Windows.
 #[cfg(unix)]
-type Inner = std::os::fd::RawFd;
+pub type RawResource = std::os::fd::RawFd;
+
+/// The native value behind a [`Resource`]: a file descriptor on Unix, a
+/// handle (or socket) on Windows.
+#[cfg(windows)]
+pub type RawResource = std::os::windows::io::RawHandle;
 
 #[cfg(windows)]
-type Inner = RawHandle;
+use std::os::windows::io::RawHandle;
 
-/// Internal owned resource with automatic cleanup support.
+type Inner = RawResource;
+
+/// Converts a successful completion result into the descriptor it carries,
+/// rejecting values that are negative or out of range.
+#[cfg(unix)]
+fn raw_from_result(result: isize) -> Option<RawResource> {
+  RawResource::try_from(result).ok().filter(|fd| *fd >= 0)
+}
+
+/// Converts a successful completion result into the handle it carries,
+/// rejecting the null and pseudo-handle range.
+#[cfg(windows)]
+fn raw_from_result(result: isize) -> Option<RawResource> {
+  (result > 0).then_some(result as RawResource)
+}
+
+/// Closes a [`RawResource`] its caller owns.
 ///
-/// This type holds the actual platform resource (file descriptor or handle) and a flag
-/// indicating whether it should be automatically closed when dropped.
+/// Every owned [`Resource`] carries the close function of whoever created it:
+/// the backend for resources produced by operations (see
+/// [`IoBackend::resource_close`](crate::backend::IoBackend::resource_close)),
+/// or the host OS's native close for resources adopted from raw
+/// descriptors/handles.
+pub type CloseFn = unsafe fn(RawResource);
+
+// SAFETY: a raw handle is an opaque identifier; like `OwnedHandle`, owning
+// or sharing it across threads is sound.
+#[cfg(windows)]
+unsafe impl Send for InnerResource {}
+// SAFETY: see `Send` above; `InnerResource` has no interior mutability.
+#[cfg(windows)]
+unsafe impl Sync for InnerResource {}
+
+/// Internal resource with automatic cleanup support.
 struct InnerResource {
   /// The platform-specific resource (RawFd on Unix, RawHandle on Windows)
   inner: Inner,
-  /// Whether to automatically close this resource on drop.
-  should_close: bool,
+  /// How to close `inner` on drop; `None` for borrowed resources.
+  close: Option<CloseFn>,
 }
 
 impl InnerResource {
-  /// Creates a new owned resource that will be closed on drop.
-  fn new(inner: Inner) -> Self {
-    Self { inner, should_close: true }
+  /// Creates a new owned resource that `close` releases on drop.
+  fn new(inner: Inner, close: CloseFn) -> Self {
+    Self { inner, close: Some(close) }
   }
 
   /// Creates a new borrowed resource that will NOT be closed on drop.
   fn new_borrowed(inner: Inner) -> Self {
-    Self { inner, should_close: false }
+    Self { inner, close: None }
   }
 }
 
 impl Drop for InnerResource {
-  /// Drops the owned resource, closing it automatically if `should_close` is true.
+  /// Closes the resource with its owner's close function, if it is owned.
   fn drop(&mut self) {
-    if !self.should_close {
-      return;
+    if let Some(close) = self.close {
+      // SAFETY: this resource owns `inner` and is dropped exactly once.
+      unsafe { close(self.inner) };
     }
-
-    let _ = syscall!(close(self.inner));
   }
 }
 
@@ -175,7 +213,7 @@ pub struct Resource(Arc<InnerResource>);
 ///     // Use the resource...
 /// }
 ///
-/// let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+/// let socket = Socket::new(lio::api::SockDomain::IPV4, lio::api::SockType::STREAM, lio::api::SockProto::DEFAULT).await?;
 /// take_resource(socket);
 /// ```
 pub trait IntoResource {
@@ -201,7 +239,7 @@ pub trait IntoResource {
 ///     println!("Resource count: {}", resource.count());
 /// }
 ///
-/// let socket = Socket::new(libc::AF_INET, libc::SOCK_STREAM, 0).await?;
+/// let socket = Socket::new(lio::api::SockDomain::IPV4, lio::api::SockType::STREAM, lio::api::SockProto::DEFAULT).await?;
 /// inspect_resource(&socket);
 /// // socket is still usable here
 /// ```
@@ -257,11 +295,42 @@ impl_native_convervions!(Resource);
 #[cfg(unix)]
 impl std::os::fd::FromRawFd for Resource {
   unsafe fn from_raw_fd(fd: std::os::fd::RawFd) -> Self {
-    Resource(Arc::new(InnerResource::new(fd)))
+    Resource(Arc::new(InnerResource::new(fd, crate::backend::native::close)))
   }
 }
 
 impl Resource {
+  /// Takes ownership of the descriptor/handle a resource-creating
+  /// operation completed with.
+  ///
+  /// The resource is closed with the close function of the backend that
+  /// produced the completion.
+  ///
+  /// # Safety
+  ///
+  /// A non-negative `completion.result` must carry a newly created
+  /// descriptor/handle owned by the caller.
+  ///
+  /// # Errors
+  ///
+  /// A negative result is the operation's error code. A non-negative result
+  /// that does not fit a [`RawResource`] is reported as
+  /// [`io::ErrorKind::InvalidData`] instead of being truncated.
+  pub(crate) unsafe fn from_completion(
+    completion: &crate::api::op::Completion,
+  ) -> io::Result<Self> {
+    if completion.result < 0 {
+      return Err(completion.os_error());
+    }
+    let raw = raw_from_result(completion.result).ok_or_else(|| {
+      io::Error::new(
+        io::ErrorKind::InvalidData,
+        "backend completed with an invalid resource",
+      )
+    })?;
+    Ok(Resource(Arc::new(InnerResource::new(raw, completion.resource_close()))))
+  }
+
   /// Creates a Resource that borrows a file descriptor without taking ownership.
   ///
   /// The fd/handle will NOT be closed when this Resource is dropped. Use this when the
@@ -281,7 +350,10 @@ impl Resource {
 #[cfg(windows)]
 impl std::os::windows::io::FromRawHandle for Resource {
   unsafe fn from_raw_handle(handle: RawHandle) -> Self {
-    Resource(Arc::new(InnerResource::new(handle)))
+    Resource(Arc::new(InnerResource::new(
+      handle,
+      crate::backend::native::close,
+    )))
   }
 }
 
@@ -303,50 +375,10 @@ impl Resource {
   /// let stdout = Resource::stdout();
   /// // Use stdout for async I/O...
   /// ```
-  #[cfg(unix)]
   pub fn stdout() -> Self {
-    // SAFETY: fd is valid
-    unsafe { Self::borrow(libc::STDOUT_FILENO) }
-  }
-
-  /// Returns a `Resource` for standard output (stdout).
-  #[cfg(windows)]
-  pub fn stdout() -> Self {
-    use windows_sys::Win32::Foundation::{
-      DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::System::Console::{
-      GetStdHandle, STD_OUTPUT_HANDLE,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    // SAFETY: GetStdHandle is safe to call with valid constants
-    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    assert!(handle != INVALID_HANDLE_VALUE, "Failed to get stdout handle");
-
-    let mut dup_handle: HANDLE = 0;
-    let current_process = unsafe { GetCurrentProcess() };
-
-    // SAFETY: All handles are valid, dup_handle is a valid out pointer
-    let result = unsafe {
-      DuplicateHandle(
-        current_process,
-        handle,
-        current_process,
-        &mut dup_handle,
-        0,
-        0, // bInheritHandle = FALSE
-        DUPLICATE_SAME_ACCESS,
-      )
-    };
-    assert!(result != 0, "Failed to duplicate stdout handle");
-
-    // SAFETY: dup_handle is valid, just returned from DuplicateHandle
-    unsafe {
-      <Self as std::os::windows::io::FromRawHandle>::from_raw_handle(
-        dup_handle as *mut std::ffi::c_void,
-      )
-    }
+    // SAFETY: the process std handles stay valid; borrowing them means this
+    // `Resource` never closes them.
+    unsafe { Self::borrow(crate::backend::native::stdout()) }
   }
 
   /// Returns a `Resource` for standard error (stderr).
@@ -366,48 +398,10 @@ impl Resource {
   /// let stderr = Resource::stderr();
   /// // Use stderr for async I/O...
   /// ```
-  #[cfg(unix)]
   pub fn stderr() -> Self {
-    // SAFETY: fd is valid
-    unsafe { Self::borrow(libc::STDERR_FILENO) }
-  }
-
-  /// Returns a `Resource` for standard error (stderr).
-  #[cfg(windows)]
-  pub fn stderr() -> Self {
-    use windows_sys::Win32::Foundation::{
-      DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    // SAFETY: GetStdHandle is safe to call with valid constants
-    let handle = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
-    assert!(handle != INVALID_HANDLE_VALUE, "Failed to get stderr handle");
-
-    let mut dup_handle: HANDLE = 0;
-    let current_process = unsafe { GetCurrentProcess() };
-
-    // SAFETY: All handles are valid, dup_handle is a valid out pointer
-    let result = unsafe {
-      DuplicateHandle(
-        current_process,
-        handle,
-        current_process,
-        &mut dup_handle,
-        0,
-        0, // bInheritHandle = FALSE
-        DUPLICATE_SAME_ACCESS,
-      )
-    };
-    assert!(result != 0, "Failed to duplicate stderr handle");
-
-    // SAFETY: dup_handle is valid, just returned from DuplicateHandle
-    unsafe {
-      <Self as std::os::windows::io::FromRawHandle>::from_raw_handle(
-        dup_handle as *mut std::ffi::c_void,
-      )
-    }
+    // SAFETY: the process std handles stay valid; borrowing them means this
+    // `Resource` never closes them.
+    unsafe { Self::borrow(crate::backend::native::stderr()) }
   }
 
   /// Returns a `Resource` for standard input (stdin).
@@ -427,48 +421,10 @@ impl Resource {
   /// let stdin = Resource::stdin();
   /// // Use stdin for async I/O...
   /// ```
-  #[cfg(unix)]
   pub fn stdin() -> Self {
-    // SAFETY: fd is valid
-    unsafe { Self::borrow(libc::STDIN_FILENO) }
-  }
-
-  /// Returns a `Resource` for standard input (stdin).
-  #[cfg(windows)]
-  pub fn stdin() -> Self {
-    use windows_sys::Win32::Foundation::{
-      DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    // SAFETY: GetStdHandle is safe to call with valid constants
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    assert!(handle != INVALID_HANDLE_VALUE, "Failed to get stdin handle");
-
-    let mut dup_handle: HANDLE = 0;
-    let current_process = unsafe { GetCurrentProcess() };
-
-    // SAFETY: All handles are valid, dup_handle is a valid out pointer
-    let result = unsafe {
-      DuplicateHandle(
-        current_process,
-        handle,
-        current_process,
-        &mut dup_handle,
-        0,
-        0, // bInheritHandle = FALSE
-        DUPLICATE_SAME_ACCESS,
-      )
-    };
-    assert!(result != 0, "Failed to duplicate stdin handle");
-
-    // SAFETY: dup_handle is valid, just returned from DuplicateHandle
-    unsafe {
-      <Self as std::os::windows::io::FromRawHandle>::from_raw_handle(
-        dup_handle as *mut std::ffi::c_void,
-      )
-    }
+    // SAFETY: the process std handles stay valid; borrowing them means this
+    // `Resource` never closes them.
+    unsafe { Self::borrow(crate::backend::native::stdin()) }
   }
 
   /// Returns a `Resource` representing the current working directory.
@@ -488,15 +444,13 @@ impl Resource {
   /// async fn open_file() -> std::io::Result<Resource> {
   ///     let cwd = Resource::cwd();
   ///     let path = CString::new("myfile.txt").unwrap();
-  ///     lio::api::openat(&cwd, path, libc::O_RDONLY, 0).await
+  ///     lio::api::openat(&cwd, path, lio::api::OpenFlags::READ, 0).await
   /// }
   /// ```
-  #[cfg(unix)]
   pub fn cwd() -> Self {
-    // SAFETY: AT_FDCWD is a special constant (-100 on Linux, -2 on macOS)
-    // that tells *at() syscalls to use the current working directory.
-    // We use borrow_fd so it won't be closed on drop.
-    unsafe { Self::borrow(libc::AT_FDCWD) }
+    // SAFETY: the cwd value is a sentinel the backends resolve (`AT_FDCWD` on
+    // Unix); it is borrowed and therefore never closed.
+    unsafe { Self::borrow(crate::backend::native::CWD) }
   }
 
   /// Returns the number of strong references to this resource.

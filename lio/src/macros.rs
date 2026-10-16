@@ -98,6 +98,7 @@ macro_rules! doc_op {
     ) => {
         #[doc = $short]
         #[doc = concat!("\n\nEquivalent to the [`", $syscall, "`](", $url, ") syscall.\n")]
+        #[inline]
         $($rest)*
     };
 
@@ -110,6 +111,7 @@ macro_rules! doc_op {
     ) => {
         #[doc = $short]
         #[doc = concat!("\n\nEquivalent to the `", $syscall, "` syscall.\n")]
+        #[inline]
         $($rest)*
     };
 
@@ -120,6 +122,7 @@ macro_rules! doc_op {
         $($rest:tt)*
     ) => {
         #[doc = $short]
+        #[inline]
         $($rest)*
     };
 
@@ -150,50 +153,4 @@ macro_rules! doc_op {
     ) => {
         $($rest)*
     };
-}
-
-macro_rules! syscall {
-  (raw $fn: ident ( $($arg: expr),* $(,)* ) ? ) => {{
-      let val = syscall!(raw $fn ($($arg),*));
-
-      if val < 0 {
-          return val;
-      }
-
-      val
-  }};
-  (raw $fn: ident ( $($arg: expr),* $(,)* ) ) => {{
-    #[allow(unused_unsafe)]
-    {
-      // SAFETY: This exists on the platform in cfg.
-      let res = unsafe { libc::$fn($($arg, )*) };
-      if res != -1 {
-        res as isize
-      }
-      else {
-        // Return negative errno - this will cause early return from function
-        //
-        #[cfg(target_os = "linux")]
-        // SAFETY: This exists on the platform in cfg.
-        let err = unsafe { *libc::__errno_location() };
-        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-        // SAFETY: This exists on the platform in cfg.
-        let err = unsafe { *libc::__error() };
-        #[cfg(windows)]
-        // SAFETY: This exists on the platform in cfg.
-        let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-
-        -(err as isize)
-      }
-    }
-  }};
-
-  ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
-      let result = syscall!(raw $fn($($arg),*));
-      if result >= 0 {
-          Ok(result as i32)
-      } else {
-          Err(std::io::Error::from_raw_os_error(-(result as i32)))
-      }
-  }};
 }

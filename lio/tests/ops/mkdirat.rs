@@ -38,9 +38,10 @@ fn mkdir(lio: &mut Lio, path: CString) -> Result<(), std::io::Error> {
 }
 
 fn unlink_dir(lio: &mut Lio, path: CString) {
-  let mut receiver = api::unlinkat(&Resource::cwd(), path, libc::AT_REMOVEDIR)
-    .with_lio(lio)
-    .send();
+  let mut receiver =
+    api::unlinkat(&Resource::cwd(), path, api::UnlinkKind::Directory)
+      .with_lio(lio)
+      .send();
   common::poll_recv(lio, &mut receiver).unwrap();
 }
 
@@ -71,7 +72,10 @@ fn test_mkdirat_existing_path_fails() {
   mkdir(&mut lio, path.clone()).unwrap();
 
   let result = mkdir(&mut lio, path.clone());
-  assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EEXIST));
+  assert_eq!(
+    result.unwrap_err().raw_os_error(),
+    Some(lio::backend::ds::errno::EEXIST)
+  );
 
   unlink_dir(&mut lio, path);
 }

@@ -45,15 +45,16 @@ impl SlabKey {
 /// Slot storage with generation tracking.
 pub(crate) struct Slot<T> {
   generation: u32,
+  next_free: u32,
   state: T,
   occupied: bool,
 }
 
 /// Generic generational slot pool with stable per-slot state.
-pub(crate) struct SlotPool<T> {
+pub(crate) struct SlotPool<T, const TRACK_LEN: bool = true> {
   slots: Vec<Slot<T>>,
-  /// Free slot indices available for reuse (LIFO for cache locality)
-  free_list: Vec<u32>,
+  /// Head of the intrusive free list, or `u32::MAX` when empty.
+  free_head: u32,
   /// Next slot to bump-allocate
   next_slot: u32,
   /// Maximum capacity
@@ -62,7 +63,7 @@ pub(crate) struct SlotPool<T> {
   len: u32,
 }
 
-impl<T> SlotPool<T> {
+impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
   pub(crate) fn with_capacity(
     capacity: usize,
     mut init_slot: impl FnMut() -> T,
@@ -70,35 +71,51 @@ impl<T> SlotPool<T> {
     let capacity = capacity.min(u32::MAX as usize) as u32;
     let mut slots = Vec::with_capacity(capacity as usize);
     for _ in 0..capacity {
-      slots.push(Slot { generation: 0, state: init_slot(), occupied: false });
+      slots.push(Slot {
+        generation: 0,
+        next_free: u32::MAX,
+        state: init_slot(),
+        occupied: false,
+      });
     }
-    Self {
-      slots,
-      free_list: Vec::with_capacity(capacity as usize),
-      next_slot: 0,
-      capacity,
-      len: 0,
-    }
+    Self { slots, free_head: u32::MAX, next_slot: 0, capacity, len: 0 }
   }
 
   #[inline]
   pub(crate) fn allocate(&mut self) -> Option<(SlabKey, &mut T)> {
-    let slot_idx = match self.free_list.pop() {
-      Some(slot_idx) => slot_idx,
-      None => {
-        if self.next_slot >= self.capacity {
-          return None;
-        }
-        let slot_idx = self.next_slot;
-        self.next_slot += 1;
-        slot_idx
-      }
-    };
+    self.allocate_with(|_| {})
+  }
 
+  /// Allocates a slot after `init` has prepared its state.
+  ///
+  /// The slot is only marked occupied once `init` returns, so a panicking
+  /// `init` leaves the pool unchanged instead of holding an occupied slot
+  /// whose state was never initialized.
+  #[inline]
+  pub(crate) fn allocate_with(
+    &mut self,
+    init: impl FnOnce(&mut T),
+  ) -> Option<(SlabKey, &mut T)> {
+    let slot_idx = if self.free_head != u32::MAX {
+      self.free_head
+    } else if self.next_slot < self.capacity {
+      self.next_slot
+    } else {
+      return None;
+    };
+    init(&mut self.slots[slot_idx as usize].state);
+
+    if self.free_head == slot_idx {
+      self.free_head = self.slots[slot_idx as usize].next_free;
+    } else {
+      self.next_slot += 1;
+    }
     let slot = &mut self.slots[slot_idx as usize];
     debug_assert!(!slot.occupied);
     slot.occupied = true;
-    self.len += 1;
+    if TRACK_LEN {
+      self.len += 1;
+    }
     let key = SlabKey { slot: slot_idx, generation: slot.generation };
     Some((key, &mut slot.state))
   }
@@ -113,8 +130,27 @@ impl<T> SlotPool<T> {
     }
   }
 
+  /// Removes the slot `key` names, handing its state to `on_remove`.
+  ///
+  /// `on_remove` runs before the slot is released, so it must not panic.
+  /// Move the value out and drop it after this returns: a destructor that
+  /// panicked here would leave the slot occupied around a dropped value.
   #[inline]
   pub(crate) fn remove_with<R>(
+    &mut self,
+    key: SlabKey,
+    on_remove: impl FnOnce(&mut T) -> R,
+  ) -> Option<R> {
+    let removed = self.retire_with(key, on_remove)?;
+    self.release(key.slot());
+    Some(removed)
+  }
+
+  /// Like [`remove_with`](Self::remove_with), but the slot is not reused
+  /// until [`release`](Self::release)d: `key` stops resolving at once, while
+  /// the slot's state stays untouched by allocation in the meantime.
+  #[inline]
+  pub(crate) fn retire_with<R>(
     &mut self,
     key: SlabKey,
     on_remove: impl FnOnce(&mut T) -> R,
@@ -123,18 +159,59 @@ impl<T> SlotPool<T> {
     if slot.generation != key.generation() || !slot.occupied {
       return None;
     }
+    Some(self.retire_known_with(key, on_remove))
+  }
+
+  /// [`retire_with`](Self::retire_with) for a key already validated under
+  /// the same exclusive pool borrow. `on_remove` must not panic.
+  #[inline]
+  pub(crate) fn retire_known_with<R>(
+    &mut self,
+    key: SlabKey,
+    on_remove: impl FnOnce(&mut T) -> R,
+  ) -> R {
+    let slot = &mut self.slots[key.slot() as usize];
+    assert!(slot.generation == key.generation() && slot.occupied);
 
     let removed = on_remove(&mut slot.state);
     slot.occupied = false;
-    self.len -= 1;
+    if TRACK_LEN {
+      self.len -= 1;
+    }
     slot.generation = slot.generation.wrapping_add(1);
-    self.free_list.push(key.slot());
-    Some(removed)
+    removed
   }
 
+  /// Makes a slot retired by [`retire_with`](Self::retire_with) available
+  /// for allocation again.
+  #[inline]
+  pub(crate) fn release(&mut self, slot_idx: u32) {
+    let slot = &mut self.slots[slot_idx as usize];
+    debug_assert!(!slot.occupied);
+    slot.next_free = self.free_head;
+    self.free_head = slot_idx;
+  }
+
+  /// Whether `allocate` would succeed.
+  #[inline]
+  pub(crate) fn has_free_slot(&self) -> bool {
+    self.free_head != u32::MAX || self.next_slot < self.capacity
+  }
+
+  // Only the Unix backend implementations use the slab.
+  #[cfg_attr(any(windows, not(feature = "backend_impls")), allow(dead_code))]
   #[inline]
   pub(crate) fn len(&self) -> usize {
     self.len as usize
+  }
+
+  /// Calls `f` on the state of every occupied slot.
+  pub(crate) fn for_each_occupied(&mut self, mut f: impl FnMut(&mut T)) {
+    for slot in &mut self.slots[..self.next_slot as usize] {
+      if slot.occupied {
+        f(&mut slot.state);
+      }
+    }
   }
 }
 
@@ -142,10 +219,12 @@ impl<T> SlotPool<T> {
 ///
 /// Allocates items of type `T` in contiguous memory with O(1) insert/remove.
 /// Uses bump allocation for new slots and a free list for reuse.
+#[cfg_attr(any(windows, not(feature = "backend_impls")), allow(dead_code))]
 pub struct Slab<T> {
   pool: SlotPool<MaybeUninit<T>>,
 }
 
+#[cfg_attr(any(windows, not(feature = "backend_impls")), allow(dead_code))]
 impl<T> Slab<T> {
   /// Creates a new slab with the given capacity.
   ///
@@ -180,13 +259,8 @@ impl<T> Slab<T> {
   /// Returns `true` if removed, `false` if key was invalid or stale.
   #[inline]
   pub fn remove(&mut self, key: SlabKey) -> bool {
-    self
-      .pool
-      .remove_with(key, |slot| {
-        // SAFETY: occupied slots always contain an initialized value.
-        unsafe { slot.assume_init_drop() };
-      })
-      .is_some()
+    // Drop the value only once its slot is released.
+    self.remove_value(key).is_some()
   }
 
   /// Remove a value by key and return it.
@@ -211,6 +285,20 @@ impl<T> Slab<T> {
   #[inline]
   pub fn len(&self) -> usize {
     self.pool.len()
+  }
+
+  /// Keys of the values matching `pred`, by a linear scan of the slots in
+  /// use so far. Meant for rare lookups, such as cancellation.
+  pub fn keys_where<'a>(
+    &'a self,
+    mut pred: impl FnMut(&T) -> bool + 'a,
+  ) -> impl Iterator<Item = SlabKey> + 'a {
+    let used = &self.pool.slots[..self.pool.next_slot as usize];
+    used.iter().enumerate().filter_map(move |(index, slot)| {
+      // SAFETY: occupied slots always contain an initialized value.
+      (slot.occupied && pred(unsafe { slot.state.assume_init_ref() }))
+        .then_some(SlabKey { slot: index as u32, generation: slot.generation })
+    })
   }
 }
 

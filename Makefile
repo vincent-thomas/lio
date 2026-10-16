@@ -1,4 +1,7 @@
-.PHONY: lint lint-full doc book book-serve book-test cbuild test test-debug test-release test-lio-uring test-doc test-lib test-integration test-nix vm-linux vm-windows vm-freebsd vm-all
+.PHONY: lint lint-full doc book book-serve book-test cbuild test test-debug test-release test-lio-uring test-doc test-lib test-integration test-nix vm-linux vm-windows vm-freebsd vm-all bench
+
+bench:
+	cargo bench -p lio --bench bookkeeping
 
 lint:
 	nix run .#lint

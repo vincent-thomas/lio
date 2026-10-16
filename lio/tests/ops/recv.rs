@@ -10,24 +10,11 @@ use super::common;
 use super::common::{poll_recv, poll_until_recv, setup_tcp_pair};
 use lio::Lio;
 use lio::api;
-use std::os::fd::{AsFd, AsRawFd};
+use std::io::Write;
 use std::sync::mpsc;
 
 fn send_all(fd: &lio::api::resource::Resource, data: &[u8]) {
-  let mut written = 0usize;
-
-  while written < data.len() {
-    let n = unsafe {
-      libc::send(
-        fd.as_fd().as_raw_fd(),
-        data[written..].as_ptr().cast(),
-        data.len() - written,
-        0,
-      )
-    };
-    assert!(n >= 0, "peer send failed");
-    written += n as usize;
-  }
+  common::as_tcp_stream(fd).write_all(data).expect("peer send failed");
 }
 
 #[test]
@@ -114,7 +101,7 @@ fn with_flags() {
   send_all(&client_sock, &data);
 
   let (sender_recv, receiver_recv) = mpsc::channel();
-  api::recv(&accepted_fd, vec![0u8; 64], Some(0))
+  api::recv(&accepted_fd, vec![0u8; 64], None)
     .with_lio(&mut lio)
     .send_with(sender_recv);
 
