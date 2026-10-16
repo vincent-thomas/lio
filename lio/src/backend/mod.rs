@@ -39,6 +39,7 @@
 
 pub mod ds;
 pub mod op;
+pub mod testing;
 
 /// Test utilities for IoBackend implementations.
 ///
