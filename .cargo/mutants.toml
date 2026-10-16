@@ -37,6 +37,10 @@ exclude_re = [
   "lio/src/api/op\\.rs:80:33: replace << with >>",
 ]
 test_tool = "nextest"
+# Each mutant rebuilds and reruns these only: the core suites, which drive
+# the scripted backend. The real-backend integration suites barely touch
+# the core and would make up most of every mutant's build and run.
+additional_cargo_test_args = ["--lib", "--test", "cancellation", "--test", "capacity"]
 # A mutant can turn a loop infinite. nextest stops a hung test after 60s
 # (`.config/nextest.toml`); this whole-run timeout is only the backstop.
 timeout_multiplier = 3.0
