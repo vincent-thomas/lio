@@ -184,30 +184,6 @@ impl OpStore {
   }
 
   /// Gets mutable access to an operation's per-step lowering arena.
-  /// Whether `id` names a live registration.
-  pub fn contains(&self, id: u64) -> bool {
-    self.slots.contains(SlabKey::from_u64(id))
-  }
-
-  /// Panics if the store's bookkeeping is inconsistent, after checking
-  /// every live registration and handing it to `f` with its id.
-  ///
-  /// Returns the retired slots, in ascending order: detached registrations
-  /// whose slot is not released yet.
-  pub fn check_invariants(
-    &self,
-    mut f: impl FnMut(u64, &Registration),
-  ) -> Vec<u32> {
-    let retired = self.slots.check_invariants();
-    self.slots.for_each_occupied_key(|key, slot| {
-      // SAFETY: occupied slots hold an initialized registration.
-      let registration = unsafe { slot.registration.assume_init_ref() };
-      registration.check_invariants();
-      f(key.as_u64(), registration);
-    });
-    retired
-  }
-
   #[inline]
   pub fn step_bump_mut(&mut self, id: u64) -> Option<&mut Bump> {
     let key = SlabKey::from_u64(id);

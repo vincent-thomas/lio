@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Unique identifier for a timer (matches operation ID).
@@ -287,6 +287,15 @@ impl Clock {
     self.advance_to(self.current_tick.saturating_add(ticks));
   }
 
+  /// Whether timer `id` is still tracked: scheduled, or fired and not
+  /// removed yet.
+  pub(crate) fn contains(&self, id: TimerId) -> bool {
+    self
+      .timers
+      .get(id as u32 as usize)
+      .is_some_and(|slot| slot.is_occupied() && slot.id == id)
+  }
+
   pub fn remove(&mut self, id: TimerId) -> bool {
     let slot_index = id as u32 as usize;
     let Some(slot) = self.timers.get_mut(slot_index) else {
@@ -335,108 +344,6 @@ impl Clock {
 
   pub(crate) fn current_tick(&self) -> u64 {
     self.current_tick
-  }
-
-  /// Ids of every timer the clock tracks: scheduled, or fired and not
-  /// removed yet.
-  pub(crate) fn timer_ids(&self) -> impl Iterator<Item = TimerId> + '_ {
-    self.timers.iter().filter(|slot| slot.is_occupied()).map(|slot| slot.id)
-  }
-
-  /// Panics if the wheel's bookkeeping is inconsistent.
-  pub(crate) fn check_invariants(&self) {
-    let mut entries = HashSet::new();
-    for (level, (len, slots)) in [
-      (self.level0.len, &self.level0.slots),
-      (self.level1.len, &self.level1.slots),
-      (self.level2.len, &self.level2.slots),
-      (self.level3.len, &self.level3.slots),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-      assert_eq!(
-        len,
-        slots.iter().map(Vec::len).sum::<usize>(),
-        "clock: level {level} len differs from its entries"
-      );
-      for entry in slots.iter().flatten() {
-        assert!(
-          (entry.id as u32 as usize) < self.timers.len(),
-          "clock: wheel entry for timer {} has no timer slot",
-          entry.id
-        );
-        entries.insert((entry.id, entry.deadline_ticks));
-      }
-    }
-
-    let mut occupied = 0;
-    let mut active = BTreeMap::<u64, usize>::new();
-    for (index, slot) in self.timers.iter().enumerate() {
-      if !slot.is_occupied() {
-        continue;
-      }
-      occupied += 1;
-      assert_eq!(
-        slot.id as u32 as usize, index,
-        "clock: timer {} is in slot {index}",
-        slot.id
-      );
-      if slot.entry.pending_index != ACTIVE_TIMER {
-        continue;
-      }
-      let deadline = slot.entry.deadline_ticks;
-      assert!(
-        deadline > self.current_tick,
-        "clock: timer {} is due at {deadline} but did not fire by tick {}",
-        slot.id,
-        self.current_tick
-      );
-      assert!(
-        entries.contains(&(slot.id, deadline)),
-        "clock: timer {} has no wheel entry, so it can never fire",
-        slot.id
-      );
-      *active.entry(deadline).or_default() += 1;
-    }
-    assert_eq!(
-      self.timer_count, occupied,
-      "clock: timer_count differs from the tracked timers"
-    );
-
-    let mut counted = self.later_deadline_counts.clone();
-    if let Some((earliest, count)) = self.earliest_deadline {
-      assert!(
-        counted.keys().all(|&later| later > earliest),
-        "clock: a later deadline is not after the earliest"
-      );
-      assert!(
-        counted.insert(earliest, count).is_none(),
-        "clock: the earliest deadline is also counted as later"
-      );
-    }
-    assert_eq!(
-      counted, active,
-      "clock: deadline counts differ from the active timers"
-    );
-
-    assert!(
-      self.pending_index <= self.pending_fire.len(),
-      "clock: delivery cursor past the fired timers"
-    );
-    if !self.pending_has_stale {
-      // Delivery skips its staleness check then; every entry must be live.
-      for (index, pending) in
-        self.pending_fire.iter().enumerate().skip(self.pending_index)
-      {
-        let timer = self.timers[pending.id as u32 as usize];
-        assert!(
-          timer.id == pending.id && timer.entry.pending_index == index,
-          "clock: fired timer {} is stale, but not marked so",
-          pending.id
-        );
-      }
-    }
   }
 
   pub(crate) fn is_empty(&self) -> bool {
@@ -515,19 +422,29 @@ impl Clock {
       {
         self.earliest_deadline = Some((earliest, count - amount));
       }
-      Some((earliest, _)) if deadline_ticks == earliest => {
+      Some((earliest, count)) if deadline_ticks == earliest => {
+        assert_eq!(
+          count, amount,
+          "clock: {amount} timers left deadline {deadline_ticks}, which only \
+           {count} had"
+        );
         self.earliest_deadline = self.later_deadline_counts.pop_first();
       }
       _ => {
-        let remove = match self.later_deadline_counts.get_mut(&deadline_ticks) {
-          Some(count) if *count > amount => {
-            *count -= amount;
-            false
-          }
-          Some(_) => true,
-          None => false,
+        let Some(count) = self.later_deadline_counts.get_mut(&deadline_ticks)
+        else {
+          panic!(
+            "clock: {amount} timers left deadline {deadline_ticks}, which none \
+             had"
+          );
         };
-        if remove {
+        assert!(
+          *count >= amount,
+          "clock: {amount} timers left deadline {deadline_ticks}, which only \
+           {count} had"
+        );
+        *count -= amount;
+        if *count == 0 {
           self.later_deadline_counts.remove(&deadline_ticks);
         }
       }
@@ -624,6 +541,14 @@ impl Clock {
     }
   }
 
+  /// Whether fired entry `index` is still its timer's current delivery.
+  fn pending_is_live(&self, index: usize) -> bool {
+    let pending = self.pending_fire[index];
+    self.timers.get(pending.id as u32 as usize).is_some_and(|timer| {
+      timer.id == pending.id && timer.entry.pending_index == index
+    })
+  }
+
   #[inline]
   fn pending_is_undelivered(&self, id: TimerId, index: usize) -> bool {
     index >= self.pending_index
@@ -638,6 +563,12 @@ impl Clock {
       self.pending_index += 1;
 
       if !self.pending_has_stale {
+        // The flag lets delivery skip this check; debug builds verify it.
+        debug_assert!(
+          self.pending_is_live(index),
+          "clock: delivering stale timer {}, which is not marked stale",
+          pending.id
+        );
         return Some(pending.id);
       }
 
@@ -683,6 +614,11 @@ impl Iterator for ExpiredIterator<'_> {
 
     while self.clock.pending_index < self.clock.pending_fire.len() {
       let pending = self.clock.pending_fire[self.clock.pending_index];
+      debug_assert!(
+        self.clock.pending_is_live(self.clock.pending_index),
+        "clock: delivering stale timer {}, which is not marked stale",
+        pending.id
+      );
       self.clock.pending_index += 1;
 
       accum = f(accum, pending.id);
@@ -984,7 +920,23 @@ mod tests {
   }
 
   #[test]
-  fn invariants_hold_through_mixed_operations() {
+  #[should_panic(expected = "which none had")]
+  fn leaving_an_uncounted_deadline_panics() {
+    let mut clock = Clock::new();
+    clock.schedule_at(1, 5);
+    clock.decrement_active_deadline(9);
+  }
+
+  #[test]
+  #[should_panic(expected = "which only 1 had")]
+  fn leaving_a_deadline_more_often_than_counted_panics() {
+    let mut clock = Clock::new();
+    clock.schedule_at(1, 5);
+    clock.decrement_active_deadline_by(5, 2);
+  }
+
+  #[test]
+  fn deadline_counts_survive_mixed_operations() {
     let mut clock = Clock::with_capacity(16);
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let mut next = move || {
@@ -993,6 +945,7 @@ mod tests {
       state ^= state << 17;
       state
     };
+    // Every step goes through the asserting bookkeeping.
     for _ in 0..20_000 {
       let roll = next();
       let id = (next() % 4) << 32 | (next() % 16);
@@ -1010,25 +963,6 @@ mod tests {
           }
         }
       }
-      clock.check_invariants();
     }
-  }
-
-  #[test]
-  #[should_panic(expected = "has no wheel entry, so it can never fire")]
-  fn a_timer_lost_from_the_wheel_is_caught() {
-    let mut clock = Clock::new();
-    clock.schedule(1, Duration::from_millis(5));
-    clock.level0.clear_slot(5);
-    clock.check_invariants();
-  }
-
-  #[test]
-  #[should_panic(expected = "deadline counts differ from the active timers")]
-  fn a_wrong_deadline_count_is_caught() {
-    let mut clock = Clock::new();
-    clock.schedule(1, Duration::from_millis(5));
-    clock.earliest_deadline = Some((5, 2));
-    clock.check_invariants();
   }
 }

@@ -405,6 +405,7 @@ impl Registration {
 
   /// Sets the waker, replacing any existing waker.
   pub fn set_waker(&mut self, waker: Waker) {
+    assert!(!self.cancelled, "registration: waker set after cancellation");
     match &mut self.state {
       State::Waker { waker: w, .. } => {
         *w = Some(waker);
@@ -472,17 +473,9 @@ impl Registration {
     self.cancelled
   }
 
-  /// Panics if the registration's state is inconsistent.
-  pub(crate) fn check_invariants(&self) {
-    if self.cancelled
-      && let State::Waker { waker: Some(_), .. } = &self.state
-    {
-      panic!("registration: cancelled, but still holds a waker");
-    }
-  }
-
   #[inline]
   pub(crate) fn restore_waker(&mut self, waker: Waker) {
+    assert!(!self.cancelled, "registration: waker restored after cancellation");
     if let State::Waker { waker: slot @ None, .. } = &mut self.state {
       *slot = Some(waker);
     }
@@ -852,5 +845,13 @@ mod tests {
     assert!(reg.is_finished());
     assert!(reg.action().is_none());
     assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+  }
+
+  #[test]
+  #[should_panic(expected = "waker set after cancellation")]
+  fn setting_a_waker_after_cancellation_panics() {
+    let (_arena, mut reg) = new_callback_reg(|_| {}, Nop);
+    reg.cancel();
+    reg.set_waker(Waker::noop().clone());
   }
 }

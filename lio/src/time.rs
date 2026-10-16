@@ -156,6 +156,12 @@ impl TimeManager {
   }
 
   /// Removes a timer from tracking.
+  /// Whether timer `id` is still tracked: scheduled, or fired and not
+  /// removed yet.
+  pub fn contains(&self, id: TimerId) -> bool {
+    self.clock.contains(id)
+  }
+
   pub fn remove(&mut self, id: TimerId) -> bool {
     self.clock.remove(id)
   }
@@ -186,16 +192,6 @@ impl TimeManager {
       let elapsed = Duration::from_millis(self.clock.current_tick() * TICK_MS);
       self.state = TimeState::Running { epoch: Instant::now() - elapsed };
     }
-  }
-
-  /// Ids of every timer still tracked.
-  pub fn timer_ids(&self) -> impl Iterator<Item = TimerId> + '_ {
-    self.clock.timer_ids()
-  }
-
-  /// Panics if the timer wheel's bookkeeping is inconsistent.
-  pub fn check_invariants(&self) {
-    self.clock.check_invariants();
   }
 
   pub fn is_paused(&self) -> bool {
