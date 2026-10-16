@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 /// Unique identifier for a timer (matches operation ID).
@@ -335,6 +335,108 @@ impl Clock {
 
   pub(crate) fn current_tick(&self) -> u64 {
     self.current_tick
+  }
+
+  /// Ids of every timer the clock tracks: scheduled, or fired and not
+  /// removed yet.
+  pub(crate) fn timer_ids(&self) -> impl Iterator<Item = TimerId> + '_ {
+    self.timers.iter().filter(|slot| slot.is_occupied()).map(|slot| slot.id)
+  }
+
+  /// Panics if the wheel's bookkeeping is inconsistent.
+  pub(crate) fn check_invariants(&self) {
+    let mut entries = HashSet::new();
+    for (level, (len, slots)) in [
+      (self.level0.len, &self.level0.slots),
+      (self.level1.len, &self.level1.slots),
+      (self.level2.len, &self.level2.slots),
+      (self.level3.len, &self.level3.slots),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+      assert_eq!(
+        len,
+        slots.iter().map(Vec::len).sum::<usize>(),
+        "clock: level {level} len differs from its entries"
+      );
+      for entry in slots.iter().flatten() {
+        assert!(
+          (entry.id as u32 as usize) < self.timers.len(),
+          "clock: wheel entry for timer {} has no timer slot",
+          entry.id
+        );
+        entries.insert((entry.id, entry.deadline_ticks));
+      }
+    }
+
+    let mut occupied = 0;
+    let mut active = BTreeMap::<u64, usize>::new();
+    for (index, slot) in self.timers.iter().enumerate() {
+      if !slot.is_occupied() {
+        continue;
+      }
+      occupied += 1;
+      assert_eq!(
+        slot.id as u32 as usize, index,
+        "clock: timer {} is in slot {index}",
+        slot.id
+      );
+      if slot.entry.pending_index != ACTIVE_TIMER {
+        continue;
+      }
+      let deadline = slot.entry.deadline_ticks;
+      assert!(
+        deadline > self.current_tick,
+        "clock: timer {} is due at {deadline} but did not fire by tick {}",
+        slot.id,
+        self.current_tick
+      );
+      assert!(
+        entries.contains(&(slot.id, deadline)),
+        "clock: timer {} has no wheel entry, so it can never fire",
+        slot.id
+      );
+      *active.entry(deadline).or_default() += 1;
+    }
+    assert_eq!(
+      self.timer_count, occupied,
+      "clock: timer_count differs from the tracked timers"
+    );
+
+    let mut counted = self.later_deadline_counts.clone();
+    if let Some((earliest, count)) = self.earliest_deadline {
+      assert!(
+        counted.keys().all(|&later| later > earliest),
+        "clock: a later deadline is not after the earliest"
+      );
+      assert!(
+        counted.insert(earliest, count).is_none(),
+        "clock: the earliest deadline is also counted as later"
+      );
+    }
+    assert_eq!(
+      counted, active,
+      "clock: deadline counts differ from the active timers"
+    );
+
+    assert!(
+      self.pending_index <= self.pending_fire.len(),
+      "clock: delivery cursor past the fired timers"
+    );
+    if !self.pending_has_stale {
+      // Delivery skips its staleness check then; every entry must be live.
+      for (index, pending) in
+        self.pending_fire.iter().enumerate().skip(self.pending_index)
+      {
+        let timer = self.timers[pending.id as u32 as usize];
+        assert!(
+          timer.id == pending.id && timer.entry.pending_index == index,
+          "clock: fired timer {} is stale, but not marked so",
+          pending.id
+        );
+      }
+    }
   }
 
   pub(crate) fn is_empty(&self) -> bool {
@@ -879,5 +981,54 @@ mod tests {
     assert!(collect_expired(&mut clock).is_empty());
     clock.advance_to(600_000);
     assert_eq!(collect_expired(&mut clock), vec![0]);
+  }
+
+  #[test]
+  fn invariants_hold_through_mixed_operations() {
+    let mut clock = Clock::with_capacity(16);
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state
+    };
+    for _ in 0..20_000 {
+      let roll = next();
+      let id = (next() % 4) << 32 | (next() % 16);
+      match roll % 5 {
+        0 | 1 => clock.schedule_at(id, clock.current_tick() + next() % 70_000),
+        2 => {
+          clock.remove(id);
+        }
+        3 => clock.advance_by(next() % 300),
+        _ => {
+          for id in collect_expired(&mut clock) {
+            if next() % 2 == 0 {
+              clock.remove(id);
+            }
+          }
+        }
+      }
+      clock.check_invariants();
+    }
+  }
+
+  #[test]
+  #[should_panic(expected = "has no wheel entry, so it can never fire")]
+  fn a_timer_lost_from_the_wheel_is_caught() {
+    let mut clock = Clock::new();
+    clock.schedule(1, Duration::from_millis(5));
+    clock.level0.clear_slot(5);
+    clock.check_invariants();
+  }
+
+  #[test]
+  #[should_panic(expected = "deadline counts differ from the active timers")]
+  fn a_wrong_deadline_count_is_caught() {
+    let mut clock = Clock::new();
+    clock.schedule(1, Duration::from_millis(5));
+    clock.earliest_deadline = Some((5, 2));
+    clock.check_invariants();
   }
 }

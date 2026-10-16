@@ -213,6 +213,81 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
       }
     }
   }
+
+  /// Whether `key` names an occupied slot.
+  pub(crate) fn contains(&self, key: SlabKey) -> bool {
+    self
+      .slots
+      .get(key.slot() as usize)
+      .is_some_and(|slot| slot.occupied && slot.generation == key.generation())
+  }
+
+  /// Calls `f` with the key and state of every occupied slot.
+  pub(crate) fn for_each_occupied_key(&self, mut f: impl FnMut(SlabKey, &T)) {
+    for (index, slot) in
+      self.slots[..self.next_slot as usize].iter().enumerate()
+    {
+      if slot.occupied {
+        let key = SlabKey { slot: index as u32, generation: slot.generation };
+        f(key, &slot.state);
+      }
+    }
+  }
+
+  /// Panics if the pool's bookkeeping is inconsistent.
+  ///
+  /// Returns the retired slots, in ascending order: neither occupied nor
+  /// free, waiting for [`release`](Self::release).
+  pub(crate) fn check_invariants(&self) -> Vec<u32> {
+    assert_eq!(
+      self.slots.len(),
+      self.capacity as usize,
+      "slot pool: slot count differs from the capacity"
+    );
+    assert!(
+      self.next_slot <= self.capacity,
+      "slot pool: bump pointer {} past the capacity {}",
+      self.next_slot,
+      self.capacity
+    );
+    let bumped = self.next_slot as usize;
+    for (offset, slot) in self.slots[bumped..].iter().enumerate() {
+      assert!(
+        !slot.occupied && slot.generation == 0,
+        "slot pool: slot {} past the bump pointer was used",
+        bumped + offset
+      );
+    }
+
+    let mut free = vec![false; bumped];
+    let mut cursor = self.free_head;
+    while cursor != u32::MAX {
+      let index = cursor as usize;
+      assert!(
+        index < bumped,
+        "slot pool: free list holds slot {index}, never allocated"
+      );
+      assert!(!free[index], "slot pool: free list reaches slot {index} twice");
+      assert!(
+        !self.slots[index].occupied,
+        "slot pool: free list holds occupied slot {index}"
+      );
+      free[index] = true;
+      cursor = self.slots[index].next_free;
+    }
+
+    if TRACK_LEN {
+      let occupied = self.slots[..bumped].iter().filter(|s| s.occupied).count();
+      assert_eq!(
+        self.len as usize, occupied,
+        "slot pool: len differs from the occupied slots"
+      );
+    }
+    (0..bumped)
+      .filter(|&index| !self.slots[index].occupied && !free[index])
+      .map(|index| index as u32)
+      .collect()
+  }
 }
 
 /// Generic slab allocator with generational indices.
@@ -285,6 +360,13 @@ impl<T> Slab<T> {
   #[inline]
   pub fn len(&self) -> usize {
     self.pool.len()
+  }
+
+  /// Panics if the slab's bookkeeping is inconsistent.
+  #[cfg(test)]
+  pub fn check_invariants(&self) {
+    let retired = self.pool.check_invariants();
+    assert!(retired.is_empty(), "slab: slots {retired:?} were never freed");
   }
 
   /// Keys of the values matching `pred`, by a linear scan of the slots in
@@ -407,5 +489,62 @@ mod tests {
     }
     // Slab dropped, remaining item dropped
     assert_eq!(*drop_count.borrow(), 2);
+  }
+
+  #[test]
+  fn invariants_hold_through_inserts_and_removes() {
+    let mut slab: Slab<u32> = Slab::new(8);
+    let mut keys = Vec::new();
+    for round in 0..4 {
+      while let Some(key) = slab.insert(round) {
+        keys.push(key);
+        slab.check_invariants();
+      }
+      for key in keys.drain(..).rev().step_by(2) {
+        assert!(slab.remove(key));
+        slab.check_invariants();
+      }
+    }
+  }
+
+  #[test]
+  fn retired_slots_are_reported_until_released() {
+    let mut pool: SlotPool<()> = SlotPool::with_capacity(4, || ());
+    let (a, _) = pool.allocate().unwrap();
+    let (b, _) = pool.allocate().unwrap();
+    pool.retire_with(a, |_| ()).unwrap();
+    pool.retire_with(b, |_| ()).unwrap();
+    assert_eq!(pool.check_invariants(), vec![0, 1]);
+    pool.release(a.slot());
+    assert_eq!(pool.check_invariants(), vec![1]);
+    assert!(!pool.contains(a) && !pool.contains(b));
+  }
+
+  #[test]
+  #[should_panic(expected = "free list reaches slot 0 twice")]
+  fn a_free_list_cycle_is_caught() {
+    let mut pool: SlotPool<()> = SlotPool::with_capacity(2, || ());
+    let (a, _) = pool.allocate().unwrap();
+    pool.remove_with(a, |_| ()).unwrap();
+    pool.slots[0].next_free = 0;
+    pool.check_invariants();
+  }
+
+  #[test]
+  #[should_panic(expected = "free list holds occupied slot 0")]
+  fn an_occupied_slot_on_the_free_list_is_caught() {
+    let mut pool: SlotPool<()> = SlotPool::with_capacity(2, || ());
+    let (a, _) = pool.allocate().unwrap();
+    pool.free_head = a.slot();
+    pool.check_invariants();
+  }
+
+  #[test]
+  #[should_panic(expected = "len differs from the occupied slots")]
+  fn a_wrong_len_is_caught() {
+    let mut pool: SlotPool<()> = SlotPool::with_capacity(2, || ());
+    pool.allocate().unwrap();
+    pool.len = 2;
+    pool.check_invariants();
   }
 }

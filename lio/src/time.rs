@@ -188,6 +188,16 @@ impl TimeManager {
     }
   }
 
+  /// Ids of every timer still tracked.
+  pub fn timer_ids(&self) -> impl Iterator<Item = TimerId> + '_ {
+    self.clock.timer_ids()
+  }
+
+  /// Panics if the timer wheel's bookkeeping is inconsistent.
+  pub fn check_invariants(&self) {
+    self.clock.check_invariants();
+  }
+
   pub fn is_paused(&self) -> bool {
     matches!(self.state, TimeState::Paused)
   }

@@ -21,6 +21,12 @@ use lio::backend::op::Op;
 use lio::backend::testing::{Checked, POISON, ScriptedBackend};
 use lio::{Lio, api};
 
+/// Runs the driver once without blocking, then checks its bookkeeping.
+fn step(lio: &Lio) {
+  lio.try_run().unwrap();
+  lio.check_invariants();
+}
+
 /// An op model that reports what happens to it.
 struct Tracked {
   dropped: Arc<AtomicBool>,
@@ -65,7 +71,7 @@ fn dropped_future_keeps_its_op_alive_until_completion() {
   );
   let mut cx = Context::from_waker(Waker::noop());
   assert!(future.as_mut().poll(&mut cx).is_pending());
-  lio.try_run().unwrap();
+  step(&lio);
   let id = backend.pushed()[0];
 
   drop(future);
@@ -74,16 +80,18 @@ fn dropped_future_keeps_its_op_alive_until_completion() {
     !dropped.load(Ordering::SeqCst),
     "the op's memory must outlive its operation in the backend"
   );
+  lio.check_invariants();
   assert!(lio.is_full(), "its slot stays taken until then");
 
   backend.complete(id, -1);
-  lio.try_run().unwrap();
+  step(&lio);
   assert!(dropped.load(Ordering::SeqCst), "freed once the backend is done");
   assert_eq!(
     completions.load(Ordering::SeqCst),
     1,
     "the op model still sees the result, to release what it produced"
   );
+  lio.check_invariants();
   assert!(!lio.is_full());
 }
 
@@ -101,7 +109,7 @@ fn drop_driver_with_op_in_flight(backend: &ScriptedBackend) -> Arc<AtomicBool> {
   );
   let mut cx = Context::from_waker(Waker::noop());
   assert!(future.as_mut().poll(&mut cx).is_pending());
-  lio.try_run().unwrap();
+  step(&lio);
   drop(future);
   drop(lio);
   dropped
@@ -160,6 +168,7 @@ fn dropped_sleep_is_removed_at_once() {
 
   // Timers live in the driver, not the backend.
   assert!(backend.cancelled().is_empty());
+  lio.check_invariants();
   assert!(!lio.is_full());
 }
 
@@ -208,14 +217,15 @@ fn stream_dropped_by_its_wake_up_is_not_resubmitted() {
     assert!(next.as_mut().poll(&mut cx).is_pending());
   }
   *holder.0.borrow_mut() = Some(stream);
-  lio.try_run().unwrap();
+  step(&lio);
   let id = backend.pushed()[0];
 
   // The completion wakes the task, which drops the stream mid-delivery.
   backend.complete(id, 0);
-  lio.try_run().unwrap();
+  step(&lio);
   assert!(holder.0.borrow().is_none(), "the wake-up dropped the stream");
   assert_eq!(backend.pushed(), vec![id], "no next step is pushed");
+  lio.check_invariants();
   assert!(!lio.is_full(), "its slot is free");
 }
 
@@ -254,6 +264,7 @@ fn stream_on_the_global_lio_cancels_on_the_driver_it_ran_on() {
   let mut cx = Context::from_waker(Waker::noop());
   assert!(next.as_mut().poll(&mut cx).is_pending());
   drop(next);
+  first.check_invariants();
   assert!(first.is_full());
 
   // Another driver becomes the global; its first op gets the same id.
@@ -266,7 +277,9 @@ fn stream_on_the_global_lio_cancels_on_the_driver_it_ran_on() {
   assert!(sleep.as_mut().poll(&mut cx).is_pending());
 
   drop(stream);
+  first.check_invariants();
   assert!(!first.is_full(), "the stream's own operation was cancelled");
+  second.check_invariants();
   assert!(second.is_full(), "the other driver's operation was left alone");
 }
 
@@ -280,10 +293,10 @@ fn read_buffer_receives_the_backends_bytes() {
     Box::pin(api::read(&stdin, vec![0u8; 16]).with_lio(&lio).into_future());
   let mut cx = Context::from_waker(Waker::noop());
   assert!(read.as_mut().poll(&mut cx).is_pending());
-  lio.try_run().unwrap();
+  step(&lio);
 
   backend.complete(backend.pushed()[0], 4);
-  lio.try_run().unwrap();
+  step(&lio);
   let Poll::Ready((result, buf)) = read.as_mut().poll(&mut cx) else {
     panic!("the read completed");
   };
@@ -301,12 +314,13 @@ fn dropped_read_keeps_its_buffer_until_the_backend_writes_it() {
     Box::pin(api::read(&stdin, vec![0u8; 4096]).with_lio(&lio).into_future());
   let mut cx = Context::from_waker(Waker::noop());
   assert!(read.as_mut().poll(&mut cx).is_pending());
-  lio.try_run().unwrap();
+  step(&lio);
   drop(read);
 
   // The backend writes the whole buffer as it finishes: under Miri or a
   // sanitizer, a buffer freed with the future is caught here.
   backend.complete(backend.pushed()[0], 4096);
-  lio.try_run().unwrap();
+  step(&lio);
+  lio.check_invariants();
   assert!(!lio.is_full());
 }
