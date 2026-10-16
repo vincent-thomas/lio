@@ -798,7 +798,7 @@ fn search_path_parallel(
                 }
                 if let Some(remaining_budget) = remaining_budget.as_ref() {
                   if remaining_budget
-                    .fetch_update(
+                    .try_update(
                       Ordering::AcqRel,
                       Ordering::Acquire,
                       |remaining| remaining.checked_sub(1),
