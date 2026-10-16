@@ -13,41 +13,11 @@ use std::time::Duration;
 use lio::api::op::{Action, Completion, OpModel, OpResult, StreamOpModel};
 use lio::api::{Io, IoStream};
 use lio::backend::op::Op;
-use lio::backend::{IoBackend, OpCompleted};
+use lio::backend::testing::{Checked, ScriptedBackend};
 use lio::{Lio, api};
 
-/// Completes every queued no-op on the next wait, in submission order.
-#[derive(Default)]
-struct InOrderBackend {
-  queued: Vec<u64>,
-}
-
-impl IoBackend for InOrderBackend {
-  fn init(&mut self, _cap: usize) -> std::io::Result<()> {
-    Ok(())
-  }
-
-  fn push(&mut self, id: u64, _op: Op, _step_bump: &mut bumpalo::Bump) {
-    self.queued.push(id);
-  }
-
-  fn flush(&mut self) -> std::io::Result<()> {
-    Ok(())
-  }
-
-  fn wait(
-    &mut self,
-    _timeout: Option<Duration>,
-    completed: &mut Vec<OpCompleted>,
-  ) -> std::io::Result<()> {
-    completed.clear();
-    completed.extend(self.queued.drain(..).map(|id| OpCompleted::new(id, 0)));
-    Ok(())
-  }
-}
-
 fn lio(cap: usize) -> Lio {
-  Lio::new_with_backend(InOrderBackend::default(), cap).unwrap()
+  Lio::new_with_backend(Checked::new(ScriptedBackend::auto(0)), cap).unwrap()
 }
 
 #[derive(Default)]
@@ -245,6 +215,7 @@ fn panicking_first_action_does_not_keep_its_slot() {
 
 #[test]
 fn zero_capacity_is_rejected() {
-  let err = Lio::new_with_backend(InOrderBackend::default(), 0).err();
+  let err =
+    Lio::new_with_backend(Checked::new(ScriptedBackend::auto(0)), 0).err();
   assert_eq!(err.map(|e| e.kind()), Some(std::io::ErrorKind::InvalidInput));
 }

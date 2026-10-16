@@ -7,65 +7,19 @@ mod common;
 use std::cell::RefCell;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Wake, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use lio::api::op::{
   Action, Completion, OneshotOpModel, OpModel, OpResult, StreamOpModel,
 };
+use lio::api::resource::Resource;
 use lio::api::{Io, IoStream};
 use lio::backend::op::Op;
-use lio::backend::{IoBackend, OpCompleted};
+use lio::backend::testing::{Checked, POISON, ScriptedBackend};
 use lio::{Lio, api};
-
-/// Holds every operation until the test completes it, and records
-/// cancellation requests.
-#[derive(Default)]
-struct Held {
-  pushed: Vec<u64>,
-  cancelled: Vec<u64>,
-  complete: Vec<OpCompleted>,
-  /// Makes `drain` report operations still running.
-  stuck: bool,
-}
-
-#[derive(Clone, Default)]
-struct HoldingBackend(Rc<RefCell<Held>>);
-
-impl IoBackend for HoldingBackend {
-  fn init(&mut self, _cap: usize) -> std::io::Result<()> {
-    Ok(())
-  }
-
-  fn push(&mut self, id: u64, _op: Op, _step_bump: &mut bumpalo::Bump) {
-    self.0.borrow_mut().pushed.push(id);
-  }
-
-  fn flush(&mut self) -> std::io::Result<()> {
-    Ok(())
-  }
-
-  fn cancel(&mut self, id: u64) {
-    self.0.borrow_mut().cancelled.push(id);
-  }
-
-  fn drain(&mut self) -> bool {
-    !self.0.borrow().stuck
-  }
-
-  fn wait(
-    &mut self,
-    _timeout: Option<Duration>,
-    completed: &mut Vec<OpCompleted>,
-  ) -> std::io::Result<()> {
-    completed.clear();
-    completed.append(&mut self.0.borrow_mut().complete);
-    Ok(())
-  }
-}
 
 /// An op model that reports what happens to it.
 struct Tracked {
@@ -96,8 +50,8 @@ impl Drop for Tracked {
 
 #[test]
 fn dropped_future_keeps_its_op_alive_until_completion() {
-  let backend = HoldingBackend::default();
-  let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
+  let backend = ScriptedBackend::new();
+  let lio = Lio::new_with_backend(Checked::new(backend.clone()), 1).unwrap();
   let dropped = Arc::new(AtomicBool::new(false));
   let completions = Arc::new(AtomicUsize::new(0));
 
@@ -112,17 +66,17 @@ fn dropped_future_keeps_its_op_alive_until_completion() {
   let mut cx = Context::from_waker(Waker::noop());
   assert!(future.as_mut().poll(&mut cx).is_pending());
   lio.try_run().unwrap();
-  let id = backend.0.borrow().pushed[0];
+  let id = backend.pushed()[0];
 
   drop(future);
-  assert_eq!(backend.0.borrow().cancelled, vec![id], "the backend is asked");
+  assert_eq!(backend.cancelled(), vec![id], "the backend is asked");
   assert!(
     !dropped.load(Ordering::SeqCst),
     "the op's memory must outlive its operation in the backend"
   );
   assert!(lio.is_full(), "its slot stays taken until then");
 
-  backend.0.borrow_mut().complete.push(OpCompleted::new(id, -1));
+  backend.complete(id, -1);
   lio.try_run().unwrap();
   assert!(dropped.load(Ordering::SeqCst), "freed once the backend is done");
   assert_eq!(
@@ -134,8 +88,8 @@ fn dropped_future_keeps_its_op_alive_until_completion() {
 }
 
 /// Submits a `Tracked` op, drops its future, then drops the driver.
-fn drop_driver_with_op_in_flight(backend: &HoldingBackend) -> Arc<AtomicBool> {
-  let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
+fn drop_driver_with_op_in_flight(backend: &ScriptedBackend) -> Arc<AtomicBool> {
+  let lio = Lio::new_with_backend(Checked::new(backend.clone()), 1).unwrap();
   let dropped = Arc::new(AtomicBool::new(false));
   let mut future = Box::pin(
     Io::from_op(Tracked {
@@ -155,15 +109,15 @@ fn drop_driver_with_op_in_flight(backend: &HoldingBackend) -> Arc<AtomicBool> {
 
 #[test]
 fn dropping_the_driver_frees_ops_the_backend_drained() {
-  let backend = HoldingBackend::default();
+  let backend = ScriptedBackend::new();
   let dropped = drop_driver_with_op_in_flight(&backend);
   assert!(dropped.load(Ordering::SeqCst), "the store releases the op");
 }
 
 #[test]
 fn dropping_the_driver_leaks_ops_the_backend_could_not_drain() {
-  let backend = HoldingBackend::default();
-  backend.0.borrow_mut().stuck = true;
+  let backend = ScriptedBackend::new();
+  backend.set_stuck(true);
   let dropped = drop_driver_with_op_in_flight(&backend);
   assert!(
     !dropped.load(Ordering::SeqCst),
@@ -195,8 +149,8 @@ fn receiver_outliving_its_driver_never_completes() {
 
 #[test]
 fn dropped_sleep_is_removed_at_once() {
-  let backend = HoldingBackend::default();
-  let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
+  let backend = ScriptedBackend::new();
+  let lio = Lio::new_with_backend(Checked::new(backend.clone()), 1).unwrap();
 
   let mut future =
     Box::pin(api::sleep(Duration::from_secs(60)).with_lio(&lio).into_future());
@@ -205,7 +159,7 @@ fn dropped_sleep_is_removed_at_once() {
   drop(future);
 
   // Timers live in the driver, not the backend.
-  assert!(backend.0.borrow().cancelled.is_empty());
+  assert!(backend.cancelled().is_empty());
   assert!(!lio.is_full());
 }
 
@@ -242,8 +196,8 @@ impl Wake for DropOnWake {
 
 #[test]
 fn stream_dropped_by_its_wake_up_is_not_resubmitted() {
-  let backend = HoldingBackend::default();
-  let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
+  let backend = ScriptedBackend::new();
+  let lio = Lio::new_with_backend(Checked::new(backend.clone()), 1).unwrap();
 
   let holder = Arc::new(DropOnWake(RefCell::new(None)));
   let waker = Waker::from(holder.clone());
@@ -255,13 +209,13 @@ fn stream_dropped_by_its_wake_up_is_not_resubmitted() {
   }
   *holder.0.borrow_mut() = Some(stream);
   lio.try_run().unwrap();
-  let id = backend.0.borrow().pushed[0];
+  let id = backend.pushed()[0];
 
   // The completion wakes the task, which drops the stream mid-delivery.
-  backend.0.borrow_mut().complete.push(OpCompleted::new(id, 0));
+  backend.complete(id, 0);
   lio.try_run().unwrap();
   assert!(holder.0.borrow().is_none(), "the wake-up dropped the stream");
-  assert_eq!(backend.0.borrow().pushed, vec![id], "no next step is pushed");
+  assert_eq!(backend.pushed(), vec![id], "no next step is pushed");
   assert!(!lio.is_full(), "its slot is free");
 }
 
@@ -314,4 +268,45 @@ fn stream_on_the_global_lio_cancels_on_the_driver_it_ran_on() {
   drop(stream);
   assert!(!first.is_full(), "the stream's own operation was cancelled");
   assert!(second.is_full(), "the other driver's operation was left alone");
+}
+
+#[test]
+fn read_buffer_receives_the_backends_bytes() {
+  let backend = ScriptedBackend::new();
+  let lio = Lio::new_with_backend(Checked::new(backend.clone()), 1).unwrap();
+  let stdin = Resource::stdin();
+
+  let mut read =
+    Box::pin(api::read(&stdin, vec![0u8; 16]).with_lio(&lio).into_future());
+  let mut cx = Context::from_waker(Waker::noop());
+  assert!(read.as_mut().poll(&mut cx).is_pending());
+  lio.try_run().unwrap();
+
+  backend.complete(backend.pushed()[0], 4);
+  lio.try_run().unwrap();
+  let Poll::Ready((result, buf)) = read.as_mut().poll(&mut cx) else {
+    panic!("the read completed");
+  };
+  assert_eq!(result.unwrap(), 4);
+  assert_eq!(buf, vec![POISON; 4]);
+}
+
+#[test]
+fn dropped_read_keeps_its_buffer_until_the_backend_writes_it() {
+  let backend = ScriptedBackend::new();
+  let lio = Lio::new_with_backend(Checked::new(backend.clone()), 1).unwrap();
+  let stdin = Resource::stdin();
+
+  let mut read =
+    Box::pin(api::read(&stdin, vec![0u8; 4096]).with_lio(&lio).into_future());
+  let mut cx = Context::from_waker(Waker::noop());
+  assert!(read.as_mut().poll(&mut cx).is_pending());
+  lio.try_run().unwrap();
+  drop(read);
+
+  // The backend writes the whole buffer as it finishes: under Miri or a
+  // sanitizer, a buffer freed with the future is caught here.
+  backend.complete(backend.pushed()[0], 4096);
+  lio.try_run().unwrap();
+  assert!(!lio.is_full());
 }
