@@ -119,13 +119,11 @@ fn build_linux() {
     // Wrap static inline functions so they can be called from Rust
     .wrap_static_fns(true)
     .wrap_static_fns_path(out_dir.join("liburing_wrapper"))
-    // The headers bindgen reads are the fresh copy in OUT_DIR, rewritten on
-    // every run, so watching them would rerun this script, and rebuild
-    // everything depending on this crate, on every cargo invocation. The
-    // real sources are watched above.
-    .parse_callbacks(Box::new(
-      bindgen::CargoCallbacks::new().rerun_on_header_files(false),
-    ))
+    // No `bindgen::CargoCallbacks`: it watches every header bindgen reads,
+    // the wrapper's includes too, and those are the fresh copy in OUT_DIR,
+    // rewritten on every run. That reran this script, and rebuilt every
+    // crate depending on this one, on every cargo invocation. The real
+    // sources are watched above.
     // Finish the builder and generate the bindings.
     .generate()
     // Unwrap the Result and panic on failure.
