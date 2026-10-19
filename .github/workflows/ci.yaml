@@ -65,14 +65,14 @@ jobs:
       - name: a second check compiles nothing
         if: runner.os == 'Linux'
         env:
-          # Plain lines to match on, and cargo's reasons for any rebuild.
+          # Plain lines to match on.
           CARGO_TERM_COLOR: never
-          CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: |
-          cargo check ${{ matrix.packages }} --all-targets ${{ matrix.features }} > second-check.log 2>&1
+          # --verbose makes cargo say why each crate is dirty.
+          cargo check --verbose ${{ matrix.packages }} --all-targets ${{ matrix.features }} > second-check.log 2>&1
           if grep -E '^\s+(Compiling|Checking) ' second-check.log; then
             echo "::error::these crates rebuilt with nothing changed; cargo's reasons:"
-            grep -iE 'dirty|stale|changed|fingerprint' second-check.log | head -40
+            grep -E '^\s+Dirty ' second-check.log
             exit 1
           fi
 
