@@ -29,20 +29,19 @@ jobs:
           LIO_LIFECYCLE_DEPTH: "8"
         run: cargo test -p lio --release --lib -- model lifecycle
 
-  # Each borrow model's tests run in two halves, each under two seeds, all
-  # side by side. `slice` deals the sorted tests out in turn, so the heavy
-  # lifecycle pairings split evenly between the halves. The seeds move on with every run, so nightly runs keep
-  # trying new ones instead of repeating the same few.
+  # Each borrow model's tests run in four parts side by side, under one
+  # seed per run. The seed moves on with every run, so nightly runs keep
+  # trying new ones instead of repeating the same few. `slice` deals the
+  # sorted tests out in turn, so the heavy lifecycle pairings split evenly.
   miri:
-    name: miri-${{ matrix.borrows }}-part-${{ matrix.part }}-seed-${{ matrix.seed }}
+    name: miri-${{ matrix.borrows }}-part-${{ matrix.part }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         borrows: [stacked, tree]
-        part: [1, 2]
-        seed: [0, 1]
+        part: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -56,20 +55,23 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # Restores dependency builds, so the first build starts warm.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri
+
       - name: miri (core bookkeeping)
         env:
           BORROWS: ${{ matrix.borrows == 'tree' && '-Zmiri-tree-borrows' || '' }}
-          RUN: ${{ github.run_number }}
-          SLOT: ${{ matrix.seed }}
+          SEED: ${{ github.run_number }}
           PROPTEST_CASES: "16"
           # Each ordering is a fresh driver, so keep it shallow under Miri.
           LIO_LIFECYCLE_DEPTH: "2"
           RUSTFLAGS: ""
         run: |
-          SEED=$(( RUN * 2 + SLOT ))
           echo "Miri seed $SEED"
           MIRIFLAGS="-Zmiri-seed=$SEED $BORROWS" \
-            scripts/test-miri.sh --partition slice:${{ matrix.part }}/2
+            scripts/test-miri.sh --partition slice:${{ matrix.part }}/4
 
   mutants:
     name: mutants-${{ matrix.shard }}
@@ -78,7 +80,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        # With the 8 Miri jobs and search, 20: GitHub's concurrent job limit.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -91,7 +94,12 @@ jobs:
         with:
           tool: cargo-mutants,cargo-nextest
 
-      - name: every core mutant, shard ${{ matrix.shard }} of 10
+      # Restores dependency builds, so the first build starts warm.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants
+
+      - name: every core mutant, shard ${{ matrix.shard }} of 11
         env:
           NEXTEST_PROFILE: mutants
           # A mutant is almost always caught within a few cases; the deep
@@ -105,7 +113,7 @@ jobs:
         # space (8 GiB) makes that test fail instead of taking the runner down.
         run: |
           ulimit -v 8388608
-          cargo mutants --shard ${{ matrix.shard }}/10 --no-shuffle --jobs 2
+          cargo mutants --shard ${{ matrix.shard }}/11 --no-shuffle --jobs 2
 
       - uses: actions/upload-artifact@v4
         if: always()
