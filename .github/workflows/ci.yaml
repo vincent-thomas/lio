@@ -60,6 +60,17 @@ jobs:
       - name: cargo check
         run: cargo check ${{ matrix.packages }} --all-targets ${{ matrix.features }}
 
+      # A build script that reruns every time rebuilds everything above it
+      # on every cargo invocation, for every developer and CI job.
+      - name: a second check compiles nothing
+        if: runner.os == 'Linux'
+        run: |
+          cargo check ${{ matrix.packages }} --all-targets ${{ matrix.features }} 2>&1 | tee second-check.log
+          if grep -E '^\s+(Compiling|Checking) ' second-check.log; then
+            echo "::error::these crates rebuilt with nothing changed"
+            exit 1
+          fi
+
       - name: cargo doc
         run: cargo test --doc -p lio -p lio-test ${{ matrix.features }}
 
@@ -96,6 +107,11 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # Restores dependency builds, so the first build starts warm.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-${{ matrix.borrows }}
+
       - name: miri (core bookkeeping)
         env:
           MIRIFLAGS: ${{ matrix.flags }}
@@ -120,6 +136,11 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants,cargo-nextest
+
+      # Restores dependency builds, so the first build starts warm.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants
 
       # Every mutant of a changed line in the core must make a test fail;
       # `.cargo/mutants.toml` says which files count as core.
