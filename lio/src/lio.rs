@@ -1,9 +1,10 @@
 use crate::{
-  api::op::{Action, Completion},
+  api::op::{Action, Completion, CompletionFlags},
   backend::{
     IoBackend, OpCompleted,
     store::{Detached, OpStore},
   },
+  registration::ProcessResult,
   registration::Registration,
   time::TimeManager,
 };
@@ -574,9 +575,15 @@ impl Lio {
         let Some(Detached { registration, slot }) = next else {
           break;
         };
-        // Released even if the drop panics.
-        let _release = ReleaseSlot { lio: self, slot };
-        drop(registration);
+        let waker = {
+          // Released even if the drop panics.
+          let _release = ReleaseSlot { lio: self, slot };
+          registration.dispose()
+        };
+        // With the slot released, so the woken task can use it.
+        if let Some(waker) = waker {
+          waker.wake();
+        }
         buried = true;
       }
       if !buried {
@@ -654,8 +661,8 @@ impl Lio {
       budget -= 1;
       let (id, completion, timer) = if let Some(c) = inner.ready_io.pop_front()
       {
-        let completion =
-          Completion::new(c.result()).with_resource_close(resource_close);
+        let completion = Completion::with_flags(c.result(), c.flags())
+          .with_resource_close(resource_close);
         (c.registration_id(), completion, false)
       } else if let Some(id) = inner.ready_timers.pop_front() {
         (id, TimeManager::fired_completion(), true)
@@ -701,9 +708,12 @@ impl Lio {
       PROFILE,
       stats,
       completion_store_lookup_time,
-      inner.store.get_mut(id).map(|reg| reg.begin_completion())
+      inner.store.get_mut(id).map(|reg| {
+        let (handler, waker) = reg.begin_completion();
+        (handler, waker, reg.delivers())
+      })
     );
-    let Some((handler, mut waker)) = begun else {
+    let Some((handler, mut waker, deliver)) = begun else {
       // An earlier handler may have cancelled a sleep whose timer already
       // fired. An I/O registration, though, lives until its completion
       // arrives: one without it was completed twice, or never pushed.
@@ -714,6 +724,7 @@ impl Lio {
       return (inner, false);
     };
 
+    let more = completion.flags.contains(CompletionFlags::MORE);
     drop(inner);
     batch.current = Some(id);
     let result = timed!(PROFILE, stats, completion_on_completion_time, {
@@ -721,7 +732,7 @@ impl Lio {
       // removed below: dropping its consumer only marks it cancelled. For a
       // cancelled operation the op model still sees the result, so what it
       // produced (an accepted socket, say) is released, but nobody is woken.
-      unsafe { handler.complete(completion, &mut waker) }
+      unsafe { handler.complete(completion, &mut waker, deliver) }
     });
     batch.current = None;
     let mut inner = self.inner.borrow_mut();
@@ -730,15 +741,19 @@ impl Lio {
     let Some(reg) = inner_ref.store.get_mut(id) else {
       panic!("driver: registration {id} was removed while its handler ran");
     };
-    // A cancelled operation takes no further step; its consumer may also
-    // have been dropped by the wake-up just now.
-    let next_action =
-      if reg.is_cancelled() { None } else { result.next_action };
-    match next_action {
-      Some(action) => {
-        if let Some(waker) = waker {
-          reg.restore_waker(waker);
-        }
+    // A cancelled or done operation takes no further step; its consumer may
+    // also have been dropped by the wake-up just now.
+    // A waker the completion did not consume goes back: the task still
+    // waits, for its next item or for the item channel to close (which
+    // `bury_and_wake` wakes it for). A cancelled consumer has none.
+    if let Some(waker) = waker
+      && !reg.is_cancelled()
+    {
+      reg.restore_waker(waker);
+    }
+    let result = if reg.delivers() { result } else { ProcessResult::Done };
+    match result {
+      ProcessResult::Continue(action) => {
         timed!(
           PROFILE,
           stats,
@@ -747,7 +762,18 @@ impl Lio {
         );
         stats.count_dispatch();
       }
-      None => {
+      // The backend reports the operation's next result on its own.
+      ProcessResult::Pending => {}
+      ProcessResult::Done if more => {
+        // The model is done, but the operation is still in the backend,
+        // using the registration's memory: finish it early, and keep the
+        // registration until its final completion.
+        if reg.delivers() {
+          reg.mark_done();
+          inner_ref.io.cancel(id);
+        }
+      }
+      ProcessResult::Done => {
         // Dropped by `bury_and_wake` once the driver is not borrowed.
         timed!(PROFILE, stats, remove_time, Self::retire(inner_ref, id));
         stats.count_remove();
@@ -782,8 +808,11 @@ impl Lio {
       if inner.time.remove(id) {
         Self::retire(inner, id);
       } else {
+        // A done model already had its operation cancelled.
+        if !reg.is_done() {
+          inner.io.cancel(id);
+        }
         reg.cancel();
-        inner.io.cancel(id);
         return;
       }
     }
@@ -851,6 +880,10 @@ mod model_tests;
 #[cfg(test)]
 #[path = "lio_lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "lio_multishot_tests.rs"]
+mod multishot_tests;
 
 #[cfg(test)]
 mod tests {

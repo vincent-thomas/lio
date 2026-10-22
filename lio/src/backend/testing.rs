@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use bumpalo::Bump;
 
+use crate::api::op::CompletionFlags;
 use crate::api::resource::CloseFn;
 use crate::backend::op::{MsgBuf, MsgBufMut, Op};
 use crate::backend::{IoBackend, OpCompleted};
@@ -142,6 +143,27 @@ impl ScriptedBackend {
       unsafe { touch(&op) };
     }
     script.ready.push_back(OpCompleted::new(id, result));
+  }
+
+  /// Reports a result for in-flight operation `id` with
+  /// [`CompletionFlags::MORE`] set, in the next `wait()`, as a multishot
+  /// operation does. The operation stays in flight.
+  ///
+  /// # Panics
+  ///
+  /// If `id` is not in flight.
+  pub fn complete_more(&self, id: u64, result: isize) {
+    let mut script = self.0.borrow_mut();
+    let Some((_, op)) = script.in_flight.iter().find(|(i, _)| *i == id) else {
+      panic!("ScriptedBackend::complete_more: operation {id} is not in flight");
+    };
+    if !script.no_poison {
+      // SAFETY: the operation is in flight, so the driver keeps the memory
+      // it points to valid.
+      unsafe { touch(op) };
+    }
+    let done = OpCompleted::with_flags(id, result, CompletionFlags::MORE);
+    script.ready.push_back(done);
   }
 
   /// Finishes every in-flight operation with `result`, in push order.
@@ -299,10 +321,12 @@ unsafe fn read_bytes(ptr: *const u8, len: usize) {
 ///   succeeded
 ///
 /// and that the backend:
-/// - completes only ids that are in flight, each exactly once
+/// - completes only ids that are in flight, each with exactly one final
+///   completion
+/// - sets no completion flag other than [`CompletionFlags::MORE`]
 ///
-/// An operation is in flight from its `push` until its completion is
-/// returned by `wait`, or until a successful `drain`.
+/// An operation is in flight from its `push` until its final completion (one
+/// without `MORE`) is returned by `wait`, or until a successful `drain`.
 pub struct Checked<B> {
   inner: B,
   cap: Option<usize>,
@@ -386,7 +410,18 @@ impl<B: IoBackend> IoBackend for Checked<B> {
     for done in completed.iter() {
       let id = done.registration_id();
       assert!(
-        self.in_flight.remove(&id),
+        CompletionFlags::MORE.contains(done.flags()),
+        "contract: backend completed operation {id} with flags {:?}; only \
+         `MORE` is a backend's to set",
+        done.flags()
+      );
+      let in_flight = if done.has_more() {
+        self.in_flight.contains(&id)
+      } else {
+        self.in_flight.remove(&id)
+      };
+      assert!(
+        in_flight,
         "contract: backend completed operation {id}, which is not in flight \
          (unknown, or already completed)"
       );
@@ -510,6 +545,82 @@ mod tests {
       offset: None,
       flags: Default::default(),
     }
+  }
+
+  #[test]
+  fn more_completions_keep_the_operation_in_flight() {
+    for poison in [true, false] {
+      let backend = ScriptedBackend::new();
+      let backend = if poison { backend } else { backend.without_poison() };
+      let mut checked = Checked::new(backend.clone());
+      checked.init(1).unwrap();
+      let (mut into, mut iovec) =
+        (0u8, RawBuf { ptr: ptr::null_mut(), len: 0 });
+      checked.push(1, read_into(&mut into, &mut iovec), &mut Bump::new());
+
+      backend.complete_more(1, 4);
+      backend.complete_more(1, 5);
+      let mut completed = Vec::new();
+      checked.wait(Some(Duration::ZERO), &mut completed).unwrap();
+      let seen: Vec<_> = completed
+        .iter()
+        .map(|c| (c.registration_id(), c.result(), c.has_more()))
+        .collect();
+      assert_eq!(seen, vec![(1, 4, true), (1, 5, true)]);
+      assert_eq!(into, if poison { POISON } else { 0 }, "poison: {poison}");
+      assert_eq!(backend.in_flight(), vec![1]);
+      assert_eq!(checked.in_flight(), 1);
+
+      backend.complete(1, 0);
+      checked.wait(Some(Duration::ZERO), &mut completed).unwrap();
+      assert!(!completed[0].has_more());
+      assert_eq!(checked.in_flight(), 0);
+    }
+  }
+
+  #[test]
+  #[should_panic(expected = "is not in flight")]
+  fn more_for_an_unknown_operation_panics() {
+    ScriptedBackend::new().complete_more(1, 0);
+  }
+
+  /// Reports one completion for operation 1 with `flags`.
+  struct Flagged(CompletionFlags);
+
+  impl IoBackend for Flagged {
+    fn init(&mut self, _: usize) -> io::Result<()> {
+      Ok(())
+    }
+    fn push(&mut self, _: u64, _: Op, _: &mut Bump) {}
+    fn flush(&mut self) -> io::Result<()> {
+      Ok(())
+    }
+    fn wait(
+      &mut self,
+      _: Option<Duration>,
+      completed: &mut Vec<OpCompleted>,
+    ) -> io::Result<()> {
+      completed.clear();
+      completed.push(OpCompleted::with_flags(1, 0, self.0));
+      Ok(())
+    }
+  }
+
+  #[test]
+  #[should_panic(expected = "only `MORE` is a backend's to set")]
+  fn a_flag_other_than_more_breaks_the_contract() {
+    let mut checked = Checked::new(Flagged(CompletionFlags::TIMER));
+    checked.init(1).unwrap();
+    checked.push(1, Op::Nop, &mut Bump::new());
+    wait(&mut checked);
+  }
+
+  #[test]
+  #[should_panic(expected = "which is not in flight")]
+  fn more_for_an_operation_not_in_flight_breaks_the_contract() {
+    let mut checked = Checked::new(Flagged(CompletionFlags::MORE));
+    checked.init(1).unwrap();
+    wait(&mut checked);
   }
 
   #[test]

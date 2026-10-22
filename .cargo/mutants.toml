@@ -34,7 +34,7 @@ exclude_re = [
   "replace < with <= in Clock::insert_timer",
   "replace < with <= in Clock::insert_higher_timer",
   # `CompletionFlags::MORE` is `1 << 0`, and `1 >> 0` is the same value.
-  "lio/src/api/op\\.rs:80:33: replace << with >>",
+  "lio/src/api/op\\.rs:88:33: replace << with >>",
 ]
 test_tool = "nextest"
 # Each mutant builds and runs these only: the core suites, which drive the

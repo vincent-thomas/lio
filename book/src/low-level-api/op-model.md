@@ -64,6 +64,8 @@ Today, that means one of:
 - `Yield(item)`: the model produced one item but remains live
 - `Done(item)`: the model reached its terminal state
 
+After `Again` or `Yield`, the driver normally asks `action()` for the next step. The exception is a completion carrying `CompletionFlags::MORE`: the backend is still running the step (a multishot accept or receive, say) and reports its next result by itself, so nothing is submitted again. A model that returns `Done` on such a completion has the step cancelled. It still sees the step's remaining completions so it can release what they carry, but nothing it returns for them is delivered.
+
 That is the entire contract. A model does not need any additional hooks to express one-shot, multi-step, or streaming behavior. The rest of the chapter is mostly different consequences of that small interface.
 
 ## Two kinds of models
