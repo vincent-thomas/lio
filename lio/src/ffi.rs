@@ -252,7 +252,7 @@ impl IoBufMut for CBuf {
   }
 
   unsafe fn set_len(&mut self, len: usize) {
-    debug_assert!(len <= self.cap);
+    assert!(len <= self.cap);
     self.len = len;
   }
 }
