@@ -94,18 +94,22 @@ doc_op! {
     where
         B: IoBufMutVec + Send + Sync + 'static,
     {
-        Io::from_op(ops::Read::new(res.as_resource().clone(), buf, -1))
+        Io::from_op(ops::Read::new(res.as_resource().clone(), buf, None))
     }
 }
 
 doc_op! {
     short: "Reads into one or more owned buffers from a fixed offset.",
 
-    pub fn read_at<B>(res: &impl AsResource, buf: B, offset: u32) -> Io<ops::Read<B>>
+    ///
+    /// Operating systems address files with signed 64-bit offsets, so an
+    /// `offset` above `i64::MAX` completes with
+    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput) without reading.
+    pub fn read_at<B>(res: &impl AsResource, buf: B, offset: u64) -> Io<ops::Read<B>>
     where
         B: IoBufMutVec + Send + Sync + 'static,
     {
-        Io::from_op(ops::Read::new(res.as_resource().clone(), buf, offset as i64))
+        Io::from_op(ops::Read::new(res.as_resource().clone(), buf, Some(offset)))
     }
 }
 
@@ -118,23 +122,27 @@ doc_op! {
     where
         B: IoBufVec + Send + Sync + 'static,
     {
-        Io::from_op(ops::Write::new(res.as_resource().clone(), buf, -1))
+        Io::from_op(ops::Write::new(res.as_resource().clone(), buf, None))
     }
 }
 
 doc_op! {
-    short: "Writes one or more owned buffers.",
-    syscall: "write(2)",
-    doc_link: "https://man7.org/linux/man-pages/man2/write.2.html",
+    short: "Writes one or more owned buffers at a fixed offset.",
+    syscall: "pwrite(2)",
+    doc_link: "https://man7.org/linux/man-pages/man2/pwrite.2.html",
 
-    pub fn write_at<B>(res: &impl AsResource, buf: B, offset: u32) -> Io<ops::Write<B>>
+    ///
+    /// Operating systems address files with signed 64-bit offsets, so an
+    /// `offset` above `i64::MAX` completes with
+    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput) without writing.
+    pub fn write_at<B>(res: &impl AsResource, buf: B, offset: u64) -> Io<ops::Write<B>>
     where
         B: IoBufVec + Send + Sync + 'static,
     {
         Io::from_op(ops::Write::new(
             res.as_resource().clone(),
             buf,
-            offset as i64,
+            Some(offset),
         ))
     }
 }

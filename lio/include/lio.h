@@ -373,12 +373,14 @@ void lio_bind(struct lio_handle_t *lio,
 void lio_listen(struct lio_handle_t *lio, intptr_t fd, int backlog, void (*callback)(int));
 
 /**
- * Write data to `fd` at `offset`.  Pass `offset = -1` for current position.
+ * Write data to `fd` at the absolute file `offset`.  Use [`lio_write`] to
+ * write at the current position.
  *
  * lio borrows `buf` until the callback fires and never frees it.
  *
  * - `callback(result, buf, len)`: bytes written (or negative errno), the
- *   same `buf`, and `len = buf_len`
+ *   same `buf`, and `len = buf_len`; `-EINVAL` without writing when `offset`
+ *   exceeds `INT64_MAX`
  *
  * # Safety
  * `lio` must be valid; `fd` must be a valid open file descriptor; and `buf`
@@ -389,17 +391,18 @@ void lio_write_at(struct lio_handle_t *lio,
                   intptr_t fd,
                   uint8_t *buf,
                   uintptr_t buf_len,
-                  int64_t offset,
+                  uint64_t offset,
                   void (*callback)(int, uint8_t*, uintptr_t));
 
 /**
- * Read from `fd` at `offset` into `buf`.  Pass `offset = -1` for current
- * position.
+ * Read from `fd` at the absolute file `offset` into `buf`.  Use [`lio_read`]
+ * to read from the current position.
  *
  * lio borrows `buf` until the callback fires and never frees it.
  *
  * - `callback(result, buf, len)`: bytes read (or negative errno), the same
- *   `buf`, and `len` = bytes read (0 on error)
+ *   `buf`, and `len` = bytes read (0 on error); `-EINVAL` without reading
+ *   when `offset` exceeds `INT64_MAX`
  *
  * # Safety
  * `lio` must be valid; `fd` must be a valid open file descriptor; and `buf`
@@ -411,7 +414,7 @@ void lio_read_at(struct lio_handle_t *lio,
                  intptr_t fd,
                  uint8_t *buf,
                  uintptr_t buf_len,
-                 int64_t offset,
+                 uint64_t offset,
                  void (*callback)(int, uint8_t*, uintptr_t));
 
 /**

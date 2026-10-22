@@ -55,6 +55,24 @@ macro_rules! op_flags {
   };
 }
 
+/// The largest file offset a positioned [`Op::Read`] or [`Op::Write`] may
+/// carry.
+///
+/// Kernel file offsets are signed (`off_t` on Unix, `LARGE_INTEGER` on
+/// Windows), so a larger offset cannot be honoured. Op models never submit
+/// one; a backend that receives one anyway completes the op with `EINVAL`
+/// rather than truncating or wrapping it.
+pub const MAX_FILE_OFFSET: u64 = i64::MAX as u64;
+
+/// Whether a read or write `offset` is one a backend can honour: the current
+/// position (`None`) or an absolute offset of at most [`MAX_FILE_OFFSET`].
+pub const fn is_valid_file_offset(offset: Option<u64>) -> bool {
+  match offset {
+    Some(offset) => offset <= MAX_FILE_OFFSET,
+    None => true,
+  }
+}
+
 op_flags!(ReadFlags);
 op_flags!(WriteFlags);
 op_flags!(RecvFlags);
@@ -606,10 +624,8 @@ pub enum Op {
   /// Generic read operation supporting all read variants.
   ///
   /// Backends select the appropriate syscall based on parameters:
-  /// - Simple read: buf.ptr != null, iovecs == null, offset == -1
-  /// - Positioned read (pread): buf.ptr != null, offset >= 0
-  /// - Vectored read (readv): iovecs != null, offset == -1
-  /// - Vectored positioned (preadv): iovecs != null, offset >= 0
+  /// - Read (readv): offset == None
+  /// - Positioned read (preadv): offset == Some(_)
   /// - With flags (preadv2): Any above + flags != 0
   ///
   /// The buffer/iovec pointers are owned by the OpModel and must remain valid.
@@ -620,8 +636,11 @@ pub enum Op {
     iovecs: NonNull<RawBuf>,
     /// Number of iovecs
     iov_count: usize,
-    /// File offset (-1 for current position)
-    offset: i64,
+    /// Absolute file offset, or `None` for the current file position.
+    ///
+    /// `Some(offset)` is at most [`MAX_FILE_OFFSET`]; backends complete a
+    /// larger one with `EINVAL`.
+    offset: Option<u64>,
     /// Backend-interpreted read flags.
     flags: ReadFlags,
   },
@@ -629,10 +648,8 @@ pub enum Op {
   /// Generic write operation supporting all write variants.
   ///
   /// Backends select the appropriate syscall based on parameters:
-  /// - Simple write: buf.ptr != null, iovecs == null, offset == -1
-  /// - Positioned write (pwrite): buf.ptr != null, offset >= 0
-  /// - Vectored write (writev): iovecs != null, offset == -1
-  /// - Vectored positioned (pwritev): iovecs != null, offset >= 0
+  /// - Write (writev): offset == None
+  /// - Positioned write (pwritev): offset == Some(_)
   /// - With flags (pwritev2): Any above + flags != 0
   ///
   /// The buffer/iovec pointers are owned by the OpModel and must remain valid.
@@ -643,8 +660,11 @@ pub enum Op {
     iovecs: NonNull<RawBuf>,
     /// Number of iovecs
     iov_count: usize,
-    /// File offset (-1 for current position)
-    offset: i64,
+    /// Absolute file offset, or `None` for the current file position.
+    ///
+    /// `Some(offset)` is at most [`MAX_FILE_OFFSET`]; backends complete a
+    /// larger one with `EINVAL`.
+    offset: Option<u64>,
     /// Backend-interpreted write flags.
     flags: WriteFlags,
   },

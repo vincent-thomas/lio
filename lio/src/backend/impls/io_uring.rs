@@ -21,7 +21,7 @@ use lio_uring::{
 use crate::backend::{
   IoBackend, OpCompleted,
   impls::unix_stat::file_type_from_dirent_dtype,
-  op::{DirEntryRef, LinkKind, Op, ReadDirResult},
+  op::{DirEntryRef, LinkKind, Op, ReadDirResult, is_valid_file_offset},
 };
 use crate::slab::{Slab, SlabKey};
 
@@ -707,8 +707,11 @@ impl IoUring {
   }
 
   #[inline]
-  fn io_offset(offset: i64) -> u64 {
-    if offset < 0 { u64::MAX } else { offset as u64 }
+  /// The SQE offset for a read or write: io_uring takes `-1` (all bits set)
+  /// as the current file position. `validate_op` has rejected offsets past
+  /// `MAX_FILE_OFFSET`, so an absolute offset never reaches that value.
+  fn io_offset(offset: Option<u64>) -> u64 {
+    offset.unwrap_or(u64::MAX)
   }
 
   fn refill_read_dir_state(
@@ -910,7 +913,7 @@ impl IoUring {
   fn validate_op(op: &Op) -> Option<isize> {
     match op {
       Op::Read { iovecs: _, offset, flags, .. } => {
-        if *offset < -1 {
+        if !is_valid_file_offset(*offset) {
           return Some(-(libc::EINVAL as isize));
         }
 
@@ -928,7 +931,7 @@ impl IoUring {
         None
       }
       Op::Write { iovecs: _, offset, flags, .. } => {
-        if *offset < -1 {
+        if !is_valid_file_offset(*offset) {
           return Some(-(libc::EINVAL as isize));
         }
 

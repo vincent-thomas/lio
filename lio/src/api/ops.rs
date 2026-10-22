@@ -23,8 +23,8 @@ use crate::{
     FileMode, FileStat, MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, OpenFlags,
     RawBuf, ReadDirBuf, ReadFlags, RecvFlags, SendFlags, ShutdownHow,
     SockDomain, SockProto, SockType, SocketAddrBuf, SocketAddrFamily,
-    StatTarget, UnlinkKind, WriteFlags, socket_addr_from_buf,
-    socket_addr_into_buf,
+    StatTarget, UnlinkKind, WriteFlags, is_valid_file_offset,
+    socket_addr_from_buf, socket_addr_into_buf,
   },
   buf::MAX_IOV_COUNT,
 };
@@ -682,6 +682,17 @@ fn stage_into<B: IoBufMutVec>(buf: &mut B, bytes: &[u8]) {
   assert_eq!(copied, bytes.len(), "staged bytes exceed total buffer capacity");
 }
 
+/// The error for a file offset past [`MAX_FILE_OFFSET`], which no kernel can
+/// address.
+///
+/// [`MAX_FILE_OFFSET`]: crate::backend::op::MAX_FILE_OFFSET
+fn offset_out_of_range_error() -> io::Error {
+  io::Error::new(
+    io::ErrorKind::InvalidInput,
+    "file offset exceeds the largest offset the OS supports (i64::MAX)",
+  )
+}
+
 // ============================================================================
 // Read
 // ============================================================================
@@ -691,11 +702,17 @@ pub struct Read<B: IoBufMutVec> {
   buf: Option<B>,
   raws: [RawBuf; MAX_IOV_COUNT],
   iov_count: usize,
-  offset: i64,
+  offset: Option<u64>,
 }
 
 impl<B: IoBufMutVec> Read<B> {
-  pub(crate) fn new(res: Resource, buf: B, offset: i64) -> Self {
+  /// Reads at `offset`, or from the current position when `None`.
+  ///
+  /// An offset past [`MAX_FILE_OFFSET`] submits no read and completes with
+  /// `InvalidInput`.
+  ///
+  /// [`MAX_FILE_OFFSET`]: crate::backend::op::MAX_FILE_OFFSET
+  pub(crate) fn new(res: Resource, buf: B, offset: Option<u64>) -> Self {
     Self {
       res,
       buf: Some(buf),
@@ -717,6 +734,9 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
   type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
+    if !is_valid_file_offset(self.offset) {
+      return Action::Io(Op::Nop);
+    }
     let buf = self.buf.as_mut().expect("buffer not available");
     self.iov_count = collect_regions(buf, &mut self.raws, |ptr, len| {
       // SAFETY: the region is model-owned storage that stays valid in place
@@ -736,7 +756,9 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     let mut buf = self.buf.take().expect("buffer not available");
 
-    let result = if completion.result < 0 {
+    let result = if !is_valid_file_offset(self.offset) {
+      Err(offset_out_of_range_error())
+    } else if completion.result < 0 {
       Err(completion.os_error())
     } else {
       let mut remaining = completion.result as usize;
@@ -765,7 +787,7 @@ impl OpModelContract for Read<Vec<u8>> {
   }
 
   fn contract_model() -> Self {
-    Self::new(Resource::stdin(), vec![0u8; 8], -1)
+    Self::new(Resource::stdin(), vec![0u8; 8], None)
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
@@ -775,7 +797,7 @@ impl OpModelContract for Read<Vec<u8>> {
           action,
           Action::Io(Op::Read {
             iov_count: 1,
-            offset: -1,
+            offset: None,
             flags: ReadFlags::EMPTY,
             ..
           })
@@ -801,7 +823,7 @@ impl OpModelContract for Read<(Vec<u8>, Vec<u8>)> {
   }
 
   fn contract_model() -> Self {
-    Self::new(Resource::stdin(), (vec![0u8; 3], vec![0u8; 5]), -1)
+    Self::new(Resource::stdin(), (vec![0u8; 3], vec![0u8; 5]), None)
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
@@ -811,7 +833,7 @@ impl OpModelContract for Read<(Vec<u8>, Vec<u8>)> {
           action,
           Action::Io(Op::Read {
             iov_count: 2,
-            offset: -1,
+            offset: None,
             flags: ReadFlags::EMPTY,
             ..
           })
@@ -837,11 +859,17 @@ pub struct Write<B: IoBufVec + std::marker::Send + Sync> {
   res: Resource,
   buf: Option<B>,
   raws: [RawBuf; MAX_IOV_COUNT],
-  offset: i64,
+  offset: Option<u64>,
 }
 
 impl<B: IoBufVec + std::marker::Send + Sync> Write<B> {
-  pub(crate) fn new(res: Resource, buf: B, offset: i64) -> Self {
+  /// Writes at `offset`, or at the current position when `None`.
+  ///
+  /// An offset past [`MAX_FILE_OFFSET`] submits no write and completes with
+  /// `InvalidInput`.
+  ///
+  /// [`MAX_FILE_OFFSET`]: crate::backend::op::MAX_FILE_OFFSET
+  pub(crate) fn new(res: Resource, buf: B, offset: Option<u64>) -> Self {
     Self {
       res,
       buf: Some(buf),
@@ -857,6 +885,9 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
   type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
+    if !is_valid_file_offset(self.offset) {
+      return Action::Io(Op::Nop);
+    }
     let buf = self.buf.as_ref().expect("buffer not available");
     let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
@@ -875,7 +906,9 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
     let buf = self.buf.take().expect("buffer not available");
-    let result = if completion.result < 0 {
+    let result = if !is_valid_file_offset(self.offset) {
+      Err(offset_out_of_range_error())
+    } else if completion.result < 0 {
       Err(completion.os_error())
     } else {
       Ok(completion.result as usize)
@@ -897,7 +930,7 @@ impl OpModelContract for Write<Vec<u8>> {
   }
 
   fn contract_model() -> Self {
-    Self::new(Resource::stdin(), b"pong".to_vec(), -1)
+    Self::new(Resource::stdin(), b"pong".to_vec(), None)
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
@@ -907,7 +940,7 @@ impl OpModelContract for Write<Vec<u8>> {
           action,
           Action::Io(Op::Write {
             iov_count: 1,
-            offset: -1,
+            offset: None,
             flags: WriteFlags::EMPTY,
             ..
           })
@@ -930,7 +963,7 @@ impl OpModelContract for Write<(Vec<u8>, Vec<u8>)> {
   }
 
   fn contract_model() -> Self {
-    Self::new(Resource::stdin(), (b"ab".to_vec(), b"cde".to_vec()), -1)
+    Self::new(Resource::stdin(), (b"ab".to_vec(), b"cde".to_vec()), None)
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
@@ -940,7 +973,7 @@ impl OpModelContract for Write<(Vec<u8>, Vec<u8>)> {
           action,
           Action::Io(Op::Write {
             iov_count: 2,
-            offset: -1,
+            offset: None,
             flags: WriteFlags::EMPTY,
             ..
           })

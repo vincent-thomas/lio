@@ -47,12 +47,18 @@ impl FromResource for File {
 
 impl File {
   /// Reads from a fixed offset into the provided buffer.
-  pub fn read_at(&self, buf: Vec<u8>, offset: u32) -> Io<ops::Read<Vec<u8>>> {
+  ///
+  /// An `offset` above `i64::MAX` completes with
+  /// [`InvalidInput`](io::ErrorKind::InvalidInput); see [`crate::api::read_at`].
+  pub fn read_at(&self, buf: Vec<u8>, offset: u64) -> Io<ops::Read<Vec<u8>>> {
     crate::api::read_at(self, buf, offset)
   }
 
   /// Writes the provided buffer at a fixed offset.
-  pub fn write_at(&self, buf: Vec<u8>, offset: u32) -> Io<ops::Write<Vec<u8>>> {
+  ///
+  /// An `offset` above `i64::MAX` completes with
+  /// [`InvalidInput`](io::ErrorKind::InvalidInput); see [`crate::api::write_at`].
+  pub fn write_at(&self, buf: Vec<u8>, offset: u64) -> Io<ops::Write<Vec<u8>>> {
     crate::api::write_at(self, buf, offset)
   }
 
@@ -810,7 +816,11 @@ impl OpModel for ReadToString {
         OpResult::Done(Ok(fd)) => {
           self.state = ReadToStringState::Reading {
             fd: fd.clone(),
-            op: ops::Read::new(fd, vec![0u8; DEFAULT_READ_TO_STRING_BYTES], -1),
+            op: ops::Read::new(
+              fd,
+              vec![0u8; DEFAULT_READ_TO_STRING_BYTES],
+              None,
+            ),
           };
           OpResult::Again
         }
@@ -834,7 +844,7 @@ impl OpModel for ReadToString {
             self.bytes.extend_from_slice(&buf[..n]);
             self.state = ReadToStringState::Reading {
               fd: fd.clone(),
-              op: ops::Read::new(fd, buf, -1),
+              op: ops::Read::new(fd, buf, None),
             };
             OpResult::Again
           }
