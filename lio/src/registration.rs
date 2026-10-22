@@ -540,7 +540,8 @@ mod tests {
     stage: u8,
   }
 
-  impl OpModel for AgainThenDone {
+  // SAFETY: `action` only returns `Op`s without pointers.
+  unsafe impl OpModel for AgainThenDone {
     type Item = i32;
 
     fn action(&mut self) -> Action {
@@ -567,7 +568,8 @@ mod tests {
     stage: u8,
   }
 
-  impl OpModel for YieldTwiceThenDone {
+  // SAFETY: `action` only returns `Op`s without pointers.
+  unsafe impl OpModel for YieldTwiceThenDone {
     type Item = i32;
 
     fn action(&mut self) -> Action {
@@ -755,7 +757,8 @@ mod tests {
   fn waker_registration_repeated_again_preserves_waker_until_yield() {
     struct AgainThenYield(usize);
 
-    impl OpModel for AgainThenYield {
+    // SAFETY: `action` only returns `Op`s without pointers.
+    unsafe impl OpModel for AgainThenYield {
       type Item = i32;
 
       fn action(&mut self) -> Action {

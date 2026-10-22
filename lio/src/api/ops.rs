@@ -117,7 +117,9 @@ impl Socket {
   }
 }
 
-impl OpModel for Socket {
+// SAFETY: `action` only returns `Op`s without pointers; what they carry is
+// owned by the `Op`.
+unsafe impl OpModel for Socket {
   type Item = io::Result<Resource>;
 
   fn action(&mut self) -> Action {
@@ -129,7 +131,8 @@ impl OpModel for Socket {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    // SAFETY: a successful socket completion carries a new owned socket.
+    // SAFETY: a successful socket completion carries a new owned socket, as
+    // `IoBackend`'s safety contract requires.
     OpResult::Done(unsafe { Resource::from_completion(&completion) })
   }
 }
@@ -196,7 +199,9 @@ impl Accept {
   }
 }
 
-impl OpModel for Accept {
+// SAFETY: `action` points the `Op` at `self.addr`, which the model owns and
+// leaves untouched until `complete`.
+unsafe impl OpModel for Accept {
   type Item = io::Result<(Resource, SocketAddr)>;
 
   fn action(&mut self) -> Action {
@@ -232,7 +237,8 @@ impl Accept {
     &mut self,
     completion: Completion,
   ) -> io::Result<Resource> {
-    // SAFETY: a successful accept completion carries a new owned socket.
+    // SAFETY: a successful accept completion carries a new owned socket, as
+    // `IoBackend`'s safety contract requires.
     unsafe { Resource::from_completion(&completion) }
   }
 }
@@ -298,7 +304,9 @@ impl AcceptUnix {
   }
 }
 
-impl OpModel for AcceptUnix {
+// SAFETY: `action` returns the `Op` of the inner `Accept`, an `OpModel` the
+// model owns and only drives through that trait.
+unsafe impl OpModel for AcceptUnix {
   type Item = io::Result<(Resource, UnixAddr)>;
 
   fn action(&mut self) -> Action {
@@ -408,7 +416,9 @@ impl Connect {
   }
 }
 
-impl OpModel for Connect {
+// SAFETY: `action` only returns `Op`s without pointers; what they carry is
+// owned by the `Op`.
+unsafe impl OpModel for Connect {
   type Item = std::io::Result<()>;
 
   fn action(&mut self) -> Action {
@@ -465,7 +475,9 @@ impl Bind {
   }
 }
 
-impl OpModel for Bind {
+// SAFETY: `action` only returns `Op`s without pointers; what they carry is
+// owned by the `Op`.
+unsafe impl OpModel for Bind {
   type Item = io::Result<()>;
 
   fn action(&mut self) -> Action {
@@ -498,7 +510,9 @@ impl Listen {
   }
 }
 
-impl OpModel for Listen {
+// SAFETY: `action` only returns `Op`s without pointers; what they carry is
+// owned by the `Op`.
+unsafe impl OpModel for Listen {
   type Item = io::Result<()>;
 
   fn action(&mut self) -> Action {
@@ -531,7 +545,9 @@ impl Shutdown {
   }
 }
 
-impl OpModel for Shutdown {
+// SAFETY: `action` only returns `Op`s without pointers; what they carry is
+// owned by the `Op`.
+unsafe impl OpModel for Shutdown {
   type Item = io::Result<()>;
 
   fn action(&mut self) -> Action {
@@ -563,7 +579,9 @@ impl Fsync {
   }
 }
 
-impl OpModel for Fsync {
+// SAFETY: `action` only returns `Op`s without pointers; what they carry is
+// owned by the `Op`.
+unsafe impl OpModel for Fsync {
   type Item = io::Result<()>;
 
   fn action(&mut self) -> Action {
@@ -607,7 +625,9 @@ impl OpModelContract for Fsync {
 
 pub struct Nop;
 
-impl OpModel for Nop {
+// SAFETY: `action` only returns `Op`s without pointers; what they carry is
+// owned by the `Op`.
+unsafe impl OpModel for Nop {
   type Item = std::io::Result<()>;
 
   fn action(&mut self) -> Action {
@@ -713,7 +733,10 @@ impl<B: IoBufMutVec> Read<B> {
   }
 }
 
-impl<B: IoBufMutVec> OpModel for Read<B> {
+// SAFETY: `action` points the `Op` at `self.raws` and at the regions of
+// `self.buf`, all owned by the model and left untouched until `complete`. A
+// safe `IoBufMutVec` can only hand out regions it lends exclusively.
+unsafe impl<B: IoBufMutVec> OpModel for Read<B> {
   type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
@@ -853,7 +876,12 @@ impl<B: IoBufVec + std::marker::Send + Sync> Write<B> {
   }
 }
 
-impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
+// SAFETY: `action` points the `Op` at `self.raws` and at the regions of
+// `self.buf`, all owned by the model and left untouched until `complete`. The
+// operation only reads them.
+unsafe impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel
+  for Write<B>
+{
   type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
@@ -1057,7 +1085,11 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> Recv<B> {
   }
 }
 
-impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Recv<B> {
+// SAFETY: `RecvCore::action` points the `Op` at the core's `bufs` and `from`
+// and at the regions of its buffer, all owned by the model and left untouched
+// until `complete`. A safe `IoBufMutVec` can only hand out regions it lends
+// exclusively.
+unsafe impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Recv<B> {
   type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
@@ -1081,7 +1113,9 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvFrom<B> {
   }
 }
 
-impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for RecvFrom<B> {
+// SAFETY: as for `Recv`: `RecvCore::action` points the `Op` only at memory the
+// model owns and leaves untouched until `complete`.
+unsafe impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for RecvFrom<B> {
   type Item = (std::io::Result<usize>, B, Option<SocketAddr>);
 
   fn action(&mut self) -> Action {
@@ -1261,7 +1295,12 @@ impl<B: IoBufVec + std::marker::Send + Sync> Send<B> {
   }
 }
 
-impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Send<B> {
+// SAFETY: `action` points the `Op` at `self.bufs` and at the regions of
+// `self.buf`, all owned by the model and left untouched until `complete`. The
+// operation only reads them.
+unsafe impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel
+  for Send<B>
+{
   type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
@@ -1367,7 +1406,8 @@ impl Sleep {
   }
 }
 
-impl OpModel for Sleep {
+// SAFETY: `action` only returns sleeps, which carry no pointers.
+unsafe impl OpModel for Sleep {
   type Item = io::Result<()>;
 
   fn action(&mut self) -> Action {
@@ -1424,7 +1464,8 @@ impl Interval {
   }
 }
 
-impl OpModel for Interval {
+// SAFETY: `action` only returns sleeps, which carry no pointers.
+unsafe impl OpModel for Interval {
   type Item = io::Result<()>;
 
   fn action(&mut self) -> Action {
@@ -1488,7 +1529,9 @@ impl OpenAt {
   }
 }
 
-impl OpModel for OpenAt {
+// SAFETY: `action` only returns `Op`s without pointers; what they carry is
+// owned by the `Op`.
+unsafe impl OpModel for OpenAt {
   type Item = std::io::Result<Resource>;
 
   fn action(&mut self) -> Action {
@@ -1501,7 +1544,8 @@ impl OpModel for OpenAt {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    // SAFETY: a successful open completion carries a new owned handle.
+    // SAFETY: a successful open completion carries a new owned handle, as
+    // `IoBackend`'s safety contract requires.
     OpResult::Done(unsafe { Resource::from_completion(&completion) })
   }
 }
@@ -1559,7 +1603,9 @@ impl Stat {
   }
 }
 
-impl OpModel for Stat {
+// SAFETY: `action` points the `Op` at `self.out`, an initialized `FileStat`
+// the model owns and leaves untouched until `complete`.
+unsafe impl OpModel for Stat {
   type Item = std::io::Result<FileStat>;
 
   fn action(&mut self) -> Action {
@@ -1602,7 +1648,10 @@ impl ReadDir {
   }
 }
 
-impl OpModel for ReadDir {
+// SAFETY: `action` points the `Op` at the vectors and fields of `self.buf`,
+// sized as the `Op` says, owned by the model and left untouched until
+// `complete`.
+unsafe impl OpModel for ReadDir {
   type Item = std::io::Result<ReadDirBuf>;
 
   fn action(&mut self) -> Action {
@@ -1735,7 +1784,9 @@ impl UnlinkAt {
   }
 }
 
-impl OpModel for UnlinkAt {
+// SAFETY: `action` only returns `Op`s without pointers; what they carry is
+// owned by the `Op`.
+unsafe impl OpModel for UnlinkAt {
   type Item = std::io::Result<()>;
 
   fn action(&mut self) -> Action {
@@ -1802,7 +1853,9 @@ impl RenameAt {
   }
 }
 
-impl OpModel for RenameAt {
+// SAFETY: `action` only returns `Op`s without pointers; what they carry is
+// owned by the `Op`.
+unsafe impl OpModel for RenameAt {
   type Item = std::io::Result<()>;
 
   fn action(&mut self) -> Action {
@@ -1864,7 +1917,9 @@ impl MkdirAt {
   }
 }
 
-impl OpModel for MkdirAt {
+// SAFETY: `action` only returns `Op`s without pointers; what they carry is
+// owned by the `Op`.
+unsafe impl OpModel for MkdirAt {
   type Item = std::io::Result<()>;
 
   fn action(&mut self) -> Action {
@@ -1928,7 +1983,9 @@ impl LinkAt {
   }
 }
 
-impl OpModel for LinkAt {
+// SAFETY: `action` only returns `Op`s without pointers; what they carry is
+// owned by the `Op`.
+unsafe impl OpModel for LinkAt {
   type Item = std::io::Result<()>;
 
   fn action(&mut self) -> Action {
@@ -1999,7 +2056,12 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> ReadlinkAt<B> {
   }
 }
 
-impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
+// SAFETY: `action` points the `Op` at the first region of `self.buf`, owned by
+// the model and left untouched until `complete`. A safe `IoBufMutVec` can only
+// hand out regions it lends exclusively.
+unsafe impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel
+  for ReadlinkAt<B>
+{
   type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
@@ -2053,7 +2115,9 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> GetCwd<B> {
   }
 }
 
-impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
+// SAFETY: `action` points the `Op` at `self.out`, an initialized `OsString` the
+// model owns and leaves untouched until `complete`.
+unsafe impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
   type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
@@ -2145,7 +2209,9 @@ impl Spawn {
   }
 }
 
-impl OpModel for Spawn {
+// SAFETY: `action` only returns `Op`s without pointers; what they carry is
+// owned by the `Op`.
+unsafe impl OpModel for Spawn {
   type Item = std::io::Result<crate::api::Pid>;
 
   fn action(&mut self) -> Action {

@@ -927,7 +927,10 @@ mod tests {
   #[derive(Default)]
   struct Twice(Vec<u64>);
 
-  impl IoBackend for Twice {
+  // SAFETY: not upheld on purpose: it reports each completion twice, which
+  // the driver must catch. It never touches operation memory and is only
+  // pushed `Op::Nop`, so the panic comes before any harm.
+  unsafe impl IoBackend for Twice {
     fn init(&mut self, _: usize) -> io::Result<()> {
       Ok(())
     }
@@ -993,7 +996,8 @@ mod tests {
   /// Takes one more step, then finishes.
   struct TwoSteps(bool);
 
-  impl crate::api::op::OpModel for TwoSteps {
+  // SAFETY: `action` only returns `Op`s without pointers.
+  unsafe impl crate::api::op::OpModel for TwoSteps {
     type Item = ();
 
     fn action(&mut self) -> Action {
@@ -1058,7 +1062,10 @@ mod tests {
     first_allocs: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
   }
 
-  impl IoBackend for Lowering {
+  // SAFETY: forwards to `inner`, which upholds the contract; the arena
+  // allocation is only recorded, never used. Only `Op::Nop` is pushed, so no
+  // completion carries a resource for the default `resource_close`.
+  unsafe impl IoBackend for Lowering {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
@@ -1164,7 +1171,10 @@ mod tests {
     timeouts: Rc<RefCell<Vec<Option<Duration>>>>,
   }
 
-  impl IoBackend for Recording {
+  // SAFETY: forwards to `inner`, which upholds the contract. The default
+  // `drain` is right: `inner` only touches operation memory inside its own
+  // calls, and no clone of it is kept to complete anything later.
+  unsafe impl IoBackend for Recording {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }

@@ -138,7 +138,66 @@ impl From<Duration> for Action {
 
 /// Contract for the execution of one or many [`Action`]s. See [`OpResult`] for
 /// complete contract.
-pub trait OpModel: Send + 'static {
+///
+/// # Safety
+///
+/// An [`Op`] returned in [`Action::Io`] carries raw pointers that the backend
+/// hands to the kernel or to its worker threads, which read and write through
+/// them unchecked. For every such `Op` returned from [`action`](Self::action),
+/// implementors must guarantee:
+///
+/// - Every pointer in it, and every pointer in the memory it points to (the
+///   `RawBuf`s behind `iovecs`, the `MsgBuf`s behind a `MsgSend`, ...), is
+///   valid for the reads and writes its variant describes, over the full
+///   length or count the `Op` gives, and is properly aligned. Where the
+///   backend reads or replaces a typed value (`SocketAddrBuf`, `FileStat`,
+///   `OsString`, `ReadDirResult`, ...), that value is initialized.
+/// - That memory stays valid, and is neither moved nor freed, from the moment
+///   `action` returns until the operation's completion has been passed to
+///   [`complete`](Self::complete), or, if it never is, until the model is
+///   dropped. lio keeps the model at one address from before its first
+///   `action` call until it is dropped, and does not drop it while an `Op` it
+///   returned may still be running, so memory the model owns, inline or on
+///   the heap, qualifies. Memory borrowed from outside the model generally
+///   does not.
+/// - While the operation is in flight, nothing besides the backend accesses
+///   memory the operation may write, and nothing writes memory it may read:
+///   the model does not share that memory (through an `Arc`, a raw pointer,
+///   an item it already handed out, ...) with code that may run meanwhile.
+///
+/// Models that only return [`Action::Sleep`] or `Op`s without pointers (such
+/// as [`Op::Nop`]) uphold this trivially.
+///
+/// A safe `impl` does not compile, so safe code cannot hand the kernel a
+/// wild pointer:
+///
+/// ```compile_fail,E0200
+/// use lio::api::op::{Action, Completion, OpModel, OpResult};
+/// use lio::api::resource::Resource;
+/// use lio::backend::op::{Op, ReadFlags};
+/// use std::ptr::NonNull;
+///
+/// struct Wild;
+///
+/// impl OpModel for Wild {
+///   type Item = ();
+///
+///   fn action(&mut self) -> Action {
+///     Action::Io(Op::Read {
+///       fd: Resource::stdin(),
+///       iovecs: NonNull::dangling(),
+///       iov_count: 1,
+///       offset: -1,
+///       flags: ReadFlags::EMPTY,
+///     })
+///   }
+///
+///   fn complete(&mut self, _: Completion) -> OpResult<()> {
+///     OpResult::Done(())
+///   }
+/// }
+/// ```
+pub unsafe trait OpModel: Send + 'static {
   /// The item yielded or completed by this logical operation.
   type Item: Send;
 

@@ -88,12 +88,20 @@ fn trace_read_batches() {
     inner: IoUring,
     stats: Rc<RefCell<Stats>>,
   }
-  impl IoBackend for Observed {
+  // SAFETY: every call that matters to the contract is forwarded to `inner`,
+  // which upholds it; `Observed` only times them.
+  unsafe impl IoBackend for Observed {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
     fn push(&mut self, id: u64, op: Op, bump: &mut Bump) {
       self.inner.push(id, op, bump)
+    }
+    fn cancel(&mut self, id: u64) {
+      self.inner.cancel(id)
+    }
+    fn drain(&mut self) -> bool {
+      self.inner.drain()
     }
     fn flush(&mut self) -> io::Result<()> {
       let t = Instant::now();

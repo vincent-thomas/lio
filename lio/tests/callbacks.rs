@@ -259,7 +259,9 @@ struct InOrderBackend {
   queued: Vec<u64>,
 }
 
-impl lio::backend::IoBackend for InOrderBackend {
+// SAFETY: it completes each pushed operation once, never touches operation
+// memory, and is only pushed NOPs, so no result claims bytes or resources.
+unsafe impl lio::backend::IoBackend for InOrderBackend {
   fn init(&mut self, _cap: usize) -> std::io::Result<()> {
     Ok(())
   }

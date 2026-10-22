@@ -172,7 +172,10 @@ impl Copy {
   }
 }
 
-impl OpModel for Copy {
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl OpModel for Copy {
   type Item = io::Result<u64>;
 
   fn action(&mut self) -> Action {

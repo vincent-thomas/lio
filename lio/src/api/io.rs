@@ -1112,7 +1112,8 @@ mod tests {
   /// Yields 1 and 2, then finishes with 3.
   struct Counter(u32);
 
-  impl OpModel for Counter {
+  // SAFETY: `action` only returns `Op`s without pointers.
+  unsafe impl OpModel for Counter {
     type Item = u32;
 
     fn action(&mut self) -> Action {
@@ -1159,7 +1160,8 @@ mod tests {
   /// Takes a step without an item, then finishes with 7.
   struct AgainThenDone(bool);
 
-  impl OpModel for AgainThenDone {
+  // SAFETY: `action` only returns `Op`s without pointers.
+  unsafe impl OpModel for AgainThenDone {
     type Item = u32;
 
     fn action(&mut self) -> Action {

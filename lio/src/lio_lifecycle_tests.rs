@@ -43,7 +43,8 @@ struct Tagged {
   drops: Arc<Mutex<Vec<u32>>>,
 }
 
-impl OpModel for Tagged {
+// SAFETY: `action` only returns `Op`s without pointers.
+unsafe impl OpModel for Tagged {
   type Item = (u32, isize);
 
   fn action(&mut self) -> Action {

@@ -86,7 +86,16 @@ impl ScriptedBackend {
   ///
   /// Only for tests that check buffer contents the scripted results do not
   /// fill in.
-  pub fn without_poison(self) -> Self {
+  ///
+  /// # Safety
+  ///
+  /// Without poison, a scripted byte count no longer has written bytes
+  /// behind it, while lio's op models take a successful count as the
+  /// number of bytes initialized in their buffers. Every successful
+  /// result the test scripts for an operation that receives into a
+  /// buffer must be at most the number of bytes already initialized at
+  /// the front of it.
+  pub unsafe fn without_poison(self) -> Self {
     self.0.borrow_mut().no_poison = true;
     self
   }
@@ -152,7 +161,13 @@ impl ScriptedBackend {
   }
 }
 
-impl IoBackend for ScriptedBackend {
+// SAFETY: each pushed operation is reported once, after `complete` removed it
+// from `in_flight`, which only accepts ids in flight; memory is only touched
+// before that, or in `drain` before it returns `true`. Poisoning fills every
+// byte buffer, so a scripted count has initialized bytes behind it (unless
+// the caller of the unsafe `without_poison` takes that over). Resources are
+// never closed, so a scripted one cannot close a descriptor lio does not own.
+unsafe impl IoBackend for ScriptedBackend {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.0.borrow_mut().init = Some(cap);
     Ok(())
@@ -332,7 +347,9 @@ impl<B: IoBackend> Checked<B> {
   }
 }
 
-impl<B: IoBackend> IoBackend for Checked<B> {
+// SAFETY: every call is forwarded to `inner`, which upholds the contract;
+// `Checked` adds no completions and changes no results.
+unsafe impl<B: IoBackend> IoBackend for Checked<B> {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     assert!(self.cap.is_none(), "contract: `init` called twice");
     self.inner.init(cap)?;
@@ -523,7 +540,12 @@ mod tests {
   fn drain_poisons_unless_told_not_to() {
     for poison in [true, false] {
       let backend = ScriptedBackend::new();
-      let mut backend = if poison { backend } else { backend.without_poison() };
+      let mut backend = if poison {
+        backend
+      } else {
+        // SAFETY: nothing is completed with a byte count.
+        unsafe { backend.without_poison() }
+      };
       backend.init(1).unwrap();
       let (mut into, mut iovec) =
         (0u8, RawBuf { ptr: ptr::null_mut(), len: 0 });
@@ -535,7 +557,8 @@ mod tests {
 
   #[test]
   fn without_poison_completes_without_touching_buffers() {
-    let backend = ScriptedBackend::new().without_poison();
+    // SAFETY: the count of 1 only reaches `wait`, never an op model.
+    let backend = unsafe { ScriptedBackend::new().without_poison() };
     let mut driver = backend.clone();
     driver.init(1).unwrap();
     let (mut into, mut iovec) = (0u8, RawBuf { ptr: ptr::null_mut(), len: 0 });
@@ -600,7 +623,10 @@ mod tests {
   #[should_panic(expected = "which is not in flight")]
   fn completing_twice_breaks_the_contract() {
     struct Twice(Option<u64>);
-    impl IoBackend for Twice {
+    // SAFETY: not upheld on purpose: it reports a completion twice, which
+    // `Checked` must catch. It never touches operation memory and is only
+    // pushed `Op::Nop`, so the panic comes before any harm.
+    unsafe impl IoBackend for Twice {
       fn init(&mut self, _: usize) -> io::Result<()> {
         Ok(())
       }

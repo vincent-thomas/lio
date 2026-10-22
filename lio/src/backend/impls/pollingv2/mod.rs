@@ -1175,7 +1175,12 @@ impl Poller {
   }
 }
 
-impl IoBackend for Poller {
+// SAFETY: all I/O happens inside `flush` and `wait`, which report each pushed
+// operation once, after its syscall returned; `cancel` reports an operation
+// still waiting for readiness once and forgets it. Nothing runs between calls,
+// so the default `drain` is right. Results are the syscalls' own:
+// resource-creating operations yield fresh descriptors.
+unsafe impl IoBackend for Poller {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.sys = Some(sys::OsPoller::new()?);
     self.events = Events::with_capacity(cap.min(4096));

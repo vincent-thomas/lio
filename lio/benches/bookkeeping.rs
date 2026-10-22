@@ -34,7 +34,9 @@ struct ImmediateBackend {
   ready: Vec<u64>,
 }
 
-impl IoBackend for ImmediateBackend {
+// SAFETY: it only accepts `Op::Nop`, which points at nothing, and completes
+// each pushed operation once.
+unsafe impl IoBackend for ImmediateBackend {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.queued.reserve(cap);
     self.ready.reserve(cap);
@@ -154,7 +156,8 @@ struct SteppedStream {
   remaining: usize,
 }
 
-impl OpModel for SteppedStream {
+// SAFETY: `action` only returns `Op`s without pointers.
+unsafe impl OpModel for SteppedStream {
   type Item = ();
 
   fn action(&mut self) -> Action {

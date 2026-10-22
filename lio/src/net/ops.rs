@@ -50,7 +50,10 @@ impl SocketAccept {
   }
 }
 
-impl OpModel for SocketAccept {
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl OpModel for SocketAccept {
   type Item = io::Result<(Socket, SocketAddr)>;
 
   fn action(&mut self) -> Action {
@@ -93,7 +96,8 @@ impl SocketNew {
   }
 }
 
-impl OpModel for SocketNew {
+// SAFETY: `action` only returns an `Op` without pointers.
+unsafe impl OpModel for SocketNew {
   type Item = io::Result<Socket>;
 
   fn action(&mut self) -> Action {
@@ -105,7 +109,8 @@ impl OpModel for SocketNew {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    // SAFETY: a successful socket completion carries a new owned socket.
+    // SAFETY: a successful socket completion carries a new owned socket, as
+    // `IoBackend`'s safety contract requires.
     let resource =
       unsafe { crate::api::resource::Resource::from_completion(&completion) };
     OpResult::Done(resource.map(Socket::from_resource))
@@ -124,7 +129,10 @@ impl TcpAccept {
 
 // LEGACY `OpModel` impl parked during the serial-contract migration.
 //
-impl OpModel for TcpAccept {
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl OpModel for TcpAccept {
   type Item = io::Result<(TcpStream, SocketAddr)>;
 
   fn action(&mut self) -> Action {
@@ -194,7 +202,10 @@ impl BindListener<UnixListener> {
   }
 }
 
-impl<T: FromResource + std::marker::Send + 'static> OpModel
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl<T: FromResource + std::marker::Send + 'static> OpModel
   for BindListener<T>
 {
   type Item = io::Result<T>;
@@ -313,7 +324,10 @@ impl StreamConnect<UnixStream> {
   }
 }
 
-impl<T: FromResource + std::marker::Send + 'static> OpModel
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl<T: FromResource + std::marker::Send + 'static> OpModel
   for StreamConnect<T>
 {
   type Item = io::Result<T>;
@@ -383,7 +397,10 @@ impl UnixAccept {
   }
 }
 
-impl OpModel for UnixAccept {
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl OpModel for UnixAccept {
   type Item = io::Result<UnixStream>;
 
   fn action(&mut self) -> Action {
@@ -425,7 +442,10 @@ impl UdpBindSocket {
   }
 }
 
-impl OpModel for UdpBindSocket {
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl OpModel for UdpBindSocket {
   type Item = io::Result<UdpSocket>;
 
   fn action(&mut self) -> Action {
@@ -501,7 +521,10 @@ impl UdpConnectSocket {
   }
 }
 
-impl OpModel for UdpConnectSocket {
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl OpModel for UdpConnectSocket {
   type Item = io::Result<UdpSocket>;
 
   fn action(&mut self) -> Action {

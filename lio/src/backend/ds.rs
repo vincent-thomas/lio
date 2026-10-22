@@ -2677,7 +2677,12 @@ impl DSBackend {
   }
 }
 
-impl IoBackend for DSBackend {
+// SAFETY: a simulation that performs every operation inside its own calls,
+// writing through the `Op`'s pointers only before it reports that operation's
+// single completion (cancelling one reports it once, too), so `drain` may
+// return `true`. Results follow the `Op` docs; resources are simulated ids that
+// `close_simulated` never closes.
+unsafe impl IoBackend for DSBackend {
   fn resource_close(&self) -> crate::api::resource::CloseFn {
     close_simulated
   }
@@ -3987,7 +3992,10 @@ impl DSTBackend {
   }
 }
 
-impl IoBackend for DSTBackend {
+// SAFETY: as for `DSBackend`, which runs the local operations (it ignores the
+// step arena, so passing it a fresh one is fine); network operations are
+// simulated inside these calls the same way.
+unsafe impl IoBackend for DSTBackend {
   fn resource_close(&self) -> crate::api::resource::CloseFn {
     close_simulated
   }
