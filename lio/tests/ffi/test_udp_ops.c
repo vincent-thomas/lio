@@ -73,7 +73,7 @@ static void test_udp_echo(void) {
 
     /* Clean up */
     free(g_recvfrom_buf);
-    if (g_recvfrom_addr) free((void*)g_recvfrom_addr);
+    lio_sockaddr_free(g_recvfrom_addr);
     close(sender_fd);
     close(receiver_fd);
     lio_destroy(lio);
