@@ -292,7 +292,7 @@ static void test_full_server_flow(void) {
     int accepted_fd = (int)g_accept_result;
 
     /* Clean up */
-    free((void*)g_accept_addr);
+    lio_sockaddr_free(g_accept_addr);
     close(accepted_fd);
     close(client_fd);
     close(server_fd);

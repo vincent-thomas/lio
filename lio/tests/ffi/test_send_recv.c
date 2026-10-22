@@ -191,8 +191,8 @@ static void test_recv_invalid_fd(void) {
 
     ASSERT(g_recv_called, "recv callback should be called");
     ASSERT_LT(g_recv_result, 0, "recv on invalid fd should return error");
-    ASSERT_NOT_NULL(g_recv_buf, "buffer must be returned on error");
-    ASSERT_EQ(g_recv_len, 32, "buffer length should be preserved");
+    ASSERT(g_recv_buf == buf, "the same buffer must be returned on error");
+    ASSERT_EQ(g_recv_len, 0, "a failed recv reports no bytes received");
     free(g_recv_buf);
 
     lio_destroy(lio);
@@ -252,6 +252,74 @@ static void test_send_recv_buffer_roundtrip(void) {
     TEST_PASS("test_send_recv_buffer_roundtrip");
 }
 
+/* lio borrows buffers: the callback reports the bytes received, and the
+ * buffer is released the usual way for where it came from. */
+static void test_recv_buf_alloc_then_free(void) {
+    lio_handle_t *lio = lio_create(TEST_CAPACITY);
+    ASSERT_NOT_NULL(lio, "lio_create should succeed");
+
+    int server_fd, client_fd, accepted_fd;
+    int ret = create_socket_pair(&server_fd, &client_fd, &accepted_fd);
+    ASSERT_EQ(ret, 0, "socket pair creation should succeed");
+
+    const char *msg = "short";
+    ssize_t sent = send(client_fd, msg, strlen(msg), 0);
+    ASSERT_EQ(sent, (ssize_t)strlen(msg), "blocking send should succeed");
+
+    g_recv_called = 0;
+    g_recv_buf = NULL;
+    uint8_t *buf = lio_buf_alloc(4096);
+    ASSERT_NOT_NULL(buf, "lio_buf_alloc should succeed");
+
+    lio_recv(lio, accepted_fd, buf, 4096, 0, recv_callback);
+    tick_until_flag(lio, &g_recv_called, 1000);
+
+    ASSERT(g_recv_called, "recv callback should be called");
+    ASSERT(g_recv_buf == buf, "the same buffer must be returned");
+    ASSERT_EQ(g_recv_len, strlen(msg), "len should be the bytes received");
+    ASSERT(memcmp(buf, msg, strlen(msg)) == 0, "received data should match");
+    /* Freed by pointer alone, whatever `len` the callback reported. */
+    lio_buf_free(buf);
+
+    close(accepted_fd);
+    close(client_fd);
+    close(server_fd);
+    lio_destroy(lio);
+    TEST_PASS("test_recv_buf_alloc_then_free");
+}
+
+static void test_send_recv_stack_buffers(void) {
+    lio_handle_t *lio = lio_create(TEST_CAPACITY);
+    ASSERT_NOT_NULL(lio, "lio_create should succeed");
+
+    int server_fd, client_fd, accepted_fd;
+    int ret = create_socket_pair(&server_fd, &client_fd, &accepted_fd);
+    ASSERT_EQ(ret, 0, "socket pair creation should succeed");
+
+    uint8_t out[] = "on the stack";
+    g_send_called = 0;
+    lio_send(lio, client_fd, out, sizeof(out), 0, send_callback);
+    tick_until_flag(lio, &g_send_called, 1000);
+    ASSERT(g_send_called, "send should complete");
+    ASSERT(g_send_buf == out, "the same buffer must be returned");
+    ASSERT_EQ(g_send_result, (int)sizeof(out), "all bytes should be sent");
+
+    uint8_t in[64];
+    g_recv_called = 0;
+    lio_recv(lio, accepted_fd, in, sizeof(in), 0, recv_callback);
+    tick_until_flag(lio, &g_recv_called, 1000);
+    ASSERT(g_recv_called, "recv should complete");
+    ASSERT(g_recv_buf == in, "the same buffer must be returned");
+    ASSERT_EQ(g_recv_len, sizeof(out), "len should be the bytes received");
+    ASSERT(memcmp(in, out, sizeof(out)) == 0, "received data should match");
+
+    close(accepted_fd);
+    close(client_fd);
+    close(server_fd);
+    lio_destroy(lio);
+    TEST_PASS("test_send_recv_stack_buffers");
+}
+
 /* ─── Main ───────────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -262,6 +330,8 @@ int main(void) {
     test_recv_basic();
     test_recv_invalid_fd();
     test_send_recv_buffer_roundtrip();
+    test_recv_buf_alloc_then_free();
+    test_send_recv_stack_buffers();
 
     printf(GREEN "All send/recv tests passed\n" RESET);
     return 0;
