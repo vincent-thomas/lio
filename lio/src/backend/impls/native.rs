@@ -31,14 +31,17 @@ pub(crate) const BUFFER_TOO_SMALL: i32 =
   windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER as i32;
 
 /// Error code for "the final path component is a symbolic link", as an open
-/// with [`OpenFlags::NOFOLLOW`] reports it.
+/// with [`OpenFlags::NOFOLLOW`](crate::backend::op::OpenFlags::NOFOLLOW)
+/// reports it.
 #[cfg(unix)]
+#[cfg_attr(not(feature = "high"), allow(dead_code))]
 pub(crate) const SYMLINK_LOOP: i32 = libc::ELOOP;
 
 /// Error code for "the final path component is a symbolic link", as an open
 /// with [`OpenFlags::NOFOLLOW`](crate::backend::op::OpenFlags::NOFOLLOW)
 /// reports it.
 #[cfg(windows)]
+#[cfg_attr(not(feature = "high"), allow(dead_code))]
 pub(crate) const SYMLINK_LOOP: i32 =
   windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME as i32;
 
