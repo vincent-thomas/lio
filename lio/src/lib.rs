@@ -25,7 +25,9 @@ pub mod io;
 pub mod net;
 pub mod time;
 
-pub use buf::{BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec, IoSlicesMut};
+pub use buf::{
+  BufResult, IoBuf, IoBufMut, IoBufMutVec, IoBufVec, IoSlicesMut, Slice,
+};
 
 mod registration;
 mod slab;

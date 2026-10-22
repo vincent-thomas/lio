@@ -14,21 +14,26 @@
 //! it does not own. Only [`IoBufMut::set_len`] is `unsafe`, and only to *call*:
 //! lio calls it after the kernel has initialized the bytes.
 //!
+//! # Buffers
+//!
+//! Writes take any [`IoBuf`]: `Vec<u8>`, `Box<[u8]>`, `String`, `Box<str>`,
+//! `&'static [u8]`, `&'static str`, `Arc<[u8]>`, `Arc<str>`, `[u8; N]`, and
+//! `Cow<'static, [u8]>`. Reads take any [`IoBufMut`]: `Vec<u8>`. With the
+//! `bytes` feature, `bytes::Bytes` is an [`IoBuf`] and `bytes::BytesMut` an
+//! [`IoBufMut`].
+//!
+//! [`IoBuf::slice`] and [`IoBufMut::slice_mut`] narrow a buffer to a range
+//! without copying it: to send the rest of a buffer after a short write, or
+//! to read into the spare capacity after the bytes already there.
+//!
 //! # Constants
 //!
 //! - [`MAX_IOV_COUNT`]: Maximum number of buffers for vectored I/O (16).
-//!
-//! # Feature `zeroize`
-//!
-//! When the `zeroize` feature is enabled, buffers can be
-//! automatically and securely zeroed out on drop. This provides
-//! defense-in-depth against memory disclosure vulnerabilities by ensuring sensitive
-//! data doesn't persist in pooled buffers.
-//!
-//! This uses the [`zeroize`](https://docs.rs/zeroize) crate, which guarantees that
-//! compiler optimizations won't eliminate the zeroing operation.
 
+use std::borrow::Cow;
 use std::mem::MaybeUninit;
+use std::ops::{Bound, RangeBounds};
+use std::sync::Arc;
 
 /// Maximum number of buffers supported for vectored I/O operations.
 ///
@@ -69,6 +74,32 @@ pub type BufResult<T, B> = (std::io::Result<T>, B);
 pub trait IoBuf: Send + Sync + 'static {
   /// Returns the bytes to write.
   fn as_slice(&self) -> &[u8];
+
+  /// Narrows the buffer to `range` of its bytes, without copying.
+  ///
+  /// The result writes only those bytes; [`Slice::into_inner`] returns the
+  /// whole buffer.
+  ///
+  /// ```
+  /// use lio::IoBuf;
+  ///
+  /// // After a short write of 2 bytes, send the rest.
+  /// let rest = b"hello".to_vec().slice(2..);
+  /// assert_eq!(rest.as_slice(), b"llo");
+  /// assert_eq!(rest.into_inner(), b"hello");
+  /// ```
+  ///
+  /// # Panics
+  ///
+  /// If `range` is not within [`as_slice`](IoBuf::as_slice).
+  fn slice(self, range: impl RangeBounds<usize>) -> Slice<Self>
+  where
+    Self: Sized,
+  {
+    let len = self.as_slice().len();
+    let (begin, end) = bounds(range, len);
+    Slice { buf: self, begin, end }
+  }
 }
 
 /// A mutable buffer for read operations - provides mutable access and capacity.
@@ -93,6 +124,119 @@ pub trait IoBufMut: IoBuf {
   /// `len` must be at most `as_uninit_mut().len()`, and the first `len` bytes of
   /// [`as_uninit_mut`](IoBufMut::as_uninit_mut) must be initialized.
   unsafe fn set_len(&mut self, len: usize);
+
+  /// Narrows the buffer to `range` of its capacity, without copying: a read
+  /// into the result fills that range.
+  ///
+  /// The range must start within the bytes already initialized. A read
+  /// extends the buffer's initialized bytes to the end of what it filled,
+  /// and never shrinks them. [`Slice::into_inner`] returns the whole buffer.
+  ///
+  /// ```
+  /// use lio::IoBufMut;
+  ///
+  /// let mut buf = Vec::with_capacity(16);
+  /// buf.extend_from_slice(b"head");
+  /// // Read into the spare capacity, after the 4 bytes already there.
+  /// let spare = buf.slice_mut(4..);
+  /// assert_eq!((spare.begin(), spare.end()), (4, spare.get_ref().capacity()));
+  /// ```
+  ///
+  /// # Panics
+  ///
+  /// If `range` is not within [`as_uninit_mut`](IoBufMut::as_uninit_mut),
+  /// or starts past [`as_slice`](IoBuf::as_slice).
+  fn slice_mut(mut self, range: impl RangeBounds<usize>) -> Slice<Self>
+  where
+    Self: Sized,
+  {
+    let capacity = self.as_uninit_mut().len();
+    let (begin, end) = bounds(range, capacity);
+    let init = self.as_slice().len();
+    assert!(
+      begin <= init,
+      "slice_mut: range starts at {begin}, past the {init} initialized bytes"
+    );
+    Slice { buf: self, begin, end }
+  }
+}
+
+/// Resolves `range` against a length, panicking if it is out of bounds.
+fn bounds(range: impl RangeBounds<usize>, len: usize) -> (usize, usize) {
+  let begin = match range.start_bound() {
+    Bound::Included(&n) => n,
+    Bound::Excluded(&n) => n.checked_add(1).expect("range start overflows"),
+    Bound::Unbounded => 0,
+  };
+  let end = match range.end_bound() {
+    Bound::Included(&n) => n.checked_add(1).expect("range end overflows"),
+    Bound::Excluded(&n) => n,
+    Bound::Unbounded => len,
+  };
+  assert!(begin <= end, "slice: range starts at {begin} but ends at {end}");
+  assert!(end <= len, "slice: range ends at {end}, past the length {len}");
+  (begin, end)
+}
+
+/// A buffer narrowed to a range, made by [`IoBuf::slice`] or
+/// [`IoBufMut::slice_mut`].
+///
+/// It owns the buffer, and does the I/O on the range alone.
+#[derive(Debug)]
+pub struct Slice<B> {
+  buf: B,
+  begin: usize,
+  end: usize,
+}
+
+impl<B> Slice<B> {
+  /// Where the range starts in the buffer.
+  pub fn begin(&self) -> usize {
+    self.begin
+  }
+
+  /// Where the range ends in the buffer (exclusive).
+  pub fn end(&self) -> usize {
+    self.end
+  }
+
+  /// The whole buffer.
+  pub fn get_ref(&self) -> &B {
+    &self.buf
+  }
+
+  /// Returns the whole buffer.
+  pub fn into_inner(self) -> B {
+    self.buf
+  }
+}
+
+impl<B: IoBuf> IoBuf for Slice<B> {
+  /// The range's initialized bytes: all of it for a write, and for a read
+  /// those filled so far.
+  fn as_slice(&self) -> &[u8] {
+    let init = self.buf.as_slice();
+    let end = self.end.min(init.len());
+    &init[self.begin.min(end)..end]
+  }
+}
+
+impl<B: IoBufMut> IoBufMut for Slice<B> {
+  fn as_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+    &mut self.buf.as_uninit_mut()[self.begin..self.end]
+  }
+
+  unsafe fn set_len(&mut self, len: usize) {
+    let init = self.buf.as_slice().len();
+    // `slice_mut` checked this, but only the buffer knows its length now.
+    assert!(self.begin <= init, "slice: starts past the initialized bytes");
+    let filled = self.begin + len;
+    // SAFETY: the bytes before `begin` were initialized (checked above), the
+    // caller guarantees the `len` after it are, and `filled <= end`, which is
+    // within the capacity. Never shrinking keeps bytes past `filled` that
+    // were initialized before.
+    unsafe { self.buf.set_len(filled.max(init)) }
+  }
 }
 
 impl IoBuf for Vec<u8> {
@@ -119,6 +263,96 @@ impl IoBufMut for Vec<u8> {
 impl IoBuf for Box<[u8]> {
   fn as_slice(&self) -> &[u8] {
     self
+  }
+}
+
+impl IoBuf for Box<str> {
+  fn as_slice(&self) -> &[u8] {
+    self.as_bytes()
+  }
+}
+
+impl IoBuf for String {
+  fn as_slice(&self) -> &[u8] {
+    self.as_bytes()
+  }
+}
+
+impl IoBuf for &'static [u8] {
+  fn as_slice(&self) -> &[u8] {
+    self
+  }
+}
+
+impl IoBuf for &'static str {
+  fn as_slice(&self) -> &[u8] {
+    self.as_bytes()
+  }
+}
+
+impl IoBuf for Arc<[u8]> {
+  fn as_slice(&self) -> &[u8] {
+    self
+  }
+}
+
+impl IoBuf for Arc<str> {
+  fn as_slice(&self) -> &[u8] {
+    self.as_bytes()
+  }
+}
+
+impl IoBuf for Cow<'static, [u8]> {
+  fn as_slice(&self) -> &[u8] {
+    self
+  }
+}
+
+/// Inline storage: the array moves with the operation that owns it, which
+/// stays in place while the operation is in flight.
+impl<const N: usize> IoBuf for [u8; N] {
+  fn as_slice(&self) -> &[u8] {
+    self
+  }
+}
+
+#[cfg(feature = "bytes")]
+impl IoBuf for bytes::Bytes {
+  fn as_slice(&self) -> &[u8] {
+    self
+  }
+}
+
+#[cfg(feature = "bytes")]
+impl IoBuf for bytes::BytesMut {
+  fn as_slice(&self) -> &[u8] {
+    self
+  }
+}
+
+#[cfg(feature = "bytes")]
+impl IoBufMut for bytes::BytesMut {
+  fn as_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+    // `BytesMut` hands out its whole capacity only as spare capacity, so
+    // take that with the length at 0. Its slice derefs only cover the
+    // initialized bytes, too little to extend to the capacity.
+    let len = self.len();
+    // SAFETY: no bytes are claimed initialized.
+    unsafe { self.set_len(0) };
+    let whole = self.spare_capacity_mut();
+    let (ptr, cap) = (whole.as_mut_ptr(), whole.len());
+    // SAFETY: the first `len` bytes were initialized and still are.
+    unsafe { self.set_len(len) };
+    // SAFETY: `ptr` points to the `cap` bytes of the buffer, which setting
+    // the length did not touch; `MaybeUninit<u8>` permits uninitialized
+    // contents, and the borrow of `self` prevents reallocation.
+    unsafe { std::slice::from_raw_parts_mut(ptr, cap) }
+  }
+
+  unsafe fn set_len(&mut self, len: usize) {
+    // SAFETY: the caller guarantees `len <= capacity` and that the first `len`
+    // bytes are initialized.
+    unsafe { bytes::BytesMut::set_len(self, len) }
   }
 }
 
@@ -379,5 +613,191 @@ impl<B: IoBufMut> IoBufMutVec for Vec<B> {
   unsafe fn set_buf_len(&mut self, i: usize, len: usize) {
     // SAFETY: forwarded from the caller.
     unsafe { self[i].set_len(len) }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Fills the first `bytes.len()` bytes of `buf`'s writable region, as a
+  /// read would, and reports them.
+  fn read_into<B: IoBufMut>(buf: &mut B, bytes: &[u8]) {
+    for (dst, src) in buf.as_uninit_mut().iter_mut().zip(bytes) {
+      dst.write(*src);
+    }
+    // SAFETY: the first `bytes.len()` bytes were just written.
+    unsafe { buf.set_len(bytes.len()) };
+  }
+
+  #[test]
+  fn a_slice_writes_its_range_and_returns_the_whole_buffer() {
+    let slice = b"hello".to_vec().slice(1..4);
+    assert_eq!(slice.as_slice(), b"ell");
+    assert_eq!((slice.begin(), slice.end()), (1, 4));
+    assert_eq!(slice.get_ref(), b"hello");
+    assert_eq!(slice.into_inner(), b"hello");
+
+    assert_eq!(b"hello".to_vec().slice(..).as_slice(), b"hello");
+    assert_eq!(b"hello".to_vec().slice(2..=3).as_slice(), b"ll");
+    assert_eq!(b"hello".to_vec().slice(5..).as_slice(), b"");
+    let excluded_start = (Bound::Excluded(1), Bound::Unbounded);
+    assert_eq!("hello".slice(excluded_start).as_slice(), b"llo");
+  }
+
+  #[test]
+  #[should_panic(expected = "past the length 5")]
+  fn a_slice_past_the_end_panics() {
+    let _ = b"hello".to_vec().slice(..6);
+  }
+
+  #[test]
+  #[should_panic(expected = "starts at 3 but ends at 2")]
+  fn a_backwards_slice_panics() {
+    #[allow(clippy::reversed_empty_ranges)]
+    let _ = b"hello".to_vec().slice(3..2);
+  }
+
+  #[test]
+  fn a_mutable_slice_reads_into_spare_capacity() {
+    let mut buf = Vec::with_capacity(16);
+    buf.extend_from_slice(b"head");
+    let mut spare = buf.slice_mut(4..);
+    assert_eq!(spare.as_uninit_mut().len(), spare.get_ref().capacity() - 4);
+    assert_eq!(spare.as_slice(), b"", "nothing read yet");
+
+    read_into(&mut spare, b"tail");
+    assert_eq!(spare.as_slice(), b"tail");
+    assert_eq!(spare.into_inner(), b"headtail");
+  }
+
+  #[test]
+  fn a_mutable_slice_never_shrinks_the_buffer() {
+    let mut slice = b"0123456789".to_vec().slice_mut(2..5);
+    assert_eq!(slice.as_uninit_mut().len(), 3);
+    read_into(&mut slice, b"ab");
+    assert_eq!(slice.as_slice(), b"ab4");
+    assert_eq!(slice.into_inner(), b"01ab456789");
+  }
+
+  #[test]
+  #[should_panic(expected = "past the 4 initialized bytes")]
+  fn a_mutable_slice_past_the_initialized_bytes_panics() {
+    let mut buf = Vec::with_capacity(16);
+    buf.extend_from_slice(b"head");
+    let _ = buf.slice_mut(5..);
+  }
+
+  #[test]
+  #[should_panic(expected = "past the length")]
+  fn a_mutable_slice_past_the_capacity_panics() {
+    let buf = Vec::<u8>::with_capacity(4);
+    let cap = buf.capacity();
+    let _ = buf.slice_mut(..cap + 1);
+  }
+
+  #[test]
+  fn borrowed_and_shared_buffers_write_their_bytes() {
+    fn bytes(buf: impl IoBuf) -> Vec<u8> {
+      buf.as_slice().to_vec()
+    }
+    assert_eq!(bytes(&b"static"[..]), b"static");
+    assert_eq!(bytes("str"), b"str");
+    assert_eq!(bytes(String::from("string")), b"string");
+    assert_eq!(bytes(Box::<str>::from("boxed")), b"boxed");
+    assert_eq!(bytes(Box::<[u8]>::from(&b"boxed"[..])), b"boxed");
+    assert_eq!(bytes(Arc::<[u8]>::from(&b"shared"[..])), b"shared");
+    assert_eq!(bytes(Arc::<str>::from("shared")), b"shared");
+    assert_eq!(bytes(Cow::Borrowed(&b"cow"[..])), b"cow");
+    assert_eq!(bytes(Cow::<[u8]>::Owned(b"cow".to_vec())), b"cow");
+    assert_eq!(bytes(*b"array"), b"array");
+  }
+
+  #[cfg(feature = "bytes")]
+  #[test]
+  fn bytes_buffers_write_and_read() {
+    let frozen = bytes::Bytes::from_static(b"frozen");
+    assert_eq!(IoBuf::as_slice(&frozen), b"frozen");
+
+    let mut buf = bytes::BytesMut::with_capacity(8);
+    buf.extend_from_slice(b"ab");
+    assert_eq!(IoBuf::as_slice(&buf), b"ab");
+    let mut spare = buf.slice_mut(2..);
+    read_into(&mut spare, b"cd");
+    assert_eq!(&spare.into_inner()[..], b"abcd");
+  }
+
+  /// The backend gets the slice's own bytes, in the original allocation.
+  mod in_operations {
+    use crate::Lio;
+    use crate::api;
+    use crate::api::resource::Resource;
+    use crate::backend::op::Op;
+    use crate::backend::testing::{POISON, ScriptedBackend};
+
+    use super::*;
+
+    fn lio() -> (ScriptedBackend, Lio) {
+      let backend = ScriptedBackend::new();
+      (backend.clone(), Lio::new_with_backend(backend, 1).unwrap())
+    }
+
+    /// The single region an in-flight read or write points at.
+    fn region(backend: &ScriptedBackend) -> (*const u8, usize) {
+      let op = backend.op(backend.pushed()[0]).expect("op in flight");
+      let (Op::Write { iovecs, iov_count: 1, .. }
+      | Op::Read { iovecs, iov_count: 1, .. }) = op
+      else {
+        panic!("not a single-buffer read or write: {op:?}");
+      };
+      // SAFETY: the op is in flight, so its descriptor array is alive.
+      let raw = unsafe { iovecs.as_ptr().read() };
+      (raw.ptr.cast_const(), raw.len)
+    }
+
+    #[test]
+    fn a_write_sends_the_rest_after_a_short_write() {
+      let (backend, lio) = lio();
+      let buf = b"hello world".to_vec();
+      let base = buf.as_ptr();
+      let done = std::rc::Rc::new(std::cell::RefCell::new(None));
+      let out = done.clone();
+      api::write(&Resource::stdout(), buf.slice(6..)).with_lio(&lio).when_done(
+        move |(res, slice)| {
+          *out.borrow_mut() = Some((res.unwrap(), slice.into_inner()));
+        },
+      );
+      assert_eq!(region(&backend), (base.wrapping_add(6), 5));
+
+      backend.complete(backend.pushed()[0], 5);
+      lio.try_run().unwrap();
+      let (written, buf) = done.borrow_mut().take().unwrap();
+      assert_eq!(written, 5);
+      assert_eq!(buf.as_ptr(), base, "the same allocation comes back");
+    }
+
+    #[test]
+    fn a_read_appends_into_spare_capacity() {
+      let (backend, lio) = lio();
+      let mut buf = Vec::with_capacity(16);
+      buf.extend_from_slice(b"head");
+      let (base, cap) = (buf.as_ptr(), buf.capacity());
+      let done = std::rc::Rc::new(std::cell::RefCell::new(None));
+      let out = done.clone();
+      api::read(&Resource::stdin(), buf.slice_mut(4..))
+        .with_lio(&lio)
+        .when_done(move |(res, slice)| {
+          *out.borrow_mut() = Some((res.unwrap(), slice.into_inner()));
+        });
+      assert_eq!(region(&backend), (base.wrapping_add(4), cap - 4));
+
+      // The scripted backend fills the region with `POISON`.
+      backend.complete(backend.pushed()[0], 3);
+      lio.try_run().unwrap();
+      let (read, buf) = done.borrow_mut().take().unwrap();
+      assert_eq!(read, 3);
+      assert_eq!(buf, [b'h', b'e', b'a', b'd', POISON, POISON, POISON]);
+      assert_eq!(buf.as_ptr(), base);
+    }
   }
 }
