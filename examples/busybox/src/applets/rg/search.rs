@@ -1716,7 +1716,7 @@ impl SearchEngine {
     if file.done || first_newline + 1 == bytes.len() {
       return Ok(());
     }
-    debug_assert!(file.carry.is_empty());
+    assert!(file.carry.is_empty());
     self.process_stream_bytes_no_carry(
       file,
       &bytes[first_newline + 1..],
