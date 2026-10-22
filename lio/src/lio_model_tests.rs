@@ -26,7 +26,8 @@ use crate::backend::testing::{Checked, ScriptedBackend};
 /// which backend id belongs to which submission.
 struct Tagged(u32);
 
-impl OpModel for Tagged {
+// SAFETY: `action` only returns `Op`s without pointers.
+unsafe impl OpModel for Tagged {
   type Item = (u32, isize);
 
   fn action(&mut self) -> Action {

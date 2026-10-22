@@ -34,14 +34,16 @@ struct ImmediateBackend {
   ready: Vec<u64>,
 }
 
-impl IoBackend for ImmediateBackend {
+// SAFETY: it only accepts `Op::Nop`, which points at nothing, and completes
+// each pushed operation once.
+unsafe impl IoBackend for ImmediateBackend {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.queued.reserve(cap);
     self.ready.reserve(cap);
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
+  unsafe fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
     assert!(matches!(op, Op::Nop), "benchmark backend only supports NOP");
     self.queued.push(id);
   }
@@ -77,7 +79,11 @@ fn direct_backend(criterion: &mut Criterion) {
       |bencher, &depth| {
         bencher.iter(|| {
           for id in 0..depth as u64 {
-            backend.push(id, Op::Nop, &mut bump);
+            // SAFETY: `Op::Nop` points at nothing, and every id completes in the
+            // same iteration, before it is pushed again.
+            unsafe {
+              backend.push(id, Op::Nop, &mut bump);
+            }
           }
           backend.flush().unwrap();
           backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
@@ -154,7 +160,8 @@ struct SteppedStream {
   remaining: usize,
 }
 
-impl OpModel for SteppedStream {
+// SAFETY: `action` only returns `Op`s without pointers.
+unsafe impl OpModel for SteppedStream {
   type Item = ();
 
   fn action(&mut self) -> Action {

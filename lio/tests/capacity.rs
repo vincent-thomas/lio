@@ -119,7 +119,8 @@ struct OneShotStream {
   done: bool,
 }
 
-impl OpModel for OneShotStream {
+// SAFETY: `action` only returns `Op`s without pointers.
+unsafe impl OpModel for OneShotStream {
   type Item = u32;
 
   fn action(&mut self) -> Action {
@@ -181,7 +182,8 @@ impl Drop for PanicsOnAction {
   }
 }
 
-impl OpModel for PanicsOnAction {
+// SAFETY: `action` never returns an `Op`.
+unsafe impl OpModel for PanicsOnAction {
   type Item = ();
 
   fn action(&mut self) -> Action {

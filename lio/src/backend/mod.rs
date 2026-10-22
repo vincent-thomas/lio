@@ -28,8 +28,10 @@
 //! let mut backend = DefaultBackend::new();
 //! backend.init(1024).unwrap();  // Pre-allocate for 1024 concurrent ops
 //!
-//! // Submit a nop operation
-//! backend.push(1, Op::Nop, &mut bumpalo::Bump::new());
+//! // Submit a nop operation. Its arena must outlive the operation.
+//! let mut step_bump = bumpalo::Bump::new();
+//! // SAFETY: `Op::Nop` points at nothing, and id 1 is not in flight.
+//! unsafe { backend.push(1, Op::Nop, &mut step_bump) };
 //! backend.flush().unwrap();
 //!
 //! // Poll for completions (non-blocking)
@@ -188,11 +190,77 @@ impl OpCompleted {
 /// ```ignore
 /// let mut backend = Backend::default();
 /// backend.init(1024)?;                    // Pre-allocate for 1024 ops
-/// backend.push(op_id, op)?;               // Queue operation
+/// unsafe { backend.push(op_id, op, &mut step_bump) }; // Queue operation
 /// backend.flush()?;                       // Submit to kernel
 /// let done = backend.wait(timeout)?;      // Get completions
 /// ```
-pub trait IoBackend {
+///
+/// # Safety
+///
+/// lio pushes [`Op`]s whose raw pointers point into memory owned by op
+/// models, frees or reuses that memory once the operation's completion is
+/// reported, and acts on what the backend reports without checking it.
+/// Implementors must guarantee:
+///
+/// - **One completion per push.** Each `push(id, ..)` is followed by exactly
+///   one [`OpCompleted`] for `id` from [`wait`](Self::wait), unless
+///   [`drain`](Self::drain) returns `true` first, also when the operation
+///   was [`cancel`](Self::cancel)led. `wait` never reports an `id` that is
+///   not pushed and still unreported: lio pushes an `id` again once its
+///   completion arrives, so a stray or duplicate completion would complete a
+///   different operation whose memory is still in use.
+/// - **No access after completion.** Neither the backend, nor the kernel, nor
+///   any thread working for it reads or writes memory an `Op` points to, or
+///   allocations made in the `step_bump` passed to its `push`, after the
+///   operation's completion has been reported. A completion is only reported
+///   once the operation has really finished.
+/// - **Honest drain.** `drain` returns `true` only when no pushed operation
+///   can still access that memory. lio drops the backend before freeing it,
+///   so the backend's own `Drop` is the only code that may still touch it.
+/// - **Truthful results.** A completion's result, and anything written
+///   through the `Op`'s pointers, mean what the `Op` variant documents. In
+///   particular:
+///   - a successful result of an operation that creates a resource
+///     ([`Op::Socket`], [`Op::Accept`], [`Op::OpenAt`]) is a newly created
+///     descriptor/handle whose ownership the backend transfers to lio: nothing
+///     else owns it or will close it;
+///   - a successful byte count is at most the number of bytes actually
+///     written, in order, into the operation's buffers (for reads) or taken
+///     from them (for writes);
+///   - output storage the `Op` points to (`FileStat`, `OsString`,
+///     `SocketAddrBuf`, `ReadDirResult`, ...) holds valid, initialized values
+///     on success, and a `ReadDir` state/drop-function pair stays sound to
+///     call once, from any thread.
+/// - **Matching close.** [`resource_close`](Self::resource_close) releases
+///   exactly the resources this backend's completions carry, from any thread.
+///
+/// A safe `impl` does not compile, so safe code cannot hand lio descriptors
+/// it does not own, or have lio free memory still in use:
+///
+/// ```compile_fail,E0200
+/// use lio::backend::{IoBackend, OpCompleted, op::Op};
+/// use std::{io, time::Duration};
+///
+/// struct Liar;
+///
+/// impl IoBackend for Liar {
+///   fn init(&mut self, _: usize) -> io::Result<()> {
+///     Ok(())
+///   }
+///   unsafe fn push(&mut self, _: u64, _: Op, _: &mut bumpalo::Bump) {}
+///   fn flush(&mut self) -> io::Result<()> {
+///     Ok(())
+///   }
+///   fn wait(
+///     &mut self,
+///     _: Option<Duration>,
+///     _: &mut Vec<OpCompleted>,
+///   ) -> io::Result<()> {
+///     Ok(())
+///   }
+/// }
+/// ```
+pub unsafe trait IoBackend {
   /// Initialize backend with capacity for `cap` concurrent operations.
   ///
   /// Pre-allocates all resources for zero-allocation runtime.
@@ -212,7 +280,29 @@ pub trait IoBackend {
   /// Queue an operation for submission.
   ///
   /// Call `flush()` to submit queued operations.
-  fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump);
+  ///
+  /// # Safety
+  ///
+  /// The caller guarantees that:
+  /// - every pointer in `op` is valid as the [`OpModel`] safety contract
+  ///   describes, and stays so until this backend reports the completion
+  ///   for `id`, or until [`drain`](Self::drain) returns `true`;
+  /// - `step_bump` is not reset or dropped before then either, since the
+  ///   backend may lower the operation into it;
+  /// - `id` is not in flight already: a previous `push` with the same `id`
+  ///   has had its completion reported, or was drained.
+  ///
+  /// Calling it from safe code does not compile:
+  ///
+  /// ```compile_fail,E0133
+  /// use lio::backend::{IoBackend, impls::DefaultBackend, op::Op};
+  ///
+  /// let mut backend = DefaultBackend::new();
+  /// backend.push(1, Op::Nop, &mut bumpalo::Bump::new());
+  /// ```
+  ///
+  /// [`OpModel`]: crate::api::op::OpModel
+  unsafe fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump);
 
   /// Submit all queued operations to kernel.
   fn flush(&mut self) -> io::Result<()>;

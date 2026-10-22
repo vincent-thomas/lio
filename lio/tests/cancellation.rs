@@ -27,7 +27,8 @@ struct Tracked {
   completions: Arc<AtomicUsize>,
 }
 
-impl OpModel for Tracked {
+// SAFETY: `action` only returns `Op`s without pointers.
+unsafe impl OpModel for Tracked {
   type Item = isize;
 
   fn action(&mut self) -> Action {
@@ -168,7 +169,8 @@ fn dropped_sleep_is_removed_at_once() {
 /// Yields a value for every completion, forever.
 struct Endless;
 
-impl OpModel for Endless {
+// SAFETY: `action` only returns `Op`s without pointers.
+unsafe impl OpModel for Endless {
   type Item = ();
 
   fn action(&mut self) -> Action {

@@ -1351,7 +1351,13 @@ impl IoUring {
   }
 }
 
-impl IoBackend for IoUring {
+// SAFETY: each pushed operation is completed once: from its own CQE, which the
+// kernel posts only when it is done with the operation's memory, or from the
+// backlog and immediate paths before it reaches the kernel. `cancel` leaves a
+// submitted operation pending until that CQE, and `drain` cancels and waits
+// for every request still in the kernel, returning `false` if any remains.
+// Results are the kernel's own: resource-creating operations yield fresh fds.
+unsafe impl IoBackend for IoUring {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.ring = Some(if self.deferred_completions {
       Self::create_ring_with(cap as u32, LioUring::with_params)?
@@ -1372,7 +1378,7 @@ impl IoBackend for IoUring {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump) {
+  unsafe fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump) {
     assert!(
       self.backlog.len() + self.in_flight < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",

@@ -963,7 +963,13 @@ impl Iocp {
   }
 }
 
-impl IoBackend for Iocp {
+// SAFETY: each pushed operation is completed once: overlapped operations from
+// their completion packet, which the kernel posts only when it is done with the
+// operation's memory, and blocking ones once their worker finished. `cancel`
+// waits for that packet as well, and `drain` stops the workers and waits for
+// every packet, returning `false` if any remains. Results are the OS's own:
+// resource-creating operations yield fresh handles.
+unsafe impl IoBackend for Iocp {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     ensure_wsa()?;
     // SAFETY: creating a fresh completion port.
@@ -990,7 +996,7 @@ impl IoBackend for Iocp {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
+  unsafe fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
     assert!(
       self.backlog.len() + self.in_flight.len() + self.blocking_in_flight
         < self.capacity,

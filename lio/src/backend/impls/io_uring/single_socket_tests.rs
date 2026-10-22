@@ -17,7 +17,11 @@ fn pair() -> (Resource, UdpSocket) {
 }
 
 fn complete(backend: &mut IoUring, arena: &mut Bump, op: Op) -> isize {
-  backend.push(123, op, arena);
+  // SAFETY: test only: callers keep what `op` points to, and `arena`,
+  // alive across this call, which waits for the completion.
+  unsafe {
+    backend.push(123, op, arena);
+  }
   backend.flush().unwrap();
   let deadline = Instant::now() + Duration::from_secs(2);
   let mut completed = Vec::new();

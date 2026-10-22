@@ -88,12 +88,21 @@ fn trace_read_batches() {
     inner: IoUring,
     stats: Rc<RefCell<Stats>>,
   }
-  impl IoBackend for Observed {
+  // SAFETY: every call that matters to the contract is forwarded to `inner`,
+  // which upholds it; `Observed` only times them.
+  unsafe impl IoBackend for Observed {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    fn push(&mut self, id: u64, op: Op, bump: &mut Bump) {
-      self.inner.push(id, op, bump)
+    unsafe fn push(&mut self, id: u64, op: Op, bump: &mut Bump) {
+      // SAFETY: forwarded under this call's own contract.
+      unsafe { self.inner.push(id, op, bump) }
+    }
+    fn cancel(&mut self, id: u64) {
+      self.inner.cancel(id)
+    }
+    fn drain(&mut self) -> bool {
+      self.inner.drain()
     }
     fn flush(&mut self) -> io::Result<()> {
       let t = Instant::now();
@@ -258,17 +267,21 @@ fn nonblocking_waits_make_progress_on_file_completions() {
     })
     .collect();
   for (id, raw) in raws.iter().enumerate() {
-    backend.push(
-      id as u64,
-      Op::Read {
-        fd: file.clone(),
-        iovecs: NonNull::from(raw),
-        iov_count: 1,
-        offset: Some(0),
-        flags: ReadFlags::EMPTY,
-      },
-      &mut arena,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        id as u64,
+        Op::Read {
+          fd: file.clone(),
+          iovecs: NonNull::from(raw),
+          iov_count: 1,
+          offset: Some(0),
+          flags: ReadFlags::EMPTY,
+        },
+        &mut arena,
+      );
+    }
   }
   backend.flush().unwrap();
   let mut seen = [false; DEPTH];
@@ -310,17 +323,21 @@ fn read_with_more_iovecs_than_the_native_array_is_rejected() {
     // SAFETY: the buffers outlive every use of the backend below.
     .map(|buf| unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) })
     .collect();
-  backend.push(
-    1,
-    Op::Read {
-      fd: reader,
-      iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
-      iov_count: raws.len(),
-      offset: None,
-      flags: ReadFlags::EMPTY,
-    },
-    &mut arena,
-  );
+  // SAFETY: test only: what the operation points to outlives it here,
+  // and its id is not in flight.
+  unsafe {
+    backend.push(
+      1,
+      Op::Read {
+        fd: reader,
+        iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
+        iov_count: raws.len(),
+        offset: None,
+        flags: ReadFlags::EMPTY,
+      },
+      &mut arena,
+    );
+  }
   backend.flush().unwrap();
   let mut completed = Vec::new();
   backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
@@ -341,17 +358,21 @@ fn drop_waits_for_operations_in_the_kernel() {
   let mut buf = [0u8; 4];
   // SAFETY: `buf` outlives every use of the backend below.
   let raw = unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
-  backend.push(
-    1,
-    Op::Read {
-      fd: reader.clone(),
-      iovecs: NonNull::from(&raw),
-      iov_count: 1,
-      offset: None,
-      flags: ReadFlags::EMPTY,
-    },
-    &mut arena,
-  );
+  // SAFETY: test only: what the operation points to outlives it here,
+  // and its id is not in flight.
+  unsafe {
+    backend.push(
+      1,
+      Op::Read {
+        fd: reader.clone(),
+        iovecs: NonNull::from(&raw),
+        iov_count: 1,
+        offset: None,
+        flags: ReadFlags::EMPTY,
+      },
+      &mut arena,
+    );
+  }
   backend.flush().unwrap();
   let mut completed = Vec::new();
   backend.wait(Some(Duration::ZERO), &mut completed).unwrap();

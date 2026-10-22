@@ -284,7 +284,10 @@ pub struct OpenFile {
   inner: ops::OpenAt,
 }
 
-impl OpModel for OpenFile {
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl OpModel for OpenFile {
   type Item = io::Result<File>;
 
   fn action(&mut self) -> Action {
@@ -310,7 +313,10 @@ pub struct OpenDirectory {
   inner: ops::OpenAt,
 }
 
-impl OpModel for OpenDirectory {
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl OpModel for OpenDirectory {
   type Item = io::Result<Directory>;
 
   fn action(&mut self) -> Action {
@@ -366,7 +372,10 @@ impl OpenReadDir {
   }
 }
 
-impl OpModel for OpenReadDir {
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl OpModel for OpenReadDir {
   type Item = io::Result<ReadDir>;
 
   fn action(&mut self) -> Action {
@@ -578,7 +587,10 @@ impl RemoveDirAll {
   }
 }
 
-impl OpModel for RemoveDirAll {
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl OpModel for RemoveDirAll {
   type Item = io::Result<()>;
 
   fn action(&mut self) -> Action {
@@ -722,7 +734,10 @@ impl ReadLink {
   }
 }
 
-impl OpModel for ReadLink {
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl OpModel for ReadLink {
   type Item = io::Result<PathBuf>;
 
   fn action(&mut self) -> Action {
@@ -795,7 +810,10 @@ impl ReadToString {
   }
 }
 
-impl OpModel for ReadToString {
+// SAFETY: every `Op` comes from the `action` of an inner `OpModel`, which
+// stays in place in `self` until its completion is forwarded to it, or carries
+// no pointers.
+unsafe impl OpModel for ReadToString {
   type Item = io::Result<String>;
 
   fn action(&mut self) -> Action {

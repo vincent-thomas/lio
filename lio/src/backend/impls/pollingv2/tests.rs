@@ -40,7 +40,11 @@ mod immediate_sockets {
     };
     // Poller does not use the step arena. Models are boxed by the caller so
     // the buffers and message descriptors stay stable until completion.
-    backend.push(id, op, &mut Bump::new());
+    // SAFETY: test only: callers box the model and keep it until the
+    // completion, and never reuse an id in flight. Poller ignores the arena.
+    unsafe {
+      backend.push(id, op, &mut Bump::new());
+    }
   }
 
   #[test]
@@ -57,7 +61,9 @@ mod immediate_sockets {
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].registration_id(), 11);
     let OpResult::Done((result, buf)) =
-      model.complete(Completion::new(completed[0].result()))
+      // SAFETY: the poller reported this completion for the operation the
+      // model's `action` returned.
+      model.complete(unsafe { Completion::new(completed[0].result()) })
     else {
       panic!();
     };
@@ -126,7 +132,11 @@ mod immediate_sockets {
     backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 1);
     peer.write_all(b"hello").unwrap();
-    backend.push(16, Op::Nop, &mut Bump::new());
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(16, Op::Nop, &mut Bump::new());
+    }
     backend.flush().unwrap();
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
@@ -190,17 +200,21 @@ mod immediate_sockets {
       .map(|buf| unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) })
       .collect();
     let mut backend = backend();
-    backend.push(
-      18,
-      Op::Read {
-        fd: socket,
-        iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
-        iov_count: raws.len(),
-        offset: None,
-        flags: ReadFlags::EMPTY,
-      },
-      &mut Bump::new(),
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        18,
+        Op::Read {
+          fd: socket,
+          iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
+          iov_count: raws.len(),
+          offset: None,
+          flags: ReadFlags::EMPTY,
+        },
+        &mut Bump::new(),
+      );
+    }
     backend.flush().unwrap();
     let mut completed = Vec::new();
     backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();

@@ -32,7 +32,7 @@ If you are only using `lio`, you can treat `OpModel` as background machinery at 
 The trait in `lio/src/api/op.rs` is intentionally small.
 
 ```rust,ignore
-pub trait OpModel: Send + 'static {
+pub unsafe trait OpModel: Send + 'static {
     type Item: Send;
 
     fn action(&mut self) -> Action;
@@ -48,6 +48,8 @@ That small surface is deliberate. `OpModel` is not trying to be a full framework
 Everything else in the operation lifecycle is built on top of those two methods. That narrow interface is what lets the trait stay composable instead of becoming a mini-runtime API of its own.
 
 That is the trait's main design strength. It stays small enough that simple operations stay simple, but expressive enough that composed operations do not need a second abstraction.
+
+The trait is `unsafe` to implement. An `Op` carries raw pointers (buffers, iovec arrays, output slots) that the backend hands to the kernel, so an implementation promises that they point at memory the model owns, valid for what the operation does, until its completion comes back. The trait's `# Safety` section spells the contract out. Models built only from other models, or from operations without pointers, uphold it trivially, as long as they pass each `Completion` unchanged to the model whose operation it completes. Going the other way, a `Completion` can only be made with `unsafe` (`Completion::new`), so a model can trust its result the way it trusts the backend: a descriptor it may own, a byte count it may mark initialized.
 
 ## The return types matter
 
@@ -390,7 +392,9 @@ enum State {
     Done,
 }
 
-impl OpModel for MyModel {
+// SAFETY: every `Op` this model returns points only at memory it owns, and
+// leaves that memory alone until the completion arrives.
+unsafe impl OpModel for MyModel {
     type Item = io::Result<usize>;
 
     fn action(&mut self) -> Action {
