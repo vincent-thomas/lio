@@ -21,7 +21,7 @@ use crate::{
   },
   backend::op::{
     FileMode, FileStat, MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, OpenFlags,
-    RawBuf, ReadDirBuf, ReadFlags, RecvFlags, SendFlags, ShutdownHow,
+    RawBuf, RawPath, ReadDirBuf, ReadFlags, RecvFlags, SendFlags, ShutdownHow,
     SockDomain, SockProto, SockType, SocketAddrBuf, SocketAddrFamily,
     StatTarget, UnlinkKind, WriteFlags, is_valid_file_offset,
     socket_addr_from_buf, socket_addr_into_buf,
@@ -1527,7 +1527,7 @@ impl OpModel for OpenAt {
   fn action(&mut self) -> Action {
     Action::Io(Op::OpenAt {
       dir_fd: self.dir_res.clone(),
-      path: cstring_to_osstring(&self.pathname),
+      path: RawPath::new(&self.pathname),
       flags: self.flags,
       mode: self.mode,
     })
@@ -1600,7 +1600,7 @@ impl OpModel for Stat {
       StatModelTarget::Path { dir_res, pathname, follow_symlinks } => {
         StatTarget::Path {
           dir_fd: dir_res.clone(),
-          path: cstring_to_osstring(pathname),
+          path: RawPath::new(pathname),
           follow_symlinks: *follow_symlinks,
         }
       }
@@ -1774,7 +1774,7 @@ impl OpModel for UnlinkAt {
   fn action(&mut self) -> Action {
     Action::Io(Op::UnlinkAt {
       dir_fd: self.dir_res.clone(),
-      path: cstring_to_osstring(&self.pathname),
+      path: RawPath::new(&self.pathname),
       kind: self.kind,
     })
   }
@@ -1841,9 +1841,9 @@ impl OpModel for RenameAt {
   fn action(&mut self) -> Action {
     Action::Io(Op::RenameAt {
       old_dir_fd: self.old_dir_res.clone(),
-      old_path: cstring_to_osstring(&self.old_pathname),
+      old_path: RawPath::new(&self.old_pathname),
       new_dir_fd: self.new_dir_res.clone(),
-      new_path: cstring_to_osstring(&self.new_pathname),
+      new_path: RawPath::new(&self.new_pathname),
     })
   }
 
@@ -1903,7 +1903,7 @@ impl OpModel for MkdirAt {
   fn action(&mut self) -> Action {
     Action::Io(Op::MkdirAt {
       dir_fd: self.dir_res.clone(),
-      path: cstring_to_osstring(&self.pathname),
+      path: RawPath::new(&self.pathname),
       mode: self.mode,
     })
   }
@@ -1968,9 +1968,9 @@ impl OpModel for LinkAt {
     Action::Io(Op::LinkAt {
       kind: self.kind,
       source_dir_fd: self.source_dir_res.clone(),
-      source_path: cstring_to_osstring(&self.source_pathname),
+      source_path: RawPath::new(&self.source_pathname),
       new_dir_fd: self.new_dir_res.clone(),
-      new_path: cstring_to_osstring(&self.new_pathname),
+      new_path: RawPath::new(&self.new_pathname),
     })
   }
 
@@ -2049,7 +2049,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
 
     Action::Io(Op::ReadlinkAt {
       dir_fd: self.dir_res.clone(),
-      path: cstring_to_osstring(&self.pathname),
+      path: RawPath::new(&self.pathname),
       buf: ptr,
       buf_len: self.raw_len,
     })
@@ -2255,6 +2255,110 @@ impl OpModelContract for ReadlinkAt<Vec<u8>> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Path ops hand the backend the caller's own path buffer, not a copy.
+  mod paths_are_not_copied {
+    use std::ffi::{CStr, c_char};
+
+    use crate::Lio;
+    use crate::api;
+    use crate::backend::testing::ScriptedBackend;
+
+    use super::*;
+
+    /// Submits `submit` and returns the paths of the op it pushed.
+    fn pushed_paths(
+      submit: impl FnOnce(&Lio, &Resource),
+    ) -> Vec<(*const c_char, Vec<u8>)> {
+      let backend = ScriptedBackend::new();
+      let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
+      submit(&lio, &Resource::cwd());
+      let op = backend.op(backend.pushed()[0]).expect("op in flight");
+      let paths = match op {
+        Op::OpenAt { path, .. }
+        | Op::UnlinkAt { path, .. }
+        | Op::MkdirAt { path, .. }
+        | Op::ReadlinkAt { path, .. }
+        | Op::Stat { target: StatTarget::Path { path, .. }, .. } => vec![path],
+        Op::RenameAt { old_path, new_path, .. }
+        | Op::LinkAt { source_path: old_path, new_path, .. } => {
+          vec![old_path, new_path]
+        }
+        other => panic!("not a path op: {other:?}"),
+      };
+      paths
+        .into_iter()
+        .map(|path| {
+          // SAFETY: the op is still in flight, so its model owns the path.
+          let bytes = unsafe { path.as_c_str() }.to_bytes().to_vec();
+          (path.as_ptr(), bytes)
+        })
+        .collect()
+    }
+
+    fn path(bytes: &CStr) -> (CString, *const c_char) {
+      let path = bytes.to_owned();
+      let ptr = path.as_ptr();
+      (path, ptr)
+    }
+
+    #[test]
+    fn single_path_ops() {
+      type Submit = fn(&Lio, &Resource, CString);
+      let ops: [Submit; 5] = [
+        |lio, dir, p| {
+          api::openat(dir, p, OpenFlags::READ, 0)
+            .with_lio(lio)
+            .when_done(|_| {})
+        },
+        |lio, dir, p| {
+          api::unlinkat(dir, p, UnlinkKind::File)
+            .with_lio(lio)
+            .when_done(|_| {})
+        },
+        |lio, dir, p| {
+          api::mkdirat(dir, p, 0o755).with_lio(lio).when_done(|_| {})
+        },
+        |lio, dir, p| {
+          api::readlinkat(dir, p, Vec::with_capacity(8))
+            .with_lio(lio)
+            .when_done(|_| {})
+        },
+        |lio, dir, p| {
+          api::statat(dir, p, false).with_lio(lio).when_done(|_| {})
+        },
+      ];
+      for submit in ops {
+        let (p, ptr) = path(c"some/path");
+        let pushed = pushed_paths(move |lio, dir| submit(lio, dir, p));
+        assert_eq!(pushed, [(ptr, b"some/path".to_vec())]);
+      }
+    }
+
+    #[test]
+    fn two_path_ops() {
+      type Submit = fn(&Lio, &Resource, CString, CString);
+      let ops: [Submit; 2] = [
+        |lio, dir, old, new| {
+          api::renameat(dir, old, dir, new).with_lio(lio).when_done(|_| {})
+        },
+        |lio, dir, old, new| {
+          api::linkat(dir, old, dir, new, LinkKind::Hard)
+            .with_lio(lio)
+            .when_done(|_| {})
+        },
+      ];
+      for submit in ops {
+        let (old, old_ptr) = path(c"old");
+        let (new, new_ptr) = path(c"new");
+        let pushed = pushed_paths(move |lio, dir| submit(lio, dir, old, new));
+        assert_eq!(
+          pushed,
+          [(old_ptr, b"old".to_vec()), (new_ptr, b"new".to_vec())]
+        );
+      }
+    }
+  }
 
   mod nop_contract {
     use super::*;
