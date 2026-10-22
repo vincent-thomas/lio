@@ -266,7 +266,7 @@ unsafe impl lio::backend::IoBackend for InOrderBackend {
     Ok(())
   }
 
-  fn push(
+  unsafe fn push(
     &mut self,
     id: u64,
     _op: lio::backend::op::Op,

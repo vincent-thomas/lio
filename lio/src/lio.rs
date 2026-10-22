@@ -277,7 +277,12 @@ impl Lio {
           .step_bump_mut(id)
           .expect("dispatching action for unknown registration");
         step_bump.reset();
-        io.push(id, op, step_bump);
+        // SAFETY: `op` comes from the `action` of registration `id`'s model,
+        // so the `OpModel` contract keeps its pointers valid until the model
+        // sees the completion; the registration, and with it the model and
+        // `step_bump`, lives until that completion is routed (or the backend
+        // drained). `id`'s previous operation, if any, already completed.
+        unsafe { io.push(id, op, step_bump) };
       }
       Action::Sleep(duration) => time.schedule(id, duration),
     }
@@ -424,7 +429,9 @@ impl Lio {
       ));
     };
     match action {
-      Action::Io(op) => io.push(id, op, step_bump),
+      // SAFETY: as in `dispatch_action`; `id` is a freshly claimed slot, so
+      // nothing is in flight for it.
+      Action::Io(op) => unsafe { io.push(id, op, step_bump) },
       Action::Sleep(duration) => time.schedule(id, duration),
     }
     Ok(id)
@@ -654,8 +661,12 @@ impl Lio {
       budget -= 1;
       let (id, completion, timer) = if let Some(c) = inner.ready_io.pop_front()
       {
-        let completion =
-          Completion::new(c.result()).with_resource_close(resource_close);
+        // SAFETY: the backend upholds the `IoBackend` contract, so this is
+        // the one completion of the operation registration `c` last pushed,
+        // which `route` hands to that registration's model only. Its
+        // resources are closed with that backend's `resource_close`.
+        let completion = unsafe { Completion::new(c.result()) }
+          .with_resource_close(resource_close);
         (c.registration_id(), completion, false)
       } else if let Some(id) = inner.ready_timers.pop_front() {
         (id, TimeManager::fired_completion(), true)
@@ -934,7 +945,12 @@ mod tests {
     fn init(&mut self, _: usize) -> io::Result<()> {
       Ok(())
     }
-    fn push(&mut self, id: u64, _: crate::backend::op::Op, _: &mut Bump) {
+    unsafe fn push(
+      &mut self,
+      id: u64,
+      _: crate::backend::op::Op,
+      _: &mut Bump,
+    ) {
       self.0.extend([id, id]);
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -1069,10 +1085,16 @@ mod tests {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    fn push(&mut self, id: u64, op: crate::backend::op::Op, bump: &mut Bump) {
+    unsafe fn push(
+      &mut self,
+      id: u64,
+      op: crate::backend::op::Op,
+      bump: &mut Bump,
+    ) {
       let at = bump.alloc(0u64) as *mut u64 as usize;
       self.first_allocs.borrow_mut().push(at);
-      self.inner.push(id, op, bump);
+      // SAFETY: forwarded under this call's own contract.
+      unsafe { self.inner.push(id, op, bump) };
     }
     fn flush(&mut self) -> io::Result<()> {
       self.inner.flush()
@@ -1181,8 +1203,14 @@ mod tests {
     fn resource_close(&self) -> crate::api::resource::CloseFn {
       self.inner.resource_close()
     }
-    fn push(&mut self, id: u64, op: crate::backend::op::Op, bump: &mut Bump) {
-      self.inner.push(id, op, bump);
+    unsafe fn push(
+      &mut self,
+      id: u64,
+      op: crate::backend::op::Op,
+      bump: &mut Bump,
+    ) {
+      // SAFETY: forwarded under this call's own contract.
+      unsafe { self.inner.push(id, op, bump) };
     }
     fn flush(&mut self) -> io::Result<()> {
       self.inner.flush()

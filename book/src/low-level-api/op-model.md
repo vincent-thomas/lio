@@ -49,7 +49,7 @@ Everything else in the operation lifecycle is built on top of those two methods.
 
 That is the trait's main design strength. It stays small enough that simple operations stay simple, but expressive enough that composed operations do not need a second abstraction.
 
-The trait is `unsafe` to implement. An `Op` carries raw pointers (buffers, iovec arrays, output slots) that the backend hands to the kernel, so an implementation promises that they point at memory the model owns, valid for what the operation does, until its completion comes back. The trait's `# Safety` section spells the contract out. Models built only from other models, or from operations without pointers, uphold it trivially.
+The trait is `unsafe` to implement. An `Op` carries raw pointers (buffers, iovec arrays, output slots) that the backend hands to the kernel, so an implementation promises that they point at memory the model owns, valid for what the operation does, until its completion comes back. The trait's `# Safety` section spells the contract out. Models built only from other models, or from operations without pointers, uphold it trivially, as long as they pass each `Completion` unchanged to the model whose operation it completes. Going the other way, a `Completion` can only be made with `unsafe` (`Completion::new`), so a model can trust its result the way it trusts the backend: a descriptor it may own, a byte count it may mark initialized.
 
 ## The return types matter
 

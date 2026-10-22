@@ -5,6 +5,19 @@ use crate::backend::op::Op;
 use std::time::Duration;
 
 /// Completion metadata routed from the backend to one `OpModel`.
+///
+/// Op models act on a completion without checking it: a resource-creating
+/// model takes ownership of the descriptor in `result`, a reading one marks
+/// `result` bytes of its buffer initialized. So a completion can only be
+/// made with `unsafe` ([`Completion::new`], [`Completion::with_flags`]), and
+/// otherwise only reaches [`OpModel::complete`], whose implementations are
+/// bound by that trait's safety contract in what they forward or change.
+///
+/// Making one from safe code does not compile:
+///
+/// ```compile_fail,E0133
+/// let completion = lio::api::op::Completion::new(0);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Completion {
   pub result: isize,
@@ -16,16 +29,59 @@ pub struct Completion {
 
 impl Completion {
   /// A completion whose resources (if any) are native OS descriptors/handles.
-  pub const fn new(result: isize) -> Self {
-    Self::with_flags(result, CompletionFlags::empty())
+  ///
+  /// # Safety
+  ///
+  /// As for [`with_flags`](Self::with_flags).
+  pub const unsafe fn new(result: isize) -> Self {
+    // SAFETY: the caller upholds `with_flags`' contract.
+    unsafe { Self::with_flags(result, CompletionFlags::empty()) }
   }
 
-  pub const fn with_flags(result: isize, flags: CompletionFlags) -> Self {
+  /// A completion with `flags`, whose resources (if any) are native OS
+  /// descriptors/handles.
+  ///
+  /// # Safety
+  ///
+  /// The completion may only be passed to the [`OpModel::complete`] of the
+  /// model whose [`action`](OpModel::action) returned the action it
+  /// completes. For an [`Action::Io`], `result` must be what a backend
+  /// upholding the [`IoBackend`](crate::backend::IoBackend) contract could
+  /// report for that operation: in particular, a successful
+  /// resource-creating operation carries a newly created native
+  /// descriptor/handle the model may take ownership of, and a byte count is
+  /// at most the number of bytes actually transferred, in order, through the
+  /// operation's buffers. An [`Action::Sleep`] completes with `0` and
+  /// [`CompletionFlags::TIMER`].
+  pub const unsafe fn with_flags(
+    result: isize,
+    flags: CompletionFlags,
+  ) -> Self {
     Self {
       result,
       flags,
       resource_close: ResourceClose(crate::backend::native::close),
     }
+  }
+
+  /// A completion a unit test scripts for a model it drives by hand.
+  ///
+  /// Not `unsafe` only to keep the many scripted model tests readable: each
+  /// test is responsible for scripting results its model can trust, as the
+  /// [`with_flags`](Self::with_flags) contract describes.
+  #[cfg(test)]
+  pub(crate) const fn scripted(result: isize) -> Self {
+    Self::scripted_with_flags(result, CompletionFlags::empty())
+  }
+
+  /// [`scripted`](Self::scripted), with `flags`.
+  #[cfg(test)]
+  pub(crate) const fn scripted_with_flags(
+    result: isize,
+    flags: CompletionFlags,
+  ) -> Self {
+    // SAFETY: test only; the calling test scripts a trustworthy result.
+    unsafe { Self::with_flags(result, flags) }
   }
 
   /// Sets how a resource carried by this completion is closed.
@@ -164,6 +220,11 @@ impl From<Duration> for Action {
 ///   memory the operation may write, and nothing writes memory it may read:
 ///   the model does not share that memory (through an `Arc`, a raw pointer,
 ///   an item it already handed out, ...) with code that may run meanwhile.
+/// - A [`Completion`] it receives is only passed on (to an inner model's
+///   [`complete`](Self::complete)) unchanged, and only to the model whose
+///   `action` returned the operation it completes: the
+///   [`Completion::with_flags`] contract holds for every completion handed
+///   to a model.
 ///
 /// Models that only return [`Action::Sleep`] or `Op`s without pointers (such
 /// as [`Op::Nop`]) uphold this trivially.
@@ -255,8 +316,8 @@ mod completion_tests {
   #[test]
   fn completions_compare_their_resource_close() {
     fn other(_: crate::api::resource::RawResource) {}
-    let native = Completion::new(3);
-    assert_eq!(native, Completion::new(3));
+    let native = Completion::scripted(3);
+    assert_eq!(native, Completion::scripted(3));
     assert_ne!(native, native.with_resource_close(other));
     assert!(format!("{native:?}").contains("resource_close: ResourceClose"));
   }
@@ -268,7 +329,7 @@ mod os_error_tests {
 
   #[test]
   fn negative_results_map_to_their_os_error() {
-    let err = Completion::new(-2).os_error();
+    let err = Completion::scripted(-2).os_error();
     assert_eq!(err.raw_os_error(), Some(2));
   }
 
@@ -277,7 +338,7 @@ mod os_error_tests {
     // Negates to one past `i32::MAX`, where `isize` is wide enough.
     let past_i32 = isize::try_from(-i64::from(i32::MAX) - 2).ok();
     for result in std::iter::once(isize::MIN).chain(past_i32) {
-      let err = Completion::new(result).os_error();
+      let err = Completion::scripted(result).os_error();
       assert_eq!(err.raw_os_error(), None, "{result}");
       assert_eq!(err.kind(), std::io::ErrorKind::Other);
     }

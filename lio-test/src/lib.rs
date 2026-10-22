@@ -194,7 +194,11 @@ macro_rules! test_io_backend {
         let step_bump =
           step_bumps.entry((backend_key, id)).or_insert_with(Bump::new);
         step_bump.reset();
-        IoBackend::push(backend, id, op, step_bump);
+        // SAFETY: test only. Every test in this suite keeps the memory its
+        // operations point to alive until it has waited for their
+        // completions, and never reuses an id still in flight; the step
+        // arena lives in `STEP_BUMPS` until the next push with this id.
+        unsafe { IoBackend::push(backend, id, op, step_bump) };
       });
     }
 

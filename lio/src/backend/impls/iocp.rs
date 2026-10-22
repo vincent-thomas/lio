@@ -996,7 +996,7 @@ unsafe impl IoBackend for Iocp {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
+  unsafe fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
     assert!(
       self.backlog.len() + self.in_flight.len() + self.blocking_in_flight
         < self.capacity,

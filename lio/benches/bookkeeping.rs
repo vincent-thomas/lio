@@ -43,7 +43,7 @@ unsafe impl IoBackend for ImmediateBackend {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
+  unsafe fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
     assert!(matches!(op, Op::Nop), "benchmark backend only supports NOP");
     self.queued.push(id);
   }
@@ -79,7 +79,11 @@ fn direct_backend(criterion: &mut Criterion) {
       |bencher, &depth| {
         bencher.iter(|| {
           for id in 0..depth as u64 {
-            backend.push(id, Op::Nop, &mut bump);
+            // SAFETY: `Op::Nop` points at nothing, and every id completes in the
+            // same iteration, before it is pushed again.
+            unsafe {
+              backend.push(id, Op::Nop, &mut bump);
+            }
           }
           backend.flush().unwrap();
           backend.wait(Some(Duration::ZERO), &mut completed).unwrap();

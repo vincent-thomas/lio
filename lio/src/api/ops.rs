@@ -164,9 +164,9 @@ impl OpModelContract for Socket {
       },
       #[cfg(unix)]
       // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
-      Completion::new(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
+      Completion::scripted(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
       #[cfg(windows)]
-      Completion::new({
+      Completion::scripted({
         use std::os::windows::io::IntoRawSocket;
         // A fresh owned socket for the resulting `Resource` to take over.
         std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into_raw_socket()
@@ -346,9 +346,9 @@ impl OpModelContract for AcceptUnix {
       },
       #[cfg(unix)]
       // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
-      Completion::new(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
+      Completion::scripted(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
       #[cfg(windows)]
-      Completion::new({
+      Completion::scripted({
         use std::os::windows::io::IntoRawSocket;
         // A fresh owned socket for the resulting `Resource` to take over.
         std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into_raw_socket()
@@ -382,9 +382,9 @@ impl OpModelContract for Accept {
       |model| model.stage_peer_addr("127.0.0.1:8080".parse().unwrap()),
       #[cfg(unix)]
       // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
-      Completion::new(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
+      Completion::scripted(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
       #[cfg(windows)]
-      Completion::new({
+      Completion::scripted({
         use std::os::windows::io::IntoRawSocket;
         // A fresh owned socket for the resulting `Resource` to take over.
         std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into_raw_socket()
@@ -450,7 +450,7 @@ impl OpModelContract for Connect {
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
       |action| matches!(action, Action::Io(Op::Connect { .. })),
-      Completion::new(0),
+      Completion::scripted(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
   }
@@ -613,7 +613,7 @@ impl OpModelContract for Fsync {
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
       |action| matches!(action, Action::Io(Op::Fsync { .. })),
-      Completion::new(0),
+      Completion::scripted(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
   }
@@ -656,7 +656,7 @@ impl OpModelContract for Nop {
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
       |action| matches!(action, Action::Io(Op::Nop)),
-      Completion::new(0),
+      Completion::scripted(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
   }
@@ -805,7 +805,7 @@ impl OpModelContract for Read<Vec<u8>> {
         )
       },
       |model| model.stage_read_data(b"ping"),
-      Completion::new(4),
+      Completion::scripted(4),
       |result| {
         matches!(
           result,
@@ -841,7 +841,7 @@ impl OpModelContract for Read<(Vec<u8>, Vec<u8>)> {
         )
       },
       |model| model.stage_read_data(b"abcde"),
-      Completion::new(5),
+      Completion::scripted(5),
       |result: &TwoVecOpResult| match result {
         OpResult::Done((Ok(5), (a, b))) => {
           a.as_slice() == b"abc" && b.as_slice() == b"de"
@@ -941,7 +941,7 @@ impl OpModelContract for Write<Vec<u8>> {
           })
         )
       },
-      Completion::new(4),
+      Completion::scripted(4),
       |result: &OpResult<BufResult<usize, Vec<u8>>>| match result {
         OpResult::Done((Ok(4), buf)) => buf.as_slice() == b"pong",
         _ => false,
@@ -974,7 +974,7 @@ impl OpModelContract for Write<(Vec<u8>, Vec<u8>)> {
           })
         )
       },
-      Completion::new(5),
+      Completion::scripted(5),
       |result: &TwoVecOpResult| match result {
         OpResult::Done((Ok(5), (a, b))) => {
           a.as_slice() == b"ab" && b.as_slice() == b"cde"
@@ -1157,7 +1157,7 @@ impl OpModelContract for Recv<Vec<u8>> {
         _ => false,
       },
       |model| model.core.stage_recv_data(b"recv"),
-      Completion::new(4),
+      Completion::scripted(4),
       |result: &OpResult<BufResult<usize, Vec<u8>>>| match result {
         OpResult::Done((Ok(4), buf)) => buf.as_slice() == b"recv",
         _ => false,
@@ -1188,7 +1188,7 @@ impl OpModelContract for Recv<(Vec<u8>, Vec<u8>)> {
         _ => false,
       },
       |model| model.core.stage_recv_data(b"hello"),
-      Completion::new(5),
+      Completion::scripted(5),
       |result: &TwoVecOpResult| match result {
         OpResult::Done((Ok(5), (a, b))) => {
           a.as_slice() == b"he" && b.as_slice() == b"llo"
@@ -1226,7 +1226,7 @@ impl OpModelContract for RecvFrom<Vec<u8>> {
           .core
           .stage_from_addr("127.0.0.1:7000".parse().expect("socket addr"));
       },
-      Completion::new(4),
+      Completion::scripted(4),
       |result| match result {
         OpResult::Done((Ok(4), buf, Some(addr))) => {
           buf.as_slice() == b"recv"
@@ -1346,7 +1346,7 @@ impl OpModelContract for Send<Vec<u8>> {
         Action::Io(Op::Send { flags, .. }) => flags.bits() == TEST_SEND_FLAG,
         _ => false,
       },
-      Completion::new(4),
+      Completion::scripted(4),
       |result: &OpResult<BufResult<usize, Vec<u8>>>| match result {
         OpResult::Done((Ok(4), buf)) => buf.as_slice() == b"send",
         _ => false,
@@ -1377,7 +1377,7 @@ impl OpModelContract for Send<(Vec<u8>, Vec<u8>)> {
         Action::Io(Op::Send { flags, .. }) => flags.bits() == TEST_SEND_FLAG,
         _ => false,
       },
-      Completion::new(5),
+      Completion::scripted(5),
       |result: &TwoVecOpResult| match result {
         OpResult::Done((Ok(5), (a, b))) => {
           a.as_slice() == b"he" && b.as_slice() == b"llo"
@@ -1440,7 +1440,7 @@ impl OpModelContract for Sleep {
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
       |action| matches!(action, Action::Sleep(duration) if *duration == Duration::from_millis(10)),
-      Completion::with_flags(0, CompletionFlags::TIMER),
+      Completion::scripted_with_flags(0, CompletionFlags::TIMER),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
   }
@@ -1499,12 +1499,12 @@ impl OpModelContract for Interval {
     vec![
       ContractStep::new(
         |action| matches!(action, Action::Sleep(duration) if *duration == Duration::from_millis(5)),
-        Completion::with_flags(0, CompletionFlags::TIMER),
+        Completion::scripted_with_flags(0, CompletionFlags::TIMER),
         |result| matches!(result, OpResult::Yield(Ok(()))),
       ),
       ContractStep::new(
         |action| matches!(action, Action::Sleep(duration) if *duration == Duration::from_millis(5)),
-        Completion::with_flags(0, CompletionFlags::TIMER),
+        Completion::scripted_with_flags(0, CompletionFlags::TIMER),
         |result| matches!(result, OpResult::Yield(Ok(()))),
       ),
     ]
@@ -1708,7 +1708,7 @@ impl OpModelContract for ReadDir {
           eof: true,
         };
       },
-      Completion::new(0),
+      Completion::scripted(0),
       |result| {
         matches!(
           result,
@@ -1756,7 +1756,7 @@ impl OpModelContract for Stat {
           gid: 1000,
         };
       },
-      Completion::new(0),
+      Completion::scripted(0),
       |result| {
         matches!(
           result,
@@ -1829,7 +1829,7 @@ impl OpModelContract for UnlinkAt {
           Action::Io(Op::UnlinkAt { kind: UnlinkKind::Directory, .. })
         )
       },
-      Completion::new(0),
+      Completion::scripted(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
   }
@@ -1895,7 +1895,7 @@ impl OpModelContract for RenameAt {
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
       |action| matches!(action, Action::Io(Op::RenameAt { .. })),
-      Completion::new(0),
+      Completion::scripted(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
   }
@@ -1957,7 +1957,7 @@ impl OpModelContract for MkdirAt {
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
       |action| matches!(action, Action::Io(Op::MkdirAt { mode, .. }) if mode.bits() == 0o755),
-      Completion::new(0),
+      Completion::scripted(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
   }
@@ -2029,7 +2029,7 @@ impl OpModelContract for LinkAt {
       |action| {
         matches!(action, Action::Io(Op::LinkAt { kind: LinkKind::Hard, .. }))
       },
-      Completion::new(0),
+      Completion::scripted(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
   }
@@ -2180,7 +2180,7 @@ impl OpModelContract for GetCwd<Vec<u8>> {
           model.out = std::ffi::OsString::from("/tmp");
         }
       },
-      Completion::new(0),
+      Completion::scripted(0),
       |result| match result {
         OpResult::Done((Ok(bytes), buf)) => *bytes == 4 && &buf[..4] == b"/tmp",
         _ => false,
@@ -2248,7 +2248,7 @@ impl OpModelContract for Spawn {
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
       |action| matches!(action, Action::Io(Op::Spawn { .. })),
-      Completion::new(1234),
+      Completion::scripted(1234),
       |result: &OpResult<std::io::Result<crate::api::Pid>>| matches!(result, OpResult::Done(Ok(pid)) if pid.as_raw() == 1234),
     )]
   }
@@ -2276,7 +2276,7 @@ impl OpModelContract for ReadlinkAt<Vec<u8>> {
         model.buf.as_mut().expect("buffer available")[..4]
           .copy_from_slice(b"dest");
       },
-      Completion::new(4),
+      Completion::scripted(4),
       |result| match result {
         OpResult::Done((Ok(bytes), buf)) => *bytes == 4 && &buf[..4] == b"dest",
         _ => false,

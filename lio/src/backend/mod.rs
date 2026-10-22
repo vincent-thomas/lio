@@ -28,8 +28,10 @@
 //! let mut backend = DefaultBackend::new();
 //! backend.init(1024).unwrap();  // Pre-allocate for 1024 concurrent ops
 //!
-//! // Submit a nop operation
-//! backend.push(1, Op::Nop, &mut bumpalo::Bump::new());
+//! // Submit a nop operation. Its arena must outlive the operation.
+//! let mut step_bump = bumpalo::Bump::new();
+//! // SAFETY: `Op::Nop` points at nothing, and id 1 is not in flight.
+//! unsafe { backend.push(1, Op::Nop, &mut step_bump) };
 //! backend.flush().unwrap();
 //!
 //! // Poll for completions (non-blocking)
@@ -188,7 +190,7 @@ impl OpCompleted {
 /// ```ignore
 /// let mut backend = Backend::default();
 /// backend.init(1024)?;                    // Pre-allocate for 1024 ops
-/// backend.push(op_id, op)?;               // Queue operation
+/// unsafe { backend.push(op_id, op, &mut step_bump) }; // Queue operation
 /// backend.flush()?;                       // Submit to kernel
 /// let done = backend.wait(timeout)?;      // Get completions
 /// ```
@@ -245,7 +247,7 @@ impl OpCompleted {
 ///   fn init(&mut self, _: usize) -> io::Result<()> {
 ///     Ok(())
 ///   }
-///   fn push(&mut self, _: u64, _: Op, _: &mut bumpalo::Bump) {}
+///   unsafe fn push(&mut self, _: u64, _: Op, _: &mut bumpalo::Bump) {}
 ///   fn flush(&mut self) -> io::Result<()> {
 ///     Ok(())
 ///   }
@@ -278,7 +280,29 @@ pub unsafe trait IoBackend {
   /// Queue an operation for submission.
   ///
   /// Call `flush()` to submit queued operations.
-  fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump);
+  ///
+  /// # Safety
+  ///
+  /// The caller guarantees that:
+  /// - every pointer in `op` is valid as the [`OpModel`] safety contract
+  ///   describes, and stays so until this backend reports the completion
+  ///   for `id`, or until [`drain`](Self::drain) returns `true`;
+  /// - `step_bump` is not reset or dropped before then either, since the
+  ///   backend may lower the operation into it;
+  /// - `id` is not in flight already: a previous `push` with the same `id`
+  ///   has had its completion reported, or was drained.
+  ///
+  /// Calling it from safe code does not compile:
+  ///
+  /// ```compile_fail,E0133
+  /// use lio::backend::{IoBackend, impls::DefaultBackend, op::Op};
+  ///
+  /// let mut backend = DefaultBackend::new();
+  /// backend.push(1, Op::Nop, &mut bumpalo::Bump::new());
+  /// ```
+  ///
+  /// [`OpModel`]: crate::api::op::OpModel
+  unsafe fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump);
 
   /// Submit all queued operations to kernel.
   fn flush(&mut self) -> io::Result<()>;

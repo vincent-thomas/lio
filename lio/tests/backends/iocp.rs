@@ -28,17 +28,21 @@ fn drop_cancels_a_blocked_pipe_read() {
 
   let mut backend = Iocp::new();
   backend.init(8).unwrap();
-  backend.push(
-    1,
-    Op::Read {
-      fd: reader,
-      iovecs: std::ptr::NonNull::from(&mut raw),
-      iov_count: 1,
-      offset: -1,
-      flags: ReadFlags::from_bits(0).unwrap(),
-    },
-    &mut bumpalo::Bump::new(),
-  );
+  // SAFETY: test only: what the operation points to outlives it here,
+  // and its id is not in flight.
+  unsafe {
+    backend.push(
+      1,
+      Op::Read {
+        fd: reader,
+        iovecs: std::ptr::NonNull::from(&mut raw),
+        iov_count: 1,
+        offset: -1,
+        flags: ReadFlags::from_bits(0).unwrap(),
+      },
+      &mut bumpalo::Bump::new(),
+    );
+  }
   backend.flush().unwrap();
   // Give a worker time to block in ReadFile on the empty pipe.
   std::thread::sleep(Duration::from_millis(50));

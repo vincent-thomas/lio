@@ -2697,7 +2697,7 @@ unsafe impl IoBackend for DSBackend {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
+  unsafe fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
     self.assert_initialized();
     self.assert_capacity();
     self.queued.push((id, op));
@@ -3982,11 +3982,14 @@ impl DSTBackend {
           .push(OpCompleted::new(id, -(errno::EINVAL as isize)));
       }
       other => {
-        self
+        let local = self
           .local
           .as_mut()
-          .expect("non-network DST backend op requires local backend")
-          .push(id, other, &mut Bump::new());
+          .expect("non-network DST backend op requires local backend");
+        // SAFETY: `other` was pushed to this backend under `push`'s
+        // contract, which carries over; `DSBackend` never allocates in the
+        // step arena, so a fresh one is enough.
+        unsafe { local.push(id, other, &mut Bump::new()) };
       }
     }
   }
@@ -4020,7 +4023,7 @@ unsafe impl IoBackend for DSTBackend {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump) {
+  unsafe fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump) {
     let use_network = match &op {
       Op::Socket { .. } => true,
       Op::Bind { fd, .. }
@@ -4042,11 +4045,12 @@ unsafe impl IoBackend for DSTBackend {
     if use_network {
       self.queue_network_op(id, op);
     } else {
-      self
+      let local = self
         .local
         .as_mut()
-        .expect("non-network DST backend push requires local backend")
-        .push(id, op, step_bump);
+        .expect("non-network DST backend push requires local backend");
+      // SAFETY: forwarded under this call's own contract.
+      unsafe { local.push(id, op, step_bump) };
     }
   }
 
@@ -4245,8 +4249,16 @@ mod tests {
 
     let mut step_a = Bump::new();
     let mut step_b = Bump::new();
-    a.push(1, Op::Nop, &mut step_a);
-    b.push(1, Op::Nop, &mut step_b);
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      a.push(1, Op::Nop, &mut step_a);
+    }
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      b.push(1, Op::Nop, &mut step_b);
+    }
     a.flush().unwrap();
     b.flush().unwrap();
 
@@ -4272,11 +4284,15 @@ mod tests {
 
     let mut out = std::ffi::OsString::new();
     let mut step_bump = Bump::new();
-    backend.push(
-      1,
-      Op::GetCwd { out: NonNull::from(&mut out) },
-      &mut step_bump,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        1,
+        Op::GetCwd { out: NonNull::from(&mut out) },
+        &mut step_bump,
+      );
+    }
     backend.flush().unwrap();
 
     let mut completed = Vec::new();
@@ -4304,11 +4320,15 @@ mod tests {
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
     let msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     let mut step_bump = Bump::new();
-    backend.push(
-      1,
-      Op::Recv { fd: Resource::stdin(), msg, flags: RecvFlags::EMPTY },
-      &mut step_bump,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        1,
+        Op::Recv { fd: Resource::stdin(), msg, flags: RecvFlags::EMPTY },
+        &mut step_bump,
+      );
+    }
     backend.flush().unwrap();
 
     let mut completed = Vec::new();
@@ -4338,11 +4358,15 @@ mod tests {
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
     let msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     let mut step_bump = Bump::new();
-    backend.push(
-      1,
-      Op::Recv { fd: socket, msg, flags: RecvFlags::EMPTY },
-      &mut step_bump,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        1,
+        Op::Recv { fd: socket, msg, flags: RecvFlags::EMPTY },
+        &mut step_bump,
+      );
+    }
     backend.flush().unwrap();
 
     let mut completed = Vec::new();
@@ -4394,11 +4418,15 @@ mod tests {
     let send_buf = crate::backend::op::MsgBuf::from_slice(&payload);
     let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
     let mut send_bump = Bump::new();
-    backend.push(
-      1,
-      Op::Send { fd: sender, msg: send_msg, flags: SendFlags::EMPTY },
-      &mut send_bump,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        1,
+        Op::Send { fd: sender, msg: send_msg, flags: SendFlags::EMPTY },
+        &mut send_bump,
+      );
+    }
     backend.flush().unwrap();
 
     let mut send_done = Vec::new();
@@ -4411,11 +4439,15 @@ mod tests {
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
     let mut recv_bump = Bump::new();
-    backend.push(
-      2,
-      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
-      &mut recv_bump,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        2,
+        Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
+        &mut recv_bump,
+      );
+    }
     backend.flush().unwrap();
 
     let mut recv_done = Vec::new();
@@ -4470,11 +4502,15 @@ mod tests {
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
     let mut recv_bump = Bump::new();
-    backend.push(
-      1,
-      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
-      &mut recv_bump,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        1,
+        Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
+        &mut recv_bump,
+      );
+    }
     backend.flush().unwrap();
 
     let mut completed = Vec::new();
@@ -4488,11 +4524,15 @@ mod tests {
     let send_buf = crate::backend::op::MsgBuf::from_slice(&payload);
     let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
     let mut send_bump = Bump::new();
-    backend.push(
-      2,
-      Op::Send { fd: sender, msg: send_msg, flags: SendFlags::EMPTY },
-      &mut send_bump,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        2,
+        Op::Send { fd: sender, msg: send_msg, flags: SendFlags::EMPTY },
+        &mut send_bump,
+      );
+    }
     backend.flush().unwrap();
 
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
@@ -4547,22 +4587,33 @@ mod tests {
 
     let mut accepted_addr = SocketAddrBuf::unspecified();
     let mut accept_bump = Bump::new();
-    backend.push(
-      1,
-      Op::Accept {
-        fd: listener,
-        addr: NonNull::new(&mut accepted_addr).unwrap(),
-      },
-      &mut accept_bump,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        1,
+        Op::Accept {
+          fd: listener,
+          addr: NonNull::new(&mut accepted_addr).unwrap(),
+        },
+        &mut accept_bump,
+      );
+    }
 
     let connect_addr = "127.0.0.1:7000".parse().unwrap();
     let mut connect_bump = Bump::new();
-    backend.push(
-      2,
-      Op::Connect { fd: client, addr: op::socket_addr_into_buf(connect_addr) },
-      &mut connect_bump,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        2,
+        Op::Connect {
+          fd: client,
+          addr: op::socket_addr_into_buf(connect_addr),
+        },
+        &mut connect_bump,
+      );
+    }
     backend.flush().unwrap();
 
     let mut completed = Vec::new();
@@ -4630,11 +4681,15 @@ mod tests {
     let before = backend.progress_snapshot();
 
     let mut recv_bump = Bump::new();
-    backend.push(
-      1,
-      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
-      &mut recv_bump,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        1,
+        Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
+        &mut recv_bump,
+      );
+    }
     backend.flush().unwrap();
 
     let after_flush = backend.progress_snapshot();
@@ -4687,21 +4742,29 @@ mod tests {
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
     let mut recv_bump = Bump::new();
-    backend.push(
-      1,
-      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
-      &mut recv_bump,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        1,
+        Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
+        &mut recv_bump,
+      );
+    }
 
     let payload = b"ping".to_vec();
     let send_buf = crate::backend::op::MsgBuf::from_slice(&payload);
     let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
     let mut send_bump = Bump::new();
-    backend.push(
-      2,
-      Op::Send { fd: sender, msg: send_msg, flags: SendFlags::EMPTY },
-      &mut send_bump,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        2,
+        Op::Send { fd: sender, msg: send_msg, flags: SendFlags::EMPTY },
+        &mut send_bump,
+      );
+    }
     backend.flush().unwrap();
 
     let mut completed = Vec::new();
@@ -5213,16 +5276,20 @@ mod tests {
 
     let path = std::ffi::OsString::from("/tmp/demo");
     let mut step_bump = Bump::new();
-    backend.push(
-      1,
-      Op::OpenAt {
-        dir_fd: Resource::cwd(),
-        path,
-        flags: OpenFlags::READ,
-        mode: crate::backend::op::FileMode::from_bits(0),
-      },
-      &mut step_bump,
-    );
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(
+        1,
+        Op::OpenAt {
+          dir_fd: Resource::cwd(),
+          path,
+          flags: OpenFlags::READ,
+          mode: crate::backend::op::FileMode::from_bits(0),
+        },
+        &mut step_bump,
+      );
+    }
     backend.flush().unwrap();
 
     let mut completed = Vec::new();
@@ -5291,7 +5358,11 @@ mod tests {
     dst_test_socket(&backend.node, 91);
 
     let fd = dst_resource(91);
-    backend.push(1, Op::Fsync { fd }, &mut Bump::new());
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      backend.push(1, Op::Fsync { fd }, &mut Bump::new());
+    }
     backend.flush().unwrap();
     assert!(dst.step());
 

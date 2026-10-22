@@ -642,7 +642,7 @@ mod tests {
       reg.action(),
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(reg.on_completion(Completion::scripted(0)).next_action.is_none());
     assert!(reg.is_finished());
 
     let items = received.lock().unwrap();
@@ -661,7 +661,7 @@ mod tests {
       reg.action(),
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(reg.on_completion(Completion::scripted(0)).next_action.is_none());
     assert!(reg.is_finished());
     assert_eq!(wake_count.load(Ordering::SeqCst), 1);
 
@@ -683,12 +683,12 @@ mod tests {
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert!(matches!(
-      reg.on_completion(Completion::new(0)).next_action,
+      reg.on_completion(Completion::scripted(0)).next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert!(!reg.is_finished(), "Again must keep the registration live");
 
-    assert!(reg.on_completion(Completion::new(1)).next_action.is_none());
+    assert!(reg.on_completion(Completion::scripted(1)).next_action.is_none());
     assert!(reg.is_finished(), "Done must finish the registration");
 
     let items = received.lock().unwrap();
@@ -709,13 +709,13 @@ mod tests {
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert!(matches!(
-      reg.on_completion(Completion::new(0)).next_action,
+      reg.on_completion(Completion::scripted(0)).next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert!(!reg.is_finished(), "Yield must keep the registration live");
 
     assert!(matches!(
-      reg.on_completion(Completion::new(1)).next_action,
+      reg.on_completion(Completion::scripted(1)).next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert!(
@@ -723,7 +723,7 @@ mod tests {
       "subsequent Yield must keep the registration live"
     );
 
-    assert!(reg.on_completion(Completion::new(2)).next_action.is_none());
+    assert!(reg.on_completion(Completion::scripted(2)).next_action.is_none());
     assert!(reg.is_finished());
 
     let items = received.lock().unwrap();
@@ -739,14 +739,14 @@ mod tests {
       new_waker_reg(waker, tx, AgainThenDone { stage: 0 });
 
     assert!(matches!(
-      reg.on_completion(Completion::new(0)).next_action,
+      reg.on_completion(Completion::scripted(0)).next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert_eq!(wake_count.load(Ordering::SeqCst), 0);
     assert!(rx.try_recv().is_err(), "Again must not send a terminal item");
     assert!(!reg.is_finished());
 
-    assert!(reg.on_completion(Completion::new(1)).next_action.is_none());
+    assert!(reg.on_completion(Completion::scripted(1)).next_action.is_none());
     assert_eq!(wake_count.load(Ordering::SeqCst), 1);
     let item = rx.try_recv().expect("Done result should be sent");
     assert_eq!(item, 7);
@@ -780,16 +780,16 @@ mod tests {
     let (_arena, mut reg) =
       new_waker_reg(test_waker(Arc::clone(&wake_count)), tx, AgainThenYield(0));
     for _ in 0..8 {
-      assert!(!reg.on_completion(Completion::new(0)).is_done());
+      assert!(!reg.on_completion(Completion::scripted(0)).is_done());
       assert_eq!(wake_count.load(Ordering::SeqCst), 0);
       assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
-    assert!(!reg.on_completion(Completion::new(0)).is_done());
+    assert!(!reg.on_completion(Completion::scripted(0)).is_done());
     assert_eq!(wake_count.load(Ordering::SeqCst), 1);
     assert_eq!(rx.try_recv().unwrap(), 11);
 
     reg.set_waker(test_waker(Arc::clone(&wake_count)));
-    assert!(reg.on_completion(Completion::new(0)).is_done());
+    assert!(reg.on_completion(Completion::scripted(0)).is_done());
     assert_eq!(wake_count.load(Ordering::SeqCst), 2);
     assert_eq!(rx.try_recv().unwrap(), 17);
   }
@@ -803,7 +803,7 @@ mod tests {
       new_waker_reg(waker, tx, YieldTwiceThenDone { stage: 0 });
 
     assert!(matches!(
-      reg.on_completion(Completion::new(0)).next_action,
+      reg.on_completion(Completion::scripted(0)).next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert_eq!(wake_count.load(Ordering::SeqCst), 1);
@@ -812,7 +812,7 @@ mod tests {
 
     reg.set_waker(test_waker(Arc::clone(&wake_count)));
     assert!(matches!(
-      reg.on_completion(Completion::new(1)).next_action,
+      reg.on_completion(Completion::scripted(1)).next_action,
       Some(Action::Io(crate::backend::op::Op::Nop))
     ));
     assert_eq!(wake_count.load(Ordering::SeqCst), 2);
@@ -820,7 +820,7 @@ mod tests {
     assert!(!reg.is_finished());
 
     reg.set_waker(test_waker(Arc::clone(&wake_count)));
-    assert!(reg.on_completion(Completion::new(2)).next_action.is_none());
+    assert!(reg.on_completion(Completion::scripted(2)).next_action.is_none());
     assert_eq!(wake_count.load(Ordering::SeqCst), 3);
     assert_eq!(rx.try_recv().unwrap(), 17);
     assert!(reg.is_finished());
@@ -833,7 +833,7 @@ mod tests {
     let (tx, _rx) = mpsc::channel();
     let (_arena, mut reg) = new_waker_reg(waker, tx, Nop);
 
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(reg.on_completion(Completion::scripted(0)).next_action.is_none());
     assert!(reg.is_finished());
 
     reg.set_waker(test_waker(Arc::clone(&wake_count)));
@@ -844,10 +844,10 @@ mod tests {
   fn done_registration_has_no_further_action_or_completion() {
     let (_arena, mut reg) = new_callback_reg(|_: std::io::Result<()>| {}, Nop);
 
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(reg.on_completion(Completion::scripted(0)).next_action.is_none());
     assert!(reg.is_finished());
     assert!(reg.action().is_none());
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(reg.on_completion(Completion::scripted(0)).next_action.is_none());
   }
 
   #[test]

@@ -177,7 +177,7 @@ unsafe impl IoBackend for ScriptedBackend {
     |_| {}
   }
 
-  fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
+  unsafe fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
     let mut script = self.0.borrow_mut();
     script.pushed.push(id);
     script.in_flight.push((id, op));
@@ -361,7 +361,7 @@ unsafe impl<B: IoBackend> IoBackend for Checked<B> {
     self.inner.resource_close()
   }
 
-  fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump) {
+  unsafe fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump) {
     let cap = self.cap("push");
     assert!(
       self.in_flight.len() < cap,
@@ -372,7 +372,8 @@ unsafe impl<B: IoBackend> IoBackend for Checked<B> {
       self.in_flight.insert(id),
       "contract: pushed operation {id} while it is still in flight"
     );
-    self.inner.push(id, op, step_bump);
+    // SAFETY: forwarded under this call's own contract.
+    unsafe { self.inner.push(id, op, step_bump) };
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -445,8 +446,16 @@ mod tests {
   #[test]
   fn holds_operations_until_completed() {
     let (backend, mut checked) = init(4);
-    checked.push(1, Op::Nop, &mut Bump::new());
-    checked.push(2, Op::Nop, &mut Bump::new());
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      checked.push(1, Op::Nop, &mut Bump::new());
+    }
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      checked.push(2, Op::Nop, &mut Bump::new());
+    }
     checked.flush().unwrap();
     assert!(wait(&mut checked).is_empty());
 
@@ -465,7 +474,11 @@ mod tests {
     let mut backend = Checked::new(ScriptedBackend::auto(7));
     backend.init(4).unwrap();
     for id in [3, 1, 2] {
-      backend.push(id, Op::Nop, &mut Bump::new());
+      // SAFETY: test only: what the operation points to outlives it here,
+      // and its id is not in flight.
+      unsafe {
+        backend.push(id, Op::Nop, &mut Bump::new());
+      }
     }
     assert!(wait(&mut backend).is_empty(), "nothing before the flush");
     backend.flush().unwrap();
@@ -509,8 +522,16 @@ mod tests {
       }
     };
 
-    checked.push(1, op(&read_buf, false), &mut Bump::new());
-    checked.push(2, op(&write_buf, true), &mut Bump::new());
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      checked.push(1, op(&read_buf, false), &mut Bump::new());
+    }
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      checked.push(2, op(&write_buf, true), &mut Bump::new());
+    }
     backend.complete_all(8);
     assert_eq!(into, [POISON; 8]);
     assert_eq!(&from, b"payload!", "sent bytes are only read");
@@ -549,7 +570,11 @@ mod tests {
       backend.init(1).unwrap();
       let (mut into, mut iovec) =
         (0u8, RawBuf { ptr: ptr::null_mut(), len: 0 });
-      backend.push(1, read_into(&mut into, &mut iovec), &mut Bump::new());
+      // SAFETY: test only: what the operation points to outlives it here,
+      // and its id is not in flight.
+      unsafe {
+        backend.push(1, read_into(&mut into, &mut iovec), &mut Bump::new());
+      }
       assert!(backend.drain());
       assert_eq!(into, if poison { POISON } else { 0 }, "poison: {poison}");
     }
@@ -562,7 +587,11 @@ mod tests {
     let mut driver = backend.clone();
     driver.init(1).unwrap();
     let (mut into, mut iovec) = (0u8, RawBuf { ptr: ptr::null_mut(), len: 0 });
-    driver.push(1, read_into(&mut into, &mut iovec), &mut Bump::new());
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      driver.push(1, read_into(&mut into, &mut iovec), &mut Bump::new());
+    }
     backend.complete(1, 1);
     assert_eq!(into, 0);
     assert_eq!(wait(&mut driver), vec![1]);
@@ -571,7 +600,11 @@ mod tests {
   #[test]
   fn records_cancels_and_drains() {
     let (backend, mut checked) = init(2);
-    checked.push(1, Op::Nop, &mut Bump::new());
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      checked.push(1, Op::Nop, &mut Bump::new());
+    }
     checked.cancel(1);
     checked.cancel(99);
     assert_eq!(backend.cancelled(), vec![1, 99]);
@@ -593,7 +626,9 @@ mod tests {
   #[test]
   #[should_panic(expected = "before `init`")]
   fn push_before_init_breaks_the_contract() {
-    Checked::new(ScriptedBackend::new()).push(1, Op::Nop, &mut Bump::new());
+    let mut checked = Checked::new(ScriptedBackend::new());
+    // SAFETY: `Op::Nop` points at nothing, and nothing is in flight.
+    unsafe { checked.push(1, Op::Nop, &mut Bump::new()) };
   }
 
   #[test]
@@ -607,16 +642,32 @@ mod tests {
   #[should_panic(expected = "still in flight")]
   fn pushing_an_in_flight_id_breaks_the_contract() {
     let (_, mut checked) = init(2);
-    checked.push(1, Op::Nop, &mut Bump::new());
-    checked.push(1, Op::Nop, &mut Bump::new());
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      checked.push(1, Op::Nop, &mut Bump::new());
+    }
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      checked.push(1, Op::Nop, &mut Bump::new());
+    }
   }
 
   #[test]
   #[should_panic(expected = "already in flight (capacity 1)")]
   fn pushing_over_capacity_breaks_the_contract() {
     let (_, mut checked) = init(1);
-    checked.push(1, Op::Nop, &mut Bump::new());
-    checked.push(2, Op::Nop, &mut Bump::new());
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      checked.push(1, Op::Nop, &mut Bump::new());
+    }
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      checked.push(2, Op::Nop, &mut Bump::new());
+    }
   }
 
   #[test]
@@ -630,7 +681,7 @@ mod tests {
       fn init(&mut self, _: usize) -> io::Result<()> {
         Ok(())
       }
-      fn push(&mut self, id: u64, _: Op, _: &mut Bump) {
+      unsafe fn push(&mut self, id: u64, _: Op, _: &mut Bump) {
         self.0 = Some(id);
       }
       fn flush(&mut self) -> io::Result<()> {
@@ -649,7 +700,11 @@ mod tests {
 
     let mut checked = Checked::new(Twice(None));
     checked.init(1).unwrap();
-    checked.push(1, Op::Nop, &mut Bump::new());
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      checked.push(1, Op::Nop, &mut Bump::new());
+    }
     wait(&mut checked);
     wait(&mut checked);
   }
@@ -658,6 +713,10 @@ mod tests {
   #[should_panic(expected = "no successful `drain`")]
   fn dropping_with_operations_in_flight_breaks_the_contract() {
     let (_, mut checked) = init(1);
-    checked.push(1, Op::Nop, &mut Bump::new());
+    // SAFETY: test only: what the operation points to outlives it here,
+    // and its id is not in flight.
+    unsafe {
+      checked.push(1, Op::Nop, &mut Bump::new());
+    }
   }
 }

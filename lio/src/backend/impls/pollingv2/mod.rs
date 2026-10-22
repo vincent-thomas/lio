@@ -1193,7 +1193,7 @@ unsafe impl IoBackend for Poller {
     Ok(())
   }
 
-  fn push(
+  unsafe fn push(
     &mut self,
     id: u64,
     op: crate::backend::op::Op,

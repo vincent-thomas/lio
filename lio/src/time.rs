@@ -152,7 +152,9 @@ impl TimeManager {
   /// Its result is always `0`: expiry is normalized here so op models never
   /// interpret OS-specific values for it.
   pub fn fired_completion() -> Completion {
-    Completion::with_flags(0, CompletionFlags::TIMER)
+    // SAFETY: the driver only routes this to registrations whose current
+    // action is the sleep that fired, and this is what a sleep completes with.
+    unsafe { Completion::with_flags(0, CompletionFlags::TIMER) }
   }
 
   /// Removes a timer from tracking.

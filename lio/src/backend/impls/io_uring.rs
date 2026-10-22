@@ -1375,7 +1375,7 @@ unsafe impl IoBackend for IoUring {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump) {
+  unsafe fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump) {
     assert!(
       self.backlog.len() + self.in_flight < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
