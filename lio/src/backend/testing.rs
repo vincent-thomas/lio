@@ -567,7 +567,11 @@ mod tests {
         .map(|c| (c.registration_id(), c.result(), c.has_more()))
         .collect();
       assert_eq!(seen, vec![(1, 4, true), (1, 5, true)]);
-      assert_eq!(into, if poison { POISON } else { 0 }, "poison: {poison}");
+      // Read through the op's own pointer, which the backend writes through
+      // again below: reading `into` directly would invalidate it.
+      // SAFETY: `iovec.ptr` points to `into`, which is alive.
+      let filled = unsafe { iovec.ptr.read() };
+      assert_eq!(filled, if poison { POISON } else { 0 }, "poison: {poison}");
       assert_eq!(backend.in_flight(), vec![1]);
       assert_eq!(checked.in_flight(), 1);
 
