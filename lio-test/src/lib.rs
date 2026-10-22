@@ -106,6 +106,8 @@
 /// `Op::OpenAt`:
 /// - success produces a non-error file descriptor result
 /// - missing path returns exact raw `-ENOENT`
+/// - `NOFOLLOW` on a symlink returns exact raw `-ELOOP`, while the same open
+///   without it follows the link and succeeds
 ///
 /// `Op::Stat`:
 /// - success returns exact `0` and fills the metadata output
@@ -434,6 +436,7 @@ macro_rules! test_io_backend {
         pub const NOTSUP: i32 = libc::ENOTSUP;
         pub const NOENT: i32 = libc::ENOENT;
         pub const EXIST: i32 = libc::EEXIST;
+        pub const LOOP: i32 = libc::ELOOP;
         pub const CONNECT_MISSING: i32 = libc::ENOENT;
         pub const SPAWN_MISSING: i32 = libc::ENOENT;
       }
@@ -454,6 +457,8 @@ macro_rules! test_io_backend {
         pub const NOENT: i32 = 2;
         /// `ERROR_ALREADY_EXISTS`
         pub const EXIST: i32 = 183;
+        /// `ERROR_CANT_RESOLVE_FILENAME`
+        pub const LOOP: i32 = 1921;
         /// `WSAECONNREFUSED`
         pub const CONNECT_MISSING: i32 = 10061;
         /// `ERROR_PATH_NOT_FOUND`
@@ -471,6 +476,7 @@ macro_rules! test_io_backend {
       pub const NOTSUP: isize = neg(codes::NOTSUP);
       pub const NOENT: isize = neg(codes::NOENT);
       pub const EXIST: isize = neg(codes::EXIST);
+      pub const LOOP: isize = neg(codes::LOOP);
       pub const CONNECT_MISSING: isize = neg(codes::CONNECT_MISSING);
       pub const SPAWN_MISSING: isize = neg(codes::SPAWN_MISSING);
     }
@@ -2166,6 +2172,41 @@ macro_rules! test_io_backend {
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 81, expect::NOENT);
+      }
+
+      #[test]
+      fn nofollow_rejects_symlink_and_plain_open_follows_it() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let target = temp_path("openat-nofollow-target");
+        let link = temp_path("openat-nofollow-link");
+        fs::write(&target, b"hello").unwrap();
+        symlink_file(&target, &link);
+        let open = |flags| Op::OpenAt {
+          dir_fd: Resource::cwd(),
+          path: link.as_os_str().to_os_string(),
+          flags,
+          mode: FileMode::from_bits(0),
+        };
+
+        push_op(&mut backend, 86, open(OpenFlags::READ | OpenFlags::NOFOLLOW));
+        backend.flush().unwrap();
+        let completed = wait_for_single_completion(&mut backend);
+        assert_exact_result(&completed, 86, expect::LOOP);
+
+        push_op(&mut backend, 87, open(OpenFlags::READ));
+        backend.flush().unwrap();
+        let completed = wait_for_single_completion(&mut backend);
+        assert_eq!(completed.registration_id(), 87);
+        assert!(
+          completed.result() >= 0,
+          "openat without NOFOLLOW must follow the link, got {}",
+          completed.result()
+        );
+        close_raw(completed.result());
+        fs::remove_file(link).ok();
+        fs::remove_file(target).ok();
       }
     }
 
