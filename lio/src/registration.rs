@@ -1,3 +1,5 @@
+use std::any::TypeId;
+use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::task::Waker;
 
@@ -48,15 +50,94 @@ fn has_more(completion: &Completion) -> bool {
   completion.flags.contains(CompletionFlags::MORE)
 }
 
-/// Waker-based result handler that sends typed results through a channel.
+/// Items an op model produced that its consumer has not taken yet, kept in
+/// the registration's arena.
 ///
-/// This handler manages an OpModel, processes completions, and sends
-/// yielded items to a channel while waking the associated task.
+/// One item is held inline, so an operation whose consumer takes each item
+/// before the next arrives never allocates. Only items that pile up spill
+/// to the heap.
+pub(crate) enum Items<T> {
+  None,
+  One(T),
+  Many(VecDeque<T>),
+}
+
+impl<T> Items<T> {
+  fn push(&mut self, item: T) {
+    match std::mem::replace(self, Self::None) {
+      Self::None => *self = Self::One(item),
+      Self::One(first) => *self = Self::Many(VecDeque::from([first, item])),
+      Self::Many(mut items) => {
+        items.push_back(item);
+        *self = Self::Many(items);
+      }
+    }
+  }
+
+  fn pop(&mut self) -> Option<T> {
+    match std::mem::replace(self, Self::None) {
+      Self::None => None,
+      Self::One(item) => Some(item),
+      Self::Many(mut items) => {
+        let item = items.pop_front();
+        // Keep the allocation for later items.
+        *self = Self::Many(items);
+        item
+      }
+    }
+  }
+
+  fn is_empty(&self) -> bool {
+    match self {
+      Self::None => true,
+      Self::One(_) => false,
+      Self::Many(items) => items.is_empty(),
+    }
+  }
+}
+
+/// Where a waker registration puts the items its model produces.
+trait ItemSink<T>: 'static {
+  /// Stores `item`, or returns `false` if nobody can take items any more.
+  fn put(&mut self, item: T) -> bool;
+
+  /// Whether items are waiting to be taken from the registration itself.
+  fn has_items(&self) -> bool;
+}
+
+impl<T: Send + 'static> ItemSink<T> for mpsc::Sender<T> {
+  fn put(&mut self, item: T) -> bool {
+    self.send(item).is_ok()
+  }
+
+  fn has_items(&self) -> bool {
+    // Sent items are the receiver's.
+    false
+  }
+}
+
+impl<T: 'static> ItemSink<T> for Items<T> {
+  fn put(&mut self, item: T) -> bool {
+    self.push(item);
+    true
+  }
+
+  fn has_items(&self) -> bool {
+    !self.is_empty()
+  }
+}
+
+/// Waker-based result handler: puts each item its model produces into a
+/// channel or into the registration's [`Items`], and wakes the task.
 pub(crate) struct WakerResultHandler {
   payload: *mut (),
   on_completion_fn: WakerCompletionFn,
   action_fn: fn(*mut ()) -> Action,
+  has_items_fn: fn(*mut ()) -> bool,
   drop_fn: fn(*mut ()),
+  /// The op model's type, for a payload whose items stay in [`Items`]: what
+  /// [`Registration::take_item`] checks before reading them.
+  local_model: Option<TypeId>,
 }
 
 /// Processes one completion for a waker registration: the payload, the
@@ -68,30 +149,61 @@ type WakerCompletionFn =
 /// completion, and whether the item reaches the callback.
 type CallbackCompletionFn = fn(*mut (), Completion, bool) -> ProcessResult;
 
-struct WakerPayload<T: OpModel> {
-  sender: mpsc::Sender<T::Item>,
+struct WakerPayload<T, S> {
+  sink: S,
   op_model: T,
 }
 
 impl WakerResultHandler {
   #[inline]
-  fn new_in<T>(
-    arena: &mut Bump,
-    sender: mpsc::Sender<T::Item>,
-    op_model: T,
-  ) -> Self
+  fn new_in<T, S>(arena: &mut Bump, sink: S, op_model: T) -> Self
   where
     T: OpModel,
+    S: ItemSink<T::Item>,
   {
     Self {
       payload: BumpBox::into_raw(BumpBox::new_in(
-        WakerPayload { sender, op_model },
+        WakerPayload { sink, op_model },
         arena,
       )) as *mut (),
-      on_completion_fn: Self::on_completion_impl::<T>,
-      action_fn: Self::action_impl::<T>,
-      drop_fn: Self::drop_bump_impl::<T>,
+      on_completion_fn: Self::on_completion_impl::<T, S>,
+      action_fn: Self::action_impl::<T, S>,
+      has_items_fn: Self::has_items_impl::<T, S>,
+      drop_fn: Self::drop_bump_impl::<T, S>,
+      local_model: None,
     }
+  }
+
+  /// A handler whose items stay in the registration, for its consumer to
+  /// [`take`](Registration::take_item).
+  #[inline]
+  fn new_local_in<T: OpModel>(arena: &mut Bump, op_model: T) -> Self {
+    // Set in place: `..handler` would copy the fields and then drop
+    // `handler`, freeing the payload the copy points to.
+    let mut handler = Self::new_in(arena, Items::<T::Item>::None, op_model);
+    handler.local_model = Some(TypeId::of::<T>());
+    handler
+  }
+
+  /// Takes the oldest item waiting, for a handler made by
+  /// [`new_local_in`](Self::new_local_in) with model `T`.
+  fn take_item<T: OpModel>(&mut self) -> Option<T::Item> {
+    assert_eq!(
+      self.local_model,
+      Some(TypeId::of::<T>()),
+      "registration: took items of another model type"
+    );
+    // SAFETY: `local_model` names `T`, so the payload is the
+    // `WakerPayload<T, Items<T::Item>>` that `new_local_in` made, alive for
+    // the handler's lifetime.
+    let payload =
+      unsafe { &mut *(self.payload as *mut WakerPayload<T, Items<T::Item>>) };
+    payload.sink.pop()
+  }
+
+  #[inline]
+  fn has_items(&self) -> bool {
+    (self.has_items_fn)(self.payload)
   }
 
   /// Get the next runtime action to perform.
@@ -114,24 +226,33 @@ impl WakerResultHandler {
   }
 
   #[inline]
-  fn action_impl<T: OpModel>(payload_ptr: *mut ()) -> Action {
-    // SAFETY: `payload_ptr` is created from `WakerPayload<T>` in `new`/`new_in`
+  fn action_impl<T: OpModel, S>(payload_ptr: *mut ()) -> Action {
+    // SAFETY: `payload_ptr` is created from `WakerPayload<T, S>` in `new_in`
     // and remains valid for the lifetime of this handler.
-    let payload = unsafe { &mut *(payload_ptr as *mut WakerPayload<T>) };
+    let payload = unsafe { &mut *(payload_ptr as *mut WakerPayload<T, S>) };
     payload.op_model.action()
   }
 
+  fn has_items_impl<T: OpModel, S: ItemSink<T::Item>>(
+    payload_ptr: *mut (),
+  ) -> bool {
+    // SAFETY: as in `action_impl`.
+    let payload = unsafe { &*(payload_ptr as *const WakerPayload<T, S>) };
+    payload.sink.has_items()
+  }
+
   #[inline]
-  fn on_completion_impl<T: OpModel>(
+  fn on_completion_impl<T: OpModel, S: ItemSink<T::Item>>(
     payload_ptr: *mut (),
     completion: Completion,
     waker: &mut Option<Waker>,
     deliver: bool,
   ) -> ProcessResult {
-    // SAFETY: `payload_ptr` is created from `WakerPayload<T>` in `new`/`new_in`
-    // and remains valid while completions are dispatched.
-    let payload = unsafe { &mut *(payload_ptr as *mut WakerPayload<T>) };
-    let sender = &payload.sender;
+    // SAFETY: `payload_ptr` is created from `WakerPayload<T, S>` in `new_in`
+    // and remains valid while completions are dispatched. It is not used
+    // once the waker runs: a task polled inline reaches the items itself.
+    let payload = unsafe { &mut *(payload_ptr as *mut WakerPayload<T, S>) };
+    let sink = &mut payload.sink;
     let op_model = &mut payload.op_model;
     let more = has_more(&completion);
 
@@ -147,7 +268,7 @@ impl WakerResultHandler {
         return ProcessResult::next(op_model, more);
       }
       OpResult::Yield(item) => {
-        if sender.send(item).is_err() {
+        if !sink.put(item) {
           // Every receiver is gone, so nothing can take another item: stop
           // instead of resubmitting forever.
           return ProcessResult::Done;
@@ -155,7 +276,7 @@ impl WakerResultHandler {
         ProcessResult::next(op_model, more)
       }
       OpResult::Done(item) => {
-        let _ = sender.send(item);
+        sink.put(item);
         ProcessResult::Done
       }
     };
@@ -165,10 +286,10 @@ impl WakerResultHandler {
     result
   }
 
-  fn drop_bump_impl<T: OpModel>(payload_ptr: *mut ()) {
+  fn drop_bump_impl<T: OpModel, S>(payload_ptr: *mut ()) {
     // SAFETY: `payload_ptr` was allocated by `BumpBox::into_raw` in `new_in`.
     unsafe {
-      drop(BumpBox::from_raw(payload_ptr as *mut WakerPayload<T>));
+      drop(BumpBox::from_raw(payload_ptr as *mut WakerPayload<T, S>));
     }
   }
 }
@@ -181,7 +302,8 @@ impl Drop for WakerResultHandler {
 
 // SAFETY: the handler only stores an opaque payload pointer and function
 // pointers; thread-safety requirements are carried by the concrete `OpModel`
-// and channel sender captured in the payload constructors.
+// and item sink (a channel sender, or items of the model's `Send` item type)
+// captured in the payload constructors.
 unsafe impl Send for WakerResultHandler {}
 
 /// Type-erased callback that processes results and invokes user callback.
@@ -354,6 +476,10 @@ pub struct Registration {
   /// the backend ([`CompletionFlags::MORE`]). Its consumer may still be
   /// waiting, for the end of the stream.
   done: bool,
+  /// Set when the operation is over (nothing of it is left in the backend)
+  /// but its consumer has items left to [`take`](Self::take_item). The
+  /// registration is removed once they are taken, or the consumer is gone.
+  parked: bool,
 }
 
 /// Unified state machine for I/O operations.
@@ -370,6 +496,7 @@ enum State {
 
 impl Registration {
   /// Create a waker-based registration with payload storage in a bump arena.
+  #[cfg(test)]
   #[inline]
   pub fn new_waker_in<T>(
     arena: &mut Bump,
@@ -387,6 +514,27 @@ impl Registration {
       },
       cancelled: false,
       done: false,
+      parked: false,
+    }
+  }
+
+  /// Create a registration that keeps the items its model produces, in its
+  /// arena, until its consumer [`take`](Self::take_item)s them, and wakes
+  /// `waker` for each. Nothing is allocated per item, unless items pile up.
+  #[inline]
+  pub fn new_local_in<T: OpModel>(
+    arena: &mut Bump,
+    waker: Waker,
+    op_model: T,
+  ) -> Self {
+    Self {
+      state: State::Waker {
+        waker: Some(waker),
+        handler: WakerResultHandler::new_local_in(arena, op_model),
+      },
+      cancelled: false,
+      done: false,
+      parked: false,
     }
   }
 
@@ -408,6 +556,7 @@ impl Registration {
       },
       cancelled: false,
       done: false,
+      parked: false,
     }
   }
 
@@ -426,6 +575,7 @@ impl Registration {
       state: State::Callback(OpCallback::new_in(arena, callback, op_model)),
       cancelled: false,
       done: false,
+      parked: false,
     }
   }
 
@@ -442,7 +592,54 @@ impl Registration {
     }
   }
 
+  /// Takes the oldest item a [`new_local_in`](Self::new_local_in)
+  /// registration with model `T` keeps.
+  ///
+  /// # Panics
+  ///
+  /// If the registration was made otherwise, or with another model type.
+  pub(crate) fn take_item<T: OpModel>(&mut self) -> Option<T::Item> {
+    match &mut self.state {
+      State::Waker { handler, .. } => handler.take_item::<T>(),
+      _ => panic!("registration: took items from one that keeps none"),
+    }
+  }
+
+  /// Whether items are waiting to be taken from the registration.
+  #[inline]
+  pub(crate) fn has_items(&self) -> bool {
+    match &self.state {
+      State::Waker { handler, .. } => handler.has_items(),
+      _ => false,
+    }
+  }
+
+  /// Marks the operation as over while items wait for its consumer (see
+  /// the `parked` field).
+  #[inline]
+  pub(crate) fn park(&mut self) {
+    self.parked = true;
+  }
+
+  /// Whether the operation is over and only waits for its consumer.
+  #[inline]
+  pub(crate) fn is_parked(&self) -> bool {
+    self.parked
+  }
+
+  /// Registers `waker` to be woken for the next item, unless the one
+  /// registered already wakes the same task.
+  pub(crate) fn register_waker(&mut self, waker: &Waker) {
+    assert!(!self.cancelled, "registration: waker set after cancellation");
+    if let State::Waker { waker: slot, .. } = &mut self.state
+      && !slot.as_ref().is_some_and(|w| w.will_wake(waker))
+    {
+      *slot = Some(waker.clone());
+    }
+  }
+
   /// Sets the waker, replacing any existing waker.
+  #[cfg(test)]
   pub fn set_waker(&mut self, waker: Waker) {
     assert!(!self.cancelled, "registration: waker set after cancellation");
     match &mut self.state {
@@ -1058,6 +1255,108 @@ mod tests {
     let (_arena, mut reg) = new_callback_reg(|_| {}, Nop);
     reg.cancel();
     assert!(!reg.is_done() && !reg.delivers());
+  }
+
+  #[test]
+  fn items_hold_one_inline_and_queue_the_rest_in_order() {
+    let mut items = Items::None;
+    assert!(items.is_empty());
+    assert_eq!(items.pop(), None);
+    items.push(1);
+    assert!(matches!(items, Items::One(1)));
+    assert!(!items.is_empty());
+    items.push(2);
+    items.push(3);
+    assert_eq!(items.pop(), Some(1));
+    assert_eq!(items.pop(), Some(2));
+    items.push(4);
+    assert_eq!(items.pop(), Some(3));
+    assert!(!items.is_empty());
+    assert_eq!(items.pop(), Some(4));
+    assert!(items.is_empty());
+    assert_eq!(items.pop(), None);
+  }
+
+  #[test]
+  fn a_local_registration_keeps_its_items_for_its_consumer() {
+    let wake_count = Arc::new(AtomicUsize::new(0));
+    let mut arena = Bump::new();
+    let mut reg = Registration::new_local_in(
+      &mut arena,
+      test_waker(Arc::clone(&wake_count)),
+      YieldTwiceThenDone { stage: 0 },
+    );
+    assert!(!reg.has_items());
+    assert!(reg.action().is_some());
+    assert!(reg.on_completion(Completion::new(0)).action().is_some());
+    assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+    assert!(reg.has_items());
+    assert_eq!(reg.take_item::<YieldTwiceThenDone>(), Some(11));
+    assert!(!reg.has_items());
+    assert_eq!(reg.take_item::<YieldTwiceThenDone>(), None);
+
+    reg.register_waker(&test_waker(Arc::clone(&wake_count)));
+    assert!(reg.on_completion(Completion::new(1)).action().is_some());
+    assert_eq!(wake_count.load(Ordering::SeqCst), 2);
+    assert_eq!(reg.take_item::<YieldTwiceThenDone>(), Some(13));
+    assert!(!reg.is_parked());
+    reg.park();
+    assert!(reg.is_parked());
+  }
+
+  #[test]
+  fn registering_the_same_task_s_waker_again_keeps_the_first() {
+    let first = Arc::new(AtomicUsize::new(0));
+    let mut arena = Bump::new();
+    let mut reg = Registration::new_local_in(
+      &mut arena,
+      test_waker(Arc::clone(&first)),
+      AgainThenDone { stage: 0 },
+    );
+    // `will_wake` compares the data pointer and vtable: a clone of the same
+    // waker wakes the same task, a waker of another counter does not.
+    let same = reg_waker(&reg).clone();
+    reg.register_waker(&same);
+    assert!(reg_waker(&reg).will_wake(&same));
+    let other = Arc::new(AtomicUsize::new(0));
+    reg.register_waker(&test_waker(Arc::clone(&other)));
+    reg.on_completion(Completion::new(0));
+    reg.on_completion(Completion::new(1));
+    assert_eq!(first.load(Ordering::SeqCst), 0);
+    assert_eq!(other.load(Ordering::SeqCst), 1, "the newer task is woken");
+  }
+
+  fn reg_waker(reg: &Registration) -> &Waker {
+    match &reg.state {
+      State::Waker { waker: Some(waker), .. } => waker,
+      _ => panic!("no waker registered"),
+    }
+  }
+
+  #[test]
+  #[should_panic(expected = "took items of another model type")]
+  fn taking_items_as_another_model_type_panics() {
+    let mut arena = Bump::new();
+    let mut reg =
+      Registration::new_local_in(&mut arena, Waker::noop().clone(), Nop);
+    let _ = reg.take_item::<AgainThenDone>();
+  }
+
+  #[test]
+  #[should_panic(expected = "keeps none")]
+  fn taking_items_from_a_callback_registration_panics() {
+    let (_arena, mut reg) = new_callback_reg(|_| {}, Nop);
+    let _ = reg.take_item::<Nop>();
+  }
+
+  #[test]
+  fn channel_and_callback_registrations_keep_no_items() {
+    let (tx, _rx) = mpsc::channel();
+    let (_arena, mut reg) = new_waker_reg(Waker::noop().clone(), tx, Nop);
+    assert!(reg.on_completion(Completion::new(0)).is_done());
+    assert!(!reg.has_items(), "sent items are the receiver's");
+    let (_arena, reg) = new_callback_reg(|_| {}, Nop);
+    assert!(!reg.has_items());
   }
 
   #[test]
