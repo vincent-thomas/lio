@@ -33,19 +33,32 @@
 //!
 //! ## Buffer ownership
 //!
-//! Operations that accept a `buf` pointer take **ownership** of that buffer.
-//! The buffer is returned via the callback and must be freed by the caller.
+//! The caller always owns the buffers it passes in; lio only **borrows** them.
+//! An operation that takes `buf`/`buf_len` reads from or writes into that
+//! memory and never frees it, so it can come from `malloc`, [`lio_buf_alloc`],
+//! the stack, or anywhere else. Until the callback fires, the memory must stay
+//! valid and the caller must not touch it. The callback receives the same
+//! pointer and the number of bytes in it that hold data: the bytes read for
+//! read-like operations (0 on error), or `buf_len` for write-like ones.
+//!
+//! If the handle is destroyed while an operation is in flight, its callback
+//! never fires and the buffer simply stays with the caller; it must remain
+//! valid until [`lio_destroy`] returns.
+//!
+//! Memory lio allocates and hands out has exactly one release function, which
+//! takes only the pointer: [`lio_buf_free`] for bytes, [`lio_dir_entries_free`]
+//! for directory entries and [`lio_sockaddr_free`] for addresses.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::{
-  mem,
+  mem::{self, MaybeUninit},
   net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-  ptr,
+  ptr::{self, NonNull},
   time::Duration,
 };
 
 use crate::{
-  Lio,
+  IoBuf, IoBufMut, Lio,
   api::{
     self, FileStat, FileType, ReadDirBuf, RecvFlags, SendFlags, ShutdownHow,
     SockDomain, SockProto, SockType, resource::Resource,
@@ -135,87 +148,206 @@ fn resource_to_fd(r: &Resource) -> libc::intptr_t {
   r.as_raw_fd() as libc::intptr_t
 }
 
-/// Allocate a buffer suitable for lio FFI read/write operations.
+/// Allocate `len` zeroed bytes.
 ///
-/// Buffers passed to lio read/write/send/recv functions must come from this
-/// function and must eventually be released with [`lio_buf_free`].
+/// A convenience only: operations borrow their buffers, so any memory works.
+/// Release the result with [`lio_buf_free`], never `free`.
+///
+/// Returns null if the allocation fails.
 #[unsafe(no_mangle)]
 pub extern "C" fn lio_buf_alloc(len: usize) -> *mut u8 {
-  let mut buf = vec![0_u8; len];
-  let ptr = buf.as_mut_ptr();
-  std::mem::forget(buf);
-  ptr
+  // At least one byte, so null always means failure.
+  unsafe { libc::calloc(len.max(1), 1) }.cast()
 }
 
-/// Free a buffer allocated by [`lio_buf_alloc`] or returned by an FFI callback.
+/// Free a byte buffer from [`lio_buf_alloc`] or one lio handed out, such as the
+/// names buffer of [`lio_readdir`]. Null is ignored.
+///
+/// Do not pass it memory from anywhere else; lio never frees buffers it
+/// borrowed for an operation, so those stay the caller's to release.
 ///
 /// # Safety
-/// `buf` must have been allocated by [`lio_buf_alloc`] with capacity `len` and
-/// must not be used after this call.
+/// `buf` must be null or such a buffer, not freed before, and must not be used
+/// after this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lio_buf_free(buf: *mut u8, len: usize) {
-  if !buf.is_null() {
-    drop(unsafe { Vec::from_raw_parts(buf, 0, len) });
-  }
+pub unsafe extern "C" fn lio_buf_free(buf: *mut u8) {
+  unsafe { libc::free(buf.cast()) };
 }
 
 /// A byte count as the C API's `int` result code.
 ///
 /// A count above `INT_MAX` cannot be represented and saturates; callbacks
-/// that hand a buffer back still report its real length in `len`.
+/// that hand a buffer back still report the real count in `len`.
 fn ffi_count(n: usize) -> i32 {
   i32::try_from(n).unwrap_or(i32::MAX)
 }
 
-/// Free a socket address allocated by lio, such as the address returned by
-/// [`lio_accept`] or [`lio_recvfrom`].
+/// A buffer the C caller owns and lends to one operation.
 ///
-/// # Safety
-/// `addr` must be a pointer returned by lio and must not be used after this
-/// call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn lio_sockaddr_free(addr: *mut libc::sockaddr_storage) {
-  if !addr.is_null() {
-    drop(unsafe { Box::from_raw(addr) });
-  }
-}
-
-/// Free a directory entry array returned by [`lio_readdir`].
-///
-/// # Safety
-/// `entries` must be null or the pointer returned by [`lio_readdir`], and
-/// `len` must be the length returned with that pointer. The entries must not be
-/// used after this call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn lio_dir_entries_free(
-  entries: *mut lio_dir_entry_t,
+/// lio reads from or fills the memory but never frees it: dropping a `CBuf`,
+/// whether the operation completed or [`lio_destroy`] discarded it in flight,
+/// leaves the allocation to C, whichever allocator it came from.
+struct CBuf {
+  /// The caller's pointer, handed back unchanged. Null only if `cap` is 0.
+  ptr: *mut u8,
+  /// Bytes lent.
+  cap: usize,
+  /// Leading bytes that hold data, and so are initialized.
   len: usize,
-) {
-  if !entries.is_null() {
-    // The returned boxed slice has exactly `len` elements.
-    drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(entries, len)) });
+}
+
+// SAFETY: a `CBuf` is only a pointer and lengths. The caller of the operation
+// that holds it guarantees the memory is valid and untouched by anything else
+// until the operation ends, and memory has no thread affinity.
+unsafe impl Send for CBuf {}
+// SAFETY: as for `Send`; `&CBuf` only exposes the bytes for reading.
+unsafe impl Sync for CBuf {}
+
+impl CBuf {
+  /// Lends `len` initialized bytes at `ptr` for an operation to read from.
+  ///
+  /// Returns `None` if `ptr` is null but `len` is not 0.
+  ///
+  /// # Safety
+  /// Unless `len` is 0, `ptr` must be valid for reads of `len` initialized
+  /// bytes, and for writes if the operation fills the buffer, until the
+  /// operation ends. Nothing else may access the bytes in that time.
+  unsafe fn filled(ptr: *mut u8, len: usize) -> Option<Self> {
+    (!ptr.is_null() || len == 0).then_some(Self { ptr, cap: len, len })
+  }
+
+  /// Lends `cap` bytes at `ptr`, which need not be initialized, for an
+  /// operation to fill.
+  ///
+  /// Returns `None` if `ptr` is null but `cap` is not 0.
+  ///
+  /// # Safety
+  /// Unless `cap` is 0, `ptr` must be valid for reads and writes of `cap`
+  /// bytes until the operation ends. Nothing else may access them in that
+  /// time.
+  unsafe fn empty(ptr: *mut u8, cap: usize) -> Option<Self> {
+    (!ptr.is_null() || cap == 0).then_some(Self { ptr, cap, len: 0 })
+  }
+
+  /// The start of the region, which slices need non-null even when empty.
+  fn base(&self) -> *mut u8 {
+    if self.ptr.is_null() { NonNull::dangling().as_ptr() } else { self.ptr }
   }
 }
 
-/// Export an exactly sized allocation for `lio_dir_entries_free`.
-fn readdir_entries_into_ffi(
-  entries: Vec<lio_dir_entry_t>,
-) -> (*mut lio_dir_entry_t, usize) {
-  let mut entries = entries.into_boxed_slice();
-  let len = entries.len();
-  let ptr = entries.as_mut_ptr();
-  mem::forget(entries);
-  (ptr, len)
+impl IoBuf for CBuf {
+  fn as_slice(&self) -> &[u8] {
+    // SAFETY: `base` is non-null, and the first `len` bytes are initialized and
+    // lent for as long as `self` lives (or `len` is 0).
+    unsafe { std::slice::from_raw_parts(self.base(), self.len) }
+  }
 }
 
-/// Export an exactly sized allocation for `lio_buf_free(buf, len)`.
-/// The boxed slice has the same allocation layout as a Vec with capacity `len`.
-fn readdir_raw_into_ffi(raw: Vec<u8>) -> (*mut u8, usize) {
-  let mut raw = raw.into_boxed_slice();
-  let len = raw.len();
-  let ptr = raw.as_mut_ptr();
-  mem::forget(raw);
-  (ptr, len)
+impl IoBufMut for CBuf {
+  fn as_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+    // SAFETY: `base` is non-null, and `cap` bytes are lent exclusively for as
+    // long as `self` lives (or `cap` is 0). `MaybeUninit<u8>` permits
+    // uninitialized contents.
+    unsafe { std::slice::from_raw_parts_mut(self.base().cast(), self.cap) }
+  }
+
+  unsafe fn set_len(&mut self, len: usize) {
+    debug_assert!(len <= self.cap);
+    self.len = len;
+  }
+}
+
+/// Lends a C buffer holding `len` bytes of data, or reports `EINVAL` through
+/// `callback` if `buf` is null with a nonzero length.
+///
+/// # Safety
+/// As [`CBuf::filled`].
+unsafe fn lend_filled(
+  buf: *mut u8,
+  len: usize,
+  callback: extern "C" fn(libc::c_int, *mut u8, usize),
+) -> Option<CBuf> {
+  let lent = unsafe { CBuf::filled(buf, len) };
+  if lent.is_none() {
+    callback(-libc::EINVAL, buf, 0);
+  }
+  lent
+}
+
+/// Lends a C buffer of `cap` bytes to fill, or reports `EINVAL` through
+/// `callback` if `buf` is null with a nonzero capacity.
+///
+/// # Safety
+/// As [`CBuf::empty`].
+unsafe fn lend_empty(
+  buf: *mut u8,
+  cap: usize,
+  callback: extern "C" fn(libc::c_int, *mut u8, usize),
+) -> Option<CBuf> {
+  let lent = unsafe { CBuf::empty(buf, cap) };
+  if lent.is_none() {
+    callback(-libc::EINVAL, buf, 0);
+  }
+  lent
+}
+
+/// Hands a lent buffer back to C with the operation's result: the caller's
+/// pointer and the number of bytes in it that hold data.
+fn return_buf(
+  callback: extern "C" fn(libc::c_int, *mut u8, usize),
+  res: std::io::Result<usize>,
+  buf: CBuf,
+) {
+  let code = match res {
+    Ok(n) => ffi_count(n),
+    Err(e) => -e.raw_os_error().unwrap_or(1),
+  };
+  callback(code, buf.ptr, buf.len);
+}
+
+/// Free a socket address allocated by lio, such as the address returned by
+/// [`lio_accept`] or [`lio_recvfrom`]. Null is ignored.
+///
+/// # Safety
+/// `addr` must be null or a pointer returned by lio, not freed before, and
+/// must not be used after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_sockaddr_free(
+  addr: *const libc::sockaddr_storage,
+) {
+  if !addr.is_null() {
+    drop(unsafe { Box::from_raw(addr.cast_mut()) });
+  }
+}
+
+/// Free a directory entry array returned by [`lio_readdir`]. Null is ignored.
+///
+/// # Safety
+/// `entries` must be null or an array returned by [`lio_readdir`], not freed
+/// before. The entries must not be used after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lio_dir_entries_free(entries: *mut lio_dir_entry_t) {
+  unsafe { libc::free(entries.cast()) };
+}
+
+/// Copies `items` into a `malloc` allocation, the kind [`lio_buf_free`] and
+/// [`lio_dir_entries_free`] release, so freeing needs only the pointer.
+///
+/// Returns null for an empty slice, and `None` if the allocation fails.
+fn malloc_copy<T: Copy>(items: &[T]) -> Option<*mut T> {
+  // `malloc` aligns for every fundamental type, which covers 8 bytes.
+  const { assert!(mem::align_of::<T>() <= 8) };
+  if items.is_empty() {
+    return Some(ptr::null_mut());
+  }
+  let out = unsafe { libc::malloc(mem::size_of_val(items)) }.cast::<T>();
+  if out.is_null() {
+    return None;
+  }
+  // SAFETY: `out` is a fresh, suitably aligned allocation of `items.len()`
+  // elements.
+  unsafe { ptr::copy_nonoverlapping(items.as_ptr(), out, items.len()) };
+  Some(out)
 }
 
 fn file_type_to_ffi(file_type: FileType) -> libc::c_int {
@@ -323,6 +455,13 @@ pub extern "C" fn lio_create(capacity: libc::c_uint) -> *mut lio_handle_t {
 /// Destroy a lio handle created by [`lio_create`].
 ///
 /// After this call `lio` is invalid.
+///
+/// Operations still in flight are cancelled and their callbacks never fire.
+/// lio does not free their buffers: they stay owned by the caller, and must
+/// remain valid until this call returns. (If a backend cannot confirm in time
+/// that the kernel let go of an operation, lio leaks its own state rather than
+/// free it under the kernel; a caller that cannot rule this out should not
+/// reuse the buffers of operations it destroyed in flight.)
 ///
 /// # Safety
 /// `lio` must have been returned by [`lio_create`] and must not be used
@@ -578,16 +717,16 @@ pub unsafe extern "C" fn lio_listen(
 /// Write data to `fd` at the absolute file `offset`.  Use [`lio_write`] to
 /// write at the current position.
 ///
-/// Ownership of `buf` (which must have been `malloc`'d with at least `buf_len`
-/// bytes) transfers to lio.  The callback receives the original pointer so the
-/// caller can `free` it.
+/// lio borrows `buf` until the callback fires and never frees it.
 ///
-/// - `callback(result, buf, len)`: bytes written (or negative errno), buffer;
-///   `-EINVAL` without writing when `offset` exceeds `INT64_MAX`
+/// - `callback(result, buf, len)`: bytes written (or negative errno), the
+///   same `buf`, and `len = buf_len`; `-EINVAL` without writing when `offset`
+///   exceeds `INT64_MAX`
 ///
 /// # Safety
-/// `lio` must be valid; `buf` must point to at least `buf_len` bytes allocated
-/// with `malloc`.
+/// `lio` must be valid; `fd` must be a valid open file descriptor; and `buf`
+/// must point to `buf_len` initialized bytes (it may be null if `buf_len` is
+/// 0) that stay valid and untouched until the callback fires.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_write_at(
   lio: *mut lio_handle_t,
@@ -601,36 +740,32 @@ pub unsafe extern "C" fn lio_write_at(
     callback(-libc::EINVAL, buf, buf_len);
     return;
   }
-  // SAFETY: C caller transfers ownership of a buffer allocated by lio_buf_alloc.
-  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  // SAFETY: the caller lends `buf_len` initialized bytes per fn contract.
+  let Some(buf) = (unsafe { lend_filled(buf, buf_len, callback) }) else {
+    return;
+  };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::write_at(&resource, vec, offset)
+  api::write_at(&resource, buf, offset)
     .with_lio(&unsafe { handle(lio) }.inner)
-    .when_done(move |(res, mut buf)| {
-      let code = match res {
-        Ok(n) => ffi_count(n),
-        Err(e) => -e.raw_os_error().unwrap_or(1),
-      };
-      let ptr = buf.as_mut_ptr();
-      let len = buf.len();
-      // Return buffer ownership to C - caller will free it
-      std::mem::forget(buf);
-      callback(code, ptr, len);
-    });
+    .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
 
 /// Read from `fd` at the absolute file `offset` into `buf`.  Use [`lio_read`]
 /// to read from the current position.
 ///
-/// Ownership of `buf` transfers to lio (see [`lio_write_at`]).
+/// lio borrows `buf` until the callback fires and never frees it.
 ///
-/// - `callback(result, buf, len)`: bytes read (or negative errno), buffer;
-///   `-EINVAL` without reading when `offset` exceeds `INT64_MAX`
+/// - `callback(result, buf, len)`: bytes read (or negative errno), the same
+///   `buf`, and `len` = bytes read (0 on error); `-EINVAL` without reading
+///   when `offset` exceeds `INT64_MAX`
 ///
 /// # Safety
-/// Same requirements as [`lio_write_at`].
+/// `lio` must be valid; `fd` must be a valid open file descriptor; and `buf`
+/// must point to `buf_len` writable bytes, which need not be initialized (it
+/// may be null if `buf_len` is 0), that stay valid and untouched until the
+/// callback fires.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_read_at(
   lio: *mut lio_handle_t,
@@ -641,29 +776,19 @@ pub unsafe extern "C" fn lio_read_at(
   callback: extern "C" fn(libc::c_int, *mut u8, usize),
 ) {
   if !is_valid_file_offset(Some(offset)) {
-    callback(-libc::EINVAL, buf, buf_len);
+    callback(-libc::EINVAL, buf, 0);
     return;
   }
-  // SAFETY: caller transfers ownership of a buffer allocated by
-  // `lio_buf_alloc(buf_len)`, which matches the `Vec<u8>` layout reconstructed
-  // here.
-  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  // SAFETY: the caller lends `buf_len` writable bytes per fn contract.
+  let Some(buf) = (unsafe { lend_empty(buf, buf_len, callback) }) else {
+    return;
+  };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::read_at(&resource, vec, offset)
+  api::read_at(&resource, buf, offset)
     .with_lio(&unsafe { handle(lio) }.inner)
-    .when_done(move |(res, mut buf)| {
-      let code = match res {
-        Ok(n) => ffi_count(n),
-        Err(e) => -e.raw_os_error().unwrap_or(1),
-      };
-      let ptr = buf.as_mut_ptr();
-      let len = buf.len();
-      // Return buffer ownership to C - caller will free it
-      std::mem::forget(buf);
-      callback(code, ptr, len);
-    });
+    .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
 
 /// Create a socket.
@@ -744,8 +869,8 @@ pub unsafe extern "C" fn lio_socket(
 /// Accept a connection.
 ///
 /// - `callback(result, addr)`: new socket fd on success (negative errno on
-///   error); `addr` is heap-allocated `sockaddr_storage` — **caller must free
-///   it** — or null on error.
+///   error); `addr` is the peer address, allocated by lio, which the caller
+///   must release with [`lio_sockaddr_free`] — or null on error.
 ///
 /// # Safety
 /// `lio` must be valid; `fd` must be a listening socket.
@@ -808,13 +933,15 @@ pub unsafe extern "C" fn lio_accept(
 
 /// Send data on a connected socket.
 ///
-/// Ownership of `buf` transfers to lio (see [`lio_write_at`]).
+/// lio borrows `buf` until the callback fires and never frees it.
 ///
-/// - `callback(result, buf, len)`: bytes sent (or negative errno), buffer
+/// - `callback(result, buf, len)`: bytes sent (or negative errno), the same
+///   `buf`, and `len = buf_len`
 ///
 /// # Safety
-/// `lio` must be valid; `buf` must point to at least `buf_len` bytes allocated
-/// with `malloc`.
+/// `lio` must be valid; `fd` must be a valid open socket; and `buf` must point
+/// to `buf_len` initialized bytes (it may be null if `buf_len` is 0) that stay
+/// valid and untouched until the callback fires.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_send(
   lio: *mut lio_handle_t,
@@ -824,39 +951,33 @@ pub unsafe extern "C" fn lio_send(
   flags: libc::c_int,
   callback: extern "C" fn(libc::c_int, *mut u8, usize),
 ) {
-  // SAFETY: C caller transfers malloc ownership of buf with size buf_len
-  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  // SAFETY: the caller lends `buf_len` initialized bytes per fn contract.
+  let Some(buf) = (unsafe { lend_filled(buf, buf_len, callback) }) else {
+    return;
+  };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::send(
     &resource,
-    vec,
+    buf,
     Some(SendFlags::from_bits(flags).unwrap_or(SendFlags::EMPTY)),
   )
   .with_lio(&unsafe { handle(lio) }.inner)
-  .when_done(move |(res, mut buf)| {
-    let code = match res {
-      Ok(n) => ffi_count(n),
-      Err(e) => -e.raw_os_error().unwrap_or(1),
-    };
-    let ptr = buf.as_mut_ptr();
-    let len = buf.len();
-    // Return buffer ownership to C - caller will free it
-    std::mem::forget(buf);
-    callback(code, ptr, len);
-  });
+  .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
 
 /// Receive data from a socket.
 ///
-/// Ownership of `buf` transfers to lio (see [`lio_write_at`]).
+/// lio borrows `buf` until the callback fires and never frees it.
 ///
-/// - `callback(result, buf, len)`: bytes received (or negative errno), buffer
+/// - `callback(result, buf, len)`: bytes received (or negative errno), the
+///   same `buf`, and `len` = bytes received (0 on error)
 ///
 /// # Safety
-/// `lio` must be valid; `buf` must be a live buffer previously allocated by
-/// [`lio_buf_alloc(buf_len)`].
+/// `lio` must be valid; `fd` must be a valid open socket; and `buf` must point
+/// to `buf_len` writable bytes, which need not be initialized (it may be null
+/// if `buf_len` is 0), that stay valid and untouched until the callback fires.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_recv(
   lio: *mut lio_handle_t,
@@ -866,39 +987,36 @@ pub unsafe extern "C" fn lio_recv(
   flags: libc::c_int,
   callback: extern "C" fn(libc::c_int, *mut u8, usize),
 ) {
-  // SAFETY: caller transfers ownership of a buffer allocated by
-  // `lio_buf_alloc(buf_len)`, which matches the `Vec<u8>` layout reconstructed
-  // here.
-  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  // SAFETY: the caller lends `buf_len` writable bytes per fn contract.
+  let Some(buf) = (unsafe { lend_empty(buf, buf_len, callback) }) else {
+    return;
+  };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
   api::recv(
     &resource,
-    vec,
+    buf,
     Some(RecvFlags::from_bits(flags).unwrap_or(RecvFlags::EMPTY)),
   )
   .with_lio(&unsafe { handle(lio) }.inner)
-  .when_done(move |(res, mut buf)| {
-    let code = match res {
-      Ok(n) => ffi_count(n),
-      Err(e) => -e.raw_os_error().unwrap_or(1),
-    };
-    let ptr = buf.as_mut_ptr();
-    let len = buf.len();
-    // Return buffer ownership to C - caller will free it
-    std::mem::forget(buf);
-    callback(code, ptr, len);
-  });
+  .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
 
 /// Receive data and sender address from a socket.
 ///
-/// Ownership of `buf` transfers to lio and is returned through `callback`.
+/// lio borrows `buf` until the callback fires and never frees it.
+///
+/// - `callback(result, buf, len, addr)`: bytes received (or negative errno),
+///   the same `buf`, `len` = bytes received (0 on error), and the sender
+///   address, which the caller must release with [`lio_sockaddr_free`], or
+///   null
 ///
 /// # Safety
 /// `lio` must be a valid handle; `fd` must be a valid open socket; and `buf`
-/// must be a live buffer allocated by [`lio_buf_alloc`] with length `buf_len`.
+/// must point to `buf_len` writable bytes, which need not be initialized (it
+/// may be null if `buf_len` is 0), that stay valid and untouched until the
+/// callback fires.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_recvfrom(
   lio: *mut lio_handle_t,
@@ -913,15 +1031,18 @@ pub unsafe extern "C" fn lio_recvfrom(
     *const libc::sockaddr_storage,
   ),
 ) {
-  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  let Some(buf) = (unsafe { CBuf::empty(buf, buf_len) }) else {
+    callback(-libc::EINVAL, buf, 0, ptr::null());
+    return;
+  };
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   api::recvfrom(
     &resource,
-    vec,
+    buf,
     Some(RecvFlags::from_bits(flags).unwrap_or(RecvFlags::EMPTY)),
   )
   .with_lio(&unsafe { handle(lio) }.inner)
-  .when_done(move |(res, mut buf, addr)| {
+  .when_done(move |(res, buf, addr)| {
     let (code, addr_ptr): (libc::c_int, *const libc::sockaddr_storage) =
       match res {
         Ok(n) => {
@@ -935,10 +1056,7 @@ pub unsafe extern "C" fn lio_recvfrom(
         }
         Err(e) => (-e.raw_os_error().unwrap_or(1), ptr::null()),
       };
-    let ptr = buf.as_mut_ptr();
-    let len = buf.len();
-    std::mem::forget(buf);
-    callback(code, ptr, len, addr_ptr);
+    callback(code, buf.ptr, buf.len, addr_ptr);
   });
 }
 
@@ -1069,13 +1187,16 @@ pub unsafe extern "C" fn lio_connect(
 
 /// Send data to a specific address (UDP).
 ///
-/// Ownership of `buf` transfers to lio.
+/// lio borrows `buf` until the callback fires and never frees it.
 ///
-/// - `callback(result, buf, len)`: bytes sent (or negative errno), buffer
+/// - `callback(result, buf, len)`: bytes sent (or negative errno), the same
+///   `buf`, and `len = buf_len`
 ///
 /// # Safety
-/// `lio` must be valid; `buf` must be allocated with malloc; `addr` must be
-/// valid.
+/// `lio` must be valid; `fd` must be a valid open socket; `buf` must point to
+/// `buf_len` initialized bytes (it may be null if `buf_len` is 0) that stay
+/// valid and untouched until the callback fires; and a non-null `addr` must be
+/// readable for `addr_len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_sendto(
   lio: *mut lio_handle_t,
@@ -1087,84 +1208,30 @@ pub unsafe extern "C" fn lio_sendto(
   addr_len: libc::socklen_t,
   callback: extern "C" fn(libc::c_int, *mut u8, usize),
 ) {
-  let socket_addr = match sockaddr_to_socketaddr(addr, addr_len) {
-    Some(a) => a,
-    None => {
-      callback(-libc::EINVAL, buf, buf_len);
-      return;
-    }
+  // SAFETY: the caller lends `buf_len` initialized bytes per fn contract.
+  let Some(buf) = (unsafe { lend_filled(buf, buf_len, callback) }) else {
+    return;
   };
-  // SAFETY: C caller transfers malloc ownership of buf with size buf_len
-  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  let Some(socket_addr) = sockaddr_to_socketaddr(addr, addr_len) else {
+    return_buf(
+      callback,
+      Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+      buf,
+    );
+    return;
+  };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
   crate::api::io::Io::from_op(api::ops::Send::new(
     resource.clone(),
-    vec,
+    buf,
     Some(socket_addr),
     Some(SendFlags::from_bits(flags).unwrap_or(SendFlags::EMPTY)),
   ))
   .with_lio(&unsafe { handle(lio) }.inner)
-  .when_done(move |(res, mut buf)| {
-    let code = match res {
-      Ok(n) => ffi_count(n),
-      Err(e) => -e.raw_os_error().unwrap_or(1),
-    };
-    let ptr = buf.as_mut_ptr();
-    let len = buf.len();
-    std::mem::forget(buf);
-    callback(code, ptr, len);
-  });
+  .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
-
-// /// Receive data and get the sender's address (UDP).
-// ///
-// /// Ownership of `buf` transfers to lio.
-// ///
-// /// - `callback(result, buf, len, addr)`: bytes received, buffer, sender address
-// ///   (heap-allocated, caller must free)
-// ///
-// /// # Safety
-// /// `lio` must be valid; `buf` must be allocated with malloc.
-// #[unsafe(no_mangle)]
-// pub unsafe extern "C" fn lio_recvfrom(
-//   lio: *mut lio_handle_t,
-//   fd: libc::intptr_t,
-//   buf: *mut u8,
-//   buf_len: usize,
-//   flags: libc::c_int,
-//   callback: extern "C" fn(
-//     libc::c_int,
-//     *mut u8,
-//     usize,
-//     *const libc::sockaddr_storage,
-//   ),
-// ) {
-//   // SAFETY: C caller transfers malloc ownership of buf with size buf_len
-//   let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
-//   // SAFETY: caller guarantees fd is valid per fn contract
-//   let resource = unsafe { fd_to_borrowed_resource(fd) };
-//   // SAFETY: caller guarantees lio is valid per fn contract
-//   api::recvfrom(&resource, vec, Some(flags))
-//     .with_lio(&unsafe { handle(lio) }.inner)
-//     .when_done(move |(res, mut buf, addr)| {
-//       let (code, addr_ptr): (i32, *const libc::sockaddr_storage) = match res {
-//         Ok(n) => {
-//           let addr_ptr = match addr {
-//             Some(a) => Box::into_raw(Box::new(std_socketaddr_into_libc(a))),
-//             None => ptr::null_mut(),
-//           };
-//           (n, addr_ptr)
-//         }
-//         Err(e) => (-e.raw_os_error().unwrap_or(1), ptr::null()),
-//       };
-//       let ptr = buf.as_mut_ptr();
-//       let len = buf.len();
-//       std::mem::forget(buf);
-//       callback(code, ptr, len, addr_ptr);
-//     });
-// }
 
 /// Open a file relative to a directory fd.
 ///
@@ -1218,12 +1285,11 @@ pub unsafe extern "C" fn lio_openat(
 
 /// Read from fd at current position.
 ///
-/// Ownership of `buf` transfers to lio.
-///
-/// - `callback(result, buf, len)`: bytes read (or negative errno), buffer
+/// Equivalent to [`lio_read_at`] with `offset = -1`, with the same buffer
+/// rules and callback.
 ///
 /// # Safety
-/// `lio` must be valid; `buf` must be allocated with malloc.
+/// Same requirements as [`lio_read_at`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_read(
   lio: *mut lio_handle_t,
@@ -1232,33 +1298,25 @@ pub unsafe extern "C" fn lio_read(
   buf_len: usize,
   callback: extern "C" fn(libc::c_int, *mut u8, usize),
 ) {
-  // SAFETY: C caller transfers malloc ownership of buf with size buf_len
-  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  // SAFETY: the caller lends `buf_len` writable bytes per fn contract.
+  let Some(buf) = (unsafe { lend_empty(buf, buf_len, callback) }) else {
+    return;
+  };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::read(&resource, vec).with_lio(&unsafe { handle(lio) }.inner).when_done(
-    move |(res, mut buf)| {
-      let code = match res {
-        Ok(n) => ffi_count(n),
-        Err(e) => -e.raw_os_error().unwrap_or(1),
-      };
-      let ptr = buf.as_mut_ptr();
-      let len = buf.len();
-      std::mem::forget(buf);
-      callback(code, ptr, len);
-    },
-  );
+  api::read(&resource, buf)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
 
 /// Write to fd at current position.
 ///
-/// Ownership of `buf` transfers to lio.
-///
-/// - `callback(result, buf, len)`: bytes written (or negative errno), buffer
+/// Equivalent to [`lio_write_at`] with `offset = -1`, with the same buffer
+/// rules and callback.
 ///
 /// # Safety
-/// `lio` must be valid; `buf` must be allocated with malloc.
+/// Same requirements as [`lio_write_at`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_write(
   lio: *mut lio_handle_t,
@@ -1267,23 +1325,16 @@ pub unsafe extern "C" fn lio_write(
   buf_len: usize,
   callback: extern "C" fn(libc::c_int, *mut u8, usize),
 ) {
-  // SAFETY: C caller transfers malloc ownership of buf with size buf_len
-  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  // SAFETY: the caller lends `buf_len` initialized bytes per fn contract.
+  let Some(buf) = (unsafe { lend_filled(buf, buf_len, callback) }) else {
+    return;
+  };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::write(&resource, vec).with_lio(&unsafe { handle(lio) }.inner).when_done(
-    move |(res, mut buf)| {
-      let code = match res {
-        Ok(n) => ffi_count(n),
-        Err(e) => -e.raw_os_error().unwrap_or(1),
-      };
-      let ptr = buf.as_mut_ptr();
-      let len = buf.len();
-      std::mem::forget(buf);
-      callback(code, ptr, len);
-    },
-  );
+  api::write(&resource, buf)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
 
 // /// Apply or remove an advisory lock on a file.
@@ -1529,13 +1580,19 @@ pub unsafe extern "C" fn lio_fstat(
 
 /// Reads the target of a symbolic link relative to a directory file descriptor.
 ///
-/// Ownership of `buf` transfers to lio and is returned through `callback`.
+/// lio borrows `buf` until the callback fires and never frees it.
+///
+/// - `callback(result, buf, len)`: the target's length (or negative errno),
+///   the same `buf`, and `len` = bytes of the target written into `buf` (0 on
+///   error). The target is not NUL-terminated.
 ///
 /// # Safety
 /// `lio` must be a valid handle; `dir_fd` must be a valid open directory file
 /// descriptor; a non-null `path` must point to a valid NUL-terminated string;
-/// and `buf` must be a live buffer allocated by [`lio_buf_alloc`] with length
-/// `buf_len`. The descriptor must remain open until the operation completes.
+/// and `buf` must point to `buf_len` writable bytes, which need not be
+/// initialized (it may be null if `buf_len` is 0), that stay valid and
+/// untouched until the callback fires. The descriptor must remain open until
+/// the operation completes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_readlinkat(
   lio: *mut lio_handle_t,
@@ -1545,33 +1602,39 @@ pub unsafe extern "C" fn lio_readlinkat(
   buf_len: usize,
   callback: extern "C" fn(libc::c_int, *mut u8, usize),
 ) {
-  let Some(path) = (unsafe { cstr_to_owned(path) }) else {
-    callback(-libc::EINVAL, buf, buf_len);
+  let Some(buf) = (unsafe { lend_empty(buf, buf_len, callback) }) else {
     return;
   };
-  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
+  let Some(path) = (unsafe { cstr_to_owned(path) }) else {
+    return_buf(
+      callback,
+      Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+      buf,
+    );
+    return;
+  };
   let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
-  api::readlinkat(&dir_res, path, vec)
-    .with_lio(&unsafe { handle(lio) }.inner)
-    .when_done(move |(res, mut buf)| {
-      let code = match res {
-        Ok(n) => ffi_count(n),
-        Err(e) => -e.raw_os_error().unwrap_or(1),
-      };
-      let ptr = buf.as_mut_ptr();
-      let len = buf.len();
-      std::mem::forget(buf);
-      callback(code, ptr, len);
-    });
+  crate::api::io::Io::from_op(api::ops::ReadlinkAt::new(
+    dir_res.clone(),
+    path,
+    buf,
+  ))
+  .with_lio(&unsafe { handle(lio) }.inner)
+  .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
 
 /// Reads the current working directory into a caller-provided buffer.
 ///
-/// Ownership of `buf` transfers to lio and is returned through `callback`.
+/// lio borrows `buf` until the callback fires and never frees it.
+///
+/// - `callback(result, buf, len)`: the path's length (or negative errno), the
+///   same `buf`, and `len` = bytes of the path written into `buf` (0 on
+///   error). The path is not NUL-terminated.
 ///
 /// # Safety
-/// `lio` must be a valid handle, and `buf` must be a live buffer allocated by
-/// [`lio_buf_alloc`] with length `buf_len`.
+/// `lio` must be a valid handle, and `buf` must point to `buf_len` writable
+/// bytes, which need not be initialized (it may be null if `buf_len` is 0),
+/// that stay valid and untouched until the callback fires.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lio_getcwd(
   lio: *mut lio_handle_t,
@@ -1579,25 +1642,22 @@ pub unsafe extern "C" fn lio_getcwd(
   buf_len: usize,
   callback: extern "C" fn(libc::c_int, *mut u8, usize),
 ) {
-  let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
-  api::getcwd(vec).with_lio(&unsafe { handle(lio) }.inner).when_done(
-    move |(res, mut buf)| {
-      let code = match res {
-        Ok(n) => ffi_count(n),
-        Err(e) => -e.raw_os_error().unwrap_or(1),
-      };
-      let ptr = buf.as_mut_ptr();
-      let len = buf.len();
-      std::mem::forget(buf);
-      callback(code, ptr, len);
-    },
-  );
+  let Some(buf) = (unsafe { lend_empty(buf, buf_len, callback) }) else {
+    return;
+  };
+  crate::api::io::Io::from_op(api::ops::GetCwd::new(buf))
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
 
 /// Reads one batch of directory entries from an open directory descriptor.
 ///
-/// The buffers returned through `callback` must be released with
-/// [`lio_buf_free`] and [`lio_dir_entries_free`], respectively.
+/// - `callback(result, names, names_len, entries, entries_len, eof)`: 0 (or
+///   negative errno); the entry names, `names_len` bytes, which each entry
+///   indexes with `name_offset`/`name_len`; `entries_len` entries; and whether
+///   the end of the directory was reached. Both arrays are allocated by lio
+///   (null when empty or on error) and the caller must release them with
+///   [`lio_buf_free`] and [`lio_dir_entries_free`], respectively.
 ///
 /// # Safety
 /// `lio` must be a valid handle, and `fd` must be a valid open directory file
@@ -1637,12 +1697,21 @@ pub unsafe extern "C" fn lio_readdir(
           ino: entry.ino.unwrap_or(0),
         })
         .collect();
-      let (entries_ptr, entries_len) = readdir_entries_into_ffi(entries);
-
+      let raw = &buf.raw[..buf.result.raw_written];
       let eof = i32::from(buf.result.eof);
-      let (raw_ptr, raw_len) =
-        readdir_raw_into_ffi(buf.raw[..buf.result.raw_written].to_vec());
-      callback(0, raw_ptr, raw_len, entries_ptr, entries_len, eof);
+      match (malloc_copy(raw), malloc_copy(&entries)) {
+        (Some(raw_ptr), Some(entries_ptr)) => {
+          callback(0, raw_ptr, raw.len(), entries_ptr, entries.len(), eof)
+        }
+        (raw_ptr, entries_ptr) => {
+          // SAFETY: whichever copy succeeded is ours alone and unused.
+          unsafe {
+            lio_buf_free(raw_ptr.unwrap_or(ptr::null_mut()));
+            lio_dir_entries_free(entries_ptr.unwrap_or(ptr::null_mut()));
+          }
+          callback(-libc::ENOMEM, ptr::null_mut(), 0, ptr::null_mut(), 0, 1)
+        }
+      }
     }
     Err(e) => callback(
       -e.raw_os_error().unwrap_or(1),
@@ -2054,12 +2123,14 @@ pub unsafe extern "C" fn lio_spawn(
 // /// 4096 bytes. Returns 0 when end of directory is reached.
 // ///
 // /// - `fd`: Open directory file descriptor
-// /// - `buf`: Buffer to read entries into (must be malloc'd)
+// /// - `buf`: Buffer to read entries into, borrowed until the callback fires
 // /// - `buf_len`: Size of buffer
-// /// - `callback(result, buf, len)`: bytes read (0=EOF, negative=error), buffer
+// /// - `callback(result, buf, len)`: bytes read (0=EOF, negative=error), the
+// ///   same buffer, bytes read
 // ///
 // /// # Safety
-// /// `lio` must be valid; `fd` must be an open directory; `buf` must be malloc'd.
+// /// `lio` must be valid; `fd` must be an open directory; `buf` must point to
+// /// `buf_len` writable bytes that stay valid until the callback fires.
 // #[unsafe(no_mangle)]
 // pub unsafe extern "C" fn lio_getdents(
 //   lio: *mut lio_handle_t,
@@ -2068,23 +2139,17 @@ pub unsafe extern "C" fn lio_spawn(
 //   buf_len: libc::size_t,
 //   callback: extern "C" fn(libc::c_int, *mut u8, libc::size_t),
 // ) {
-//   // SAFETY: C caller transfers malloc ownership of buf with size buf_len
-//   let vec = unsafe { Vec::from_raw_parts(buf, 0, buf_len) };
+//   let Some(buf) = (unsafe { lend_empty(buf, buf_len, callback) }) else {
+//     return;
+//   };
 //   // SAFETY: caller guarantees fd is valid per fn contract
 //   let resource = unsafe { fd_to_borrowed_resource(fd) };
 //   // SAFETY: caller guarantees lio is valid per fn contract
-//   api::getdents(&resource, vec)
+//   api::getdents(&resource, buf)
 //     .with_lio(&unsafe { handle(lio) }.inner)
-//     .when_done(move |(res, mut buf, _entries)| {
+//     .when_done(move |(res, buf, _entries)| {
 //       // We ignore the parsed entries and just return raw bytes
-//       let code = match res {
-//         Ok(n) => n,
-//         Err(e) => -e.raw_os_error().unwrap_or(1),
-//       };
-//       let ptr = buf.as_mut_ptr();
-//       let len = buf.len();
-//       std::mem::forget(buf);
-//       callback(code, ptr, len);
+//       return_buf(callback, res, buf);
 //     });
 // }
 //
@@ -2292,7 +2357,7 @@ mod rw_offset_tests {
         let bytes =
           unsafe { std::slice::from_raw_parts(buf as *const u8, len) }.to_vec();
         // SAFETY: as above; it is not used after this.
-        unsafe { lio_buf_free(buf as *mut u8, len) };
+        unsafe { lio_buf_free(buf as *mut u8) };
         return (code, bytes);
       }
       // SAFETY: `lio` is a live handle from `lio_create`.
@@ -2363,7 +2428,8 @@ mod rw_offset_tests {
   }
 
   /// An offset past `INT64_MAX` fails with `-EINVAL` and hands the buffer
-  /// back untouched, without a handle or descriptor being used.
+  /// back untouched, without a handle or descriptor being used. A write
+  /// reports `len = buf_len`, a failed read `len = 0`.
   #[test]
   fn offset_past_int64_max_is_einval() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -2378,7 +2444,7 @@ mod rw_offset_tests {
       unsafe {
         lio_read_at(ptr::null_mut(), -1, buf_with(b"data"), 4, offset, on_rw)
       };
-      assert_eq!(wait(ptr::null_mut()), (-libc::EINVAL, b"data".to_vec()));
+      assert_eq!(wait(ptr::null_mut()), (-libc::EINVAL, Vec::new()));
     }
   }
 }
@@ -2412,44 +2478,193 @@ fn open_flags_from_posix(bits: libc::c_int) -> Option<api::OpenFlags> {
 }
 
 #[cfg(test)]
-mod readdir_ownership_tests {
+mod buffer_ownership_tests {
+  //! lio borrows C buffers and never frees them. These tests drive the
+  //! scripted backend, which writes into read buffers on completion and drain
+  //! as the kernel would, so Miri also checks that lio neither frees nor
+  //! touches C memory it does not own at the wrong time.
+
   use super::*;
+  use crate::backend::testing::{Checked, POISON, ScriptedBackend};
+  use std::sync::Mutex;
+
+  /// What a buffer callback reported: result, pointer and length.
+  type Report = Mutex<Vec<(libc::c_int, usize, usize)>>;
+
+  fn record(report: &Report, code: libc::c_int, buf: *mut u8, len: usize) {
+    report.lock().unwrap().push((code, buf as usize, len));
+  }
+
+  fn take(report: &Report) -> Vec<(libc::c_int, usize, usize)> {
+    mem::take(&mut *report.lock().unwrap())
+  }
+
+  /// A C handle over a scripted backend, which never touches a descriptor.
+  fn scripted_handle(backend: &ScriptedBackend) -> *mut lio_handle_t {
+    let inner =
+      Lio::new_with_backend(Checked::new(backend.clone()), 8).unwrap();
+    Box::into_raw(Box::new(lio_handle_t { inner }))
+  }
+
+  /// Completes every in-flight operation with `result` and runs callbacks.
+  fn complete_all(lio: *mut lio_handle_t, backend: &ScriptedBackend, n: isize) {
+    unsafe { lio_tick(lio) };
+    backend.complete_all(n);
+    unsafe { lio_tick(lio) };
+  }
 
   #[test]
-  fn ffi_readdir_allocations_round_trip_for_multiple_lengths() {
-    // Spare Vec capacity must not affect deallocation by the reported length.
-    for len in [0, 1, 2, 3, 7, 32, 100, 1024] {
-      for _ in 0..16 {
-        let mut raw = Vec::with_capacity(len + 17);
-        raw.extend((0..len).map(|i| i as u8));
-        let (raw_ptr, raw_len) = readdir_raw_into_ffi(raw);
-        assert_eq!(raw_len, len);
-        assert_eq!(
-          unsafe { std::slice::from_raw_parts(raw_ptr, raw_len) },
-          (0..len).map(|i| i as u8).collect::<Vec<_>>()
-        );
-        unsafe { lio_buf_free(raw_ptr, raw_len) };
+  fn read_reports_bytes_read_and_frees_by_pointer_alone() {
+    static READ: Report = Mutex::new(Vec::new());
+    extern "C" fn on_read(code: libc::c_int, buf: *mut u8, len: usize) {
+      record(&READ, code, buf, len);
+    }
 
-        let mut entries = Vec::with_capacity(len + 17);
-        entries.resize(len, lio_dir_entry_t::default());
-        for (i, entry) in entries.iter_mut().enumerate() {
-          entry.name_offset = i as u32;
-        }
-        let (entries_ptr, entries_len) = readdir_entries_into_ffi(entries);
-        assert_eq!(entries_len, len);
-        for (i, entry) in
-          unsafe { std::slice::from_raw_parts(entries_ptr, entries_len) }
-            .iter()
-            .enumerate()
-        {
+    let backend = ScriptedBackend::new();
+    let lio = scripted_handle(&backend);
+    let buf = lio_buf_alloc(4096);
+    assert!(!buf.is_null());
+    unsafe { lio_read(lio, 0, buf, 4096, on_read) };
+    complete_all(lio, &backend, 100);
+
+    assert_eq!(take(&READ), [(100, buf as usize, 100)]);
+    let read = unsafe { std::slice::from_raw_parts(buf, 100) };
+    assert!(read.iter().all(|&b| b == POISON));
+    // The documented release takes no length. It used to take one, and C
+    // passing the reported `len` (100, not 4096) freed with the wrong layout.
+    unsafe {
+      lio_buf_free(buf);
+      lio_destroy(lio);
+    }
+  }
+
+  #[test]
+  fn buffers_from_any_allocator_stay_with_the_caller() {
+    static DONE: Report = Mutex::new(Vec::new());
+    extern "C" fn on_done(code: libc::c_int, buf: *mut u8, len: usize) {
+      record(&DONE, code, buf, len);
+    }
+
+    let backend = ScriptedBackend::new();
+    let lio = scripted_handle(&backend);
+
+    // Part of a Rust allocation, a `malloc` allocation, and a stack array.
+    let mut vec = vec![7u8; 64];
+    let part = unsafe { vec.as_mut_ptr().add(16) };
+    let malloced = unsafe { libc::malloc(32) }.cast::<u8>();
+    assert!(!malloced.is_null());
+    let mut stack = *b"stack data";
+    unsafe {
+      lio_read(lio, 0, part, 8, on_done);
+      lio_recv(lio, 0, malloced, 32, 0, on_done);
+      lio_send(lio, 0, stack.as_mut_ptr(), stack.len(), 0, on_done);
+    }
+    complete_all(lio, &backend, 3);
+
+    let mut reports = take(&DONE);
+    reports.sort_unstable();
+    let mut expected = [
+      (3, part as usize, 3),
+      (3, malloced as usize, 3),
+      (3, stack.as_ptr() as usize, stack.len()),
+    ];
+    expected.sort_unstable();
+    assert_eq!(reports, expected);
+
+    // Only the lent bytes were written, and every buffer is still ours.
+    assert!(vec[..16].iter().all(|&b| b == 7));
+    assert!(vec[16..24].iter().all(|&b| b == POISON));
+    assert!(vec[24..].iter().all(|&b| b == 7));
+    assert_eq!(&stack, b"stack data");
+    vec.extend_from_slice(&[1; 1024]);
+    unsafe {
+      libc::free(malloced.cast());
+      lio_destroy(lio);
+    }
+  }
+
+  #[test]
+  fn destroy_with_operations_in_flight_leaves_buffers_to_the_caller() {
+    static NEVER: Report = Mutex::new(Vec::new());
+    extern "C" fn on_done(code: libc::c_int, buf: *mut u8, len: usize) {
+      record(&NEVER, code, buf, len);
+    }
+
+    let backend = ScriptedBackend::new();
+    let lio = scripted_handle(&backend);
+    let mut read_buf = vec![0u8; 32];
+    let mut write_buf = b"in flight".to_vec();
+    unsafe {
+      lio_read(lio, 0, read_buf.as_mut_ptr(), read_buf.len(), on_done);
+      lio_write(lio, 0, write_buf.as_mut_ptr(), write_buf.len(), on_done);
+      lio_tick(lio);
+    }
+    assert_eq!(backend.in_flight().len(), 2);
+
+    unsafe { lio_destroy(lio) };
+
+    assert!(take(&NEVER).is_empty(), "destroyed operations never call back");
+    // Draining wrote into the read buffer like a kernel finishing the request,
+    // and both buffers are still valid and owned here.
+    assert!(read_buf.iter().all(|&b| b == POISON));
+    assert_eq!(write_buf, b"in flight");
+    read_buf.extend_from_slice(&[1; 1024]);
+    write_buf.extend_from_slice(&[1; 1024]);
+  }
+
+  #[test]
+  fn null_buffer_is_rejected_unless_empty() {
+    static DONE: Report = Mutex::new(Vec::new());
+    extern "C" fn on_done(code: libc::c_int, buf: *mut u8, len: usize) {
+      record(&DONE, code, buf, len);
+    }
+
+    // Rejected before the handle is used.
+    unsafe {
+      lio_read(ptr::null_mut(), 0, ptr::null_mut(), 16, on_done);
+      lio_write(ptr::null_mut(), 0, ptr::null_mut(), 16, on_done);
+    }
+    assert_eq!(take(&DONE), [(-libc::EINVAL, 0, 0), (-libc::EINVAL, 0, 0)]);
+
+    let backend = ScriptedBackend::new();
+    let lio = scripted_handle(&backend);
+    unsafe { lio_read(lio, 0, ptr::null_mut(), 0, on_done) };
+    complete_all(lio, &backend, 0);
+    assert_eq!(take(&DONE), [(0, 0, 0)]);
+    unsafe { lio_destroy(lio) };
+  }
+
+  #[test]
+  fn readdir_allocations_free_by_pointer_alone() {
+    for len in [0, 1, 2, 3, 7, 32, 100, 1024] {
+      let raw: Vec<u8> = (0..len).map(|i| i as u8).collect();
+      let raw_ptr = malloc_copy(&raw).unwrap();
+      assert_eq!(raw_ptr.is_null(), len == 0);
+      if len > 0 {
+        assert_eq!(unsafe { std::slice::from_raw_parts(raw_ptr, len) }, raw);
+      }
+      unsafe { lio_buf_free(raw_ptr) };
+
+      let entries: Vec<lio_dir_entry_t> = (0..len)
+        .map(|i| lio_dir_entry_t {
+          name_offset: i as u32,
+          ..Default::default()
+        })
+        .collect();
+      let entries_ptr = malloc_copy(&entries).unwrap();
+      if len > 0 {
+        assert!(entries_ptr.is_aligned());
+        let copied = unsafe { std::slice::from_raw_parts(entries_ptr, len) };
+        for (i, entry) in copied.iter().enumerate() {
           assert_eq!(entry.name_offset, i as u32);
         }
-        unsafe { lio_dir_entries_free(entries_ptr, entries_len) };
       }
+      unsafe { lio_dir_entries_free(entries_ptr) };
     }
     unsafe {
-      lio_buf_free(ptr::null_mut(), 0);
-      lio_dir_entries_free(ptr::null_mut(), 0);
+      lio_buf_free(ptr::null_mut());
+      lio_dir_entries_free(ptr::null_mut());
+      lio_sockaddr_free(ptr::null());
     }
   }
 }

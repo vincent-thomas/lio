@@ -253,41 +253,46 @@ extern "C" {
 #endif // __cplusplus
 
 /**
- * Allocate a buffer suitable for lio FFI read/write operations.
+ * Allocate `len` zeroed bytes.
  *
- * Buffers passed to lio read/write/send/recv functions must come from this
- * function and must eventually be released with [`lio_buf_free`].
+ * A convenience only: operations borrow their buffers, so any memory works.
+ * Release the result with [`lio_buf_free`], never `free`.
+ *
+ * Returns null if the allocation fails.
  */
 uint8_t *lio_buf_alloc(uintptr_t len);
 
 /**
- * Free a buffer allocated by [`lio_buf_alloc`] or returned by an FFI callback.
+ * Free a byte buffer from [`lio_buf_alloc`] or one lio handed out, such as the
+ * names buffer of [`lio_readdir`]. Null is ignored.
+ *
+ * Do not pass it memory from anywhere else; lio never frees buffers it
+ * borrowed for an operation, so those stay the caller's to release.
  *
  * # Safety
- * `buf` must have been allocated by [`lio_buf_alloc`] with capacity `len` and
- * must not be used after this call.
+ * `buf` must be null or such a buffer, not freed before, and must not be used
+ * after this call.
  */
-void lio_buf_free(uint8_t *buf, uintptr_t len);
+void lio_buf_free(uint8_t *buf);
 
 /**
  * Free a socket address allocated by lio, such as the address returned by
- * [`lio_accept`] or [`lio_recvfrom`].
+ * [`lio_accept`] or [`lio_recvfrom`]. Null is ignored.
  *
  * # Safety
- * `addr` must be a pointer returned by lio and must not be used after this
- * call.
+ * `addr` must be null or a pointer returned by lio, not freed before, and
+ * must not be used after this call.
  */
-void lio_sockaddr_free(sockaddr_storage *addr);
+void lio_sockaddr_free(const sockaddr_storage *addr);
 
 /**
- * Free a directory entry array returned by [`lio_readdir`].
+ * Free a directory entry array returned by [`lio_readdir`]. Null is ignored.
  *
  * # Safety
- * `entries` must be null or the pointer returned by [`lio_readdir`], and
- * `len` must be the length returned with that pointer. The entries must not be
- * used after this call.
+ * `entries` must be null or an array returned by [`lio_readdir`], not freed
+ * before. The entries must not be used after this call.
  */
-void lio_dir_entries_free(struct lio_dir_entry_t *entries, uintptr_t len);
+void lio_dir_entries_free(struct lio_dir_entry_t *entries);
 
 /**
  * Create a new lio driver with the given operation capacity.
@@ -302,6 +307,13 @@ struct lio_handle_t *lio_create(unsigned int capacity);
  * Destroy a lio handle created by [`lio_create`].
  *
  * After this call `lio` is invalid.
+ *
+ * Operations still in flight are cancelled and their callbacks never fire.
+ * lio does not free their buffers: they stay owned by the caller, and must
+ * remain valid until this call returns. (If a backend cannot confirm in time
+ * that the kernel let go of an operation, lio leaks its own state rather than
+ * free it under the kernel; a caller that cannot rule this out should not
+ * reuse the buffers of operations it destroyed in flight.)
  *
  * # Safety
  * `lio` must have been returned by [`lio_create`] and must not be used
@@ -364,16 +376,16 @@ void lio_listen(struct lio_handle_t *lio, intptr_t fd, int backlog, void (*callb
  * Write data to `fd` at the absolute file `offset`.  Use [`lio_write`] to
  * write at the current position.
  *
- * Ownership of `buf` (which must have been `malloc`'d with at least `buf_len`
- * bytes) transfers to lio.  The callback receives the original pointer so the
- * caller can `free` it.
+ * lio borrows `buf` until the callback fires and never frees it.
  *
- * - `callback(result, buf, len)`: bytes written (or negative errno), buffer;
- *   `-EINVAL` without writing when `offset` exceeds `INT64_MAX`
+ * - `callback(result, buf, len)`: bytes written (or negative errno), the
+ *   same `buf`, and `len = buf_len`; `-EINVAL` without writing when `offset`
+ *   exceeds `INT64_MAX`
  *
  * # Safety
- * `lio` must be valid; `buf` must point to at least `buf_len` bytes allocated
- * with `malloc`.
+ * `lio` must be valid; `fd` must be a valid open file descriptor; and `buf`
+ * must point to `buf_len` initialized bytes (it may be null if `buf_len` is
+ * 0) that stay valid and untouched until the callback fires.
  */
 void lio_write_at(struct lio_handle_t *lio,
                   intptr_t fd,
@@ -386,13 +398,17 @@ void lio_write_at(struct lio_handle_t *lio,
  * Read from `fd` at the absolute file `offset` into `buf`.  Use [`lio_read`]
  * to read from the current position.
  *
- * Ownership of `buf` transfers to lio (see [`lio_write_at`]).
+ * lio borrows `buf` until the callback fires and never frees it.
  *
- * - `callback(result, buf, len)`: bytes read (or negative errno), buffer;
- *   `-EINVAL` without reading when `offset` exceeds `INT64_MAX`
+ * - `callback(result, buf, len)`: bytes read (or negative errno), the same
+ *   `buf`, and `len` = bytes read (0 on error); `-EINVAL` without reading
+ *   when `offset` exceeds `INT64_MAX`
  *
  * # Safety
- * Same requirements as [`lio_write_at`].
+ * `lio` must be valid; `fd` must be a valid open file descriptor; and `buf`
+ * must point to `buf_len` writable bytes, which need not be initialized (it
+ * may be null if `buf_len` is 0), that stay valid and untouched until the
+ * callback fires.
  */
 void lio_read_at(struct lio_handle_t *lio,
                  intptr_t fd,
@@ -420,8 +436,8 @@ void lio_socket(struct lio_handle_t *lio,
  * Accept a connection.
  *
  * - `callback(result, addr)`: new socket fd on success (negative errno on
- *   error); `addr` is heap-allocated `sockaddr_storage` — **caller must free
- *   it** — or null on error.
+ *   error); `addr` is the peer address, allocated by lio, which the caller
+ *   must release with [`lio_sockaddr_free`] — or null on error.
  *
  * # Safety
  * `lio` must be valid; `fd` must be a listening socket.
@@ -432,13 +448,15 @@ void lio_accept(struct lio_handle_t *lio, intptr_t fd, void (*callback)(intptr_t
 /**
  * Send data on a connected socket.
  *
- * Ownership of `buf` transfers to lio (see [`lio_write_at`]).
+ * lio borrows `buf` until the callback fires and never frees it.
  *
- * - `callback(result, buf, len)`: bytes sent (or negative errno), buffer
+ * - `callback(result, buf, len)`: bytes sent (or negative errno), the same
+ *   `buf`, and `len = buf_len`
  *
  * # Safety
- * `lio` must be valid; `buf` must point to at least `buf_len` bytes allocated
- * with `malloc`.
+ * `lio` must be valid; `fd` must be a valid open socket; and `buf` must point
+ * to `buf_len` initialized bytes (it may be null if `buf_len` is 0) that stay
+ * valid and untouched until the callback fires.
  */
 void lio_send(struct lio_handle_t *lio,
               intptr_t fd,
@@ -450,13 +468,15 @@ void lio_send(struct lio_handle_t *lio,
 /**
  * Receive data from a socket.
  *
- * Ownership of `buf` transfers to lio (see [`lio_write_at`]).
+ * lio borrows `buf` until the callback fires and never frees it.
  *
- * - `callback(result, buf, len)`: bytes received (or negative errno), buffer
+ * - `callback(result, buf, len)`: bytes received (or negative errno), the
+ *   same `buf`, and `len` = bytes received (0 on error)
  *
  * # Safety
- * `lio` must be valid; `buf` must be a live buffer previously allocated by
- * [`lio_buf_alloc(buf_len)`].
+ * `lio` must be valid; `fd` must be a valid open socket; and `buf` must point
+ * to `buf_len` writable bytes, which need not be initialized (it may be null
+ * if `buf_len` is 0), that stay valid and untouched until the callback fires.
  */
 void lio_recv(struct lio_handle_t *lio,
               intptr_t fd,
@@ -468,11 +488,18 @@ void lio_recv(struct lio_handle_t *lio,
 /**
  * Receive data and sender address from a socket.
  *
- * Ownership of `buf` transfers to lio and is returned through `callback`.
+ * lio borrows `buf` until the callback fires and never frees it.
+ *
+ * - `callback(result, buf, len, addr)`: bytes received (or negative errno),
+ *   the same `buf`, `len` = bytes received (0 on error), and the sender
+ *   address, which the caller must release with [`lio_sockaddr_free`], or
+ *   null
  *
  * # Safety
  * `lio` must be a valid handle; `fd` must be a valid open socket; and `buf`
- * must be a live buffer allocated by [`lio_buf_alloc`] with length `buf_len`.
+ * must point to `buf_len` writable bytes, which need not be initialized (it
+ * may be null if `buf_len` is 0), that stay valid and untouched until the
+ * callback fires.
  */
 void lio_recvfrom(struct lio_handle_t *lio,
                   intptr_t fd,
@@ -529,13 +556,16 @@ void lio_connect(struct lio_handle_t *lio,
 /**
  * Send data to a specific address (UDP).
  *
- * Ownership of `buf` transfers to lio.
+ * lio borrows `buf` until the callback fires and never frees it.
  *
- * - `callback(result, buf, len)`: bytes sent (or negative errno), buffer
+ * - `callback(result, buf, len)`: bytes sent (or negative errno), the same
+ *   `buf`, and `len = buf_len`
  *
  * # Safety
- * `lio` must be valid; `buf` must be allocated with malloc; `addr` must be
- * valid.
+ * `lio` must be valid; `fd` must be a valid open socket; `buf` must point to
+ * `buf_len` initialized bytes (it may be null if `buf_len` is 0) that stay
+ * valid and untouched until the callback fires; and a non-null `addr` must be
+ * readable for `addr_len` bytes.
  */
 void lio_sendto(struct lio_handle_t *lio,
                 intptr_t fd,
@@ -568,12 +598,11 @@ void lio_openat(struct lio_handle_t *lio,
 /**
  * Read from fd at current position.
  *
- * Ownership of `buf` transfers to lio.
- *
- * - `callback(result, buf, len)`: bytes read (or negative errno), buffer
+ * Equivalent to [`lio_read_at`] with `offset = -1`, with the same buffer
+ * rules and callback.
  *
  * # Safety
- * `lio` must be valid; `buf` must be allocated with malloc.
+ * Same requirements as [`lio_read_at`].
  */
 void lio_read(struct lio_handle_t *lio,
               intptr_t fd,
@@ -584,12 +613,11 @@ void lio_read(struct lio_handle_t *lio,
 /**
  * Write to fd at current position.
  *
- * Ownership of `buf` transfers to lio.
- *
- * - `callback(result, buf, len)`: bytes written (or negative errno), buffer
+ * Equivalent to [`lio_write_at`] with `offset = -1`, with the same buffer
+ * rules and callback.
  *
  * # Safety
- * `lio` must be valid; `buf` must be allocated with malloc.
+ * Same requirements as [`lio_write_at`].
  */
 void lio_write(struct lio_handle_t *lio,
                intptr_t fd,
@@ -699,13 +727,19 @@ void lio_fstat(struct lio_handle_t *lio,
 /**
  * Reads the target of a symbolic link relative to a directory file descriptor.
  *
- * Ownership of `buf` transfers to lio and is returned through `callback`.
+ * lio borrows `buf` until the callback fires and never frees it.
+ *
+ * - `callback(result, buf, len)`: the target's length (or negative errno),
+ *   the same `buf`, and `len` = bytes of the target written into `buf` (0 on
+ *   error). The target is not NUL-terminated.
  *
  * # Safety
  * `lio` must be a valid handle; `dir_fd` must be a valid open directory file
  * descriptor; a non-null `path` must point to a valid NUL-terminated string;
- * and `buf` must be a live buffer allocated by [`lio_buf_alloc`] with length
- * `buf_len`. The descriptor must remain open until the operation completes.
+ * and `buf` must point to `buf_len` writable bytes, which need not be
+ * initialized (it may be null if `buf_len` is 0), that stay valid and
+ * untouched until the callback fires. The descriptor must remain open until
+ * the operation completes.
  */
 void lio_readlinkat(struct lio_handle_t *lio,
                     intptr_t dir_fd,
@@ -717,11 +751,16 @@ void lio_readlinkat(struct lio_handle_t *lio,
 /**
  * Reads the current working directory into a caller-provided buffer.
  *
- * Ownership of `buf` transfers to lio and is returned through `callback`.
+ * lio borrows `buf` until the callback fires and never frees it.
+ *
+ * - `callback(result, buf, len)`: the path's length (or negative errno), the
+ *   same `buf`, and `len` = bytes of the path written into `buf` (0 on
+ *   error). The path is not NUL-terminated.
  *
  * # Safety
- * `lio` must be a valid handle, and `buf` must be a live buffer allocated by
- * [`lio_buf_alloc`] with length `buf_len`.
+ * `lio` must be a valid handle, and `buf` must point to `buf_len` writable
+ * bytes, which need not be initialized (it may be null if `buf_len` is 0),
+ * that stay valid and untouched until the callback fires.
  */
 void lio_getcwd(struct lio_handle_t *lio,
                 uint8_t *buf,
@@ -731,8 +770,12 @@ void lio_getcwd(struct lio_handle_t *lio,
 /**
  * Reads one batch of directory entries from an open directory descriptor.
  *
- * The buffers returned through `callback` must be released with
- * [`lio_buf_free`] and [`lio_dir_entries_free`], respectively.
+ * - `callback(result, names, names_len, entries, entries_len, eof)`: 0 (or
+ *   negative errno); the entry names, `names_len` bytes, which each entry
+ *   indexes with `name_offset`/`name_len`; `entries_len` entries; and whether
+ *   the end of the directory was reached. Both arrays are allocated by lio
+ *   (null when empty or on error) and the caller must release them with
+ *   [`lio_buf_free`] and [`lio_dir_entries_free`], respectively.
  *
  * # Safety
  * `lio` must be a valid handle, and `fd` must be a valid open directory file

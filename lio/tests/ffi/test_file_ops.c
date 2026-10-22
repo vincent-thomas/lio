@@ -345,8 +345,8 @@ static void test_buffer_ownership_read(void) {
     tick_until_flag(lio, &g_rw_called, 1000);
 
     ASSERT(g_rw_called, "callback should be called");
-    ASSERT_NOT_NULL(g_rw_buf, "buffer must be returned");
-    ASSERT_EQ(g_rw_len, 32, "buffer length should be preserved");
+    ASSERT(g_rw_buf == buf, "the same buffer must be returned");
+    ASSERT_EQ(g_rw_len, 0, "a failed read reports no bytes read");
     free(g_rw_buf);
 
     lio_destroy(lio);

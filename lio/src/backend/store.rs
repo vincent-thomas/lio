@@ -196,6 +196,12 @@ impl OpStore {
     let slot = self.slots.get_mut(key)?;
     Some(&mut slot.step_bump)
   }
+
+  /// Sets the generation of a slot, as if it had been used that many times.
+  #[cfg(test)]
+  pub fn set_generation(&mut self, slot: u32, generation: u32) {
+    self.slots.set_generation(slot, generation);
+  }
 }
 
 /// Drops a registration that was written into a slot not claimed yet, if
@@ -395,6 +401,29 @@ mod tests {
     assert!(result.is_err());
     assert!(store.get_mut(id).is_none(), "the stale id no longer resolves");
     assert!(!store.is_full(), "the slot is free again");
+  }
+
+  #[test]
+  fn a_spent_slot_is_replaced_with_its_arenas() {
+    let mut store = OpStore::with_capacity(1);
+    store.set_generation(0, u32::MAX);
+    let spent = store.insert_with(dummy_stored_op);
+    store.step_bump_mut(spent).unwrap().alloc(0u8);
+    let Detached { registration, slot } = store.detach(spent).unwrap();
+    drop(registration);
+    assert!(store.is_full(), "held until released");
+    store.release(slot);
+    assert!(!store.is_full(), "a replacement is free");
+
+    let (id, _, bump) = store.insert_with_action(dummy_stored_op);
+    assert!(bump.allocated_bytes() > 0, "the replacement took the arenas");
+    let key = SlabKey::from_u64(id);
+    assert_eq!((key.slot(), key.generation()), (1, 0));
+    assert!(store.is_full(), "the capacity is still one");
+    assert!(store.get_mut(spent).is_none());
+    assert!(store.step_bump_mut(spent).is_none());
+    assert!(store.get_mut(id).is_some());
+    assert!(store.remove(id));
   }
 
   #[test]
