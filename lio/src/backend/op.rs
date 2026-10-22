@@ -4,7 +4,7 @@
 //! as pure data. Backends match on this enum to execute operations.
 
 use crate::api::resource::Resource;
-use std::ffi::OsString;
+use std::ffi::{CStr, OsString, c_char};
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -335,6 +335,47 @@ unsafe impl Send for RawBuf {}
 // SAFETY: Same as Send - we only access through the owning TypedOp.
 unsafe impl Sync for RawBuf {}
 
+/// A NUL-terminated path owned by the op model, handed to the backend
+/// without copying.
+///
+/// On Unix the bytes are the native path. On Windows they are UTF-8;
+/// backends reject other bytes as invalid input. The memory stays valid, and
+/// unchanged, while the operation is in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawPath(NonNull<c_char>);
+
+impl RawPath {
+  /// Points at `path`, which must outlive the operation it is submitted with.
+  #[inline]
+  pub fn new(path: &CStr) -> Self {
+    Self(NonNull::from(path.to_bytes_with_nul()).cast())
+  }
+
+  /// The pointer to the path's first byte, as C APIs take it.
+  #[inline]
+  pub const fn as_ptr(self) -> *const c_char {
+    self.0.as_ptr()
+  }
+
+  /// The path this points to.
+  ///
+  /// # Safety
+  ///
+  /// The path it was made from must still be alive and unchanged, as it is
+  /// for an operation in flight, for as long as the result is used.
+  #[inline]
+  pub unsafe fn as_c_str<'a>(self) -> &'a CStr {
+    // SAFETY: the caller guarantees `self` still points to the
+    // NUL-terminated path it was made from.
+    unsafe { CStr::from_ptr(self.as_ptr()) }
+  }
+}
+
+// SAFETY: like `RawBuf`, a pointer into memory owned by the operation's model.
+unsafe impl Send for RawPath {}
+// SAFETY: it is never written through.
+unsafe impl Sync for RawPath {}
+
 #[derive(Clone, Copy, Debug)]
 pub struct MsgBuf {
   pub ptr: NonNull<u8>,
@@ -608,7 +649,7 @@ impl FileStat {
 
 #[derive(Clone, Debug)]
 pub enum StatTarget {
-  Path { dir_fd: Resource, path: OsString, follow_symlinks: bool },
+  Path { dir_fd: Resource, path: RawPath, follow_symlinks: bool },
   Fd { fd: Resource },
 }
 
@@ -783,7 +824,7 @@ pub enum Op {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
     /// Platform-native path.
-    path: OsString,
+    path: RawPath,
     /// Semantic open flags.
     flags: OpenFlags,
     /// File creation mode used when creating a file.
@@ -797,7 +838,7 @@ pub enum Op {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
     /// Platform-native path.
-    path: OsString,
+    path: RawPath,
     /// Whether to remove a file-like object or directory.
     kind: UnlinkKind,
   },
@@ -809,11 +850,11 @@ pub enum Op {
     /// Directory file descriptor used as the base for the old path.
     old_dir_fd: Resource,
     /// Null-terminated old pathname pointer.
-    old_path: OsString,
+    old_path: RawPath,
     /// Directory file descriptor used as the base for the new path.
     new_dir_fd: Resource,
     /// Null-terminated new pathname pointer.
-    new_path: OsString,
+    new_path: RawPath,
   },
   /// Create a directory relative to a directory file descriptor.
   ///
@@ -823,7 +864,7 @@ pub enum Op {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
     /// Platform-native path.
-    path: OsString,
+    path: RawPath,
     /// Directory creation mode.
     mode: FileMode,
   },
@@ -837,11 +878,11 @@ pub enum Op {
     /// Directory file descriptor used as the base for the source path.
     source_dir_fd: Resource,
     /// Null-terminated source pathname pointer or symlink target string.
-    source_path: OsString,
+    source_path: RawPath,
     /// Directory file descriptor used as the base for the new path.
     new_dir_fd: Resource,
     /// Null-terminated new pathname pointer.
-    new_path: OsString,
+    new_path: RawPath,
   },
   /// Read the target of a symbolic link relative to a directory file descriptor.
   ///
@@ -852,7 +893,7 @@ pub enum Op {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
     /// Null-terminated pathname pointer.
-    path: OsString,
+    path: RawPath,
     /// Output buffer pointer.
     buf: NonNull<u8>,
     /// Output buffer length.
@@ -913,4 +954,20 @@ pub enum Op {
     fd: Resource,
   },
   Nop,
+}
+
+#[cfg(test)]
+mod tests {
+  use super::RawPath;
+
+  #[test]
+  fn a_raw_path_points_at_the_path_it_was_made_from() {
+    let path = c"dir/file".to_owned();
+    let raw = RawPath::new(&path);
+    assert_eq!(raw.as_ptr(), path.as_ptr());
+    assert_eq!(raw, RawPath::new(&path));
+    // SAFETY: `path` is alive and unchanged.
+    assert_eq!(unsafe { raw.as_c_str() }, path.as_c_str());
+    assert_ne!(raw, RawPath::new(c"dir/file"), "compares the pointer");
+  }
 }

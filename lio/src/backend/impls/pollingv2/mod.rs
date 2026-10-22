@@ -503,15 +503,6 @@ impl Poller {
     self.sys.as_ref().expect("Poller not initialized")
   }
 
-  #[cfg(unix)]
-  fn os_path_to_cstring(
-    path: &std::ffi::OsString,
-  ) -> Result<std::ffi::CString, isize> {
-    use std::os::unix::ffi::OsStrExt;
-    std::ffi::CString::new(path.as_os_str().as_bytes())
-      .map_err(|_| -(libc::EINVAL as isize))
-  }
-
   /// Perform vectored read, choosing the appropriate syscall based on offset and flags
   #[inline]
   fn do_readv(
@@ -909,9 +900,6 @@ impl Poller {
       }
 
       Op::OpenAt { dir_fd, path, flags, mode } => {
-        let Ok(path) = Self::os_path_to_cstring(path) else {
-          return -(libc::EINVAL as isize);
-        };
         match crate::backend::native::open_flags(*flags) {
           Ok(flags) => syscall!(raw openat(
             dir_fd.as_raw_fd(),
@@ -932,9 +920,6 @@ impl Poller {
           } => {
             let flags =
               if *follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
-            let Ok(path) = Self::os_path_to_cstring(path) else {
-              return -(libc::EINVAL as isize);
-            };
             syscall!(raw fstatat(
               dir_fd.as_raw_fd(),
               path.as_ptr(),
@@ -995,9 +980,6 @@ impl Poller {
         }
       }
       Op::UnlinkAt { dir_fd, path, kind } => {
-        let Ok(path) = Self::os_path_to_cstring(path) else {
-          return -(libc::EINVAL as isize);
-        };
         let flags = match kind {
           crate::backend::op::UnlinkKind::File => 0,
           crate::backend::op::UnlinkKind::Directory => libc::AT_REMOVEDIR,
@@ -1005,12 +987,6 @@ impl Poller {
         syscall!(raw unlinkat(dir_fd.as_raw_fd(), path.as_ptr(), flags))
       }
       Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
-        let Ok(old_path) = Self::os_path_to_cstring(old_path) else {
-          return -(libc::EINVAL as isize);
-        };
-        let Ok(new_path) = Self::os_path_to_cstring(new_path) else {
-          return -(libc::EINVAL as isize);
-        };
         syscall!(raw renameat(
           old_dir_fd.as_raw_fd(),
           old_path.as_ptr(),
@@ -1019,9 +995,6 @@ impl Poller {
         ))
       }
       Op::MkdirAt { dir_fd, path, mode } => {
-        let Ok(path) = Self::os_path_to_cstring(path) else {
-          return -(libc::EINVAL as isize);
-        };
         syscall!(raw mkdirat(
           dir_fd.as_raw_fd(),
           path.as_ptr(),
@@ -1031,12 +1004,6 @@ impl Poller {
       Op::LinkAt { kind, source_dir_fd, source_path, new_dir_fd, new_path } => {
         match kind {
           crate::backend::op::LinkKind::Hard => {
-            let Ok(source_path) = Self::os_path_to_cstring(source_path) else {
-              return -(libc::EINVAL as isize);
-            };
-            let Ok(new_path) = Self::os_path_to_cstring(new_path) else {
-              return -(libc::EINVAL as isize);
-            };
             syscall!(raw linkat(
               source_dir_fd.as_raw_fd(),
               source_path.as_ptr(),
@@ -1046,12 +1013,6 @@ impl Poller {
             ))
           }
           crate::backend::op::LinkKind::Soft => {
-            let Ok(source_path) = Self::os_path_to_cstring(source_path) else {
-              return -(libc::EINVAL as isize);
-            };
-            let Ok(new_path) = Self::os_path_to_cstring(new_path) else {
-              return -(libc::EINVAL as isize);
-            };
             syscall!(raw symlinkat(
               source_path.as_ptr(),
               new_dir_fd.as_raw_fd(),
@@ -1061,9 +1022,6 @@ impl Poller {
         }
       }
       Op::ReadlinkAt { dir_fd, path, buf, buf_len } => {
-        let Ok(path) = Self::os_path_to_cstring(path) else {
-          return -(libc::EINVAL as isize);
-        };
         syscall!(raw readlinkat(
           dir_fd.as_raw_fd(),
           path.as_ptr(),

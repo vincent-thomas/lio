@@ -603,6 +603,17 @@ macro_rules! test_io_backend {
       path
     }
 
+    /// `path` as the NUL-terminated bytes a path op carries. Keep it alive
+    /// until the op completes.
+    fn c_path(path: &std::path::Path) -> std::ffi::CString {
+      std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .expect("test paths contain no NUL byte")
+    }
+
+    fn raw_path(path: &std::ffi::CStr) -> __lio_test_lio::backend::op::RawPath {
+      __lio_test_lio::backend::op::RawPath::new(path)
+    }
+
     fn temp_path(prefix: &str) -> PathBuf {
       let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -2136,11 +2147,12 @@ macro_rules! test_io_backend {
         let path = temp_path("openat-ok");
         fs::write(&path, b"hello").unwrap();
 
+        let path_c = c_path(&path);
         push_op(&mut backend,
           80,
           Op::OpenAt {
             dir_fd: Resource::cwd(),
-            path: path.as_os_str().to_os_string(),
+            path: raw_path(&path_c),
             flags: OpenFlags::READ,
             mode: FileMode::from_bits(0),
           },
@@ -2165,11 +2177,12 @@ macro_rules! test_io_backend {
 
         let path = temp_path("openat-missing");
 
+        let path_c = c_path(&path);
         push_op(&mut backend,
           81,
           Op::OpenAt {
             dir_fd: Resource::cwd(),
-            path: path.as_os_str().to_os_string(),
+            path: raw_path(&path_c),
             flags: OpenFlags::READ,
             mode: FileMode::from_bits(0),
           },
@@ -2193,12 +2206,13 @@ macro_rules! test_io_backend {
         fs::write(&path, b"hello").unwrap();
         let mut out = FileStat::zeroed();
 
+        let path_c = c_path(&path);
         push_op(&mut backend,
           82,
           Op::Stat {
             target: __lio_test_lio::backend::op::StatTarget::Path {
               dir_fd: Resource::cwd(),
-              path: path.as_os_str().to_os_string(),
+              path: raw_path(&path_c),
               follow_symlinks: true,
             },
             out: nonnull(&mut out),
@@ -2221,12 +2235,13 @@ macro_rules! test_io_backend {
         let path = temp_path("stat-missing");
         let mut out = FileStat::zeroed();
 
+        let path_c = c_path(&path);
         push_op(&mut backend,
           83,
           Op::Stat {
             target: __lio_test_lio::backend::op::StatTarget::Path {
               dir_fd: Resource::cwd(),
-              path: path.as_os_str().to_os_string(),
+              path: raw_path(&path_c),
               follow_symlinks: true,
             },
             out: nonnull(&mut out),
@@ -2249,12 +2264,13 @@ macro_rules! test_io_backend {
         symlink_file(&target, &link);
         let mut out = FileStat::zeroed();
 
+        let link_c = c_path(&link);
         push_op(&mut backend,
           84,
           Op::Stat {
             target: __lio_test_lio::backend::op::StatTarget::Path {
               dir_fd: Resource::cwd(),
-              path: link.as_os_str().to_os_string(),
+              path: raw_path(&link_c),
               follow_symlinks: false,
             },
             out: nonnull(&mut out),
@@ -2351,11 +2367,12 @@ macro_rules! test_io_backend {
         let path = temp_path("unlinkat-ok");
         fs::write(&path, b"hello").unwrap();
 
+        let path_c = c_path(&path);
         push_op(&mut backend,
           70,
           Op::UnlinkAt {
             dir_fd: Resource::cwd(),
-            path: path.as_os_str().to_os_string(),
+            path: raw_path(&path_c),
             kind: UnlinkKind::File,
           },
         );
@@ -2373,11 +2390,12 @@ macro_rules! test_io_backend {
 
         let path = temp_path("unlinkat-missing");
 
+        let path_c = c_path(&path);
         push_op(&mut backend,
           71,
           Op::UnlinkAt {
             dir_fd: Resource::cwd(),
-            path: path.as_os_str().to_os_string(),
+            path: raw_path(&path_c),
             kind: UnlinkKind::File,
           },
         );
@@ -2401,13 +2419,15 @@ macro_rules! test_io_backend {
         fs::write(&source, b"hello").unwrap();
         fs::remove_file(&dest).ok();
 
+        let source_c = c_path(&source);
+        let dest_c = c_path(&dest);
         push_op(&mut backend,
           72,
           Op::RenameAt {
             old_dir_fd: Resource::cwd(),
-            old_path: source.as_os_str().to_os_string(),
+            old_path: raw_path(&source_c),
             new_dir_fd: Resource::cwd(),
-            new_path: dest.as_os_str().to_os_string(),
+            new_path: raw_path(&dest_c),
           },
         );
         backend.flush().unwrap();
@@ -2428,13 +2448,15 @@ macro_rules! test_io_backend {
         let dest = temp_path("renameat-target");
         fs::remove_file(&dest).ok();
 
+        let source_c = c_path(&source);
+        let dest_c = c_path(&dest);
         push_op(&mut backend,
           73,
           Op::RenameAt {
             old_dir_fd: Resource::cwd(),
-            old_path: source.as_os_str().to_os_string(),
+            old_path: raw_path(&source_c),
             new_dir_fd: Resource::cwd(),
-            new_path: dest.as_os_str().to_os_string(),
+            new_path: raw_path(&dest_c),
           },
         );
         backend.flush().unwrap();
@@ -2455,11 +2477,12 @@ macro_rules! test_io_backend {
         let path = temp_path("mkdirat-ok");
         fs::remove_dir(&path).ok();
 
+        let path_c = c_path(&path);
         push_op(&mut backend,
           74,
           Op::MkdirAt {
             dir_fd: Resource::cwd(),
-            path: path.as_os_str().to_os_string(),
+            path: raw_path(&path_c),
             mode: FileMode::from_bits(0o755),
           },
         );
@@ -2479,11 +2502,12 @@ macro_rules! test_io_backend {
         let path = temp_path("mkdirat-exists");
         fs::create_dir(&path).unwrap();
 
+        let path_c = c_path(&path);
         push_op(&mut backend,
           75,
           Op::MkdirAt {
             dir_fd: Resource::cwd(),
-            path: path.as_os_str().to_os_string(),
+            path: raw_path(&path_c),
             mode: FileMode::from_bits(0o755),
           },
         );
@@ -2508,14 +2532,16 @@ macro_rules! test_io_backend {
         fs::write(&source, b"hello").unwrap();
         fs::remove_file(&dest).ok();
 
+        let source_c = c_path(&source);
+        let dest_c = c_path(&dest);
         push_op(&mut backend,
           76,
           Op::LinkAt {
             kind: LinkKind::Hard,
             source_dir_fd: Resource::cwd(),
-            source_path: source.as_os_str().to_os_string(),
+            source_path: raw_path(&source_c),
             new_dir_fd: Resource::cwd(),
-            new_path: dest.as_os_str().to_os_string(),
+            new_path: raw_path(&dest_c),
           },
         );
         backend.flush().unwrap();
@@ -2537,14 +2563,16 @@ macro_rules! test_io_backend {
         fs::write(&source, b"hello").unwrap();
         fs::remove_file(&dest).ok();
 
+        let source_c = c_path(&source);
+        let dest_c = c_path(&dest);
         push_op(&mut backend,
           77,
           Op::LinkAt {
             kind: LinkKind::Soft,
             source_dir_fd: Resource::cwd(),
-            source_path: source.as_os_str().to_os_string(),
+            source_path: raw_path(&source_c),
             new_dir_fd: Resource::cwd(),
-            new_path: dest.as_os_str().to_os_string(),
+            new_path: raw_path(&dest_c),
           },
         );
         backend.flush().unwrap();
@@ -2568,14 +2596,16 @@ macro_rules! test_io_backend {
         let dest = temp_path("linkat-missing-dest");
         fs::remove_file(&dest).ok();
 
+        let source_c = c_path(&source);
+        let dest_c = c_path(&dest);
         push_op(&mut backend,
           78,
           Op::LinkAt {
             kind: LinkKind::Hard,
             source_dir_fd: Resource::cwd(),
-            source_path: source.as_os_str().to_os_string(),
+            source_path: raw_path(&source_c),
             new_dir_fd: Resource::cwd(),
-            new_path: dest.as_os_str().to_os_string(),
+            new_path: raw_path(&dest_c),
           },
         );
         backend.flush().unwrap();
@@ -2599,11 +2629,12 @@ macro_rules! test_io_backend {
         symlink_file(&target, &link);
         let mut buf = [0_u8; 512];
 
+        let link_c = c_path(&link);
         push_op(&mut backend,
           79,
           Op::ReadlinkAt {
             dir_fd: Resource::cwd(),
-            path: link.as_os_str().to_os_string(),
+            path: raw_path(&link_c),
             buf: nonnull(buf.as_mut_ptr()),
             buf_len: buf.len(),
           },
@@ -2629,11 +2660,12 @@ macro_rules! test_io_backend {
         let link = temp_path("readlinkat-missing");
         let mut buf = [0_u8; 64];
 
+        let link_c = c_path(&link);
         push_op(&mut backend,
           80,
           Op::ReadlinkAt {
             dir_fd: Resource::cwd(),
-            path: link.as_os_str().to_os_string(),
+            path: raw_path(&link_c),
             buf: nonnull(buf.as_mut_ptr()),
             buf_len: buf.len(),
           },

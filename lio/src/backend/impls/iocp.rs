@@ -59,8 +59,9 @@ use crate::backend::impls::sockaddr::{
 use crate::backend::native::CWD as CWD_HANDLE;
 use crate::backend::op::{
   DirEntryRef, FileStat, FileType, LinkKind, MsgRecv, MsgSend, Op,
-  OpaqueDropFn, OpenFlags, RawBuf, ReadDirResult, ShutdownHow, SocketAddrBuf,
-  SocketAddrFamily, SpawnSpec, StatTarget, UnlinkKind, is_valid_file_offset,
+  OpaqueDropFn, OpenFlags, RawBuf, RawPath, ReadDirResult, ShutdownHow,
+  SocketAddrBuf, SocketAddrFamily, SpawnSpec, StatTarget, UnlinkKind,
+  is_valid_file_offset,
 };
 use crate::backend::{IoBackend, OpCompleted};
 
@@ -1361,9 +1362,19 @@ fn final_path(handle: HANDLE) -> io::Result<PathBuf> {
   }
 }
 
+/// The path an operation in flight carries, which lio passes as UTF-8.
+fn os_path(path: &RawPath) -> io::Result<&OsStr> {
+  // SAFETY: the operation carrying `path` is in flight, so the model that
+  // owns the path keeps it alive and unchanged.
+  let bytes = unsafe { path.as_c_str() }.to_bytes();
+  std::str::from_utf8(bytes).map(OsStr::new).map_err(|_| {
+    io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8")
+  })
+}
+
 /// Resolves `path` relative to the directory `dir`, like the `*at` syscalls.
-fn resolve(dir: &Resource, path: &OsStr) -> io::Result<PathBuf> {
-  let path = Path::new(path);
+fn resolve(dir: &Resource, path: &RawPath) -> io::Result<PathBuf> {
+  let path = Path::new(os_path(path)?);
   if path.has_root() || handle_of(dir) == CWD_HANDLE {
     return Ok(path.to_path_buf());
   }
@@ -1372,7 +1383,7 @@ fn resolve(dir: &Resource, path: &OsStr) -> io::Result<PathBuf> {
 
 fn open_at(
   dir: &Resource,
-  path: &OsStr,
+  path: &RawPath,
   flags: OpenFlags,
 ) -> io::Result<isize> {
   if !flags.reads() && !flags.writes() {
@@ -1540,14 +1551,15 @@ fn read_dir(
 fn link_at(
   kind: LinkKind,
   source_dir: &Resource,
-  source: &OsStr,
+  source: &RawPath,
   new_dir: &Resource,
-  new: &OsStr,
+  new: &RawPath,
 ) -> io::Result<()> {
   let new = resolve(new_dir, new)?;
   match kind {
     LinkKind::Hard => fs::hard_link(resolve(source_dir, source)?, new),
     LinkKind::Soft => {
+      let source = os_path(source)?;
       // Windows distinguishes file and directory symlinks; pick by what the
       // target currently is, relative to the link's own directory.
       let target = new.parent().unwrap_or(Path::new("")).join(source);

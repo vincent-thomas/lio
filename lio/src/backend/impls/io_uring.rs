@@ -57,12 +57,6 @@ struct NativeMsgState {
   hdr: libc::msghdr,
 }
 
-#[derive(Debug)]
-struct NativePathState {
-  path1: std::ffi::CString,
-  path2: Option<std::ffi::CString>,
-}
-
 impl NativeMsgState {
   fn from_recv(msg: &crate::backend::op::MsgRecv) -> Option<Self> {
     // The native iovec array is fixed-size; a longer list would make the
@@ -220,7 +214,7 @@ struct NativeSocketState {
 struct NativeStatState {
   statx: lio_uring::statx,
   out: std::ptr::NonNull<crate::backend::op::FileStat>,
-  path: Option<std::ffi::CString>,
+  path: Option<crate::backend::op::RawPath>,
 }
 
 impl NativeStatState {
@@ -232,7 +226,7 @@ impl NativeStatState {
 
   fn with_path(
     out: std::ptr::NonNull<crate::backend::op::FileStat>,
-    path: std::ffi::CString,
+    path: crate::backend::op::RawPath,
   ) -> Self {
     // SAFETY: `statx` is a POD output struct written by the kernel before
     // being read during finalize.
@@ -299,18 +293,9 @@ enum LoweredState {
   Msg(NonNull<NativeMsgState>),
   Socket(NonNull<NativeSocketState>),
   Stat(NonNull<NativeStatState>),
-  Path(NonNull<NativePathState>),
 }
 
 impl LoweredState {
-  fn os_path_to_cstring(
-    path: &std::ffi::OsString,
-  ) -> io::Result<std::ffi::CString> {
-    use std::os::unix::ffi::OsStrExt;
-    std::ffi::CString::new(path.as_os_str().as_bytes())
-      .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
-  }
-
   fn lower_in(op: &Op, arena: &Bump, single_socket: bool) -> io::Result<Self> {
     Ok(match op {
       Op::Read { iovecs, iov_count, .. } => {
@@ -364,28 +349,13 @@ impl LoweredState {
       Op::Stat { target, out } => {
         let state = match target {
           crate::backend::op::StatTarget::Path { path, .. } => {
-            let path_cstr = Self::os_path_to_cstring(path)?;
-            NativeStatState::with_path(*out, path_cstr)
+            NativeStatState::with_path(*out, *path)
           }
           crate::backend::op::StatTarget::Fd { .. } => {
             NativeStatState::new(*out)
           }
         };
         Self::Stat(NonNull::from(arena.alloc(state)))
-      }
-      Op::OpenAt { path, .. }
-      | Op::UnlinkAt { path, .. }
-      | Op::MkdirAt { path, .. } => {
-        let path1 = Self::os_path_to_cstring(path)?;
-        Self::Path(NonNull::from(
-          arena.alloc(NativePathState { path1, path2: None }),
-        ))
-      }
-      Op::RenameAt { old_path, new_path, .. }
-      | Op::LinkAt { source_path: old_path, new_path, .. } => {
-        let path1 = Self::os_path_to_cstring(old_path)?;
-        let path2 = Some(Self::os_path_to_cstring(new_path)?);
-        Self::Path(NonNull::from(arena.alloc(NativePathState { path1, path2 })))
       }
       _ => Self::Plain,
     })
@@ -426,11 +396,6 @@ impl LoweredState {
         // SAFETY: `state` points into the bump arena backing this lowered op
         // and remains valid until submission finishes.
         IoUring::create_stat_entry(op, unsafe { state.as_ref() })
-      }
-      Self::Path(state) => {
-        // SAFETY: `state` points into the bump arena backing this lowered op
-        // and remains valid until submission finishes.
-        IoUring::create_path_entry(op, unsafe { state.as_ref() })
       }
     }
   }
@@ -966,53 +931,51 @@ impl IoUring {
     }
   }
 
-  fn create_path_entry(op: &Op, state: &NativePathState) -> Entry {
+  /// The entry for a path operation, which points the kernel straight at
+  /// the paths the op model owns.
+  fn create_path_entry(op: &Op) -> Entry {
     match op {
-      Op::OpenAt { dir_fd, flags, mode, .. } => {
-        OpenAt::new(dir_fd.as_raw_fd(), state.path1.as_ptr())
+      Op::OpenAt { dir_fd, path, flags, mode } => {
+        OpenAt::new(dir_fd.as_raw_fd(), path.as_ptr())
           // Invalid flags were rejected by `validate_op`.
           .flags(crate::backend::native::open_flags(*flags).unwrap_or(0))
           .mode(mode.bits() as libc::mode_t)
           .build()
       }
-      Op::UnlinkAt { dir_fd, kind, .. } => {
+      Op::UnlinkAt { dir_fd, path, kind } => {
         let flags = match kind {
           crate::backend::op::UnlinkKind::File => 0,
           crate::backend::op::UnlinkKind::Directory => libc::AT_REMOVEDIR,
         };
-        UnlinkAt::new(dir_fd.as_raw_fd(), state.path1.as_ptr())
-          .flags(flags)
-          .build()
+        UnlinkAt::new(dir_fd.as_raw_fd(), path.as_ptr()).flags(flags).build()
       }
-      Op::RenameAt { old_dir_fd, new_dir_fd, .. } => {
-        let path2 = state.path2.as_ref().expect("RenameAt must have path2");
+      Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
         RenameAt::new(
           old_dir_fd.as_raw_fd(),
-          state.path1.as_ptr(),
+          old_path.as_ptr(),
           new_dir_fd.as_raw_fd(),
-          path2.as_ptr(),
+          new_path.as_ptr(),
         )
         .build()
       }
-      Op::MkdirAt { dir_fd, mode, .. } => {
-        MkDirAt::new(dir_fd.as_raw_fd(), state.path1.as_ptr())
+      Op::MkdirAt { dir_fd, path, mode } => {
+        MkDirAt::new(dir_fd.as_raw_fd(), path.as_ptr())
           .mode(mode.bits() as libc::mode_t)
           .build()
       }
-      Op::LinkAt { kind, source_dir_fd, new_dir_fd, .. } => {
-        let path2 = state.path2.as_ref().expect("LinkAt must have path2");
+      Op::LinkAt { kind, source_dir_fd, source_path, new_dir_fd, new_path } => {
         match kind {
           LinkKind::Hard => LinkAt::new(
             source_dir_fd.as_raw_fd(),
-            state.path1.as_ptr(),
+            source_path.as_ptr(),
             new_dir_fd.as_raw_fd(),
-            path2.as_ptr(),
+            new_path.as_ptr(),
           )
           .build(),
           LinkKind::Soft => SymlinkAt::new(
             new_dir_fd.as_raw_fd(),
-            state.path1.as_ptr(),
-            path2.as_ptr(),
+            source_path.as_ptr(),
+            new_path.as_ptr(),
           )
           .build(),
         }
@@ -1028,9 +991,7 @@ impl IoUring {
       | Op::UnlinkAt { .. }
       | Op::RenameAt { .. }
       | Op::MkdirAt { .. }
-      | Op::LinkAt { .. } => {
-        unreachable!("path operations must use create_path_entry")
-      }
+      | Op::LinkAt { .. } => Self::create_path_entry(op),
       Op::Socket { domain, ty, proto } => {
         let (domain, ty, proto) =
           crate::backend::impls::sockaddr::socket_to_raw(*domain, *ty, *proto)
@@ -1146,8 +1107,7 @@ impl IoUring {
         } => {
           let path_ptr = native_stat
             .path
-            .as_ref()
-            .expect("path-based stat must have path cstring")
+            .expect("path-based stat must have its path")
             .as_ptr();
           let flags =
             if *follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
@@ -1194,17 +1154,12 @@ impl IoUring {
   fn execute_immediate(op: &Op) -> Option<io::Result<isize>> {
     match op {
       Op::ReadlinkAt { dir_fd, path, buf, buf_len } => {
-        use std::os::unix::ffi::OsStrExt;
-        let Ok(path_cstr) = std::ffi::CString::new(path.as_os_str().as_bytes())
-        else {
-          return Some(Err(io::Error::from_raw_os_error(libc::EINVAL)));
-        };
         // SAFETY: pointers come directly from validated op arguments and remain
         // valid for the duration of this synchronous syscall.
         let result = unsafe {
           libc::readlinkat(
             dir_fd.as_raw_fd(),
-            path_cstr.as_ptr(),
+            path.as_ptr(),
             buf.as_ptr().cast::<libc::c_char>(),
             *buf_len,
           )

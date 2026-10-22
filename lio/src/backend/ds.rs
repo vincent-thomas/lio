@@ -38,7 +38,7 @@ use crate::api::resource::Resource;
 use crate::backend::op::SendFlags;
 use crate::backend::op::{
   self, DirEntryRef, FileStat, FileType, MsgRecv, MsgSend, Op, OpaqueDropFn,
-  OpenFlags, RawBuf, ReadDirResult, ReadFlags, RecvFlags, ShutdownHow,
+  OpenFlags, RawBuf, RawPath, ReadDirResult, ReadFlags, RecvFlags, ShutdownHow,
   SockDomain, SockProto, SockType, SocketAddrBuf, SocketAddrFamily, UnlinkKind,
 };
 use crate::backend::{IoBackend, OpCompleted};
@@ -1594,8 +1594,15 @@ impl DSBackend {
     1 + self.payload_rng.range_usize(total)
   }
 
-  fn os_path(path: &std::ffi::OsString) -> Vec<u8> {
-    Self::normalize_path(path.as_encoded_bytes())
+  /// The bytes of an in-flight operation's path.
+  fn path_bytes(path: &RawPath) -> &[u8] {
+    // SAFETY: the operation carrying `path` is being executed, so the model
+    // that owns the path keeps it alive.
+    unsafe { path.as_c_str() }.to_bytes()
+  }
+
+  fn os_path(path: &RawPath) -> Vec<u8> {
+    Self::normalize_path(Self::path_bytes(path))
   }
 
   fn normalize_path_from(dir: &[u8], path: &[u8]) -> Vec<u8> {
@@ -1655,9 +1662,9 @@ impl DSBackend {
   fn resolve_open_path(
     &self,
     dir_fd: &Resource,
-    path: &std::ffi::OsString,
+    path: &RawPath,
   ) -> Result<Vec<u8>, isize> {
-    let bytes = path.as_encoded_bytes();
+    let bytes = Self::path_bytes(path);
     if bytes.first() == Some(&b'/') {
       return Ok(Self::normalize_path(bytes));
     }
@@ -5203,13 +5210,13 @@ mod tests {
       SimNode::File { bytes: b"demo-bytes".to_vec(), mode: 0o644 },
     );
 
-    let path = std::ffi::OsString::from("/tmp/demo");
+    let path = c"/tmp/demo";
     let mut step_bump = Bump::new();
     backend.push(
       1,
       Op::OpenAt {
         dir_fd: Resource::cwd(),
-        path,
+        path: RawPath::new(path),
         flags: OpenFlags::READ,
         mode: crate::backend::op::FileMode::from_bits(0),
       },
