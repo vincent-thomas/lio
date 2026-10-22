@@ -86,6 +86,15 @@ impl OpenFlags {
   pub const EXCLUSIVE: Self = Self(1 << 5);
   /// Fail unless the path is a directory.
   pub const DIRECTORY: Self = Self(1 << 6);
+  /// Fail if the final path component is a symbolic link, instead of
+  /// opening what it points to. Earlier components are still resolved.
+  ///
+  /// The failure is the platform's "too many symbolic links" error (`ELOOP`
+  /// on Unix, `ERROR_CANT_RESOLVE_FILENAME` on Windows, where any name
+  /// surrogate reparse point, such as a junction, counts as a link). Combined
+  /// with [`DIRECTORY`](Self::DIRECTORY), some kernels report "not a
+  /// directory" for a link instead.
+  pub const NOFOLLOW: Self = Self(1 << 7);
 
   /// No flags; combine with others.
   pub const fn empty() -> Self {

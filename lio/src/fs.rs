@@ -487,6 +487,12 @@ impl RemoveDirFrame {
 }
 
 /// Recursive directory-removal operation specialized to return `()`.
+///
+/// Like [`std::fs::remove_dir_all`], it never follows a symbolic link: every
+/// directory is opened with [`OpenFlags::NOFOLLOW`], so a link met during the
+/// walk, even one swapped in for a directory after it was listed, is removed
+/// itself and what it points to is left alone. A link passed as the path is
+/// removed too.
 pub struct RemoveDirAll {
   stack: Vec<RemoveDirFrame>,
   state: RemoveDirAllState,
@@ -494,6 +500,7 @@ pub struct RemoveDirAll {
 
 enum RemoveDirAllState {
   Opening { parent: Resource, name: CString, op: ops::OpenAt },
+  StatingRoot { name: CString, err: io::Error, op: ops::Stat },
   Reading { op: ops::ReadDir },
   Stating { parent: Resource, name: CString, op: ops::Stat },
   RemovingEntry { op: ops::UnlinkAt },
@@ -501,21 +508,36 @@ enum RemoveDirAllState {
   Done,
 }
 
+impl RemoveDirAllState {
+  /// Opens `name` in `parent` as a directory, failing rather than following
+  /// a symbolic link there.
+  fn opening(parent: Resource, name: CString) -> Self {
+    Self::Opening {
+      op: ops::OpenAt::new(
+        parent.clone(),
+        name.clone(),
+        OpenFlags::READ | OpenFlags::DIRECTORY | OpenFlags::NOFOLLOW,
+        0,
+      ),
+      parent,
+      name,
+    }
+  }
+}
+
+/// Whether a no-follow directory open failed because the path is not a
+/// directory: some other file, or a symbolic link. Kernels report a link as
+/// either.
+fn is_not_directory(err: &io::Error) -> bool {
+  err.kind() == io::ErrorKind::NotADirectory
+    || err.raw_os_error() == Some(crate::backend::native::SYMLINK_LOOP)
+}
+
 impl RemoveDirAll {
   fn new(path: CString) -> Self {
-    let parent = Resource::cwd();
     Self {
       stack: Vec::new(),
-      state: RemoveDirAllState::Opening {
-        op: ops::OpenAt::new(
-          parent.clone(),
-          path.clone(),
-          OpenFlags::READ | OpenFlags::DIRECTORY,
-          0,
-        ),
-        parent,
-        name: path,
-      },
+      state: RemoveDirAllState::opening(Resource::cwd(), path),
     }
   }
 
@@ -528,16 +550,7 @@ impl RemoveDirAll {
     if let Some(entry) = frame.entries.pop() {
       match entry.file_type {
         Some(FileType::Directory) => {
-          self.state = RemoveDirAllState::Opening {
-            op: ops::OpenAt::new(
-              frame.fd.clone(),
-              entry.name.clone(),
-              OpenFlags::READ | OpenFlags::DIRECTORY,
-              0,
-            ),
-            parent: frame.fd.clone(),
-            name: entry.name,
-          };
+          self.state = RemoveDirAllState::opening(frame.fd.clone(), entry.name);
         }
         Some(_) => {
           self.state = RemoveDirAllState::RemovingEntry {
@@ -578,6 +591,7 @@ impl OpModel for RemoveDirAll {
   fn action(&mut self) -> Action {
     match &mut self.state {
       RemoveDirAllState::Opening { op, .. } => op.action(),
+      RemoveDirAllState::StatingRoot { op, .. } => op.action(),
       RemoveDirAllState::Reading { op } => op.action(),
       RemoveDirAllState::Stating { op, .. } => op.action(),
       RemoveDirAllState::RemovingEntry { op } => op.action(),
@@ -599,12 +613,48 @@ impl OpModel for RemoveDirAll {
             self.state = RemoveDirAllState::Reading { op };
             OpResult::Again
           }
+          // The path passed in: std removes it if it is a symbolic link,
+          // and fails if it is any other non-directory.
+          OpResult::Done(Err(err))
+            if self.stack.is_empty() && is_not_directory(&err) =>
+          {
+            self.state = RemoveDirAllState::StatingRoot {
+              op: ops::Stat::new_at(parent, name.clone(), false),
+              name,
+              err,
+            };
+            OpResult::Again
+          }
+          // An entry that is not a directory (anymore) is removed without
+          // descending: never through a symbolic link.
+          OpResult::Done(Err(err)) if is_not_directory(&err) => {
+            self.state = RemoveDirAllState::RemovingEntry {
+              op: ops::UnlinkAt::new(parent, name, UnlinkKind::File),
+            };
+            OpResult::Again
+          }
           OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
           OpResult::Again => {
             self.state = RemoveDirAllState::Opening { parent, name, op };
             OpResult::Again
           }
           OpResult::Yield(_) => unreachable!("openat is a oneshot operation"),
+        }
+      }
+      RemoveDirAllState::StatingRoot { name, err, mut op } => {
+        match op.complete(completion) {
+          OpResult::Done(Ok(stat)) if stat.is_symlink() => {
+            self.state = RemoveDirAllState::RemovingEntry {
+              op: ops::UnlinkAt::new(Resource::cwd(), name, UnlinkKind::File),
+            };
+            OpResult::Again
+          }
+          OpResult::Done(_) => OpResult::Done(Err(err)),
+          OpResult::Again => {
+            self.state = RemoveDirAllState::StatingRoot { name, err, op };
+            OpResult::Again
+          }
+          OpResult::Yield(_) => unreachable!("stat is a oneshot operation"),
         }
       }
       RemoveDirAllState::Reading { mut op } => match op.complete(completion) {
@@ -634,16 +684,7 @@ impl OpModel for RemoveDirAll {
         match op.complete(completion) {
           OpResult::Done(Ok(stat)) => {
             self.state = if stat.is_dir() {
-              RemoveDirAllState::Opening {
-                op: ops::OpenAt::new(
-                  parent.clone(),
-                  name.clone(),
-                  OpenFlags::READ | OpenFlags::DIRECTORY,
-                  0,
-                ),
-                parent,
-                name,
-              }
+              RemoveDirAllState::opening(parent, name)
             } else {
               RemoveDirAllState::RemovingEntry {
                 op: ops::UnlinkAt::new(parent, name, UnlinkKind::File),
@@ -948,6 +989,10 @@ pub fn remove_dir(path: std::ffi::CString) -> Io<ops::UnlinkAt> {
 }
 
 /// Recursively removes a directory relative to the current working directory.
+///
+/// Symbolic links are never followed, as with [`std::fs::remove_dir_all`]: a
+/// link inside the tree is removed, not what it points to, and if `path`
+/// itself is a link, only the link is removed.
 pub fn remove_dir_all(path: std::ffi::CString) -> Io<RemoveDirAll> {
   Io::from_op(RemoveDirAll::new(path))
 }
@@ -970,4 +1015,194 @@ fn os_string_from_bytes(bytes: &[u8]) -> OsString {
 /// `None` if the path contains a NUL byte.
 fn path_to_cstring(path: &std::path::Path) -> Option<CString> {
   CString::new(path.as_os_str().as_encoded_bytes()).ok()
+}
+
+#[cfg(test)]
+mod remove_dir_all_tests {
+  //! The walk's handling of symbolic links, scripted: a real filesystem
+  //! cannot reliably swap a directory for a link between the listing and
+  //! the open.
+
+  use std::{cell::RefCell, rc::Rc};
+
+  use super::*;
+  use crate::{
+    Lio,
+    backend::{
+      ds::errno,
+      op::{DirEntryRef, Op, ReadDirResult, StatTarget},
+      testing::{Checked, ScriptedBackend},
+    },
+  };
+
+  type Outcome = Rc<RefCell<Option<io::Result<()>>>>;
+
+  fn start(path: &str) -> (ScriptedBackend, Lio, Outcome) {
+    // Unpoisoned: the test fills in the directory listings itself.
+    let backend = ScriptedBackend::new().without_poison();
+    let lio = Lio::new_with_backend(Checked::new(backend.clone()), 4).unwrap();
+    let outcome: Outcome = Rc::default();
+    let out = outcome.clone();
+    remove_dir_all(CString::new(path).unwrap())
+      .with_lio(&lio)
+      .when_done(move |res| *out.borrow_mut() = Some(res));
+    lio.try_run().unwrap();
+    (backend, lio, outcome)
+  }
+
+  /// The single operation in flight.
+  fn in_flight(backend: &ScriptedBackend) -> (u64, Op) {
+    let ids = backend.in_flight();
+    assert_eq!(ids.len(), 1, "expected one operation in flight");
+    (ids[0], backend.op(ids[0]).unwrap())
+  }
+
+  fn complete(backend: &ScriptedBackend, lio: &Lio, id: u64, result: isize) {
+    backend.complete(id, result);
+    lio.try_run().unwrap();
+  }
+
+  fn expect_nofollow_open(backend: &ScriptedBackend, name: &str) -> u64 {
+    let (id, op) = in_flight(backend);
+    let Op::OpenAt { path, flags, .. } = op else {
+      panic!("expected openat of {name}, got {op:?}");
+    };
+    assert_eq!(path, OsString::from(name));
+    assert!(
+      flags.contains(OpenFlags::DIRECTORY | OpenFlags::NOFOLLOW),
+      "{name} must be opened as a directory without following links"
+    );
+    id
+  }
+
+  fn expect_unlink(backend: &ScriptedBackend, name: &str, want: UnlinkKind) {
+    let (_, op) = in_flight(backend);
+    let Op::UnlinkAt { path, kind, .. } = op else {
+      panic!("expected unlinkat of {name}, got {op:?}");
+    };
+    assert_eq!(path, OsString::from(name));
+    assert_eq!(kind, want);
+  }
+
+  /// Answers the in-flight readdir with `name` as a directory, then EOF.
+  fn list_one_directory(backend: &ScriptedBackend, lio: &Lio, name: &str) {
+    let (id, op) = in_flight(backend);
+    let Op::ReadDir { raw_buf, raw_cap, entries, entries_cap, out, .. } = op
+    else {
+      panic!("expected readdir, got {op:?}");
+    };
+    assert!(raw_cap >= name.len() && entries_cap >= 1);
+    // SAFETY: the operation is in flight, so its buffers are live and sized
+    // as checked above.
+    unsafe {
+      raw_buf.as_ptr().copy_from(name.as_ptr(), name.len());
+      entries.as_ptr().write(DirEntryRef {
+        name_offset: 0,
+        name_len: name.len() as u16,
+        file_type: Some(FileType::Directory),
+        ino: None,
+      });
+      out.as_ptr().write(ReadDirResult {
+        entries: 1,
+        raw_written: name.len(),
+        eof: true,
+      });
+    }
+    complete(backend, lio, id, 0);
+  }
+
+  fn finish_unlink(backend: &ScriptedBackend, lio: &Lio) {
+    let (id, _) = in_flight(backend);
+    complete(backend, lio, id, 0);
+  }
+
+  /// Scripts the stat of a root path that could not be opened as a
+  /// directory.
+  fn answer_root_stat(
+    backend: &ScriptedBackend,
+    lio: &Lio,
+    name: &str,
+    file_type: FileType,
+  ) {
+    let (id, op) = in_flight(backend);
+    let Op::Stat {
+      target: StatTarget::Path { path, follow_symlinks, .. },
+      out,
+    } = op
+    else {
+      panic!("expected stat of {name}, got {op:?}");
+    };
+    assert_eq!(path, OsString::from(name));
+    assert!(!follow_symlinks, "the root must be inspected, not its target");
+    // SAFETY: the operation is in flight, so its output is live.
+    unsafe { out.as_ptr().write(FileStat { file_type, ..FileStat::zeroed() }) };
+    complete(backend, lio, id, 0);
+  }
+
+  /// An entry listed as a directory but replaced by a symbolic link before
+  /// it is opened is unlinked, never descended into. Kernels report the
+  /// refused link as `ELOOP` or, with `O_DIRECTORY`, as `ENOTDIR`.
+  #[test]
+  fn a_directory_swapped_for_a_symlink_is_unlinked_not_followed() {
+    for code in [errno::ELOOP, errno::ENOTDIR] {
+      let (backend, lio, outcome) = start("root");
+      let id = expect_nofollow_open(&backend, "root");
+      complete(&backend, &lio, id, 3);
+
+      list_one_directory(&backend, &lio, "swapped");
+      let id = expect_nofollow_open(&backend, "swapped");
+      complete(&backend, &lio, id, -(code as isize));
+
+      expect_unlink(&backend, "swapped", UnlinkKind::File);
+      finish_unlink(&backend, &lio);
+      expect_unlink(&backend, "root", UnlinkKind::Directory);
+      finish_unlink(&backend, &lio);
+
+      assert!(matches!(*outcome.borrow(), Some(Ok(()))), "code {code}");
+      assert!(backend.in_flight().is_empty());
+    }
+  }
+
+  /// A symbolic link passed as the path is removed itself, as std does.
+  #[test]
+  fn a_symlink_root_is_removed_itself() {
+    for code in [errno::ELOOP, errno::ENOTDIR] {
+      let (backend, lio, outcome) = start("link");
+      let id = expect_nofollow_open(&backend, "link");
+      complete(&backend, &lio, id, -(code as isize));
+
+      answer_root_stat(&backend, &lio, "link", FileType::Symlink);
+      expect_unlink(&backend, "link", UnlinkKind::File);
+      finish_unlink(&backend, &lio);
+
+      assert!(matches!(*outcome.borrow(), Some(Ok(()))), "code {code}");
+      assert!(backend.in_flight().is_empty());
+    }
+  }
+
+  /// Any other non-directory passed as the path fails, as std does.
+  #[test]
+  fn a_file_root_fails_with_not_a_directory() {
+    let (backend, lio, outcome) = start("file");
+    let id = expect_nofollow_open(&backend, "file");
+    complete(&backend, &lio, id, -(errno::ENOTDIR as isize));
+
+    answer_root_stat(&backend, &lio, "file", FileType::File);
+
+    let outcome = outcome.borrow_mut().take().expect("remove_dir_all done");
+    assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::NotADirectory);
+    assert!(backend.in_flight().is_empty());
+  }
+
+  /// Errors other than "not a directory" still end the walk.
+  #[test]
+  fn other_open_errors_still_fail_the_walk() {
+    let (backend, lio, outcome) = start("root");
+    let id = expect_nofollow_open(&backend, "root");
+    complete(&backend, &lio, id, -(errno::ENOENT as isize));
+
+    let outcome = outcome.borrow_mut().take().expect("remove_dir_all done");
+    assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::NotFound);
+    assert!(backend.in_flight().is_empty());
+  }
 }

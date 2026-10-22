@@ -33,10 +33,10 @@ use std::time::{Duration, Instant};
 
 use bumpalo::Bump;
 use windows_sys::Win32::Foundation::{
-  CloseHandle, ERROR_BROKEN_PIPE, ERROR_DIRECTORY, ERROR_HANDLE_EOF,
-  ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_NOT_SUPPORTED,
-  ERROR_OPERATION_ABORTED, FALSE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-  NO_ERROR, TRUE, WAIT_TIMEOUT,
+  CloseHandle, ERROR_BROKEN_PIPE, ERROR_CANT_RESOLVE_FILENAME, ERROR_DIRECTORY,
+  ERROR_HANDLE_EOF, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING,
+  ERROR_NOT_SUPPORTED, ERROR_OPERATION_ABORTED, FALSE, GetLastError, HANDLE,
+  INVALID_HANDLE_VALUE, NO_ERROR, TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock as ws;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -1140,7 +1140,7 @@ fn blocking_result(op: Op) -> Option<isize> {
     Op::UnlinkAt { dir_fd, path, kind } => Some(
       resolve(&dir_fd, &path)
         .and_then(|path| match kind {
-          UnlinkKind::File => fs::remove_file(path),
+          UnlinkKind::File => unlink_file(&path),
           UnlinkKind::Directory => fs::remove_dir(path),
         })
         .map_or_else(io_error, |()| 0),
@@ -1370,6 +1370,26 @@ fn resolve(dir: &Resource, path: &OsStr) -> io::Result<PathBuf> {
   Ok(final_path(handle_of(dir))?.join(path))
 }
 
+/// Removes a non-directory entry, like `unlink(2)`.
+///
+/// A symbolic link or junction to a directory is a directory entry on
+/// Windows, which `DeleteFileW` refuses; `RemoveDirectoryW` removes the link
+/// itself, never what it points to.
+fn unlink_file(path: &Path) -> io::Result<()> {
+  use std::os::windows::fs::MetadataExt;
+  use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+
+  fs::remove_file(path).or_else(|err| match fs::symlink_metadata(path) {
+    Ok(meta)
+      if meta.is_symlink()
+        && meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 =>
+    {
+      fs::remove_dir(path)
+    }
+    _ => Err(err),
+  })
+}
+
 fn open_at(
   dir: &Resource,
   path: &OsStr,
@@ -1382,8 +1402,14 @@ fn open_at(
   let mut options = OpenOptions::new();
   // Directories can only be opened with backup semantics. std opens handles
   // non-inheritable, so they never leak into child processes.
+  let mut custom_flags = FILE_FLAG_BACKUP_SEMANTICS;
+  if flags.contains(OpenFlags::NOFOLLOW) {
+    // Open a reparse point itself rather than what it points to; a link is
+    // rejected below once we hold its handle, so the check cannot race.
+    custom_flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+  }
   options
-    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+    .custom_flags(custom_flags)
     .read(flags.reads())
     .write(flags.contains(OpenFlags::WRITE))
     .append(flags.contains(OpenFlags::APPEND))
@@ -1396,6 +1422,14 @@ fn open_at(
     }
   }
   let file = options.open(path)?;
+  // std reports a symlink for name-surrogate reparse points: symbolic links
+  // and junctions. Other reparse points (say, deduplicated or cloud files)
+  // are opened as the file they stand for, as `O_NOFOLLOW` would.
+  if flags.contains(OpenFlags::NOFOLLOW) && file.metadata()?.is_symlink() {
+    return Err(io::Error::from_raw_os_error(
+      ERROR_CANT_RESOLVE_FILENAME as i32,
+    ));
+  }
   if flags.contains(OpenFlags::DIRECTORY) && !file.metadata()?.is_dir() {
     return Err(io::Error::from_raw_os_error(ERROR_DIRECTORY as i32));
   }

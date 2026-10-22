@@ -59,8 +59,9 @@ pub mod errno {
   pub use libc::{
     EACCES, EADDRINUSE, EAGAIN, EBADF, ECANCELED, ECONNABORTED, ECONNREFUSED,
     ECONNRESET, EDESTADDRREQ, EEXIST, EFBIG, EHOSTUNREACH, EINVAL, EIO,
-    EISCONN, EMFILE, ENFILE, ENOENT, ENOSPC, ENOTCONN, ENOTDIR, ENOTSOCK,
-    ENOTSUP, EOPNOTSUPP, EPIPE, EPROTOTYPE, ERANGE, ESPIPE, ETIMEDOUT,
+    EISCONN, ELOOP, EMFILE, ENFILE, ENOENT, ENOSPC, ENOTCONN, ENOTDIR,
+    ENOTSOCK, ENOTSUP, EOPNOTSUPP, EPIPE, EPROTOTYPE, ERANGE, ESPIPE,
+    ETIMEDOUT,
   };
 
   /// `ERROR_ACCESS_DENIED`
@@ -108,6 +109,9 @@ pub mod errno {
   /// `WSAEISCONN`
   #[cfg(windows)]
   pub const EISCONN: i32 = 10056;
+  /// `ERROR_CANT_RESOLVE_FILENAME`
+  #[cfg(windows)]
+  pub const ELOOP: i32 = 1921;
   /// `ERROR_TOO_MANY_OPEN_FILES`
   #[cfg(windows)]
   pub const EMFILE: i32 = 4;
@@ -2324,12 +2328,20 @@ impl DSBackend {
         OpAction::StartConnect { accepted_fd, listener_fd, ready_at_tick }
       }
       Op::OpenAt { dir_fd, path, flags, .. } => {
-        let path = match self.resolve_open_path(&dir_fd, &path) {
+        let mut path = match self.resolve_open_path(&dir_fd, &path) {
           Ok(path) => path,
           Err(err) => return OpAction::Complete(err),
         };
         if !flags.reads() && !flags.writes() {
           return OpAction::Complete(-(errno::EINVAL as isize));
+        }
+        if let Some(SimNode::Symlink { target, .. }) = self.world.fs.get(&path)
+        {
+          if flags.contains(OpenFlags::NOFOLLOW) {
+            return OpAction::Complete(-(errno::ELOOP as isize));
+          }
+          // Like `resolve_path_node`, the simulation follows one level.
+          path = target.clone();
         }
         let exists = self.world.fs.contains_key(&path);
         if exists && flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
@@ -5221,6 +5233,52 @@ mod tests {
     backend.wait(None, &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert!(completed[0].result() >= 0);
+  }
+
+  #[test]
+  fn openat_nofollow_rejects_a_symlink_and_plain_open_follows_it() {
+    let mut backend = DSBackend::with_config(DSConfig {
+      seed: 1,
+      max_delay_ticks: 0,
+      fault_every: 0,
+      network_faults: DSNetworkFaults::Off,
+    });
+    backend.init(8).unwrap();
+    backend
+      .world
+      .fs
+      .insert(b"/tmp/target".to_vec(), SimNode::Directory { mode: 0o755 });
+    backend.world.fs.insert(
+      b"/tmp/link".to_vec(),
+      SimNode::Symlink { target: b"/tmp/target".to_vec(), mode: 0o777 },
+    );
+    let open = |flags| Op::OpenAt {
+      dir_fd: Resource::cwd(),
+      path: std::ffi::OsString::from("/tmp/link"),
+      flags,
+      mode: crate::backend::op::FileMode::from_bits(0),
+    };
+
+    let nofollow = backend.complete_op(open(
+      OpenFlags::READ | OpenFlags::DIRECTORY | OpenFlags::NOFOLLOW,
+    ));
+    assert!(matches!(
+      nofollow,
+      OpAction::Complete(result) if result == -(errno::ELOOP as isize)
+    ));
+
+    let follow =
+      backend.complete_op(open(OpenFlags::READ | OpenFlags::DIRECTORY));
+    let OpAction::Complete(fd) = follow else {
+      panic!("openat should complete immediately");
+    };
+    assert!(fd >= 0, "following the link should open its target, got {fd}");
+    let Some(SimResource::File(handle)) =
+      backend.world.resources.get(&(fd as i32))
+    else {
+      panic!("openat should register a file handle");
+    };
+    assert_eq!(handle.path, b"/tmp/target");
   }
 
   #[test]
