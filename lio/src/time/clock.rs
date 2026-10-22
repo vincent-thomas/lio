@@ -51,7 +51,7 @@ impl<const SIZE: usize> Wheel<SIZE> {
 
   /// Gives a drained slot's allocation back for reuse.
   fn restore_slot(&mut self, slot: usize, entries: Vec<WheelEntry>) {
-    debug_assert!(entries.is_empty());
+    assert!(entries.is_empty());
     let slot = &mut self.slots[slot];
     if slot.is_empty() {
       *slot = entries;
@@ -584,8 +584,8 @@ impl Clock {
       self.pending_index += 1;
 
       if !self.pending_has_stale {
-        // The flag lets delivery skip this check; debug builds verify it.
-        debug_assert!(
+        // The flag lets delivery skip the stale check; verify it was right.
+        assert!(
           self.pending_is_live(index),
           "clock: delivering stale timer {}, which is not marked stale",
           pending.id
@@ -635,7 +635,7 @@ impl Iterator for ExpiredIterator<'_> {
 
     while self.clock.pending_index < self.clock.pending_fire.len() {
       let pending = self.clock.pending_fire[self.clock.pending_index];
-      debug_assert!(
+      assert!(
         self.clock.pending_is_live(self.clock.pending_index),
         "clock: delivering stale timer {}, which is not marked stale",
         pending.id
@@ -1085,7 +1085,6 @@ mod tests {
   }
 
   #[test]
-  #[cfg_attr(not(debug_assertions), ignore = "checked by a `debug_assert`")]
   #[should_panic(expected = "which is not marked stale")]
   fn delivering_an_unmarked_stale_timer_panics() {
     let mut clock = Clock::new();

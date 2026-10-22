@@ -24,6 +24,27 @@ jobs:
       - name: nix flake check
         run: nix flake check '.?submodules=1&shallow=0'
 
+  # A `debug_assert!` vanishes from release builds, so the invariant it
+  # states goes unchecked exactly where users run the code.
+  no-debug-assert:
+    name: no-debug-assert
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: scan for debug_assert!
+        run: |
+          # git grep skips untracked files and the liburing submodule.
+          if ! hits=$(git grep -nE 'debug_assert(_eq|_ne)?!' -- '*.rs'); then
+            exit 0
+          fi
+          while IFS=: read -r file line _; do
+            echo "::error file=$file,line=$line::debug_assert is compiled out of release builds; use assert! (or assert_eq!/assert_ne!) instead"
+          done <<< "$hits"
+          echo "$hits"
+          echo "Found debug_assert!; replace each with assert!, assert_eq! or assert_ne!."
+          exit 1
+
   check:
     name: check-${{ matrix.os }}
     runs-on: ${{ matrix.os }}

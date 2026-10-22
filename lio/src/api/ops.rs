@@ -1375,7 +1375,7 @@ impl OpModel for Sleep {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    debug_assert!(completion.flags.contains(CompletionFlags::TIMER));
+    assert!(completion.flags.contains(CompletionFlags::TIMER));
 
     let result =
       if completion.result == 0 { Ok(()) } else { Err(completion.os_error()) };
@@ -1432,7 +1432,7 @@ impl OpModel for Interval {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    debug_assert!(completion.flags.contains(CompletionFlags::TIMER));
+    assert!(completion.flags.contains(CompletionFlags::TIMER));
 
     let result =
       if completion.result == 0 { Ok(()) } else { Err(completion.os_error()) };
