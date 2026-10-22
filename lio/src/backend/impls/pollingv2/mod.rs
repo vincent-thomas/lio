@@ -34,7 +34,9 @@ use crate::backend::{
   IoBackend, OpCompleted,
   impls::pollingv2::interest::Interest,
   impls::unix_stat::{file_stat_from_raw, file_type_from_dirent_dtype},
-  op::{DirEntryRef, MsgRecv, MsgSend, Op, ReadDirResult},
+  op::{
+    DirEntryRef, MsgRecv, MsgSend, Op, ReadDirResult, is_valid_file_offset,
+  },
 };
 use crate::slab::{Slab, SlabKey};
 mod interest;
@@ -516,10 +518,13 @@ impl Poller {
     fd: RawFd,
     iovecs: *const libc::iovec,
     iov_count: usize,
-    offset: i64,
+    offset: Option<u64>,
     flags: i32,
   ) -> isize {
-    if offset < -1 || iovecs.is_null() {
+    let Ok(offset) = offset.map(libc::off_t::try_from).transpose() else {
+      return -(libc::EINVAL as isize);
+    };
+    if iovecs.is_null() {
       return -(libc::EINVAL as isize);
     }
 
@@ -537,15 +542,22 @@ impl Poller {
 
     // Linux: native preadv2 support
     #[cfg(target_os = "linux")]
-    return syscall!(raw preadv2(fd, iovecs, iov_count as i32, offset, flags));
+    return syscall!(raw preadv2(
+      fd,
+      iovecs,
+      iov_count as i32,
+      offset.unwrap_or(-1),
+      flags
+    ));
 
     #[cfg(not(target_os = "linux"))]
     {
       // Non-Linux: Emulate flags (all are no-ops for reads)
-      let result = if offset == -1 {
-        syscall!(raw readv(fd, iovecs, iov_count as i32)?)
-      } else {
-        syscall!(raw preadv(fd, iovecs, iov_count as i32, offset)?)
+      let result = match offset {
+        None => syscall!(raw readv(fd, iovecs, iov_count as i32)?),
+        Some(offset) => {
+          syscall!(raw preadv(fd, iovecs, iov_count as i32, offset)?)
+        }
       };
 
       assert!(result >= 0, "error did not return");
@@ -559,10 +571,13 @@ impl Poller {
     fd: RawFd,
     iovecs: *const libc::iovec,
     iov_count: usize,
-    offset: i64,
+    offset: Option<u64>,
     flags: i32,
   ) -> isize {
-    if offset < -1 || iovecs.is_null() {
+    let Ok(offset) = offset.map(libc::off_t::try_from).transpose() else {
+      return -(libc::EINVAL as isize);
+    };
+    if iovecs.is_null() {
       return -(libc::EINVAL as isize);
     }
     const RWF_HIPRI: i32 = 0x00000001;
@@ -579,7 +594,13 @@ impl Poller {
 
     // Linux: native pwritev2 support
     #[cfg(target_os = "linux")]
-    return syscall!(raw pwritev2(fd, iovecs, iov_count as i32, offset, flags));
+    return syscall!(raw pwritev2(
+      fd,
+      iovecs,
+      iov_count as i32,
+      offset.unwrap_or(-1),
+      flags
+    ));
 
     #[cfg(not(target_os = "linux"))]
     {
@@ -593,15 +614,16 @@ impl Poller {
         let result = syscall!(raw fstat(fd, stat.as_mut_ptr())?);
         assert_eq!(result, 0);
         // SAFETY: successful `fstat` initialized `stat`.
-        unsafe { stat.assume_init() }.st_size
+        Some(unsafe { stat.assume_init() }.st_size)
       } else {
         offset
       };
 
-      let result = if write_offset == -1 {
-        syscall!(raw writev(fd, iovecs, iov_count as i32)?)
-      } else {
-        syscall!(raw pwritev(fd, iovecs, iov_count as i32, write_offset)?)
+      let result = match write_offset {
+        None => syscall!(raw writev(fd, iovecs, iov_count as i32)?),
+        Some(offset) => {
+          syscall!(raw pwritev(fd, iovecs, iov_count as i32, offset)?)
+        }
       };
 
       assert!(result >= 0, "error did not return");
@@ -699,7 +721,7 @@ impl Poller {
   fn validate_op(op: &crate::backend::op::Op) -> Option<isize> {
     match op {
       Op::Read { iovecs: _, offset, flags, .. } => {
-        if *offset < -1 {
+        if !is_valid_file_offset(*offset) {
           return Some(-(libc::EINVAL as isize));
         }
 
@@ -717,7 +739,7 @@ impl Poller {
         None
       }
       Op::Write { iovecs: _, offset, flags, .. } => {
-        if *offset < -1 {
+        if !is_valid_file_offset(*offset) {
           return Some(-(libc::EINVAL as isize));
         }
 

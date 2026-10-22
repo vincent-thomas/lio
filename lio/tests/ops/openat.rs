@@ -48,12 +48,12 @@ fn unlink_file(lio: &mut Lio, path: CString) {
   common::poll_recv(lio, &mut receiver).unwrap();
 }
 
-fn write_all_at(lio: &mut Lio, fd: &Resource, bytes: &[u8], offset: u32) {
+fn write_all_at(lio: &mut Lio, fd: &Resource, bytes: &[u8], offset: u64) {
   let mut written_total = 0usize;
   while written_total < bytes.len() {
     let chunk = bytes[written_total..].to_vec();
     let mut receiver =
-      api::write_at(fd, chunk.clone(), offset + written_total as u32)
+      api::write_at(fd, chunk.clone(), offset + written_total as u64)
         .with_lio(lio)
         .send();
     let (result, returned_buf) = common::poll_recv(lio, &mut receiver);
@@ -68,12 +68,12 @@ fn read_exact_at(
   lio: &mut Lio,
   fd: &Resource,
   len: usize,
-  offset: u32,
+  offset: u64,
 ) -> Vec<u8> {
   let mut out = Vec::with_capacity(len);
   while out.len() < len {
     let mut receiver =
-      api::read_at(fd, vec![0u8; len - out.len()], offset + out.len() as u32)
+      api::read_at(fd, vec![0u8; len - out.len()], offset + out.len() as u64)
         .with_lio(lio)
         .send();
     let (result, buf) = common::poll_recv(lio, &mut receiver);

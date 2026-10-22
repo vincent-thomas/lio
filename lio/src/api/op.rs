@@ -248,7 +248,7 @@ impl From<Duration> for Action {
 ///       fd: Resource::stdin(),
 ///       iovecs: NonNull::dangling(),
 ///       iov_count: 1,
-///       offset: -1,
+///       offset: None,
 ///       flags: ReadFlags::EMPTY,
 ///     })
 ///   }

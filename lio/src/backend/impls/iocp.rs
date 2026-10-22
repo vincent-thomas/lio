@@ -60,7 +60,7 @@ use crate::backend::native::CWD as CWD_HANDLE;
 use crate::backend::op::{
   DirEntryRef, FileStat, FileType, LinkKind, MsgRecv, MsgSend, Op,
   OpaqueDropFn, OpenFlags, RawBuf, ReadDirResult, ShutdownHow, SocketAddrBuf,
-  SocketAddrFamily, SpawnSpec, StatTarget, UnlinkKind,
+  SocketAddrFamily, SpawnSpec, StatTarget, UnlinkKind, is_valid_file_offset,
 };
 use crate::backend::{IoBackend, OpCompleted};
 
@@ -396,7 +396,7 @@ impl Iocp {
         // SAFETY: the op model keeps `iov_count` buffers alive until done.
         let bufs =
           unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) };
-        if offset < -1 {
+        if !is_valid_file_offset(offset) {
           return Some(neg(ERROR_INVALID_PARAMETER));
         }
         if flags.bits() != 0 {
@@ -415,7 +415,7 @@ impl Iocp {
         // SAFETY: the op model keeps `iov_count` buffers alive until done.
         let bufs =
           unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) };
-        if offset < -1 {
+        if !is_valid_file_offset(offset) {
           return Some(neg(ERROR_INVALID_PARAMETER));
         }
         if flags.bits() != 0 {
@@ -1279,12 +1279,12 @@ fn ensure_bound(socket: ws::SOCKET, family: u16) -> Result<(), isize> {
 fn file_transfer(
   handle: HANDLE,
   bufs: &[RawBuf],
-  offset: i64,
+  offset: Option<u64>,
   write: bool,
 ) -> isize {
   let mut total = 0usize;
   for buf in bufs {
-    let at = if offset < 0 { None } else { Some(offset as u64 + total as u64) };
+    let at = offset.map(|offset| offset + total as u64);
     let len = buf.len.min(u32::MAX as usize) as u32;
     match transfer_once(handle, buf.ptr, len, at, write) {
       Ok(n) => {

@@ -508,7 +508,7 @@ mod tests {
           fd,
           iovecs,
           iov_count: 1,
-          offset: -1,
+          offset: None,
           flags: Default::default(),
         }
       } else {
@@ -516,7 +516,7 @@ mod tests {
           fd,
           iovecs,
           iov_count: 1,
-          offset: -1,
+          offset: None,
           flags: Default::default(),
         }
       }
@@ -545,7 +545,7 @@ mod tests {
       fd: crate::api::resource::Resource::stdout(),
       iovecs: ptr::NonNull::from(&*iovec),
       iov_count: 1,
-      offset: -1,
+      offset: None,
       flags: Default::default(),
     }
   }

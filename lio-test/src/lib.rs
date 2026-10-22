@@ -56,7 +56,9 @@
 ///   successful submissions must eventually transfer the exact total byte count
 /// - pending reads remain pending until data arrives
 /// - EOF returns exact `0`
-/// - invalid offset returns exact raw `-EINVAL`
+/// - an offset past `MAX_FILE_OFFSET` (`i64::MAX`) returns exact raw
+///   `-EINVAL`; it is never truncated, wrapped or taken as the current
+///   position
 /// - unsupported flags return exact raw `-ENOTSUP`
 /// - null iovec pointer returns exact raw `-EINVAL`
 /// - invalid fd returns exact raw `-EBADF`
@@ -66,7 +68,9 @@
 ///   submissions must eventually transfer the exact total byte count
 /// - vectored success may return short positive byte counts, but repeated
 ///   successful submissions must eventually transfer the exact total byte count
-/// - invalid offset returns exact raw `-EINVAL`
+/// - an offset past `MAX_FILE_OFFSET` (`i64::MAX`) returns exact raw
+///   `-EINVAL`; it is never truncated, wrapped or taken as the current
+///   position
 /// - unsupported flags return exact raw `-ENOTSUP`
 /// - null iovec pointer returns exact raw `-EINVAL`
 /// - invalid fd returns exact raw `-EBADF`
@@ -307,7 +311,7 @@ macro_rules! test_io_backend {
           fd: read_res.clone(),
           iovecs: nonnull(&mut raw_buf),
           iov_count: 1,
-          offset: -1,
+          offset: None,
           flags: read_flags(0),
         },
       );
@@ -393,7 +397,7 @@ macro_rules! test_io_backend {
           fd: invalid_fd,
           iovecs: nonnull(&mut raw_buf),
           iov_count: 1,
-          offset: -2,
+          offset: Some(u64::MAX),
           flags: read_flags(0),
         },
       );
@@ -863,7 +867,7 @@ macro_rules! test_io_backend {
             fd: reader.clone(),
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
-            offset: -1,
+            offset: None,
             flags: read_flags(0),
           },
         );
@@ -1029,7 +1033,7 @@ macro_rules! test_io_backend {
               fd: read_res.clone(),
               iovecs: nonnull(&mut raw_buf),
               iov_count: 1,
-              offset: -1,
+              offset: None,
               flags: read_flags(0),
             },
           );
@@ -1068,7 +1072,7 @@ macro_rules! test_io_backend {
             fd: read_res.clone(),
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
-            offset: -1,
+            offset: None,
             flags: read_flags(0),
           },
         );
@@ -1109,7 +1113,7 @@ macro_rules! test_io_backend {
               fd: read_res.clone(),
               iovecs: nonnull(&mut raw_buf),
               iov_count: 1,
-              offset: -1,
+              offset: None,
               flags: read_flags(0),
             },
           );
@@ -1148,7 +1152,7 @@ macro_rules! test_io_backend {
             fd: read_res.clone(),
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
-            offset: -1,
+            offset: None,
             flags: read_flags(0),
           },
         );
@@ -1216,7 +1220,7 @@ macro_rules! test_io_backend {
               fd: read_res.clone(),
               iovecs: nonnull(bufs.as_mut_ptr()),
               iov_count: bufs.len(),
-              offset: -1,
+              offset: None,
               flags: read_flags(0),
             },
           );
@@ -1255,7 +1259,7 @@ macro_rules! test_io_backend {
             fd: read_res.clone(),
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
-            offset: -1,
+            offset: None,
             flags: read_flags(0),
           },
         );
@@ -1280,7 +1284,7 @@ macro_rules! test_io_backend {
             fd: invalid_fd_resource(),
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
-            offset: -1,
+            offset: None,
             flags: read_flags(0),
           },
         );
@@ -1299,21 +1303,25 @@ macro_rules! test_io_backend {
         let mut buf = [0_u8; 4];
         let mut raw_buf = raw_buf_from_mut_slice(&mut buf);
 
-        push_op(&mut backend,
-          69,
-          Op::Read {
-            fd: read_res,
-            iovecs: nonnull(&mut raw_buf),
-            iov_count: 1,
-            offset: -2,
-            flags: read_flags(0),
-          },
-        );
-        backend.flush().unwrap();
+        // The first offset past `i64::MAX`, and the one whose bits read as
+        // `-1` (the kernel's "current position").
+        for (id, offset) in [(69, i64::MAX as u64 + 1), (70, u64::MAX)] {
+          push_op(&mut backend,
+            id,
+            Op::Read {
+              fd: read_res.clone(),
+              iovecs: nonnull(&mut raw_buf),
+              iov_count: 1,
+              offset: Some(offset),
+              flags: read_flags(0),
+            },
+          );
+          backend.flush().unwrap();
 
-        let completed = wait_completions(&mut backend, Some(Duration::ZERO));
-        assert_eq!(completed.len(), 1);
-        assert_exact_result(&completed[0], 69, expect::INVAL);
+          let completed = wait_completions(&mut backend, Some(Duration::ZERO));
+          assert_eq!(completed.len(), 1);
+          assert_exact_result(&completed[0], id, expect::INVAL);
+        }
       }
 
       #[test]
@@ -1331,7 +1339,7 @@ macro_rules! test_io_backend {
             fd: read_res,
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
-            offset: -1,
+            offset: None,
             flags: read_flags(1 << 30),
           },
         );
@@ -1372,7 +1380,7 @@ macro_rules! test_io_backend {
             fd: write_res.clone(),
             iovecs: nonnull_const(&raw_buf),
               iov_count: 1,
-              offset: -1,
+              offset: None,
               flags: write_flags(0),
             },
           );
@@ -1423,7 +1431,7 @@ macro_rules! test_io_backend {
             fd: write_res.clone(),
             iovecs: nonnull_const(bufs.as_ptr()),
               iov_count: bufs.len(),
-              offset: -1,
+              offset: None,
               flags: write_flags(0),
             },
           );
@@ -1461,7 +1469,7 @@ macro_rules! test_io_backend {
             fd: invalid_fd_resource(),
             iovecs: nonnull_const(&raw_buf),
             iov_count: 1,
-            offset: -1,
+            offset: None,
             flags: write_flags(0),
           },
         );
@@ -1482,20 +1490,24 @@ macro_rules! test_io_backend {
         // write operation and is only read from.
         let raw_buf = unsafe { RawBuf::from_raw_parts(payload.as_ptr().cast_mut(), payload.len()) };
 
-        push_op(&mut backend,
-          72,
-          Op::Write {
-            fd: write_res,
-            iovecs: nonnull_const(&raw_buf),
-            iov_count: 1,
-            offset: -2,
-            flags: write_flags(0),
-          },
-        );
-        backend.flush().unwrap();
+        // The first offset past `i64::MAX`, and the one whose bits read as
+        // `-1` (the kernel's "current position").
+        for (id, offset) in [(72, i64::MAX as u64 + 1), (73, u64::MAX)] {
+          push_op(&mut backend,
+            id,
+            Op::Write {
+              fd: write_res.clone(),
+              iovecs: nonnull_const(&raw_buf),
+              iov_count: 1,
+              offset: Some(offset),
+              flags: write_flags(0),
+            },
+          );
+          backend.flush().unwrap();
 
-        let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 72, expect::INVAL);
+          let completed = wait_for_single_completion(&mut backend);
+          assert_exact_result(&completed, id, expect::INVAL);
+        }
       }
 
       #[test]
@@ -1515,7 +1527,7 @@ macro_rules! test_io_backend {
             fd: write_res,
             iovecs: nonnull_const(&raw_buf),
             iov_count: 1,
-            offset: -1,
+            offset: None,
             flags: write_flags(1 << 30),
           },
         );
@@ -2742,7 +2754,7 @@ macro_rules! test_io_backend {
             fd: invalid_fd_resource(),
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
-            offset: -1,
+            offset: None,
             flags: read_flags(0),
           },
         );
@@ -2867,7 +2879,7 @@ macro_rules! test_io_backend {
             fd: read_a.clone(),
             iovecs: nonnull(&mut raw_a),
             iov_count: 1,
-            offset: -1,
+            offset: None,
             flags: read_flags(0),
           },
         );
@@ -2877,7 +2889,7 @@ macro_rules! test_io_backend {
             fd: read_b.clone(),
             iovecs: nonnull(&mut raw_b),
             iov_count: 1,
-            offset: -1,
+            offset: None,
             flags: read_flags(0),
           },
         );

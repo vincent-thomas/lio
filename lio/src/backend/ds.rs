@@ -1523,6 +1523,18 @@ impl DSBackend {
     choices[self.fault_rng.range_usize(choices.len())]
   }
 
+  /// The position a read or write addresses in a simulated file: `None` for
+  /// the current position, or `-EINVAL` for an offset no backend honours.
+  fn file_position(offset: Option<u64>) -> Result<Option<usize>, isize> {
+    if !op::is_valid_file_offset(offset) {
+      return Err(-(errno::EINVAL as isize));
+    }
+    offset
+      .map(usize::try_from)
+      .transpose()
+      .map_err(|_| -(errno::EINVAL as isize))
+  }
+
   #[cfg(unix)]
   fn resource_key(resource: &Resource) -> i32 {
     resource.as_raw_fd()
@@ -1934,7 +1946,7 @@ impl DSBackend {
   fn process_pending_op(&mut self, _id: u64, op: Op) -> PendingAction {
     match op {
       Op::Read { fd, iovecs, iov_count, offset, flags } => {
-        if offset < -1 || flags.bits() < 0 || offset >= 0 {
+        if offset.is_some() || flags.bits() < 0 {
           return PendingAction::Complete(-(errno::EINVAL as isize));
         }
         let raw = Self::resource_key(&fd);
@@ -2166,9 +2178,10 @@ impl DSBackend {
 
     match op {
       Op::Read { fd, iovecs, iov_count, offset, flags } => {
-        if offset < -1 {
-          return OpAction::Complete(-(errno::EINVAL as isize));
-        }
+        let position = match Self::file_position(offset) {
+          Ok(position) => position,
+          Err(err) => return OpAction::Complete(err),
+        };
         if flags.bits() < 0 {
           return OpAction::Complete(-(errno::ENOTSUP as isize));
         }
@@ -2178,12 +2191,8 @@ impl DSBackend {
             .iter()
             .map(|iov| iov.len)
             .sum();
-        if offset >= 0 {
-          return match self.read_bytes_from_resource(
-            &fd,
-            total,
-            Some(offset as usize),
-          ) {
+        if position.is_some() {
+          return match self.read_bytes_from_resource(&fd, total, position) {
             Ok(bytes) => OpAction::Complete(Self::write_to_iovecs(
               iovecs, iov_count, &bytes,
             ) as isize),
@@ -2214,18 +2223,15 @@ impl DSBackend {
         }
       }
       Op::Write { fd, iovecs, iov_count, offset, flags } => {
-        if offset < -1 {
-          return OpAction::Complete(-(errno::EINVAL as isize));
-        }
+        let position = match Self::file_position(offset) {
+          Ok(position) => position,
+          Err(err) => return OpAction::Complete(err),
+        };
         if flags.bits() < 0 {
           return OpAction::Complete(-(errno::ENOTSUP as isize));
         }
         let bytes = Self::extract_iovec_bytes(iovecs, iov_count);
-        match self.write_bytes_to_resource(
-          &fd,
-          &bytes,
-          (offset >= 0).then_some(offset as usize),
-        ) {
+        match self.write_bytes_to_resource(&fd, &bytes, position) {
           Ok(len) => OpAction::Complete(len as isize),
           Err(err) => OpAction::Complete(err),
         }
@@ -3362,16 +3368,16 @@ impl DSTBackend {
     fd: &Resource,
     iovecs: NonNull<RawBuf>,
     iov_count: usize,
-    offset: i64,
+    offset: Option<u64>,
     flags: ReadFlags,
   ) -> PendingAction {
-    if offset < -1 {
+    if !op::is_valid_file_offset(offset) {
       return PendingAction::Complete(-(errno::EINVAL as isize));
     }
     if flags.bits() < 0 {
       return PendingAction::Complete(-(errno::ENOTSUP as isize));
     }
-    if offset >= 0 {
+    if offset.is_some() {
       return PendingAction::Complete(-(errno::ESPIPE as isize));
     }
     let raw = DSBackend::resource_key(fd);
@@ -3867,14 +3873,13 @@ impl DSTBackend {
         ));
       }
       Op::Write { fd, iovecs, iov_count, offset, flags } => {
-        if offset < -1 {
-          self
-            .node
-            .borrow_mut()
-            .ready
-            .push(OpCompleted::new(id, -(errno::EINVAL as isize)));
-          return;
-        }
+        let position = match DSBackend::file_position(offset) {
+          Ok(position) => position,
+          Err(err) => {
+            self.node.borrow_mut().ready.push(OpCompleted::new(id, err));
+            return;
+          }
+        };
         if flags.bits() < 0 {
           self
             .node
@@ -3884,12 +3889,7 @@ impl DSTBackend {
           return;
         }
         let bytes = DSBackend::extract_iovec_bytes(iovecs, iov_count);
-        let result = self.process_network_write(
-          &fd,
-          &bytes,
-          (offset >= 0).then_some(offset as usize),
-          None,
-        );
+        let result = self.process_network_write(&fd, &bytes, position, None);
         self.node.borrow_mut().ready.push(OpCompleted::new(
           id,
           result.map(|len| len as isize).unwrap_or_else(|err| err),

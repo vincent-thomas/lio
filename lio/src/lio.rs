@@ -1255,4 +1255,25 @@ mod tests {
     lio.try_run().unwrap();
     assert!(!lio.is_full(), "the panicking op's slot is released");
   }
+
+  #[test]
+  fn completing_an_op_on_its_slot_s_last_generation_keeps_the_capacity() {
+    let backend = ScriptedBackend::auto(0);
+    let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
+    lio.inner.borrow_mut().store.set_generation(0, u32::MAX);
+    let done = Rc::new(RefCell::new(0));
+    for _ in 0..2 {
+      let done = done.clone();
+      crate::api::nop()
+        .with_lio(&lio)
+        .when_done(move |_| *done.borrow_mut() += 1);
+      assert_eq!(lio.try_run().unwrap(), 1);
+      assert!(!lio.is_full(), "the slot, or its replacement, is free");
+    }
+    assert_eq!(*done.borrow(), 2);
+    let [spent, fresh] = backend.pushed()[..] else { panic!("two ops") };
+    assert_eq!(spent, u64::from(u32::MAX) << 32);
+    assert_eq!(fresh, 1, "the replacement slot, at its first generation");
+    assert!(lio.inner.borrow_mut().store.get_mut(spent).is_none());
+  }
 }

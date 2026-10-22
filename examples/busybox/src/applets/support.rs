@@ -114,15 +114,9 @@ pub fn dd_copy_sequential(
   while spec.count.is_none_or(|count| blocks_copied < count) {
     let buf = vec![0u8; spec.block_size];
     let (result, mut returned_buf) = if spec.input.is_some() {
-      if input_offset > u32::MAX as usize {
-        return Err(io::Error::new(
-          io::ErrorKind::InvalidInput,
-          "dd: input offset exceeds current lio read_at limit",
-        ));
-      }
       io_util::run(
         lio,
-        api::read_at(input, buf, input_offset as u32).with_lio(lio).send(),
+        api::read_at(input, buf, input_offset as u64).with_lio(lio).send(),
       )
     } else {
       io_util::run(lio, api::read(input, buf).with_lio(lio).send())
@@ -136,15 +130,9 @@ pub fn dd_copy_sequential(
     returned_buf.truncate(n);
 
     if spec.output.is_some() {
-      if output_offset > u32::MAX as usize {
-        return Err(io::Error::new(
-          io::ErrorKind::InvalidInput,
-          "dd: output offset exceeds current lio write_at limit",
-        ));
-      }
       let (write_result, _) = io_util::run(
         lio,
-        api::write_at(output, returned_buf, output_offset as u32)
+        api::write_at(output, returned_buf, output_offset as u64)
           .with_lio(lio)
           .send(),
       );
@@ -228,15 +216,8 @@ pub fn dd_copy_file_to_file(
           )
         })?;
 
-      if input_offset > u32::MAX as usize || output_offset > u32::MAX as usize {
-        return Err(io::Error::new(
-          io::ErrorKind::InvalidInput,
-          "dd: offset exceeds current lio read_at/write_at limit",
-        ));
-      }
-
       let rx =
-        api::read_at(input, vec![0u8; spec.block_size], input_offset as u32)
+        api::read_at(input, vec![0u8; spec.block_size], input_offset as u64)
           .with_lio(lio)
           .send();
       let slot = pending
@@ -268,7 +249,7 @@ pub fn dd_copy_file_to_file(
             }
             update_dd_input_stats(stats, n, spec.block_size);
             buf.truncate(n);
-            let write_rx = api::write_at(output, buf, output_offset as u32)
+            let write_rx = api::write_at(output, buf, output_offset as u64)
               .with_lio(lio)
               .send();
             *slot = Some(DdPending::Write { rx: write_rx, expected: n });
