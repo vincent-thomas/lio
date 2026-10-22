@@ -1,5 +1,5 @@
 use crate::{
-  api::op::{Action, Completion, CompletionFlags},
+  api::op::{Action, Completion, CompletionFlags, OpModel},
   backend::{
     IoBackend, OpCompleted,
     store::{Detached, OpStore},
@@ -291,7 +291,10 @@ impl Lio {
   /// * `cap` - The number of operations that can be in flight at once
   ///
   /// All memory for `cap` operations is reserved up front, so a driver sized
-  /// for its peak load does not allocate per operation. Beyond `cap`, futures
+  /// for its peak load does not allocate per operation: an awaited
+  /// operation's result, and a stream's items, wait in the operation's slot
+  /// until taken. A finished operation therefore holds its slot until its
+  /// future or stream takes the result, or is dropped. Beyond `cap`, futures
   /// wait for a free slot, while [`Io::when_done`](crate::api::Io::when_done)
   /// and [`Io::send`](crate::api::Io::send) queue the operation, which
   /// allocates; see [`Lio::is_full`].
@@ -773,6 +776,11 @@ impl Lio {
           inner_ref.io.cancel(id);
         }
       }
+      // The operation is over, but its consumer has items left to take:
+      // they stay in the registration until then.
+      ProcessResult::Done if reg.has_items() && !reg.is_cancelled() => {
+        reg.park();
+      }
       ProcessResult::Done => {
         // Dropped by `bury_and_wake` once the driver is not borrowed.
         timed!(PROFILE, stats, remove_time, Self::retire(inner_ref, id));
@@ -785,16 +793,37 @@ impl Lio {
   // NOTE: check_done and check_stream_done are no longer needed with the channel-based
   // architecture. Results are now sent through mpsc channels directly to futures/streams.
 
-  pub(crate) fn set_waker(&self, id: u64, waker: Waker) {
+  /// Takes the next item of operation `id`, a
+  /// [`Registration::new_local_in`] one with model `T`, or registers
+  /// `waker` for it.
+  ///
+  /// Taking the last item of an operation that is over removes it.
+  pub(crate) fn take_item<T: OpModel>(
+    &self,
+    id: u64,
+    waker: &Waker,
+  ) -> Taken<T::Item> {
     let mut inner = self.inner.borrow_mut();
-    if let Some(entry) = inner.store.get_mut(id) {
-      entry.set_waker(waker);
+    let Some(reg) = inner.store.get_mut(id) else {
+      return Taken::Gone;
+    };
+    let Some(item) = reg.take_item::<T>() else {
+      reg.register_waker(waker);
+      return Taken::Pending;
+    };
+    let last = reg.is_parked() && !reg.has_items();
+    if last {
+      Self::retire(&mut inner, id);
+      drop(inner);
+      self.bury_and_wake();
     }
+    Taken::Item { item, last }
   }
 
   /// Cancels an operation whose consumer (a future or stream) was dropped.
   ///
-  /// A pending timer is simply removed. An I/O operation may still be in the
+  /// A parked operation (see [`Registration::park`]) or a pending timer is
+  /// simply removed. An I/O operation may still be in the
   /// backend, using memory owned by its registration, so the registration
   /// stays until the operation's completion arrives; the backend is asked to
   /// finish it early, and the completion is discarded.
@@ -805,7 +834,8 @@ impl Lio {
       let Some(reg) = inner.store.get_mut(id) else {
         return;
       };
-      if inner.time.remove(id) {
+      if reg.is_parked() || inner.time.remove(id) {
+        // Nothing of it is in the backend: the items left are dropped.
         Self::retire(inner, id);
       } else {
         // A done model already had its operation cancelled.
@@ -818,6 +848,18 @@ impl Lio {
     }
     self.bury_and_wake();
   }
+}
+
+/// What [`Lio::take_item`] found.
+pub(crate) enum Taken<T> {
+  /// The next item. `last` once the operation is over and this was its
+  /// final item: it is gone now.
+  Item { item: T, last: bool },
+  /// No item yet: the waker is registered.
+  Pending,
+  /// The operation is gone, after its final item was taken, or after its
+  /// handler panicked.
+  Gone,
 }
 
 /// Tracks the registration whose handler is running during a run.
@@ -884,6 +926,10 @@ mod lifecycle_tests;
 #[cfg(test)]
 #[path = "lio_multishot_tests.rs"]
 mod multishot_tests;
+
+#[cfg(test)]
+#[path = "lio_local_tests.rs"]
+mod local_tests;
 
 #[cfg(test)]
 mod tests {
