@@ -64,6 +64,11 @@ typedef struct sockaddr_storage sockaddr_storage;
 #define EBADF 6
 
 /**
+ * `ERROR_OPERATION_ABORTED`
+ */
+#define ECANCELED 995
+
+/**
  * `WSAECONNABORTED`
  */
 #define ECONNABORTED 10053
@@ -182,6 +187,11 @@ typedef struct sockaddr_storage sockaddr_storage;
  * `WSAETIMEDOUT`
  */
 #define ETIMEDOUT 10060
+
+/**
+ * The byte [`ScriptedBackend`] writes into the buffers it fills.
+ */
+#define POISON 165
 
 /**
  * Completion flags understood by higher-level operation models.
@@ -351,13 +361,15 @@ void lio_bind(struct lio_handle_t *lio,
 void lio_listen(struct lio_handle_t *lio, intptr_t fd, int backlog, void (*callback)(int));
 
 /**
- * Write data to `fd` at `offset`.  Pass `offset = -1` for current position.
+ * Write data to `fd` at the absolute file `offset`.  Use [`lio_write`] to
+ * write at the current position.
  *
  * Ownership of `buf` (which must have been `malloc`'d with at least `buf_len`
  * bytes) transfers to lio.  The callback receives the original pointer so the
  * caller can `free` it.
  *
- * - `callback(result, buf, len)`: bytes written (or negative errno), buffer
+ * - `callback(result, buf, len)`: bytes written (or negative errno), buffer;
+ *   `-EINVAL` without writing when `offset` exceeds `INT64_MAX`
  *
  * # Safety
  * `lio` must be valid; `buf` must point to at least `buf_len` bytes allocated
@@ -367,16 +379,17 @@ void lio_write_at(struct lio_handle_t *lio,
                   intptr_t fd,
                   uint8_t *buf,
                   uintptr_t buf_len,
-                  int64_t offset,
+                  uint64_t offset,
                   void (*callback)(int, uint8_t*, uintptr_t));
 
 /**
- * Read from `fd` at `offset` into `buf`.  Pass `offset = -1` for current
- * position.
+ * Read from `fd` at the absolute file `offset` into `buf`.  Use [`lio_read`]
+ * to read from the current position.
  *
  * Ownership of `buf` transfers to lio (see [`lio_write_at`]).
  *
- * - `callback(result, buf, len)`: bytes read (or negative errno), buffer
+ * - `callback(result, buf, len)`: bytes read (or negative errno), buffer;
+ *   `-EINVAL` without reading when `offset` exceeds `INT64_MAX`
  *
  * # Safety
  * Same requirements as [`lio_write_at`].
@@ -385,7 +398,7 @@ void lio_read_at(struct lio_handle_t *lio,
                  intptr_t fd,
                  uint8_t *buf,
                  uintptr_t buf_len,
-                 int64_t offset,
+                 uint64_t offset,
                  void (*callback)(int, uint8_t*, uintptr_t));
 
 /**

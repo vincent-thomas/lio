@@ -9,7 +9,11 @@ use super::common;
 use lio::{
   Lio,
   api::{self, resource::Resource},
-  backend::ds::{DSBackend, DSConfig},
+  backend::{
+    ds::{DSBackend, DSConfig},
+    op::Op,
+    testing::{Checked, ScriptedBackend},
+  },
 };
 use proptest::{prelude::*, test_runner::TestRunner};
 use std::ffi::CString;
@@ -59,7 +63,7 @@ fn write_all_at(
   lio: &mut Lio,
   fd: &Resource,
   bytes: &[u8],
-  offset: u32,
+  offset: u64,
 ) -> Vec<u8> {
   let expected = bytes.to_vec();
   let mut written_total = 0usize;
@@ -67,7 +71,7 @@ fn write_all_at(
   while written_total < expected.len() {
     let chunk = expected[written_total..].to_vec();
     let mut receiver =
-      api::write_at(fd, chunk.clone(), offset + written_total as u32)
+      api::write_at(fd, chunk.clone(), offset + written_total as u64)
         .with_lio(lio)
         .send();
 
@@ -94,7 +98,7 @@ fn read_once_at(
   lio: &mut Lio,
   fd: &Resource,
   len: usize,
-  offset: u32,
+  offset: u64,
 ) -> (usize, Vec<u8>) {
   let mut receiver =
     api::read_at(fd, vec![0u8; len], offset).with_lio(lio).send();
@@ -119,13 +123,13 @@ fn read_exact_at(
   lio: &mut Lio,
   fd: &Resource,
   len: usize,
-  offset: u32,
+  offset: u64,
 ) -> Vec<u8> {
   let mut out = Vec::with_capacity(len);
 
   while out.len() < len {
     let (bytes_read, buf) =
-      read_once_at(lio, fd, len - out.len(), offset + out.len() as u32);
+      read_once_at(lio, fd, len - out.len(), offset + out.len() as u64);
     assert!(bytes_read <= buf.len());
     assert!(
       bytes_read > 0,
@@ -234,6 +238,103 @@ fn read_at_offset_beyond_file() {
   unlink_file(&mut lio, path);
 }
 
+/// Offsets past 4 GiB reach the file intact. They used to be `u32`, so the C
+/// API wrapped a write at 5 GiB to 1 GiB. The file is sparse, so this takes no
+/// disk space on APFS, ext4 or tmpfs.
+#[test]
+#[cfg_attr(miri, ignore = "needs a real backend")]
+#[cfg_attr(
+  windows,
+  ignore = "NTFS files are not sparse by default: this would write 5 GiB"
+)]
+fn read_write_at_offset_past_4_gib() {
+  const OFFSET: u64 = 5 << 30;
+  const WRAPPED: u64 = OFFSET as u32 as u64;
+  let data = b"past 4 GiB";
+
+  let mut lio = Lio::new(64).unwrap();
+  let temp = common::TempFile::new("lio_rw_offset_past_4_gib");
+  let file = open_rw_file(&mut lio, temp.path.clone());
+
+  let _ = write_all_at(&mut lio, &file, data, OFFSET);
+  assert_eq!(read_exact_at(&mut lio, &file, data.len(), OFFSET), data);
+
+  let len = std::fs::metadata(temp.path.to_str().unwrap()).unwrap().len();
+  assert_eq!(len, OFFSET + data.len() as u64);
+  // Nothing landed where the truncated offset points.
+  assert_eq!(
+    read_exact_at(&mut lio, &file, data.len(), WRAPPED),
+    vec![0u8; data.len()]
+  );
+}
+
+/// A kernel file offset is signed, so an offset past `i64::MAX` fails with
+/// `InvalidInput` before any read or write reaches the backend. Cast to
+/// `off_t` it would turn negative, and `u64::MAX` would read as `-1`: the
+/// current position.
+#[test]
+fn offset_past_i64_max_is_invalid_input() {
+  for offset in [i64::MAX as u64 + 1, u64::MAX] {
+    let backend = ScriptedBackend::new();
+    let lio = Lio::new_with_backend(Checked::new(backend.clone()), 4).unwrap();
+    let file = Resource::stdin();
+
+    let mut read =
+      api::read_at(&file, vec![0u8; 4], offset).with_lio(&lio).send();
+    let mut write =
+      api::write_at(&file, b"data".to_vec(), offset).with_lio(&lio).send();
+    lio.try_run().unwrap();
+
+    let pushed = backend.in_flight();
+    assert_eq!(pushed.len(), 2);
+    for id in pushed {
+      let op = backend.op(id).unwrap();
+      assert!(matches!(op, Op::Nop), "{offset} reached the backend: {op:?}");
+      backend.complete(id, 0);
+    }
+    lio.try_run().unwrap();
+
+    let (result, buf) = read.try_recv().expect("read completed");
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(buf, [0u8; 4]);
+    let (result, buf) = write.try_recv().expect("write completed");
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(buf, b"data");
+  }
+}
+
+/// The largest offset the kernel accepts is still submitted as given.
+#[test]
+fn offset_at_i64_max_is_submitted() {
+  let backend = ScriptedBackend::new();
+  let lio = Lio::new_with_backend(Checked::new(backend.clone()), 4).unwrap();
+  let file = Resource::stdin();
+
+  let _read =
+    api::read_at(&file, vec![0u8; 4], i64::MAX as u64).with_lio(&lio).send();
+  let _write = api::write_at(&file, b"data".to_vec(), i64::MAX as u64)
+    .with_lio(&lio)
+    .send();
+  lio.try_run().unwrap();
+
+  let ops: Vec<_> =
+    backend.in_flight().into_iter().map(|id| backend.op(id).unwrap()).collect();
+  assert!(
+    matches!(
+      ops.as_slice(),
+      [
+        Op::Read { offset: Some(read), .. },
+        Op::Write { offset: Some(write), .. },
+      ] if *read == i64::MAX as u64 && *write == i64::MAX as u64
+    ),
+    "{ops:?}"
+  );
+  for id in backend.in_flight() {
+    backend.complete(id, 0);
+  }
+  lio.try_run().unwrap();
+}
+
 #[test]
 fn read_empty_file() {
   let mut lio = new_ds_lio();
@@ -281,7 +382,7 @@ fn prop_test_read_arbitrary_data_and_offsets() {
   });
 
   runner
-    .run(&(1..=4096usize, 0..=2048u32, 1..=2048usize, any::<u64>()), |props| {
+    .run(&(1..=4096usize, 0..=2048u64, 1..=2048usize, any::<u64>()), |props| {
       let (data_size, read_offset, buffer_size, seed) = props;
       prop_test_read_arbitrary_data_and_offsets_run(
         data_size,
@@ -295,7 +396,7 @@ fn prop_test_read_arbitrary_data_and_offsets() {
 
 fn prop_test_read_arbitrary_data_and_offsets_run(
   data_size: usize,
-  read_offset: u32,
+  read_offset: u64,
   buffer_size: usize,
   seed: u64,
 ) -> Result<(), TestCaseError> {
@@ -385,7 +486,7 @@ fn prop_test_write_arbitrary_data_and_offsets() {
   let mut runner = TestRunner::new(ProptestConfig::default());
 
   runner
-    .run(&(0usize..=8192, 0u32..=4096, any::<u64>()), |props| {
+    .run(&(0usize..=8192, 0u64..=4096, any::<u64>()), |props| {
       prop_test_write_arbitrary_data_and_offsets_run(props.0, props.1, props.2)
     })
     .unwrap();
@@ -393,7 +494,7 @@ fn prop_test_write_arbitrary_data_and_offsets() {
 
 fn prop_test_write_arbitrary_data_and_offsets_run(
   data_size: usize,
-  write_offset: u32,
+  write_offset: u64,
   seed: u64,
 ) -> Result<(), TestCaseError> {
   let mut lio = new_ds_lio();

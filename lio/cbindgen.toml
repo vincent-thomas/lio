@@ -15,6 +15,9 @@ typedef struct sockaddr_storage sockaddr_storage;
 """
 
 [export]
+# The C API documents its own bound (`INT64_MAX`) on the functions that take
+# file offsets; keep the backend contract's constant out of the C namespace.
+exclude = ["MAX_FILE_OFFSET"]
 
 [parse]
 parse_deps = false

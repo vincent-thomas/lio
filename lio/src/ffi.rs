@@ -50,7 +50,9 @@ use crate::{
     self, FileStat, FileType, ReadDirBuf, RecvFlags, SendFlags, ShutdownHow,
     SockDomain, SockProto, SockType, resource::Resource,
   },
-  backend::impls::sockaddr::std_socketaddr_into_libc,
+  backend::{
+    impls::sockaddr::std_socketaddr_into_libc, op::is_valid_file_offset,
+  },
 };
 
 #[cfg(unix)]
@@ -573,13 +575,15 @@ pub unsafe extern "C" fn lio_listen(
 //     });
 // }
 
-/// Write data to `fd` at `offset`.  Pass `offset = -1` for current position.
+/// Write data to `fd` at the absolute file `offset`.  Use [`lio_write`] to
+/// write at the current position.
 ///
 /// Ownership of `buf` (which must have been `malloc`'d with at least `buf_len`
 /// bytes) transfers to lio.  The callback receives the original pointer so the
 /// caller can `free` it.
 ///
-/// - `callback(result, buf, len)`: bytes written (or negative errno), buffer
+/// - `callback(result, buf, len)`: bytes written (or negative errno), buffer;
+///   `-EINVAL` without writing when `offset` exceeds `INT64_MAX`
 ///
 /// # Safety
 /// `lio` must be valid; `buf` must point to at least `buf_len` bytes allocated
@@ -590,21 +594,21 @@ pub unsafe extern "C" fn lio_write_at(
   fd: libc::intptr_t,
   buf: *mut u8,
   buf_len: usize,
-  offset: i64,
+  offset: u64,
   callback: extern "C" fn(libc::c_int, *mut u8, usize),
 ) {
+  if !is_valid_file_offset(Some(offset)) {
+    callback(-libc::EINVAL, buf, buf_len);
+    return;
+  }
   // SAFETY: C caller transfers ownership of a buffer allocated by lio_buf_alloc.
   let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
-  let op = if offset < 0 {
-    api::write(&resource, vec)
-  } else {
-    api::write_at(&resource, vec, offset as u32)
-  };
   // SAFETY: caller guarantees lio is valid per fn contract
-  op.with_lio(&unsafe { handle(lio) }.inner).when_done(
-    move |(res, mut buf)| {
+  api::write_at(&resource, vec, offset)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, mut buf)| {
       let code = match res {
         Ok(n) => ffi_count(n),
         Err(e) => -e.raw_os_error().unwrap_or(1),
@@ -614,16 +618,16 @@ pub unsafe extern "C" fn lio_write_at(
       // Return buffer ownership to C - caller will free it
       std::mem::forget(buf);
       callback(code, ptr, len);
-    },
-  );
+    });
 }
 
-/// Read from `fd` at `offset` into `buf`.  Pass `offset = -1` for current
-/// position.
+/// Read from `fd` at the absolute file `offset` into `buf`.  Use [`lio_read`]
+/// to read from the current position.
 ///
 /// Ownership of `buf` transfers to lio (see [`lio_write_at`]).
 ///
-/// - `callback(result, buf, len)`: bytes read (or negative errno), buffer
+/// - `callback(result, buf, len)`: bytes read (or negative errno), buffer;
+///   `-EINVAL` without reading when `offset` exceeds `INT64_MAX`
 ///
 /// # Safety
 /// Same requirements as [`lio_write_at`].
@@ -633,23 +637,23 @@ pub unsafe extern "C" fn lio_read_at(
   fd: libc::intptr_t,
   buf: *mut u8,
   buf_len: usize,
-  offset: i64,
+  offset: u64,
   callback: extern "C" fn(libc::c_int, *mut u8, usize),
 ) {
+  if !is_valid_file_offset(Some(offset)) {
+    callback(-libc::EINVAL, buf, buf_len);
+    return;
+  }
   // SAFETY: caller transfers ownership of a buffer allocated by
   // `lio_buf_alloc(buf_len)`, which matches the `Vec<u8>` layout reconstructed
   // here.
   let vec = unsafe { Vec::from_raw_parts(buf, buf_len, buf_len) };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
-  let op = if offset < 0 {
-    api::read(&resource, vec)
-  } else {
-    api::read_at(&resource, vec, offset as u32)
-  };
   // SAFETY: caller guarantees lio is valid per fn contract
-  op.with_lio(&unsafe { handle(lio) }.inner).when_done(
-    move |(res, mut buf)| {
+  api::read_at(&resource, vec, offset)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, mut buf)| {
       let code = match res {
         Ok(n) => ffi_count(n),
         Err(e) => -e.raw_os_error().unwrap_or(1),
@@ -659,8 +663,7 @@ pub unsafe extern "C" fn lio_read_at(
       // Return buffer ownership to C - caller will free it
       std::mem::forget(buf);
       callback(code, ptr, len);
-    },
-  );
+    });
 }
 
 /// Create a socket.
@@ -2263,6 +2266,119 @@ mod sockaddr_tests {
     unsafe {
       lio_destroy(lio);
       libc::close(fd);
+    }
+  }
+}
+
+#[cfg(all(test, unix))]
+mod rw_offset_tests {
+  use super::*;
+  use std::os::fd::AsRawFd;
+  use std::sync::Mutex;
+
+  /// `(result, buf, len)` from the last read or write callback.
+  static DONE: Mutex<Option<(libc::c_int, usize, usize)>> = Mutex::new(None);
+  /// Held by each test: they share `DONE`.
+  static SERIAL: Mutex<()> = Mutex::new(());
+  extern "C" fn on_rw(code: libc::c_int, buf: *mut u8, len: usize) {
+    *DONE.lock().unwrap() = Some((code, buf as usize, len));
+  }
+
+  /// Ticks `lio` until the callback ran; returns its result and the buffer.
+  fn wait(lio: *mut lio_handle_t) -> (libc::c_int, Vec<u8>) {
+    for _ in 0..5_000 {
+      if let Some((code, buf, len)) = DONE.lock().unwrap().take() {
+        // SAFETY: the callback hands back the buffer from `lio_buf_alloc`.
+        let bytes =
+          unsafe { std::slice::from_raw_parts(buf as *const u8, len) }.to_vec();
+        // SAFETY: as above; it is not used after this.
+        unsafe { lio_buf_free(buf as *mut u8, len) };
+        return (code, bytes);
+      }
+      // SAFETY: `lio` is a live handle from `lio_create`.
+      unsafe { lio_tick(lio) };
+      std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("read/write callback never ran");
+  }
+
+  fn buf_with(bytes: &[u8]) -> *mut u8 {
+    let buf = lio_buf_alloc(bytes.len());
+    // SAFETY: `buf` holds `bytes.len()` bytes.
+    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len()) };
+    buf
+  }
+
+  /// Offsets past 4 GiB reach the file. `lio_write_at` used to truncate them
+  /// to 32 bits, so a write at 5 GiB landed at 1 GiB. The file is sparse.
+  #[test]
+  #[cfg_attr(miri, ignore = "needs a real backend")]
+  fn read_write_at_past_4_gib() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    const OFFSET: u64 = 5 << 30;
+    let data = b"past 4 GiB";
+    let path = std::env::temp_dir()
+      .join(format!("lio_ffi_rw_past_4_gib_{}", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .truncate(true)
+      .open(&path)
+      .unwrap();
+    let fd = file.as_raw_fd() as libc::intptr_t;
+    let lio = lio_create(16);
+    assert!(!lio.is_null());
+
+    // SAFETY: valid handle, fd and `lio_buf_alloc` buffer of `data.len()`.
+    unsafe { lio_write_at(lio, fd, buf_with(data), data.len(), OFFSET, on_rw) };
+    assert_eq!(wait(lio), (data.len() as libc::c_int, data.to_vec()));
+    assert_eq!(file.metadata().unwrap().len(), OFFSET + data.len() as u64);
+
+    let zeros = vec![0; data.len()];
+    // SAFETY: as above.
+    unsafe {
+      lio_read_at(lio, fd, buf_with(&zeros), data.len(), OFFSET, on_rw)
+    };
+    assert_eq!(wait(lio), (data.len() as libc::c_int, data.to_vec()));
+
+    // Where the truncated offset pointed, the file is still a hole.
+    // SAFETY: as above.
+    unsafe {
+      lio_read_at(
+        lio,
+        fd,
+        buf_with(data),
+        data.len(),
+        OFFSET as u32 as u64,
+        on_rw,
+      )
+    };
+    assert_eq!(wait(lio), (data.len() as libc::c_int, zeros));
+
+    // SAFETY: `lio` is not used after this.
+    unsafe { lio_destroy(lio) };
+    drop(file);
+    std::fs::remove_file(path).unwrap();
+  }
+
+  /// An offset past `INT64_MAX` fails with `-EINVAL` and hands the buffer
+  /// back untouched, without a handle or descriptor being used.
+  #[test]
+  fn offset_past_int64_max_is_einval() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for offset in [i64::MAX as u64 + 1, u64::MAX] {
+      // SAFETY: rejected before `lio` or the fd are used; the buffer comes
+      // from `lio_buf_alloc`.
+      unsafe {
+        lio_write_at(ptr::null_mut(), -1, buf_with(b"data"), 4, offset, on_rw)
+      };
+      assert_eq!(wait(ptr::null_mut()), (-libc::EINVAL, b"data".to_vec()));
+      // SAFETY: as above.
+      unsafe {
+        lio_read_at(ptr::null_mut(), -1, buf_with(b"data"), 4, offset, on_rw)
+      };
+      assert_eq!(wait(ptr::null_mut()), (-libc::EINVAL, b"data".to_vec()));
     }
   }
 }

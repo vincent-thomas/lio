@@ -196,7 +196,7 @@ mod immediate_sockets {
         fd: socket,
         iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
         iov_count: raws.len(),
-        offset: -1,
+        offset: None,
         flags: ReadFlags::EMPTY,
       },
       &mut Bump::new(),

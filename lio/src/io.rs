@@ -159,7 +159,7 @@ impl Copy {
       writer: writer.clone(),
       total: 0,
       limit,
-      state: CopyState::Reading(ops::Read::new(reader, buf, -1)),
+      state: CopyState::Reading(ops::Read::new(reader, buf, None)),
     }
   }
 
@@ -191,7 +191,7 @@ impl OpModel for Copy {
           self.total += n as u64;
           let buf = buf.into_inner();
           self.state =
-            CopyState::Writing(ops::Write::new(self.writer.clone(), buf, -1));
+            CopyState::Writing(ops::Write::new(self.writer.clone(), buf, None));
           OpResult::Again
         }
         OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
@@ -207,8 +207,11 @@ impl OpModel for Copy {
             let remaining = buf.len() - written;
             buf.copy_within(written.., 0);
             buf.truncate(remaining);
-            self.state =
-              CopyState::Writing(ops::Write::new(self.writer.clone(), buf, -1));
+            self.state = CopyState::Writing(ops::Write::new(
+              self.writer.clone(),
+              buf,
+              None,
+            ));
             return OpResult::Again;
           }
 
@@ -217,8 +220,11 @@ impl OpModel for Copy {
           } else {
             buf.clear();
             let buf = CappedBuf::new(buf, self.next_read_len());
-            self.state =
-              CopyState::Reading(ops::Read::new(self.reader.clone(), buf, -1));
+            self.state = CopyState::Reading(ops::Read::new(
+              self.reader.clone(),
+              buf,
+              None,
+            ));
             OpResult::Again
           }
         }

@@ -37,12 +37,12 @@ fn open_rw_file(lio: &mut Lio, path: std::ffi::CString) -> Resource {
   common::poll_recv(lio, &mut receiver).unwrap()
 }
 
-fn write_all_at(lio: &mut Lio, fd: &Resource, bytes: &[u8], offset: u32) {
+fn write_all_at(lio: &mut Lio, fd: &Resource, bytes: &[u8], offset: u64) {
   let mut written_total = 0usize;
   while written_total < bytes.len() {
     let chunk = bytes[written_total..].to_vec();
     let mut receiver =
-      api::write_at(fd, chunk.clone(), offset + written_total as u32)
+      api::write_at(fd, chunk.clone(), offset + written_total as u64)
         .with_lio(lio)
         .send();
     let (result, returned_buf) = common::poll_recv(lio, &mut receiver);
