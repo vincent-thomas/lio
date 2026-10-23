@@ -133,21 +133,24 @@ use std::time::Duration;
 
 use bumpalo::Bump;
 
+use crate::api::op::CompletionFlags;
 use crate::api::resource::CloseFn;
 use crate::backend::op::Op;
 
 /// Represents a completed I/O operation.
 ///
 /// This type is returned by backend handlers when an operation completes,
-/// containing the operation ID and its result.
+/// containing the operation ID, its result and its flags.
 #[derive(Debug, Clone, Copy)]
 pub struct OpCompleted {
   registration_id: u64,
   result: isize,
+  flags: CompletionFlags,
 }
 
 impl OpCompleted {
-  /// Creates a new completed operation result.
+  /// Creates a new completed operation result, with no flags: the
+  /// operation's final completion.
   ///
   /// # Parameters
   ///
@@ -155,7 +158,16 @@ impl OpCompleted {
   /// - `result`: The operation result (non-negative for success, negative errno for error)
   #[inline]
   pub fn new(op_id: u64, result: isize) -> Self {
-    Self { registration_id: op_id, result }
+    Self::with_flags(op_id, result, CompletionFlags::empty())
+  }
+
+  /// Creates a completed operation result carrying `flags`.
+  ///
+  /// Backends report only [`CompletionFlags::MORE`]; the other flags are
+  /// set by the driver.
+  #[inline]
+  pub fn with_flags(op_id: u64, result: isize, flags: CompletionFlags) -> Self {
+    Self { registration_id: op_id, result, flags }
   }
 
   #[inline]
@@ -166,6 +178,18 @@ impl OpCompleted {
   #[inline]
   pub fn registration_id(&self) -> u64 {
     self.registration_id
+  }
+
+  #[inline]
+  pub fn flags(&self) -> CompletionFlags {
+    self.flags
+  }
+
+  /// Whether the operation is still in the backend after this completion
+  /// ([`CompletionFlags::MORE`]).
+  #[inline]
+  pub fn has_more(&self) -> bool {
+    self.flags.contains(CompletionFlags::MORE)
   }
 }
 
@@ -182,6 +206,11 @@ impl OpCompleted {
 ///   immediate completions observable on the next `wait()`
 /// - `wait()` writes zero or more completions into the caller-provided
 ///   `completed` vector for that call only
+/// - every pushed operation produces one final completion, one without
+///   [`CompletionFlags::MORE`]. Before it, an operation that produces several
+///   results (a multishot accept or receive) reports each of the others as a
+///   completion with `MORE` set. The memory the [`Op`] points to stays valid,
+///   and its id stays in flight, until the final completion is reported
 ///
 /// # Usage
 ///
@@ -219,10 +248,11 @@ pub trait IoBackend {
 
   /// Asks the backend to finish operation `id` early: its consumer is gone.
   ///
-  /// The operation must still produce exactly one completion, from a later
-  /// `wait()`: a cancellation error, or its own result if it finished
-  /// first. Until then the memory its [`Op`] points to stays valid, so the
-  /// backend must not consider the operation gone before it reports it.
+  /// The operation must still produce its final completion (one without
+  /// [`CompletionFlags::MORE`]), from a later `wait()`: a cancellation error,
+  /// or its own result if it finished first. Until then the memory its [`Op`]
+  /// points to stays valid, so the backend must not consider the operation
+  /// gone before it reports it.
   ///
   /// `id` may be unknown to the backend (already completed, or not an I/O
   /// operation); that is not an error.

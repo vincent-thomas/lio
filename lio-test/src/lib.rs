@@ -240,6 +240,14 @@ macro_rules! test_io_backend {
     ) -> Vec<__lio_test_lio::backend::OpCompleted> {
       let mut completed = Vec::new();
       backend.wait(timeout, &mut completed).unwrap();
+      for done in &completed {
+        // No operation in the contract is multishot: each completes once.
+        assert!(
+          !done.has_more(),
+          "registration {} completed with MORE, but its op produces one result",
+          done.registration_id()
+        );
+      }
       completed
     }
 

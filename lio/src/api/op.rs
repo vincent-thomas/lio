@@ -77,10 +77,20 @@ impl Eq for ResourceClose {}
 pub struct CompletionFlags(u32);
 
 impl CompletionFlags {
+  /// The operation is still in the backend: more completions for it follow,
+  /// without it being submitted again.
+  ///
+  /// Set by backends for each result of an operation that produces several
+  /// (a multishot accept or receive) but its last. The driver then does not
+  /// ask the model for its next [`action`](OpModel::action); a model that
+  /// finishes on such a completion has the backend operation cancelled, and
+  /// the completions still to come are discarded.
   pub const MORE: Self = Self(1 << 0);
   pub const CANCELLED: Self = Self(1 << 1);
   pub const TERMINAL: Self = Self(1 << 2);
   pub const TIMEOUT: Self = Self(1 << 3);
+  /// Set by the driver on the completion of an
+  /// [`Action::Sleep`](Action::Sleep).
   pub const TIMER: Self = Self(1 << 4);
 
   pub const fn empty() -> Self {
@@ -146,6 +156,13 @@ pub trait OpModel: Send + 'static {
   fn action(&mut self) -> Action;
 
   /// Interpret the completion of the previously submitted low-level step.
+  ///
+  /// A completion with [`CompletionFlags::MORE`] leaves that step running:
+  /// after it, [`action`](Self::action) is not called, and the next
+  /// completion is the step's next result. A model that returns
+  /// [`OpResult::Done`] on such a completion still has `complete` called for
+  /// the step's remaining completions, so it can release what they carry
+  /// (an accepted socket, say); what it returns for them is dropped.
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item>;
 }
 
