@@ -467,6 +467,15 @@ impl Registration {
     }
   }
 
+  /// Takes the waker of a task still waiting on this operation.
+  #[inline]
+  pub(crate) fn take_waker(&mut self) -> Option<Waker> {
+    match &mut self.state {
+      State::Waker { waker, .. } => waker.take(),
+      _ => None,
+    }
+  }
+
   /// Whether the operation was abandoned by its consumer.
   #[inline]
   pub(crate) fn is_cancelled(&self) -> bool {

@@ -123,6 +123,10 @@ struct LioInner {
   overflow: VecDeque<PendingSubmission>,
   /// Futures waiting for a free slot.
   capacity_waiters: Vec<Waker>,
+  /// Tasks that polled an operation after it was removed but before its
+  /// registration (and with it the stream's sender) was dropped. Woken once
+  /// it is, so their next poll sees the stream end.
+  orphaned_wakers: Vec<Waker>,
   profile: Option<LioProfile>,
 }
 
@@ -346,6 +350,7 @@ impl Lio {
       ready_timers: VecDeque::new(),
       dying: Vec::new(),
       burying: 0,
+      orphaned_wakers: Vec::new(),
       overflow: VecDeque::new(),
       capacity_waiters: Vec::new(),
       profile: std::env::var_os("LIO_PROFILE").map(|_| LioProfile::default()),
@@ -571,12 +576,21 @@ impl Lio {
           inner.burying += usize::from(next.is_some());
           next
         };
-        let Some(Detached { registration, slot }) = next else {
+        let Some(Detached { mut registration, slot }) = next else {
           break;
         };
-        // Released even if the drop panics.
-        let _release = ReleaseSlot { lio: self, slot };
-        drop(registration);
+        // A task may have polled after the final item was sent, and found
+        // the channel empty but still open. Wake it once the registration,
+        // which holds the sender, is gone.
+        let waker = registration.take_waker();
+        {
+          // Released even if the drop panics.
+          let _release = ReleaseSlot { lio: self, slot };
+          drop(registration);
+        }
+        if let Some(waker) = waker {
+          waker.wake();
+        }
         buried = true;
       }
       if !buried {
@@ -584,8 +598,12 @@ impl Lio {
       }
       // Scheduling queued submissions may remove ops without a first action,
       // so go around again until nothing is left to bury.
-      let waiters = Self::release_capacity(&mut self.inner.borrow_mut());
-      for waker in waiters {
+      let (waiters, orphaned) = {
+        let mut inner = self.inner.borrow_mut();
+        let waiters = Self::release_capacity(&mut inner);
+        (waiters, std::mem::take(&mut inner.orphaned_wakers))
+      };
+      for waker in waiters.into_iter().chain(orphaned) {
         waker.wake();
       }
     }
@@ -756,13 +774,17 @@ impl Lio {
     (inner, true)
   }
 
-  // NOTE: check_done and check_stream_done are no longer needed with the channel-based
-  // architecture. Results are now sent through mpsc channels directly to futures/streams.
-
   pub(crate) fn set_waker(&self, id: u64, waker: Waker) {
     let mut inner = self.inner.borrow_mut();
     if let Some(entry) = inner.store.get_mut(id) {
       entry.set_waker(waker);
+    } else if !inner.dying.is_empty() || inner.burying > 0 {
+      // Removed, but perhaps not dropped yet: the task's channel may still
+      // be open, so wake it once it is not.
+      inner.orphaned_wakers.push(waker);
+    } else {
+      drop(inner);
+      waker.wake();
     }
   }
 
@@ -923,6 +945,40 @@ mod tests {
     assert!(!lio.is_full(), "both slots are free again");
   }
 
+  #[test]
+  fn a_waker_set_between_retiring_and_burying_is_woken_once_buried() {
+    use std::sync::{Arc, mpsc};
+
+    let (backend, lio) = lio(1);
+    let (tx, rx) = mpsc::channel();
+    lio
+      .schedule_with(|arena| {
+        crate::registration::Registration::new_waker_in(
+          arena,
+          Waker::noop().clone(),
+          tx,
+          crate::api::ops::Nop,
+        )
+      })
+      .unwrap();
+    let id = backend.pushed()[0];
+    Lio::retire(&mut lio.inner.borrow_mut(), id);
+
+    // The channel is still open, so a stream polled now waits.
+    let wakes = Arc::new(Wakes::default());
+    lio.set_waker(id, Waker::from(wakes.clone()));
+    assert_eq!(wakes.count(), 0, "woken before the channel closed");
+    lio.bury_and_wake();
+    assert_eq!(wakes.count(), 1);
+    assert!(
+      rx.try_recv().is_err_and(|e| e == mpsc::TryRecvError::Disconnected)
+    );
+
+    // With nothing left to drop, a waker for a gone operation is woken now.
+    lio.set_waker(id, Waker::from(wakes.clone()));
+    assert_eq!(wakes.count(), 2);
+  }
+
   /// Reports a completion for every pushed op, twice.
   #[derive(Default)]
   struct Twice(Vec<u64>);
@@ -1018,6 +1074,12 @@ mod tests {
   impl std::task::Wake for Wakes {
     fn wake(self: std::sync::Arc<Self>) {
       self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+  }
+
+  impl Wakes {
+    fn count(&self) -> usize {
+      self.0.load(std::sync::atomic::Ordering::SeqCst)
     }
   }
 
