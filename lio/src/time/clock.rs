@@ -197,8 +197,9 @@ impl Clock {
     let slot_index = id as u32 as usize;
     if slot_index >= self.timers.len() {
       // Checked: on 32-bit targets `u32::MAX + 1` would wrap to 0.
-      #[expect(clippy::expect_used, reason = "no memory holds 2^32 timers")]
-      let required = slot_index.checked_add(1).expect("timer id out of range");
+      let Some(required) = slot_index.checked_add(1) else {
+        panic!("timer id {id} out of range");
+      };
       self.grow_timer_slots(required);
     }
     let entry = TimerEntry { deadline_ticks, pending_index: ACTIVE_TIMER };

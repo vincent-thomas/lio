@@ -702,9 +702,11 @@ impl IoUring {
   }
 
   #[inline]
-  #[expect(clippy::expect_used, reason = "the driver calls init first")]
   fn ring(&mut self) -> &mut LioUring {
-    self.ring.as_mut().expect("IoUring not initialized")
+    let Some(ring) = self.ring.as_mut() else {
+      panic!("IoUring not initialized: the driver calls init first");
+    };
+    ring
   }
 
   #[inline]
@@ -955,11 +957,9 @@ impl IoUring {
           .build()
       }
       Op::RenameAt { old_dir_fd, new_dir_fd, .. } => {
-        #[expect(
-          clippy::expect_used,
-          reason = "the path state holds both paths"
-        )]
-        let path2 = state.path2.as_ref().expect("RenameAt must have path2");
+        let Some(path2) = state.path2.as_ref() else {
+          unreachable!("RenameAt must have path2");
+        };
         RenameAt::new(
           old_dir_fd.as_raw_fd(),
           state.path1.as_ptr(),
@@ -974,11 +974,9 @@ impl IoUring {
           .build()
       }
       Op::LinkAt { kind, source_dir_fd, new_dir_fd, .. } => {
-        #[expect(
-          clippy::expect_used,
-          reason = "the path state holds both paths"
-        )]
-        let path2 = state.path2.as_ref().expect("LinkAt must have path2");
+        let Some(path2) = state.path2.as_ref() else {
+          unreachable!("LinkAt must have path2");
+        };
         match kind {
           LinkKind::Hard => LinkAt::new(
             source_dir_fd.as_raw_fd(),
@@ -1010,13 +1008,11 @@ impl IoUring {
         unreachable!("path operations must use create_path_entry")
       }
       Op::Socket { domain, ty, proto } => {
-        #[expect(
-          clippy::expect_used,
-          reason = "push validates socket ops first"
-        )]
-        let (domain, ty, proto) =
+        let Ok((domain, ty, proto)) =
           crate::backend::impls::sockaddr::socket_to_raw(*domain, *ty, *proto)
-            .expect("socket op must be validated before entry creation");
+        else {
+          unreachable!("socket op must be validated before entry creation");
+        };
         Socket::new(domain, ty, proto).build()
       }
       Op::Stat { .. } => {
@@ -1126,12 +1122,10 @@ impl IoUring {
           follow_symlinks,
           ..
         } => {
-          #[expect(clippy::expect_used, reason = "path stats store their path")]
-          let path_ptr = native_stat
-            .path
-            .as_ref()
-            .expect("path-based stat must have path cstring")
-            .as_ptr();
+          let Some(path) = native_stat.path.as_ref() else {
+            unreachable!("path-based stat must have path cstring");
+          };
+          let path_ptr = path.as_ptr();
           let flags =
             if *follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
           Statx::new(
@@ -1454,11 +1448,10 @@ impl IoBackend for IoUring {
 
       let pending_insert_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
-      #[expect(clippy::expect_used, reason = "push enforces the capacity")]
-      let (pending_key, pending) = self
-        .pending
-        .insert_get_mut(entry)
-        .expect("in-flight pending operations must fit backend capacity");
+      let Some((pending_key, pending)) = self.pending.insert_get_mut(entry)
+      else {
+        unreachable!("in-flight pending operations must fit backend capacity");
+      };
       if let Some(started) = pending_insert_started {
         pending_insert_time += started.elapsed();
       }

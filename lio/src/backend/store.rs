@@ -107,19 +107,17 @@ impl OpStore {
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> (u64, Option<Action>, &mut Bump) {
     let mut action = None;
-    #[expect(clippy::expect_used, reason = "the caller checks is_full first")]
-    let (key, slot) = self
-      .slots
-      .allocate_with(|slot| {
-        slot.model_bump.reset();
-        slot.step_bump.reset();
-        let registration = slot.registration.write(init(&mut slot.model_bump));
-        let mut guard = DropOnUnwind { registration, armed: true };
-        action = guard.registration.action();
-        // It returned: the slot gets claimed and owns the registration now.
-        guard.armed = false;
-      })
-      .expect("insert_with_action on a full store");
+    let Some((key, slot)) = self.slots.allocate_with(|slot| {
+      slot.model_bump.reset();
+      slot.step_bump.reset();
+      let registration = slot.registration.write(init(&mut slot.model_bump));
+      let mut guard = DropOnUnwind { registration, armed: true };
+      action = guard.registration.action();
+      // It returned: the slot gets claimed and owns the registration now.
+      guard.armed = false;
+    }) else {
+      panic!("insert_with_action on a full store: check is_full first");
+    };
     (key.as_u64(), action, &mut slot.step_bump)
   }
 

@@ -490,9 +490,9 @@ impl MsgSend {
   /// If `bufs` is empty.
   #[inline]
   pub fn new(bufs: &[MsgBuf], to: Option<SocketAddr>) -> Self {
-    #[expect(clippy::expect_used, reason = "an empty message is a caller bug")]
-    let buf_count = NonZeroUsize::new(bufs.len())
-      .expect("MsgSend must contain at least one buffer");
+    let Some(buf_count) = NonZeroUsize::new(bufs.len()) else {
+      panic!("MsgSend must contain at least one buffer");
+    };
     let bufs = NonNull::from(bufs).cast();
     Self { bufs, buf_count, to }
   }
@@ -515,9 +515,9 @@ impl MsgRecv {
   /// If `bufs` is empty.
   #[inline]
   pub fn new(bufs: &[MsgBufMut]) -> Self {
-    #[expect(clippy::expect_used, reason = "an empty message is a caller bug")]
-    let buf_count = NonZeroUsize::new(bufs.len())
-      .expect("MsgRecv must contain at least one buffer");
+    let Some(buf_count) = NonZeroUsize::new(bufs.len()) else {
+      panic!("MsgRecv must contain at least one buffer");
+    };
     let bufs = NonNull::from(bufs).cast();
     Self { bufs, buf_count, from: None }
   }

@@ -421,11 +421,9 @@ impl OpModel for OpenReadDir {
       }
       OpenReadDirState::Opening(mut op) => match op.complete(completion) {
         OpResult::Done(Ok(fd)) => {
-          #[expect(
-            clippy::expect_used,
-            reason = "the buffer is back between reads"
-          )]
-          let buf = self.buf.take().expect("read_dir buffer missing");
+          let Some(buf) = self.buf.take() else {
+            unreachable!("read_dir buffer missing");
+          };
           self.state = OpenReadDirState::Reading {
             fd: fd.clone(),
             op: ops::ReadDir::new(fd, buf),
@@ -457,11 +455,9 @@ impl OpModel for OpenReadDir {
           if eof {
             OpResult::Done(Ok(ReadDir::new(std::mem::take(&mut self.entries))))
           } else {
-            #[expect(
-              clippy::expect_used,
-              reason = "the buffer was put back above"
-            )]
-            let buf = self.buf.take().expect("read_dir buffer missing");
+            let Some(buf) = self.buf.take() else {
+              unreachable!("read_dir buffer missing");
+            };
             self.state = OpenReadDirState::Reading {
               fd: fd.clone(),
               op: ops::ReadDir::new(fd, buf),
@@ -515,20 +511,21 @@ impl RemoveDirFrame {
     }
   }
 
-  #[expect(clippy::expect_used, reason = "the buffer is back between reads")]
   fn next_read(&mut self) -> ops::ReadDir {
-    let buf = self.buf.take().expect("remove_dir_all buffer missing");
+    let Some(buf) = self.buf.take() else {
+      unreachable!("remove_dir_all buffer missing");
+    };
     ops::ReadDir::new(self.fd.clone(), buf)
   }
 
-  #[expect(clippy::expect_used, reason = "the OS never puts NUL in a name")]
   fn push_entries(&mut self, buf: ReadDirBuf) {
     let entries = buf
       .iter()
-      .map(|entry| PendingDirEntry {
-        name: CString::new(entry.name)
-          .expect("directory entry names must not contain interior NUL bytes"),
-        file_type: entry.file_type,
+      .map(|entry| {
+        let Ok(name) = CString::new(entry.name) else {
+          unreachable!("directory entry names never contain NUL bytes");
+        };
+        PendingDirEntry { name, file_type: entry.file_type }
       })
       .collect::<Vec<_>>();
     self.entries.extend(entries);
@@ -614,11 +611,9 @@ impl RemoveDirAll {
       return OpResult::Again;
     }
 
-    #[expect(
-      clippy::expect_used,
-      reason = "each read has its frame on the stack"
-    )]
-    let frame = self.stack.pop().expect("remove_dir_all stack missing frame");
+    let Some(frame) = self.stack.pop() else {
+      unreachable!("remove_dir_all stack missing frame");
+    };
     self.state = RemoveDirAllState::RemovingDir {
       op: ops::UnlinkAt::new(frame.parent, frame.name, UnlinkKind::Directory),
     };
@@ -669,14 +664,9 @@ impl OpModel for RemoveDirAll {
             );
           }
 
-          #[expect(
-            clippy::expect_used,
-            reason = "each read has its frame on the stack"
-          )]
-          let frame = self
-            .stack
-            .last_mut()
-            .expect("remove_dir_all missing frame for directory read");
+          let Some(frame) = self.stack.last_mut() else {
+            unreachable!("remove_dir_all missing frame for directory read");
+          };
           frame.eof = buf.result.eof;
           frame.push_entries(buf);
           self.advance()

@@ -226,15 +226,14 @@ enum LioHandle {
 
 impl LioHandle {
   #[inline]
-  #[expect(
-    clippy::expect_used,
-    reason = "using lio uninstalled is a caller bug"
-  )]
   fn into_lio(self) -> Lio {
     match self {
-      LioHandle::GloballyInstalled => driver::get_global().expect(
-        "No Lio instance available. Either call install_global(lio) or use .with_lio(&lio) before consuming the operation.",
-      ),
+      LioHandle::GloballyInstalled => match driver::get_global() {
+        Some(lio) => lio,
+        None => panic!(
+          "No Lio instance available. Either call install_global(lio) or use .with_lio(&lio) before consuming the operation."
+        ),
+      },
       LioHandle::Custom(lio) => lio,
     }
   }
@@ -268,12 +267,14 @@ impl<T> Receiver<T> {
   ///
   /// Panics if the [`Lio`] is dropped before the operation completes, since
   /// the result can then never arrive.
-  #[expect(clippy::expect_used, reason = "documented under # Panics")]
   pub fn recv(mut self) -> T {
     match self.get_inner() {
-      Some(value) => value
-        .recv()
-        .expect("lio: the Lio was dropped before the operation completed"),
+      Some(value) => match value.recv() {
+        Ok(value) => value,
+        Err(_) => {
+          panic!("lio: the Lio was dropped before the operation completed")
+        }
+      },
       None => unreachable!(),
     }
   }
@@ -500,31 +501,30 @@ where
         }));
         let callback_slot = Rc::clone(&slot);
 
-        #[expect(
-          clippy::expect_used,
-          reason = "is_full() was checked just above"
-        )]
-        let id = this
-          .lio
-          .schedule_with(move |arena| {
-            Registration::new_callback_in(
-              arena,
-              move |item| {
-                let waker = {
-                  let mut slot = callback_slot.borrow_mut();
-                  slot.item = Some(item);
-                  slot.waker.take()
-                };
-                // Wake with the slot released: the waker may poll or drop
-                // this future inline, and both borrow the slot.
-                if let Some(waker) = waker {
-                  waker.wake();
-                }
-              },
-              stream_op,
-            )
-          })
-          .expect("lio rejected an operation it had capacity for");
+        let scheduled = this.lio.schedule_with(move |arena| {
+          Registration::new_callback_in(
+            arena,
+            move |item| {
+              let waker = {
+                let mut slot = callback_slot.borrow_mut();
+                slot.item = Some(item);
+                slot.waker.take()
+              };
+              // Wake with the slot released: the waker may poll or drop
+              // this future inline, and both borrow the slot.
+              if let Some(waker) = waker {
+                waker.wake();
+              }
+            },
+            stream_op,
+          )
+        });
+        let id = match scheduled {
+          Ok(id) => id,
+          Err(err) => {
+            unreachable!("lio rejected an operation it had capacity for: {err}")
+          }
+        };
 
         this.state = IoStreamFutureState::Inflight { id, slot };
         Poll::Pending
@@ -737,15 +737,15 @@ impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
         // First poll - create channel and schedule operation
         let (tx, rx) = std::sync::mpsc::channel();
 
-        #[expect(
-          clippy::expect_used,
-          reason = "is_full() was checked just above"
-        )]
-        let id = lio
-          .schedule_with(move |arena| {
-            Registration::new_waker_in(arena, cx.waker().clone(), tx, stream_op)
-          })
-          .expect("lio rejected an operation it had capacity for");
+        let scheduled = lio.schedule_with(move |arena| {
+          Registration::new_waker_in(arena, cx.waker().clone(), tx, stream_op)
+        });
+        let id = match scheduled {
+          Ok(id) => id,
+          Err(err) => {
+            unreachable!("lio rejected an operation it had capacity for: {err}")
+          }
+        };
         stream.state = IoStreamState::Inflight { id, receiver: rx, lio };
         Poll::Pending
       }
