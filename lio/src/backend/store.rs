@@ -107,6 +107,7 @@ impl OpStore {
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> (u64, Option<Action>, &mut Bump) {
     let mut action = None;
+    #[expect(clippy::expect_used, reason = "the caller checks is_full first")]
     let (key, slot) = self
       .slots
       .allocate_with(|slot| {

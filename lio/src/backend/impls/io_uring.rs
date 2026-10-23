@@ -702,6 +702,7 @@ impl IoUring {
   }
 
   #[inline]
+  #[expect(clippy::expect_used, reason = "the driver calls init first")]
   fn ring(&mut self) -> &mut LioUring {
     self.ring.as_mut().expect("IoUring not initialized")
   }
@@ -954,6 +955,10 @@ impl IoUring {
           .build()
       }
       Op::RenameAt { old_dir_fd, new_dir_fd, .. } => {
+        #[expect(
+          clippy::expect_used,
+          reason = "the path state holds both paths"
+        )]
         let path2 = state.path2.as_ref().expect("RenameAt must have path2");
         RenameAt::new(
           old_dir_fd.as_raw_fd(),
@@ -969,6 +974,10 @@ impl IoUring {
           .build()
       }
       Op::LinkAt { kind, source_dir_fd, new_dir_fd, .. } => {
+        #[expect(
+          clippy::expect_used,
+          reason = "the path state holds both paths"
+        )]
         let path2 = state.path2.as_ref().expect("LinkAt must have path2");
         match kind {
           LinkKind::Hard => LinkAt::new(
@@ -1001,6 +1010,10 @@ impl IoUring {
         unreachable!("path operations must use create_path_entry")
       }
       Op::Socket { domain, ty, proto } => {
+        #[expect(
+          clippy::expect_used,
+          reason = "push validates socket ops first"
+        )]
         let (domain, ty, proto) =
           crate::backend::impls::sockaddr::socket_to_raw(*domain, *ty, *proto)
             .expect("socket op must be validated before entry creation");
@@ -1113,6 +1126,7 @@ impl IoUring {
           follow_symlinks,
           ..
         } => {
+          #[expect(clippy::expect_used, reason = "path stats store their path")]
           let path_ptr = native_stat
             .path
             .as_ref()
@@ -1440,6 +1454,7 @@ impl IoBackend for IoUring {
 
       let pending_insert_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
+      #[expect(clippy::expect_used, reason = "push enforces the capacity")]
       let (pending_key, pending) = self
         .pending
         .insert_get_mut(entry)

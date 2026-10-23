@@ -226,6 +226,10 @@ enum LioHandle {
 
 impl LioHandle {
   #[inline]
+  #[expect(
+    clippy::expect_used,
+    reason = "using lio uninstalled is a caller bug"
+  )]
   fn into_lio(self) -> Lio {
     match self {
       LioHandle::GloballyInstalled => driver::get_global().expect(
@@ -264,6 +268,7 @@ impl<T> Receiver<T> {
   ///
   /// Panics if the [`Lio`] is dropped before the operation completes, since
   /// the result can then never arrive.
+  #[expect(clippy::expect_used, reason = "documented under # Panics")]
   pub fn recv(mut self) -> T {
     match self.get_inner() {
       Some(value) => value
@@ -495,6 +500,10 @@ where
         }));
         let callback_slot = Rc::clone(&slot);
 
+        #[expect(
+          clippy::expect_used,
+          reason = "is_full() was checked just above"
+        )]
         let id = this
           .lio
           .schedule_with(move |arena| {
@@ -728,6 +737,10 @@ impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
         // First poll - create channel and schedule operation
         let (tx, rx) = std::sync::mpsc::channel();
 
+        #[expect(
+          clippy::expect_used,
+          reason = "is_full() was checked just above"
+        )]
         let id = lio
           .schedule_with(move |arena| {
             Registration::new_waker_in(arena, cx.waker().clone(), tx, stream_op)

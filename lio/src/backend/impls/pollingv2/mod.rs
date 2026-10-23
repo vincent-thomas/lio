@@ -500,6 +500,7 @@ impl Poller {
   }
 
   #[inline]
+  #[expect(clippy::expect_used, reason = "the driver calls init first")]
   fn sys(&self) -> &sys::OsPoller {
     self.sys.as_ref().expect("Poller not initialized")
   }
@@ -1254,12 +1255,11 @@ impl IoBackend for Poller {
     }
     // This backend performs the I/O itself once the descriptor is ready, so
     // nothing outside it uses the op's memory: it can be dropped right away.
-    let Some(key) =
-      self.pending.keys_where(|entry| entry.registration_id == id).next()
-    else {
+    let key =
+      self.pending.keys_where(|entry| entry.registration_id == id).next();
+    let Some(entry) = key.and_then(|key| self.pending.remove_value(key)) else {
       return;
     };
-    let entry = self.pending.remove_value(key).expect("found above");
     let (fd, interest) = self.extract_fd_interest(&entry.op);
     if !interest.is_none() {
       let _ = self.sys().delete(fd);
@@ -1285,7 +1285,10 @@ impl IoBackend for Poller {
     let timeout =
       if completed.is_empty() { timeout } else { Some(Duration::ZERO) };
 
-    let sys = self.sys.as_ref().unwrap();
+    // Borrows only the field, unlike `sys()`: the loop below updates
+    // `pending` while `sys` is live.
+    #[expect(clippy::expect_used, reason = "the driver calls init first")]
+    let sys = self.sys.as_ref().expect("Poller not initialized");
 
     {
       let event_count = match sys.wait(self.events.as_buf(), timeout) {
@@ -1316,6 +1319,10 @@ impl IoBackend for Poller {
           // EAGAIN/EWOULDBLOCK - re-register for retry
           let (fd, interest) = self.extract_fd_interest(&entry.op);
           let registration_id = entry.registration_id;
+          #[expect(
+            clippy::expect_used,
+            reason = "the entry came out of `pending` above, freeing a slot"
+          )]
           let (pending_key, _entry) = self
             .pending
             .insert_get_mut(entry)

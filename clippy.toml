@@ -1,0 +1,4 @@
+# Library crates deny clippy::unwrap_used and clippy::expect_used; test code
+# may still unwrap.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

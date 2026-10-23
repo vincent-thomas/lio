@@ -434,11 +434,7 @@ pub struct MsgBuf {
 impl MsgBuf {
   #[inline]
   pub fn from_slice(buf: &[u8]) -> Self {
-    Self {
-      ptr: NonNull::new(buf.as_ptr().cast_mut())
-        .expect("slice pointer must be non-null"),
-      len: buf.len(),
-    }
+    Self { ptr: NonNull::from(buf).cast(), len: buf.len() }
   }
 
   /// # Safety
@@ -464,11 +460,7 @@ pub struct MsgBufMut {
 impl MsgBufMut {
   #[inline]
   pub fn from_slice(buf: &mut [u8]) -> Self {
-    Self {
-      ptr: NonNull::new(buf.as_mut_ptr())
-        .expect("slice pointer must be non-null"),
-      len: buf.len(),
-    }
+    Self { ptr: NonNull::from(&mut *buf).cast(), len: buf.len() }
   }
 
   /// # Safety
@@ -496,10 +488,10 @@ pub struct MsgSend {
 impl MsgSend {
   #[inline]
   pub fn new(bufs: &[MsgBuf], to: Option<SocketAddr>) -> Self {
+    #[expect(clippy::expect_used, reason = "an empty message is a caller bug")]
     let buf_count = NonZeroUsize::new(bufs.len())
       .expect("MsgSend must contain at least one buffer");
-    let bufs = NonNull::new(bufs.as_ptr().cast_mut())
-      .expect("buffer slice pointer must be non-null");
+    let bufs = NonNull::from(bufs).cast();
     Self { bufs, buf_count, to }
   }
 }
@@ -519,10 +511,10 @@ pub struct MsgRecv {
 impl MsgRecv {
   #[inline]
   pub fn new(bufs: &[MsgBufMut]) -> Self {
+    #[expect(clippy::expect_used, reason = "an empty message is a caller bug")]
     let buf_count = NonZeroUsize::new(bufs.len())
       .expect("MsgRecv must contain at least one buffer");
-    let bufs = NonNull::new(bufs.as_ptr().cast_mut())
-      .expect("buffer slice pointer must be non-null");
+    let bufs = NonNull::from(bufs).cast();
     Self { bufs, buf_count, from: None }
   }
 

@@ -681,6 +681,15 @@ fn stage_into<B: IoBufMutVec>(buf: &mut B, bytes: &[u8]) {
   assert_eq!(copied, bytes.len(), "staged bytes exceed total buffer capacity");
 }
 
+/// The buffer an op holds from construction until `complete` hands it back.
+///
+/// The driver completes an op at most once and never asks it for an action
+/// afterwards, so the buffer is always there when this is called.
+#[expect(clippy::expect_used, reason = "an op is completed at most once")]
+fn held<T>(buf: Option<T>) -> T {
+  buf.expect("buffer not available")
+}
+
 /// The error for a file offset past [`MAX_FILE_OFFSET`], which no kernel can
 /// address.
 ///
@@ -725,7 +734,7 @@ impl<B: IoBufMutVec> Read<B> {
 
   #[cfg(test)]
   fn stage_read_data(&mut self, bytes: &[u8]) {
-    stage_into(self.buf.as_mut().expect("buffer not available"), bytes);
+    stage_into(held(self.buf.as_mut()), bytes);
   }
 }
 
@@ -736,7 +745,7 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
     if !is_valid_file_offset(self.offset) {
       return Action::Io(Op::Nop);
     }
-    let buf = self.buf.as_mut().expect("buffer not available");
+    let buf = held(self.buf.as_mut());
     self.iov_count = collect_regions(buf, &mut self.raws, |ptr, len| {
       // SAFETY: the region is model-owned storage that stays valid in place
       // until `complete()` consumes the buffer.
@@ -753,7 +762,7 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let mut buf = self.buf.take().expect("buffer not available");
+    let mut buf = held(self.buf.take());
 
     let result = if !is_valid_file_offset(self.offset) {
       Err(offset_out_of_range_error())
@@ -887,7 +896,7 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
     if !is_valid_file_offset(self.offset) {
       return Action::Io(Op::Nop);
     }
-    let buf = self.buf.as_ref().expect("buffer not available");
+    let buf = held(self.buf.as_ref());
     let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
     for i in 0..buf_count {
@@ -904,7 +913,7 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let buf = self.buf.take().expect("buffer not available");
+    let buf = held(self.buf.take());
     let result = if !is_valid_file_offset(self.offset) {
       Err(offset_out_of_range_error())
     } else if completion.result < 0 {
@@ -1023,7 +1032,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
   }
 
   fn action(&mut self) -> Action {
-    let buf = self.buf.as_mut().expect("buffer not available");
+    let buf = held(self.buf.as_mut());
     let buf_count = collect_regions(buf, &mut self.bufs, |ptr, len| {
       // SAFETY: the region is model-owned storage that stays valid in place
       // until `complete_buf()` consumes the buffer.
@@ -1045,7 +1054,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
     &mut self,
     completion: Completion,
   ) -> (std::io::Result<usize>, B) {
-    let mut buf = self.buf.take().expect("buffer not available");
+    let mut buf = held(self.buf.take());
 
     let result = if completion.result < 0 {
       Err(completion.os_error())
@@ -1067,7 +1076,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
 
   #[cfg(test)]
   fn stage_recv_data(&mut self, bytes: &[u8]) {
-    stage_into(self.buf.as_mut().expect("buffer not available"), bytes);
+    stage_into(held(self.buf.as_mut()), bytes);
   }
 
   #[cfg(test)]
@@ -1274,7 +1283,7 @@ impl<B: IoBufVec + std::marker::Send + Sync> Send<B> {
   }
 
   fn hydrate_msg(&mut self) -> MsgSend {
-    let buf = self.buf.as_ref().expect("buffer not available");
+    let buf = held(self.buf.as_ref());
     let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
     for i in 0..buf_count {
@@ -1294,7 +1303,7 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Send<B> {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let buf = self.buf.take().expect("buffer not available");
+    let buf = held(self.buf.take());
     let result = if completion.result < 0 {
       Err(completion.os_error())
     } else {
@@ -1627,10 +1636,9 @@ impl OpModel for ReadDir {
   fn action(&mut self) -> Action {
     Action::Io(Op::ReadDir {
       fd: self.fd.clone(),
-      raw_buf: NonNull::new(self.buf.raw.as_mut_ptr()).expect("raw buffer"),
+      raw_buf: NonNull::from(self.buf.raw.as_mut_slice()).cast(),
       raw_cap: self.buf.raw.len(),
-      entries: NonNull::new(self.buf.entries.as_mut_ptr())
-        .expect("entry buffer"),
+      entries: NonNull::from(self.buf.entries.as_mut_slice()).cast(),
       entries_cap: self.buf.entries.len(),
       opaque: NonNull::from(&mut self.buf.opaque),
       opaque_drop: NonNull::from(&mut self.buf.opaque_drop),
@@ -2022,9 +2030,13 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
   type Item = BufResult<usize, B>;
 
   fn action(&mut self) -> Action {
-    let buf = self.buf.as_mut().expect("buffer not available");
+    let buf = held(self.buf.as_mut());
     let mut regions = IoSlicesMut::new();
     buf.bufs_mut(&mut regions);
+    #[expect(
+      clippy::expect_used,
+      reason = "a buffer without regions is a caller bug"
+    )]
     let region = regions.into_iter().next().expect("readlink needs a buffer");
     let len = region.len();
     let ptr = NonNull::from(region).cast::<u8>();
@@ -2042,7 +2054,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let mut buf = self.buf.take().expect("buffer not available");
+    let mut buf = held(self.buf.take());
     let result = if completion.result < 0 {
       Err(completion.os_error())
     } else {
@@ -2080,7 +2092,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let mut buf = self.buf.take().expect("buffer not available");
+    let mut buf = held(self.buf.take());
     let result = if completion.result < 0 {
       Err(completion.os_error())
     } else {
