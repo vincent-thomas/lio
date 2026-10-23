@@ -429,8 +429,9 @@ fn sockaddr_to_socketaddr(
       Some(SocketAddr::V6(SocketAddrV6::new(
         ipv6_addr,
         port,
-        u32::from_be(sockaddr_v6.sin6_flowinfo),
-        u32::from_be(sockaddr_v6.sin6_scope_id),
+        // Unlike the port, neither field is in network byte order.
+        sockaddr_v6.sin6_flowinfo,
+        sockaddr_v6.sin6_scope_id,
       )))
     }
     _ => None,
@@ -503,30 +504,24 @@ fn socket_parts_from_ffi(
   ty: libc::c_int,
   proto: libc::c_int,
 ) -> Result<(SockDomain, SockType, SockProto), libc::c_int> {
-  let domain = if domain == 1 || domain == libc::AF_INET {
-    SockDomain::IPV4
-  } else if domain == 2 || domain == libc::AF_INET6 {
-    SockDomain::IPV6
-  } else if domain == 3 || domain == libc::AF_UNIX {
-    SockDomain::UNIX
-  } else {
-    return Err(libc::EAFNOSUPPORT);
+  // Only the platform's own constants: small private aliases would collide
+  // with them (AF_UNIX is 1, IPPROTO_ICMP is 1).
+  let domain = match domain {
+    libc::AF_INET => SockDomain::IPV4,
+    libc::AF_INET6 => SockDomain::IPV6,
+    libc::AF_UNIX => SockDomain::UNIX,
+    _ => return Err(libc::EAFNOSUPPORT),
   };
-  let ty = if ty == 1 || ty == libc::SOCK_STREAM {
-    SockType::STREAM
-  } else if ty == 2 || ty == libc::SOCK_DGRAM {
-    SockType::DGRAM
-  } else {
-    return Err(libc::EINVAL);
+  let ty = match ty {
+    libc::SOCK_STREAM => SockType::STREAM,
+    libc::SOCK_DGRAM => SockType::DGRAM,
+    _ => return Err(libc::EINVAL),
   };
-  let proto = if proto == 0 {
-    SockProto::DEFAULT
-  } else if proto == 1 || proto == libc::IPPROTO_TCP {
-    SockProto::TCP
-  } else if proto == 2 || proto == libc::IPPROTO_UDP {
-    SockProto::UDP
-  } else {
-    return Err(libc::EPROTONOSUPPORT);
+  let proto = match proto {
+    0 => SockProto::DEFAULT,
+    libc::IPPROTO_TCP => SockProto::TCP,
+    libc::IPPROTO_UDP => SockProto::UDP,
+    _ => return Err(libc::EPROTONOSUPPORT),
   };
 
   if matches!(domain, SockDomain::UNIX) && !matches!(proto, SockProto::DEFAULT)
@@ -2251,10 +2246,39 @@ mod sockaddr_tests {
   }
 
   #[test]
+  fn socket_parts_use_platform_constants() {
+    let parts =
+      |d, t, p| socket_parts_from_ffi(d, t, p).map(|(d, t, _)| (d, t));
+    assert!(matches!(
+      parts(libc::AF_UNIX, libc::SOCK_STREAM, 0),
+      Ok((SockDomain::UNIX, SockType::STREAM))
+    ));
+    assert!(matches!(
+      parts(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP),
+      Ok((SockDomain::IPV4, SockType::DGRAM))
+    ));
+    assert!(matches!(
+      parts(libc::AF_INET6, libc::SOCK_STREAM, libc::IPPROTO_TCP),
+      Ok((SockDomain::IPV6, SockType::STREAM))
+    ));
+    assert_eq!(
+      parts(libc::AF_INET, libc::SOCK_STREAM, libc::IPPROTO_ICMP).err(),
+      Some(libc::EPROTONOSUPPORT)
+    );
+    assert_eq!(parts(3, libc::SOCK_STREAM, 0).err(), Some(libc::EAFNOSUPPORT));
+  }
+
+  #[test]
   fn short_and_unaligned_addresses() {
     for addr in [
       SocketAddr::from(([127, 0, 0, 1], 4321)),
       SocketAddr::from((Ipv6Addr::LOCALHOST, 4321)),
+      SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+        4321,
+        7,
+        3,
+      )),
     ] {
       let len = match addr {
         SocketAddr::V4(_) => mem::size_of::<libc::sockaddr_in>(),
@@ -2761,6 +2785,33 @@ mod buffer_ownership_tests {
       lio_buf_free(ptr::null_mut());
       lio_dir_entries_free(ptr::null_mut());
       lio_sockaddr_free(ptr::null());
+    }
+  }
+}
+
+#[cfg(test)]
+mod header_tests {
+  /// cbindgen emits every public item it finds in the crate, whatever its
+  /// `cfg`. Only the C API's own names may reach the header: anything else
+  /// (errno codes above all) would clash with the system headers.
+  #[test]
+  fn header_defines_only_c_api_names() {
+    let header = include_str!("../include/lio.h");
+    for line in header.lines() {
+      let name = if let Some(rest) = line.strip_prefix("#define ") {
+        rest.split_whitespace().next()
+      } else if let Some(rest) = line.strip_prefix("typedef struct ") {
+        rest.split_whitespace().next()
+      } else {
+        None
+      };
+      let Some(name) = name else { continue };
+      assert!(
+        name.starts_with("lio_")
+          || name.starts_with("WATCH_")
+          || matches!(name, "LIO_H" | "sockaddr" | "sockaddr_storage"),
+        "lio.h defines `{name}`, which is not part of the C API"
+      );
     }
   }
 }

@@ -1207,6 +1207,60 @@ mod tests {
     assert_eq!(item, Poll::Ready(Some(7)));
   }
 
+  /// Polls its stream inline when woken, as an executor that runs tasks from
+  /// `wake` would: takes the item, then polls for the next one with `next`.
+  struct InlineNext {
+    stream: std::cell::RefCell<IoStream<AgainThenDone>>,
+    items: std::cell::RefCell<Vec<Option<u32>>>,
+    next: Waker,
+  }
+
+  // SAFETY: the test drives everything on one thread.
+  unsafe impl Send for InlineNext {}
+  // SAFETY: as above.
+  unsafe impl Sync for InlineNext {}
+
+  impl std::task::Wake for InlineNext {
+    fn wake(self: Arc<Self>) {
+      let mut stream = self.stream.borrow_mut();
+      let mut cx = Context::from_waker(&self.next);
+      for _ in 0..2 {
+        if let Poll::Ready(item) =
+          Box::pin(stream.next()).as_mut().poll(&mut cx)
+        {
+          self.items.borrow_mut().push(item);
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn a_stream_polled_inline_after_its_last_item_is_woken_at_its_end() {
+    let (backend, lio) = scripted(1);
+    let counts = Arc::default();
+    let inline = Arc::new(InlineNext {
+      stream: IoStream::from_op(AgainThenDone(true)).with_lio(&lio).into(),
+      items: Default::default(),
+      next: counting_waker(&counts),
+    });
+    let waker = Waker::from(inline.clone());
+    let first = Box::pin(inline.stream.borrow_mut().next())
+      .as_mut()
+      .poll(&mut Context::from_waker(&waker));
+    assert!(first.is_pending());
+
+    // The item wakes `inline`, which takes it and polls again while the
+    // stream's channel is still open.
+    backend.complete_all(0);
+    lio.try_run().unwrap();
+    assert_eq!(*inline.items.borrow(), [Some(7)]);
+    assert_eq!(counts.wakes.load(Ordering::SeqCst), 1, "woken at the end");
+    let end = Box::pin(inline.stream.borrow_mut().next())
+      .as_mut()
+      .poll(&mut Context::from_waker(&inline.next));
+    assert_eq!(end, Poll::Ready(None));
+  }
+
   #[test]
   fn test_stream_send_uses_bound_lio() {
     let lio = Lio::new(64).unwrap();

@@ -15,9 +15,53 @@ typedef struct sockaddr_storage sockaddr_storage;
 """
 
 [export]
-# The C API documents its own bound (`INT64_MAX`) on the functions that take
-# file offsets; keep the backend contract's constant out of the C namespace.
-exclude = ["MAX_FILE_OFFSET"]
+# cbindgen parses the whole crate and ignores `cfg`, so public items that are
+# not part of the C API leak into the header. Keep them out:
+# - The C API documents its own bound (`INT64_MAX`) on the functions that take
+#   file offsets, so the backend contract's constant stays out.
+# - `backend::ds::errno` holds Windows codes under `cfg(windows)`; emitted,
+#   they would redefine `<errno.h>`'s macros with the wrong values.
+# - Test-backend and contract types the C API never names.
+# `ffi::header_tests` fails when anything else slips in.
+exclude = [
+  "MAX_FILE_OFFSET",
+  "MAX_IOV_COUNT",
+  "POISON",
+  "CompletionFlags",
+  "Interest",
+  "SockDomain",
+  "SockProto",
+  "SockType",
+  "EACCES",
+  "EADDRINUSE",
+  "EAGAIN",
+  "EBADF",
+  "ECANCELED",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EDESTADDRREQ",
+  "EEXIST",
+  "EFBIG",
+  "EHOSTUNREACH",
+  "EINVAL",
+  "EIO",
+  "EISCONN",
+  "EMFILE",
+  "ENFILE",
+  "ENOENT",
+  "ENOSPC",
+  "ENOTCONN",
+  "ENOTDIR",
+  "ENOTSOCK",
+  "ENOTSUP",
+  "EOPNOTSUPP",
+  "EPIPE",
+  "EPROTOTYPE",
+  "ERANGE",
+  "ESPIPE",
+  "ETIMEDOUT",
+]
 
 [parse]
 parse_deps = false

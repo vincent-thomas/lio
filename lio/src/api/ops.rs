@@ -614,8 +614,12 @@ impl OpModel for Nop {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    assert_eq!(completion.result, 0);
-    OpResult::Done(Ok(()))
+    // A nop cancelled before it ran completes with an error (`-ECANCELED`).
+    OpResult::Done(if completion.result < 0 {
+      Err(completion.os_error())
+    } else {
+      Ok(())
+    })
   }
 }
 
@@ -1039,12 +1043,13 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
       unsafe { MsgBufMut::from_raw_parts(ptr, len) }
     });
     self.iov_count = buf_count;
+    // The contract takes at least one region: an empty collection receives
+    // into the zero-length placeholder, as `recvmsg` would with no iovecs.
+    let regions = &self.bufs[..buf_count.max(1)];
 
     let msg = match self.from.as_mut() {
-      Some(addr) => {
-        MsgRecv::with_from(&self.bufs[..buf_count], NonNull::from(addr))
-      }
-      None => MsgRecv::new(&self.bufs[..buf_count]),
+      Some(addr) => MsgRecv::with_from(regions, NonNull::from(addr)),
+      None => MsgRecv::new(regions),
     };
 
     Action::Io(Op::Recv { fd: self.res.clone(), msg, flags: self.flags })
@@ -1290,7 +1295,9 @@ impl<B: IoBufVec + std::marker::Send + Sync> Send<B> {
       self.bufs[i] = MsgBuf::from_slice(buf.buf(i));
     }
 
-    MsgSend::new(&self.bufs[..buf_count], self.addr)
+    // The contract takes at least one region: an empty collection sends the
+    // zero-length placeholder, as `sendmsg` would with no iovecs.
+    MsgSend::new(&self.bufs[..buf_count.max(1)], self.addr)
   }
 }
 
@@ -2258,6 +2265,16 @@ mod tests {
     use super::*;
 
     lio_test::test_op_model_contract!(Nop);
+
+    #[test]
+    fn cancelled_nop_completes_with_its_error() {
+      let OpResult::Done(Err(err)) =
+        OpModel::complete(&mut Nop, Completion::new(-125))
+      else {
+        panic!("a failed nop must complete with an error");
+      };
+      assert_eq!(err.raw_os_error(), Some(125));
+    }
   }
 
   mod socket_contract {
@@ -2408,5 +2425,31 @@ mod tests {
     use super::*;
 
     lio_test::test_op_model_contract!(Send<(Vec<u8>, Vec<u8>)>);
+  }
+
+  #[test]
+  fn empty_buffer_collections_submit_one_empty_region() {
+    let mut send =
+      Send::new(Resource::stdin(), Vec::<Vec<u8>>::new(), None, None);
+    let Action::Io(Op::Send { msg, .. }) = OpModel::action(&mut send) else {
+      panic!("send must submit a send");
+    };
+    assert_eq!(msg.buf_count.get(), 1);
+    // SAFETY: `msg` points into `send`, which is still alive.
+    assert_eq!(unsafe { msg.bufs.as_ref() }.len, 0);
+
+    let mut recv = Recv::new(Resource::stdin(), Vec::<Vec<u8>>::new(), None);
+    let Action::Io(Op::Recv { msg, .. }) = OpModel::action(&mut recv) else {
+      panic!("recv must submit a recv");
+    };
+    assert_eq!(msg.buf_count.get(), 1);
+    // SAFETY: `msg` points into `recv`, which is still alive.
+    assert_eq!(unsafe { msg.bufs.as_ref() }.len, 0);
+    let OpResult::Done((Ok(0), bufs)) =
+      OpModel::complete(&mut recv, Completion::new(0))
+    else {
+      panic!("an empty recv must complete with zero bytes");
+    };
+    assert!(bufs.is_empty());
   }
 }

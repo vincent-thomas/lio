@@ -486,6 +486,8 @@ pub struct MsgSend {
 }
 
 impl MsgSend {
+  /// # Panics
+  /// If `bufs` is empty.
   #[inline]
   pub fn new(bufs: &[MsgBuf], to: Option<SocketAddr>) -> Self {
     #[expect(clippy::expect_used, reason = "an empty message is a caller bug")]
@@ -509,6 +511,8 @@ pub struct MsgRecv {
 }
 
 impl MsgRecv {
+  /// # Panics
+  /// If `bufs` is empty.
   #[inline]
   pub fn new(bufs: &[MsgBufMut]) -> Self {
     #[expect(clippy::expect_used, reason = "an empty message is a caller bug")]
