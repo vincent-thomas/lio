@@ -216,23 +216,6 @@ macro_rules! test_io_backend {
       unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) }
     }
 
-    fn read_flags(bits: i32) -> ReadFlags {
-      ReadFlags::from_bits(bits).expect("read flags must be nonnegative")
-    }
-
-    fn write_flags(bits: i32) -> WriteFlags {
-      WriteFlags::from_bits(bits).expect("write flags must be nonnegative")
-    }
-
-    fn recv_flags(bits: i32) -> RecvFlags {
-      RecvFlags::from_bits(bits).expect("recv flags must be nonnegative")
-    }
-
-    fn send_flags(bits: i32) -> SendFlags {
-      SendFlags::from_bits(bits).expect("send flags must be nonnegative")
-    }
-
-
     fn new_backend() -> impl IoBackend {
       $backend_ctor
     }
@@ -308,7 +291,7 @@ macro_rules! test_io_backend {
           iovecs: nonnull(&mut raw_buf),
           iov_count: 1,
           offset: None,
-          flags: read_flags(0),
+          flags: ReadFlags::empty(),
         },
       );
       backend.flush().unwrap();
@@ -394,7 +377,7 @@ macro_rules! test_io_backend {
           iovecs: nonnull(&mut raw_buf),
           iov_count: 1,
           offset: Some(u64::MAX),
-          flags: read_flags(0),
+          flags: ReadFlags::empty(),
         },
       );
 
@@ -864,7 +847,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
             offset: None,
-            flags: read_flags(0),
+            flags: ReadFlags::empty(),
           },
         );
 
@@ -912,7 +895,7 @@ macro_rules! test_io_backend {
         let bufs = [MsgBufMut::from_slice(&mut buf)];
         push_op(&mut backend,
           97,
-          Op::Recv { fd: read_res.clone(), msg: MsgRecv::new(&bufs), flags: recv_flags(0) },
+          Op::Recv { fd: read_res.clone(), msg: MsgRecv::new(&bufs), flags: RecvFlags::empty() },
         );
         backend.flush().unwrap();
         assert!(
@@ -947,7 +930,7 @@ macro_rules! test_io_backend {
         let bufs = [MsgBufMut::from_slice(&mut buf)];
         push_op(&mut backend,
           98,
-          Op::Recv { fd: read_res.clone(), msg: MsgRecv::new(&bufs), flags: recv_flags(0) },
+          Op::Recv { fd: read_res.clone(), msg: MsgRecv::new(&bufs), flags: RecvFlags::empty() },
         );
         backend.cancel(98);
         backend.flush().unwrap();
@@ -1030,7 +1013,7 @@ macro_rules! test_io_backend {
               iovecs: nonnull(&mut raw_buf),
               iov_count: 1,
               offset: None,
-              flags: read_flags(0),
+              flags: ReadFlags::empty(),
             },
           );
           backend.flush().unwrap();
@@ -1069,7 +1052,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
             offset: None,
-            flags: read_flags(0),
+            flags: ReadFlags::empty(),
           },
         );
         backend.flush().unwrap();
@@ -1110,7 +1093,7 @@ macro_rules! test_io_backend {
               iovecs: nonnull(&mut raw_buf),
               iov_count: 1,
               offset: None,
-              flags: read_flags(0),
+              flags: ReadFlags::empty(),
             },
           );
           backend.flush().unwrap();
@@ -1149,7 +1132,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
             offset: None,
-            flags: read_flags(0),
+            flags: ReadFlags::empty(),
           },
         );
         backend.flush().unwrap();
@@ -1217,7 +1200,7 @@ macro_rules! test_io_backend {
               iovecs: nonnull(bufs.as_mut_ptr()),
               iov_count: bufs.len(),
               offset: None,
-              flags: read_flags(0),
+              flags: ReadFlags::empty(),
             },
           );
           backend.flush().unwrap();
@@ -1256,7 +1239,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
             offset: None,
-            flags: read_flags(0),
+            flags: ReadFlags::empty(),
           },
         );
         backend.flush().unwrap();
@@ -1281,7 +1264,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
             offset: None,
-            flags: read_flags(0),
+            flags: ReadFlags::empty(),
           },
         );
         backend.flush().unwrap();
@@ -1309,7 +1292,7 @@ macro_rules! test_io_backend {
               iovecs: nonnull(&mut raw_buf),
               iov_count: 1,
               offset: Some(offset),
-              flags: read_flags(0),
+              flags: ReadFlags::empty(),
             },
           );
           backend.flush().unwrap();
@@ -1318,32 +1301,6 @@ macro_rules! test_io_backend {
           assert_eq!(completed.len(), 1);
           assert_exact_result(&completed[0], id, expect::INVAL);
         }
-      }
-
-      #[test]
-      fn unsupported_flags_report_enotsup() {
-        let mut backend = new_backend();
-        backend.init(64).unwrap();
-
-        let (read_res, _write_res) = socket_pair();
-        let mut buf = [0_u8; 4];
-        let mut raw_buf = raw_buf_from_mut_slice(&mut buf);
-
-        push_op(&mut backend,
-          70,
-          Op::Read {
-            fd: read_res,
-            iovecs: nonnull(&mut raw_buf),
-            iov_count: 1,
-            offset: None,
-            flags: read_flags(1 << 30),
-          },
-        );
-        backend.flush().unwrap();
-
-        let completed = wait_completions(&mut backend, Some(Duration::ZERO));
-        assert_eq!(completed.len(), 1);
-        assert_exact_result(&completed[0], 70, expect::NOTSUP);
       }
 
     }
@@ -1377,7 +1334,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull_const(&raw_buf),
               iov_count: 1,
               offset: None,
-              flags: write_flags(0),
+              flags: WriteFlags::empty(),
             },
           );
           backend.flush().unwrap();
@@ -1428,7 +1385,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull_const(bufs.as_ptr()),
               iov_count: bufs.len(),
               offset: None,
-              flags: write_flags(0),
+              flags: WriteFlags::empty(),
             },
           );
           backend.flush().unwrap();
@@ -1466,7 +1423,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull_const(&raw_buf),
             iov_count: 1,
             offset: None,
-            flags: write_flags(0),
+            flags: WriteFlags::empty(),
           },
         );
         backend.flush().unwrap();
@@ -1496,7 +1453,7 @@ macro_rules! test_io_backend {
               iovecs: nonnull_const(&raw_buf),
               iov_count: 1,
               offset: Some(offset),
-              flags: write_flags(0),
+              flags: WriteFlags::empty(),
             },
           );
           backend.flush().unwrap();
@@ -1507,30 +1464,40 @@ macro_rules! test_io_backend {
       }
 
       #[test]
-      fn unsupported_flags_report_enotsup() {
+      fn append_flag_writes_at_end_or_reports_enotsup() {
         let mut backend = new_backend();
         backend.init(64).unwrap();
 
-        let (_read_res, write_res) = socket_pair();
-        let payload = *b"arg!";
-        // SAFETY: `payload` remains alive for the duration of this submitted
-        // write operation and is only read from.
-        let raw_buf = unsafe { RawBuf::from_raw_parts(payload.as_ptr().cast_mut(), payload.len()) };
+        let path = temp_path("write-append");
+        fs::write(&path, b"head").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        #[cfg(unix)]
+        let file = own_raw(file.into_raw_fd() as isize);
+        #[cfg(windows)]
+        let file = own_raw(file.into_raw_handle() as isize);
+        let payload = *b"tail";
+        let raw_buf = RawBuf::new(&payload);
 
+        // APPEND overrides the offset.
         push_op(&mut backend,
           73,
           Op::Write {
-            fd: write_res,
+            fd: file,
             iovecs: nonnull_const(&raw_buf),
             iov_count: 1,
-            offset: None,
-            flags: write_flags(1 << 30),
+            offset: Some(0),
+            flags: WriteFlags::APPEND,
           },
         );
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
-        assert_exact_result(&completed, 73, expect::NOTSUP);
+        // A backend that cannot honour a flag reports `ENOTSUP` instead.
+        if completed.result() != expect::NOTSUP {
+          assert_exact_result(&completed, 73, payload.len() as isize);
+          assert_eq!(fs::read(&path).unwrap(), b"headtail");
+        }
+        fs::remove_file(path).ok();
       }
 
     }
@@ -1559,7 +1526,7 @@ macro_rules! test_io_backend {
             Op::Recv {
               fd: read_res.clone(),
               msg: MsgRecv::new(&bufs),
-              flags: recv_flags(0),
+              flags: RecvFlags::empty(),
             },
           );
           backend.flush().unwrap();
@@ -1572,6 +1539,41 @@ macro_rules! test_io_backend {
           id += 1;
         }
         assert_eq!(total, payload.len());
+        assert_eq!(&buf, &payload);
+      }
+
+      #[test]
+      fn peek_leaves_data_queued() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let (read_res, write_res) = socket_pair();
+        let payload = *b"peek";
+        let wrote = send_payload(&write_res, &payload);
+        assert_eq!(wrote, payload.len() as isize);
+
+        let mut peeked = [0_u8; 4];
+        let bufs = [MsgBufMut::from_slice(&mut peeked)];
+
+        push_op(&mut backend,
+          47,
+          Op::Recv {
+            fd: read_res.clone(),
+            msg: MsgRecv::new(&bufs),
+            flags: RecvFlags::PEEK,
+          },
+        );
+        backend.flush().unwrap();
+
+        let completed = wait_for_positive_completion(&mut backend);
+        assert_eq!(completed.registration_id(), 47);
+        let n = completed.result() as usize;
+        assert!(n <= payload.len(), "peek completed more bytes than sent");
+        assert_eq!(&peeked[..n], &payload[..n]);
+
+        let mut buf = [0_u8; 4];
+        let n = recv_payload(&read_res, &mut buf);
+        assert_eq!(n, payload.len() as isize, "peek must not consume data");
         assert_eq!(&buf, &payload);
       }
 
@@ -1590,7 +1592,7 @@ macro_rules! test_io_backend {
           Op::Recv {
             fd: read_res.clone(),
             msg: MsgRecv::new(&bufs),
-            flags: recv_flags(0),
+            flags: RecvFlags::empty(),
           },
         );
         backend.flush().unwrap();
@@ -1623,7 +1625,7 @@ macro_rules! test_io_backend {
             Op::Recv {
               fd: read_res.clone(),
               msg: MsgRecv::new(&bufs),
-              flags: recv_flags(0),
+              flags: RecvFlags::empty(),
             },
           );
           backend.flush().unwrap();
@@ -1655,7 +1657,7 @@ macro_rules! test_io_backend {
           Op::Recv {
             fd: read_res.clone(),
             msg: MsgRecv::new(&bufs),
-            flags: recv_flags(0),
+            flags: RecvFlags::empty(),
           },
         );
         backend.flush().unwrap();
@@ -1708,7 +1710,7 @@ macro_rules! test_io_backend {
             Op::Recv {
               fd: read_res.clone(),
               msg: MsgRecv::new(&bufs),
-              flags: recv_flags(0),
+              flags: RecvFlags::empty(),
             },
           );
           backend.flush().unwrap();
@@ -1740,7 +1742,7 @@ macro_rules! test_io_backend {
           Op::Recv {
             fd: read_res.clone(),
             msg: MsgRecv::new(&bufs),
-            flags: recv_flags(0),
+            flags: RecvFlags::empty(),
           },
         );
         backend.flush().unwrap();
@@ -1763,7 +1765,7 @@ macro_rules! test_io_backend {
           Op::Recv {
             fd: invalid_fd_resource(),
             msg: MsgRecv::new(&bufs),
-            flags: recv_flags(0),
+            flags: RecvFlags::empty(),
           },
         );
         backend.flush().unwrap();
@@ -1793,7 +1795,7 @@ macro_rules! test_io_backend {
             Op::Send {
               fd: write_res.clone(),
               msg: MsgSend::new(&bufs, None),
-              flags: send_flags(0),
+              flags: SendFlags::empty(),
             },
           );
           backend.flush().unwrap();
@@ -1837,7 +1839,7 @@ macro_rules! test_io_backend {
             Op::Send {
               fd: write_res.clone(),
               msg: MsgSend::new(&bufs, None),
-              flags: send_flags(0),
+              flags: SendFlags::empty(),
             },
           );
           backend.flush().unwrap();
@@ -1871,7 +1873,7 @@ macro_rules! test_io_backend {
           Op::Send {
             fd: invalid_fd_resource(),
             msg: MsgSend::new(&bufs, None),
-            flags: send_flags(0),
+            flags: SendFlags::empty(),
           },
         );
         backend.flush().unwrap();
@@ -2142,7 +2144,7 @@ macro_rules! test_io_backend {
             dir_fd: Resource::cwd(),
             path: path.as_os_str().to_os_string(),
             flags: OpenFlags::READ,
-            mode: FileMode::from_bits(0),
+            mode: FileMode::empty(),
           },
         );
         backend.flush().unwrap();
@@ -2171,7 +2173,7 @@ macro_rules! test_io_backend {
             dir_fd: Resource::cwd(),
             path: path.as_os_str().to_os_string(),
             flags: OpenFlags::READ,
-            mode: FileMode::from_bits(0),
+            mode: FileMode::empty(),
           },
         );
         backend.flush().unwrap();
@@ -2460,7 +2462,7 @@ macro_rules! test_io_backend {
           Op::MkdirAt {
             dir_fd: Resource::cwd(),
             path: path.as_os_str().to_os_string(),
-            mode: FileMode::from_bits(0o755),
+            mode: FileMode::from_octal(0o755).unwrap(),
           },
         );
         backend.flush().unwrap();
@@ -2484,7 +2486,7 @@ macro_rules! test_io_backend {
           Op::MkdirAt {
             dir_fd: Resource::cwd(),
             path: path.as_os_str().to_os_string(),
-            mode: FileMode::from_bits(0o755),
+            mode: FileMode::from_octal(0o755).unwrap(),
           },
         );
         backend.flush().unwrap();
@@ -2751,7 +2753,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_buf),
             iov_count: 1,
             offset: None,
-            flags: read_flags(0),
+            flags: ReadFlags::empty(),
           },
         );
         backend.flush().unwrap();
@@ -2876,7 +2878,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_a),
             iov_count: 1,
             offset: None,
-            flags: read_flags(0),
+            flags: ReadFlags::empty(),
           },
         );
         push_op(&mut backend,
@@ -2886,7 +2888,7 @@ macro_rules! test_io_backend {
             iovecs: nonnull(&mut raw_b),
             iov_count: 1,
             offset: None,
-            flags: read_flags(0),
+            flags: ReadFlags::empty(),
           },
         );
         backend.flush().unwrap();

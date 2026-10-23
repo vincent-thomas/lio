@@ -86,9 +86,14 @@ pub(super) fn read_searchable_file(
   let cpath = fs_util::path_to_cstring(path)?;
   let fd = match io_util::run(
     lio,
-    api::openat(&Resource::cwd(), cpath, lio::api::OpenFlags::READ, 0)
-      .with_lio(lio)
-      .send(),
+    api::openat(
+      &Resource::cwd(),
+      cpath,
+      lio::api::OpenFlags::READ,
+      lio::api::FileMode::empty(),
+    )
+    .with_lio(lio)
+    .send(),
   ) {
     Ok(fd) => fd,
     Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {

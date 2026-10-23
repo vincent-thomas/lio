@@ -484,11 +484,11 @@ fn schedule_script_op(
     }
     ScriptOp::OpenAt { path, flags, mode } => {
       let tx = tx.clone();
-      api::openat(&cwd, path, flags, mode).with_lio(lio).when_done(
-        move |result| {
+      api::openat(&cwd, path, flags, common::file_mode(mode))
+        .with_lio(lio)
+        .when_done(move |result| {
           tx.send(Event::OpenAt { id, result }).unwrap();
-        },
-      );
+        });
     }
     ScriptOp::StatAt { path, follow_symlinks } => {
       let tx = tx.clone();
@@ -508,9 +508,11 @@ fn schedule_script_op(
     }
     ScriptOp::MkdirAt { path, mode } => {
       let tx = tx.clone();
-      api::mkdirat(&cwd, path, mode).with_lio(lio).when_done(move |result| {
-        tx.send(Event::MkdirAt { id, result }).unwrap();
-      });
+      api::mkdirat(&cwd, path, common::file_mode(mode))
+        .with_lio(lio)
+        .when_done(move |result| {
+          tx.send(Event::MkdirAt { id, result }).unwrap();
+        });
     }
     ScriptOp::UnlinkAt { path, kind } => {
       let tx = tx.clone();

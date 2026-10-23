@@ -35,7 +35,7 @@ fn drop_cancels_a_blocked_pipe_read() {
       iovecs: std::ptr::NonNull::from(&mut raw),
       iov_count: 1,
       offset: None,
-      flags: ReadFlags::from_bits(0).unwrap(),
+      flags: ReadFlags::empty(),
     },
     &mut bumpalo::Bump::new(),
   );

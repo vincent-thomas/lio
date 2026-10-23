@@ -10,7 +10,7 @@ use std::{
 use std::os::unix::ffi::OsStringExt;
 
 use crate::api::{
-  FileStat, FileType, OpenFlags, ReadDirBuf, UnlinkKind,
+  FileMode, FileStat, FileType, OpenFlags, ReadDirBuf, UnlinkKind,
   io::Io,
   op::{Action, Completion, OneshotOpModel, OpModel, OpResult},
   ops,
@@ -102,7 +102,7 @@ impl Directory {
         Resource::cwd(),
         path,
         OpenFlags::READ | OpenFlags::DIRECTORY,
-        0,
+        FileMode::empty(),
       ),
     })
   }
@@ -183,7 +183,7 @@ pub struct OpenOptions {
   truncate: bool,
   create: bool,
   create_new: bool,
-  mode: u32,
+  mode: FileMode,
 }
 
 impl Default for OpenOptions {
@@ -202,7 +202,7 @@ impl OpenOptions {
       truncate: false,
       create: false,
       create_new: false,
-      mode: 0o666,
+      mode: FileMode::from_octal(0o666).unwrap(),
     }
   }
 
@@ -243,7 +243,7 @@ impl OpenOptions {
   }
 
   /// Sets the mode used when creating a file.
-  pub const fn mode(mut self, mode: u32) -> Self {
+  pub const fn mode(mut self, mode: FileMode) -> Self {
     self.mode = mode;
     self
   }
@@ -517,7 +517,7 @@ impl RemoveDirAll {
           parent.clone(),
           path.clone(),
           OpenFlags::READ | OpenFlags::DIRECTORY,
-          0,
+          FileMode::empty(),
         ),
         parent,
         name: path,
@@ -539,7 +539,7 @@ impl RemoveDirAll {
               frame.fd.clone(),
               entry.name.clone(),
               OpenFlags::READ | OpenFlags::DIRECTORY,
-              0,
+              FileMode::empty(),
             ),
             parent: frame.fd.clone(),
             name: entry.name,
@@ -645,7 +645,7 @@ impl OpModel for RemoveDirAll {
                   parent.clone(),
                   name.clone(),
                   OpenFlags::READ | OpenFlags::DIRECTORY,
-                  0,
+                  FileMode::empty(),
                 ),
                 parent,
                 name,
@@ -788,7 +788,7 @@ impl ReadToString {
         Resource::cwd(),
         path,
         OpenFlags::READ,
-        0,
+        FileMode::empty(),
       )),
       bytes: Vec::new(),
     }
@@ -875,7 +875,7 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> Io<OpenReadDir> {
       Resource::cwd(),
       path,
       OpenFlags::READ | OpenFlags::DIRECTORY,
-      0,
+      FileMode::empty(),
     )),
     None => OpenReadDirState::InvalidPath,
   };
@@ -935,7 +935,7 @@ pub fn read_to_string<P: AsRef<Path>>(path: P) -> Io<ReadToString> {
 }
 
 /// Creates a directory relative to the current working directory.
-pub fn create_dir(path: std::ffi::CString, mode: u32) -> Io<ops::MkdirAt> {
+pub fn create_dir(path: std::ffi::CString, mode: FileMode) -> Io<ops::MkdirAt> {
   crate::api::mkdirat(&Resource::cwd(), path, mode)
 }
 

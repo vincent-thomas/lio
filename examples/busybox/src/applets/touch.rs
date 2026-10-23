@@ -59,7 +59,11 @@ impl Command for TouchCommand {
       if !self.no_create {
         flags |= lio::api::OpenFlags::CREATE;
       }
-      let mode = if self.no_create { 0 } else { 0o666 };
+      let mode = if self.no_create {
+        lio::api::FileMode::empty()
+      } else {
+        lio::api::FileMode::from_octal(0o666).unwrap()
+      };
       open_receivers
         .push(api::openat(&cwd, cpath, flags, mode).with_lio(ctx.lio()).send());
     }

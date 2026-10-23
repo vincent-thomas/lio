@@ -64,7 +64,14 @@ impl Command for TeeCommand {
           lio::api::OpenFlags::TRUNCATE
         };
       open_receivers.push(
-        api::openat(&ctx.cwd(), cpath, flags, 0o666).with_lio(ctx.lio()).send(),
+        api::openat(
+          &ctx.cwd(),
+          cpath,
+          flags,
+          lio::api::FileMode::from_octal(0o666).unwrap(),
+        )
+        .with_lio(ctx.lio())
+        .send(),
       );
     }
     for result in io_util::run_all(ctx.lio(), open_receivers) {

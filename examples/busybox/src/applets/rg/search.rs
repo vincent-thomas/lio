@@ -170,11 +170,16 @@ impl WorkerFilePipeline {
       }),
     );
     let events = Rc::clone(&self.events);
-    api::openat(cwd, cpath, lio::api::OpenFlags::READ, 0)
-      .with_lio(lio)
-      .when_done(move |result| {
-        events.borrow_mut().push_back(StreamFileEvent::Open { id, result });
-      });
+    api::openat(
+      cwd,
+      cpath,
+      lio::api::OpenFlags::READ,
+      lio::api::FileMode::empty(),
+    )
+    .with_lio(lio)
+    .when_done(move |result| {
+      events.borrow_mut().push_back(StreamFileEvent::Open { id, result });
+    });
     self.inflight += 1;
     Ok(())
   }
@@ -220,11 +225,16 @@ fn schedule_batch_file_open(
 ) -> io::Result<()> {
   let cpath = std::ffi::CString::new(file.path.to_string_lossy().as_bytes())?;
   let sender = tx.clone();
-  api::openat(cwd, cpath, lio::api::OpenFlags::READ, 0)
-    .with_lio(lio)
-    .when_done(move |result| {
-      let _ = sender.send(BatchFileEvent::Open { index, result });
-    });
+  api::openat(
+    cwd,
+    cpath,
+    lio::api::OpenFlags::READ,
+    lio::api::FileMode::empty(),
+  )
+  .with_lio(lio)
+  .when_done(move |result| {
+    let _ = sender.send(BatchFileEvent::Open { index, result });
+  });
   Ok(())
 }
 
@@ -1264,11 +1274,16 @@ impl SearchEngine {
       let cpath =
         std::ffi::CString::new(file.path.to_string_lossy().as_bytes())?;
       let sender = tx.clone();
-      api::openat(cwd, cpath, lio::api::OpenFlags::READ, 0)
-        .with_lio(lio)
-        .when_done(move |result| {
-          let _ = sender.send(FileEvent::Open { index, result });
-        });
+      api::openat(
+        cwd,
+        cpath,
+        lio::api::OpenFlags::READ,
+        lio::api::FileMode::empty(),
+      )
+      .with_lio(lio)
+      .when_done(move |result| {
+        let _ = sender.send(FileEvent::Open { index, result });
+      });
       inflight += 1;
     }
     drop(tx.clone());

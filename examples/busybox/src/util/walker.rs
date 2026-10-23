@@ -1079,9 +1079,14 @@ impl FileWalker {
     let cpath = fs_util::path_to_cstring(ignore_path)?;
     let fd = io_util::run(
       ctx.lio(),
-      lio::api::openat(&ctx.cwd(), cpath, lio::api::OpenFlags::READ, 0)
-        .with_lio(ctx.lio())
-        .send(),
+      lio::api::openat(
+        &ctx.cwd(),
+        cpath,
+        lio::api::OpenFlags::READ,
+        lio::api::FileMode::empty(),
+      )
+      .with_lio(ctx.lio())
+      .send(),
     )
     .map_err(|err| self.walk_io_error(ignore_path, err))?;
     let bytes = io_util::read_to_bytes_fd(ctx.lio(), &fd)

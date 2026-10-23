@@ -265,7 +265,7 @@ fn nonblocking_waits_make_progress_on_file_completions() {
         iovecs: NonNull::from(raw),
         iov_count: 1,
         offset: Some(0),
-        flags: ReadFlags::EMPTY,
+        flags: ReadFlags::empty(),
       },
       &mut arena,
     );
@@ -317,7 +317,7 @@ fn read_with_more_iovecs_than_the_native_array_is_rejected() {
       iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
       iov_count: raws.len(),
       offset: None,
-      flags: ReadFlags::EMPTY,
+      flags: ReadFlags::empty(),
     },
     &mut arena,
   );
@@ -348,7 +348,7 @@ fn drop_waits_for_operations_in_the_kernel() {
       iovecs: NonNull::from(&raw),
       iov_count: 1,
       offset: None,
-      flags: ReadFlags::EMPTY,
+      flags: ReadFlags::empty(),
     },
     &mut arena,
   );

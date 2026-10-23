@@ -31,12 +31,11 @@ use crate::{
 #[cfg(test)]
 use lio_test::{ContractKind, ContractStep, OpModelContract};
 
-/// Arbitrary flag bits for contract tests: op models pass flags through
-/// untouched, whatever the platform means by them.
+/// Flags for contract tests: op models pass flags through untouched.
 #[cfg(test)]
-const TEST_RECV_FLAG: i32 = 0x40;
+const TEST_RECV_FLAGS: RecvFlags = RecvFlags::PEEK;
 #[cfg(test)]
-const TEST_SEND_FLAG: i32 = 0x4000;
+const TEST_SEND_FLAGS: SendFlags = SendFlags::OOB;
 
 fn os_string_from_bytes(bytes: &[u8]) -> OsString {
   #[cfg(unix)]
@@ -749,7 +748,7 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
       iovecs: NonNull::from(&mut self.raws).cast(),
       iov_count: self.iov_count,
       offset: self.offset,
-      flags: ReadFlags::EMPTY,
+      flags: ReadFlags::empty(),
     })
   }
 
@@ -798,9 +797,9 @@ impl OpModelContract for Read<Vec<u8>> {
           Action::Io(Op::Read {
             iov_count: 1,
             offset: None,
-            flags: ReadFlags::EMPTY,
+            flags,
             ..
-          })
+          }) if flags.is_empty()
         )
       },
       |model| model.stage_read_data(b"ping"),
@@ -834,9 +833,9 @@ impl OpModelContract for Read<(Vec<u8>, Vec<u8>)> {
           Action::Io(Op::Read {
             iov_count: 2,
             offset: None,
-            flags: ReadFlags::EMPTY,
+            flags,
             ..
-          })
+          }) if flags.is_empty()
         )
       },
       |model| model.stage_read_data(b"abcde"),
@@ -900,7 +899,7 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
       iovecs: NonNull::from(&mut self.raws).cast(),
       iov_count: buf_count,
       offset: self.offset,
-      flags: WriteFlags::EMPTY,
+      flags: WriteFlags::empty(),
     })
   }
 
@@ -941,9 +940,9 @@ impl OpModelContract for Write<Vec<u8>> {
           Action::Io(Op::Write {
             iov_count: 1,
             offset: None,
-            flags: WriteFlags::EMPTY,
+            flags,
             ..
-          })
+          }) if flags.is_empty()
         )
       },
       Completion::new(4),
@@ -974,9 +973,9 @@ impl OpModelContract for Write<(Vec<u8>, Vec<u8>)> {
           Action::Io(Op::Write {
             iov_count: 2,
             offset: None,
-            flags: WriteFlags::EMPTY,
+            flags,
             ..
-          })
+          }) if flags.is_empty()
         )
       },
       Completion::new(5),
@@ -1018,7 +1017,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
       bufs: [unsafe { MsgBufMut::from_raw_parts(NonNull::dangling(), 0) };
         MAX_IOV_COUNT],
       iov_count: 0,
-      flags: flags.unwrap_or(RecvFlags::EMPTY),
+      flags: flags.unwrap_or(RecvFlags::empty()),
       from: with_from.then(SocketAddrBuf::unspecified),
     }
   }
@@ -1142,17 +1141,13 @@ impl OpModelContract for Recv<Vec<u8>> {
   }
 
   fn contract_model() -> Self {
-    Self::new(
-      Resource::stdin(),
-      vec![0u8; 8],
-      Some(RecvFlags::from_bits(TEST_RECV_FLAG).unwrap()),
-    )
+    Self::new(Resource::stdin(), vec![0u8; 8], Some(TEST_RECV_FLAGS))
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
       |action| match action {
-        Action::Io(Op::Recv { flags, .. }) => flags.bits() == TEST_RECV_FLAG,
+        Action::Io(Op::Recv { flags, .. }) => *flags == TEST_RECV_FLAGS,
         _ => false,
       },
       |model| model.core.stage_recv_data(b"recv"),
@@ -1176,14 +1171,14 @@ impl OpModelContract for Recv<(Vec<u8>, Vec<u8>)> {
     Self::new(
       Resource::stdin(),
       (vec![0u8; 2], vec![0u8; 4]),
-      Some(RecvFlags::from_bits(TEST_RECV_FLAG).unwrap()),
+      Some(TEST_RECV_FLAGS),
     )
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
       |action| match action {
-        Action::Io(Op::Recv { flags, .. }) => flags.bits() == TEST_RECV_FLAG,
+        Action::Io(Op::Recv { flags, .. }) => *flags == TEST_RECV_FLAGS,
         _ => false,
       },
       |model| model.core.stage_recv_data(b"hello"),
@@ -1206,17 +1201,13 @@ impl OpModelContract for RecvFrom<Vec<u8>> {
   }
 
   fn contract_model() -> Self {
-    Self::new(
-      Resource::stdin(),
-      vec![0u8; 8],
-      Some(RecvFlags::from_bits(TEST_RECV_FLAG).unwrap()),
-    )
+    Self::new(Resource::stdin(), vec![0u8; 8], Some(TEST_RECV_FLAGS))
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
       |action| match action {
-        Action::Io(Op::Recv { flags, .. }) => flags.bits() == TEST_RECV_FLAG,
+        Action::Io(Op::Recv { flags, .. }) => *flags == TEST_RECV_FLAGS,
         _ => false,
       },
       |model| {
@@ -1277,7 +1268,7 @@ impl<B: IoBufVec + std::marker::Send + Sync> Send<B> {
       // `action()` installs real buffer slices.
       bufs: [unsafe { MsgBuf::from_raw_parts(NonNull::dangling(), 0) };
         MAX_IOV_COUNT],
-      flags: flags.unwrap_or(SendFlags::EMPTY),
+      flags: flags.unwrap_or(SendFlags::empty()),
       addr,
     }
   }
@@ -1326,18 +1317,13 @@ impl OpModelContract for Send<Vec<u8>> {
   }
 
   fn contract_model() -> Self {
-    Self::new(
-      Resource::stdin(),
-      b"send".to_vec(),
-      None,
-      Some(SendFlags::from_bits(TEST_SEND_FLAG).unwrap()),
-    )
+    Self::new(Resource::stdin(), b"send".to_vec(), None, Some(TEST_SEND_FLAGS))
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
       |action| match action {
-        Action::Io(Op::Send { flags, .. }) => flags.bits() == TEST_SEND_FLAG,
+        Action::Io(Op::Send { flags, .. }) => *flags == TEST_SEND_FLAGS,
         _ => false,
       },
       Completion::new(4),
@@ -1361,14 +1347,14 @@ impl OpModelContract for Send<(Vec<u8>, Vec<u8>)> {
       Resource::stdin(),
       (b"he".to_vec(), b"llo".to_vec()),
       None,
-      Some(SendFlags::from_bits(TEST_SEND_FLAG).unwrap()),
+      Some(TEST_SEND_FLAGS),
     )
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
       |action| match action {
-        Action::Io(Op::Send { flags, .. }) => flags.bits() == TEST_SEND_FLAG,
+        Action::Io(Op::Send { flags, .. }) => *flags == TEST_SEND_FLAGS,
         _ => false,
       },
       Completion::new(5),
@@ -1515,9 +1501,9 @@ impl OpenAt {
     dir_res: Resource,
     pathname: CString,
     flags: OpenFlags,
-    mode: impl Into<FileMode>,
+    mode: FileMode,
   ) -> Self {
-    Self { dir_res, pathname, flags, mode: mode.into() }
+    Self { dir_res, pathname, flags, mode }
   }
 }
 
@@ -1891,9 +1877,9 @@ impl MkdirAt {
   pub(crate) fn new(
     dir_res: Resource,
     pathname: CString,
-    mode: impl Into<FileMode>,
+    mode: FileMode,
   ) -> Self {
-    Self { dir_res, pathname, mode: mode.into() }
+    Self { dir_res, pathname, mode }
   }
 }
 
@@ -1928,13 +1914,13 @@ impl OpModelContract for MkdirAt {
     Self::new(
       Resource::cwd(),
       CString::new("new-dir").expect("cstring"),
-      FileMode::from_bits(0o755),
+      FileMode::from_octal(0o755).unwrap(),
     )
   }
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| matches!(action, Action::Io(Op::MkdirAt { mode, .. }) if mode.bits() == 0o755),
+      |action| matches!(action, Action::Io(Op::MkdirAt { mode, .. }) if mode.octal() == 0o755),
       Completion::new(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]

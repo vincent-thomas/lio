@@ -69,7 +69,7 @@ pub fn read_dir_paths(
           &ctx.cwd(),
           path_to_cstring(path)?,
           lio::api::OpenFlags::READ | lio::api::OpenFlags::DIRECTORY,
-          0,
+          lio::api::FileMode::empty(),
         )
         .with_lio(ctx.lio())
         .send(),
@@ -143,4 +143,9 @@ pub fn read_dir_paths(
 pub fn path_to_cstring(path: &Path) -> io::Result<CString> {
   CString::new(path.as_os_str().to_string_lossy().as_bytes())
     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))
+}
+
+pub fn file_mode(mode: u32) -> io::Result<api::FileMode> {
+  api::FileMode::from_octal(mode)
+    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid mode"))
 }

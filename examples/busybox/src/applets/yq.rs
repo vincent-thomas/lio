@@ -112,9 +112,14 @@ impl Command for YqCommand {
     for path in &self.files {
       let cpath = CString::new(path.as_str())?;
       open_receivers.push(
-        api::openat(&ctx.cwd(), cpath, lio::api::OpenFlags::READ, 0)
-          .with_lio(ctx.lio())
-          .send(),
+        api::openat(
+          &ctx.cwd(),
+          cpath,
+          lio::api::OpenFlags::READ,
+          lio::api::FileMode::empty(),
+        )
+        .with_lio(ctx.lio())
+        .send(),
       );
     }
 

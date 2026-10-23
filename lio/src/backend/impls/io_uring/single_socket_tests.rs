@@ -44,18 +44,15 @@ fn lowering_selects_single_buffers_without_arena_allocation() {
   let op = Op::Recv {
     fd: fd.clone(),
     msg: MsgRecv::new(&recv),
-    flags: RecvFlags::from_bits(0).unwrap(),
+    flags: RecvFlags::empty(),
   };
   assert!(matches!(
     LoweredState::lower_in(&op, &arena, true).unwrap(),
     LoweredState::SingleMsg { len: 4, .. }
   ));
   let send = [MsgBuf::from_slice(&data)];
-  let op = Op::Send {
-    fd,
-    msg: MsgSend::new(&send, None),
-    flags: SendFlags::from_bits(0).unwrap(),
-  };
+  let op =
+    Op::Send { fd, msg: MsgSend::new(&send, None), flags: SendFlags::empty() };
   assert!(matches!(
     LoweredState::lower_in(&op, &arena, true).unwrap(),
     LoweredState::SingleMsg { len: 4, .. }
@@ -77,7 +74,7 @@ fn lowering_preserves_general_path_and_unsupported_kernel_fallback() {
     let op = Op::Send {
       fd: fd.clone(),
       msg: MsgSend::new(bufs, to),
-      flags: SendFlags::from_bits(0).unwrap(),
+      flags: SendFlags::empty(),
     };
     assert!(matches!(
       LoweredState::lower_in(&op, &arena, supported).unwrap(),
@@ -90,17 +87,13 @@ fn lowering_preserves_general_path_and_unsupported_kernel_fallback() {
   let op = Op::Recv {
     fd: fd.clone(),
     msg: MsgRecv::with_from(&recv, NonNull::from(&mut from)),
-    flags: RecvFlags::from_bits(0).unwrap(),
+    flags: RecvFlags::empty(),
   };
   assert!(matches!(
     LoweredState::lower_in(&op, &arena, true).unwrap(),
     LoweredState::Msg(_)
   ));
-  let op = Op::Recv {
-    fd,
-    msg: MsgRecv::new(&recv),
-    flags: RecvFlags::from_bits(0).unwrap(),
-  };
+  let op = Op::Recv { fd, msg: MsgRecv::new(&recv), flags: RecvFlags::empty() };
   assert!(matches!(
     LoweredState::lower_in(&op, &arena, false).unwrap(),
     LoweredState::Msg(_)
@@ -118,18 +111,14 @@ fn oversized_buffers_are_not_truncated_to_u32() {
   let op = Op::Send {
     fd: fd.clone(),
     msg: MsgSend::new(&bufs, None),
-    flags: SendFlags::from_bits(0).unwrap(),
+    flags: SendFlags::empty(),
   };
   assert!(matches!(
     LoweredState::lower_in(&op, &arena, true).unwrap(),
     LoweredState::Msg(_)
   ));
   let bufs = [MsgBufMut { ptr: NonNull::dangling(), len }];
-  let op = Op::Recv {
-    fd,
-    msg: MsgRecv::new(&bufs),
-    flags: RecvFlags::from_bits(0).unwrap(),
-  };
+  let op = Op::Recv { fd, msg: MsgRecv::new(&bufs), flags: RecvFlags::empty() };
   assert!(matches!(
     LoweredState::lower_in(&op, &arena, true).unwrap(),
     LoweredState::Msg(_)
@@ -147,15 +136,12 @@ fn udp_peek_truncation_and_zero_length_match_general_path() {
     let mut arena = Bump::new();
     let (fd, peer) = pair();
     peer.send(b"payload").unwrap();
-    for (flags, expected) in [(libc::MSG_PEEK, 3), (libc::MSG_TRUNC, 7)] {
+    // A peek leaves the datagram queued; the plain recv then truncates it.
+    for flags in [RecvFlags::PEEK, RecvFlags::empty()] {
       let mut data = [0; 3];
       let bufs = [MsgBufMut::from_slice(&mut data)];
-      let op = Op::Recv {
-        fd: fd.clone(),
-        msg: MsgRecv::new(&bufs),
-        flags: RecvFlags::from_bits(flags).unwrap(),
-      };
-      assert_eq!(complete(&mut backend, &mut arena, op), expected);
+      let op = Op::Recv { fd: fd.clone(), msg: MsgRecv::new(&bufs), flags };
+      assert_eq!(complete(&mut backend, &mut arena, op), 3);
       assert_eq!(&data, b"pay");
     }
     // A zero-length datagram must still be sent and consumed as a message.
@@ -163,18 +149,15 @@ fn udp_peek_truncation_and_zero_length_match_general_path() {
     let op = Op::Send {
       fd: fd.clone(),
       msg: MsgSend::new(&bufs, None),
-      flags: SendFlags::from_bits(0).unwrap(),
+      flags: SendFlags::empty(),
     };
     assert_eq!(complete(&mut backend, &mut arena, op), 0);
     assert_eq!(peer.recv(&mut [0; 1]).unwrap(), 0);
     peer.send(&[]).unwrap();
     let mut empty = [];
     let bufs = [MsgBufMut::from_slice(&mut empty)];
-    let op = Op::Recv {
-      fd,
-      msg: MsgRecv::new(&bufs),
-      flags: RecvFlags::from_bits(0).unwrap(),
-    };
+    let op =
+      Op::Recv { fd, msg: MsgRecv::new(&bufs), flags: RecvFlags::empty() };
     assert_eq!(complete(&mut backend, &mut arena, op), 0);
   }
 }

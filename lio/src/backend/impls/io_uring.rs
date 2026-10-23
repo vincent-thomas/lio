@@ -397,12 +397,12 @@ impl LoweredState {
       Self::SingleMsg { ptr, len } => match op {
         Op::Recv { fd, flags, .. } => {
           Recv::new(fd.as_raw_fd(), ptr.as_ptr(), len)
-            .flags(flags.bits())
+            .flags(crate::backend::native::recv_flags(*flags))
             .build()
         }
         Op::Send { fd, flags, .. } => {
           Send::new(fd.as_raw_fd(), ptr.as_ptr(), len)
-            .flags(flags.bits())
+            .flags(crate::backend::native::send_flags(*flags))
             .build()
         }
         _ => unreachable!("single message requires send/recv op"),
@@ -912,41 +912,10 @@ impl IoUring {
 
   fn validate_op(op: &Op) -> Option<isize> {
     match op {
-      Op::Read { iovecs: _, offset, flags, .. } => {
-        if !is_valid_file_offset(*offset) {
-          return Some(-(libc::EINVAL as isize));
-        }
-
-        const RWF_HIPRI: i32 = 0x00000001;
-        const RWF_DSYNC: i32 = 0x00000002;
-        const RWF_SYNC: i32 = 0x00000004;
-        const RWF_APPEND: i32 = 0x00000010;
-        const ALL_KNOWN_FLAGS: i32 =
-          RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
-
-        if flags.bits() & !ALL_KNOWN_FLAGS != 0 {
-          return Some(-(libc::ENOTSUP as isize));
-        }
-
-        None
-      }
-      Op::Write { iovecs: _, offset, flags, .. } => {
-        if !is_valid_file_offset(*offset) {
-          return Some(-(libc::EINVAL as isize));
-        }
-
-        const RWF_HIPRI: i32 = 0x00000001;
-        const RWF_DSYNC: i32 = 0x00000002;
-        const RWF_SYNC: i32 = 0x00000004;
-        const RWF_APPEND: i32 = 0x00000010;
-        const ALL_KNOWN_FLAGS: i32 =
-          RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
-
-        if flags.bits() & !ALL_KNOWN_FLAGS != 0 {
-          return Some(-(libc::ENOTSUP as isize));
-        }
-
-        None
+      Op::Read { offset, .. } | Op::Write { offset, .. }
+        if !is_valid_file_offset(*offset) =>
+      {
+        Some(-(libc::EINVAL as isize))
       }
       Op::Connect { addr, .. } | Op::Bind { addr, .. } => {
         crate::backend::impls::sockaddr::socket_addr_buf_to_storage(addr)
@@ -972,7 +941,7 @@ impl IoUring {
         OpenAt::new(dir_fd.as_raw_fd(), state.path1.as_ptr())
           // Invalid flags were rejected by `validate_op`.
           .flags(crate::backend::native::open_flags(*flags).unwrap_or(0))
-          .mode(mode.bits() as libc::mode_t)
+          .mode(crate::backend::native::file_mode(*mode))
           .build()
       }
       Op::UnlinkAt { dir_fd, kind, .. } => {
@@ -996,7 +965,7 @@ impl IoUring {
       }
       Op::MkdirAt { dir_fd, mode, .. } => {
         MkDirAt::new(dir_fd.as_raw_fd(), state.path1.as_ptr())
-          .mode(mode.bits() as libc::mode_t)
+          .mode(crate::backend::native::file_mode(*mode))
           .build()
       }
       Op::LinkAt { kind, source_dir_fd, new_dir_fd, .. } => {
@@ -1075,10 +1044,10 @@ impl IoUring {
 
   fn create_rw_entry(op: &Op, native_rw: &NativeRwState) -> Entry {
     match op {
-      Op::Read { fd, iov_count, offset, flags, .. } => {
+      // `ReadFlags` has no flags yet, so there are none to apply.
+      Op::Read { fd, iov_count, offset, .. } => {
         Readv::new(fd.as_raw_fd(), native_rw.iovecs.as_ptr(), *iov_count as u32)
           .offset(Self::io_offset(*offset))
-          .rw_flags(flags.bits())
           .build()
       }
       Op::Write { fd, iov_count, offset, flags, .. } => Writev::new(
@@ -1087,7 +1056,7 @@ impl IoUring {
         *iov_count as u32,
       )
       .offset(Self::io_offset(*offset))
-      .rw_flags(flags.bits())
+      .rw_flags(crate::backend::native::write_flags(*flags))
       .build(),
       _ => unreachable!("rw entry requires read/write op"),
     }
@@ -1099,11 +1068,11 @@ impl IoUring {
         fd.as_raw_fd(),
         (&native_msg.hdr as *const libc::msghdr).cast_mut(),
       )
-      .flags(flags.bits() as u32)
+      .flags(crate::backend::native::recv_flags(*flags) as u32)
       .build(),
       Op::Send { fd, flags, .. } => {
         SendMsg::new(fd.as_raw_fd(), &native_msg.hdr)
-          .flags(flags.bits() as u32)
+          .flags(crate::backend::native::send_flags(*flags) as u32)
           .build()
       }
       _ => unreachable!("msg entry requires recv/send op"),

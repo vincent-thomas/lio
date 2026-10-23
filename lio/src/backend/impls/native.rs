@@ -7,8 +7,10 @@
 //! and those adopted through `FromRawFd`/`FromRawHandle`.
 
 use crate::api::resource::RawResource;
+#[cfg(target_os = "linux")]
+use crate::backend::op::WriteFlags;
 #[cfg(unix)]
-use crate::backend::op::OpenFlags;
+use crate::backend::op::{FileMode, OpenFlags, RecvFlags, SendFlags};
 
 /// Handle value standing in for "the current working directory" on Windows,
 /// mirroring `AT_FDCWD`. It is never a valid kernel handle (those are
@@ -117,4 +119,80 @@ pub(crate) fn open_flags(flags: OpenFlags) -> Result<i32, i32> {
     }
   }
   Ok(bits)
+}
+
+/// Translates [`FileMode`] to a `mode_t`.
+#[cfg(unix)]
+#[cfg_attr(not(feature = "backend_impls"), allow(dead_code))]
+pub(crate) fn file_mode(mode: FileMode) -> libc::mode_t {
+  let mut bits = 0;
+  for (flag, native) in [
+    (FileMode::OWNER_READ, libc::S_IRUSR),
+    (FileMode::OWNER_WRITE, libc::S_IWUSR),
+    (FileMode::OWNER_EXECUTE, libc::S_IXUSR),
+    (FileMode::GROUP_READ, libc::S_IRGRP),
+    (FileMode::GROUP_WRITE, libc::S_IWGRP),
+    (FileMode::GROUP_EXECUTE, libc::S_IXGRP),
+    (FileMode::OTHER_READ, libc::S_IROTH),
+    (FileMode::OTHER_WRITE, libc::S_IWOTH),
+    (FileMode::OTHER_EXECUTE, libc::S_IXOTH),
+    (FileMode::SET_USER_ID, libc::S_ISUID),
+    (FileMode::SET_GROUP_ID, libc::S_ISGID),
+    (FileMode::STICKY, libc::S_ISVTX),
+  ] {
+    if mode.contains(flag) {
+      bits |= native;
+    }
+  }
+  bits
+}
+
+/// Translates [`RecvFlags`] to `recv(2)` flags.
+#[cfg(unix)]
+#[cfg_attr(not(feature = "backend_impls"), allow(dead_code))]
+pub(crate) fn recv_flags(flags: RecvFlags) -> i32 {
+  let mut bits = 0;
+  for (flag, native) in
+    [(RecvFlags::PEEK, libc::MSG_PEEK), (RecvFlags::OOB, libc::MSG_OOB)]
+  {
+    if flags.contains(flag) {
+      bits |= native;
+    }
+  }
+  bits
+}
+
+/// Translates [`SendFlags`] to `send(2)` flags, always adding
+/// `MSG_NOSIGNAL` so a send to a closed peer fails with `EPIPE` instead of
+/// raising `SIGPIPE`.
+#[cfg(unix)]
+#[cfg_attr(not(feature = "backend_impls"), allow(dead_code))]
+pub(crate) fn send_flags(flags: SendFlags) -> i32 {
+  let mut bits = libc::MSG_NOSIGNAL;
+  for (flag, native) in [
+    (SendFlags::OOB, libc::MSG_OOB),
+    (SendFlags::DONTROUTE, libc::MSG_DONTROUTE),
+  ] {
+    if flags.contains(flag) {
+      bits |= native;
+    }
+  }
+  bits
+}
+
+/// Translates [`WriteFlags`] to `pwritev2(2)` flags.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(feature = "backend_impls"), allow(dead_code))]
+pub(crate) fn write_flags(flags: WriteFlags) -> i32 {
+  let mut bits = 0;
+  for (flag, native) in [
+    (WriteFlags::DSYNC, libc::RWF_DSYNC),
+    (WriteFlags::SYNC, libc::RWF_SYNC),
+    (WriteFlags::APPEND, libc::RWF_APPEND),
+  ] {
+    if flags.contains(flag) {
+      bits |= native;
+    }
+  }
+  bits
 }

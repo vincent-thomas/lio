@@ -30,13 +30,16 @@ fn open_file(
   flags: lio::api::OpenFlags,
   mode: u32,
 ) -> Result<Resource, std::io::Error> {
-  let mut receiver = api::openat(dir, path, flags, mode).with_lio(lio).send();
+  let mut receiver =
+    api::openat(dir, path, flags, common::file_mode(mode)).with_lio(lio).send();
   common::poll_recv(lio, &mut receiver)
 }
 
 fn mkdir(lio: &mut Lio, path: CString) {
   let mut receiver =
-    api::mkdirat(&Resource::cwd(), path, 0o755).with_lio(lio).send();
+    api::mkdirat(&Resource::cwd(), path, common::file_mode(0o755))
+      .with_lio(lio)
+      .send();
   common::poll_recv(lio, &mut receiver).unwrap();
 }
 
