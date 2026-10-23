@@ -218,8 +218,13 @@ fn create_candidate(
     })?;
 
   if directory {
-    let mut receiver =
-      api::mkdirat(&ctx.cwd(), cpath, 0o700).with_lio(ctx.lio()).send();
+    let mut receiver = api::mkdirat(
+      &ctx.cwd(),
+      cpath,
+      lio::api::FileMode::from_octal(0o700).unwrap(),
+    )
+    .with_lio(ctx.lio())
+    .send();
     io_util::run_recv(ctx.lio(), &mut receiver)
   } else {
     let mut receiver = api::openat(
@@ -229,7 +234,7 @@ fn create_candidate(
         | lio::api::OpenFlags::WRITE
         | lio::api::OpenFlags::CREATE
         | lio::api::OpenFlags::EXCLUSIVE,
-      0o600,
+      lio::api::FileMode::from_octal(0o600).unwrap(),
     )
     .with_lio(ctx.lio())
     .send();

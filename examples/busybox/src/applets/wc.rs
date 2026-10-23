@@ -56,9 +56,14 @@ impl Command for WcCommand {
     for path in &self.files {
       let cpath = CString::new(path.as_str())?;
       open_receivers.push(
-        api::openat(&ctx.cwd(), cpath, lio::api::OpenFlags::READ, 0)
-          .with_lio(ctx.lio())
-          .send(),
+        api::openat(
+          &ctx.cwd(),
+          cpath,
+          lio::api::OpenFlags::READ,
+          lio::api::FileMode::empty(),
+        )
+        .with_lio(ctx.lio())
+        .send(),
       );
     }
 
@@ -215,7 +220,7 @@ mod tests {
         &lio::api::resource::Resource::cwd(),
         std::ffi::CString::new(path.to_str().unwrap()).unwrap(),
         lio::api::OpenFlags::READ,
-        0,
+        lio::api::FileMode::empty(),
       )
       .with_lio(ctx.lio())
       .send(),

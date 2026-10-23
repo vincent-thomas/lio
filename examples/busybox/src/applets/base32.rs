@@ -39,7 +39,7 @@ impl Command for Base32Command {
           &ctx.cwd(),
           std::ffi::CString::new(path)?,
           lio::api::OpenFlags::READ,
-          0,
+          lio::api::FileMode::empty(),
         )
         .with_lio(ctx.lio())
         .send(),
@@ -75,7 +75,7 @@ mod tests {
         &ctx.cwd(),
         CString::new(input_path.to_str().unwrap()).unwrap(),
         lio::api::OpenFlags::READ,
-        0,
+        lio::api::FileMode::empty(),
       )
       .with_lio(ctx.lio())
       .send(),

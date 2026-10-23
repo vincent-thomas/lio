@@ -2073,7 +2073,7 @@ fn append_to_path(
       lio::api::OpenFlags::WRITE
         | lio::api::OpenFlags::APPEND
         | lio::api::OpenFlags::CREATE,
-      0o666,
+      lio::api::FileMode::from_octal(0o666).unwrap(),
     )
     .with_lio(ctx.lio())
     .send(),

@@ -41,7 +41,7 @@ impl Command for CksumCommand {
           &ctx.cwd(),
           std::ffi::CString::new(path.as_str())?,
           lio::api::OpenFlags::READ,
-          0,
+          lio::api::FileMode::empty(),
         )
         .with_lio(ctx.lio())
         .send(),

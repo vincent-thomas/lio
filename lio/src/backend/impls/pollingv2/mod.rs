@@ -35,7 +35,8 @@ use crate::backend::{
   impls::pollingv2::interest::Interest,
   impls::unix_stat::{file_stat_from_raw, file_type_from_dirent_dtype},
   op::{
-    DirEntryRef, MsgRecv, MsgSend, Op, ReadDirResult, is_valid_file_offset,
+    DirEntryRef, MsgRecv, MsgSend, Op, ReadDirResult, WriteFlags,
+    is_valid_file_offset,
   },
 };
 use crate::slab::{Slab, SlabKey};
@@ -512,14 +513,16 @@ impl Poller {
       .map_err(|_| -(libc::EINVAL as isize))
   }
 
-  /// Perform vectored read, choosing the appropriate syscall based on offset and flags
+  /// Perform vectored read, choosing the appropriate syscall based on offset
+  ///
+  /// [`ReadFlags`](crate::backend::op::ReadFlags) has no flags yet, so there
+  /// are none to apply.
   #[inline]
   fn do_readv(
     fd: RawFd,
     iovecs: *const libc::iovec,
     iov_count: usize,
     offset: Option<u64>,
-    flags: i32,
   ) -> isize {
     let Ok(offset) = offset.map(libc::off_t::try_from).transpose() else {
       return -(libc::EINVAL as isize);
@@ -528,41 +531,15 @@ impl Poller {
       return -(libc::EINVAL as isize);
     }
 
-    const RWF_HIPRI: i32 = 0x00000001;
-    const RWF_DSYNC: i32 = 0x00000002;
-    const RWF_SYNC: i32 = 0x00000004;
-    const RWF_APPEND: i32 = 0x00000010;
+    let result = match offset {
+      None => syscall!(raw readv(fd, iovecs, iov_count as i32)?),
+      Some(offset) => {
+        syscall!(raw preadv(fd, iovecs, iov_count as i32, offset)?)
+      }
+    };
 
-    const ALL_KNOWN_FLAGS: i32 = RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
-
-    // Validate inputs
-    if flags & !ALL_KNOWN_FLAGS != 0 {
-      return -(libc::ENOTSUP as isize);
-    }
-
-    // Linux: native preadv2 support
-    #[cfg(target_os = "linux")]
-    return syscall!(raw preadv2(
-      fd,
-      iovecs,
-      iov_count as i32,
-      offset.unwrap_or(-1),
-      flags
-    ));
-
-    #[cfg(not(target_os = "linux"))]
-    {
-      // Non-Linux: Emulate flags (all are no-ops for reads)
-      let result = match offset {
-        None => syscall!(raw readv(fd, iovecs, iov_count as i32)?),
-        Some(offset) => {
-          syscall!(raw preadv(fd, iovecs, iov_count as i32, offset)?)
-        }
-      };
-
-      assert!(result >= 0, "error did not return");
-      result
-    }
+    assert!(result >= 0, "error did not return");
+    result
   }
 
   /// Perform vectored write, choosing the appropriate syscall based on offset and flags
@@ -572,24 +549,13 @@ impl Poller {
     iovecs: *const libc::iovec,
     iov_count: usize,
     offset: Option<u64>,
-    flags: i32,
+    flags: WriteFlags,
   ) -> isize {
     let Ok(offset) = offset.map(libc::off_t::try_from).transpose() else {
       return -(libc::EINVAL as isize);
     };
     if iovecs.is_null() {
       return -(libc::EINVAL as isize);
-    }
-    const RWF_HIPRI: i32 = 0x00000001;
-    const RWF_DSYNC: i32 = 0x00000002;
-    const RWF_SYNC: i32 = 0x00000004;
-    const RWF_APPEND: i32 = 0x00000010;
-
-    const ALL_KNOWN_FLAGS: i32 = RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
-
-    // Validate inputs
-    if flags & !ALL_KNOWN_FLAGS != 0 {
-      return -(libc::ENOTSUP as isize);
     }
 
     // Linux: native pwritev2 support
@@ -599,17 +565,13 @@ impl Poller {
       iovecs,
       iov_count as i32,
       offset.unwrap_or(-1),
-      flags
+      crate::backend::native::write_flags(flags)
     ));
 
     #[cfg(not(target_os = "linux"))]
     {
-      let has_dsync = flags & RWF_DSYNC != 0;
-      let has_sync = flags & RWF_SYNC != 0;
-      let has_append = flags & RWF_APPEND != 0;
-
-      // Emulate RWF_APPEND: write at end of file
-      let write_offset = if has_append {
+      // Emulate APPEND: write at end of file
+      let write_offset = if flags.contains(WriteFlags::APPEND) {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         let result = syscall!(raw fstat(fd, stat.as_mut_ptr())?);
         assert_eq!(result, 0);
@@ -628,10 +590,10 @@ impl Poller {
 
       assert!(result >= 0, "error did not return");
 
-      // RWF_SYNC takes precedence over RWF_DSYNC
-      if has_sync {
+      // SYNC takes precedence over DSYNC
+      if flags.contains(WriteFlags::SYNC) {
         let _ = syscall!(raw fsync(fd)?);
-      } else if has_dsync {
+      } else if flags.contains(WriteFlags::DSYNC) {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let _ = syscall!(raw fcntl(fd, libc::F_FULLFSYNC)?);
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -720,41 +682,10 @@ impl Poller {
   /// Validate malformed ops that should fail immediately without readiness registration.
   fn validate_op(op: &crate::backend::op::Op) -> Option<isize> {
     match op {
-      Op::Read { iovecs: _, offset, flags, .. } => {
-        if !is_valid_file_offset(*offset) {
-          return Some(-(libc::EINVAL as isize));
-        }
-
-        const RWF_HIPRI: i32 = 0x00000001;
-        const RWF_DSYNC: i32 = 0x00000002;
-        const RWF_SYNC: i32 = 0x00000004;
-        const RWF_APPEND: i32 = 0x00000010;
-        const ALL_KNOWN_FLAGS: i32 =
-          RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
-
-        if flags.bits() & !ALL_KNOWN_FLAGS != 0 {
-          return Some(-(libc::ENOTSUP as isize));
-        }
-
-        None
-      }
-      Op::Write { iovecs: _, offset, flags, .. } => {
-        if !is_valid_file_offset(*offset) {
-          return Some(-(libc::EINVAL as isize));
-        }
-
-        const RWF_HIPRI: i32 = 0x00000001;
-        const RWF_DSYNC: i32 = 0x00000002;
-        const RWF_SYNC: i32 = 0x00000004;
-        const RWF_APPEND: i32 = 0x00000010;
-        const ALL_KNOWN_FLAGS: i32 =
-          RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_APPEND;
-
-        if flags.bits() & !ALL_KNOWN_FLAGS != 0 {
-          return Some(-(libc::ENOTSUP as isize));
-        }
-
-        None
+      Op::Read { offset, .. } | Op::Write { offset, .. }
+        if !is_valid_file_offset(*offset) =>
+      {
+        Some(-(libc::EINVAL as isize))
       }
       _ => None,
     }
@@ -791,7 +722,7 @@ impl Poller {
     use crate::backend::op::Op;
 
     match op {
-      Op::Read { fd, iovecs, iov_count, offset, flags } => {
+      Op::Read { fd, iovecs, iov_count, offset, flags: _ } => {
         let Some(native_iovecs) = Self::lower_raw_iovecs(*iovecs, *iov_count)
         else {
           return -(libc::EINVAL as isize);
@@ -801,7 +732,6 @@ impl Poller {
           native_iovecs.as_ptr(),
           *iov_count,
           *offset,
-          flags.bits(),
         )
       }
 
@@ -815,7 +745,7 @@ impl Poller {
           native_iovecs.as_ptr(),
           *iov_count,
           *offset,
-          flags.bits(),
+          *flags,
         )
       }
 
@@ -831,8 +761,7 @@ impl Poller {
           hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
           hdr.msg_namelen = *len;
         }
-        let result =
-          syscall!(raw recvmsg(fd, &mut hdr, flags.bits() | socket_flags));
+        let result = syscall!(raw recvmsg(fd, &mut hdr, crate::backend::native::recv_flags(*flags) | socket_flags));
         if result >= 0
           && let (Some(out), Some((storage, len))) = (msg.from, addr.as_ref())
           && let Ok(addr) = Self::raise_socket_addr(storage, *len)
@@ -856,7 +785,7 @@ impl Poller {
           hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
           hdr.msg_namelen = *len;
         }
-        syscall!(raw sendmsg(fd, &mut hdr, flags.bits() | socket_flags))
+        syscall!(raw sendmsg(fd, &mut hdr, crate::backend::native::send_flags(*flags) | socket_flags))
       }
 
       Op::Accept { fd, addr } => {
@@ -917,7 +846,7 @@ impl Poller {
             dir_fd.as_raw_fd(),
             path.as_ptr(),
             flags,
-            mode.bits(),
+            libc::c_uint::from(crate::backend::native::file_mode(*mode)),
           )),
           Err(errno) => -(errno as isize),
         }
@@ -1025,7 +954,7 @@ impl Poller {
         syscall!(raw mkdirat(
           dir_fd.as_raw_fd(),
           path.as_ptr(),
-          mode.bits() as libc::mode_t,
+          crate::backend::native::file_mode(*mode),
         ))
       }
       Op::LinkAt { kind, source_dir_fd, source_path, new_dir_fd, new_path } => {

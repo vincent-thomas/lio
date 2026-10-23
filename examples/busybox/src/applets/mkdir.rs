@@ -166,8 +166,9 @@ fn create_directory_parents(
 
 fn mkdir_path(ctx: &AppContext, path: &Path, mode: u32) -> io::Result<()> {
   let cpath = path_to_cstring(path)?;
-  let mut receiver =
-    api::mkdirat(&ctx.cwd(), cpath, mode).with_lio(ctx.lio()).send();
+  let mut receiver = api::mkdirat(&ctx.cwd(), cpath, fs_util::file_mode(mode)?)
+    .with_lio(ctx.lio())
+    .send();
   io_util::run_recv(ctx.lio(), &mut receiver)
 }
 

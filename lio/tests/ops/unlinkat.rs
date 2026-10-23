@@ -29,13 +29,17 @@ fn open_file(
   mode: u32,
 ) -> Resource {
   let mut receiver =
-    api::openat(&Resource::cwd(), path, flags, mode).with_lio(lio).send();
+    api::openat(&Resource::cwd(), path, flags, common::file_mode(mode))
+      .with_lio(lio)
+      .send();
   common::poll_recv(lio, &mut receiver).unwrap()
 }
 
 fn mkdir(lio: &mut Lio, path: CString) {
   let mut receiver =
-    api::mkdirat(&Resource::cwd(), path, 0o755).with_lio(lio).send();
+    api::mkdirat(&Resource::cwd(), path, common::file_mode(0o755))
+      .with_lio(lio)
+      .send();
   common::poll_recv(lio, &mut receiver).unwrap();
 }
 

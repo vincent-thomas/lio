@@ -33,7 +33,9 @@ fn stat_path(
 
 fn mkdir(lio: &mut Lio, path: CString) -> Result<(), std::io::Error> {
   let mut receiver =
-    api::mkdirat(&Resource::cwd(), path, 0o755).with_lio(lio).send();
+    api::mkdirat(&Resource::cwd(), path, common::file_mode(0o755))
+      .with_lio(lio)
+      .send();
   common::poll_recv(lio, &mut receiver)
 }
 

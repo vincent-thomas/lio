@@ -93,7 +93,7 @@ impl Command for CommCommand {
         &ctx.cwd(),
         std::ffi::CString::new(self.left_path.as_str())?,
         lio::api::OpenFlags::READ,
-        0,
+        lio::api::FileMode::empty(),
       )
       .with_lio(ctx.lio())
       .send(),
@@ -104,7 +104,7 @@ impl Command for CommCommand {
         &ctx.cwd(),
         std::ffi::CString::new(self.right_path.as_str())?,
         lio::api::OpenFlags::READ,
-        0,
+        lio::api::FileMode::empty(),
       )
       .with_lio(ctx.lio())
       .send(),

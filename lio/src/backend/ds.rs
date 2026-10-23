@@ -17,6 +17,8 @@
 //! - synthetic file/socket resources are reused across later operations
 //! - standard resources (`stdin`, `stdout`, `stderr`, `cwd`) are modeled as
 //!   deterministic built-ins
+//! - read, write, send and receive flags are not modeled: an op that sets
+//!   any completes with `ENOTSUP`
 //!
 //! The goal is deterministic replay of backend variance and stateful behavior,
 //! not syscall fidelity.
@@ -1946,7 +1948,7 @@ impl DSBackend {
   fn process_pending_op(&mut self, _id: u64, op: Op) -> PendingAction {
     match op {
       Op::Read { fd, iovecs, iov_count, offset, flags } => {
-        if offset.is_some() || flags.bits() < 0 {
+        if offset.is_some() {
           return PendingAction::Complete(-(errno::EINVAL as isize));
         }
         let raw = Self::resource_key(&fd);
@@ -1970,9 +1972,6 @@ impl DSBackend {
         }
       }
       Op::Recv { fd, msg, flags } => {
-        if flags.bits() < 0 {
-          return PendingAction::Complete(-(errno::EINVAL as isize));
-        }
         let raw = Self::resource_key(&fd);
         let total = unsafe {
           std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
@@ -2182,7 +2181,7 @@ impl DSBackend {
           Ok(position) => position,
           Err(err) => return OpAction::Complete(err),
         };
-        if flags.bits() < 0 {
+        if !flags.is_empty() {
           return OpAction::Complete(-(errno::ENOTSUP as isize));
         }
         let total: usize =
@@ -2227,7 +2226,7 @@ impl DSBackend {
           Ok(position) => position,
           Err(err) => return OpAction::Complete(err),
         };
-        if flags.bits() < 0 {
+        if !flags.is_empty() {
           return OpAction::Complete(-(errno::ENOTSUP as isize));
         }
         let bytes = Self::extract_iovec_bytes(iovecs, iov_count);
@@ -2237,8 +2236,8 @@ impl DSBackend {
         }
       }
       Op::Recv { fd, msg, flags } => {
-        if flags.bits() < 0 {
-          return OpAction::Complete(-(errno::EINVAL as isize));
+        if !flags.is_empty() {
+          return OpAction::Complete(-(errno::ENOTSUP as isize));
         }
         let total =
           // SAFETY: `MsgRecv` buffers stay alive for the op lifetime.
@@ -2277,8 +2276,8 @@ impl DSBackend {
         }
       }
       Op::Send { fd, msg, flags } => {
-        if flags.bits() < 0 {
-          return OpAction::Complete(-(errno::EINVAL as isize));
+        if !flags.is_empty() {
+          return OpAction::Complete(-(errno::ENOTSUP as isize));
         }
         let bytes = Self::read_msg_send(msg);
         match self.write_bytes_to_resource(&fd, &bytes, None) {
@@ -3369,7 +3368,7 @@ impl DSTBackend {
     if !op::is_valid_file_offset(offset) {
       return PendingAction::Complete(-(errno::EINVAL as isize));
     }
-    if flags.bits() < 0 {
+    if !flags.is_empty() {
       return PendingAction::Complete(-(errno::ENOTSUP as isize));
     }
     if offset.is_some() {
@@ -3406,8 +3405,8 @@ impl DSTBackend {
     msg: MsgRecv,
     flags: RecvFlags,
   ) -> PendingAction {
-    if flags.bits() < 0 {
-      return PendingAction::Complete(-(errno::EINVAL as isize));
+    if !flags.is_empty() {
+      return PendingAction::Complete(-(errno::ENOTSUP as isize));
     }
     let raw = DSBackend::resource_key(fd);
     let Some(socket) = node.sockets.get_mut(&raw) else {
@@ -3851,12 +3850,12 @@ impl DSTBackend {
         }
       }
       Op::Send { fd, msg, flags } => {
-        if flags.bits() < 0 {
+        if !flags.is_empty() {
           self
             .node
             .borrow_mut()
             .ready
-            .push(OpCompleted::new(id, -(errno::EINVAL as isize)));
+            .push(OpCompleted::new(id, -(errno::ENOTSUP as isize)));
           return;
         }
         let target = msg.to.map(op::socket_addr_into_buf);
@@ -3875,7 +3874,7 @@ impl DSTBackend {
             return;
           }
         };
-        if flags.bits() < 0 {
+        if !flags.is_empty() {
           self
             .node
             .borrow_mut()
@@ -4298,7 +4297,7 @@ mod tests {
     let mut step_bump = Bump::new();
     backend.push(
       1,
-      Op::Recv { fd: Resource::stdin(), msg, flags: RecvFlags::EMPTY },
+      Op::Recv { fd: Resource::stdin(), msg, flags: RecvFlags::empty() },
       &mut step_bump,
     );
     backend.flush().unwrap();
@@ -4332,7 +4331,7 @@ mod tests {
     let mut step_bump = Bump::new();
     backend.push(
       1,
-      Op::Recv { fd: socket, msg, flags: RecvFlags::EMPTY },
+      Op::Recv { fd: socket, msg, flags: RecvFlags::empty() },
       &mut step_bump,
     );
     backend.flush().unwrap();
@@ -4388,7 +4387,7 @@ mod tests {
     let mut send_bump = Bump::new();
     backend.push(
       1,
-      Op::Send { fd: sender, msg: send_msg, flags: SendFlags::EMPTY },
+      Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
     );
     backend.flush().unwrap();
@@ -4405,7 +4404,7 @@ mod tests {
     let mut recv_bump = Bump::new();
     backend.push(
       2,
-      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
+      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
     );
     backend.flush().unwrap();
@@ -4417,6 +4416,78 @@ mod tests {
     assert!(recv_len > 0);
     assert!(recv_len <= sent as usize);
     assert_eq!(&buf[..recv_len], &payload[..recv_len]);
+  }
+
+  #[test]
+  fn send_and_recv_flags_are_not_supported() {
+    let mut backend = DSBackend::with_config(DSConfig {
+      seed: 13,
+      max_delay_ticks: 0,
+      fault_every: 0,
+      network_faults: DSNetworkFaults::Off,
+    });
+    backend.init(16).unwrap();
+
+    let sender_fd = backend.create_socket_resource(
+      SockDomain::IPV4,
+      SockType::STREAM,
+      SockProto::TCP,
+    );
+    let receiver_fd = backend.create_socket_resource(
+      SockDomain::IPV4,
+      SockType::STREAM,
+      SockProto::TCP,
+    );
+    for (fd, peer) in [(sender_fd, receiver_fd), (receiver_fd, sender_fd)] {
+      let Some(SimResource::Socket(socket)) =
+        backend.world.resources.get_mut(&fd)
+      else {
+        panic!("socket resource missing");
+      };
+      socket.peer = Some(peer);
+    }
+    let sender = dst_resource(sender_fd);
+    let receiver = dst_resource(receiver_fd);
+
+    let payload = b"ping".to_vec();
+    let send_buf = crate::backend::op::MsgBuf::from_slice(&payload);
+    let mut buf = [0_u8; 16];
+    let mut recv_buf = MsgBufMut::from_slice(&mut buf);
+    let mut bump = Bump::new();
+    let mut run = |id, op| {
+      backend.push(id, op, &mut bump);
+      backend.flush().unwrap();
+      let mut done = Vec::new();
+      backend.wait(Some(Duration::ZERO), &mut done).unwrap();
+      assert_eq!(done.len(), 1);
+      done[0].result()
+    };
+    let send = |flags| Op::Send {
+      fd: sender.clone(),
+      msg: MsgSend::new(std::slice::from_ref(&send_buf), None),
+      flags,
+    };
+
+    assert_eq!(run(1, send(SendFlags::OOB)), -(errno::ENOTSUP as isize));
+    assert!(run(2, send(SendFlags::empty())) > 0);
+    let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
+    assert_eq!(
+      run(
+        3,
+        Op::Recv {
+          fd: receiver.clone(),
+          msg: recv_msg,
+          flags: RecvFlags::PEEK
+        }
+      ),
+      -(errno::ENOTSUP as isize)
+    );
+    assert!(
+      run(
+        4,
+        Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() }
+      ) > 0
+    );
   }
 
   #[test]
@@ -4464,7 +4535,7 @@ mod tests {
     let mut recv_bump = Bump::new();
     backend.push(
       1,
-      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
+      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
     );
     backend.flush().unwrap();
@@ -4482,7 +4553,7 @@ mod tests {
     let mut send_bump = Bump::new();
     backend.push(
       2,
-      Op::Send { fd: sender, msg: send_msg, flags: SendFlags::EMPTY },
+      Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
     );
     backend.flush().unwrap();
@@ -4624,7 +4695,7 @@ mod tests {
     let mut recv_bump = Bump::new();
     backend.push(
       1,
-      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
+      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
     );
     backend.flush().unwrap();
@@ -4681,7 +4752,7 @@ mod tests {
     let mut recv_bump = Bump::new();
     backend.push(
       1,
-      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::EMPTY },
+      Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
     );
 
@@ -4691,7 +4762,7 @@ mod tests {
     let mut send_bump = Bump::new();
     backend.push(
       2,
-      Op::Send { fd: sender, msg: send_msg, flags: SendFlags::EMPTY },
+      Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
     );
     backend.flush().unwrap();
@@ -4758,7 +4829,7 @@ mod tests {
           Op::Send {
             fd: dst_resource(11),
             msg: send_msg,
-            flags: SendFlags::EMPTY,
+            flags: SendFlags::empty(),
           },
         );
       }
@@ -4817,7 +4888,7 @@ mod tests {
         Op::Send {
           fd: dst_resource(11),
           msg: send_msg,
-          flags: SendFlags::EMPTY,
+          flags: SendFlags::empty(),
         },
       );
     }
@@ -4833,7 +4904,11 @@ mod tests {
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       10,
-      Op::Recv { fd: dst_resource(22), msg: recv_msg, flags: RecvFlags::EMPTY },
+      Op::Recv {
+        fd: dst_resource(22),
+        msg: recv_msg,
+        flags: RecvFlags::empty(),
+      },
     );
     let first = dst_take_ready(&receiver.node);
     assert_eq!(first.len(), 1);
@@ -4845,7 +4920,11 @@ mod tests {
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       11,
-      Op::Recv { fd: dst_resource(22), msg: recv_msg, flags: RecvFlags::EMPTY },
+      Op::Recv {
+        fd: dst_resource(22),
+        msg: recv_msg,
+        flags: RecvFlags::empty(),
+      },
     );
     let second = dst_take_ready(&receiver.node);
     assert_eq!(second.len(), 1);
@@ -4883,7 +4962,11 @@ mod tests {
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       1,
-      Op::Recv { fd: dst_resource(22), msg: recv_msg, flags: RecvFlags::EMPTY },
+      Op::Recv {
+        fd: dst_resource(22),
+        msg: recv_msg,
+        flags: RecvFlags::empty(),
+      },
     );
     assert!(dst_take_ready(&receiver.node).is_empty());
 
@@ -4936,7 +5019,11 @@ mod tests {
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     receiver.network_complete_op(
       1,
-      Op::Recv { fd: dst_resource(22), msg: recv_msg, flags: RecvFlags::EMPTY },
+      Op::Recv {
+        fd: dst_resource(22),
+        msg: recv_msg,
+        flags: RecvFlags::empty(),
+      },
     );
     assert!(dst_take_ready(&receiver.node).is_empty());
 
@@ -4959,7 +5046,11 @@ mod tests {
     let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
     receiver.network_complete_op(
       2,
-      Op::Send { fd: dst_resource(22), msg: send_msg, flags: SendFlags::EMPTY },
+      Op::Send {
+        fd: dst_resource(22),
+        msg: send_msg,
+        flags: SendFlags::empty(),
+      },
     );
     let receiver_ready = dst_take_ready(&receiver.node);
     assert_eq!(receiver_ready.len(), 1);
@@ -5085,7 +5176,7 @@ mod tests {
     let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
     backend.network_complete_op(
       3,
-      Op::Send { fd: stream.clone(), msg: send_msg, flags: SendFlags::EMPTY },
+      Op::Send { fd: stream.clone(), msg: send_msg, flags: SendFlags::empty() },
     );
     let ready = dst_take_ready(&backend.node);
     assert_eq!(ready.len(), 1);
@@ -5125,7 +5216,7 @@ mod tests {
 
     backend.network_complete_op(
       7,
-      Op::Recv { fd: stream, msg: recv_msg, flags: RecvFlags::EMPTY },
+      Op::Recv { fd: stream, msg: recv_msg, flags: RecvFlags::empty() },
     );
     let ready = dst_take_ready(&backend.node);
     assert_eq!(ready.len(), 1);
@@ -5211,7 +5302,7 @@ mod tests {
         dir_fd: Resource::cwd(),
         path,
         flags: OpenFlags::READ,
-        mode: crate::backend::op::FileMode::from_bits(0),
+        mode: crate::backend::op::FileMode::empty(),
       },
       &mut step_bump,
     );

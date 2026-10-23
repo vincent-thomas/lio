@@ -51,7 +51,7 @@ impl Command for CmpCommand {
         &ctx.cwd(),
         CString::new(self.left.as_str())?,
         lio::api::OpenFlags::READ,
-        0,
+        lio::api::FileMode::empty(),
       )
       .with_lio(ctx.lio())
       .send(),
@@ -62,7 +62,7 @@ impl Command for CmpCommand {
         &ctx.cwd(),
         CString::new(self.right.as_str())?,
         lio::api::OpenFlags::READ,
-        0,
+        lio::api::FileMode::empty(),
       )
       .with_lio(ctx.lio())
       .send(),
@@ -165,7 +165,7 @@ mod tests {
         &ctx.cwd(),
         CString::new(left_path.to_str().unwrap()).unwrap(),
         lio::api::OpenFlags::READ,
-        0,
+        lio::api::FileMode::empty(),
       )
       .with_lio(ctx.lio())
       .send(),
@@ -177,7 +177,7 @@ mod tests {
         &ctx.cwd(),
         CString::new(right_path.to_str().unwrap()).unwrap(),
         lio::api::OpenFlags::READ,
-        0,
+        lio::api::FileMode::empty(),
       )
       .with_lio(ctx.lio())
       .send(),

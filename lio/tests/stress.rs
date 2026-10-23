@@ -126,7 +126,7 @@ fn test_concurrent_file_writes_256() {
       lio::api::OpenFlags::WRITE
         | lio::api::OpenFlags::CREATE
         | lio::api::OpenFlags::TRUNCATE,
-      0o666,
+      common::file_mode(0o666),
     )
     .with_lio(&mut lio)
     .send_with(sender_open.clone());

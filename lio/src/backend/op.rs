@@ -36,20 +36,55 @@ impl SockProto {
   pub const UDP: Self = Self(2);
 }
 
-macro_rules! op_flags {
-  ($name:ident) => {
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct $name(i32);
+/// Defines a portable flag set: a newtype over private bits with named flags
+/// that combine with `|`. Backends translate the flags to their native
+/// encoding.
+macro_rules! portable_flags {
+  (
+    $(#[$meta:meta])*
+    pub struct $name:ident;
+    $(
+      $(#[$flag_meta:meta])*
+      const $flag:ident = $bits:expr;
+    )*
+  ) => {
+    $(#[$meta])*
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct $name(u32);
 
     impl $name {
-      pub const EMPTY: Self = Self(0);
+      $(
+        $(#[$flag_meta])*
+        pub const $flag: Self = Self($bits);
+      )*
 
-      pub const fn from_bits(bits: i32) -> Option<Self> {
-        if bits < 0 { None } else { Some(Self(bits)) }
+      /// No flags; combine with others.
+      pub const fn empty() -> Self {
+        Self(0)
       }
 
-      pub const fn bits(self) -> i32 {
-        self.0
+      /// Whether no flag is set.
+      pub const fn is_empty(self) -> bool {
+        self.0 == 0
+      }
+
+      /// Whether every flag in `other` is set.
+      pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+      }
+    }
+
+    impl std::ops::BitOr for $name {
+      type Output = Self;
+
+      fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+      }
+    }
+
+    impl std::ops::BitOrAssign for $name {
+      fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
       }
     }
   };
@@ -73,48 +108,82 @@ pub const fn is_valid_file_offset(offset: Option<u64>) -> bool {
   }
 }
 
-op_flags!(ReadFlags);
-op_flags!(WriteFlags);
-op_flags!(RecvFlags);
-op_flags!(SendFlags);
+portable_flags! {
+  /// How [`Op::Read`] reads. No read flags are portable yet, so this is
+  /// always [`empty`](Self::empty).
+  pub struct ReadFlags;
+}
 
-/// How [`Op::OpenAt`] opens a path. Combine flags with `|`.
-///
-/// At least one of [`READ`](Self::READ), [`WRITE`](Self::WRITE) or
-/// [`APPEND`](Self::APPEND) is required; backends reject an open without an
-/// access mode as invalid input. Backends translate these to their native
-/// flags, and never let the opened resource leak into child processes
-/// (`O_CLOEXEC` on Unix).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct OpenFlags(u32);
+portable_flags! {
+  /// How [`Op::Write`] writes. Combine flags with `|`.
+  ///
+  /// A backend that cannot honour a flag completes the write with
+  /// `ENOTSUP` rather than ignoring it.
+  pub struct WriteFlags;
+  /// Make the written data durable before completing, as if followed by
+  /// `fdatasync` (`RWF_DSYNC`).
+  const DSYNC = 1 << 0;
+  /// Make the written data and its metadata durable before completing, as
+  /// if followed by `fsync` (`RWF_SYNC`).
+  const SYNC = 1 << 1;
+  /// Write at the end of the file, ignoring the offset (`RWF_APPEND`).
+  const APPEND = 1 << 2;
+}
 
-impl OpenFlags {
+portable_flags! {
+  /// How [`Op::Recv`] receives. Combine flags with `|`.
+  ///
+  /// A backend that cannot honour a flag completes the receive with
+  /// `ENOTSUP` rather than ignoring it.
+  pub struct RecvFlags;
+  /// Return the data without removing it from the receive queue
+  /// (`MSG_PEEK`).
+  const PEEK = 1 << 0;
+  /// Receive out-of-band data (`MSG_OOB`).
+  const OOB = 1 << 1;
+}
+
+portable_flags! {
+  /// How [`Op::Send`] sends. Combine flags with `|`.
+  ///
+  /// Sending on a connection the peer has closed fails with `EPIPE`; no
+  /// backend raises `SIGPIPE` (`MSG_NOSIGNAL` on Unix). A backend that cannot
+  /// honour a flag completes the send with `ENOTSUP` rather than ignoring it.
+  pub struct SendFlags;
+  /// Send out-of-band data (`MSG_OOB`).
+  const OOB = 1 << 0;
+  /// Send only to directly connected hosts, bypassing routing
+  /// (`MSG_DONTROUTE`).
+  const DONTROUTE = 1 << 1;
+}
+
+portable_flags! {
+  /// How [`Op::OpenAt`] opens a path. Combine flags with `|`.
+  ///
+  /// At least one of [`READ`](Self::READ), [`WRITE`](Self::WRITE) or
+  /// [`APPEND`](Self::APPEND) is required; backends reject an open without an
+  /// access mode as invalid input. Backends translate these to their native
+  /// flags, and never let the opened resource leak into child processes
+  /// (`O_CLOEXEC` on Unix).
+  pub struct OpenFlags;
   /// Open for reading.
-  pub const READ: Self = Self(1 << 0);
+  const READ = 1 << 0;
   /// Open for writing.
-  pub const WRITE: Self = Self(1 << 1);
+  const WRITE = 1 << 1;
   /// Open for writing, with every write appended to the end (implies
   /// writing).
-  pub const APPEND: Self = Self(1 << 2);
+  const APPEND = 1 << 2;
   /// Create the file if it does not exist.
-  pub const CREATE: Self = Self(1 << 3);
+  const CREATE = 1 << 3;
   /// Truncate an existing file to zero length (requires writing).
-  pub const TRUNCATE: Self = Self(1 << 4);
+  const TRUNCATE = 1 << 4;
   /// With [`CREATE`](Self::CREATE): fail if the file already exists.
-  pub const EXCLUSIVE: Self = Self(1 << 5);
+  const EXCLUSIVE = 1 << 5;
   /// Fail unless the path is a directory.
-  pub const DIRECTORY: Self = Self(1 << 6);
+  const DIRECTORY = 1 << 6;
+}
 
-  /// No flags; combine with others.
-  pub const fn empty() -> Self {
-    Self(0)
-  }
-
-  /// Whether every flag in `other` is set.
-  pub const fn contains(self, other: Self) -> bool {
-    self.0 & other.0 == other.0
-  }
-
+impl OpenFlags {
   /// Whether the open reads.
   pub const fn reads(self) -> bool {
     self.contains(Self::READ)
@@ -126,36 +195,57 @@ impl OpenFlags {
   }
 }
 
-impl std::ops::BitOr for OpenFlags {
-  type Output = Self;
-
-  fn bitor(self, rhs: Self) -> Self {
-    Self(self.0 | rhs.0)
-  }
+portable_flags! {
+  /// Permissions for a file or directory that [`Op::OpenAt`] or
+  /// [`Op::MkdirAt`] creates. Combine flags with `|`, or write them in the
+  /// familiar octal form with [`from_octal`](Self::from_octal).
+  ///
+  /// Backends translate these to their native permissions. Unix applies
+  /// them as the `mode` argument, less the process umask. Windows has no
+  /// permission bits: it ignores the mode.
+  pub struct FileMode;
+  /// The owner may read.
+  const OWNER_READ = 0o400;
+  /// The owner may write.
+  const OWNER_WRITE = 0o200;
+  /// The owner may execute (search, for a directory).
+  const OWNER_EXECUTE = 0o100;
+  /// The group may read.
+  const GROUP_READ = 0o040;
+  /// The group may write.
+  const GROUP_WRITE = 0o020;
+  /// The group may execute (search, for a directory).
+  const GROUP_EXECUTE = 0o010;
+  /// Others may read.
+  const OTHER_READ = 0o004;
+  /// Others may write.
+  const OTHER_WRITE = 0o002;
+  /// Others may execute (search, for a directory).
+  const OTHER_EXECUTE = 0o001;
+  /// Execute as the file's owner.
+  const SET_USER_ID = 0o4000;
+  /// Execute as the file's group; in a directory, new entries inherit its
+  /// group.
+  const SET_GROUP_ID = 0o2000;
+  /// In a directory, only an entry's owner may remove or rename it.
+  const STICKY = 0o1000;
 }
-
-impl std::ops::BitOrAssign for OpenFlags {
-  fn bitor_assign(&mut self, rhs: Self) {
-    self.0 |= rhs.0;
-  }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FileMode(u32);
 
 impl FileMode {
-  pub const fn from_bits(bits: u32) -> Self {
-    Self(bits)
+  /// Every permission bit.
+  const ALL: u32 = 0o7777;
+
+  /// The mode written in POSIX octal notation, such as `0o644`.
+  ///
+  /// Returns `None` if `octal` sets anything but the twelve permission bits
+  /// (`0o7777`), such as file-type bits.
+  pub const fn from_octal(octal: u32) -> Option<Self> {
+    if octal & !Self::ALL == 0 { Some(Self(octal)) } else { None }
   }
 
-  pub const fn bits(self) -> u32 {
+  /// The mode in POSIX octal notation, such as `0o644`.
+  pub const fn octal(self) -> u32 {
     self.0
-  }
-}
-
-impl From<u32> for FileMode {
-  fn from(bits: u32) -> Self {
-    Self::from_bits(bits)
   }
 }
 
@@ -641,7 +731,7 @@ pub enum Op {
     /// `Some(offset)` is at most [`MAX_FILE_OFFSET`]; backends complete a
     /// larger one with `EINVAL`.
     offset: Option<u64>,
-    /// Backend-interpreted read flags.
+    /// Portable read flags.
     flags: ReadFlags,
   },
 
@@ -665,7 +755,7 @@ pub enum Op {
     /// `Some(offset)` is at most [`MAX_FILE_OFFSET`]; backends complete a
     /// larger one with `EINVAL`.
     offset: Option<u64>,
-    /// Backend-interpreted write flags.
+    /// Portable write flags.
     flags: WriteFlags,
   },
 
@@ -683,7 +773,7 @@ pub enum Op {
     fd: Resource,
     /// Portable message descriptor lowered by the backend.
     msg: MsgRecv,
-    /// Backend-interpreted receive flags.
+    /// Portable receive flags.
     flags: RecvFlags,
   },
 
@@ -701,7 +791,7 @@ pub enum Op {
     fd: Resource,
     /// Portable message descriptor lowered by the backend.
     msg: MsgSend,
-    /// Backend-interpreted send flags.
+    /// Portable send flags.
     flags: SendFlags,
   },
 
@@ -786,7 +876,7 @@ pub enum Op {
     path: OsString,
     /// Semantic open flags.
     flags: OpenFlags,
-    /// File creation mode used when creating a file.
+    /// Permissions for a file the open creates.
     mode: FileMode,
   },
   /// Remove a file or directory relative to a directory file descriptor.
@@ -824,7 +914,7 @@ pub enum Op {
     dir_fd: Resource,
     /// Platform-native path.
     path: OsString,
-    /// Directory creation mode.
+    /// Permissions for the new directory.
     mode: FileMode,
   },
   /// Create a hard or symbolic link relative to directory file descriptors.

@@ -59,8 +59,9 @@ use crate::backend::impls::sockaddr::{
 use crate::backend::native::CWD as CWD_HANDLE;
 use crate::backend::op::{
   DirEntryRef, FileStat, FileType, LinkKind, MsgRecv, MsgSend, Op,
-  OpaqueDropFn, OpenFlags, RawBuf, ReadDirResult, ShutdownHow, SocketAddrBuf,
-  SocketAddrFamily, SpawnSpec, StatTarget, UnlinkKind, is_valid_file_offset,
+  OpaqueDropFn, OpenFlags, RawBuf, ReadDirResult, RecvFlags, SendFlags,
+  ShutdownHow, SocketAddrBuf, SocketAddrFamily, SpawnSpec, StatTarget,
+  UnlinkKind, is_valid_file_offset,
 };
 use crate::backend::{IoBackend, OpCompleted};
 
@@ -399,7 +400,7 @@ impl Iocp {
         if !is_valid_file_offset(offset) {
           return Some(neg(ERROR_INVALID_PARAMETER));
         }
-        if flags.bits() != 0 {
+        if !flags.is_empty() {
           return Some(neg(ERROR_NOT_SUPPORTED));
         }
         if probe_socket(socket_of(&fd)).is_ok() {
@@ -418,7 +419,7 @@ impl Iocp {
         if !is_valid_file_offset(offset) {
           return Some(neg(ERROR_INVALID_PARAMETER));
         }
-        if flags.bits() != 0 {
+        if !flags.is_empty() {
           return Some(neg(ERROR_NOT_SUPPORTED));
         }
         if probe_socket(socket_of(&fd)).is_ok() {
@@ -436,7 +437,7 @@ impl Iocp {
           return Some(code);
         }
         let bufs = recv_bufs(&msg);
-        self.start_recv(id, &fd, bufs, flags.bits() as u32, msg.from)
+        self.start_recv(id, &fd, bufs, recv_flags(flags), msg.from)
       }
       Op::Send { fd, msg, flags } => {
         let socket = socket_of(&fd);
@@ -444,7 +445,7 @@ impl Iocp {
           return Some(code);
         }
         let bufs = send_bufs(&msg);
-        self.start_send(id, &fd, bufs, flags.bits() as u32, msg.to)
+        self.start_send(id, &fd, bufs, send_flags(flags), msg.to)
       }
       Op::Accept { fd, addr } => self.start_accept(id, &fd, addr),
       Op::Connect { fd, addr } => self.start_connect(id, &fd, &addr),
@@ -1200,6 +1201,32 @@ fn check_handle(handle: HANDLE) -> Result<(), isize> {
     }
   }
   Ok(())
+}
+
+/// Translates [`RecvFlags`] to `WSARecv` flags.
+fn recv_flags(flags: RecvFlags) -> u32 {
+  let mut bits = 0;
+  for (flag, native) in
+    [(RecvFlags::PEEK, ws::MSG_PEEK), (RecvFlags::OOB, ws::MSG_OOB)]
+  {
+    if flags.contains(flag) {
+      bits |= native;
+    }
+  }
+  bits as u32
+}
+
+/// Translates [`SendFlags`] to `WSASend` flags.
+fn send_flags(flags: SendFlags) -> u32 {
+  let mut bits = 0;
+  for (flag, native) in
+    [(SendFlags::OOB, ws::MSG_OOB), (SendFlags::DONTROUTE, ws::MSG_DONTROUTE)]
+  {
+    if flags.contains(flag) {
+      bits |= native;
+    }
+  }
+  bits as u32
 }
 
 fn wsa_bufs(bufs: impl Iterator<Item = (*mut u8, usize)>) -> Vec<ws::WSABUF> {

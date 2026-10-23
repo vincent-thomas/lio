@@ -30,7 +30,7 @@ fn open_rw_file(lio: &mut Lio, path: std::ffi::CString) -> Resource {
       | lio::api::OpenFlags::WRITE
       | lio::api::OpenFlags::CREATE
       | lio::api::OpenFlags::TRUNCATE,
-    0o644,
+    common::file_mode(0o644),
   )
   .with_lio(lio)
   .send();

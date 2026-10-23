@@ -60,8 +60,8 @@ use std::{
 use crate::{
   IoBuf, IoBufMut, Lio,
   api::{
-    self, FileStat, FileType, ReadDirBuf, RecvFlags, SendFlags, ShutdownHow,
-    SockDomain, SockProto, SockType, resource::Resource,
+    self, FileStat, FileType, ReadDirBuf, ShutdownHow, SockDomain, SockProto,
+    SockType, resource::Resource,
   },
   backend::{
     impls::sockaddr::std_socketaddr_into_libc, op::is_valid_file_offset,
@@ -935,6 +935,8 @@ pub unsafe extern "C" fn lio_accept(
 ///
 /// lio borrows `buf` until the callback fires and never frees it.
 ///
+/// - `flags`: `MSG_OOB` or `MSG_DONTROUTE`; `MSG_NOSIGNAL` is accepted and
+///   always applied. Other flags fail with `EINVAL`.
 /// - `callback(result, buf, len)`: bytes sent (or negative errno), the same
 ///   `buf`, and `len = buf_len`
 ///
@@ -955,22 +957,27 @@ pub unsafe extern "C" fn lio_send(
   let Some(buf) = (unsafe { lend_filled(buf, buf_len, callback) }) else {
     return;
   };
+  let Some(flags) = send_flags_from_posix(flags) else {
+    return_buf(
+      callback,
+      Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+      buf,
+    );
+    return;
+  };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::send(
-    &resource,
-    buf,
-    Some(SendFlags::from_bits(flags).unwrap_or(SendFlags::EMPTY)),
-  )
-  .with_lio(&unsafe { handle(lio) }.inner)
-  .when_done(move |(res, buf)| return_buf(callback, res, buf));
+  api::send(&resource, buf, Some(flags))
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
 
 /// Receive data from a socket.
 ///
 /// lio borrows `buf` until the callback fires and never frees it.
 ///
+/// - `flags`: `MSG_PEEK` or `MSG_OOB`. Other flags fail with `EINVAL`.
 /// - `callback(result, buf, len)`: bytes received (or negative errno), the
 ///   same `buf`, and `len` = bytes received (0 on error)
 ///
@@ -991,22 +998,27 @@ pub unsafe extern "C" fn lio_recv(
   let Some(buf) = (unsafe { lend_empty(buf, buf_len, callback) }) else {
     return;
   };
+  let Some(flags) = recv_flags_from_posix(flags) else {
+    return_buf(
+      callback,
+      Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+      buf,
+    );
+    return;
+  };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  api::recv(
-    &resource,
-    buf,
-    Some(RecvFlags::from_bits(flags).unwrap_or(RecvFlags::EMPTY)),
-  )
-  .with_lio(&unsafe { handle(lio) }.inner)
-  .when_done(move |(res, buf)| return_buf(callback, res, buf));
+  api::recv(&resource, buf, Some(flags))
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
 
 /// Receive data and sender address from a socket.
 ///
 /// lio borrows `buf` until the callback fires and never frees it.
 ///
+/// - `flags`: `MSG_PEEK` or `MSG_OOB`. Other flags fail with `EINVAL`.
 /// - `callback(result, buf, len, addr)`: bytes received (or negative errno),
 ///   the same `buf`, `len` = bytes received (0 on error), and the sender
 ///   address, which the caller must release with [`lio_sockaddr_free`], or
@@ -1035,29 +1047,29 @@ pub unsafe extern "C" fn lio_recvfrom(
     callback(-libc::EINVAL, buf, 0, ptr::null());
     return;
   };
+  let Some(flags) = recv_flags_from_posix(flags) else {
+    callback(-libc::EINVAL, buf.ptr, 0, ptr::null());
+    return;
+  };
   let resource = unsafe { fd_to_borrowed_resource(fd) };
-  api::recvfrom(
-    &resource,
-    buf,
-    Some(RecvFlags::from_bits(flags).unwrap_or(RecvFlags::EMPTY)),
-  )
-  .with_lio(&unsafe { handle(lio) }.inner)
-  .when_done(move |(res, buf, addr)| {
-    let (code, addr_ptr): (libc::c_int, *const libc::sockaddr_storage) =
-      match res {
-        Ok(n) => {
-          let addr_ptr = addr
-            .map(|addr| {
-              Box::into_raw(Box::new(std_socketaddr_into_libc(addr)))
-                as *const _
-            })
-            .unwrap_or(ptr::null());
-          (ffi_count(n), addr_ptr)
-        }
-        Err(e) => (-e.raw_os_error().unwrap_or(1), ptr::null()),
-      };
-    callback(code, buf.ptr, buf.len, addr_ptr);
-  });
+  api::recvfrom(&resource, buf, Some(flags))
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, buf, addr)| {
+      let (code, addr_ptr): (libc::c_int, *const libc::sockaddr_storage) =
+        match res {
+          Ok(n) => {
+            let addr_ptr = addr
+              .map(|addr| {
+                Box::into_raw(Box::new(std_socketaddr_into_libc(addr)))
+                  as *const _
+              })
+              .unwrap_or(ptr::null());
+            (ffi_count(n), addr_ptr)
+          }
+          Err(e) => (-e.raw_os_error().unwrap_or(1), ptr::null()),
+        };
+      callback(code, buf.ptr, buf.len, addr_ptr);
+    });
 }
 
 // /// Close a file descriptor.
@@ -1189,6 +1201,8 @@ pub unsafe extern "C" fn lio_connect(
 ///
 /// lio borrows `buf` until the callback fires and never frees it.
 ///
+/// - `flags`: `MSG_OOB` or `MSG_DONTROUTE`; `MSG_NOSIGNAL` is accepted and
+///   always applied. Other flags fail with `EINVAL`.
 /// - `callback(result, buf, len)`: bytes sent (or negative errno), the same
 ///   `buf`, and `len = buf_len`
 ///
@@ -1220,6 +1234,14 @@ pub unsafe extern "C" fn lio_sendto(
     );
     return;
   };
+  let Some(flags) = send_flags_from_posix(flags) else {
+    return_buf(
+      callback,
+      Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+      buf,
+    );
+    return;
+  };
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
@@ -1227,7 +1249,7 @@ pub unsafe extern "C" fn lio_sendto(
     resource.clone(),
     buf,
     Some(socket_addr),
-    Some(SendFlags::from_bits(flags).unwrap_or(SendFlags::EMPTY)),
+    Some(flags),
   ))
   .with_lio(&unsafe { handle(lio) }.inner)
   .when_done(move |(res, buf)| return_buf(callback, res, buf));
@@ -1237,7 +1259,7 @@ pub unsafe extern "C" fn lio_sendto(
 ///
 /// - `path`: null-terminated path string
 /// - `flags`: open flags (O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, etc.)
-/// - `mode`: file mode if O_CREAT is set
+/// - `mode`: permission bits if O_CREAT is set; other bits fail with `EINVAL`
 /// - `callback(result)`: new fd on success, negative errno on error
 ///
 /// # Safety
@@ -1262,9 +1284,9 @@ pub unsafe extern "C" fn lio_openat(
 
   // SAFETY: caller guarantees dir_fd is valid per fn contract
   let dir_resource = unsafe { fd_to_borrowed_resource(dir_fd) };
-  #[allow(clippy::unnecessary_cast)]
-  let mode = mode as u32;
-  let Some(flags) = open_flags_from_posix(flags) else {
+  let (Some(flags), Some(mode)) =
+    (open_flags_from_posix(flags), file_mode_from_posix(mode))
+  else {
     callback(-libc::EINVAL as libc::intptr_t);
     return;
   };
@@ -1496,7 +1518,7 @@ pub unsafe extern "C" fn lio_renameat(
 ///
 /// - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
 /// - `path`: Path to create (null-terminated)
-/// - `mode`: Permission bits (e.g., 0755)
+/// - `mode`: Permission bits (e.g., 0755); other bits fail with `EINVAL`
 /// - `callback(result)`: 0 on success, negative errno on error
 ///
 /// # Safety
@@ -1515,8 +1537,10 @@ pub unsafe extern "C" fn lio_mkdirat(
   }
   let path_cstr = unsafe { std::ffi::CStr::from_ptr(path) }.to_owned();
   let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
-  #[allow(clippy::unnecessary_cast)]
-  let mode = mode as u32;
+  let Some(mode) = file_mode_from_posix(mode) else {
+    callback(-libc::EINVAL);
+    return;
+  };
   api::mkdirat(&dir_res, path_cstr, mode)
     .with_lio(&unsafe { handle(lio) }.inner)
     .when_done(move |res| {
@@ -2475,6 +2499,76 @@ fn open_flags_from_posix(bits: libc::c_int) -> Option<api::OpenFlags> {
     }
   }
   (rest == 0).then_some(flags)
+}
+
+/// Translates POSIX `MSG_*` receive flags from C callers to
+/// [`api::RecvFlags`].
+///
+/// Returns `None` for flags lio does not model, so they are rejected rather
+/// than silently dropped.
+fn recv_flags_from_posix(bits: libc::c_int) -> Option<api::RecvFlags> {
+  use api::RecvFlags;
+  let mut flags = RecvFlags::empty();
+  let mut rest = bits;
+  for (native, flag) in
+    [(libc::MSG_PEEK, RecvFlags::PEEK), (libc::MSG_OOB, RecvFlags::OOB)]
+  {
+    if rest & native != 0 {
+      flags |= flag;
+      rest &= !native;
+    }
+  }
+  (rest == 0).then_some(flags)
+}
+
+/// Translates POSIX `MSG_*` send flags from C callers to [`api::SendFlags`].
+///
+/// Returns `None` for flags lio does not model, so they are rejected rather
+/// than silently dropped. `MSG_NOSIGNAL` is accepted; lio always sets it.
+fn send_flags_from_posix(bits: libc::c_int) -> Option<api::SendFlags> {
+  use api::SendFlags;
+  let mut flags = SendFlags::empty();
+  let mut rest = bits & !libc::MSG_NOSIGNAL;
+  for (native, flag) in [
+    (libc::MSG_OOB, SendFlags::OOB),
+    (libc::MSG_DONTROUTE, SendFlags::DONTROUTE),
+  ] {
+    if rest & native != 0 {
+      flags |= flag;
+      rest &= !native;
+    }
+  }
+  (rest == 0).then_some(flags)
+}
+
+/// Translates a POSIX `mode_t` from C callers to [`api::FileMode`].
+///
+/// Returns `None` if `mode` sets anything but permission bits, such as
+/// file-type bits.
+fn file_mode_from_posix(mode: libc::mode_t) -> Option<api::FileMode> {
+  use api::FileMode;
+  let mut out = FileMode::empty();
+  let mut rest = mode;
+  for (native, flag) in [
+    (libc::S_IRUSR, FileMode::OWNER_READ),
+    (libc::S_IWUSR, FileMode::OWNER_WRITE),
+    (libc::S_IXUSR, FileMode::OWNER_EXECUTE),
+    (libc::S_IRGRP, FileMode::GROUP_READ),
+    (libc::S_IWGRP, FileMode::GROUP_WRITE),
+    (libc::S_IXGRP, FileMode::GROUP_EXECUTE),
+    (libc::S_IROTH, FileMode::OTHER_READ),
+    (libc::S_IWOTH, FileMode::OTHER_WRITE),
+    (libc::S_IXOTH, FileMode::OTHER_EXECUTE),
+    (libc::S_ISUID, FileMode::SET_USER_ID),
+    (libc::S_ISGID, FileMode::SET_GROUP_ID),
+    (libc::S_ISVTX, FileMode::STICKY),
+  ] {
+    if rest & native != 0 {
+      out |= flag;
+      rest &= !native;
+    }
+  }
+  (rest == 0).then_some(out)
 }
 
 #[cfg(test)]

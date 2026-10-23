@@ -71,9 +71,14 @@ impl Command for DdCommand {
         let cpath = CString::new(path.as_str())?;
         io_util::run(
           ctx.lio(),
-          api::openat(&ctx.cwd(), cpath, lio::api::OpenFlags::READ, 0)
-            .with_lio(ctx.lio())
-            .send(),
+          api::openat(
+            &ctx.cwd(),
+            cpath,
+            lio::api::OpenFlags::READ,
+            lio::api::FileMode::empty(),
+          )
+          .with_lio(ctx.lio())
+          .send(),
         )?
       }
       None => ctx.stdin(),
@@ -89,7 +94,7 @@ impl Command for DdCommand {
             lio::api::OpenFlags::WRITE
               | lio::api::OpenFlags::CREATE
               | lio::api::OpenFlags::TRUNCATE,
-            0o666,
+            lio::api::FileMode::from_octal(0o666).unwrap(),
           )
           .with_lio(ctx.lio())
           .send(),

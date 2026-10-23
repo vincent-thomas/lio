@@ -274,13 +274,13 @@ doc_op! {
         dir_res: &impl AsResource,
         path: std::ffi::CString,
         flags: OpenFlags,
-        mode: impl Into<FileMode>
+        mode: FileMode,
     ) -> Io<ops::OpenAt> {
         Io::from_op(ops::OpenAt::new(
             dir_res.as_resource().clone(),
             path,
             flags,
-            mode.into()
+            mode,
         ))
     }
 }
@@ -365,12 +365,12 @@ doc_op! {
     pub fn mkdirat(
         dir_res: &impl AsResource,
         path: std::ffi::CString,
-        mode: impl Into<FileMode>,
+        mode: FileMode,
     ) -> Io<ops::MkdirAt> {
         Io::from_op(ops::MkdirAt::new(
             dir_res.as_resource().clone(),
             path,
-            mode.into(),
+            mode,
         ))
     }
 }

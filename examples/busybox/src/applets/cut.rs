@@ -92,7 +92,7 @@ fn open_input(
         &ctx.cwd(),
         std::ffi::CString::new(path)?,
         lio::api::OpenFlags::READ,
-        0,
+        lio::api::FileMode::empty(),
       )
       .with_lio(ctx.lio())
       .send(),

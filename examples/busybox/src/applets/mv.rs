@@ -298,7 +298,7 @@ fn copy_file_lio(
       &ctx.cwd(),
       fs_util::path_to_cstring(source)?,
       lio::api::OpenFlags::READ,
-      0,
+      lio::api::FileMode::empty(),
     )
     .with_lio(ctx.lio())
     .send(),
@@ -311,7 +311,7 @@ fn copy_file_lio(
       lio::api::OpenFlags::WRITE
         | lio::api::OpenFlags::CREATE
         | lio::api::OpenFlags::TRUNCATE,
-      mode & 0o7777,
+      lio::api::FileMode::from_octal(mode & 0o7777).unwrap(),
     )
     .with_lio(ctx.lio())
     .send(),
@@ -366,8 +366,9 @@ fn remove_source_dir_tree(ctx: &AppContext, path: &Path) -> io::Result<()> {
 
 fn mkdir_path(ctx: &AppContext, path: &Path, mode: u32) -> io::Result<()> {
   let cpath = path_to_cstring(path, "mv")?;
-  let mut receiver =
-    api::mkdirat(&ctx.cwd(), cpath, mode).with_lio(ctx.lio()).send();
+  let mut receiver = api::mkdirat(&ctx.cwd(), cpath, fs_util::file_mode(mode)?)
+    .with_lio(ctx.lio())
+    .send();
   io_util::run_recv(ctx.lio(), &mut receiver)
 }
 

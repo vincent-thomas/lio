@@ -30,7 +30,9 @@ fn open_file(
   mode: u32,
 ) -> Result<Resource, std::io::Error> {
   let mut receiver =
-    api::openat(&Resource::cwd(), path, flags, mode).with_lio(lio).send();
+    api::openat(&Resource::cwd(), path, flags, common::file_mode(mode))
+      .with_lio(lio)
+      .send();
   common::poll_recv(lio, &mut receiver)
 }
 

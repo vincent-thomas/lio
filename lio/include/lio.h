@@ -207,17 +207,6 @@ typedef struct CompletionFlags CompletionFlags;
  */
 typedef struct Interest Interest;
 
-/**
- * How [`Op::OpenAt`] opens a path. Combine flags with `|`.
- *
- * At least one of [`READ`](Self::READ), [`WRITE`](Self::WRITE) or
- * [`APPEND`](Self::APPEND) is required; backends reject an open without an
- * access mode as invalid input. Backends translate these to their native
- * flags, and never let the opened resource leak into child processes
- * (`O_CLOEXEC` on Unix).
- */
-typedef struct OpenFlags OpenFlags;
-
 typedef struct SockDomain SockDomain;
 
 typedef struct SockProto SockProto;
@@ -450,6 +439,8 @@ void lio_accept(struct lio_handle_t *lio, intptr_t fd, void (*callback)(intptr_t
  *
  * lio borrows `buf` until the callback fires and never frees it.
  *
+ * - `flags`: `MSG_OOB` or `MSG_DONTROUTE`; `MSG_NOSIGNAL` is accepted and
+ *   always applied. Other flags fail with `EINVAL`.
  * - `callback(result, buf, len)`: bytes sent (or negative errno), the same
  *   `buf`, and `len = buf_len`
  *
@@ -470,6 +461,7 @@ void lio_send(struct lio_handle_t *lio,
  *
  * lio borrows `buf` until the callback fires and never frees it.
  *
+ * - `flags`: `MSG_PEEK` or `MSG_OOB`. Other flags fail with `EINVAL`.
  * - `callback(result, buf, len)`: bytes received (or negative errno), the
  *   same `buf`, and `len` = bytes received (0 on error)
  *
@@ -490,6 +482,7 @@ void lio_recv(struct lio_handle_t *lio,
  *
  * lio borrows `buf` until the callback fires and never frees it.
  *
+ * - `flags`: `MSG_PEEK` or `MSG_OOB`. Other flags fail with `EINVAL`.
  * - `callback(result, buf, len, addr)`: bytes received (or negative errno),
  *   the same `buf`, `len` = bytes received (0 on error), and the sender
  *   address, which the caller must release with [`lio_sockaddr_free`], or
@@ -558,6 +551,8 @@ void lio_connect(struct lio_handle_t *lio,
  *
  * lio borrows `buf` until the callback fires and never frees it.
  *
+ * - `flags`: `MSG_OOB` or `MSG_DONTROUTE`; `MSG_NOSIGNAL` is accepted and
+ *   always applied. Other flags fail with `EINVAL`.
  * - `callback(result, buf, len)`: bytes sent (or negative errno), the same
  *   `buf`, and `len = buf_len`
  *
@@ -581,7 +576,7 @@ void lio_sendto(struct lio_handle_t *lio,
  *
  * - `path`: null-terminated path string
  * - `flags`: open flags (O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, etc.)
- * - `mode`: file mode if O_CREAT is set
+ * - `mode`: permission bits if O_CREAT is set; other bits fail with `EINVAL`
  * - `callback(result)`: new fd on success, negative errno on error
  *
  * # Safety
@@ -687,7 +682,7 @@ void lio_renameat(struct lio_handle_t *lio,
  *
  * - `dir_fd`: Directory fd (or AT_FDCWD for current directory)
  * - `path`: Path to create (null-terminated)
- * - `mode`: Permission bits (e.g., 0755)
+ * - `mode`: Permission bits (e.g., 0755); other bits fail with `EINVAL`
  * - `callback(result)`: 0 on success, negative errno on error
  *
  * # Safety

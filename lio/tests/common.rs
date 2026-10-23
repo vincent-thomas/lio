@@ -55,6 +55,12 @@ pub fn file_resource(file: File) -> Resource {
   }
 }
 
+/// A [`FileMode`](lio::api::FileMode) written in octal, such as `0o644`.
+#[allow(dead_code)]
+pub fn file_mode(octal: u32) -> lio::api::FileMode {
+  lio::api::FileMode::from_octal(octal).expect("mode sets only permission bits")
+}
+
 /// Opens a directory as a `Resource` (for `readdir` and `*at` operations).
 #[allow(dead_code)]
 pub fn open_dir(path: &std::path::Path) -> Resource {
