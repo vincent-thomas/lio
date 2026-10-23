@@ -494,6 +494,8 @@ pub struct MsgSend {
 }
 
 impl MsgSend {
+  /// # Panics
+  /// If `bufs` is empty.
   #[inline]
   pub fn new(bufs: &[MsgBuf], to: Option<SocketAddr>) -> Self {
     let buf_count = NonZeroUsize::new(bufs.len())
@@ -517,6 +519,8 @@ pub struct MsgRecv {
 }
 
 impl MsgRecv {
+  /// # Panics
+  /// If `bufs` is empty.
   #[inline]
   pub fn new(bufs: &[MsgBufMut]) -> Self {
     let buf_count = NonZeroUsize::new(bufs.len())

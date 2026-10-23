@@ -249,13 +249,28 @@ impl OpenOptions {
   }
 
   /// Opens a file relative to the current working directory.
+  ///
+  /// As with [`std::fs::OpenOptions`], `truncate`, `create` and `create_new`
+  /// need write access, and `truncate` with `append` needs `create_new`;
+  /// otherwise the open fails with [`io::ErrorKind::InvalidInput`] and
+  /// touches nothing.
   pub fn open(self, path: std::ffi::CString) -> Io<OpenFile> {
-    Io::from_op(OpenFile {
-      inner: ops::OpenAt::new(Resource::cwd(), path, self.flags(), self.mode),
-    })
+    let inner = self
+      .flags()
+      .map(|flags| ops::OpenAt::new(Resource::cwd(), path, flags, self.mode));
+    Io::from_op(OpenFile { inner })
   }
 
-  fn flags(&self) -> OpenFlags {
+  fn flags(&self) -> Result<OpenFlags, &'static str> {
+    // Without write access the backend would still truncate (or create) the
+    // file on some platforms, and refuse on others.
+    if self.append {
+      if self.truncate && !self.create_new {
+        return Err("truncating a file opened for appending needs create_new");
+      }
+    } else if !self.write && (self.truncate || self.create || self.create_new) {
+      return Err("truncating or creating a file needs write access");
+    }
     let mut flags = OpenFlags::empty();
     // With neither read nor write requested, open read-only.
     if self.read || !(self.write || self.append) {
@@ -275,24 +290,37 @@ impl OpenOptions {
     } else if self.create {
       flags |= OpenFlags::CREATE;
     }
-    flags
+    Ok(flags)
   }
 }
 
 /// Open-file operation specialized to return a typed [`File`].
 pub struct OpenFile {
-  inner: ops::OpenAt,
+  /// The options were invalid: completes with this `InvalidInput` message.
+  inner: Result<ops::OpenAt, &'static str>,
 }
 
 impl OpModel for OpenFile {
   type Item = io::Result<File>;
 
   fn action(&mut self) -> Action {
-    self.inner.action()
+    match &mut self.inner {
+      Ok(inner) => inner.action(),
+      Err(_) => Action::Io(crate::backend::op::Op::Nop),
+    }
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    match self.inner.complete(completion) {
+    let inner = match &mut self.inner {
+      Ok(inner) => inner,
+      Err(msg) => {
+        return OpResult::Done(Err(io::Error::new(
+          io::ErrorKind::InvalidInput,
+          *msg,
+        )));
+      }
+    };
+    match inner.complete(completion) {
       OpResult::Done(Ok(resource)) => {
         OpResult::Done(Ok(File::from_resource(resource)))
       }
@@ -980,4 +1008,59 @@ fn os_string_from_bytes(bytes: &[u8]) -> OsString {
 /// `None` if the path contains a NUL byte.
 fn path_to_cstring(path: &std::path::Path) -> Option<CString> {
   CString::new(path.as_os_str().as_encoded_bytes()).ok()
+}
+
+#[cfg(test)]
+mod open_options_tests {
+  use super::*;
+
+  #[test]
+  fn flags_follow_std_validation() {
+    let o = OpenOptions::new;
+    let invalid = [
+      o().truncate(true),
+      o().read(true).truncate(true),
+      o().read(true).create(true),
+      o().read(true).create_new(true),
+      o().append(true).truncate(true),
+      o().write(true).append(true).truncate(true),
+    ];
+    for opts in invalid {
+      assert!(opts.flags().is_err(), "{opts:?}");
+    }
+
+    let valid = [
+      (o(), OpenFlags::READ),
+      (o().write(true).truncate(true), OpenFlags::WRITE | OpenFlags::TRUNCATE),
+      (o().write(true).create(true), OpenFlags::WRITE | OpenFlags::CREATE),
+      (o().append(true).create(true), OpenFlags::APPEND | OpenFlags::CREATE),
+      (
+        o().append(true).truncate(true).create_new(true),
+        OpenFlags::APPEND
+          | OpenFlags::TRUNCATE
+          | OpenFlags::CREATE
+          | OpenFlags::EXCLUSIVE,
+      ),
+      (
+        o().read(true).write(true).create_new(true),
+        OpenFlags::READ
+          | OpenFlags::WRITE
+          | OpenFlags::CREATE
+          | OpenFlags::EXCLUSIVE,
+      ),
+    ];
+    for (opts, flags) in valid {
+      assert_eq!(opts.flags(), Ok(flags), "{opts:?}");
+    }
+  }
+
+  #[test]
+  fn invalid_options_complete_without_io() {
+    let mut op = OpenFile { inner: Err("bad options") };
+    assert!(matches!(op.action(), Action::Io(crate::backend::op::Op::Nop)));
+    let OpResult::Done(Err(err)) = op.complete(Completion::new(0)) else {
+      panic!("invalid options must fail");
+    };
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+  }
 }
