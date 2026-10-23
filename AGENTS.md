@@ -35,11 +35,12 @@ contract (`backend::op`) stays pure data.
 - No `debug_assert!`: CI rejects it, since it is compiled out of release
   builds. Use `assert!`.
 - Library code denies `clippy::unwrap_used` and `clippy::expect_used`
-  (`clippy.toml` exempts test code). Return an error or restructure where you
-  can; where a panic is deliberate (a broken invariant, a documented
-  `# Panics`), keep the `expect` and mark it
-  `#[expect(clippy::expect_used, reason = "...")]` on the smallest enclosing
-  statement or function.
+  (`clippy.toml` exempts test code), so every panic is spelled as one and
+  reads as intentional. Return an error or restructure where you can. Where a
+  panic is deliberate, write it out with `let ... else`:
+  `unreachable!` for a broken internal invariant, `panic!` for caller misuse
+  (document it under `# Panics`). Don't silence the lints with `#[allow]` or
+  `#[expect]`.
 
 ## Testing contract
 

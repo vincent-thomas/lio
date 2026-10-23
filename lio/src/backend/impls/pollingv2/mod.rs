@@ -500,9 +500,11 @@ impl Poller {
   }
 
   #[inline]
-  #[expect(clippy::expect_used, reason = "the driver calls init first")]
   fn sys(&self) -> &sys::OsPoller {
-    self.sys.as_ref().expect("Poller not initialized")
+    let Some(sys) = self.sys.as_ref() else {
+      panic!("Poller not initialized: the driver calls init first");
+    };
+    sys
   }
 
   #[cfg(unix)]
@@ -1287,8 +1289,9 @@ impl IoBackend for Poller {
 
     // Borrows only the field, unlike `sys()`: the loop below updates
     // `pending` while `sys` is live.
-    #[expect(clippy::expect_used, reason = "the driver calls init first")]
-    let sys = self.sys.as_ref().expect("Poller not initialized");
+    let Some(sys) = self.sys.as_ref() else {
+      panic!("Poller not initialized: the driver calls init first");
+    };
 
     {
       let event_count = match sys.wait(self.events.as_buf(), timeout) {
@@ -1319,14 +1322,11 @@ impl IoBackend for Poller {
           // EAGAIN/EWOULDBLOCK - re-register for retry
           let (fd, interest) = self.extract_fd_interest(&entry.op);
           let registration_id = entry.registration_id;
-          #[expect(
-            clippy::expect_used,
-            reason = "the entry came out of `pending` above, freeing a slot"
-          )]
-          let (pending_key, _entry) = self
-            .pending
-            .insert_get_mut(entry)
-            .expect("pending retry must fit backend capacity");
+          // The entry came out of `pending` above, freeing a slot.
+          let Some((pending_key, _entry)) = self.pending.insert_get_mut(entry)
+          else {
+            unreachable!("pending retry must fit backend capacity");
+          };
           if let Err(err) = sys.add(fd, pending_key.as_u64(), interest) {
             let _ = self.pending.remove(pending_key);
             let result = err

@@ -689,9 +689,11 @@ fn stage_into<B: IoBufMutVec>(buf: &mut B, bytes: &[u8]) {
 ///
 /// The driver completes an op at most once and never asks it for an action
 /// afterwards, so the buffer is always there when this is called.
-#[expect(clippy::expect_used, reason = "an op is completed at most once")]
 fn held<T>(buf: Option<T>) -> T {
-  buf.expect("buffer not available")
+  let Some(buf) = buf else {
+    unreachable!("buffer not available: the op was already completed");
+  };
+  buf
 }
 
 /// The error for a file offset past [`MAX_FILE_OFFSET`], which no kernel can
@@ -2040,11 +2042,9 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
     let buf = held(self.buf.as_mut());
     let mut regions = IoSlicesMut::new();
     buf.bufs_mut(&mut regions);
-    #[expect(
-      clippy::expect_used,
-      reason = "a buffer without regions is a caller bug"
-    )]
-    let region = regions.into_iter().next().expect("readlink needs a buffer");
+    let Some(region) = regions.into_iter().next() else {
+      panic!("readlink needs a buffer with at least one region");
+    };
     let len = region.len();
     let ptr = NonNull::from(region).cast::<u8>();
     // SAFETY: the region is model-owned storage that stays in place until

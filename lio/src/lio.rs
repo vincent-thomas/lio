@@ -277,10 +277,9 @@ impl Lio {
     let (store, io, time) = (&mut inner.store, &mut inner.io, &mut inner.time);
     match action {
       Action::Io(op) => {
-        #[expect(clippy::expect_used, reason = "actions come from live slots")]
-        let step_bump = store
-          .step_bump_mut(id)
-          .expect("dispatching action for unknown registration");
+        let Some(step_bump) = store.step_bump_mut(id) else {
+          unreachable!("dispatching action for unknown registration {id}");
+        };
         step_bump.reset();
         io.push(id, op, step_bump);
       }
