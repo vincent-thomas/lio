@@ -11,7 +11,7 @@ set -euo pipefail
 export MIRIFLAGS="-Zmiri-disable-isolation ${MIRIFLAGS:-}"
 export PROPTEST_CASES="${PROPTEST_CASES:-4}"
 
-core='slab|backend::store|backend::testing|registration|time::clock|driver'
+core='slab|backend::store|backend::testing|registration|time::clock|driver|buf'
 cargo +nightly miri nextest run -p lio --lib --test cancellation --test capacity \
   -E "(kind(lib) & test(/^(${core})::/)) | binary(cancellation) | binary(capacity)" \
   "$@"

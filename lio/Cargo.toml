@@ -22,11 +22,14 @@ nightly = []
 unstable_ffi = ["dep:cbindgen"]
 high = []
 backend_impls = ["dep:lio-uring"]
+## `bytes::Bytes` and `bytes::BytesMut` as I/O buffers.
+bytes = ["dep:bytes"]
 
 [dependencies]
 
 # Required
 bumpalo = { version = "3", default-features = false, features = ["boxed"] }
+bytes = { version = "1", optional = true }
 libc.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
