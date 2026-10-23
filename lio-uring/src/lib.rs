@@ -41,6 +41,7 @@
 //! - File descriptors remain valid until operations complete
 
 #![allow(clippy::new_without_default, clippy::module_inception)]
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 extern crate alloc;
 extern crate core;
 

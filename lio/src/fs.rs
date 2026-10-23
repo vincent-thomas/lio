@@ -23,6 +23,12 @@ const DEFAULT_READ_LINK_BYTES: usize = 256;
 const DEFAULT_READ_TO_STRING_BYTES: usize = 64 * 1024;
 const DEFAULT_REMOVE_DIR_ALL_SCRATCH_BYTES: usize = 4096;
 const DEFAULT_REMOVE_DIR_ALL_ENTRIES_CAP: usize = 32;
+/// `rw-rw-rw-`, less the umask: what `std::fs::OpenOptions` creates files
+/// with.
+const DEFAULT_FILE_MODE: FileMode = match FileMode::from_octal(0o666) {
+  Some(mode) => mode,
+  None => panic!("0o666 is a valid file mode"),
+};
 
 /// A regular file resource opened through lio.
 pub struct File(Resource);
@@ -202,7 +208,7 @@ impl OpenOptions {
       truncate: false,
       create: false,
       create_new: false,
-      mode: FileMode::from_octal(0o666).unwrap(),
+      mode: DEFAULT_FILE_MODE,
     }
   }
 
@@ -415,6 +421,10 @@ impl OpModel for OpenReadDir {
       }
       OpenReadDirState::Opening(mut op) => match op.complete(completion) {
         OpResult::Done(Ok(fd)) => {
+          #[expect(
+            clippy::expect_used,
+            reason = "the buffer is back between reads"
+          )]
           let buf = self.buf.take().expect("read_dir buffer missing");
           self.state = OpenReadDirState::Reading {
             fd: fd.clone(),
@@ -447,6 +457,10 @@ impl OpModel for OpenReadDir {
           if eof {
             OpResult::Done(Ok(ReadDir::new(std::mem::take(&mut self.entries))))
           } else {
+            #[expect(
+              clippy::expect_used,
+              reason = "the buffer was put back above"
+            )]
             let buf = self.buf.take().expect("read_dir buffer missing");
             self.state = OpenReadDirState::Reading {
               fd: fd.clone(),
@@ -501,11 +515,13 @@ impl RemoveDirFrame {
     }
   }
 
+  #[expect(clippy::expect_used, reason = "the buffer is back between reads")]
   fn next_read(&mut self) -> ops::ReadDir {
     let buf = self.buf.take().expect("remove_dir_all buffer missing");
     ops::ReadDir::new(self.fd.clone(), buf)
   }
 
+  #[expect(clippy::expect_used, reason = "the OS never puts NUL in a name")]
   fn push_entries(&mut self, buf: ReadDirBuf) {
     let entries = buf
       .iter()
@@ -598,6 +614,10 @@ impl RemoveDirAll {
       return OpResult::Again;
     }
 
+    #[expect(
+      clippy::expect_used,
+      reason = "each read has its frame on the stack"
+    )]
     let frame = self.stack.pop().expect("remove_dir_all stack missing frame");
     self.state = RemoveDirAllState::RemovingDir {
       op: ops::UnlinkAt::new(frame.parent, frame.name, UnlinkKind::Directory),
@@ -649,6 +669,10 @@ impl OpModel for RemoveDirAll {
             );
           }
 
+          #[expect(
+            clippy::expect_used,
+            reason = "each read has its frame on the stack"
+          )]
           let frame = self
             .stack
             .last_mut()

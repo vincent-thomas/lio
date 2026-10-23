@@ -2219,7 +2219,8 @@ fn link_kind_from_ffi(kind: libc::c_int) -> Result<api::ops::LinkKind, ()> {
   }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod sockaddr_tests {
   use super::*;
   use std::sync::atomic::{AtomicI32, Ordering};
@@ -2383,7 +2384,8 @@ mod sockaddr_tests {
   }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod rw_offset_tests {
   use super::*;
   use std::os::fd::AsRawFd;

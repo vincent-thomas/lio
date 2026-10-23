@@ -27,6 +27,8 @@
 //! }
 //! ```
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 

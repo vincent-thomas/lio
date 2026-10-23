@@ -4,7 +4,9 @@
   clippy::unsafe_removed_from_name,
   clippy::unnecessary_safety_doc,
   clippy::not_unsafe_ptr_arg_deref,
-  clippy::undocumented_unsafe_blocks
+  clippy::undocumented_unsafe_blocks,
+  clippy::unwrap_used,
+  clippy::expect_used
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../../book/src/crate.md")]

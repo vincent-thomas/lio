@@ -30,6 +30,17 @@ inherent or confined:
 New code must keep it that way: OS primitives belong in `backend/`, and the
 contract (`backend::op`) stays pure data.
 
+## Panics
+
+- No `debug_assert!`: CI rejects it, since it is compiled out of release
+  builds. Use `assert!`.
+- Library code denies `clippy::unwrap_used` and `clippy::expect_used`
+  (`clippy.toml` exempts test code). Return an error or restructure where you
+  can; where a panic is deliberate (a broken invariant, a documented
+  `# Panics`), keep the `expect` and mark it
+  `#[expect(clippy::expect_used, reason = "...")]` on the smallest enclosing
+  statement or function.
+
 ## Testing contract
 
 - When changing `lio::backend::op::Op` fields or semantic wrapper types, update the

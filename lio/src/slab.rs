@@ -295,6 +295,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
 
   /// The slot at `index`, which must exist.
   #[inline]
+  #[expect(clippy::expect_used, reason = "callers pass an index they own")]
   fn at(&mut self, index: u32) -> &mut Slot<T> {
     self.slot_mut(index).expect("slot pool: no slot at this index")
   }
@@ -388,6 +389,7 @@ impl<T> Slab<T> {
   #[inline]
   pub fn insert_get_mut(&mut self, value: T) -> Option<(SlabKey, &mut T)> {
     let key = self.insert(value)?;
+    #[expect(clippy::expect_used, reason = "the key was just inserted")]
     let value =
       self.get_mut(key).expect("just-inserted slab entry must be retrievable");
     Some((key, value))

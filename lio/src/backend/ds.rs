@@ -6,6 +6,11 @@
   clippy::unnecessary_map_or,
   clippy::collapsible_if
 )]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  reason = "a simulation backend for tests: a broken invariant should fail the test"
+)]
 
 //! Deterministic simulation backend for higher-level tests.
 //!

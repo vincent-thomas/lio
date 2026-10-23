@@ -277,6 +277,7 @@ impl Lio {
     let (store, io, time) = (&mut inner.store, &mut inner.io, &mut inner.time);
     match action {
       Action::Io(op) => {
+        #[expect(clippy::expect_used, reason = "actions come from live slots")]
         let step_bump = store
           .step_bump_mut(id)
           .expect("dispatching action for unknown registration");
