@@ -255,21 +255,28 @@ impl OpenOptions {
   /// otherwise the open fails with [`io::ErrorKind::InvalidInput`] and
   /// touches nothing.
   pub fn open(self, path: std::ffi::CString) -> Io<OpenFile> {
-    let inner = self
-      .flags()
-      .map(|flags| ops::OpenAt::new(Resource::cwd(), path, flags, self.mode));
-    Io::from_op(OpenFile { inner })
+    let state = match self.flags() {
+      Some(flags) => OpenFileState::Opening(ops::OpenAt::new(
+        Resource::cwd(),
+        path,
+        flags,
+        self.mode,
+      )),
+      None => OpenFileState::InvalidOptions,
+    };
+    Io::from_op(OpenFile { state })
   }
 
-  fn flags(&self) -> Result<OpenFlags, &'static str> {
+  /// The flags to open with, or `None` for a combination `std` rejects.
+  fn flags(&self) -> Option<OpenFlags> {
     // Without write access the backend would still truncate (or create) the
     // file on some platforms, and refuse on others.
     if self.append {
       if self.truncate && !self.create_new {
-        return Err("truncating a file opened for appending needs create_new");
+        return None;
       }
     } else if !self.write && (self.truncate || self.create || self.create_new) {
-      return Err("truncating or creating a file needs write access");
+      return None;
     }
     let mut flags = OpenFlags::empty();
     // With neither read nor write requested, open read-only.
@@ -290,37 +297,48 @@ impl OpenOptions {
     } else if self.create {
       flags |= OpenFlags::CREATE;
     }
-    Ok(flags)
+    Some(flags)
   }
+}
+
+/// The error for [`OpenOptions`] that `std` rejects.
+fn invalid_open_options_error() -> io::Error {
+  io::Error::new(
+    io::ErrorKind::InvalidInput,
+    "truncate, create and create_new need write access, and truncate with \
+     append needs create_new",
+  )
 }
 
 /// Open-file operation specialized to return a typed [`File`].
 pub struct OpenFile {
-  /// The options were invalid: completes with this `InvalidInput` message.
-  inner: Result<ops::OpenAt, &'static str>,
+  state: OpenFileState,
+}
+
+enum OpenFileState {
+  /// The options were invalid; completes with `InvalidInput`.
+  InvalidOptions,
+  Opening(ops::OpenAt),
 }
 
 impl OpModel for OpenFile {
   type Item = io::Result<File>;
 
   fn action(&mut self) -> Action {
-    match &mut self.inner {
-      Ok(inner) => inner.action(),
-      Err(_) => Action::Io(crate::backend::op::Op::Nop),
+    match &mut self.state {
+      OpenFileState::InvalidOptions => Action::Io(crate::backend::op::Op::Nop),
+      OpenFileState::Opening(op) => op.action(),
     }
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let inner = match &mut self.inner {
-      Ok(inner) => inner,
-      Err(msg) => {
-        return OpResult::Done(Err(io::Error::new(
-          io::ErrorKind::InvalidInput,
-          *msg,
-        )));
+    let op = match &mut self.state {
+      OpenFileState::InvalidOptions => {
+        return OpResult::Done(Err(invalid_open_options_error()));
       }
+      OpenFileState::Opening(op) => op,
     };
-    match inner.complete(completion) {
+    match op.complete(completion) {
       OpResult::Done(Ok(resource)) => {
         OpResult::Done(Ok(File::from_resource(resource)))
       }
@@ -1026,7 +1044,7 @@ mod open_options_tests {
       o().write(true).append(true).truncate(true),
     ];
     for opts in invalid {
-      assert!(opts.flags().is_err(), "{opts:?}");
+      assert_eq!(opts.flags(), None, "{opts:?}");
     }
 
     let valid = [
@@ -1050,13 +1068,13 @@ mod open_options_tests {
       ),
     ];
     for (opts, flags) in valid {
-      assert_eq!(opts.flags(), Ok(flags), "{opts:?}");
+      assert_eq!(opts.flags(), Some(flags), "{opts:?}");
     }
   }
 
   #[test]
   fn invalid_options_complete_without_io() {
-    let mut op = OpenFile { inner: Err("bad options") };
+    let mut op = OpenFile { state: OpenFileState::InvalidOptions };
     assert!(matches!(op.action(), Action::Io(crate::backend::op::Op::Nop)));
     let OpResult::Done(Err(err)) = op.complete(Completion::new(0)) else {
       panic!("invalid options must fail");
