@@ -14,7 +14,9 @@ pkgs.rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
 
   nativeBuildInputs = with pkgs; [
-    (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+    (pkgs.rust-bin.stable.latest.default.override {
+      extensions = [ "rust-src" ];
+    })
     clang
     llvmPackages.libclang
     llvmPackages.clang

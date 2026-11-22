@@ -55,8 +55,11 @@ jobs:
         with:
           submodules: true
 
-      # Installs rustup; rust-toolchain.toml selects the toolchain.
+      # Installs rustup and stable Rust. fmt and clippy are not in the
+      # action's minimal profile.
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -135,7 +138,7 @@ jobs:
           submodules: true
           fetch-depth: 0
 
-      # Installs rustup; rust-toolchain.toml selects the toolchain.
+      # Installs rustup and stable Rust.
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: taiki-e/install-action@v2
@@ -196,7 +199,7 @@ jobs:
         with:
           submodules: true
 
-      # Installs rustup; rust-toolchain.toml selects the toolchain.
+      # Installs rustup and stable Rust.
       - uses: dtolnay/rust-toolchain@stable
 
       - name: test backend
