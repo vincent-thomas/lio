@@ -129,10 +129,6 @@ jobs:
         with:
           components: miri, rust-src
 
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-
       # Restores dependency builds, so the first build starts warm.
       - uses: Swatinem/rust-cache@v2
         with:
@@ -161,7 +157,7 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-mutants,cargo-nextest
+          tool: cargo-mutants
 
       # Restores dependency builds, so the first build starts warm.
       - uses: Swatinem/rust-cache@v2
@@ -172,7 +168,6 @@ jobs:
       # `.cargo/mutants.toml` says which files count as core.
       - name: mutate the lines this PR changes
         env:
-          NEXTEST_PROFILE: mutants
           # A mutant is almost always caught within a few cases; the deep
           # search job runs the large searches.
           PROPTEST_CASES: "64"

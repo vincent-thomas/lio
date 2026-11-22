@@ -31,7 +31,7 @@ jobs:
 
   # Each borrow model's tests run in four parts side by side, under one
   # seed per run. The seed moves on with every run, so nightly runs keep
-  # trying new ones instead of repeating the same few. `slice` deals the
+  # trying new ones instead of repeating the same few. SHARD deals the
   # sorted tests out in turn, so the heavy lifecycle pairings split evenly.
   miri:
     name: miri-${{ matrix.borrows }}-part-${{ matrix.part }}
@@ -51,10 +51,6 @@ jobs:
         with:
           components: miri, rust-src
 
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-
       # Restores dependency builds, so the first build starts warm.
       - uses: Swatinem/rust-cache@v2
         with:
@@ -68,10 +64,11 @@ jobs:
           # Each ordering is a fresh driver, so keep it shallow under Miri.
           LIO_LIFECYCLE_DEPTH: "2"
           RUSTFLAGS: ""
+          SHARD: ${{ matrix.part }}/4
         run: |
           echo "Miri seed $SEED"
           MIRIFLAGS="-Zmiri-seed=$SEED $BORROWS" \
-            scripts/test-miri.sh --partition slice:${{ matrix.part }}/4
+            scripts/test-miri.sh
 
   mutants:
     name: mutants-${{ matrix.shard }}
@@ -92,7 +89,7 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-mutants,cargo-nextest
+          tool: cargo-mutants
 
       # Restores dependency builds, so the first build starts warm.
       - uses: Swatinem/rust-cache@v2
@@ -101,7 +98,6 @@ jobs:
 
       - name: every core mutant, shard ${{ matrix.shard }} of 11
         env:
-          NEXTEST_PROFILE: mutants
           # A mutant is almost always caught within a few cases; the deep
           # search job runs the large searches.
           PROPTEST_CASES: "64"

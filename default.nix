@@ -15,7 +15,6 @@ pkgs.rustPlatform.buildRustPackage {
 
   nativeBuildInputs = with pkgs; [
     (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-    cargo-nextest
     clang
     llvmPackages.libclang
     llvmPackages.clang
