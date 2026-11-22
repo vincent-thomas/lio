@@ -50,7 +50,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Run tests before release
-        run: ./scripts/test.sh
+        run: nix run .#test
 
       - name: Get old lio-uring version
         id: old_version

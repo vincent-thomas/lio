@@ -12,16 +12,13 @@ This directory contains scripts for testing lio on different platforms using QEM
 
 ```bash
 # Test on Linux (io_uring backend)
-make vm-linux
+./vm/linux/run.sh
 
 # Test on Windows (IOCP backend)
-make vm-windows
+./vm/windows/run.sh
 
 # Test on FreeBSD (kqueue backend)
-make vm-freebsd
-
-# Test on all platforms
-make vm-all
+./vm/freebsd/run.sh
 ```
 
 ## Detailed Usage
