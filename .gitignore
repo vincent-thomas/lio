@@ -1,8 +1,7 @@
 target
 .direnv
 .opencode
-
-book/book
+.DS_Store
 
 result
 .worktrees/

@@ -9,7 +9,7 @@
   clippy::expect_used
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![doc = include_str!("../../book/src/crate.md")]
+#![doc = include_str!("crate.md")]
 
 extern crate self as lio;
 
