@@ -1,0 +1,20 @@
+# Linux C toolchain for lio-uring: clang, ar, and libclang for bindgen.
+# conda's clang package only puts a target-prefixed ar on PATH, so publish
+# a plain `ar` next to clang. build.rs calls both by name.
+
+[tools.clang]
+version = "18.1.3"
+postinstall = { run = '''
+set -eu
+bins="$MISE_TOOL_INSTALL_PATH/.mise-bins"
+ar=$(find "$MISE_TOOL_INSTALL_PATH/bin" -type f -name '*-ar' -print -quit)
+test -n "$ar"
+printf '%s\n' '#!/bin/sh' "exec '$ar' \"\$@\"" > "$bins/ar"
+chmod +x "$bins/ar"
+''', when = "always" }
+
+[tools]
+"conda:libclang" = "18.1.3"
+
+[env]
+LIBCLANG_PATH = { value = "{{ tools.libclang.path }}/lib", tools = true }

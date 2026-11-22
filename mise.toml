@@ -8,6 +8,16 @@ rust = [
 cmake = "3.28.3"
 jq = "1.7.1"
 
+# liburing is an SSH submodule. Fetch it over HTTPS during `mise install`,
+# including when the tools are already installed. Skip trees that are not a git checkout.
+[hooks.postinstall]
+run = '''
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -c url.https://github.com/.insteadOf=git@github.com: submodule update --init
+fi
+'''
+run_windows = "git rev-parse --is-inside-work-tree >NUL 2>&1 && git -c url.https://github.com/.insteadOf=git@github.com: submodule update --init"
+
 [tasks.lint]
 run = [
   "cargo fmt --check",
