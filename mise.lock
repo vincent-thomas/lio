@@ -93,9 +93,9 @@ url = "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-windows-amd64.
 url_api = "https://api.github.com/repos/jqlang/jq/releases/assets/140521015"
 
 [[tools.rust]]
-version = "1.94.1"
+version = "1.100.0"
 backend = "core:rust"
-specifiers = ["1.94.1"]
+specifiers = ["1.100.0"]
 
 [tools.rust.options]
 components = "clippy,rust-src,rustfmt"

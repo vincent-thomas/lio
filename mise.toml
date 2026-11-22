@@ -1,6 +1,6 @@
 [tools]
 rust = [
-  { version = "1.94.1", profile = "minimal", components = "clippy,rust-src,rustfmt" },
+  { version = "1.100.0", profile = "minimal", components = "clippy,rust-src,rustfmt" },
   { version = "nightly", profile = "minimal", components = "miri,rust-src" },
 ]
 "cargo:cargo-deny" = "latest"
