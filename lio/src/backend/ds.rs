@@ -44,9 +44,10 @@ use crate::api::resource::Resource;
 #[cfg(test)]
 use crate::backend::op::SendFlags;
 use crate::backend::op::{
-  self, DirEntryRef, FileStat, FileType, MsgRecv, MsgSend, Op, OpaqueDropFn,
-  OpenFlags, RawBuf, ReadDirResult, ReadFlags, RecvFlags, ShutdownHow,
-  SockDomain, SockProto, SockType, SocketAddrBuf, SocketAddrFamily, UnlinkKind,
+  self, BorrowedOp, DirEntryRef, FileStat, FileType, MsgRecv, MsgSend, Op,
+  OpaqueDropFn, OpenFlags, RawBuf, ReadDirResult, ReadFlags, RecvFlags,
+  ShutdownHow, SockDomain, SockProto, SockType, SocketAddrBuf,
+  SocketAddrFamily, UnlinkKind,
 };
 use crate::backend::{IoBackend, OpCompleted};
 use crate::{Lio, install_global};
@@ -161,7 +162,7 @@ pub mod errno {
 
 /// Resources from the simulation are synthetic numbers, not OS descriptors:
 /// dropping them must not close anything real.
-unsafe fn close_simulated(_raw: crate::api::resource::RawResource) {}
+fn close_simulated(_raw: crate::api::resource::RawResource) {}
 
 /// File-type mode bits the simulation reports; Linux values where the
 /// platform has none (Windows' CRT).
@@ -1696,7 +1697,10 @@ impl DSBackend {
     out.copy_from_slice(src);
   }
 
-  fn extract_iovec_bytes(iovecs: NonNull<RawBuf>, iov_count: usize) -> Vec<u8> {
+  fn extract_iovec_bytes(
+    iovecs: NonNull<RawBuf<'static>>,
+    iov_count: usize,
+  ) -> Vec<u8> {
     if iov_count == 0 {
       return Vec::new();
     }
@@ -1716,7 +1720,7 @@ impl DSBackend {
   }
 
   fn write_to_iovecs(
-    iovecs: NonNull<RawBuf>,
+    iovecs: NonNull<RawBuf<'static>>,
     iov_count: usize,
     bytes: &[u8],
   ) -> usize {
@@ -2688,8 +2692,8 @@ impl DSBackend {
 }
 
 impl IoBackend for DSBackend {
-  fn resource_close(&self) -> crate::api::resource::CloseFn {
-    close_simulated
+  fn resource_close(&self) -> crate::api::resource::ResourceClose {
+    crate::api::resource::ResourceClose::from_fn(close_simulated)
   }
 
   fn init(&mut self, cap: usize) -> io::Result<()> {
@@ -2702,7 +2706,13 @@ impl IoBackend for DSBackend {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
+  unsafe fn push(
+    &mut self,
+    id: u64,
+    op: BorrowedOp<'_>,
+    _step_bump: &mut Bump,
+  ) {
+    let op = op.as_op().clone();
     self.assert_initialized();
     self.assert_capacity();
     self.queued.push((id, op));
@@ -3365,7 +3375,7 @@ impl DSTBackend {
   fn process_network_read(
     node: &mut DSTNodeState,
     fd: &Resource,
-    iovecs: NonNull<RawBuf>,
+    iovecs: NonNull<RawBuf<'static>>,
     iov_count: usize,
     offset: Option<u64>,
     flags: ReadFlags,
@@ -3981,19 +3991,23 @@ impl DSTBackend {
           .push(OpCompleted::new(id, -(errno::EINVAL as isize)));
       }
       other => {
-        self
-          .local
-          .as_mut()
-          .expect("non-network DST backend op requires local backend")
-          .push(id, other, &mut Bump::new());
+        // SAFETY: `other` was accepted by `push` and stays in flight here.
+        // Forwarding it does not create a new borrow.
+        unsafe {
+          self
+            .local
+            .as_mut()
+            .expect("non-network DST backend op requires local backend")
+            .push(id, BorrowedOp::from_op(other), &mut Bump::new());
+        }
       }
     }
   }
 }
 
 impl IoBackend for DSTBackend {
-  fn resource_close(&self) -> crate::api::resource::CloseFn {
-    close_simulated
+  fn resource_close(&self) -> crate::api::resource::ResourceClose {
+    crate::api::resource::ResourceClose::from_fn(close_simulated)
   }
 
   fn init(&mut self, cap: usize) -> io::Result<()> {
@@ -4016,8 +4030,9 @@ impl IoBackend for DSTBackend {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump) {
-    let use_network = match &op {
+  unsafe fn push(&mut self, id: u64, op: BorrowedOp<'_>, step_bump: &mut Bump) {
+    let stored = op.as_op().clone();
+    let use_network = match &stored {
       Op::Socket { .. } => true,
       Op::Bind { fd, .. }
       | Op::Listen { fd, .. }
@@ -4036,13 +4051,16 @@ impl IoBackend for DSTBackend {
     };
 
     if use_network {
-      self.queue_network_op(id, op);
+      self.queue_network_op(id, stored);
     } else {
-      self
-        .local
-        .as_mut()
-        .expect("non-network DST backend push requires local backend")
-        .push(id, op, step_bump);
+      // SAFETY: this forwards the same submission the caller pushed.
+      unsafe {
+        self
+          .local
+          .as_mut()
+          .expect("non-network DST backend push requires local backend")
+          .push(id, op, step_bump);
+      }
     }
   }
 
@@ -4095,6 +4113,12 @@ impl IoBackend for DSTBackend {
 
 #[cfg(test)]
 mod tests {
+  fn submit(backend: &mut impl IoBackend, id: u64, op: Op, bump: &mut Bump) {
+    // SAFETY: these tests keep every buffer named by `op` alive until the
+    // backend reports the completion.
+    unsafe { backend.push(id, BorrowedOp::from_op(op), bump) };
+  }
+
   use super::*;
   use crate::backend::op::{MsgBufMut, MsgRecv};
   use std::net::SocketAddr;
@@ -4122,11 +4146,13 @@ mod tests {
     // DS tests use simulated descriptor numbers managed by DSBackend, not the
     // process fd table. Borrow them so dropping Resource never closes an
     // unrelated real fd owned by a concurrently running test.
+    // SAFETY: `fd` is a simulated descriptor number owned by the DS world.
+    // It is never an OS descriptor, and the closer is `close_simulated`.
     #[cfg(unix)]
-    return unsafe { Resource::borrow(fd) };
+    return unsafe { Resource::borrow_raw(fd) };
     #[cfg(windows)]
     return unsafe {
-      Resource::borrow(fd as isize as std::os::windows::io::RawHandle)
+      Resource::borrow_raw(fd as isize as std::os::windows::io::RawHandle)
     };
   }
 
@@ -4241,8 +4267,8 @@ mod tests {
 
     let mut step_a = Bump::new();
     let mut step_b = Bump::new();
-    a.push(1, Op::Nop, &mut step_a);
-    b.push(1, Op::Nop, &mut step_b);
+    submit(&mut a, 1, Op::Nop, &mut step_a);
+    submit(&mut b, 1, Op::Nop, &mut step_b);
     a.flush().unwrap();
     b.flush().unwrap();
 
@@ -4268,7 +4294,8 @@ mod tests {
 
     let mut out = std::ffi::OsString::new();
     let mut step_bump = Bump::new();
-    backend.push(
+    submit(
+      &mut backend,
       1,
       Op::GetCwd { out: NonNull::from(&mut out) },
       &mut step_bump,
@@ -4300,7 +4327,8 @@ mod tests {
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
     let msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     let mut step_bump = Bump::new();
-    backend.push(
+    submit(
+      &mut backend,
       1,
       Op::Recv { fd: Resource::stdin(), msg, flags: RecvFlags::empty() },
       &mut step_bump,
@@ -4334,7 +4362,8 @@ mod tests {
     let mut msg_buf = MsgBufMut::from_slice(&mut buf);
     let msg = MsgRecv::new(std::slice::from_mut(&mut msg_buf));
     let mut step_bump = Bump::new();
-    backend.push(
+    submit(
+      &mut backend,
       1,
       Op::Recv { fd: socket, msg, flags: RecvFlags::empty() },
       &mut step_bump,
@@ -4390,7 +4419,8 @@ mod tests {
     let send_buf = crate::backend::op::MsgBuf::from_slice(&payload);
     let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
     let mut send_bump = Bump::new();
-    backend.push(
+    submit(
+      &mut backend,
       1,
       Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
@@ -4407,7 +4437,8 @@ mod tests {
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
     let mut recv_bump = Bump::new();
-    backend.push(
+    submit(
+      &mut backend,
       2,
       Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
@@ -4460,7 +4491,7 @@ mod tests {
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
     let mut bump = Bump::new();
     let mut run = |id, op| {
-      backend.push(id, op, &mut bump);
+      submit(&mut backend, id, op, &mut bump);
       backend.flush().unwrap();
       let mut done = Vec::new();
       backend.wait(Some(Duration::ZERO), &mut done).unwrap();
@@ -4538,7 +4569,8 @@ mod tests {
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
     let mut recv_bump = Bump::new();
-    backend.push(
+    submit(
+      &mut backend,
       1,
       Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
@@ -4556,7 +4588,8 @@ mod tests {
     let send_buf = crate::backend::op::MsgBuf::from_slice(&payload);
     let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
     let mut send_bump = Bump::new();
-    backend.push(
+    submit(
+      &mut backend,
       2,
       Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
@@ -4615,7 +4648,8 @@ mod tests {
 
     let mut accepted_addr = SocketAddrBuf::unspecified();
     let mut accept_bump = Bump::new();
-    backend.push(
+    submit(
+      &mut backend,
       1,
       Op::Accept {
         fd: listener,
@@ -4626,7 +4660,8 @@ mod tests {
 
     let connect_addr = "127.0.0.1:7000".parse().unwrap();
     let mut connect_bump = Bump::new();
-    backend.push(
+    submit(
+      &mut backend,
       2,
       Op::Connect { fd: client, addr: op::socket_addr_into_buf(connect_addr) },
       &mut connect_bump,
@@ -4698,7 +4733,8 @@ mod tests {
     let before = backend.progress_snapshot();
 
     let mut recv_bump = Bump::new();
-    backend.push(
+    submit(
+      &mut backend,
       1,
       Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
@@ -4755,7 +4791,8 @@ mod tests {
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
     let mut recv_bump = Bump::new();
-    backend.push(
+    submit(
+      &mut backend,
       1,
       Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
@@ -4765,7 +4802,8 @@ mod tests {
     let send_buf = crate::backend::op::MsgBuf::from_slice(&payload);
     let send_msg = MsgSend::new(std::slice::from_ref(&send_buf), None);
     let mut send_bump = Bump::new();
-    backend.push(
+    submit(
+      &mut backend,
       2,
       Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
@@ -5301,7 +5339,8 @@ mod tests {
 
     let path = std::ffi::OsString::from("/tmp/demo");
     let mut step_bump = Bump::new();
-    backend.push(
+    submit(
+      &mut backend,
       1,
       Op::OpenAt {
         dir_fd: Resource::cwd(),
@@ -5379,7 +5418,7 @@ mod tests {
     dst_test_socket(&backend.node, 91);
 
     let fd = dst_resource(91);
-    backend.push(1, Op::Fsync { fd }, &mut Bump::new());
+    submit(&mut backend, 1, Op::Fsync { fd }, &mut Bump::new());
     backend.flush().unwrap();
     assert!(dst.step());
 

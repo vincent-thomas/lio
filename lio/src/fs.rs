@@ -309,10 +309,10 @@ pub struct OpenFile {
 impl OpModel for OpenFile {
   type Item = io::Result<File>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     match &mut self.inner {
       Ok(inner) => inner.action(),
-      Err(_) => Action::Io(crate::backend::op::Op::Nop),
+      Err(_) => action_io!(crate::backend::op::Op::Nop),
     }
   }
 
@@ -347,7 +347,7 @@ pub struct OpenDirectory {
 impl OpModel for OpenDirectory {
   type Item = io::Result<Directory>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     self.inner.action()
   }
 
@@ -403,9 +403,9 @@ impl OpenReadDir {
 impl OpModel for OpenReadDir {
   type Item = io::Result<ReadDir>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     match &mut self.state {
-      OpenReadDirState::InvalidPath => Action::Io(crate::backend::op::Op::Nop),
+      OpenReadDirState::InvalidPath => action_io!(crate::backend::op::Op::Nop),
       OpenReadDirState::Opening(op) => op.action(),
       OpenReadDirState::Reading { op, .. } => op.action(),
       OpenReadDirState::Done => {
@@ -624,7 +624,7 @@ impl RemoveDirAll {
 impl OpModel for RemoveDirAll {
   type Item = io::Result<()>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     match &mut self.state {
       RemoveDirAllState::Opening { op, .. } => op.action(),
       RemoveDirAllState::Reading { op } => op.action(),
@@ -767,9 +767,9 @@ impl ReadLink {
 impl OpModel for ReadLink {
   type Item = io::Result<PathBuf>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     match &mut self.state {
-      ReadLinkState::InvalidPath => Action::Io(crate::backend::op::Op::Nop),
+      ReadLinkState::InvalidPath => action_io!(crate::backend::op::Op::Nop),
       ReadLinkState::Reading(op) => op.action(),
       ReadLinkState::Done => panic!("ReadLink polled after completion"),
     }
@@ -840,9 +840,9 @@ impl ReadToString {
 impl OpModel for ReadToString {
   type Item = io::Result<String>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     match &mut self.state {
-      ReadToStringState::InvalidPath => Action::Io(crate::backend::op::Op::Nop),
+      ReadToStringState::InvalidPath => action_io!(crate::backend::op::Op::Nop),
       ReadToStringState::Opening(op) => op.action(),
       ReadToStringState::Reading { op, .. } => op.action(),
       ReadToStringState::Done => panic!("ReadToString polled after completion"),
@@ -1071,7 +1071,7 @@ mod open_options_tests {
   #[test]
   fn invalid_options_complete_without_io() {
     let mut op = OpenFile { inner: Err("bad options") };
-    assert!(matches!(op.action(), Action::Io(crate::backend::op::Op::Nop)));
+    assert!(op.action().is_nop());
     let OpResult::Done(Err(err)) = op.complete(Completion::new(0)) else {
       panic!("invalid options must fail");
     };

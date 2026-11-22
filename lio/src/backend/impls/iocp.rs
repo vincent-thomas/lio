@@ -58,7 +58,7 @@ use crate::backend::impls::sockaddr::{
 };
 use crate::backend::native::CWD as CWD_HANDLE;
 use crate::backend::op::{
-  DirEntryRef, FileStat, FileType, LinkKind, MsgRecv, MsgSend, Op,
+  BorrowedOp, DirEntryRef, FileStat, FileType, LinkKind, MsgRecv, MsgSend, Op,
   OpaqueDropFn, OpenFlags, RawBuf, ReadDirResult, RecvFlags, SendFlags,
   ShutdownHow, SocketAddrBuf, SocketAddrFamily, SpawnSpec, StatTarget,
   UnlinkKind, is_valid_file_offset,
@@ -991,7 +991,15 @@ impl IoBackend for Iocp {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
+  unsafe fn push(
+    &mut self,
+    id: u64,
+    op: BorrowedOp<'_>,
+    _step_bump: &mut Bump,
+  ) {
+    // The submission contract keeps these addresses stable; the backend stores
+    // the descriptor, not a borrow of the caller's `BorrowedOp`.
+    let op = op.as_op().clone();
     assert!(
       self.backlog.len() + self.in_flight.len() + self.blocking_in_flight
         < self.capacity,
@@ -1299,7 +1307,7 @@ fn ensure_bound(socket: ws::SOCKET, family: u16) -> Result<(), isize> {
 /// Synchronous read/write on a non-socket handle.
 fn file_transfer(
   handle: HANDLE,
-  bufs: &[RawBuf],
+  bufs: &[RawBuf<'_>],
   offset: Option<u64>,
   write: bool,
 ) -> isize {

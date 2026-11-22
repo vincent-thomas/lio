@@ -17,7 +17,6 @@ use lio::api::op::{
 };
 use lio::api::resource::Resource;
 use lio::api::{Io, IoStream};
-use lio::backend::op::Op;
 use lio::backend::testing::{Checked, POISON, ScriptedBackend};
 use lio::{Lio, api};
 
@@ -30,8 +29,8 @@ struct Tracked {
 impl OpModel for Tracked {
   type Item = isize;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Nop)
+  fn action(&mut self) -> Action<'_> {
+    Action::nop()
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<isize> {
@@ -171,8 +170,8 @@ struct Endless;
 impl OpModel for Endless {
   type Item = ();
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Nop)
+  fn action(&mut self) -> Action<'_> {
+    Action::nop()
   }
 
   fn complete(&mut self, _: Completion) -> OpResult<()> {

@@ -256,7 +256,7 @@ fn render_cat_bytes(line: &[u8], args: &CatCommand) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::os::fd::FromRawFd;
+  use std::os::fd::{FromRawFd, OwnedFd};
 
   #[test]
   fn parse_cat_command_supports_show_all_and_numbering() {
@@ -350,9 +350,8 @@ mod tests {
       assert_eq!(written, payload.len() as isize);
       libc::close(fd);
 
-      let file = lio::api::resource::Resource::from_raw_fd(libc::open(
-        path.as_ptr(),
-        libc::O_RDONLY,
+      let file = lio::api::resource::Resource::from(OwnedFd::from_raw_fd(
+        libc::open(path.as_ptr(), libc::O_RDONLY),
       ));
       let command = CatCommand { show_all: true, ..CatCommand::default() };
       let output = read_rendered_cat_output(&ctx, &file, &command).unwrap();
@@ -377,9 +376,8 @@ mod tests {
       assert_eq!(written, payload.len() as isize);
       libc::close(fd);
 
-      let file = lio::api::resource::Resource::from_raw_fd(libc::open(
-        path.as_ptr(),
-        libc::O_RDONLY,
+      let file = lio::api::resource::Resource::from(OwnedFd::from_raw_fd(
+        libc::open(path.as_ptr(), libc::O_RDONLY),
       ));
       let text = io_util::read_to_string_fd(ctx.lio(), &file).unwrap();
       assert_eq!(text, "hello\n");

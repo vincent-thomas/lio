@@ -21,15 +21,15 @@
 //! # Example
 //!
 //! ```
-//! use lio::backend::{IoBackend, op::Op, impls::DefaultBackend};
+//! use lio::backend::{IoBackend, op::BorrowedOp, impls::DefaultBackend};
 //! use std::time::Duration;
 //!
 //! // Create and initialize backend
 //! let mut backend = DefaultBackend::new();
 //! backend.init(1024).unwrap();  // Pre-allocate for 1024 concurrent ops
 //!
-//! // Submit a nop operation
-//! backend.push(1, Op::Nop, &mut bumpalo::Bump::new());
+//! // Submit a nop operation. `Nop` borrows nothing.
+//! unsafe { backend.push(1, BorrowedOp::nop(), &mut bumpalo::Bump::new()) };
 //! backend.flush().unwrap();
 //!
 //! // Poll for completions (non-blocking)
@@ -133,8 +133,8 @@ use std::time::Duration;
 
 use bumpalo::Bump;
 
-use crate::api::resource::CloseFn;
-use crate::backend::op::Op;
+use crate::api::resource::ResourceClose;
+use crate::backend::op::BorrowedOp;
 
 /// Represents a completed I/O operation.
 ///
@@ -188,7 +188,9 @@ impl OpCompleted {
 /// ```ignore
 /// let mut backend = Backend::default();
 /// backend.init(1024)?;                    // Pre-allocate for 1024 ops
-/// backend.push(op_id, op)?;               // Queue operation
+/// // SAFETY: `op` borrows nothing, or the caller keeps its buffers alive
+/// // until `wait` returns the completion.
+/// unsafe { backend.push(op_id, op, &mut bump)? }; // Queue operation
 /// backend.flush()?;                       // Submit to kernel
 /// let done = backend.wait(timeout)?;      // Get completions
 /// ```
@@ -205,14 +207,28 @@ pub trait IoBackend {
   /// whose completions do not carry real OS resources (such as a simulation)
   /// must override this, or dropping those resources would close unrelated
   /// descriptors of the process.
-  fn resource_close(&self) -> CloseFn {
-    native::close
+  fn resource_close(&self) -> ResourceClose {
+    ResourceClose::native()
   }
 
   /// Queue an operation for submission.
   ///
   /// Call `flush()` to submit queued operations.
-  fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump);
+  ///
+  /// # Safety
+  ///
+  /// A safe signature cannot express this contract: the backend may copy
+  /// addresses out of `op` and dereference them after `push` returns, from
+  /// `flush`, `wait`, `cancel`, or `drain`. Those addresses must stay
+  /// allocated and unmoved, and must not be mutated by anyone but this
+  /// backend, until `wait` returns this operation's completion or `drain`
+  /// returns `true`.
+  ///
+  /// [`Lio`](crate::Lio) upholds that for operations its models return.
+  /// `action` borrows the model, the registration stays pinned in the driver
+  /// until the backend is done, and the driver does not ask the model for
+  /// another action before then.
+  unsafe fn push(&mut self, id: u64, op: BorrowedOp<'_>, step_bump: &mut Bump);
 
   /// Submit all queued operations to kernel.
   fn flush(&mut self) -> io::Result<()>;

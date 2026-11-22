@@ -29,8 +29,8 @@ struct Tagged(u32);
 impl OpModel for Tagged {
   type Item = (u32, isize);
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Listen { fd: Resource::stdin(), backlog: self.0 as i32 })
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Listen { fd: Resource::stdin(), backlog: self.0 as i32 })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<(u32, isize)> {

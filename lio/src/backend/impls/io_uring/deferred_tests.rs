@@ -1,6 +1,6 @@
 use super::*;
 use crate::api::resource::Resource;
-use crate::backend::op::{RawBuf, ReadFlags};
+use crate::backend::op::{BorrowedOp, RawBuf, ReadFlags};
 use std::os::fd::{FromRawFd, IntoRawFd};
 
 mod contract {
@@ -92,8 +92,9 @@ fn trace_read_batches() {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    fn push(&mut self, id: u64, op: Op, bump: &mut Bump) {
-      self.inner.push(id, op, bump)
+    unsafe fn push(&mut self, id: u64, op: BorrowedOp<'_>, bump: &mut Bump) {
+      // SAFETY: this wrapper forwards the same submission the caller pushed.
+      unsafe { self.inner.push(id, op, bump) }
     }
     fn flush(&mut self) -> io::Result<()> {
       let t = Instant::now();
@@ -245,7 +246,9 @@ fn nonblocking_waits_make_progress_on_file_completions() {
   let file = std::fs::File::open(&path).unwrap();
   std::fs::remove_file(&path).unwrap();
   // SAFETY: transfers the file descriptor to its sole Resource owner.
-  let file = unsafe { Resource::from_raw_fd(file.into_raw_fd()) };
+  let file = Resource::from(unsafe {
+    std::os::fd::OwnedFd::from_raw_fd(file.into_raw_fd())
+  });
   let mut backend = IoUring::with_deferred_completions();
   backend.init(DEPTH).unwrap();
   let mut arena = Bump::new();
@@ -258,17 +261,20 @@ fn nonblocking_waits_make_progress_on_file_completions() {
     })
     .collect();
   for (id, raw) in raws.iter().enumerate() {
-    backend.push(
-      id as u64,
-      Op::Read {
-        fd: file.clone(),
-        iovecs: NonNull::from(raw),
-        iov_count: 1,
-        offset: Some(0),
-        flags: ReadFlags::empty(),
-      },
-      &mut arena,
-    );
+    // SAFETY: `raw` and `file` stay alive until this backend is dropped.
+    unsafe {
+      backend.push(
+        id as u64,
+        BorrowedOp::from_op(Op::Read {
+          fd: file.clone(),
+          iovecs: NonNull::from(raw).cast(),
+          iov_count: 1,
+          offset: Some(0),
+          flags: ReadFlags::empty(),
+        }),
+        &mut arena,
+      );
+    }
   }
   backend.flush().unwrap();
   let mut seen = [false; DEPTH];
@@ -300,27 +306,32 @@ fn read_with_more_iovecs_than_the_native_array_is_rejected() {
   let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
   writer.write_all(b"hello").unwrap();
   // SAFETY: transfers the descriptor to its sole Resource owner.
-  let reader = unsafe { Resource::from_raw_fd(reader.into_raw_fd()) };
+  let reader = Resource::from(unsafe {
+    std::os::fd::OwnedFd::from_raw_fd(reader.into_raw_fd())
+  });
   let mut backend = IoUring::new();
   backend.init(8).unwrap();
   let mut arena = Bump::new();
   let mut buffers = [[0u8; 4]; crate::buf::MAX_IOV_COUNT + 1];
-  let raws: Vec<RawBuf> = buffers
+  let raws: Vec<RawBuf<'static>> = buffers
     .iter_mut()
     // SAFETY: the buffers outlive every use of the backend below.
     .map(|buf| unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) })
     .collect();
-  backend.push(
-    1,
-    Op::Read {
-      fd: reader,
-      iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
-      iov_count: raws.len(),
-      offset: None,
-      flags: ReadFlags::empty(),
-    },
-    &mut arena,
-  );
+  // SAFETY: `raws` and `reader` stay alive until this backend finishes the read.
+  unsafe {
+    backend.push(
+      1,
+      BorrowedOp::from_op(Op::Read {
+        fd: reader,
+        iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
+        iov_count: raws.len(),
+        offset: None,
+        flags: ReadFlags::empty(),
+      }),
+      &mut arena,
+    );
+  }
   backend.flush().unwrap();
   let mut completed = Vec::new();
   backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
@@ -334,24 +345,29 @@ fn drop_waits_for_operations_in_the_kernel() {
   use std::io::Write;
   let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
   // SAFETY: transfers the descriptor to its sole Resource owner.
-  let reader = unsafe { Resource::from_raw_fd(reader.into_raw_fd()) };
+  let reader = Resource::from(unsafe {
+    std::os::fd::OwnedFd::from_raw_fd(reader.into_raw_fd())
+  });
   let mut backend = IoUring::new();
   backend.init(8).unwrap();
   let mut arena = Bump::new();
   let mut buf = [0u8; 4];
   // SAFETY: `buf` outlives every use of the backend below.
   let raw = unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
-  backend.push(
-    1,
-    Op::Read {
-      fd: reader.clone(),
-      iovecs: NonNull::from(&raw),
-      iov_count: 1,
-      offset: None,
-      flags: ReadFlags::empty(),
-    },
-    &mut arena,
-  );
+  // SAFETY: `raw` and `reader` stay alive until this backend is dropped.
+  unsafe {
+    backend.push(
+      1,
+      BorrowedOp::from_op(Op::Read {
+        fd: reader.clone(),
+        iovecs: NonNull::from(&raw).cast(),
+        iov_count: 1,
+        offset: None,
+        flags: ReadFlags::empty(),
+      }),
+      &mut arena,
+    );
+  }
   backend.flush().unwrap();
   let mut completed = Vec::new();
   backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
