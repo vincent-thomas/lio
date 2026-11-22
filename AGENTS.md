@@ -57,3 +57,10 @@ contract (`backend::op`) stays pure data.
   (`.github/workflows/deep.yaml`), along with every cargo-mutants mutant of
   the files `.cargo/mutants.toml` lists. A surviving mutant in a PR's diff
   fails CI: add a test that kills it.
+
+## Compute
+
+Use Vers for compute that needs its own machine: benchmarks, and low-level I/O
+or OS tests. Create a computer from an image, run the work there, and delete
+the computer when it is done. Bookkeeping tests stay on the host through
+`lio::backend::testing`.
