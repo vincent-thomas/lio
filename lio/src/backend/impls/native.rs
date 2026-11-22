@@ -67,10 +67,10 @@ pub(crate) fn duplicate(raw: RawResource) -> std::io::Result<RawResource> {
   #[cfg(windows)]
   {
     use std::io;
-    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, HANDLE};
-    use windows_sys::Win32::System::Threading::{
-      DuplicateHandle, GetCurrentProcess,
+    use windows_sys::Win32::Foundation::{
+      DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
     };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut out: HANDLE = std::ptr::null_mut();
     // SAFETY: duplicating the process's own handle. Failure leaves `out`
     // untouched and is reported as an error; success transfers one new handle.
