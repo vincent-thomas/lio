@@ -10,20 +10,6 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
-  nix-check:
-    name: nix-check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: true
-          fetch-depth: 0
-
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/flake-checker-action@main
-      - name: nix flake check
-        run: nix flake check '.?submodules=1&shallow=0'
-
   # A `debug_assert!` vanishes from release builds, so the invariant it
   # states goes unchecked exactly where users run the code.
   no-debug-assert:
@@ -68,9 +54,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
-
-      - uses: DeterminateSystems/nix-installer-action@main
-        if: runner.os == 'Linux'
 
       # Installs rustup; rust-toolchain.toml selects the toolchain.
       - uses: dtolnay/rust-toolchain@stable
@@ -207,7 +190,7 @@ jobs:
             os: windows-latest
             test_filter: iocp
 
-    needs: [check, nix-check]
+    needs: [check]
     steps:
       - uses: actions/checkout@v7
         with:

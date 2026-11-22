@@ -28,8 +28,7 @@ jobs:
           submodules: true
           fetch-depth: 0
 
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
         uses: actions/cache@v6
@@ -42,7 +41,7 @@ jobs:
           key: cargo-release-cache
 
       - name: Install cargo-edit
-        run: nix develop -c cargo install cargo-edit -f
+        run: cargo install cargo-edit --locked
 
       - name: Configure git
         run: |
@@ -55,18 +54,18 @@ jobs:
       - name: Get old lio-uring version
         id: old_version
         run: |
-          OLD_VERSION=$(nix develop -c cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "lio-uring") | .version')
+          OLD_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "lio-uring") | .version')
           echo "lio_uring=$OLD_VERSION" >> $GITHUB_OUTPUT
 
       - name: Bump versions
         run: |
-          nix develop -c cargo set-version -p lio-uring --bump ${{ github.event.inputs.bump }}
-          nix develop -c cargo set-version -p lio --bump ${{ github.event.inputs.bump }}
+          cargo set-version -p lio-uring --bump ${{ github.event.inputs.bump }}
+          cargo set-version -p lio --bump ${{ github.event.inputs.bump }}
 
       - name: Get new version
         id: version
         run: |
-          VERSION=$(nix develop -c cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "lio") | .version')
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "lio") | .version')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Update lio dependency on lio-uring
@@ -136,7 +135,7 @@ jobs:
 
       - name: Publish lio-uring to crates.io
         run: |
-          nix develop -c cargo publish -p lio-uring
+          cargo publish -p lio-uring
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -145,6 +144,6 @@ jobs:
 
       - name: Publish lio to crates.io
         run: |
-          nix develop -c cargo publish -p lio
+          cargo publish -p lio
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
