@@ -12,9 +12,18 @@ set -euo pipefail
 export MIRIFLAGS="-Zmiri-disable-isolation ${MIRIFLAGS:-}"
 export PROPTEST_CASES="${PROPTEST_CASES:-4}"
 
+# `cargo test -- --list` prints `path::name: test` or `: ignore`. The match
+# is bash, so it does not depend on GNU sed.
 list_tests() {
-  cargo +nightly test -p lio "$@" -- --list \
-    | sed -n 's/: \(test\|ignore\)$//p'
+  local line listing
+  listing="$(cargo +nightly test -p lio "$@" -- --list)"
+  while IFS= read -r line; do
+    case "$line" in
+      *": test" | *": ignore")
+        printf '%s\n' "${line%: *}"
+        ;;
+    esac
+  done <<< "$listing"
 }
 
 selected=()
@@ -31,11 +40,20 @@ while IFS= read -r name; do
   selected+=("$name")
 done <<< "$int_list"
 
-if ((${#selected[@]} > 0)); then
-  mapfile -t selected < <(printf '%s\n' "${selected[@]}" | sort)
+# A selector that matches nothing used to fail the nextest run. Exiting 0
+# here would turn a broken filter into a green Miri job.
+if ((${#selected[@]} == 0)); then
+  echo "No Miri tests selected" >&2
+  exit 1
 fi
 
-if [[ -n "${SHARD:-}" && ${#selected[@]} -gt 0 ]]; then
+sorted=()
+while IFS= read -r name; do
+  sorted+=("$name")
+done < <(printf '%s\n' "${selected[@]}" | sort)
+selected=("${sorted[@]}")
+
+if [[ -n "${SHARD:-}" ]]; then
   k="${SHARD%/*}"
   n="${SHARD#*/}"
   shard=()
@@ -46,15 +64,16 @@ if [[ -n "${SHARD:-}" && ${#selected[@]} -gt 0 ]]; then
     fi
     i=$((i + 1))
   done
-  selected=()
-  if ((${#shard[@]} > 0)); then
-    selected=("${shard[@]}")
+  # This shard can be empty when n is larger than the suite. The suite
+  # itself was non-empty, so that is not a broken selector.
+  if ((${#shard[@]} == 0)); then
+    echo "No Miri tests in shard ${SHARD}"
+    exit 0
   fi
+  selected=("${shard[@]}")
 fi
 
-if ((${#selected[@]} == 0)); then
-  echo "No Miri tests selected"
-  exit 0
-fi
-
-cargo +nightly miri test -p lio --lib --test cancellation --test capacity -- "${selected[@]}"
+# Filters are substrings and are ORed. `--exact` keeps `test_remove` from
+# also running `test_remove_all`, including across the lib and integration
+# binaries that share this argument list.
+cargo +nightly miri test -p lio --lib --test cancellation --test capacity -- --exact "${selected[@]}"
