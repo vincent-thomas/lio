@@ -37,7 +37,6 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/.cargo/bin
           key: cargo-release-cache
 
       - name: Install cargo-edit
