@@ -1,6 +1,17 @@
 [tools]
-"rust" = "1.94.1"
+rust = [
+  { version = "1.94.1", profile = "minimal", components = "clippy,rust-src,rustfmt" },
+  { version = "nightly", profile = "minimal", components = "miri,rust-src" },
+]
 "cargo:cargo-deny" = "latest"
+"cargo:cargo-mutants" = "latest"
+cmake = "3.28.3"
+jq = "1.7.1"
+
+# rust-toolchain.toml selects stable, which overrides the pin above while
+# cargo: tools are installed. `cargo +nightly` still selects nightly.
+[env]
+RUSTUP_TOOLCHAIN = "1.94.1"
 
 [tasks.lint]
 run = [
