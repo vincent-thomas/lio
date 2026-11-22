@@ -28,6 +28,20 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
+        # Host runner. The QEMU guests lived in the same attrset and are gone.
+        native = pkgs.writeShellApplication {
+          name = "test-native";
+          text = ''
+            echo "=== Native test on $(uname -s) $(uname -m) ==="
+            cargo nextest run --all-features --release
+          '';
+          runtimeInputs = with pkgs; [
+            (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+            stdenv.cc.cc
+            clang
+            cargo-nextest
+          ];
+        };
       in
       {
         packages = {
@@ -143,6 +157,11 @@
               cargo-hack
             ];
           };
+          inherit native;
+        };
+        apps.native = {
+          type = "app";
+          program = "${native}/bin/test-native";
         };
       }
     );
