@@ -33,7 +33,7 @@
           name = "test-native";
           text = ''
             echo "=== Native test on $(uname -s) $(uname -m) ==="
-            cargo test --workspace --all-features --release
+            cargo test --all-features --release
           '';
           runtimeInputs = with pkgs; [
             (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
