@@ -25,6 +25,20 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
   }
 }
 
+/// `-I` for clang's own headers (`stdatomic.h`), ahead of gcc's copy.
+fn clang_resource_include() -> Option<String> {
+  let output = std::process::Command::new("clang")
+    .arg("-print-resource-dir")
+    .output()
+    .ok()?;
+  if !output.status.success() {
+    return None;
+  }
+  let dir = String::from_utf8(output.stdout).ok()?;
+  let dir = dir.trim();
+  if dir.is_empty() { None } else { Some(format!("-I{dir}/include")) }
+}
+
 fn build_linux() {
   use std::{env, fs, path::PathBuf, process::Command};
 
@@ -106,16 +120,25 @@ fn build_linux() {
   println!("cargo:rustc-link-search=native={}", out_dir.display());
   println!("cargo:rustc-link-lib=static=uring");
 
+  // libclang does not always search its own resource directory, so it can
+  // pick up gcc's `stdatomic.h`, which does not declare the C11 atomics.
+  let resource_include = clang_resource_include();
+
   // The bindgen::Builder is the main entry point
   // to bindgen, and lets you build up options for
   // the resulting bindings.
-  let bindings = bindgen::Builder::default()
+  let mut builder = bindgen::Builder::default()
     // The input header we would like to generate
     // bindings for.
     .header(headers_path.to_str().unwrap())
     // Add clang args to find the includes and define necessary macros
     .clang_arg(format!("-I{}", src_dir.join("include").display()))
     .clang_arg("-D_GNU_SOURCE")
+    .clang_arg("-std=gnu11");
+  if let Some(include) = &resource_include {
+    builder = builder.clang_arg(include);
+  }
+  let bindings = builder
     // Wrap static inline functions so they can be called from Rust
     .wrap_static_fns(true)
     .wrap_static_fns_path(out_dir.join("liburing_wrapper"))
@@ -138,7 +161,8 @@ fn build_linux() {
   let wrapper_c = out_dir.join("liburing_wrapper.c");
   if wrapper_c.exists() {
     let wrapper_obj = out_dir.join("liburing_wrapper.o");
-    let status = Command::new("clang")
+    let mut clang = Command::new("clang");
+    clang
       .arg("-c")
       .arg("-o")
       .arg(&wrapper_obj)
@@ -146,9 +170,12 @@ fn build_linux() {
       .arg(format!("-I{}", manifest_dir.display()))
       .arg(format!("-I{}", src_dir.join("include").display()))
       .arg("-D_GNU_SOURCE")
-      .arg("-Wno-unused-parameter")
-      .status()
-      .expect("Failed to compile wrapper file");
+      .arg("-std=gnu11")
+      .arg("-Wno-unused-parameter");
+    if let Some(include) = &resource_include {
+      clang.arg(include);
+    }
+    let status = clang.status().expect("Failed to compile wrapper file");
 
     if !status.success() {
       panic!("Failed to compile liburing_wrapper.c");

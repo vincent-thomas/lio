@@ -776,8 +776,8 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
       Err(completion.os_error())
     } else {
       let mut remaining = completion.result as usize;
-      for i in 0..self.iov_count {
-        let cap = self.raws[i].len;
+      for (i, raw) in self.raws.iter().take(self.iov_count).enumerate() {
+        let cap = raw.len;
         let len = remaining.min(cap);
         // SAFETY: the kernel filled the regions submitted in `action()` in
         // order, so the first `len <= cap` bytes of region `i` are initialized.
@@ -905,8 +905,8 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
     let buf = held(self.buf.as_ref());
     let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
-    for i in 0..buf_count {
-      self.raws[i] = RawBuf::new(buf.buf(i));
+    for (raw, i) in self.raws.iter_mut().zip(0..buf_count) {
+      *raw = RawBuf::new(buf.buf(i));
     }
 
     Action::Io(Op::Write {
@@ -1067,8 +1067,8 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
       Err(completion.os_error())
     } else {
       let mut remaining = completion.result as usize;
-      for i in 0..self.iov_count {
-        let cap = self.bufs[i].len;
+      for (i, region) in self.bufs.iter().take(self.iov_count).enumerate() {
+        let cap = region.len;
         let len = remaining.min(cap);
         // SAFETY: the kernel filled the regions submitted in `action()` in
         // order, so the first `len <= cap` bytes of region `i` are initialized.
@@ -1293,8 +1293,8 @@ impl<B: IoBufVec + std::marker::Send + Sync> Send<B> {
     let buf = held(self.buf.as_ref());
     let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
-    for i in 0..buf_count {
-      self.bufs[i] = MsgBuf::from_slice(buf.buf(i));
+    for (region, i) in self.bufs.iter_mut().zip(0..buf_count) {
+      *region = MsgBuf::from_slice(buf.buf(i));
     }
 
     // The contract takes at least one region: an empty collection sends the
