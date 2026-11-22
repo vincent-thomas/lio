@@ -69,14 +69,19 @@
 //! Or by adopting a descriptor the standard library already owns:
 //!
 //! ```rust
-//! # #[cfg(unix)]
 //! use std::fs::File;
-//! use std::os::fd::OwnedFd;
 //! use lio::api::resource::Resource;
 //!
-//! # #[cfg(unix)]
+//! #[cfg(unix)]
 //! fn from_file(file: File) -> Resource {
+//!     use std::os::fd::OwnedFd;
 //!     Resource::from(OwnedFd::from(file))
+//! }
+//!
+//! #[cfg(windows)]
+//! fn from_file(file: File) -> Resource {
+//!     use std::os::windows::io::OwnedHandle;
+//!     Resource::from(OwnedHandle::from(file))
 //! }
 //! ```
 
