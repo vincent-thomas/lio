@@ -19,28 +19,28 @@ operating system.
 
 ## Benchmarks
 
-Two Criterion benches compare the runtime with the backends:
-
 ```sh
 mise run bench
 ```
 
-That runs, in order:
+runs the two Criterion benches in order:
 
 ```sh
 cargo bench -p lio --bench bookkeeping
 cargo bench -p lio --bench backends
 ```
 
-`bookkeeping` times scheduling, submission, completion routing, cancellation,
-and buffer handling. Its backend completes operations in memory, so the
-numbers leave out kernel I/O. `backends` times the same cached 4 KiB read on
-every real backend this OS implements: `io_uring` on Linux, the poller
-(epoll or kqueue) on Linux, macOS, and the BSDs, and IOCP on Windows. Those
-numbers include the kernel. A backend this OS does not implement is not
-compiled in; run that bench on a machine that has it. The module docs at the
-top of `lio/benches/bookkeeping.rs` and `lio/benches/backends.rs` say what
-each group includes.
+`bookkeeping` is the driver with an in-memory backend: a batch round trip, the
+same batch with no driver under it, cancellation, a 256-byte buffered read
+the backend does not fill, a stream that rearms one registration, and the
+timer wheel advanced by a tick. Those numbers leave out the kernel.
+
+`backends` is one 64-byte UDP loopback transfer, repeated at the same batch
+sizes, on every real backend this OS implements. io_uring is Linux, the
+poller (epoll or kqueue) is Linux, macOS, and the BSDs, and IOCP is Windows.
+Those numbers include the kernel. A backend this OS does not implement is not
+compiled in. The module docs on `lio/benches/bookkeeping.rs` and
+`lio/benches/backends.rs` say what each group includes.
 
 Criterion flags go after `--`, for example
 `cargo bench -p lio --bench bookkeeping -- --sample-size 100`.

@@ -1,46 +1,45 @@
-//! Bookkeeping benchmarks.
+//! What lio's bookkeeping costs, with no system calls.
 //!
-//! Each group times lio's scheduling, submission, completion routing,
-//! cancellation, or buffer handling. [`ImmediateBackend`] (in this file)
-//! completes nops in memory. `read_buffer` uses
-//! [`ScriptedBackend`](lio::backend::testing::ScriptedBackend), which writes
-//! the read buffer on completion the way a kernel would. Neither backend
-//! makes a system call, so a result here is the runtime's own work. Kernel
-//! time is what `cargo bench -p lio --bench backends` measures; those numbers
-//! include it.
+//! Every group except `timer` runs on [`BenchBackend`]. A flush completes
+//! queued nops and reads in memory. `cancel` keeps flushed operations in
+//! flight until the driver cancels them, then completes those in memory too.
+//! `timer` drives [`Clock`](lio::time::Clock) directly. None of this enters
+//! the kernel. Kernel time is `cargo bench -p lio --bench backends`.
 //!
-//! - `bookkeeping/direct_backend` — push, flush, and wait `qd` nops on the
-//!   backend with no driver. Baseline for the driver groups.
-//! - `bookkeeping/driver_callback` — submit `qd` nops and deliver completions
-//!   through `when_done`.
-//! - `bookkeeping/driver_channel` — the same round trip, onto a channel.
-//! - `bookkeeping/stream_executor` — one stream item with `again` extra nops
-//!   between yields.
-//! - `bookkeeping/timer_wheel` — schedule and expire `qd` zero-duration
-//!   timers. No backend.
+//! Throughput is operations per second. `resubmit` counts yielded items.
+//!
+//! - `bookkeeping/no_driver` — push, flush, and wait `qd` nops on the backend
+//!   alone. The driver groups sit on top of this cost.
+//! - `bookkeeping/round_trip` — submit `qd` nops and deliver every completion
+//!   through `when_done`, in one `try_run`. The gap above `no_driver` is
+//!   registration, routing, the callback, and releasing the slot.
 //! - `bookkeeping/cancel` — submit `qd` nops, flush them so they stay in
 //!   flight, drop the futures, then route the cancellation completions.
-//! - `bookkeeping/read_buffer` — submit `qd` 4 KiB reads and take the buffers
-//!   back. The scripted backend fills each buffer; the descriptor is not read.
+//! - `bookkeeping/buffer_256` — the round trip for `qd` reads of a 256-byte
+//!   buffer. The backend does not write the buffer, so the gap above
+//!   `round_trip` is building the iovec and handing the buffer back.
+//! - `bookkeeping/resubmit` — one yielded stream item with `steps` extra nops
+//!   before it. A step rearms the same registration instead of releasing it.
+//!   Throughput is items per second. The other groups count every operation.
+//! - `bookkeeping/timer` — insert and fire `qd` timers on the wheel, advanced
+//!   one tick with no driver. A sleep through `Lio` waits out a real 1 ms
+//!   tick, which would hide the wheel.
 //!
-//! `qd` is the batch size. Throughput is operations per second. This file is
+//! `qd` is 1, 32, 256, and 1024. This file is
 //! `cargo bench -p lio --bench bookkeeping`. `mise run bench` runs it and
-//! then the backend bench. Criterion flags (`--sample-size`,
-//! `--measurement-time`) go after `--`.
+//! then the backend bench. Criterion flags go after `--`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::future::Future;
 use std::hint::black_box;
 use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::mpsc;
 use std::sync::{
   Arc,
   atomic::{AtomicBool, Ordering},
 };
-use std::task::{Context, Wake, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use bumpalo::Bump;
@@ -50,67 +49,109 @@ use criterion::{
 use lio::api::op::{Action, Completion, OpModel, OpResult, StreamOpModel};
 use lio::api::resource::Resource;
 use lio::backend::op::Op;
-use lio::backend::testing::ScriptedBackend;
 use lio::backend::{IoBackend, OpCompleted};
 use lio::time::Clock;
 use lio::{Lio, api};
 
 const QUEUE_DEPTHS: [usize; 4] = [1, 32, 256, 1024];
 
-/// Any negative completion is an error to the op model. This is not an errno.
+/// Reads in `bookkeeping/buffer_256`. The backend reports this many bytes
+/// and does not touch the buffer.
+const BUFFER_LEN: usize = 256;
+
+/// A negative completion is an error to the op model. Not an errno.
 const CANCEL_RESULT: isize = -1;
 
-/// A zero-syscall backend for nops.
+const SLOT_EMPTY: u8 = 0;
+const SLOT_QUEUED: u8 = 1;
+const SLOT_IN_FLIGHT: u8 = 2;
+
+/// In-memory backend for nops and fixed-size reads.
 ///
-/// By default `flush` makes every queued nop ready, so the direct benchmark
-/// and the driver benchmark do the same backend work. The difference is lio's
-/// scheduling, registration, completion, callback, and removal.
-///
-/// [`ImmediateBackend::holding`] keeps flushed ops in flight until `cancel`
-/// queues a completion. `wait` never blocks.
+/// `flush` completes everything queued, unless constructed with
+/// [`BenchBackend::holding`]: flushed ops then stay in flight until `cancel`.
+/// `wait` never blocks. Cancel of an in-flight op is indexed by slab slot, so
+/// a batch cancel is not a scan.
 #[derive(Default)]
-struct ImmediateBackend {
-  queued: Vec<u64>,
-  in_flight: HashSet<u64>,
+struct BenchBackend {
+  queued: Vec<(u64, isize)>,
   ready: Vec<(u64, isize)>,
   hold: bool,
+  slots: Vec<u8>,
+  slot_id: Vec<u64>,
 }
 
-impl ImmediateBackend {
+impl BenchBackend {
+  /// Flushed ops stay in flight until `cancel` completes them.
   fn holding() -> Self {
     Self { hold: true, ..Self::default() }
   }
 }
 
-impl IoBackend for ImmediateBackend {
+impl IoBackend for BenchBackend {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.queued.reserve(cap);
-    self.in_flight.reserve(cap);
     self.ready.reserve(cap);
+    if self.hold {
+      self.slots.resize(cap, SLOT_EMPTY);
+      self.slot_id.resize(cap, 0);
+    }
     Ok(())
   }
 
   fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
-    assert!(matches!(op, Op::Nop), "benchmark backend only supports NOP");
-    self.queued.push(id);
+    let result = match op {
+      Op::Nop => 0,
+      Op::Read { .. } => BUFFER_LEN as isize,
+      _ => panic!("bench backend only supports nop and read"),
+    };
+    if self.hold {
+      let slot = id as u32 as usize;
+      assert!(
+        slot < self.slots.len(),
+        "bench backend slot {slot} is past its capacity"
+      );
+      assert_eq!(
+        self.slots[slot], SLOT_EMPTY,
+        "bench backend slot {slot} is still in use"
+      );
+      self.slots[slot] = SLOT_QUEUED;
+      self.slot_id[slot] = id;
+    } else {
+      self.queued.push((id, result));
+    }
   }
 
   fn flush(&mut self) -> io::Result<()> {
     if self.hold {
-      self.in_flight.extend(self.queued.drain(..));
+      for state in &mut self.slots {
+        if *state == SLOT_QUEUED {
+          *state = SLOT_IN_FLIGHT;
+        }
+      }
     } else {
-      self.ready.extend(self.queued.drain(..).map(|id| (id, 0)));
+      self.ready.append(&mut self.queued);
     }
     Ok(())
   }
 
   fn cancel(&mut self, id: u64) {
-    if let Some(index) = self.queued.iter().position(|queued| *queued == id) {
-      self.queued.swap_remove(index);
-      self.ready.push((id, CANCEL_RESULT));
+    if self.hold {
+      let slot = id as u32 as usize;
+      if slot < self.slots.len()
+        && self.slot_id[slot] == id
+        && (self.slots[slot] == SLOT_QUEUED
+          || self.slots[slot] == SLOT_IN_FLIGHT)
+      {
+        self.slots[slot] = SLOT_EMPTY;
+        self.ready.push((id, CANCEL_RESULT));
+      }
       return;
     }
-    if self.in_flight.remove(&id) {
+    if let Some(index) =
+      self.queued.iter().position(|(queued, _)| *queued == id)
+    {
+      self.queued.swap_remove(index);
       self.ready.push((id, CANCEL_RESULT));
     }
   }
@@ -128,10 +169,10 @@ impl IoBackend for ImmediateBackend {
   }
 }
 
-fn direct_backend(criterion: &mut Criterion) {
-  let mut group = criterion.benchmark_group("bookkeeping/direct_backend");
+fn no_driver(criterion: &mut Criterion) {
+  let mut group = criterion.benchmark_group("bookkeeping/no_driver");
   for depth in QUEUE_DEPTHS {
-    let mut backend = ImmediateBackend::default();
+    let mut backend = BenchBackend::default();
     backend.init(depth).unwrap();
     let mut bump = Bump::new();
     let mut completed = Vec::with_capacity(depth);
@@ -156,11 +197,10 @@ fn direct_backend(criterion: &mut Criterion) {
   group.finish();
 }
 
-fn driver_callback(criterion: &mut Criterion) {
-  let mut group = criterion.benchmark_group("bookkeeping/driver_callback");
+fn round_trip(criterion: &mut Criterion) {
+  let mut group = criterion.benchmark_group("bookkeeping/round_trip");
   for depth in QUEUE_DEPTHS {
-    let lio =
-      Lio::new_with_backend(ImmediateBackend::default(), depth).unwrap();
+    let lio = Lio::new_with_backend(BenchBackend::default(), depth).unwrap();
     let completed = Rc::new(Cell::new(0usize));
 
     group.throughput(Throughput::Elements(depth as u64));
@@ -186,118 +226,13 @@ fn driver_callback(criterion: &mut Criterion) {
   group.finish();
 }
 
-fn driver_channel(criterion: &mut Criterion) {
-  let mut group = criterion.benchmark_group("bookkeeping/driver_channel");
-  for depth in [1, 256] {
-    let lio =
-      Lio::new_with_backend(ImmediateBackend::default(), depth).unwrap();
-    let (sender, receiver) = mpsc::channel();
-
-    group.throughput(Throughput::Elements(depth as u64));
-    group.bench_with_input(
-      BenchmarkId::from_parameter(format!("qd_{depth}")),
-      &depth,
-      |bencher, &depth| {
-        bencher.iter(|| {
-          for _ in 0..depth {
-            api::nop().with_lio(&lio).send_with(sender.clone());
-          }
-          assert_eq!(lio.try_run().unwrap(), depth);
-          for _ in 0..depth {
-            receiver.recv().unwrap().unwrap();
-          }
-        });
-      },
-    );
-  }
-  group.finish();
-}
-
-/// A stream with internal I/O steps between items. The backend completes one
-/// step per driver turn, allowing the executor to run between completions.
-struct SteppedStream {
-  again: usize,
-  remaining: usize,
-}
-
-impl OpModel for SteppedStream {
-  type Item = ();
-
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Nop)
-  }
-
-  fn complete(&mut self, _: Completion) -> OpResult<()> {
-    if self.remaining > 0 {
-      self.remaining -= 1;
-      OpResult::Again
-    } else {
-      self.remaining = self.again;
-      OpResult::Yield(())
-    }
-  }
-}
-
-impl StreamOpModel for SteppedStream {}
-
-#[derive(Default)]
-struct ReadyTask(AtomicBool);
-
-impl Wake for ReadyTask {
-  fn wake(self: Arc<Self>) {
-    self.wake_by_ref();
-  }
-
-  fn wake_by_ref(self: &Arc<Self>) {
-    self.0.store(true, Ordering::Relaxed);
-  }
-}
-
-fn stream_executor(criterion: &mut Criterion) {
-  let mut group = criterion.benchmark_group("bookkeeping/stream_executor");
-  group.warm_up_time(Duration::from_secs(1));
-  group.measurement_time(Duration::from_secs(4));
-  group.sample_size(60);
-  for again in [0, 1, 8] {
-    let lio = Lio::new_with_backend(ImmediateBackend::default(), 1).unwrap();
-    let mut stream =
-      api::io::IoStream::from_op(SteppedStream { again, remaining: again })
-        .with_lio(&lio);
-    let ready = Arc::new(ReadyTask::default());
-    let waker = Waker::from(Arc::clone(&ready));
-    let mut cx = Context::from_waker(&waker);
-
-    group.throughput(Throughput::Elements(1));
-    group.bench_function(BenchmarkId::new("again", again), |bencher| {
-      bencher.iter(|| {
-        let mut next = std::pin::pin!(stream.next());
-        assert!(next.as_mut().poll(&mut cx).is_pending());
-        let mut polls = 0usize;
-        loop {
-          assert_eq!(lio.try_run().unwrap(), 1);
-          if ready.0.swap(false, Ordering::Relaxed) {
-            polls += 1;
-            if let std::task::Poll::Ready(item) = next.as_mut().poll(&mut cx) {
-              assert_eq!(item, Some(()));
-              break;
-            }
-          }
-        }
-        black_box(polls);
-      });
-    });
-  }
-  group.finish();
-}
-
 fn cancel(criterion: &mut Criterion) {
   let mut group = criterion.benchmark_group("bookkeeping/cancel");
-  let ready = Arc::new(ReadyTask::default());
+  let ready = Arc::new(NopWaker::default());
   let waker = Waker::from(Arc::clone(&ready));
   let mut cx = Context::from_waker(&waker);
   for depth in QUEUE_DEPTHS {
-    let lio =
-      Lio::new_with_backend(ImmediateBackend::holding(), depth).unwrap();
+    let lio = Lio::new_with_backend(BenchBackend::holding(), depth).unwrap();
 
     group.throughput(Throughput::Elements(depth as u64));
     group.bench_with_input(
@@ -311,7 +246,6 @@ fn cancel(criterion: &mut Criterion) {
             assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
             futures.push(fut);
           }
-          // Flush into the backend. Nothing completes until cancel.
           assert_eq!(lio.try_run().unwrap(), 0);
           drop(futures);
           assert_eq!(lio.try_run().unwrap(), depth);
@@ -322,18 +256,16 @@ fn cancel(criterion: &mut Criterion) {
   group.finish();
 }
 
-fn read_buffer(criterion: &mut Criterion) {
-  let mut group = criterion.benchmark_group("bookkeeping/read_buffer");
-  // A 1024-deep batch fills 4 MiB. Give Criterion time to repeat it.
-  group.measurement_time(Duration::from_secs(4));
-  // Borrowed, so dropping the op does not close the process's stdout.
-  // ScriptedBackend never reads the descriptor.
+fn buffer(criterion: &mut Criterion) {
+  let mut group =
+    criterion.benchmark_group(format!("bookkeeping/buffer_{BUFFER_LEN}"));
+  // Borrowed, so the op's descriptor is not closed, and the backend never
+  // reads it.
   let file = Resource::stdout();
   for depth in QUEUE_DEPTHS {
-    let lio =
-      Lio::new_with_backend(ScriptedBackend::auto(4096), depth).unwrap();
+    let lio = Lio::new_with_backend(BenchBackend::default(), depth).unwrap();
     let buffers = Rc::new(RefCell::new(
-      (0..depth).map(|_| vec![0u8; 4096]).collect::<Vec<_>>(),
+      (0..depth).map(|_| vec![0u8; BUFFER_LEN]).collect::<Vec<_>>(),
     ));
     let completed = Rc::new(Cell::new(0usize));
 
@@ -350,7 +282,7 @@ fn read_buffer(criterion: &mut Criterion) {
             let completed = Rc::clone(&completed);
             api::read_at(&file, buf, 0).with_lio(&lio).when_done(
               move |(result, buf)| {
-                assert_eq!(result.unwrap(), 4096);
+                assert_eq!(result.unwrap(), BUFFER_LEN);
                 black_box(buf[0]);
                 buffers.borrow_mut().push(buf);
                 completed.set(completed.get() + 1);
@@ -366,8 +298,78 @@ fn read_buffer(criterion: &mut Criterion) {
   group.finish();
 }
 
-fn timers(criterion: &mut Criterion) {
-  let mut group = criterion.benchmark_group("bookkeeping/timer_wheel");
+/// One yielded item, with `steps` nops completed before it.
+struct SteppedNop {
+  steps: usize,
+  left: usize,
+}
+
+impl OpModel for SteppedNop {
+  type Item = ();
+
+  fn action(&mut self) -> Action {
+    Action::Io(Op::Nop)
+  }
+
+  fn complete(&mut self, _: Completion) -> OpResult<()> {
+    if self.left > 0 {
+      self.left -= 1;
+      OpResult::Again
+    } else {
+      self.left = self.steps;
+      OpResult::Yield(())
+    }
+  }
+}
+
+impl StreamOpModel for SteppedNop {}
+
+#[derive(Default)]
+struct NopWaker(AtomicBool);
+
+impl Wake for NopWaker {
+  fn wake(self: Arc<Self>) {
+    self.wake_by_ref();
+  }
+
+  fn wake_by_ref(self: &Arc<Self>) {
+    self.0.store(true, Ordering::Relaxed);
+  }
+}
+
+fn resubmit(criterion: &mut Criterion) {
+  let mut group = criterion.benchmark_group("bookkeeping/resubmit");
+  for steps in [0usize, 1, 8] {
+    let lio = Lio::new_with_backend(BenchBackend::default(), 1).unwrap();
+    let mut stream =
+      api::io::IoStream::from_op(SteppedNop { steps, left: steps })
+        .with_lio(&lio);
+    let ready = Arc::new(NopWaker::default());
+    let waker = Waker::from(Arc::clone(&ready));
+    let mut cx = Context::from_waker(&waker);
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function(BenchmarkId::new("steps", steps), |bencher| {
+      bencher.iter(|| {
+        let mut next = std::pin::pin!(stream.next());
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        loop {
+          assert_eq!(lio.try_run().unwrap(), 1);
+          if ready.0.swap(false, Ordering::Relaxed)
+            && let Poll::Ready(item) = next.as_mut().poll(&mut cx)
+          {
+            assert_eq!(item, Some(()));
+            break;
+          }
+        }
+      });
+    });
+  }
+  group.finish();
+}
+
+fn timer(criterion: &mut Criterion) {
+  let mut group = criterion.benchmark_group("bookkeeping/timer");
   for depth in QUEUE_DEPTHS {
     let mut clock = Clock::with_capacity(depth);
 
@@ -395,6 +397,6 @@ criterion_group! {
     .warm_up_time(Duration::from_millis(500))
     .measurement_time(Duration::from_secs(2))
     .sample_size(50);
-  targets = direct_backend, driver_callback, driver_channel, stream_executor, cancel, read_buffer, timers
+  targets = no_driver, round_trip, cancel, buffer, resubmit, timer
 }
 criterion_main!(benches);
