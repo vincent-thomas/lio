@@ -1373,7 +1373,7 @@ impl SedRuntime {
           SedStepStart::Line(line) => line.get(),
         };
         let line = cycle.line_number;
-        Ok(line >= first && (line - first) % step.step.get() == 0)
+        Ok(line >= first && (line - first) % step.step == 0)
       }
     }
   }
@@ -1429,7 +1429,7 @@ impl SedRuntime {
       SedRangeEnd::NextLines(count) => {
         start_line.is_some_and(|start| cycle.line_number >= start + count.get())
       }
-      SedRangeEnd::NextMultiple(count) => cycle.line_number % count.get() == 0,
+      SedRangeEnd::NextMultiple(count) => cycle.line_number % *count == 0,
     };
 
     if should_end {
