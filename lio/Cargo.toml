@@ -57,6 +57,10 @@ name = "bookkeeping"
 harness = false
 
 [[bench]]
+name = "backends"
+harness = false
+
+[[bench]]
 name = "socket_scheduling"
 harness = false
 
