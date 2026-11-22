@@ -28,7 +28,10 @@ jobs:
           submodules: true
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Rust and the other dev tools come from mise.toml.
+      - uses: jdx/mise-action@v5
+        with:
+          version: "2026.11.12"
 
       - name: Cache cargo registry
         uses: actions/cache@v6

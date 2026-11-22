@@ -55,11 +55,10 @@ jobs:
         with:
           submodules: true
 
-      # Installs rustup and stable Rust. fmt and clippy are not in the
-      # action's minimal profile.
-      - uses: dtolnay/rust-toolchain@stable
+      # Rust and the other dev tools come from mise.toml.
+      - uses: jdx/mise-action@v5
         with:
-          components: rustfmt, clippy
+          version: "2026.11.12"
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -111,9 +110,10 @@ jobs:
         with:
           submodules: true
 
-      - uses: dtolnay/rust-toolchain@nightly
+      # Rust and the other dev tools come from mise.toml, including nightly Miri.
+      - uses: jdx/mise-action@v5
         with:
-          components: miri, rust-src
+          version: "2026.11.12"
 
       # Restores dependency builds, so the first build starts warm.
       - uses: Swatinem/rust-cache@v2
@@ -138,12 +138,10 @@ jobs:
           submodules: true
           fetch-depth: 0
 
-      # Installs rustup and stable Rust.
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: taiki-e/install-action@v2
+      # Rust and cargo-mutants come from mise.toml.
+      - uses: jdx/mise-action@v5
         with:
-          tool: cargo-mutants
+          version: "2026.11.12"
 
       # Restores dependency builds, so the first build starts warm.
       - uses: Swatinem/rust-cache@v2
@@ -199,8 +197,10 @@ jobs:
         with:
           submodules: true
 
-      # Installs rustup and stable Rust.
-      - uses: dtolnay/rust-toolchain@stable
+      # Rust and the other dev tools come from mise.toml.
+      - uses: jdx/mise-action@v5
+        with:
+          version: "2026.11.12"
 
       - name: test backend
         run: cargo test -p lio --test backends ${{ matrix.test_filter }}
