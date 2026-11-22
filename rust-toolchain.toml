@@ -1,4 +1,3 @@
 [toolchain]
 components = ["clippy", "rust-src", "rustfmt"]
 channel = "stable"
-targets = ["aarch64-unknown-linux-gnu"]

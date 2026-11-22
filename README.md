@@ -19,10 +19,6 @@ operating system.
 
 ## Documentation
 
-Project documentation lives in the mdBook under [`docs/`](docs/).
-
-- Build locally: `mdbook build`
-- Serve locally: `mdbook serve`
 - API docs: [docs.rs/lio](https://docs.rs/lio)
 - Crate: [crates.io/crates/lio](https://crates.io/crates/lio)
 
