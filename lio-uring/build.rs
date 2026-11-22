@@ -25,20 +25,6 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
   }
 }
 
-/// `-I` for clang's own headers (`stdatomic.h`), ahead of gcc's copy.
-fn clang_resource_include() -> Option<String> {
-  let output = std::process::Command::new("clang")
-    .arg("-print-resource-dir")
-    .output()
-    .ok()?;
-  if !output.status.success() {
-    return None;
-  }
-  let dir = String::from_utf8(output.stdout).ok()?;
-  let dir = dir.trim();
-  if dir.is_empty() { None } else { Some(format!("-I{dir}/include")) }
-}
-
 fn build_linux() {
   use std::{env, fs, path::PathBuf, process::Command};
 
@@ -56,10 +42,13 @@ fn build_linux() {
   copy_dir_recursive(&liburing_src, &libdir_path);
 
   let headers_path = manifest_dir.join("include/liburing_wrapper.h");
+  // See c11-atomics.h: host <stdatomic.h> is not usable from libclang.
+  let atomics_path = manifest_dir.join("include/c11-atomics.h");
 
   // Rerun if liburing sources change
   println!("cargo:rerun-if-changed={}", liburing_src.display());
   println!("cargo:rerun-if-changed={}", headers_path.display());
+  println!("cargo:rerun-if-changed={}", atomics_path.display());
 
   // Run configure to generate necessary headers
   let result = Command::new("./configure")
@@ -91,6 +80,8 @@ fn build_linux() {
       .arg("-o")
       .arg(&obj_file)
       .arg(&src_file)
+      .arg("-include")
+      .arg(&atomics_path)
       .arg(format!("-I{}", src_dir.join("include").display()))
       .arg("-D_GNU_SOURCE")
       .arg("-Wno-unused-parameter")
@@ -120,25 +111,19 @@ fn build_linux() {
   println!("cargo:rustc-link-search=native={}", out_dir.display());
   println!("cargo:rustc-link-lib=static=uring");
 
-  // libclang does not always search its own resource directory, so it can
-  // pick up gcc's `stdatomic.h`, which does not declare the C11 atomics.
-  let resource_include = clang_resource_include();
-
   // The bindgen::Builder is the main entry point
   // to bindgen, and lets you build up options for
   // the resulting bindings.
-  let mut builder = bindgen::Builder::default()
+  let bindings = bindgen::Builder::default()
     // The input header we would like to generate
     // bindings for.
     .header(headers_path.to_str().unwrap())
     // Add clang args to find the includes and define necessary macros
+    .clang_arg("-include")
+    .clang_arg(atomics_path.to_str().unwrap())
     .clang_arg(format!("-I{}", src_dir.join("include").display()))
     .clang_arg("-D_GNU_SOURCE")
-    .clang_arg("-std=gnu11");
-  if let Some(include) = &resource_include {
-    builder = builder.clang_arg(include);
-  }
-  let bindings = builder
+    .clang_arg("-std=gnu11")
     // Wrap static inline functions so they can be called from Rust
     .wrap_static_fns(true)
     .wrap_static_fns_path(out_dir.join("liburing_wrapper"))
@@ -167,14 +152,13 @@ fn build_linux() {
       .arg("-o")
       .arg(&wrapper_obj)
       .arg(&wrapper_c)
+      .arg("-include")
+      .arg(&atomics_path)
       .arg(format!("-I{}", manifest_dir.display()))
       .arg(format!("-I{}", src_dir.join("include").display()))
       .arg("-D_GNU_SOURCE")
       .arg("-std=gnu11")
       .arg("-Wno-unused-parameter");
-    if let Some(include) = &resource_include {
-      clang.arg(include);
-    }
     let status = clang.status().expect("Failed to compile wrapper file");
 
     if !status.success() {
