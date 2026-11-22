@@ -15,7 +15,6 @@ pkgs.rustPlatform.buildRustPackage {
 
   nativeBuildInputs = with pkgs; [
     (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-    gnumake
     cargo-nextest
     clang
     llvmPackages.libclang
@@ -33,7 +32,7 @@ pkgs.rustPlatform.buildRustPackage {
       export C_INCLUDE_PATH=${pkgs.linuxHeaders}/include
       export BINDGEN_EXTRA_CLANG_ARGS="-I${pkgs.llvmPackages.clang}/resource-root/include -I${pkgs.glibc.dev}/include"
     ''}
-    make cbuild
+    cargo rustc -p lio --crate-type dylib,staticlib --features unstable_ffi --release
     runHook postBuild
   '';
 

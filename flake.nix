@@ -193,7 +193,6 @@
               with pkgs;
               [
                 (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-                gnumake
                 pkg-config
               ]
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [

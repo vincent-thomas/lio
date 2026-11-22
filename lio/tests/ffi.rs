@@ -18,12 +18,22 @@ fn ensure_staticlib_built() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let workspace_dir =
       PathBuf::from(&manifest_dir).parent().unwrap().to_path_buf();
-    let status = Command::new("make")
-      .arg("cbuild")
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let status = Command::new(cargo)
+      .args([
+        "rustc",
+        "-p",
+        "lio",
+        "--crate-type",
+        "dylib,staticlib",
+        "--features",
+        "unstable_ffi",
+        "--release",
+      ])
       .current_dir(&workspace_dir)
       .status()
-      .expect("Failed to run make cbuild");
-    assert!(status.success(), "Failed to build staticlib with 'make cbuild'");
+      .expect("Failed to run cargo rustc for the C library");
+    assert!(status.success(), "Failed to build staticlib");
   });
 }
 
@@ -32,7 +42,7 @@ fn get_lib_dir() -> PathBuf {
   let target_dir =
     PathBuf::from(&manifest_dir).parent().unwrap().join("target");
 
-  // Prefer release since make cbuild builds there
+  // Prefer release since the C library build uses --release
   if target_dir.join("release").join("liblio.a").exists() {
     target_dir.join("release")
   } else if target_dir.join("debug").join("liblio.a").exists() {
