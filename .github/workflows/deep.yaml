@@ -20,7 +20,7 @@ jobs:
         with:
           submodules: true
 
-      # Installs rustup; rust-toolchain.toml selects the toolchain.
+      # Installs rustup and stable Rust.
       - uses: dtolnay/rust-toolchain@stable
 
       - name: model and lifecycle tests, large
@@ -84,7 +84,7 @@ jobs:
         with:
           submodules: true
 
-      # Installs rustup; rust-toolchain.toml selects the toolchain.
+      # Installs rustup and stable Rust.
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: taiki-e/install-action@v2

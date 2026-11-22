@@ -8,11 +8,6 @@ rust = [
 cmake = "3.28.3"
 jq = "1.7.1"
 
-# rust-toolchain.toml selects stable, which overrides the pin above while
-# cargo: tools are installed. `cargo +nightly` still selects nightly.
-[env]
-RUSTUP_TOOLCHAIN = "1.94.1"
-
 [tasks.lint]
 run = [
   "cargo fmt --check",
