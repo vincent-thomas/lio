@@ -57,7 +57,7 @@ jobs:
           version: "2026.11.12"
           cache: false
 
-      # fmt, check, check-clean, clippy, then test. check-clean exits on its own off Linux.
+      # fmt, check, check-clean, clippy, then test. Windows skips check-clean.
       - name: ci
         run: mise run ci
 
