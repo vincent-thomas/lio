@@ -46,14 +46,16 @@ contract (`backend::op`) stays pure data.
 
 - When changing `lio::backend::op::Op` fields or semantic wrapper types, update the
   `lio-test` backend contract macro as well as `lio` unit/integration tests.
-  `cargo test -p lio --lib` is not sufficient; run full `cargo test` to compile
+  `cargo test -p lio --lib` is not sufficient; run `mise run test` to compile
   integration tests and doctests that instantiate raw `Op` values.
 - Core bookkeeping is tested without I/O through `lio::backend::testing`
   (`ScriptedBackend`, `Checked`). Tests that need a real backend are marked
-  `#[cfg_attr(miri, ignore = "needs a real backend")]`; `scripts/test-miri.sh`
-  runs the rest under Miri.
+  `#[cfg_attr(miri, ignore = "needs a real backend")]`; `mise run miri`
+  (`scripts/test-miri.sh`) runs the rest under Miri. That run is nightly
+  (`.github/workflows/deep.yaml`).
 - Search sizes: `PROPTEST_CASES` (model tests) and `LIO_LIFECYCLE_DEPTH`
-  (lifecycle enumeration). CI runs them small on PRs and large nightly
-  (`.github/workflows/deep.yaml`), along with every cargo-mutants mutant of
-  the files `.cargo/mutants.toml` lists. A surviving mutant in a PR's diff
-  fails CI: add a test that kills it.
+  (lifecycle enumeration). CI runs them small on PRs (`mise run test`) and
+  large nightly (`mise run search` in `.github/workflows/deep.yaml`), along
+  with every cargo-mutants mutant of the files `.cargo/mutants.toml` lists
+  (`mise run mutants`). A surviving mutant in a PR's diff fails CI
+  (`mise run mutants-diff`): add a test that kills it.

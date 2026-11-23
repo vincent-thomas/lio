@@ -1,5 +1,7 @@
 name: CI
 
+# Pull requests and main run the same mise tasks.
+# A failed task fails the job.
 on:
   push:
     branches: ["main"]
@@ -10,123 +12,69 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
-  # A `debug_assert!` vanishes from release builds, so the invariant it
-  # states goes unchecked exactly where users run the code.
   no-debug-assert:
     name: no-debug-assert
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      - name: scan for debug_assert!
-        run: |
-          # git grep skips untracked files and the liburing submodule.
-          if ! hits=$(git grep -nE 'debug_assert(_eq|_ne)?!' -- '*.rs'); then
-            exit 0
-          fi
-          while IFS=: read -r file line _; do
-            echo "::error file=$file,line=$line::debug_assert is compiled out of release builds; use assert! (or assert_eq!/assert_ne!) instead"
-          done <<< "$hits"
-          echo "$hits"
-          echo "Found debug_assert!; replace each with assert!, assert_eq! or assert_ne!."
-          exit 1
+      # Checked downloads. The action does not restore an install tree.
+      # https://mise.jdx.dev/continuous-integration.html#trusted-cache
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/mise/downloads-cas
+          key: mise-downloads-${{ runner.os }}-${{ hashFiles('mise.lock') }}
 
-  check:
-    name: check-${{ matrix.os }}
+      - uses: jdx/mise-action@v5
+        with:
+          version: "2026.11.12"
+          cache: false
+
+      - name: no-debug-assert
+        run: mise run no-debug-assert
+
+  ci:
+    name: ci-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            packages: --workspace
-            features: --all-features
-          # lio-uring is Linux-only.
-          - os: macos-latest
-            packages: --workspace --exclude lio-uring
-            features: --all-features
-          # busybox is a Unix coreutils clone and `unstable_ffi` is a C ABI
-          # built on POSIX types; neither targets Windows.
-          - os: windows-latest
-            packages: --workspace --exclude lio-uring --exclude busybox
-            features: --features lio/high
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: true
 
-      # Rust and the other dev tools come from mise.toml.
+      # Checked downloads. The action does not restore an install tree.
+      # https://mise.jdx.dev/continuous-integration.html#trusted-cache
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.os == 'Windows' && format('{0}\mise\downloads-cas', runner.temp) || runner.os == 'macOS' && '~/Library/Caches/mise/downloads-cas' || '~/.cache/mise/downloads-cas' }}
+          key: mise-downloads-${{ runner.os }}-${{ hashFiles('mise.lock') }}
+
       - uses: jdx/mise-action@v5
         with:
           version: "2026.11.12"
+          cache: false
 
-      - name: cargo fmt --check
-        run: cargo fmt --check
+      - name: fmt
+        run: mise run fmt
 
-      - name: cargo check
-        run: cargo check ${{ matrix.packages }} --all-targets ${{ matrix.features }}
+      - name: check
+        run: mise run check
 
-      # A build script that reruns every time rebuilds everything above it
-      # on every cargo invocation, for every developer and CI job.
-      - name: a second check compiles nothing
+      # A build script that always reruns would still pass the first check.
+      - name: check-clean
         if: runner.os == 'Linux'
-        env:
-          # Plain lines to match on.
-          CARGO_TERM_COLOR: never
-        run: |
-          # --verbose makes cargo say why each crate is dirty.
-          cargo check --verbose ${{ matrix.packages }} --all-targets ${{ matrix.features }} > second-check.log 2>&1
-          if grep -E '^\s+(Compiling|Checking) ' second-check.log; then
-            echo "::error::these crates rebuilt with nothing changed; cargo's reasons:"
-            grep -E '^\s+Dirty ' second-check.log
-            exit 1
-          fi
+        run: mise run check-clean
 
-      - name: cargo doc
-        run: cargo test --doc -p lio -p lio-test ${{ matrix.features }}
+      - name: clippy
+        run: mise run clippy
 
-      - name: cargo clippy
-        run: cargo clippy ${{ matrix.packages }} --all-targets ${{ matrix.features }}
+      - name: test
+        run: mise run test
 
-      - name: bookkeeping tests
-        run: cargo test -p lio --lib
-
-      - name: integration tests
-        run: cargo test -p lio --features high --test '*'
-
-  miri:
-    name: miri-${{ matrix.borrows }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - borrows: stacked
-            flags: ""
-          - borrows: tree
-            flags: -Zmiri-tree-borrows
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: true
-
-      # Rust and the other dev tools come from mise.toml, including nightly Miri.
-      - uses: jdx/mise-action@v5
-        with:
-          version: "2026.11.12"
-
-      # Restores dependency builds, so the first build starts warm.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: miri-${{ matrix.borrows }}
-
-      - name: miri (core bookkeeping)
-        env:
-          MIRIFLAGS: ${{ matrix.flags }}
-          # Nightly adds lints before stable has them.
-          RUSTFLAGS: ""
-        run: scripts/test-miri.sh
-
+  # Slow, and still a merge gate: a mutant that survives in the diff fails CI.
   mutants:
     name: mutants
     if: github.event_name == 'pull_request'
@@ -138,69 +86,27 @@ jobs:
           submodules: true
           fetch-depth: 0
 
-      # Rust and cargo-mutants come from mise.toml.
+      # Checked downloads. The action does not restore an install tree.
+      # https://mise.jdx.dev/continuous-integration.html#trusted-cache
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/mise/downloads-cas
+          key: mise-downloads-${{ runner.os }}-${{ hashFiles('mise.lock') }}
+
       - uses: jdx/mise-action@v5
         with:
           version: "2026.11.12"
+          cache: false
 
-      # Restores dependency builds, so the first build starts warm.
       - uses: Swatinem/rust-cache@v2
         with:
           key: mutants
 
-      # Every mutant of a changed line in the core must make a test fail;
-      # `.cargo/mutants.toml` says which files count as core.
-      - name: mutate the lines this PR changes
-        env:
-          # A mutant is almost always caught within a few cases; the deep
-          # search job runs the large searches.
-          PROPTEST_CASES: "64"
-          LIO_LIFECYCLE_DEPTH: "4"
-          # Each mutant is a rebuild; debug info only slows compiling and
-          # linking.
-          CARGO_PROFILE_DEV_DEBUG: "0"
-        run: |
-          git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
-          # A mutant can loop while allocating: cap each process's address
-          # space (8 GiB) so that test fails instead of the runner dying.
-          ulimit -v 8388608
-          cargo mutants --in-diff pr.diff --no-shuffle --jobs 2
+      - name: mutants-diff
+        run: mise run mutants-diff
 
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: mutants-out
           path: mutants.out
-
-  test-backend:
-    name: backend-${{ matrix.backend }}-${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - backend: io_uring
-            os: ubuntu-latest
-            test_filter: io_uring
-          - backend: poller
-            os: ubuntu-latest
-            test_filter: poller
-          - backend: poller
-            os: macos-latest
-            test_filter: poller
-          - backend: iocp
-            os: windows-latest
-            test_filter: iocp
-
-    needs: [check]
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: true
-
-      # Rust and the other dev tools come from mise.toml.
-      - uses: jdx/mise-action@v5
-        with:
-          version: "2026.11.12"
-
-      - name: test backend
-        run: cargo test -p lio --test backends ${{ matrix.test_filter }}

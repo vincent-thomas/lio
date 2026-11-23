@@ -1,16 +1,37 @@
 #!/usr/bin/env bash
 # Runs lio's core bookkeeping tests under Miri: the ones that drive the
 # scripted backend, never a real one, since Miri cannot make the syscalls.
-# Tests that need a real backend are `#[cfg_attr(miri, ignore)]`. Extra
-# MIRIFLAGS (a borrow model, a seed) are passed through.
+# Tests that need a real backend are `#[cfg_attr(miri, ignore)]`.
+# `mise run miri` runs this script.
 #
+# SEED, BORROWS, and extra MIRIFLAGS are added to the Miri flags.
 # SHARD=k/n (1-based k) runs one slice of the selected tests, in sorted
-# order, so the deep workflow can split the suite across jobs.
+# order, so the nightly workflow can split the suite across jobs.
 
 set -euo pipefail
 
-export MIRIFLAGS="-Zmiri-disable-isolation ${MIRIFLAGS:-}"
-export PROPTEST_CASES="${PROPTEST_CASES:-4}"
+# Nightly sizes. A caller can set either variable to override them.
+# Depth 2 is shallow on purpose: each ordering is a fresh driver.
+export PROPTEST_CASES="${PROPTEST_CASES:-16}"
+export LIO_LIFECYCLE_DEPTH="${LIO_LIFECYCLE_DEPTH:-2}"
+
+# SEED and BORROWS are the nightly matrix. MIRIFLAGS still passes extra flags.
+miri_flags=(-Zmiri-disable-isolation)
+if [[ -n "${SEED:-}" ]]; then
+  echo "Miri seed ${SEED}"
+  miri_flags+=("-Zmiri-seed=${SEED}")
+fi
+if [[ -n "${BORROWS:-}" ]]; then
+  miri_flags+=("${BORROWS}")
+fi
+if [[ -n "${MIRIFLAGS:-}" ]]; then
+  # Split on spaces. The value is a list of Miri flags.
+  # shellcheck disable=SC2206
+  miri_flags+=(${MIRIFLAGS})
+fi
+export MIRIFLAGS="${miri_flags[*]}"
+# Nightly warns on lints stable does not have yet.
+export RUSTFLAGS=""
 
 # `cargo test -- --list` prints `path::name: test` or `: ignore`. The match
 # is bash, so it does not depend on GNU sed.

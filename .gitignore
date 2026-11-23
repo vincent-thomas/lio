@@ -5,3 +5,7 @@ target
 
 result
 .worktrees/
+
+# `mise run mutants-diff` writes pr.diff. Both mutant tasks write mutants.out.
+/pr.diff
+/mutants.out
