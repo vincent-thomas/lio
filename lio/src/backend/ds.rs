@@ -564,7 +564,6 @@ enum DSTEvent {
     source_seq: u64,
     to: DSTSocketRef,
   },
-  #[allow(dead_code)]
   SocketReset {
     ready_at_tick: u64,
     source_node: DSTNodeId,
@@ -3335,7 +3334,6 @@ impl DSTBackend {
     seq
   }
 
-  #[allow(dead_code)]
   fn schedule_socket_reset(&mut self, peer: DSTSocketRef, errno: i32) {
     let source_seq = {
       let mut node = self.node.borrow_mut();

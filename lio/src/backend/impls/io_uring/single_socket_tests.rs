@@ -117,25 +117,34 @@ fn lowering_preserves_general_path_and_unsupported_kernel_fallback() {
 fn oversized_buffers_are_not_truncated_to_u32() {
   let (fd, _) = pair();
   let arena = Bump::new();
-  // Metadata-only check: these descriptors are never submitted or dereferenced
-  // for payload access. Lowering only copies their pointer and length fields.
+  // A 32-bit `usize` cannot hold a length past `u32::MAX`, so the cast
+  // cannot truncate there.
   let Some(len) = (u32::MAX as usize).checked_add(1) else { return };
+  // Metadata-only check: these descriptors are never submitted. Lowering
+  // copies the pointer and the full length. The pointer is dangling and
+  // must not be dereferenced.
   let bufs = [MsgBuf { ptr: NonNull::dangling(), len }];
   let op = Op::Send {
     fd: fd.clone(),
     msg: MsgSend::new(&bufs, None),
     flags: SendFlags::empty(),
   };
-  assert!(matches!(
-    LoweredState::lower_in(&op, &arena, true).unwrap(),
-    LoweredState::Msg(_)
-  ));
+  assert_lowered_len(&arena, &op, len);
   let bufs = [MsgBufMut { ptr: NonNull::dangling(), len }];
   let op = Op::Recv { fd, msg: MsgRecv::new(&bufs), flags: RecvFlags::empty() };
-  assert!(matches!(
-    LoweredState::lower_in(&op, &arena, true).unwrap(),
-    LoweredState::Msg(_)
-  ));
+  assert_lowered_len(&arena, &op, len);
+}
+
+fn assert_lowered_len(arena: &Bump, op: &Op, len: usize) {
+  let lowered = LoweredState::lower_in(op, arena, true).unwrap();
+  let LoweredState::Msg(state) = lowered else {
+    panic!("a length above u32::MAX must stay on the message path");
+  };
+  // SAFETY: `arena` owns `state` for this assertion. Only the stored length
+  // is read. The buffer address is dangling and is not dereferenced.
+  let state = unsafe { state.as_ref() };
+  assert_eq!(state.iov_count, 1);
+  assert_eq!(state.iovecs[0].iov_len, len);
 }
 
 #[test]
