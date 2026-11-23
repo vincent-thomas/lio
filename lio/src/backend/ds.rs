@@ -4009,18 +4009,18 @@ impl DSTBackend {
       }
       other => {
         // SAFETY: `other` was accepted by `push` and stays in flight here.
-        // Forwarding it does not create a new borrow.
-        unsafe {
-          self
-            .local
-            .as_mut()
-            .expect("non-network DST backend op requires local backend")
-            .push(
-              id,
-              crate::backend::InFlight::attest(BorrowedOp::from_op(other)),
-              &mut Bump::new(),
-            );
-        }
+        // The same lease goes with it. A new lease would let the driver free
+        // the model while the local backend still holds these addresses.
+        let borrowed = unsafe { BorrowedOp::from_op(other) };
+        self
+          .local
+          .as_mut()
+          .expect("non-network DST backend op requires local backend")
+          .push(
+            id,
+            crate::backend::InFlight::from_model(borrowed, keep),
+            &mut Bump::new(),
+          );
       }
     }
   }
