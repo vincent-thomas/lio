@@ -38,6 +38,7 @@ run_windows = "git rev-parse --is-inside-work-tree >NUL 2>&1 && git submodule sy
 #
 # Pull request and main: no-debug-assert, ci, and mutants-diff (pull requests).
 # ci runs fmt, check, check-clean, clippy, and test, in that order.
+# Windows skips check-clean.
 # Nightly: search, miri, mutants.
 # Release: test, then release, then publish.
 # Publish tokens are only on the publish step.
@@ -54,7 +55,10 @@ run = "cargo check --workspace --all-targets{% if os() != 'linux' %} --exclude l
 [tasks.check-clean]
 description = "On Linux, a second cargo check must compile nothing. Same flags as check."
 env = { RUSTFLAGS = "-Dwarnings" }
+# Windows starts a TOML command with cmd, which cannot run this bash script.
+# An empty list skips the task there.
 run = "scripts/check-clean.sh"
+run_windows = []
 
 [tasks.clippy]
 description = "Clippy, with the same packages and features as check."
