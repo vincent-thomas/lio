@@ -434,6 +434,10 @@ enum State {
 
 impl Registration {
   /// Create a waker-based registration with payload storage in a bump arena.
+  ///
+  /// Polled streams keep the waker in their own slot. Tests build this
+  /// registration directly.
+  #[cfg(test)]
   #[inline]
   pub fn new_waker_in<T>(
     arena: &mut Bump,
@@ -544,6 +548,7 @@ impl Registration {
   }
 
   /// Sets the waker, replacing any existing waker.
+  #[cfg(test)]
   pub fn set_waker(&mut self, waker: Waker) {
     assert!(!self.cancelled, "registration: waker set after cancellation");
     match &mut self.state {

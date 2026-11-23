@@ -121,6 +121,9 @@ struct LioInner {
   /// Registrations removed while the driver was borrowed, to be dropped
   /// once it is not (see [`Lio::bury`]). Their slots stay reserved until then.
   dying: Vec<Detached>,
+  /// Slot indices reused across [`Lio::bury_and_wake`] so releasing a batch
+  /// does not allocate.
+  released_slots: Vec<u32>,
   /// Registrations taken from `dying` and being dropped right now; their
   /// slots are released once they are gone.
   burying: usize,
@@ -380,7 +383,8 @@ impl Lio {
       completed: Vec::with_capacity(cap),
       ready_io: VecDeque::with_capacity(cap),
       ready_timers: VecDeque::new(),
-      dying: Vec::new(),
+      dying: Vec::with_capacity(cap),
+      released_slots: Vec::with_capacity(cap),
       burying: 0,
       leaked: 0,
       orphaned_wakers: Vec::new(),
@@ -491,14 +495,20 @@ impl Lio {
       !inner.time.contains(id),
       "driver: removed registration {id} with its timer still scheduled"
     );
-    let detached = inner.store.detach_known(id);
-    if detached.registration.lease_held() {
-      // The backend still has a copy. Leak the registration and keep the
-      // slot, whose arena holds the buffers.
+    // One copy, straight into `dying`. A held lease then leaves that list:
+    // the registration is leaked and the slot stays reserved, so the buffers
+    // the backend still uses stay valid.
+    inner.store.detach_known_into(id, &mut inner.dying);
+    let held = inner
+      .dying
+      .last()
+      .is_some_and(|detached| detached.registration.lease_held());
+    if held {
+      let Some(detached) = inner.dying.pop() else {
+        unreachable!("driver: retire moved registration {id} and dying is empty");
+      };
       inner.leaked += 1;
       std::mem::forget(detached);
-    } else {
-      inner.dying.push(detached);
     }
     Self::assert_retired_slots_tracked(inner);
   }
@@ -621,19 +631,25 @@ impl Lio {
   /// buffers), which may use this `Lio`, so it happens with the driver not
   /// borrowed. Each slot is released only after its registration is gone: the
   /// registration points into the slot's arenas, which reuse would reset.
+  ///
+  /// One borrow drains every registration waiting in `dying`. A single one is
+  /// dropped and its slot released before anything else is woken. Several are
+  /// dropped first, then their slots are released together.
   fn bury_and_wake(&self) {
     loop {
-      let mut buried = false;
-      loop {
-        let next = {
-          let mut inner = self.inner.borrow_mut();
-          let next = inner.dying.pop();
-          inner.burying += usize::from(next.is_some());
-          next
+      let mut inner = self.inner.borrow_mut();
+      if inner.dying.is_empty() {
+        return;
+      }
+      if inner.dying.len() == 1 {
+        let Some(Detached { mut registration, slot }) = inner.dying.pop()
+        else {
+          unreachable!(
+            "driver: dying reported one registration and did not have one"
+          );
         };
-        let Some(Detached { mut registration, slot }) = next else {
-          break;
-        };
+        inner.burying += 1;
+        drop(inner);
         // A task may have polled after the final item was sent, and found
         // the channel empty but still open. Wake it once the registration,
         // which holds the sender, is gone.
@@ -646,11 +662,60 @@ impl Lio {
         if let Some(waker) = waker {
           waker.wake();
         }
-        buried = true;
+      } else {
+        // One borrow drains every registration removed so far. Drops happen
+        // below, with the driver not borrowed. Slots are released after
+        // those drops, in one borrow, unless a drop panics.
+        let pending = std::mem::take(&mut inner.dying);
+        let slots = std::mem::take(&mut inner.released_slots);
+        inner.burying += pending.len();
+        drop(inner);
+        let mut batch = BuryBatch { lio: self, pending, slots, dropping: None };
+        let mut wakers = Vec::new();
+        // Up to 256 slots, one release borrow after every drop is cheaper
+        // than borrowing per registration. Past that, a second pass walks
+        // slots that have left the cache, so release every 64 while the
+        // registrations just dropped are still hot.
+        let release_every =
+          if batch.pending.len() > 256 { 64 } else { usize::MAX };
+        while let Some(Detached { mut registration, slot }) =
+          batch.pending.pop()
+        {
+          let waker = registration.take_waker();
+          batch.dropping = Some(slot);
+          drop(registration);
+          batch.dropping = None;
+          batch.slots.push(slot);
+          if batch.slots.len() == release_every {
+            self.release_buried_slots(&mut batch.slots);
+          }
+          if let Some(waker) = waker {
+            wakers.push(waker);
+          }
+        }
+        self.release_buried_slots(&mut batch.slots);
+        let (waiters, orphaned) = {
+          let mut inner = self.inner.borrow_mut();
+          // Hand the buffers back. A nested bury may already have retired
+          // something into the fresh `dying` queue; keep those.
+          let spare_dying = std::mem::take(&mut batch.pending);
+          if inner.dying.is_empty() {
+            inner.dying = spare_dying;
+          }
+          inner.released_slots = std::mem::take(&mut batch.slots);
+          let waiters = Self::release_capacity(&mut inner);
+          (waiters, std::mem::take(&mut inner.orphaned_wakers))
+        };
+        // Slots are released and the buffers are back in the driver.
+        // Skipping `Drop` avoids that out-of-line call on the path that
+        // already finished.
+        std::mem::forget(batch);
+        for waker in wakers.into_iter().chain(waiters).chain(orphaned) {
+          waker.wake();
+        }
+        continue;
       }
-      if !buried {
-        return;
-      }
+
       // Scheduling queued submissions may remove ops without a first action,
       // so go around again until nothing is left to bury.
       let (waiters, orphaned) = {
@@ -662,6 +727,21 @@ impl Lio {
         waker.wake();
       }
     }
+  }
+
+  /// Releases slots whose registrations were just dropped. One borrow covers
+  /// the whole chunk. `burying` already counts these slots.
+  #[inline]
+  fn release_buried_slots(&self, slots: &mut Vec<u32>) {
+    if slots.is_empty() {
+      return;
+    }
+    let mut inner = self.inner.borrow_mut();
+    for slot in slots.drain(..) {
+      inner.store.release(slot);
+      inner.burying -= 1;
+    }
+    Lio::assert_retired_slots_tracked(&inner);
   }
 
   /// One driver turn.
@@ -828,6 +908,9 @@ impl Lio {
     (inner, true)
   }
 
+  /// Records `waker` on a waker registration. Polled streams do not use this:
+  /// their waker lives in the stream's slot. Tests call it around bury.
+  #[cfg(test)]
   pub(crate) fn set_waker(&self, id: u64, waker: Waker) {
     let mut inner = self.inner.borrow_mut();
     if let Some(entry) = inner.store.get_mut(id) {
@@ -890,6 +973,50 @@ impl Drop for Batch<'_> {
     {
       inner.dying.push(detached);
     }
+  }
+}
+
+/// Registrations drained from `dying` in one borrow.
+///
+/// Their drops run with the driver not borrowed. Slots already dropped are
+/// released together afterwards. A panic during a drop releases the slot
+/// being dropped and the ones already dropped, and puts the rest back on
+/// `dying` so a later bury drops them.
+struct BuryBatch<'a> {
+  lio: &'a Lio,
+  pending: Vec<Detached>,
+  slots: Vec<u32>,
+  dropping: Option<u32>,
+}
+
+impl Drop for BuryBatch<'_> {
+  fn drop(&mut self) {
+    let Ok(mut inner) = self.lio.inner.try_borrow_mut() else {
+      // The slots leak. Only a panic, already reporting a bug, can leave
+      // the driver borrowed here; panicking again would abort.
+      assert!(
+        std::thread::panicking(),
+        "driver: {} buried registrations are never dropped: the driver is borrowed",
+        self.pending.len()
+      );
+      return;
+    };
+    if let Some(slot) = self.dropping.take() {
+      inner.store.release(slot);
+      inner.burying -= 1;
+    }
+    for slot in self.slots.drain(..) {
+      inner.store.release(slot);
+      inner.burying -= 1;
+    }
+    let n = self.pending.len();
+    inner.burying -= n;
+    if inner.dying.is_empty() {
+      inner.dying = std::mem::take(&mut self.pending);
+    } else {
+      inner.dying.append(&mut self.pending);
+    }
+    Lio::assert_retired_slots_tracked(&inner);
   }
 }
 
@@ -1393,6 +1520,86 @@ mod tests {
     assert!(run.is_err());
     lio.try_run().unwrap();
     assert!(!lio.is_full(), "the panicking op's slot is released");
+  }
+
+  /// Records whether the driver was full when its registration was dropped.
+  struct NoteFull {
+    lio: Lio,
+    full: Rc<RefCell<Vec<bool>>>,
+  }
+
+  impl Drop for NoteFull {
+    fn drop(&mut self) {
+      self.full.borrow_mut().push(self.lio.is_full());
+    }
+  }
+
+  /// Submits `cap` nops whose drops record `is_full`, then buries them all.
+  fn full_while_burying(cap: usize) -> Vec<bool> {
+    let lio = Lio::new_with_backend(ScriptedBackend::auto(0), cap).unwrap();
+    let full = Rc::new(RefCell::new(Vec::with_capacity(cap)));
+    for _ in 0..cap {
+      let note = NoteFull { lio: lio.clone(), full: Rc::clone(&full) };
+      crate::api::nop().with_lio(&lio).when_done(move |_| {
+        let _note = &note;
+      });
+    }
+    lio.try_run().unwrap();
+    full.take()
+  }
+
+  #[test]
+  fn a_batch_of_256_stays_full_until_every_registration_is_dropped() {
+    let full = full_while_burying(256);
+    assert_eq!(full.len(), 256);
+    assert!(
+      full.iter().all(|full| *full),
+      "releasing this batch waits until every registration is gone"
+    );
+  }
+
+  #[test]
+  fn a_batch_past_256_frees_a_chunk_while_later_registrations_drop() {
+    let full = full_while_burying(257);
+    assert_eq!(full.len(), 257);
+    assert!(
+      full[..64].iter().all(|full| *full),
+      "the first chunk is still held while it is dropped"
+    );
+    assert!(
+      !full[64],
+      "the next registration is dropped after that chunk was released"
+    );
+  }
+
+  /// Panics when the registration that captured it is dropped.
+  struct Bomb;
+
+  impl Drop for Bomb {
+    fn drop(&mut self) {
+      panic!("buried registration");
+    }
+  }
+
+  #[test]
+  fn a_panic_while_burying_a_batch_releases_the_slots_already_dropped() {
+    let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 3).unwrap();
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let bomb = Bomb;
+    crate::api::nop().with_lio(&lio).when_done(move |_| {
+      let _bomb = &bomb;
+    });
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      lio.try_run().unwrap();
+    }));
+    assert!(run.is_err(), "the buried registration panicked");
+    // The one not yet dropped is still on `dying`; this bury drops it.
+    lio.try_run().unwrap();
+    assert!(!lio.is_full(), "every slot of the batch is released");
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    lio.try_run().unwrap();
+    assert!(!lio.is_full(), "a later registration still accounts for its slot");
   }
 
   #[test]
