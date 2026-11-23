@@ -39,7 +39,8 @@ run_windows = "git rev-parse --is-inside-work-tree >NUL 2>&1 && git submodule sy
 # Pull request and main: no-debug-assert, fmt, check, check-clean (Linux),
 # clippy, test, and mutants-diff (pull requests).
 # Nightly: search, miri, mutants.
-# Release: test, then release. Publish tokens stay off the test step.
+# Release: test, then release, then publish.
+# Publish tokens are only on the publish step.
 
 [tasks.fmt]
 description = "Fail if rustfmt would change a file."
@@ -114,5 +115,9 @@ description = "Build the C ABI as a release dylib and staticlib."
 run = "cargo rustc -p lio --crate-type dylib,staticlib --features unstable_ffi --release"
 
 [tasks.release]
-description = "Bump, tag, and publish. Set BUMP to patch, minor, or major. Run test first."
+description = "Bump, tag, and push. Set BUMP to patch, minor, or major. Run test first."
 run = "scripts/release.sh"
+
+[tasks.publish]
+description = "Create the GitHub release and publish lio-uring, then lio. Run release first."
+run = "scripts/publish.sh"

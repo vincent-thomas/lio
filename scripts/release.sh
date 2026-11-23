@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Bump lio and lio-uring, tag v<version>, and publish.
+# Bump lio and lio-uring, commit, tag, and push.
 # BUMP is patch, minor, or major. The workflow runs `mise run test` first.
-# GITHUB_TOKEN and CARGO_REGISTRY_TOKEN are used only by gh and cargo publish.
+# This task does not publish. `mise run publish` does that, with the tokens.
 
 set -euo pipefail
 
@@ -13,16 +13,6 @@ case "${bump}" in
     exit 1
     ;;
 esac
-
-github_token="${GITHUB_TOKEN:-}"
-registry_token="${CARGO_REGISTRY_TOKEN:-}"
-unset GITHUB_TOKEN
-unset CARGO_REGISTRY_TOKEN
-
-if [[ -z "${github_token}" || -z "${registry_token}" ]]; then
-  echo "GITHUB_TOKEN and CARGO_REGISTRY_TOKEN are required to publish." >&2
-  exit 1
-fi
 
 cargo install cargo-edit --locked
 
@@ -43,9 +33,3 @@ git commit -m "release: v${version}"
 git tag "v${version}"
 git push origin main
 git push origin "v${version}"
-
-GITHUB_TOKEN="${github_token}" gh release create "v${version}" --generate-notes
-
-CARGO_REGISTRY_TOKEN="${registry_token}" cargo publish -p lio-uring
-sleep 30
-CARGO_REGISTRY_TOKEN="${registry_token}" cargo publish -p lio
