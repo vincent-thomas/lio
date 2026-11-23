@@ -578,7 +578,8 @@ mod tests {
     use crate::api::resource::Resource;
     use crate::backend::op::{
       FileStat, MsgBuf, MsgBufMut, MsgRecv, MsgSend, RawBuf, RawBufMut,
-      ReadDirResult, ReadFlags, RecvFlags, SendFlags, SocketAddrBuf, StatTarget,
+      ReadDirResult, ReadFlags, RecvFlags, SendFlags, SocketAddrBuf,
+      StatTarget,
     };
 
     let fd = Resource::stdout();
