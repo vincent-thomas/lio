@@ -17,6 +17,34 @@ The project is still evolving, but the direction is stable: stay low-level,
 preserve explicit ownership and control, and keep the abstraction close to the
 operating system.
 
+## Benchmarks
+
+```sh
+mise run bench
+```
+
+runs the two Criterion benches in order:
+
+```sh
+cargo bench -p lio --bench bookkeeping
+cargo bench -p lio --bench backends
+```
+
+`bookkeeping` is the driver with an in-memory backend: a batch round trip, the
+same batch with no driver under it, cancellation, a 256-byte buffered read
+the backend does not fill, a stream that rearms one registration, and the
+timer wheel advanced by a tick. Those numbers leave out the kernel.
+
+`backends` is one 64-byte UDP loopback transfer, repeated at the same batch
+sizes, on every real backend this OS implements. io_uring is Linux, the
+poller (epoll or kqueue) is Linux, macOS, and the BSDs, and IOCP is Windows.
+Those numbers include the kernel. A backend this OS does not implement is not
+compiled in. The module docs on `lio/benches/bookkeeping.rs` and
+`lio/benches/backends.rs` say what each group includes.
+
+Criterion flags go after `--`, for example
+`cargo bench -p lio --bench bookkeeping -- --sample-size 100`.
+
 ## Documentation
 
 - API docs: [docs.rs/lio](https://docs.rs/lio)

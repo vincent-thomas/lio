@@ -33,6 +33,13 @@ fi
 '''
 run_windows = "git rev-parse --is-inside-work-tree >NUL 2>&1 && git submodule sync && git submodule update --init"
 
+[tasks.bench]
+description = "Bookkeeping (no kernel I/O), then each real backend"
+run = [
+  "cargo bench -p lio --bench bookkeeping",
+  "cargo bench -p lio --bench backends",
+]
+
 [tasks.lint]
 run = [
   "cargo fmt --check",

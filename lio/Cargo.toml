@@ -57,9 +57,5 @@ name = "bookkeeping"
 harness = false
 
 [[bench]]
-name = "socket_scheduling"
-harness = false
-
-[[bench]]
-name = "submission"
+name = "backends"
 harness = false
