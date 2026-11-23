@@ -49,7 +49,7 @@ mod immediate_sockets {
     // finishes.
     backend.push(
       id,
-      crate::backend::InFlight::from_model(op),
+      crate::backend::InFlight::from_model(op, crate::backend::Keep::new()),
       &mut Bump::new(),
     );
   }

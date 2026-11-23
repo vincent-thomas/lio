@@ -47,7 +47,7 @@ struct Script {
   /// Every id ever pushed, in push order.
   pushed: Vec<u64>,
   /// Pushed and not yet completed, in push order.
-  in_flight: Vec<(u64, Op)>,
+  in_flight: Vec<(u64, Op, crate::backend::Keep)>,
   cancelled: Vec<u64>,
   /// Completed, waiting for the next `wait()`.
   ready: VecDeque<OpCompleted>,
@@ -109,13 +109,17 @@ impl ScriptedBackend {
 
   /// Ids pushed and not yet completed, in push order.
   pub fn in_flight(&self) -> Vec<u64> {
-    self.0.borrow().in_flight.iter().map(|(id, _)| *id).collect()
+    self.0.borrow().in_flight.iter().map(|(id, _, _)| *id).collect()
   }
 
   /// The operation `id` was pushed with, while it is in flight.
   pub fn op(&self, id: u64) -> Option<Op> {
     let script = self.0.borrow();
-    script.in_flight.iter().find(|(i, _)| *i == id).map(|(_, op)| op.clone())
+    script
+      .in_flight
+      .iter()
+      .find(|(i, _, _)| *i == id)
+      .map(|(_, op, _)| op.clone())
   }
 
   /// Every id the driver asked to cancel, in order.
@@ -132,10 +136,11 @@ impl ScriptedBackend {
   /// real backend could produce.
   pub fn complete(&self, id: u64, result: isize) {
     let mut script = self.0.borrow_mut();
-    let Some(pos) = script.in_flight.iter().position(|(i, _)| *i == id) else {
+    let Some(pos) = script.in_flight.iter().position(|(i, _, _)| *i == id)
+    else {
       panic!("ScriptedBackend::complete: operation {id} is not in flight");
     };
-    let (_, op) = script.in_flight.remove(pos);
+    let (_, op, _keep) = script.in_flight.remove(pos);
     if !script.no_poison {
       // SAFETY: the operation is still in flight, so the driver keeps the
       // memory it points to valid until it sees this completion.
@@ -168,10 +173,10 @@ impl IoBackend for ScriptedBackend {
     op: crate::backend::InFlight<'_>,
     _step_bump: &mut Bump,
   ) {
-    let op = op.as_op().clone();
+    let (op, keep) = op.into_parts();
     let mut script = self.0.borrow_mut();
     script.pushed.push(id);
-    script.in_flight.push((id, op));
+    script.in_flight.push((id, op, keep));
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -191,7 +196,7 @@ impl IoBackend for ScriptedBackend {
     if script.stuck {
       return false;
     }
-    for (_, op) in std::mem::take(&mut script.in_flight) {
+    for (_, op, _keep) in std::mem::take(&mut script.in_flight) {
       if !script.no_poison {
         // SAFETY: a drained operation may still be finishing, so the driver
         // keeps its memory valid until `drain` returns.

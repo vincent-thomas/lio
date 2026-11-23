@@ -118,6 +118,9 @@ struct LioInner {
   /// Registrations taken from `dying` and being dropped right now; their
   /// slots are released once they are gone.
   burying: usize,
+  /// Slots retired while a backend still held their lease. The registration
+  /// is leaked, and the slot is never released, so the buffers stay valid.
+  leaked: usize,
   /// Submissions made while every slot was taken, scheduled in order as
   /// slots free up. Only allocates when the driver is over capacity.
   overflow: VecDeque<PendingSubmission>,
@@ -217,11 +220,13 @@ impl Drop for LioInner {
     // They point into the store's arenas, so they go before it.
     drop(std::mem::take(&mut self.dying));
     if self.io.drain() {
-      // SAFETY: neither field is used again. The backend goes first: it may
-      // still hold `Op`s pointing into the store.
-      unsafe {
-        ManuallyDrop::drop(&mut self.io);
-        ManuallyDrop::drop(&mut self.store);
+      // SAFETY: the backend is dropped first, so it drops the leases it
+      // stored. A model whose lease is still held stays leaked with the store.
+      unsafe { ManuallyDrop::drop(&mut self.io) };
+      if self.leaked == 0 && !self.store.any_lease_held() {
+        // SAFETY: no backend copy of a lease remains, and this field is not
+        // used again.
+        unsafe { ManuallyDrop::drop(&mut self.store) };
       }
     }
     // Otherwise an operation may still be running in the kernel or on a
@@ -282,10 +287,15 @@ impl Lio {
   fn submit_registration(inner: &mut LioInner, id: u64) -> bool {
     let LioInner { io, store, time, .. } = inner;
     let Some(ran) = store.with_slot(id, |reg, step_bump| {
+      let keep = reg.lease();
       reg.with_action(&mut |action| match action {
         Action::Io(op) => {
           step_bump.reset();
-          io.push(id, crate::backend::InFlight::from_model(op), step_bump);
+          io.push(
+            id,
+            crate::backend::InFlight::from_model(op, keep.clone()),
+            step_bump,
+          );
         }
         Action::Sleep(duration) => time.schedule(id, duration),
       })
@@ -362,6 +372,7 @@ impl Lio {
       ready_timers: VecDeque::new(),
       dying: Vec::new(),
       burying: 0,
+      leaked: 0,
       orphaned_wakers: Vec::new(),
       overflow: VecDeque::new(),
       capacity_waiters: Vec::new(),
@@ -434,6 +445,7 @@ impl Lio {
     let LioInner { io, store, time, .. } = inner;
     let Some(_id) =
       store.insert_submitting(init, |id, reg, step_bump, insert| {
+        let keep = reg.lease();
         reg.with_action(&mut |action| {
           // After this, a panic must not free the model: `push` may have
           // copied its addresses. A panic inside `action` happens first and
@@ -442,7 +454,11 @@ impl Lio {
           match action {
             Action::Io(op) => {
               step_bump.reset();
-              io.push(id, crate::backend::InFlight::from_model(op), step_bump);
+              io.push(
+                id,
+                crate::backend::InFlight::from_model(op, keep.clone()),
+                step_bump,
+              );
             }
             Action::Sleep(duration) => time.schedule(id, duration),
           }
@@ -466,7 +482,14 @@ impl Lio {
       "driver: removed registration {id} with its timer still scheduled"
     );
     let detached = inner.store.detach_known(id);
-    inner.dying.push(detached);
+    if detached.registration.lease_held() {
+      // The backend still has a copy. Leak the registration and keep the
+      // slot, whose arena holds the buffers.
+      inner.leaked += 1;
+      std::mem::forget(detached);
+    } else {
+      inner.dying.push(detached);
+    }
     Self::assert_retired_slots_tracked(inner);
   }
 
@@ -476,7 +499,7 @@ impl Lio {
   /// is never reused.
   #[inline]
   fn assert_retired_slots_tracked(inner: &LioInner) {
-    let tracked = inner.dying.len() + inner.burying;
+    let tracked = inner.dying.len() + inner.burying + inner.leaked;
     assert_eq!(
       inner.store.retired(),
       tracked,
@@ -983,6 +1006,9 @@ mod tests {
       })
       .unwrap();
     let id = backend.pushed()[0];
+    // The backend drops its lease on completion. Retire then parks the
+    // registration in `dying` until bury.
+    backend.complete(id, 0);
     Lio::retire(&mut lio.inner.borrow_mut(), id);
 
     // The channel is still open, so a stream polled now waits.

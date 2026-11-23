@@ -416,6 +416,8 @@ pub struct Registration {
   /// be in the backend. The registration (and the memory the backend uses)
   /// stays alive until the operation's completion arrives.
   cancelled: bool,
+  /// The driver's share of the model lease. A backend holds the other shares.
+  lease: crate::backend::Keep,
 }
 
 /// Unified state machine for I/O operations.
@@ -448,6 +450,7 @@ impl Registration {
         handler: WakerResultHandler::new_in(arena, sender, op_model),
       },
       cancelled: false,
+      lease: crate::backend::Keep::new(),
     }
   }
 
@@ -468,6 +471,7 @@ impl Registration {
         handler: WakerResultHandler::new_in(arena, sender, op_model),
       },
       cancelled: false,
+      lease: crate::backend::Keep::new(),
     }
   }
 
@@ -485,6 +489,7 @@ impl Registration {
     Self {
       state: State::Callback(OpCallback::new_in(arena, callback, op_model)),
       cancelled: false,
+      lease: crate::backend::Keep::new(),
     }
   }
 
@@ -503,6 +508,18 @@ impl Registration {
       #[cfg(test)]
       State::Done => None,
     }
+  }
+
+  /// A copy of the lease the driver holds for this model.
+  #[inline]
+  pub(crate) fn lease(&self) -> crate::backend::Keep {
+    self.lease.clone()
+  }
+
+  /// A backend still holds a copy of this model's lease.
+  #[inline]
+  pub(crate) fn lease_held(&self) -> bool {
+    self.lease.held_elsewhere()
   }
 
   /// Runs `f` on the next action while the model that produced it is borrowed.

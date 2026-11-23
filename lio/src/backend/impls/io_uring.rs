@@ -45,6 +45,9 @@ mod single_socket_tests;
 struct PendingOp {
   registration_id: u64,
   op: Op,
+  // Held so the driver does not free the model while this entry is stored.
+  #[allow(dead_code)]
+  keep: crate::backend::Keep,
   lowered: LoweredState,
 }
 
@@ -1358,9 +1361,8 @@ impl IoBackend for IoUring {
     op: crate::backend::InFlight<'_>,
     step_bump: &mut Bump,
   ) {
-    // The model stays pinned, so these addresses stay stable. The backend
-    // stores the descriptor, not the `InFlight` borrow.
-    let op = op.as_op().clone();
+    // The model stays pinned while `keep` is stored with the operation.
+    let (op, keep) = op.into_parts();
     assert!(
       self.backlog.len() + self.in_flight < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
@@ -1377,7 +1379,7 @@ impl IoBackend for IoUring {
           return;
         }
       };
-    self.backlog.push(PendingOp { registration_id: id, op, lowered });
+    self.backlog.push(PendingOp { registration_id: id, op, keep, lowered });
   }
 
   fn flush(&mut self) -> io::Result<()> {

@@ -195,6 +195,9 @@ impl Default for Poller {
 pub struct PendingOp {
   registration_id: u64,
   op: crate::backend::op::Op,
+  // Held so the driver does not free the model while this entry is stored.
+  #[allow(dead_code)]
+  keep: crate::backend::Keep,
 }
 
 // EAGAIN and EWOULDBLOCK are the same on Linux, but may differ on other systems
@@ -1151,15 +1154,14 @@ impl IoBackend for Poller {
     op: crate::backend::InFlight<'_>,
     _step_bump: &mut Bump,
   ) {
-    // The model stays pinned, so these addresses stay stable. The backend
-    // stores the descriptor, not the `InFlight` borrow.
-    let op = op.as_op().clone();
+    // The model stays pinned while `keep` is stored with the operation.
+    let (op, keep) = op.into_parts();
     assert!(
       self.backlog.len() + self.pending.len() < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
-    self.backlog.push(PendingOp { registration_id: id, op });
+    self.backlog.push(PendingOp { registration_id: id, op, keep });
   }
 
   fn flush(&mut self) -> io::Result<()> {

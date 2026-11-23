@@ -214,10 +214,11 @@ pub trait IoBackend {
   ///
   /// `op` borrows the op model that owns its buffers. [`Lio`](crate::Lio)
   /// builds it with [`InFlight::from_model`](InFlight::from_model) while that
-  /// model is borrowed, and keeps the model pinned until `wait` returns this
-  /// completion or [`drain`](IoBackend::drain) returns `true`. An implementor
-  /// may copy the addresses out of [`InFlight::as_op`] and dereference them
-  /// until then, from `flush`, `wait`, `cancel`, or `drain`.
+  /// model is borrowed. Take [`InFlight::into_parts`] and store the [`Keep`]
+  /// for as long as any address copied from the [`Op`] is used. The driver
+  /// frees the model when it holds the last [`Keep`]. [`drain`](IoBackend::drain)
+  /// still has to stop kernel and worker threads, which do not hold a
+  /// [`Keep`].
   fn push(&mut self, id: u64, op: InFlight<'_>, step_bump: &mut Bump);
 
   /// Submit all queued operations to kernel.
@@ -241,19 +242,17 @@ pub trait IoBackend {
     let _ = id;
   }
 
-  /// Drops every address copied out of a pushed operation and waits, for a
-  /// bounded time, until nothing outside this call can dereference them.
+  /// Drops every stored [`Keep`] and waits, for a bounded time, until nothing
+  /// outside this call can dereference the operations.
   ///
-  /// Returns whether that is true. Stored copies must be dropped before this
-  /// returns `true`. The driver calls this when it is dropped, before
-  /// freeing the op model that owns the buffers, and leaks the memory and
-  /// the backend instead when it returns `false`. Completions for the
-  /// drained operations are discarded.
+  /// Returns whether the kernel and any worker threads are finished. The
+  /// driver drops the backend after `true`, which drops the [`Keep`]s it
+  /// stored, then frees a model only when no [`Keep`] remains. It leaks the
+  /// backend and the models when this returns `false`, because a thread may
+  /// still be writing. Completions for the drained operations are discarded.
   ///
-  /// The default returns `true` immediately, which is right only for a
-  /// backend that never copies an address out of the [`InFlight`] it was
-  /// given. A backend that stores those addresses, or that leaves work in
-  /// the kernel or on other threads between calls, must override this.
+  /// The default returns `true` immediately. A backend that leaves work in
+  /// the kernel or on other threads between calls must override this.
   fn drain(&mut self) -> bool {
     true
   }
@@ -272,18 +271,39 @@ pub trait IoBackend {
   ) -> io::Result<()>;
 }
 
+/// One share of the op model's lifetime.
+///
+/// The driver holds one. Each copy a backend stores holds another. The
+/// driver frees the model only when it holds the last one. Dropping a copy
+/// early, while a raw pointer taken from the operation is still in use, is
+/// still a use after free. Forgetting a copy leaks the model.
+#[derive(Clone, Debug)]
+pub struct Keep {
+  alive: std::sync::Arc<()>,
+}
+
+impl Keep {
+  pub(crate) fn new() -> Self {
+    Self { alive: std::sync::Arc::new(()) }
+  }
+
+  /// Another owner still has a copy.
+  pub(crate) fn held_elsewhere(&self) -> bool {
+    std::sync::Arc::strong_count(&self.alive) > 1
+  }
+}
+
 /// One operation borrowed from the op model that owns its buffers.
 ///
 /// [`Lio`](crate::Lio) builds this with [`from_model`](Self::from_model)
 /// while that model is borrowed, then passes it to [`IoBackend::push`]. The
-/// model stays pinned in the driver until the completion is routed or
-/// [`IoBackend::drain`] returns `true`, so the addresses the backend copies
-/// stay valid for that whole time. A buffer that lives only on the caller's
-/// stack cannot be turned into an `InFlight` without
-/// [`attest`](Self::attest), because nothing would keep it alive after the
-/// call returned.
+/// model stays pinned in the driver until the last [`Keep`] is dropped. A
+/// buffer that lives only on the caller's stack cannot be turned into an
+/// `InFlight` without [`attest`](Self::attest), because nothing would keep
+/// it alive after the call returned.
 pub struct InFlight<'a> {
   op: BorrowedOp<'a>,
+  keep: Keep,
 }
 
 impl<'a> InFlight<'a> {
@@ -293,8 +313,8 @@ impl<'a> InFlight<'a> {
   /// not move or drop that model until the backend is finished with it.
   ///
   /// [`OpModel::action`]: crate::api::op::OpModel::action
-  pub(crate) fn from_model(op: BorrowedOp<'a>) -> Self {
-    Self { op }
+  pub(crate) fn from_model(op: BorrowedOp<'a>, keep: Keep) -> Self {
+    Self { op, keep }
   }
 
   /// Wraps an operation whose buffers the caller keeps alive itself.
@@ -305,15 +325,24 @@ impl<'a> InFlight<'a> {
   /// # Safety
   ///
   /// The addresses in `op` stay allocated and unmoved, and nothing but the
-  /// backend mutates them, until `wait` returns this completion or `drain`
-  /// returns `true`.
+  /// backend mutates them, until every [`Keep`] from [`into_parts`](Self::into_parts)
+  /// is dropped. This keep is not tied to a driver registration.
   pub unsafe fn attest(op: BorrowedOp<'a>) -> Self {
-    Self { op }
+    Self { op, keep: Keep::new() }
   }
 
   /// The operation the backend copies addresses out of.
   #[inline]
   pub fn as_op(&self) -> &Op {
     self.op.as_op()
+  }
+
+  /// The operation and the lease that keeps its buffers allocated.
+  ///
+  /// Store the [`Keep`] with every copy of the addresses. Drop it when those
+  /// copies are gone.
+  #[inline]
+  pub fn into_parts(self) -> (Op, Keep) {
+    (self.op.as_op().clone(), self.keep)
   }
 }
