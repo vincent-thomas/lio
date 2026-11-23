@@ -147,6 +147,22 @@ mod immediate_sockets {
   }
 
   #[test]
+  fn drain_drops_a_registered_receive() {
+    let (socket, _peer) = pair(true);
+    let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
+    let mut backend = backend();
+    queue(&mut backend, 15, &mut *model);
+    backend.flush().unwrap();
+    assert_eq!(backend.pending.len(), 1);
+    assert!(backend.drain());
+    assert_eq!(backend.pending.len(), 0);
+    drop(model);
+    let mut completed = Vec::new();
+    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    assert!(completed.is_empty());
+  }
+
+  #[test]
   fn backpressured_send_is_registered_and_retried() {
     let (mut socket, mut peer) = UnixStream::pair().unwrap();
     socket.set_nonblocking(true).unwrap();

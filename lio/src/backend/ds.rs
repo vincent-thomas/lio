@@ -2737,6 +2737,14 @@ impl IoBackend for DSBackend {
     }
   }
 
+  fn drain(&mut self) -> bool {
+    // The simulator only dereferences stored operations from `flush` and
+    // `wait`. Dropping them here means a later call cannot see them.
+    self.queued.clear();
+    self.world.pending.clear();
+    true
+  }
+
   fn flush(&mut self) -> io::Result<()> {
     self.assert_initialized();
     let queued = mem::take(&mut self.queued);
@@ -4073,6 +4081,20 @@ impl IoBackend for DSTBackend {
     }
   }
 
+  fn drain(&mut self) -> bool {
+    self.queued.clear();
+    {
+      let mut node = self.node.borrow_mut();
+      node.outgoing.clear();
+      node.pending.clear();
+    }
+    self.inner.borrow_mut().active_outgoing_nodes.remove(&self.node_id);
+    match self.local.as_mut() {
+      Some(local) => local.drain(),
+      None => true,
+    }
+  }
+
   fn flush(&mut self) -> io::Result<()> {
     self
       .local
@@ -4117,6 +4139,31 @@ mod tests {
     // SAFETY: these tests keep every buffer named by `op` alive until the
     // backend reports the completion.
     unsafe { backend.push(id, BorrowedOp::from_op(op), bump) };
+  }
+
+  #[test]
+  fn drain_drops_a_queued_read() {
+    let mut backend = DSBackend::new();
+    backend.init(4).unwrap();
+    let mut bytes = [1u8; 4];
+    {
+      let iov = [crate::backend::op::RawBuf::from_mut(&mut bytes)];
+      let op = BorrowedOp::read(
+        crate::api::resource::Resource::invalid(),
+        &iov,
+        None,
+        Default::default(),
+      );
+      // SAFETY: `drain` below drops the queued operation before `iov` and
+      // `bytes` are released.
+      unsafe { backend.push(1, op, &mut Bump::new()) };
+      assert!(backend.drain());
+    }
+    backend.flush().unwrap();
+    let mut completed = Vec::new();
+    backend.wait(Some(std::time::Duration::ZERO), &mut completed).unwrap();
+    assert!(completed.is_empty());
+    assert_eq!(bytes, [1u8; 4]);
   }
 
   use super::*;

@@ -282,7 +282,9 @@ impl Lio {
         };
         step_bump.reset();
         // SAFETY: the registration that produced `op` stays in the store,
-        // with its buffers unmoved, until this completion is routed.
+        // with its buffers unmoved, until this completion is routed. This is
+        // not `drive`: the operation outlives the `try_run` that queued it,
+        // and its buffers are owned by the pinned registration.
         unsafe { io.push(id, op, step_bump) };
       }
       Action::Sleep(duration) => time.schedule(id, duration),

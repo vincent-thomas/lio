@@ -1272,6 +1272,26 @@ impl IoBackend for Poller {
     self.queued_completed.push(OpCompleted::new(id, CANCELED));
   }
 
+  fn drain(&mut self) -> bool {
+    // Readiness interest is the only thing the kernel holds. The bytes live
+    // in `backlog` and `pending`, and this backend only dereferences them
+    // from `flush` and `wait`, so dropping them here releases every address.
+    self.backlog.clear();
+    let keys: Vec<_> = self.pending.keys_where(|_| true).collect();
+    for key in keys {
+      let Some(entry) = self.pending.remove_value(key) else {
+        continue;
+      };
+      let (fd, interest) = self.extract_fd_interest(&entry.op);
+      if !interest.is_none()
+        && let Some(sys) = self.sys.as_ref()
+      {
+        let _ = sys.delete(fd);
+      }
+    }
+    true
+  }
+
   fn wait(
     &mut self,
     timeout: Option<Duration>,

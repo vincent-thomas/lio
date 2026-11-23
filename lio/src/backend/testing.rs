@@ -646,4 +646,102 @@ mod tests {
     let (_, mut checked) = init(1);
     push_op(&mut checked, 1, Op::Nop);
   }
+
+  #[test]
+  fn drive_releases_the_buffer_after_drain() {
+    let mut backend = ScriptedBackend::auto(4).without_poison();
+    backend.init(1).unwrap();
+    let mut buf = [9u8; 4];
+    let n = {
+      let iov = [RawBuf::from_mut(&mut buf)];
+      crate::backend::drive(&mut backend, |submit| {
+        submit.push(
+          3,
+          BorrowedOp::read(
+            crate::api::resource::Resource::invalid(),
+            &iov,
+            None,
+            Default::default(),
+          ),
+          &mut Bump::new(),
+        );
+        submit.flush().unwrap();
+        let mut done = Vec::new();
+        submit.wait(None, &mut done).unwrap();
+        done[0].result()
+      })
+    };
+    assert_eq!(n, 4);
+    assert_eq!(buf, [9u8; 4]);
+    buf[0] = 1;
+    assert_eq!(buf[0], 1);
+    assert!(backend.in_flight().is_empty());
+  }
+
+  #[test]
+  fn drive_poisons_a_buffer_it_drains() {
+    let mut backend = ScriptedBackend::new();
+    backend.init(1).unwrap();
+    let mut buf = [1u8; 4];
+    {
+      let iov = [RawBuf::from_mut(&mut buf)];
+      crate::backend::drive(&mut backend, |submit| {
+        submit.push(
+          1,
+          BorrowedOp::read(
+            crate::api::resource::Resource::invalid(),
+            &iov,
+            None,
+            Default::default(),
+          ),
+          &mut Bump::new(),
+        );
+      });
+    }
+    assert_eq!(buf, [POISON; 4]);
+    assert!(backend.in_flight().is_empty());
+  }
+
+  #[test]
+  fn drive_drains_when_the_body_panics() {
+    let backend = ScriptedBackend::new();
+    let mut checked = Checked::new(backend.clone());
+    checked.init(1).unwrap();
+    let mut buf = [1u8; 4];
+    let panicked = {
+      let iov = [RawBuf::from_mut(&mut buf)];
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::backend::drive(&mut checked, |submit| {
+          submit.push(
+            1,
+            BorrowedOp::read(
+              crate::api::resource::Resource::invalid(),
+              &iov,
+              None,
+              Default::default(),
+            ),
+            &mut Bump::new(),
+          );
+          panic!("unwind");
+        });
+      }))
+    };
+    assert!(panicked.is_err());
+    assert!(backend.in_flight().is_empty());
+    assert_eq!(buf, [POISON; 4]);
+  }
+
+  #[test]
+  fn drive_accepts_a_trait_object() {
+    let mut backend = ScriptedBackend::new();
+    backend.init(1).unwrap();
+    {
+      let backend: &mut dyn IoBackend = &mut backend;
+      crate::backend::drive(backend, |submit| {
+        submit.push(1, BorrowedOp::nop(), &mut Bump::new());
+      });
+    }
+    assert!(backend.in_flight().is_empty());
+    assert_eq!(backend.pushed(), vec![1]);
+  }
 }

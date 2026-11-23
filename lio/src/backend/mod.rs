@@ -21,20 +21,23 @@
 //! # Example
 //!
 //! ```
-//! use lio::backend::{IoBackend, op::BorrowedOp, impls::DefaultBackend};
+//! use lio::backend::{drive, IoBackend, op::BorrowedOp, impls::DefaultBackend};
 //! use std::time::Duration;
 //!
 //! // Create and initialize backend
 //! let mut backend = DefaultBackend::new();
-//! backend.init(1024).unwrap();  // Pre-allocate for 1024 concurrent ops
+//! backend.init(1024).unwrap(); // Pre-allocate for 1024 concurrent ops
 //!
-//! // Submit a nop operation. `Nop` borrows nothing.
-//! unsafe { backend.push(1, BorrowedOp::nop(), &mut bumpalo::Bump::new()) };
-//! backend.flush().unwrap();
-//!
-//! // Poll for completions (non-blocking)
-//! let mut completions = Vec::new();
-//! backend.wait(Some(Duration::ZERO), &mut completions).unwrap();
+//! // `drive` lends the backend for one scope. Buffers borrowed by an
+//! // operation stay borrowed until the scope ends, which is after `drain`.
+//! let completions = drive(&mut backend, |submit| {
+//!     submit.push(1, BorrowedOp::nop(), &mut bumpalo::Bump::new());
+//!     submit.flush().unwrap();
+//!     let mut completions = Vec::new();
+//!     submit.wait(Some(Duration::ZERO), &mut completions).unwrap();
+//!     completions
+//! });
+//! let _ = completions;
 //! ```
 
 pub mod ds;
@@ -129,6 +132,8 @@ pub(crate) mod native;
 pub(crate) mod sockaddr;
 
 use std::io;
+use std::marker::PhantomData;
+use std::process;
 use std::time::Duration;
 
 use bumpalo::Bump;
@@ -185,14 +190,20 @@ impl OpCompleted {
 ///
 /// # Usage
 ///
+/// Submit through [`drive`]. It is safe, and it is what keeps a buffer
+/// alive for as long as the backend may still hold its address. `push` is
+/// the unsafe primitive [`drive`] and [`Lio`](crate::Lio) call.
+///
 /// ```ignore
 /// let mut backend = Backend::default();
-/// backend.init(1024)?;                    // Pre-allocate for 1024 ops
-/// // SAFETY: `op` borrows nothing, or the caller keeps its buffers alive
-/// // until `wait` returns the completion.
-/// unsafe { backend.push(op_id, op, &mut bump)? }; // Queue operation
-/// backend.flush()?;                       // Submit to kernel
-/// let done = backend.wait(timeout)?;      // Get completions
+/// backend.init(1024)?;
+/// let done = lio::backend::drive(&mut backend, |submit| {
+///     submit.push(op_id, op, &mut bump);
+///     submit.flush()?;
+///     let mut done = Vec::new();
+///     submit.wait(timeout, &mut done)?;
+///     Ok(done)
+/// })?;
 /// ```
 pub trait IoBackend {
   /// Initialize backend with capacity for `cap` concurrent operations.
@@ -217,17 +228,20 @@ pub trait IoBackend {
   ///
   /// # Safety
   ///
-  /// A safe signature cannot express this contract: the backend may copy
-  /// addresses out of `op` and dereference them after `push` returns, from
-  /// `flush`, `wait`, `cancel`, or `drain`. Those addresses must stay
-  /// allocated and unmoved, and must not be mutated by anyone but this
-  /// backend, until `wait` returns this operation's completion or `drain`
-  /// returns `true`.
+  /// The backend may copy addresses out of `op` and dereference them after
+  /// `push` returns, from `flush`, `wait`, `cancel`, or `drain`. A lifetime
+  /// that ended when `push` returned cannot say that, so this method stays
+  /// `unsafe`. Those addresses must stay allocated and unmoved, and must not
+  /// be mutated by anyone but this backend, until `wait` returns this
+  /// operation's completion or `drain` returns `true`.
   ///
-  /// [`Lio`](crate::Lio) upholds that for operations its models return.
-  /// `action` borrows the model, the registration stays pinned in the driver
-  /// until the backend is done, and the driver does not ask the model for
-  /// another action before then.
+  /// [`drive`] upholds that by borrowing the buffers for the whole scope and
+  /// calling `drain` before the scope ends. [`Lio`](crate::Lio) upholds it
+  /// for operations its models return: `action` borrows the model, the
+  /// registration stays pinned until the backend is done, and the driver
+  /// does not ask the model for another action before then. An operation
+  /// submitted by the driver outlives the `try_run` that queued it, so the
+  /// driver calls `push` rather than wrapping each turn in [`drive`].
   unsafe fn push(&mut self, id: u64, op: BorrowedOp<'_>, step_bump: &mut Bump);
 
   /// Submit all queued operations to kernel.
@@ -251,18 +265,21 @@ pub trait IoBackend {
     let _ = id;
   }
 
-  /// Cancels every operation still running and waits, for a bounded time,
-  /// until none is left.
+  /// Drops every address copied out of a pushed operation and waits, for a
+  /// bounded time, until nothing outside this call can dereference them.
   ///
-  /// Returns whether nothing can touch the memory of a pushed [`Op`] any
-  /// more: no request is left in the kernel or on a backend thread. The
-  /// driver calls this when it is dropped, before freeing that memory, and
-  /// leaks the memory and the backend instead when it returns `false`.
+  /// Returns whether that is true. Stored copies must be dropped before this
+  /// returns `true`. The driver calls this when it is dropped, before
+  /// freeing that memory, and leaks the memory and the backend instead when
+  /// it returns `false`. [`drive`] calls it before the buffers borrowed for
+  /// the scope are released, and aborts the process when it returns `false`:
+  /// unwinding would free those buffers while the backend still held them.
   /// Completions for the drained operations are discarded.
   ///
-  /// The default returns `true`, which is right for a backend that only
-  /// performs I/O inside its own calls. A backend that leaves work in the
-  /// kernel or on other threads between calls must override it.
+  /// The default returns `true` immediately, which is right only for a
+  /// backend that never copies an address out of the [`BorrowedOp`] it was
+  /// given. A backend that stores those addresses, or that leaves work in
+  /// the kernel or on other threads between calls, must override this.
   fn drain(&mut self) -> bool {
     true
   }
@@ -279,4 +296,193 @@ pub trait IoBackend {
     timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
   ) -> io::Result<()>;
+}
+
+/// One submission scope of [`drive`].
+///
+/// `'scope` is invariant. A local of the closure cannot satisfy it, so every
+/// buffer and descriptor array a [`BorrowedOp<'scope>`](BorrowedOp) borrows
+/// has to belong to the caller of [`drive`]. `drive` drains the backend
+/// before it gives those buffers back.
+pub struct Submit<'scope, 'env: 'scope, B: ?Sized> {
+  backend: &'scope mut B,
+  // Invariant in both lifetimes, as `std::thread::Scope` is: a shorter
+  // scope would let the closure borrow a local that drops before `drain`.
+  _scope: PhantomData<&'scope mut &'scope ()>,
+  _env: PhantomData<&'env mut &'env ()>,
+}
+
+impl<'scope, 'env, B> Submit<'scope, 'env, B>
+where
+  B: IoBackend + ?Sized,
+{
+  /// Queues `op`.
+  ///
+  /// `op` borrows its buffers for `'scope`. [`drive`] keeps that scope alive
+  /// until [`IoBackend::drain`] returns `true`, which is the contract
+  /// [`IoBackend::push`] requires.
+  pub fn push(
+    &mut self,
+    id: u64,
+    op: BorrowedOp<'scope>,
+    step_bump: &mut Bump,
+  ) {
+    // SAFETY: `op` is borrowed for `'scope`, which a local of the closure
+    // cannot satisfy. The memory belongs to the caller of `drive`, and
+    // `drive` calls `drain` before returning that memory, including when
+    // the closure panics. The closure holds `&mut Submit`, so it cannot end
+    // the scope early.
+    unsafe { self.backend.push(id, op, step_bump) }
+  }
+
+  /// Submits every operation queued in this scope.
+  pub fn flush(&mut self) -> io::Result<()> {
+    self.backend.flush()
+  }
+
+  /// Asks the backend to finish operation `id` early. See
+  /// [`IoBackend::cancel`].
+  pub fn cancel(&mut self, id: u64) {
+    self.backend.cancel(id)
+  }
+
+  /// Polls for completions of operations queued in this scope. See
+  /// [`IoBackend::wait`].
+  pub fn wait(
+    &mut self,
+    timeout: Option<Duration>,
+    completed: &mut Vec<OpCompleted>,
+  ) -> io::Result<()> {
+    self.backend.wait(timeout, completed)
+  }
+}
+
+/// Runs `body` against `backend`, then waits until the backend has dropped
+/// every address it copied.
+///
+/// This is the safe submission API. `body` may call [`Submit::push`] with a
+/// [`BorrowedOp`] borrowed for the scope. The backend stores the addresses
+/// in that operation — the bytes, and the descriptor array that points at
+/// them — and may use them until it drains, which is after `body` returns.
+/// That memory has to belong to the caller of `drive`. A local of `body`
+/// does not live long enough, and `body` cannot return a reference into the
+/// scope. Once `drive` returns, the caller can read and write the buffers
+/// again.
+///
+/// The scope ends in `drive` itself, not in a guard the closure could
+/// forget, so `mem::forget` inside `body` cannot release a buffer early.
+///
+/// # Panics
+///
+/// If `body` panics, the backend is still drained before the panic
+/// continues. If [`IoBackend::drain`] returns `false`, the process aborts:
+/// unwinding would drop the caller's buffers while something outside this
+/// thread could still write them.
+///
+/// # Examples
+///
+/// ```
+/// use lio::api::resource::Resource;
+/// use lio::backend::drive;
+/// use lio::backend::op::{BorrowedOp, RawBuf};
+/// use lio::backend::testing::ScriptedBackend;
+/// use lio::backend::IoBackend;
+///
+/// let mut backend = ScriptedBackend::auto(4).without_poison();
+/// backend.init(1).unwrap();
+/// let mut buf = [9u8; 4];
+/// let n = {
+///     let iov = [RawBuf::from_mut(&mut buf)];
+///     drive(&mut backend, |submit| {
+///         submit.push(
+///             1,
+///             BorrowedOp::read(
+///                 Resource::invalid(),
+///                 &iov,
+///                 None,
+///                 Default::default(),
+///             ),
+///             &mut bumpalo::Bump::new(),
+///         );
+///         submit.flush().unwrap();
+///         let mut done = Vec::new();
+///         submit.wait(None, &mut done).unwrap();
+///         done[0].result()
+///     })
+/// };
+/// assert_eq!(n, 4);
+/// // The borrow ended with the scope, after the backend drained.
+/// assert_eq!(buf, [9, 9, 9, 9]);
+/// ```
+///
+/// A buffer that lives only inside the closure is rejected: it would be
+/// dropped before the backend drained.
+///
+/// ```compile_fail
+/// use lio::api::resource::Resource;
+/// use lio::backend::drive;
+/// use lio::backend::op::{BorrowedOp, RawBuf};
+/// use lio::backend::testing::ScriptedBackend;
+/// use lio::backend::IoBackend;
+///
+/// let mut backend = ScriptedBackend::new();
+/// backend.init(1).unwrap();
+/// drive(&mut backend, |submit| {
+///     let mut buf = [0u8; 4];
+///     let iov = [RawBuf::from_mut(&mut buf)];
+///     submit.push(
+///         1,
+///         BorrowedOp::read(Resource::invalid(), &iov, None, Default::default()),
+///         &mut bumpalo::Bump::new(),
+///     );
+/// });
+/// ```
+pub fn drive<'env, B, R>(
+  backend: &'env mut B,
+  body: impl for<'scope> FnOnce(&mut Submit<'scope, 'env, B>) -> R,
+) -> R
+where
+  B: IoBackend + ?Sized,
+{
+  let mut guard = DrainOnDrop { backend, armed: true };
+  let result = invoke(&mut guard, body);
+  guard.armed = false;
+  release(guard.backend);
+  result
+}
+
+fn invoke<'env, B, R>(
+  guard: &mut DrainOnDrop<'env, B>,
+  body: impl for<'scope> FnOnce(&mut Submit<'scope, 'env, B>) -> R,
+) -> R
+where
+  B: IoBackend + ?Sized,
+{
+  body(&mut Submit {
+    backend: &mut *guard.backend,
+    _scope: PhantomData,
+    _env: PhantomData,
+  })
+}
+
+fn release<B>(backend: &mut B)
+where
+  B: IoBackend + ?Sized,
+{
+  if !backend.drain() {
+    process::abort();
+  }
+}
+
+struct DrainOnDrop<'a, B: IoBackend + ?Sized> {
+  backend: &'a mut B,
+  armed: bool,
+}
+
+impl<B: IoBackend + ?Sized> Drop for DrainOnDrop<'_, B> {
+  fn drop(&mut self) {
+    if self.armed {
+      release(self.backend);
+    }
+  }
 }
