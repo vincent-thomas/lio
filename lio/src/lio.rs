@@ -1023,6 +1023,19 @@ mod tests {
   }
 
   #[test]
+  fn completing_one_op_drops_only_its_lease() {
+    let (backend, lio) = lio(2);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let first = backend.in_flight()[0];
+    let second = backend.in_flight()[1];
+    backend.complete(first, 0);
+    lio.try_run().unwrap();
+    assert_eq!(lio.inner.borrow().leaked, 0);
+    assert_eq!(backend.in_flight(), vec![second]);
+  }
+
+  #[test]
   fn dropping_a_drained_driver_frees_the_store() {
     let (backend, lio) = lio(1);
     crate::api::nop().with_lio(&lio).when_done(|_| {});

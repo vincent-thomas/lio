@@ -138,7 +138,9 @@ impl ScriptedBackend {
       panic!("ScriptedBackend::complete: operation {id} is not in flight");
     };
     let (_, op) = script.in_flight.remove(pos);
-    script.keeps.retain(|(i, _)| *i != id);
+    if let Some(kept) = script.keeps.iter().position(|(kept, _)| *kept == id) {
+      script.keeps.swap_remove(kept);
+    }
     if !script.no_poison {
       // SAFETY: the operation is still in flight, so the driver keeps the
       // memory it points to valid until it sees this completion.
