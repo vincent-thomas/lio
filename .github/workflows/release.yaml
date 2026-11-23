@@ -49,6 +49,11 @@ jobs:
             ~/.cargo/git
           key: cargo-release-cache
 
+      - name: test
+        run: mise run test
+
+      # Tokens are for publish only. The release script unsets them before
+      # cargo install, then passes each token to the command that needs it.
       - name: release
         env:
           BUMP: ${{ github.event.inputs.bump }}
