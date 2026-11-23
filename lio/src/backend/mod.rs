@@ -33,10 +33,15 @@
 //! let op = unsafe { InFlight::attest(BorrowedOp::nop()) };
 //! let mut loan = op.loan();
 //! backend.push(1, op.keep(), &mut loan, &mut bumpalo::Bump::new());
-//! backend.flush().unwrap();
+//! // SAFETY: `op` stays alive through `flush` and `wait`.
+//! unsafe { lio::backend::loan::Attested::remember(1, op.as_op()) };
+//! let mut loan = lio::backend::loan::Attested::new();
+//! backend.flush(&mut loan).unwrap();
 //!
 //! let mut completions = Vec::new();
-//! backend.wait(Some(Duration::ZERO), &mut completions, &mut crate::backend::loan::Attested::new()).unwrap();
+//! backend
+//!   .wait(Some(Duration::ZERO), &mut completions, &mut loan)
+//!   .unwrap();
 //! ```
 
 pub mod ds;
