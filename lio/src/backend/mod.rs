@@ -93,6 +93,8 @@ pub mod impls {
 
   pub(crate) use super::sockaddr;
   #[cfg(unix)]
+  pub(crate) mod iovec;
+  #[cfg(unix)]
   pub(crate) mod unix_stat;
 
   /// The backend [`Lio::new`](crate::Lio::new) uses on this platform.

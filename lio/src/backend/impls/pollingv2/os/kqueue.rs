@@ -393,10 +393,6 @@ impl ReadinessPoll for OsPoller {
       _ => Interest::READ, // Fallback
     }
   }
-
-  fn event_fflags(event: &Self::NativeEvent) -> u32 {
-    event.fflags
-  }
 }
 
 #[cfg(test)]

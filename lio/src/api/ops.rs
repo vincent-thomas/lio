@@ -1,6 +1,6 @@
-//! I/O operation definitions.
+//! Typed I/O operations.
 //!
-//! This module contains all the typed operation structs that implement `TypedOp`.
+//! Each type here is an [`OpModel`]. It builds the [`Op`] a backend executes.
 
 use std::ffi::{CString, OsString};
 use std::io;

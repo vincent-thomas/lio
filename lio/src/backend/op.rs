@@ -540,7 +540,7 @@ impl<'a> RawBufMut<'a> {
 // reference must not cross threads, so this type is not `Sync`.
 unsafe impl Send for RawBufMut<'_> {}
 
-/// Pointer and length shared by [`RawBuf`] and [`RawBufMut`].
+/// Pointer and length shared by the portable buffer descriptors.
 pub(crate) trait ByteSpan {
   fn bytes_ptr(&self) -> *mut u8;
   fn bytes_len(&self) -> usize;
@@ -659,6 +659,24 @@ unsafe impl Send for MsgBufMut {}
 // SAFETY: sharing the descriptor value does not itself permit mutation without
 // dereferencing the raw pointer.
 unsafe impl Sync for MsgBufMut {}
+
+impl ByteSpan for MsgBuf {
+  fn bytes_ptr(&self) -> *mut u8 {
+    self.ptr.as_ptr()
+  }
+  fn bytes_len(&self) -> usize {
+    self.len
+  }
+}
+
+impl ByteSpan for MsgBufMut {
+  fn bytes_ptr(&self) -> *mut u8 {
+    self.ptr.as_ptr()
+  }
+  fn bytes_len(&self) -> usize {
+    self.len
+  }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MsgSend {
@@ -912,16 +930,15 @@ pub enum StatTarget {
 #[derive(Clone, Debug)]
 pub enum Op {
   // ═══════════════════════════════════════════════════════════════════════════════
-  // Buffer operations - RawBuf (ptr/len) points to TypedOp's buffer
+  // Buffer operations. The pointers stay owned by the op model.
   // ═══════════════════════════════════════════════════════════════════════════════
-  /// Generic read operation supporting all read variants.
+  /// Read bytes into `iovecs`.
   ///
-  /// Backends select the appropriate syscall based on parameters:
-  /// - Read (readv): offset == None
-  /// - Positioned read (preadv): offset == Some(_)
-  /// - With flags (preadv2): Any above + flags != 0
+  /// `offset == None` reads at the current file position. `Some(offset)`
+  /// reads at that absolute position. [`ReadFlags`] has no flags yet.
   ///
-  /// The buffer/iovec pointers are owned by the OpModel and must remain valid.
+  /// The buffer pointers are owned by the op model and stay valid until the
+  /// operation completes.
   Read {
     /// File descriptor to read from
     fd: Resource,
@@ -938,14 +955,15 @@ pub enum Op {
     flags: ReadFlags,
   },
 
-  /// Generic write operation supporting all write variants.
+  /// Write bytes from `iovecs`.
   ///
-  /// Backends select the appropriate syscall based on parameters:
-  /// - Write (writev): offset == None
-  /// - Positioned write (pwritev): offset == Some(_)
-  /// - With flags (pwritev2): Any above + flags != 0
+  /// `offset == None` writes at the current file position. `Some(offset)`
+  /// writes at that absolute position. A set [`WriteFlags`] flag asks for
+  /// the matching durability or append behavior. A backend that cannot
+  /// honour a flag completes the write with `ENOTSUP`.
   ///
-  /// The buffer/iovec pointers are owned by the OpModel and must remain valid.
+  /// The buffer pointers are owned by the op model and stay valid until the
+  /// operation completes.
   Write {
     /// File descriptor to write to
     fd: Resource,
@@ -962,15 +980,13 @@ pub enum Op {
     flags: WriteFlags,
   },
 
-  /// Generic receive operation supporting all recv variants.
+  /// Receive bytes into `msg`.
   ///
-  /// Backends select the appropriate syscall based on parameters:
-  /// - Simple recv: buf.ptr != null, iovecs == null, addr == null, msg == null
-  /// - Receive with address (recvfrom): addr != null
-  /// - Vectored receive: iovecs != null
-  /// - Full control (recvmsg): msg != null (all other fields ignored)
+  /// The backend lowers [`MsgRecv`] to the native receive call. When `msg`
+  /// names a source-address slot, the peer address is written there.
   ///
-  /// The buffer/iovec/msg pointers are owned by the OpModel and must remain valid.
+  /// The buffer pointers are owned by the op model and stay valid until the
+  /// operation completes.
   Recv {
     /// Socket to receive from
     fd: Resource,
@@ -980,15 +996,13 @@ pub enum Op {
     flags: RecvFlags,
   },
 
-  /// Generic send operation supporting all send variants.
+  /// Send bytes from `msg`.
   ///
-  /// Backends select the appropriate syscall based on parameters:
-  /// - Simple send: buf.ptr != null, iovecs == null, addr == null, msg == null
-  /// - Send to address (sendto): addr != null
-  /// - Vectored send: iovecs != null
-  /// - Full control (sendmsg): msg != null (all other fields ignored)
+  /// The backend lowers [`MsgSend`] to the native send call. `msg.to` is the
+  /// destination address, when set.
   ///
-  /// The buffer/iovec/msg pointers are owned by the OpModel and must remain valid.
+  /// The buffer pointers are owned by the op model and stay valid until the
+  /// operation completes.
   Send {
     /// Socket to send to
     fd: Resource,
@@ -1037,16 +1051,11 @@ pub enum Op {
   // ═══════════════════════════════════════════════════════════════════════════════
   /// Accept one incoming connection from a listening socket.
   ///
-  /// Backends typically execute this with `accept(2)` or an equivalent platform
-  /// primitive once the socket becomes readable.
+  /// Backends run this once the socket is readable. On success the completion
+  /// value is the new socket, and the peer address is written to `addr`.
   ///
-  /// `addr` and `len` follow the normal `accept` contract:
-  /// - if `addr` is non-null, the peer address is written there
-  /// - `len` must point to the size of the storage on input
-  /// - on success, `*len` is updated to the actual peer address length
-  ///
-  /// The address storage pointers are owned by the `OpModel` and must remain
-  /// valid until the operation completes.
+  /// `addr` is owned by the op model and stays valid until the operation
+  /// completes.
   Accept {
     /// Listening socket to accept from.
     fd: Resource,
@@ -1060,8 +1069,8 @@ pub enum Op {
   /// - keep it pending until the socket becomes writable, then check the final
   ///   connection result
   ///
-  /// `addr` points to the destination socket address and must remain valid until
-  /// the operation completes.
+  /// `addr` is the destination socket address. It is stored by value, so it
+  /// does not borrow caller memory.
   Connect {
     /// Socket to connect.
     fd: Resource,
@@ -1101,11 +1110,11 @@ pub enum Op {
   RenameAt {
     /// Directory file descriptor used as the base for the old path.
     old_dir_fd: Resource,
-    /// Null-terminated old pathname pointer.
+    /// Old path, relative to `old_dir_fd`.
     old_path: OsString,
     /// Directory file descriptor used as the base for the new path.
     new_dir_fd: Resource,
-    /// Null-terminated new pathname pointer.
+    /// New path, relative to `new_dir_fd`.
     new_path: OsString,
   },
   /// Create a directory relative to a directory file descriptor.
@@ -1129,11 +1138,11 @@ pub enum Op {
     kind: LinkKind,
     /// Directory file descriptor used as the base for the source path.
     source_dir_fd: Resource,
-    /// Null-terminated source pathname pointer or symlink target string.
+    /// Source path, or the symlink target string when `kind` is [`LinkKind::Soft`].
     source_path: OsString,
     /// Directory file descriptor used as the base for the new path.
     new_dir_fd: Resource,
-    /// Null-terminated new pathname pointer.
+    /// New path, relative to `new_dir_fd`.
     new_path: OsString,
   },
   /// Read the target of a symbolic link relative to a directory file descriptor.
@@ -1144,11 +1153,11 @@ pub enum Op {
   ReadlinkAt {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
-    /// Null-terminated pathname pointer.
+    /// Path of the symbolic link, relative to `dir_fd`.
     path: OsString,
-    /// Output buffer pointer.
+    /// Bytes the link target is written into.
     buf: NonNull<u8>,
-    /// Output buffer length.
+    /// Number of bytes `buf` can hold.
     buf_len: usize,
   },
   /// Read the current working directory as a platform-native string.

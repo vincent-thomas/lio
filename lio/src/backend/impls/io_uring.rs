@@ -20,7 +20,10 @@ use lio_uring::{
 
 use crate::backend::{
   IoBackend, OpCompleted,
-  impls::unix_stat::file_type_from_dirent_dtype,
+  impls::{
+    iovec::fill_iovecs,
+    unix_stat::{file_type_from_dirent_dtype, file_type_from_mode},
+  },
   op::{DirEntryRef, LinkKind, Op, ReadDirResult, is_valid_file_offset},
 };
 use crate::slab::{Slab, SlabKey};
@@ -68,31 +71,18 @@ struct NativePathState {
 
 impl NativeMsgState {
   fn from_recv(msg: &crate::backend::op::MsgRecv) -> Option<Self> {
-    // The native iovec array is fixed-size; a longer list would make the
-    // kernel read past it.
-    if msg.buf_count.get() > crate::buf::MAX_IOV_COUNT {
-      return None;
-    }
-    // SAFETY: `MsgRecv` validation guarantees `bufs` points to `buf_count`
-    // live `RawBuf` entries for the duration of lowering.
-    let bufs = unsafe {
-      std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
-    };
+    // SAFETY: `MsgRecv` points at `buf_count` live `MsgBufMut` entries for
+    // the duration of lowering.
+    let iovecs = unsafe { fill_iovecs(msg.bufs, msg.buf_count.get()) }?;
     let mut state = Self {
-      iovecs: [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
-        crate::buf::MAX_IOV_COUNT],
-      iov_count: bufs.len(),
+      iovecs,
+      iov_count: msg.buf_count.get(),
       addr: None,
       from_out: msg.from,
       // SAFETY: `libc::msghdr` is a plain C struct and zero is a valid
       // sentinel initialization before we fill its pointer fields.
       hdr: unsafe { mem::zeroed() },
     };
-
-    for (dst, src) in state.iovecs.iter_mut().zip(bufs.iter()) {
-      dst.iov_base = src.ptr.as_ptr().cast();
-      dst.iov_len = src.len;
-    }
 
     if msg.from.is_some() {
       state.addr = Some((
@@ -107,33 +97,18 @@ impl NativeMsgState {
   }
 
   fn from_send(msg: &crate::backend::op::MsgSend) -> Option<Self> {
-    // The native iovec array is fixed-size; a longer list would make the
-    // kernel read past it.
-    if msg.buf_count.get() > crate::buf::MAX_IOV_COUNT {
-      return None;
-    }
-    // SAFETY: `MsgSend` validation guarantees `bufs` points to `buf_count`
-    // live `RawBuf` entries for the duration of lowering.
-    let bufs = unsafe {
-      std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
-    };
-    let mut state = Self {
-      iovecs: [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
-        crate::buf::MAX_IOV_COUNT],
-      iov_count: bufs.len(),
+    // SAFETY: `MsgSend` points at `buf_count` live `MsgBuf` entries for the
+    // duration of lowering.
+    let iovecs = unsafe { fill_iovecs(msg.bufs, msg.buf_count.get()) }?;
+    Some(Self {
+      iovecs,
+      iov_count: msg.buf_count.get(),
       addr: msg.to.map(crate::backend::impls::sockaddr::socket_addr_to_storage),
       from_out: None,
       // SAFETY: `libc::msghdr` is a plain C struct and zero is a valid
       // sentinel initialization before we fill its pointer fields.
       hdr: unsafe { mem::zeroed() },
-    };
-
-    for (dst, src) in state.iovecs.iter_mut().zip(bufs.iter()) {
-      dst.iov_base = src.ptr.as_ptr().cast();
-      dst.iov_len = src.len;
-    }
-
-    Some(state)
+    })
   }
 
   fn refresh_pointers(&mut self) {
@@ -182,24 +157,9 @@ impl NativeRwState {
     iovecs: std::ptr::NonNull<B>,
     iov_count: usize,
   ) -> Option<Self> {
-    // The native iovec array is fixed-size; a longer list would make the
-    // kernel read past it.
-    if iov_count > crate::buf::MAX_IOV_COUNT {
-      return None;
-    }
-    // SAFETY: op validation guarantees `iovecs` references `iov_count`
-    // contiguous `RawBuf` entries that stay live through lowering.
-    let raws =
-      unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) };
-    let mut state = Self {
-      iovecs: [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
-        crate::buf::MAX_IOV_COUNT],
-    };
-    for (dst, src) in state.iovecs.iter_mut().zip(raws.iter()) {
-      dst.iov_base = src.bytes_ptr().cast();
-      dst.iov_len = src.bytes_len();
-    }
-    Some(state)
+    // SAFETY: the op's descriptor array stays live through lowering.
+    let iovecs = unsafe { fill_iovecs(iovecs, iov_count) }?;
+    Some(Self { iovecs })
   }
 }
 
@@ -243,20 +203,7 @@ impl NativeStatState {
   }
 
   fn finalize(&self) {
-    let file_type = match self.statx.stx_mode & libc::S_IFMT as u16 {
-      x if x == libc::S_IFREG as u16 => crate::backend::op::FileType::File,
-      x if x == libc::S_IFDIR as u16 => crate::backend::op::FileType::Directory,
-      x if x == libc::S_IFLNK as u16 => crate::backend::op::FileType::Symlink,
-      x if x == libc::S_IFBLK as u16 => {
-        crate::backend::op::FileType::BlockDevice
-      }
-      x if x == libc::S_IFCHR as u16 => {
-        crate::backend::op::FileType::CharDevice
-      }
-      x if x == libc::S_IFIFO as u16 => crate::backend::op::FileType::Fifo,
-      x if x == libc::S_IFSOCK as u16 => crate::backend::op::FileType::Socket,
-      _ => crate::backend::op::FileType::Unknown,
-    };
+    let file_type = file_type_from_mode(self.statx.stx_mode as u32);
 
     // SAFETY: `out` was provided by the caller as writable output storage and
     // remains valid until the operation is finalized.

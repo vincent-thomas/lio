@@ -18,16 +18,6 @@
 //! # Constants
 //!
 //! - [`MAX_IOV_COUNT`]: Maximum number of buffers for vectored I/O (16).
-//!
-//! # Feature `zeroize`
-//!
-//! When the `zeroize` feature is enabled, buffers can be
-//! automatically and securely zeroed out on drop. This provides
-//! defense-in-depth against memory disclosure vulnerabilities by ensuring sensitive
-//! data doesn't persist in pooled buffers.
-//!
-//! This uses the [`zeroize`](https://docs.rs/zeroize) crate, which guarantees that
-//! compiler optimizations won't eliminate the zeroing operation.
 
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;

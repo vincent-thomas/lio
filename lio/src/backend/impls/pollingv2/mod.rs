@@ -80,28 +80,16 @@ pub(crate) trait ReadinessPoll {
   /// Extract the key from a native event
   fn event_key(event: &Self::NativeEvent) -> u64;
 
-  /// Extract the interest from a native event
+  /// Interest the kernel reported for this event.
+  ///
+  /// The backend does not branch on it. A registration is one operation,
+  /// and any event for its key means that operation should run. The poller
+  /// tests read this to lock what epoll and kqueue report.
+  #[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "read by the poller contract tests")
+  )]
   fn event_interest(event: &Self::NativeEvent) -> Interest;
-
-  /// Extract fflags from a native event (kqueue VNODE events).
-  /// Returns 0 on platforms that don't support fflags.
-  fn event_fflags(_event: &Self::NativeEvent) -> u32 {
-    0
-  }
-}
-
-/// Represents a readiness event from the poller
-#[derive(Debug, Clone, Copy)]
-pub struct Event {
-  /// User-provided key to identify this event
-  #[allow(dead_code)]
-  pub key: u64,
-  /// The interest flags that triggered (what actually happened)
-  #[allow(dead_code)]
-  pub interest: Interest,
-  /// For VNODE events (kqueue): the fflags indicating what changed
-  #[allow(dead_code)]
-  pub fflags: u32,
 }
 
 type LoweredMsg = (
@@ -154,13 +142,9 @@ impl Events {
     unsafe { self.events.set_len(len) }
   }
 
-  fn pop(&mut self) -> Option<Event> {
+  fn pop_key(&mut self) -> Option<u64> {
     let native_event = self.events.pop()?;
-    let key = sys::OsPoller::event_key(&native_event);
-    let interest = sys::OsPoller::event_interest(&native_event);
-    let fflags = sys::OsPoller::event_fflags(&native_event);
-
-    Some(Event { key, interest, fflags })
+    Some(sys::OsPoller::event_key(&native_event))
   }
 }
 
@@ -405,46 +389,11 @@ impl Poller {
     crate::backend::impls::sockaddr::socket_addr_buf_from_storage(storage, len)
   }
 
-  fn lower_raw_iovecs<B: crate::backend::op::ByteSpan>(
-    iovecs: std::ptr::NonNull<B>,
-    iov_count: usize,
-  ) -> Option<[libc::iovec; crate::buf::MAX_IOV_COUNT]> {
-    // The native iovec array is fixed-size; a longer list would make the
-    // kernel read past it.
-    if iov_count > crate::buf::MAX_IOV_COUNT {
-      return None;
-    }
-    // SAFETY: `iovecs` points to `iov_count` valid `RawBuf` entries.
-    let raws =
-      unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) };
-    let mut native =
-      [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
-        crate::buf::MAX_IOV_COUNT];
-    for (dst, src) in native.iter_mut().zip(raws.iter()) {
-      dst.iov_base = src.bytes_ptr().cast();
-      dst.iov_len = src.bytes_len();
-    }
-    Some(native)
-  }
-
   fn lower_recv_msg(msg: &MsgRecv) -> Option<LoweredMsg> {
-    // The native iovec array is fixed-size; a longer list would make the
-    // kernel read past it.
-    if msg.buf_count.get() > crate::buf::MAX_IOV_COUNT {
-      return None;
-    }
-    // SAFETY: `msg.bufs` points to `msg.buf_count` valid `MsgBufMut` items.
-    let bufs = unsafe {
-      std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
-    };
-    let mut iovecs =
-      [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
-        crate::buf::MAX_IOV_COUNT];
-
-    for (dst, src) in iovecs.iter_mut().zip(bufs.iter()) {
-      dst.iov_base = src.ptr.as_ptr().cast();
-      dst.iov_len = src.len;
-    }
+    // SAFETY: `msg.bufs` points at `buf_count` live `MsgBufMut` entries.
+    let iovecs = unsafe {
+      crate::backend::impls::iovec::fill_iovecs(msg.bufs, msg.buf_count.get())
+    }?;
 
     let addr = if msg.from.is_some() {
       Some((
@@ -469,23 +418,10 @@ impl Poller {
   }
 
   fn lower_send_msg(msg: &MsgSend) -> Option<LoweredMsg> {
-    // The native iovec array is fixed-size; a longer list would make the
-    // kernel read past it.
-    if msg.buf_count.get() > crate::buf::MAX_IOV_COUNT {
-      return None;
-    }
-    // SAFETY: `msg.bufs` points to `msg.buf_count` valid `MsgBuf` items.
-    let bufs = unsafe {
-      std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
-    };
-    let mut iovecs =
-      [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
-        crate::buf::MAX_IOV_COUNT];
-
-    for (dst, src) in iovecs.iter_mut().zip(bufs.iter()) {
-      dst.iov_base = src.ptr.as_ptr().cast();
-      dst.iov_len = src.len;
-    }
+    // SAFETY: `msg.bufs` points at `buf_count` live `MsgBuf` entries.
+    let iovecs = unsafe {
+      crate::backend::impls::iovec::fill_iovecs(msg.bufs, msg.buf_count.get())
+    }?;
 
     let addr =
       msg.to.map(crate::backend::impls::sockaddr::socket_addr_to_storage);
@@ -732,8 +668,10 @@ impl Poller {
 
     match op {
       Op::Read { fd, iovecs, iov_count, offset, flags: _ } => {
-        let Some(native_iovecs) = Self::lower_raw_iovecs(*iovecs, *iov_count)
-        else {
+        // SAFETY: the op's descriptor array stays live until this syscall returns.
+        let Some(native_iovecs) = (unsafe {
+          crate::backend::impls::iovec::fill_iovecs(*iovecs, *iov_count)
+        }) else {
           return -(libc::EINVAL as isize);
         };
         Self::do_readv(
@@ -745,8 +683,10 @@ impl Poller {
       }
 
       Op::Write { fd, iovecs, iov_count, offset, flags } => {
-        let Some(native_iovecs) = Self::lower_raw_iovecs(*iovecs, *iov_count)
-        else {
+        // SAFETY: the op's descriptor array stays live until this syscall returns.
+        let Some(native_iovecs) = (unsafe {
+          crate::backend::impls::iovec::fill_iovecs(*iovecs, *iov_count)
+        }) else {
           return -(libc::EINVAL as isize);
         };
         Self::do_writev(
@@ -1337,8 +1277,8 @@ unsafe impl IoBackend for Poller {
       unsafe { self.events.set_len(event_count) };
     }
 
-    while let Some(event) = self.events.pop() {
-      let key = SlabKey::from_u64(event.key);
+    while let Some(key) = self.events.pop_key() {
+      let key = SlabKey::from_u64(key);
       let Some(entry) = self.pending.remove_value(key) else {
         continue; // Cancelled or doesn't exist
       };
