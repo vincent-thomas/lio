@@ -227,7 +227,9 @@ unsafe fn touch(op: &Op) {
   match op {
     Op::Read { iovecs, iov_count, .. } => {
       // SAFETY: the caller guarantees the descriptor array is valid.
-      let bufs = unsafe { raw_parts(iovecs.as_ptr(), *iov_count) };
+      // A shared borrow inspects each descriptor. It does not copy one.
+      let bufs =
+        unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), *iov_count) };
       for buf in bufs {
         // SAFETY: the caller guarantees the buffer is valid for writes.
         unsafe { ptr::write_bytes(buf.ptr, POISON, buf.len) };

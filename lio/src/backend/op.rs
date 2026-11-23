@@ -470,7 +470,12 @@ unsafe impl Sync for RawBuf<'_> {}
 ///
 /// A read submits this. The memory may be uninitialized. A shared `&[u8]`
 /// cannot construct it, so a read cannot target read-only memory.
-#[derive(Clone, Copy, Debug)]
+///
+/// The descriptor is not `Copy` or `Clone`. Copying it would let two
+/// operations write the same bytes. It is `Send` and not `Sync`, like
+/// `&mut [u8]`: the owner may move it to another thread, and a shared
+/// reference may not.
+#[derive(Debug)]
 pub struct RawBufMut<'a> {
   pub(crate) ptr: *mut u8,
   pub(crate) len: usize,
@@ -498,19 +503,19 @@ impl<'a> RawBufMut<'a> {
 
   /// The address of the bytes.
   #[inline]
-  pub const fn as_ptr(self) -> *mut u8 {
+  pub const fn as_ptr(&self) -> *mut u8 {
     self.ptr
   }
 
   /// The number of bytes.
   #[inline]
-  pub const fn len(self) -> usize {
+  pub const fn len(&self) -> usize {
     self.len
   }
 
   /// Whether the descriptor covers no bytes.
   #[inline]
-  pub const fn is_empty(self) -> bool {
+  pub const fn is_empty(&self) -> bool {
     self.len == 0
   }
 
@@ -530,11 +535,10 @@ impl<'a> RawBufMut<'a> {
   }
 }
 
-// SAFETY: the descriptor is a pointer and a length. Sending it does not
-// move the bytes. The owner of those bytes is `Send`.
+// SAFETY: `RawBufMut` is a unique borrow of the bytes, like `&mut [u8]`.
+// Moving that borrow to another thread does not create an alias. A shared
+// reference must not cross threads, so this type is not `Sync`.
 unsafe impl Send for RawBufMut<'_> {}
-// SAFETY: sharing the descriptor does not alias the bytes by itself.
-unsafe impl Sync for RawBufMut<'_> {}
 
 /// Pointer and length shared by [`RawBuf`] and [`RawBufMut`].
 pub(crate) trait ByteSpan {
