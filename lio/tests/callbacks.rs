@@ -267,13 +267,17 @@ impl lio::backend::IoBackend for InOrderBackend {
   fn push(
     &mut self,
     id: u64,
-    _op: lio::backend::InFlight<'_>,
+    _keep: lio::backend::Keep,
+    _loan: &mut dyn lio::backend::loan::Loan,
     _step_bump: &mut bumpalo::Bump,
   ) {
     self.queued.push(id);
   }
 
-  fn flush(&mut self) -> std::io::Result<()> {
+  fn flush(
+    &mut self,
+    _loan: &mut dyn lio::backend::loan::Loan,
+  ) -> std::io::Result<()> {
     Ok(())
   }
 
@@ -281,6 +285,7 @@ impl lio::backend::IoBackend for InOrderBackend {
     &mut self,
     timeout: Option<Duration>,
     completed: &mut Vec<lio::backend::OpCompleted>,
+    _loan: &mut dyn lio::backend::loan::Loan,
   ) -> std::io::Result<()> {
     completed.clear();
     if self.queued.is_empty() {

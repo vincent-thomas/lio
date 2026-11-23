@@ -102,14 +102,19 @@ impl IoBackend for BenchBackend {
   fn push(
     &mut self,
     id: u64,
-    op: lio::backend::InFlight<'_>,
+    _keep: lio::backend::Keep,
+    loan: &mut dyn lio::backend::loan::Loan,
     _step_bump: &mut Bump,
   ) {
-    let result = match op.as_op() {
-      Op::Nop => 0,
-      Op::Read { .. } => BUFFER_LEN as isize,
-      _ => panic!("bench backend only supports nop and read"),
-    };
+    let mut result = 0;
+    loan.lend(id, &mut |view| {
+      // SAFETY: the bench only matches the variant. It does not keep the address.
+      result = match unsafe { view.kernel() } {
+        Op::Nop => 0,
+        Op::Read { .. } => BUFFER_LEN as isize,
+        _ => panic!("bench backend only supports nop and read"),
+      };
+    });
     if self.hold {
       let slot = id as u32 as usize;
       assert!(
@@ -127,7 +132,7 @@ impl IoBackend for BenchBackend {
     }
   }
 
-  fn flush(&mut self) -> io::Result<()> {
+  fn flush(&mut self, _: &mut dyn lio::backend::loan::Loan) -> io::Result<()> {
     if self.hold {
       for state in &mut self.slots {
         if *state == SLOT_QUEUED {
@@ -165,6 +170,7 @@ impl IoBackend for BenchBackend {
     &mut self,
     _timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
+    _: &mut dyn lio::backend::loan::Loan,
   ) -> io::Result<()> {
     completed.clear();
     completed.extend(
@@ -190,14 +196,19 @@ fn no_driver(criterion: &mut Criterion) {
         bencher.iter(|| {
           for id in 0..depth as u64 {
             // SAFETY: a no-op borrows nothing.
-            backend.push(
-              id,
-              unsafe { lio::backend::InFlight::attest(BorrowedOp::nop()) },
-              &mut bump,
-            );
+            let flight =
+              unsafe { lio::backend::InFlight::attest(BorrowedOp::nop()) };
+            let mut loan = flight.loan();
+            backend.push(id, flight.keep(), &mut loan, &mut bump);
           }
-          backend.flush().unwrap();
-          backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+          backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
+          backend
+            .wait(
+              Some(Duration::ZERO),
+              &mut completed,
+              &mut crate::backend::loan::Attested::new(),
+            )
+            .unwrap();
           assert_eq!(completed.len(), depth);
           black_box(&completed);
         });

@@ -44,10 +44,9 @@ use crate::api::resource::Resource;
 #[cfg(test)]
 use crate::backend::op::SendFlags;
 use crate::backend::op::{
-  self, BorrowedOp, DirEntryRef, FileStat, FileType, MsgRecv, MsgSend, Op,
-  OpaqueDropFn, OpenFlags, RawBuf, ReadDirResult, ReadFlags, RecvFlags,
-  ShutdownHow, SockDomain, SockProto, SockType, SocketAddrBuf,
-  SocketAddrFamily, UnlinkKind,
+  self, DirEntryRef, FileStat, FileType, MsgRecv, MsgSend, Op, OpaqueDropFn,
+  OpenFlags, RawBuf, ReadDirResult, ReadFlags, RecvFlags, ShutdownHow,
+  SockDomain, SockProto, SockType, SocketAddrBuf, SocketAddrFamily, UnlinkKind,
 };
 use crate::backend::{IoBackend, OpCompleted};
 use crate::{Lio, install_global};
@@ -2707,10 +2706,17 @@ impl IoBackend for DSBackend {
   fn push(
     &mut self,
     id: u64,
-    op: crate::backend::InFlight<'_>,
+    keep: crate::backend::Keep,
+    loan: &mut dyn crate::backend::loan::Loan,
     _step_bump: &mut Bump,
   ) {
-    let (op, keep) = op.into_parts();
+    let mut op = None;
+    loan.lend(id, &mut |view| {
+      // SAFETY: the simulator is the kernel for these bytes. It keeps the
+      // copy until it completes the operation, then drops it.
+      op = Some(unsafe { view.kernel() }.clone());
+    });
+    let Some(op) = op else { unreachable!("lend runs the callback") };
     self.assert_initialized();
     self.assert_capacity();
     self.queued.push((id, op, keep));
@@ -2743,7 +2749,10 @@ impl IoBackend for DSBackend {
     true
   }
 
-  fn flush(&mut self) -> io::Result<()> {
+  fn flush(
+    &mut self,
+    _loan: &mut dyn crate::backend::loan::Loan,
+  ) -> io::Result<()> {
     self.assert_initialized();
     let queued = mem::take(&mut self.queued);
     for (id, op, keep) in queued {
@@ -2783,6 +2792,7 @@ impl IoBackend for DSBackend {
     &mut self,
     timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
+    _loan: &mut dyn crate::backend::loan::Loan,
   ) -> io::Result<()> {
     self.assert_initialized();
     completed.clear();
@@ -4011,16 +4021,12 @@ impl DSTBackend {
         // SAFETY: `other` was accepted by `push` and stays in flight here.
         // The same lease goes with it. A new lease would let the driver free
         // the model while the local backend still holds these addresses.
-        let borrowed = unsafe { BorrowedOp::from_op(other) };
+        let mut loan = crate::backend::loan::PushLoan::any(&other);
         self
           .local
           .as_mut()
           .expect("non-network DST backend op requires local backend")
-          .push(
-            id,
-            crate::backend::InFlight::from_model(borrowed, keep),
-            &mut Bump::new(),
-          );
+          .push(id, keep, &mut loan, &mut Bump::new());
       }
     }
   }
@@ -4054,10 +4060,15 @@ impl IoBackend for DSTBackend {
   fn push(
     &mut self,
     id: u64,
-    op: crate::backend::InFlight<'_>,
+    keep: crate::backend::Keep,
+    loan: &mut dyn crate::backend::loan::Loan,
     step_bump: &mut Bump,
   ) {
-    let (stored, keep) = op.into_parts();
+    let mut stored = None;
+    loan.lend(id, &mut |view| {
+      stored = Some(unsafe { view.kernel() }.clone());
+    });
+    let Some(stored) = stored else { unreachable!("lend runs the callback") };
     let use_network = match &stored {
       Op::Socket { .. } => true,
       Op::Bind { fd, .. }
@@ -4081,16 +4092,12 @@ impl IoBackend for DSTBackend {
     } else {
       // SAFETY: `stored` was just taken from this `InFlight`. The same lease
       // goes with it into the local backend.
-      let borrowed = unsafe { BorrowedOp::from_op(stored) };
+      let mut loan = crate::backend::loan::PushLoan::any(&stored);
       self
         .local
         .as_mut()
         .expect("non-network DST backend push requires local backend")
-        .push(
-          id,
-          crate::backend::InFlight::from_model(borrowed, keep),
-          step_bump,
-        );
+        .push(id, keep, &mut loan, step_bump);
     }
   }
 
@@ -4117,12 +4124,15 @@ impl IoBackend for DSTBackend {
     }
   }
 
-  fn flush(&mut self) -> io::Result<()> {
+  fn flush(
+    &mut self,
+    loan: &mut dyn crate::backend::loan::Loan,
+  ) -> io::Result<()> {
     self
       .local
       .as_mut()
       .expect("DST backend flush requires local backend")
-      .flush()?;
+      .flush(loan)?;
     let queued = mem::take(&mut self.queued);
     if !queued.is_empty() {
       self.node.borrow_mut().outgoing.extend(queued);
@@ -4135,6 +4145,7 @@ impl IoBackend for DSTBackend {
     &mut self,
     _timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
+    loan: &mut dyn crate::backend::loan::Loan,
   ) -> io::Result<()> {
     completed.clear();
     self.drain_node_ready(completed);
@@ -4144,7 +4155,7 @@ impl IoBackend for DSTBackend {
       .local
       .as_mut()
       .expect("DST backend wait requires local backend")
-      .wait(Some(Duration::ZERO), &mut local_completed)?;
+      .wait(Some(Duration::ZERO), &mut local_completed, loan)?;
     completed.append(&mut local_completed);
     Ok(())
   }
@@ -4157,16 +4168,15 @@ impl IoBackend for DSTBackend {
 
 #[cfg(test)]
 mod tests {
+  use crate::backend::op::BorrowedOp;
+
   fn submit(backend: &mut impl IoBackend, id: u64, op: Op, bump: &mut Bump) {
     // SAFETY: these tests keep every buffer named by `op` alive until the
     // backend reports the completion.
-    unsafe {
-      backend.push(
-        id,
-        crate::backend::InFlight::attest(BorrowedOp::from_op(op)),
-        bump,
-      )
-    };
+    let flight =
+      unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
+    let mut loan = flight.loan();
+    backend.push(id, flight.keep(), &mut loan, bump);
   }
 
   #[test]
@@ -4184,14 +4194,17 @@ mod tests {
       );
       // SAFETY: `drain` below drops the queued operation before `iov` and
       // `bytes` are released.
-      unsafe {
-        backend.push(1, crate::backend::InFlight::attest(op), &mut Bump::new())
-      };
+      let flight = unsafe { crate::backend::InFlight::attest(op) };
+      let mut loan = flight.loan();
+      backend.push(1, flight.keep(), &mut loan, &mut Bump::new());
       assert!(backend.drain());
     }
-    backend.flush().unwrap();
+    let mut loan = crate::backend::loan::Attested::new();
+    backend.flush(&mut loan).unwrap();
     let mut completed = Vec::new();
-    backend.wait(Some(std::time::Duration::ZERO), &mut completed).unwrap();
+    backend
+      .wait(Some(std::time::Duration::ZERO), &mut completed, &mut loan)
+      .unwrap();
     assert!(completed.is_empty());
     assert_eq!(bytes, [1u8; 4]);
   }
@@ -4346,13 +4359,15 @@ mod tests {
     let mut step_b = Bump::new();
     submit(&mut a, 1, Op::Nop, &mut step_a);
     submit(&mut b, 1, Op::Nop, &mut step_b);
-    a.flush().unwrap();
-    b.flush().unwrap();
+    a.flush(&mut crate::backend::loan::Attested::new()).unwrap();
+    b.flush(&mut crate::backend::loan::Attested::new()).unwrap();
 
     let mut done_a = Vec::new();
     let mut done_b = Vec::new();
-    a.wait(None, &mut done_a).unwrap();
-    b.wait(None, &mut done_b).unwrap();
+    a.wait(None, &mut done_a, &mut crate::backend::loan::Attested::new())
+      .unwrap();
+    b.wait(None, &mut done_b, &mut crate::backend::loan::Attested::new())
+      .unwrap();
 
     assert_eq!(done_a.len(), 1);
     assert_eq!(done_b.len(), 1);
@@ -4377,10 +4392,12 @@ mod tests {
       Op::GetCwd { out: NonNull::from(&mut out) },
       &mut step_bump,
     );
-    backend.flush().unwrap();
+    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
 
     let mut completed = Vec::new();
-    backend.wait(None, &mut completed).unwrap();
+    backend
+      .wait(None, &mut completed, &mut crate::backend::loan::Attested::new())
+      .unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].result(), 0);
     #[cfg(unix)]
@@ -4410,10 +4427,12 @@ mod tests {
       Op::Recv { fd: Resource::stdin(), msg, flags: RecvFlags::empty() },
       &mut step_bump,
     );
-    backend.flush().unwrap();
+    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
 
     let mut completed = Vec::new();
-    backend.wait(None, &mut completed).unwrap();
+    backend
+      .wait(None, &mut completed, &mut crate::backend::loan::Attested::new())
+      .unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].result(), -(errno::ENOTSUP as isize));
   }
@@ -4445,10 +4464,16 @@ mod tests {
       Op::Recv { fd: socket, msg, flags: RecvFlags::empty() },
       &mut step_bump,
     );
-    backend.flush().unwrap();
+    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
 
     let mut completed = Vec::new();
-    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    backend
+      .wait(
+        Some(Duration::ZERO),
+        &mut completed,
+        &mut crate::backend::loan::Attested::new(),
+      )
+      .unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].result(), -(errno::ENOTSUP as isize));
   }
@@ -4502,10 +4527,16 @@ mod tests {
       Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
     );
-    backend.flush().unwrap();
+    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
 
     let mut send_done = Vec::new();
-    backend.wait(Some(Duration::ZERO), &mut send_done).unwrap();
+    backend
+      .wait(
+        Some(Duration::ZERO),
+        &mut send_done,
+        &mut crate::backend::loan::Attested::new(),
+      )
+      .unwrap();
     assert_eq!(send_done.len(), 1);
     let sent = send_done[0].result();
     assert!(sent > 0);
@@ -4520,10 +4551,16 @@ mod tests {
       Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
     );
-    backend.flush().unwrap();
+    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
 
     let mut recv_done = Vec::new();
-    backend.wait(Some(Duration::ZERO), &mut recv_done).unwrap();
+    backend
+      .wait(
+        Some(Duration::ZERO),
+        &mut recv_done,
+        &mut crate::backend::loan::Attested::new(),
+      )
+      .unwrap();
     assert_eq!(recv_done.len(), 1);
     let recv_len = recv_done[0].result() as usize;
     assert!(recv_len > 0);
@@ -4569,9 +4606,15 @@ mod tests {
     let mut bump = Bump::new();
     let mut run = |id, op| {
       submit(&mut backend, id, op, &mut bump);
-      backend.flush().unwrap();
+      backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
       let mut done = Vec::new();
-      backend.wait(Some(Duration::ZERO), &mut done).unwrap();
+      backend
+        .wait(
+          Some(Duration::ZERO),
+          &mut done,
+          &mut crate::backend::loan::Attested::new(),
+        )
+        .unwrap();
       assert_eq!(done.len(), 1);
       done[0].result()
     };
@@ -4652,10 +4695,16 @@ mod tests {
       Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
     );
-    backend.flush().unwrap();
+    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
 
     let mut completed = Vec::new();
-    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    backend
+      .wait(
+        Some(Duration::ZERO),
+        &mut completed,
+        &mut crate::backend::loan::Attested::new(),
+      )
+      .unwrap();
     assert!(
       completed.is_empty(),
       "connected empty recv should pend until bytes are delivered"
@@ -4671,13 +4720,25 @@ mod tests {
       Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
     );
-    backend.flush().unwrap();
+    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
 
-    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    backend
+      .wait(
+        Some(Duration::ZERO),
+        &mut completed,
+        &mut crate::backend::loan::Attested::new(),
+      )
+      .unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].registration_id(), 2);
 
-    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    backend
+      .wait(
+        Some(Duration::ZERO),
+        &mut completed,
+        &mut crate::backend::loan::Attested::new(),
+      )
+      .unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].registration_id(), 1);
     let recv_len = completed[0].result() as usize;
@@ -4743,10 +4804,16 @@ mod tests {
       Op::Connect { fd: client, addr: op::socket_addr_into_buf(connect_addr) },
       &mut connect_bump,
     );
-    backend.flush().unwrap();
+    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
 
     let mut completed = Vec::new();
-    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    backend
+      .wait(
+        Some(Duration::ZERO),
+        &mut completed,
+        &mut crate::backend::loan::Attested::new(),
+      )
+      .unwrap();
     assert_eq!(completed.len(), 2);
     let mut saw_accept = false;
     let mut saw_connect = false;
@@ -4816,7 +4883,7 @@ mod tests {
       Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
     );
-    backend.flush().unwrap();
+    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
 
     let after_flush = backend.progress_snapshot();
     assert_eq!(after_flush.queued, 0);
@@ -4885,13 +4952,25 @@ mod tests {
       Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
     );
-    backend.flush().unwrap();
+    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
 
     let mut completed = Vec::new();
-    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    backend
+      .wait(
+        Some(Duration::ZERO),
+        &mut completed,
+        &mut crate::backend::loan::Attested::new(),
+      )
+      .unwrap();
     assert!(!backend.is_quiescent());
 
-    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    backend
+      .wait(
+        Some(Duration::ZERO),
+        &mut completed,
+        &mut crate::backend::loan::Attested::new(),
+      )
+      .unwrap();
     let final_snapshot = backend.progress_snapshot();
     assert_eq!(final_snapshot.pending, 0);
     assert_eq!(final_snapshot.scheduled_events, 0);
@@ -5427,10 +5506,12 @@ mod tests {
       },
       &mut step_bump,
     );
-    backend.flush().unwrap();
+    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
 
     let mut completed = Vec::new();
-    backend.wait(None, &mut completed).unwrap();
+    backend
+      .wait(None, &mut completed, &mut crate::backend::loan::Attested::new())
+      .unwrap();
     assert_eq!(completed.len(), 1);
     assert!(completed[0].result() >= 0);
   }
@@ -5496,11 +5577,17 @@ mod tests {
 
     let fd = dst_resource(91);
     submit(&mut backend, 1, Op::Fsync { fd }, &mut Bump::new());
-    backend.flush().unwrap();
+    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
     assert!(dst.step());
 
     let mut completed = Vec::new();
-    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    backend
+      .wait(
+        Some(Duration::ZERO),
+        &mut completed,
+        &mut crate::backend::loan::Attested::new(),
+      )
+      .unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].result(), -(errno::EINVAL as isize));
   }

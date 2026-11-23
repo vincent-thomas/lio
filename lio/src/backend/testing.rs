@@ -47,7 +47,7 @@ struct Script {
   /// Every id ever pushed, in push order.
   pushed: Vec<u64>,
   /// Pushed and not yet completed, in push order.
-  in_flight: Vec<(u64, Op)>,
+  in_flight: Vec<(u64, Op, Vec<Kern>)>,
   /// Leases for `in_flight`, dropped with those operations.
   keeps: HashMap<u64, crate::backend::Keep>,
   cancelled: Vec<u64>,
@@ -111,13 +111,17 @@ impl ScriptedBackend {
 
   /// Ids pushed and not yet completed, in push order.
   pub fn in_flight(&self) -> Vec<u64> {
-    self.0.borrow().in_flight.iter().map(|(id, _)| *id).collect()
+    self.0.borrow().in_flight.iter().map(|(id, _, _)| *id).collect()
   }
 
   /// The operation `id` was pushed with, while it is in flight.
   pub fn op(&self, id: u64) -> Option<Op> {
     let script = self.0.borrow();
-    script.in_flight.iter().find(|(i, _)| *i == id).map(|(_, op)| op.clone())
+    script
+      .in_flight
+      .iter()
+      .find(|(i, _, _)| *i == id)
+      .map(|(_, op, _)| op.clone())
   }
 
   /// Every id the driver asked to cancel, in order.
@@ -134,15 +138,17 @@ impl ScriptedBackend {
   /// real backend could produce.
   pub fn complete(&self, id: u64, result: isize) {
     let mut script = self.0.borrow_mut();
-    let Some(pos) = script.in_flight.iter().position(|(i, _)| *i == id) else {
+    let Some(pos) = script.in_flight.iter().position(|(i, _, _)| *i == id)
+    else {
       panic!("ScriptedBackend::complete: operation {id} is not in flight");
     };
-    let (_, op) = script.in_flight.remove(pos);
+    let (_, _, bufs) = script.in_flight.remove(pos);
     script.keeps.remove(&id);
     if !script.no_poison {
-      // SAFETY: the operation is still in flight, so the driver keeps the
-      // memory it points to valid until it sees this completion.
-      unsafe { touch(&op) };
+      // SAFETY: the addresses were copied into this record at push, which is
+      // the stand-in for a kernel buffer. The model stays pinned by `keep`
+      // until this point.
+      unsafe { touch_kern(&bufs) };
     }
     script.ready.push_back(OpCompleted::new(id, result));
   }
@@ -168,17 +174,30 @@ impl IoBackend for ScriptedBackend {
   fn push(
     &mut self,
     id: u64,
-    op: crate::backend::InFlight<'_>,
+    keep: crate::backend::Keep,
+    loan: &mut dyn crate::backend::loan::Loan,
     _step_bump: &mut Bump,
   ) {
-    let (op, keep) = op.into_parts();
+    let mut seen = None;
+    loan.lend(id, &mut |view| {
+      // SAFETY: the pointer is recorded as this test kernel's buffer, the
+      // way `iov_base` is. The stored `Op` has those pointers cleared.
+      let op = unsafe { view.kernel() };
+      seen = Some((scrub(op), kern_bufs(op)));
+    });
+    let Some((op, bufs)) = seen else {
+      unreachable!("lend runs the callback");
+    };
     let mut script = self.0.borrow_mut();
     script.pushed.push(id);
-    script.in_flight.push((id, op));
+    script.in_flight.push((id, op, bufs));
     script.keeps.insert(id, keep);
   }
 
-  fn flush(&mut self) -> io::Result<()> {
+  fn flush(
+    &mut self,
+    _loan: &mut dyn crate::backend::loan::Loan,
+  ) -> io::Result<()> {
     let auto = self.0.borrow().auto;
     if let Some(result) = auto {
       self.complete_all(result);
@@ -196,11 +215,11 @@ impl IoBackend for ScriptedBackend {
       return false;
     }
     script.keeps.clear();
-    for (_, op) in std::mem::take(&mut script.in_flight) {
+    for (_, _, bufs) in std::mem::take(&mut script.in_flight) {
       if !script.no_poison {
-        // SAFETY: a drained operation may still be finishing, so the driver
-        // keeps its memory valid until `drain` returns.
-        unsafe { touch(&op) };
+        // SAFETY: same as `complete`. Drain still means this backend is
+        // finished with the caller memory.
+        unsafe { touch_kern(&bufs) };
       }
     }
     script.ready.clear();
@@ -211,6 +230,7 @@ impl IoBackend for ScriptedBackend {
     &mut self,
     _timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
+    _loan: &mut dyn crate::backend::loan::Loan,
   ) -> io::Result<()> {
     completed.clear();
     completed.extend(self.0.borrow_mut().ready.drain(..));
@@ -228,6 +248,96 @@ impl IoBackend for ScriptedBackend {
 ///
 /// The memory `op` points to must be valid as the [`IoBackend`] contract
 /// requires for an operation in flight.
+struct Kern {
+  ptr: *mut u8,
+  len: usize,
+  write: bool,
+}
+
+fn kern_bufs(op: &Op) -> Vec<Kern> {
+  let mut out = Vec::new();
+  // SAFETY: descriptors are live for this lend.
+  unsafe { collect_kern(op, &mut out) };
+  out
+}
+
+unsafe fn collect_kern(op: &Op, out: &mut Vec<Kern>) {
+  match op {
+    Op::Read { iovecs, iov_count, .. } => {
+      let bufs =
+        unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), *iov_count) };
+      for buf in bufs {
+        out.push(Kern { ptr: buf.as_ptr(), len: buf.len(), write: true });
+      }
+    }
+    Op::Write { iovecs, iov_count, .. } => {
+      let bufs = unsafe { raw_parts(iovecs.as_ptr(), *iov_count) };
+      for buf in bufs {
+        out.push(Kern { ptr: buf.as_ptr(), len: buf.len(), write: false });
+      }
+    }
+    Op::Recv { msg, .. } => {
+      let bufs = unsafe {
+        raw_parts::<MsgBufMut>(msg.bufs.as_ptr(), msg.buf_count.get())
+      };
+      for buf in bufs {
+        out.push(Kern { ptr: buf.ptr.as_ptr(), len: buf.len, write: true });
+      }
+    }
+    Op::Send { msg, .. } => {
+      let bufs =
+        unsafe { raw_parts::<MsgBuf>(msg.bufs.as_ptr(), msg.buf_count.get()) };
+      for buf in bufs {
+        out.push(Kern { ptr: buf.ptr.as_ptr(), len: buf.len, write: false });
+      }
+    }
+    Op::ReadlinkAt { buf, buf_len, .. } => {
+      out.push(Kern { ptr: buf.as_ptr(), len: *buf_len, write: true });
+    }
+    Op::ReadDir { raw_buf, raw_cap, .. } => {
+      out.push(Kern { ptr: raw_buf.as_ptr(), len: *raw_cap, write: true });
+    }
+    _ => {}
+  }
+}
+
+fn scrub(op: &Op) -> Op {
+  let mut op = op.clone();
+  match &mut op {
+    Op::Read { iovecs, .. } => *iovecs = std::ptr::NonNull::dangling(),
+    Op::Write { iovecs, .. } => *iovecs = std::ptr::NonNull::dangling(),
+    Op::Recv { msg, .. } => {
+      msg.bufs = std::ptr::NonNull::dangling();
+      msg.from = None;
+    }
+    Op::Send { msg, .. } => msg.bufs = std::ptr::NonNull::dangling(),
+    Op::Stat { out, .. } => *out = std::ptr::NonNull::dangling(),
+    Op::ReadDir { raw_buf, entries, opaque, opaque_drop, out, .. } => {
+      *raw_buf = std::ptr::NonNull::dangling();
+      *entries = std::ptr::NonNull::dangling();
+      *opaque = std::ptr::NonNull::dangling();
+      *opaque_drop = std::ptr::NonNull::dangling();
+      *out = std::ptr::NonNull::dangling();
+    }
+    Op::Accept { addr, .. } => *addr = std::ptr::NonNull::dangling(),
+    Op::ReadlinkAt { buf, .. } => *buf = std::ptr::NonNull::dangling(),
+    Op::GetCwd { out } => *out = std::ptr::NonNull::dangling(),
+    _ => {}
+  }
+  op
+}
+
+unsafe fn touch_kern(bufs: &[Kern]) {
+  for buf in bufs {
+    if buf.write {
+      unsafe { ptr::write_bytes(buf.ptr, POISON, buf.len) };
+    } else {
+      unsafe { read_bytes(buf.ptr, buf.len) };
+    }
+  }
+}
+
+#[cfg(any())]
 unsafe fn touch(op: &Op) {
   match op {
     Op::Read { iovecs, iov_count, .. } => {
@@ -360,7 +470,8 @@ impl<B: IoBackend> IoBackend for Checked<B> {
   fn push(
     &mut self,
     id: u64,
-    op: crate::backend::InFlight<'_>,
+    keep: crate::backend::Keep,
+    loan: &mut dyn crate::backend::loan::Loan,
     step_bump: &mut Bump,
   ) {
     let cap = self.cap("push");
@@ -373,12 +484,15 @@ impl<B: IoBackend> IoBackend for Checked<B> {
       self.in_flight.insert(id),
       "contract: pushed operation {id} while it is still in flight"
     );
-    self.inner.push(id, op, step_bump);
+    self.inner.push(id, keep, loan, step_bump);
   }
 
-  fn flush(&mut self) -> io::Result<()> {
+  fn flush(
+    &mut self,
+    loan: &mut dyn crate::backend::loan::Loan,
+  ) -> io::Result<()> {
     self.cap("flush");
-    self.inner.flush()
+    self.inner.flush(loan)
   }
 
   fn cancel(&mut self, id: u64) {
@@ -398,9 +512,10 @@ impl<B: IoBackend> IoBackend for Checked<B> {
     &mut self,
     timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
+    loan: &mut dyn crate::backend::loan::Loan,
   ) -> io::Result<()> {
     self.cap("wait");
-    self.inner.wait(timeout, completed)?;
+    self.inner.wait(timeout, completed, loan)?;
     for done in completed.iter() {
       let id = done.registration_id();
       assert!(
@@ -433,13 +548,11 @@ mod tests {
   fn push_op(backend: &mut impl IoBackend, id: u64, op: Op) {
     // SAFETY: every buffer these tests submit stays alive until the backend
     // completes or drains the operation.
-    unsafe {
-      backend.push(
-        id,
-        crate::backend::InFlight::attest(BorrowedOp::from_op(op)),
-        &mut Bump::new(),
-      )
-    };
+    unsafe { crate::backend::loan::Attested::remember(id, &op) };
+    let flight =
+      unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
+    let mut loan = flight.loan();
+    backend.push(id, flight.keep(), &mut loan, &mut Bump::new());
   }
   use crate::backend::op::RawBuf;
 
@@ -452,7 +565,8 @@ mod tests {
 
   fn wait(backend: &mut impl IoBackend) -> Vec<u64> {
     let mut completed = Vec::new();
-    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    let mut loan = crate::backend::loan::Attested::new();
+    backend.wait(Some(Duration::ZERO), &mut completed, &mut loan).unwrap();
     completed.iter().map(|c| c.registration_id()).collect()
   }
 
@@ -461,7 +575,7 @@ mod tests {
     let (backend, mut checked) = init(4);
     push_op(&mut checked, 1, Op::Nop);
     push_op(&mut checked, 2, Op::Nop);
-    checked.flush().unwrap();
+    checked.flush(&mut crate::backend::loan::Attested::new()).unwrap();
     assert!(wait(&mut checked).is_empty());
 
     backend.complete(2, 0);
@@ -482,9 +596,15 @@ mod tests {
       push_op(&mut backend, id, Op::Nop);
     }
     assert!(wait(&mut backend).is_empty(), "nothing before the flush");
-    backend.flush().unwrap();
+    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
     let mut completed = Vec::new();
-    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    backend
+      .wait(
+        Some(Duration::ZERO),
+        &mut completed,
+        &mut crate::backend::loan::Attested::new(),
+      )
+      .unwrap();
     assert_eq!(
       completed
         .iter()
@@ -635,18 +755,23 @@ mod tests {
       fn push(
         &mut self,
         id: u64,
-        _: crate::backend::InFlight<'_>,
+        _: crate::backend::Keep,
+        _: &mut dyn crate::backend::loan::Loan,
         _: &mut Bump,
       ) {
         self.0 = Some(id);
       }
-      fn flush(&mut self) -> io::Result<()> {
+      fn flush(
+        &mut self,
+        _: &mut dyn crate::backend::loan::Loan,
+      ) -> io::Result<()> {
         Ok(())
       }
       fn wait(
         &mut self,
         _: Option<Duration>,
         completed: &mut Vec<OpCompleted>,
+        _: &mut dyn crate::backend::loan::Loan,
       ) -> io::Result<()> {
         completed.clear();
         completed.extend(self.0.map(|id| OpCompleted::new(id, 0)));

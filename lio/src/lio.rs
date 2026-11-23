@@ -304,11 +304,10 @@ impl Lio {
       reg.with_action(&mut |action| match action {
         Action::Io(op) => {
           step_bump.reset();
-          io.push(
-            id,
-            crate::backend::InFlight::from_model(op, keep.clone()),
-            step_bump,
-          );
+          let flight = crate::backend::InFlight::from_model(op, keep.clone());
+          let mut loan =
+            crate::backend::loan::PushLoan::new(id, flight.as_op());
+          io.push(id, flight.keep(), &mut loan, step_bump);
         }
         Action::Sleep(duration) => time.schedule(id, duration),
       })
@@ -468,11 +467,11 @@ impl Lio {
           match action {
             Action::Io(op) => {
               step_bump.reset();
-              io.push(
-                id,
-                crate::backend::InFlight::from_model(op, keep.clone()),
-                step_bump,
-              );
+              let flight =
+                crate::backend::InFlight::from_model(op, keep.clone());
+              let mut loan =
+                crate::backend::loan::PushLoan::new(id, flight.as_op());
+              io.push(id, flight.keep(), &mut loan, step_bump);
             }
             Action::Sleep(duration) => time.schedule(id, duration),
           }
@@ -760,7 +759,10 @@ impl Lio {
     let mut stats = LioProfile::default();
     let inner_ref = &mut *inner;
 
-    timed!(PROFILE, stats, flush_time, inner_ref.io.flush())?;
+    timed!(PROFILE, stats, flush_time, {
+      let (io, store) = (&mut inner_ref.io, &mut inner_ref.store);
+      io.flush(store)
+    })?;
 
     // Work already queued is ready now; don't block on the backend first.
     let queued =
@@ -777,9 +779,11 @@ impl Lio {
     };
 
     inner_ref.completed.clear();
-    let (io, completed) = (&mut inner_ref.io, &mut inner_ref.completed);
-    let waited =
-      timed!(PROFILE, stats, wait_time, io.wait(effective_timeout, completed));
+    let waited = timed!(PROFILE, stats, wait_time, {
+      let (io, store, completed) =
+        (&mut inner_ref.io, &mut inner_ref.store, &mut inner_ref.completed);
+      io.wait(effective_timeout, completed, store)
+    });
     // Queue what the backend reported even if it then failed, so those
     // operations are not lost.
     inner_ref.ready_io.extend(inner_ref.completed.drain(..));
@@ -1221,16 +1225,26 @@ mod tests {
     fn init(&mut self, _: usize) -> io::Result<()> {
       Ok(())
     }
-    fn push(&mut self, id: u64, _: crate::backend::InFlight<'_>, _: &mut Bump) {
+    fn push(
+      &mut self,
+      id: u64,
+      _: crate::backend::Keep,
+      _: &mut dyn crate::backend::loan::Loan,
+      _: &mut Bump,
+    ) {
       self.0.extend([id, id]);
     }
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(
+      &mut self,
+      _: &mut dyn crate::backend::loan::Loan,
+    ) -> io::Result<()> {
       Ok(())
     }
     fn wait(
       &mut self,
       _: Option<Duration>,
       completed: &mut Vec<OpCompleted>,
+      _: &mut dyn crate::backend::loan::Loan,
     ) -> io::Result<()> {
       completed.clear();
       completed.extend(self.0.drain(..).map(|id| OpCompleted::new(id, 0)));
@@ -1361,15 +1375,19 @@ mod tests {
     fn push(
       &mut self,
       id: u64,
-      op: crate::backend::InFlight<'_>,
+      keep: crate::backend::Keep,
+      loan: &mut dyn crate::backend::loan::Loan,
       bump: &mut Bump,
     ) {
       let at = bump.alloc(0u64) as *mut u64 as usize;
       self.first_allocs.borrow_mut().push(at);
-      self.inner.push(id, op, bump);
+      self.inner.push(id, keep, loan, bump);
     }
-    fn flush(&mut self) -> io::Result<()> {
-      self.inner.flush()
+    fn flush(
+      &mut self,
+      loan: &mut dyn crate::backend::loan::Loan,
+    ) -> io::Result<()> {
+      self.inner.flush(loan)
     }
     fn drain(&mut self) -> bool {
       self.inner.drain()
@@ -1378,8 +1396,9 @@ mod tests {
       &mut self,
       timeout: Option<Duration>,
       completed: &mut Vec<OpCompleted>,
+      loan: &mut dyn crate::backend::loan::Loan,
     ) -> io::Result<()> {
-      self.inner.wait(timeout, completed)
+      self.inner.wait(timeout, completed, loan)
     }
   }
 
@@ -1475,21 +1494,26 @@ mod tests {
     fn push(
       &mut self,
       id: u64,
-      op: crate::backend::InFlight<'_>,
+      keep: crate::backend::Keep,
+      loan: &mut dyn crate::backend::loan::Loan,
       bump: &mut Bump,
     ) {
-      self.inner.push(id, op, bump);
+      self.inner.push(id, keep, loan, bump);
     }
-    fn flush(&mut self) -> io::Result<()> {
-      self.inner.flush()
+    fn flush(
+      &mut self,
+      loan: &mut dyn crate::backend::loan::Loan,
+    ) -> io::Result<()> {
+      self.inner.flush(loan)
     }
     fn wait(
       &mut self,
       timeout: Option<Duration>,
       completed: &mut Vec<OpCompleted>,
+      loan: &mut dyn crate::backend::loan::Loan,
     ) -> io::Result<()> {
       self.timeouts.borrow_mut().push(timeout);
-      self.inner.wait(timeout, completed)
+      self.inner.wait(timeout, completed, loan)
     }
   }
 

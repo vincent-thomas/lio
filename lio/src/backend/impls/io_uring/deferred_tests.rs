@@ -95,14 +95,18 @@ fn trace_read_batches() {
     fn push(
       &mut self,
       id: u64,
-      op: crate::backend::InFlight<'_>,
+      keep: crate::backend::Keep,
+      loan: &mut dyn crate::backend::loan::Loan,
       bump: &mut Bump,
     ) {
-      self.inner.push(id, op, bump)
+      self.inner.push(id, keep, loan, bump)
     }
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(
+      &mut self,
+      loan: &mut dyn crate::backend::loan::Loan,
+    ) -> io::Result<()> {
       let t = Instant::now();
-      let result = self.inner.flush();
+      let result = self.inner.flush(loan);
       self.stats.borrow_mut().flush_ns += t.elapsed().as_nanos();
       result
     }
@@ -110,9 +114,10 @@ fn trace_read_batches() {
       &mut self,
       timeout: Option<Duration>,
       completed: &mut Vec<OpCompleted>,
+      loan: &mut dyn crate::backend::loan::Loan,
     ) -> io::Result<()> {
       let t = Instant::now();
-      let result = self.inner.wait(timeout, completed);
+      let result = self.inner.wait(timeout, completed, loan);
       let elapsed = t.elapsed().as_nanos();
       let mut stats = self.stats.borrow_mut();
       stats.waits += 1;
@@ -266,27 +271,32 @@ fn nonblocking_waits_make_progress_on_file_completions() {
     .collect();
   for (id, raw) in raws.iter().enumerate() {
     // SAFETY: `raw` and `file` stay alive until this backend is dropped.
-    unsafe {
-      backend.push(
-        id as u64,
-        crate::backend::InFlight::attest(BorrowedOp::from_op(Op::Read {
-          fd: file.clone(),
-          iovecs: NonNull::from(raw).cast(),
-          iov_count: 1,
-          offset: Some(0),
-          flags: ReadFlags::empty(),
-        })),
-        &mut arena,
-      );
-    }
+    let op = Op::Read {
+      fd: file.clone(),
+      iovecs: NonNull::from(raw).cast(),
+      iov_count: 1,
+      offset: Some(0),
+      flags: ReadFlags::empty(),
+    };
+    unsafe { crate::backend::loan::Attested::remember(id as u64, &op) };
+    let flight =
+      unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
+    let mut loan = flight.loan();
+    backend.push(id as u64, flight.keep(), &mut loan, &mut arena);
   }
-  backend.flush().unwrap();
+  backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
   let mut seen = [false; DEPTH];
   let mut count = 0;
   let mut completed = Vec::new();
   let deadline = Instant::now() + Duration::from_secs(5);
   while count < DEPTH {
-    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    backend
+      .wait(
+        Some(Duration::ZERO),
+        &mut completed,
+        &mut crate::backend::loan::Attested::new(),
+      )
+      .unwrap();
     for completion in &completed {
       let id = completion.registration_id() as usize;
       assert!(!seen[id], "duplicate completion");
@@ -300,7 +310,13 @@ fn nonblocking_waits_make_progress_on_file_completions() {
     );
   }
   assert!(buffers.iter().flatten().all(|&byte| byte == 7));
-  backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+  backend
+    .wait(
+      Some(Duration::ZERO),
+      &mut completed,
+      &mut crate::backend::loan::Attested::new(),
+    )
+    .unwrap();
   assert!(completed.is_empty());
 }
 
@@ -325,22 +341,27 @@ fn read_with_more_iovecs_than_the_native_array_is_rejected() {
     })
     .collect();
   // SAFETY: `raws` and `reader` stay alive until this backend finishes the read.
-  unsafe {
-    backend.push(
-      1,
-      crate::backend::InFlight::attest(BorrowedOp::from_op(Op::Read {
-        fd: reader,
-        iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
-        iov_count: raws.len(),
-        offset: None,
-        flags: ReadFlags::empty(),
-      })),
-      &mut arena,
-    );
-  }
-  backend.flush().unwrap();
+  let op = Op::Read {
+    fd: reader,
+    iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
+    iov_count: raws.len(),
+    offset: None,
+    flags: ReadFlags::empty(),
+  };
+  unsafe { crate::backend::loan::Attested::remember(1, &op) };
+  let flight =
+    unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
+  let mut loan = flight.loan();
+  backend.push(1, flight.keep(), &mut loan, &mut arena);
+  backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
   let mut completed = Vec::new();
-  backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
+  backend
+    .wait(
+      Some(Duration::from_secs(1)),
+      &mut completed,
+      &mut crate::backend::loan::Attested::new(),
+    )
+    .unwrap();
   assert_eq!(completed.len(), 1);
   assert_eq!(completed[0].result(), -(libc::EINVAL as isize));
   assert!(buffers.iter().flatten().all(|&byte| byte == 0));
@@ -361,22 +382,27 @@ fn drop_waits_for_operations_in_the_kernel() {
   // SAFETY: `buf` outlives every use of the backend below.
   let raw = unsafe { RawBufMut::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
   // SAFETY: `raw` and `reader` stay alive until this backend is dropped.
-  unsafe {
-    backend.push(
-      1,
-      crate::backend::InFlight::attest(BorrowedOp::from_op(Op::Read {
-        fd: reader.clone(),
-        iovecs: NonNull::from(&raw).cast(),
-        iov_count: 1,
-        offset: None,
-        flags: ReadFlags::empty(),
-      })),
-      &mut arena,
-    );
-  }
-  backend.flush().unwrap();
+  let op = Op::Read {
+    fd: reader.clone(),
+    iovecs: NonNull::from(&raw).cast(),
+    iov_count: 1,
+    offset: None,
+    flags: ReadFlags::empty(),
+  };
+  unsafe { crate::backend::loan::Attested::remember(1, &op) };
+  let flight =
+    unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
+  let mut loan = flight.loan();
+  backend.push(1, flight.keep(), &mut loan, &mut arena);
+  backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
   let mut completed = Vec::new();
-  backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+  backend
+    .wait(
+      Some(Duration::ZERO),
+      &mut completed,
+      &mut crate::backend::loan::Attested::new(),
+    )
+    .unwrap();
   assert!(completed.is_empty(), "the read waits for data");
   assert_eq!(backend.in_flight, 1);
 
