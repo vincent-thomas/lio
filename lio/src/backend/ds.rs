@@ -437,14 +437,14 @@ struct DSWorld {
   bound_listeners: BTreeMap<Vec<u8>, i32>,
   occupied_addr_keys: Vec<Vec<u8>>,
   events: Vec<ScheduledEvent>,
-  pending: Vec<(u64, Op, crate::backend::Keep)>,
+  pending: Vec<(u64, crate::backend::Keep)>,
 }
 
 #[derive(Debug)]
 pub struct DSBackend {
   cap: usize,
   initialized: bool,
-  queued: Vec<(u64, Op, crate::backend::Keep)>,
+  queued: Vec<(u64, crate::backend::Keep)>,
   ready: Vec<OpCompleted>,
   schedule_rng: Prng,
   fault_rng: Prng,
@@ -464,12 +464,12 @@ enum PendingResult<T> {
 
 enum PendingAction {
   Complete(isize),
-  KeepPending(Op),
+  KeepPending,
 }
 
 enum OpAction {
   Complete(isize),
-  Pending(Op),
+  Pending,
   StartConnect { accepted_fd: i32, listener_fd: i32, ready_at_tick: u64 },
 }
 
@@ -697,6 +697,105 @@ impl DueEventBucket {
   }
 }
 
+/// Operation the cluster keeps after the lend ends.
+///
+/// The fields are the kernel record: descriptors, paths, and buffer
+/// addresses. The portable `Op` is not stored.
+#[derive(Clone, Debug)]
+enum NetOp {
+  Read {
+    fd: crate::api::resource::Resource,
+    iovecs: NonNull<crate::backend::op::RawBufMut<'static>>,
+    iov_count: usize,
+    offset: Option<u64>,
+    flags: crate::backend::op::ReadFlags,
+  },
+  Write {
+    fd: crate::api::resource::Resource,
+    iovecs: NonNull<crate::backend::op::RawBuf<'static>>,
+    iov_count: usize,
+    offset: Option<u64>,
+    flags: crate::backend::op::WriteFlags,
+  },
+  Recv {
+    fd: crate::api::resource::Resource,
+    msg: crate::backend::op::MsgRecv,
+    flags: crate::backend::op::RecvFlags,
+  },
+  Send {
+    fd: crate::api::resource::Resource,
+    msg: crate::backend::op::MsgSend,
+    flags: crate::backend::op::SendFlags,
+  },
+  Accept {
+    fd: crate::api::resource::Resource,
+    addr: NonNull<crate::backend::op::SocketAddrBuf>,
+  },
+  Connect {
+    fd: crate::api::resource::Resource,
+    addr: crate::backend::op::SocketAddrBuf,
+  },
+  Socket {
+    domain: crate::backend::op::SockDomain,
+    ty: crate::backend::op::SockType,
+    proto: crate::backend::op::SockProto,
+  },
+  Bind {
+    fd: crate::api::resource::Resource,
+    addr: crate::backend::op::SocketAddrBuf,
+  },
+  Listen {
+    fd: crate::api::resource::Resource,
+    backlog: i32,
+  },
+  Shutdown {
+    fd: crate::api::resource::Resource,
+    how: crate::backend::op::ShutdownHow,
+  },
+  Fsync {
+    fd: crate::api::resource::Resource,
+  },
+}
+
+fn lower_net(op: &Op) -> NetOp {
+  match op {
+    Op::Read { fd, iovecs, iov_count, offset, flags } => NetOp::Read {
+      fd: fd.clone(),
+      iovecs: *iovecs,
+      iov_count: *iov_count,
+      offset: *offset,
+      flags: *flags,
+    },
+    Op::Write { fd, iovecs, iov_count, offset, flags } => NetOp::Write {
+      fd: fd.clone(),
+      iovecs: *iovecs,
+      iov_count: *iov_count,
+      offset: *offset,
+      flags: *flags,
+    },
+    Op::Recv { fd, msg, flags } => {
+      NetOp::Recv { fd: fd.clone(), msg: *msg, flags: *flags }
+    }
+    Op::Send { fd, msg, flags } => NetOp::Send {
+      fd: fd.clone(),
+      msg: MsgSend { bufs: msg.bufs, buf_count: msg.buf_count, to: msg.to },
+      flags: *flags,
+    },
+    Op::Accept { fd, addr } => NetOp::Accept { fd: fd.clone(), addr: *addr },
+    Op::Connect { fd, addr } => NetOp::Connect { fd: fd.clone(), addr: *addr },
+    Op::Socket { domain, ty, proto } => {
+      NetOp::Socket { domain: *domain, ty: *ty, proto: *proto }
+    }
+    Op::Bind { fd, addr } => NetOp::Bind { fd: fd.clone(), addr: *addr },
+    Op::Listen { fd, backlog } => {
+      NetOp::Listen { fd: fd.clone(), backlog: *backlog }
+    }
+    Op::Shutdown { fd, how } => NetOp::Shutdown { fd: fd.clone(), how: *how },
+    Op::Fsync { fd } => NetOp::Fsync { fd: fd.clone() },
+    _ => unreachable!("only network operations are lowered for the cluster"),
+  }
+}
+
 #[derive(Debug)]
 struct DSTNodeState {
   initialized: bool,
@@ -704,8 +803,8 @@ struct DSTNodeState {
   next_fd: i32,
   next_network_seq: u64,
   sockets: BTreeMap<i32, DSTSocketHandle>,
-  outgoing: VecDeque<(u64, Op, crate::backend::Keep)>,
-  pending: Vec<(u64, Op, crate::backend::Keep)>,
+  outgoing: VecDeque<(u64, NetOp, crate::backend::Keep)>,
+  pending: Vec<(u64, NetOp, crate::backend::Keep)>,
   ready: Vec<OpCompleted>,
 }
 
@@ -1046,7 +1145,7 @@ struct DSTBackend {
   node_id: DSTNodeId,
   node: Rc<RefCell<DSTNodeState>>,
   inner: Rc<RefCell<DSTInner>>,
-  queued: Vec<(u64, Op, crate::backend::Keep)>,
+  queued: Vec<(u64, NetOp, crate::backend::Keep)>,
 }
 
 struct DSTNodeRunner {
@@ -1377,7 +1476,7 @@ impl DSBackend {
     }
   }
 
-  fn advance_tick(&mut self) {
+  fn advance_tick(&mut self, loan: &mut dyn crate::backend::loan::Loan) {
     self.world.tick = self.world.tick.saturating_add(1);
     self.record_trace(format!("tick={} advance", self.world.tick));
     let mut idx = 0usize;
@@ -1446,7 +1545,7 @@ impl DSBackend {
         idx += 1;
       }
     }
-    self.poll_pending_ops();
+    self.poll_pending_ops(loan);
     self.schedule_rng.shuffle(&mut self.ready);
   }
 
@@ -1763,7 +1862,7 @@ impl DSBackend {
     written
   }
 
-  fn read_msg_send(msg: MsgSend) -> Vec<u8> {
+  fn read_msg_send(msg: &MsgSend) -> Vec<u8> {
     // SAFETY: op model keeps send buffers alive for the op lifetime.
     let bufs = unsafe {
       std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
@@ -1931,11 +2030,15 @@ impl DSBackend {
     Ok(PendingResult::Ready(out))
   }
 
-  fn poll_pending_ops(&mut self) {
+  fn poll_pending_ops(&mut self, loan: &mut dyn crate::backend::loan::Loan) {
     let mut idx = 0usize;
     while idx < self.world.pending.len() {
-      let (id, op, keep) = self.world.pending.remove(idx);
-      match self.process_pending_op(id, op) {
+      let (id, keep) = self.world.pending.remove(idx);
+      let mut action = PendingAction::KeepPending;
+      loan.lend(id, &mut |view| {
+        action = self.process_pending_op(id, view.op());
+      });
+      match action {
         PendingAction::Complete(result) => {
           self.record_trace(format!(
             "tick={} deliver-pending id={} result={}",
@@ -1943,21 +2046,23 @@ impl DSBackend {
           ));
           self.ready.push(OpCompleted::new(id, result));
         }
-        PendingAction::KeepPending(op) => {
-          self.world.pending.insert(idx, (id, op, keep));
+        PendingAction::KeepPending => {
+          self.world.pending.insert(idx, (id, keep));
           idx += 1;
         }
       }
     }
   }
 
-  fn process_pending_op(&mut self, _id: u64, op: Op) -> PendingAction {
+  fn process_pending_op(&mut self, _id: u64, op: &Op) -> PendingAction {
     match op {
       Op::Read { fd, iovecs, iov_count, offset, flags } => {
+        let (iovecs, iov_count, offset, _flags) =
+          (*iovecs, *iov_count, *offset, *flags);
         if offset.is_some() {
           return PendingAction::Complete(-(errno::EINVAL as isize));
         }
-        let raw = Self::resource_key(&fd);
+        let raw = Self::resource_key(fd);
         let total: usize =
           unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) }
             .iter()
@@ -1967,18 +2072,14 @@ impl DSBackend {
           Ok(PendingResult::Ready(bytes)) => PendingAction::Complete(
             Self::write_to_iovecs(iovecs, iov_count, &bytes) as isize,
           ),
-          Ok(PendingResult::Pending) => PendingAction::KeepPending(Op::Read {
-            fd,
-            iovecs,
-            iov_count,
-            offset,
-            flags,
-          }),
+          Ok(PendingResult::Pending) => PendingAction::KeepPending,
           Err(err) => PendingAction::Complete(err),
         }
       }
       Op::Recv { fd, msg, flags } => {
-        let raw = Self::resource_key(&fd);
+        let msg = *msg;
+        let _flags = *flags;
+        let raw = Self::resource_key(fd);
         let total = unsafe {
           std::slice::from_raw_parts(msg.bufs.as_ptr(), msg.buf_count.get())
         }
@@ -2003,14 +2104,13 @@ impl DSBackend {
           Ok(PendingResult::Ready(bytes)) => {
             PendingAction::Complete(self.write_to_msg_recv(msg, &bytes) as isize)
           }
-          Ok(PendingResult::Pending) => {
-            PendingAction::KeepPending(Op::Recv { fd, msg, flags })
-          }
+          Ok(PendingResult::Pending) => PendingAction::KeepPending,
           Err(err) => PendingAction::Complete(err),
         }
       }
       Op::Accept { fd, addr } => {
-        let raw = Self::resource_key(&fd);
+        let addr = *addr;
+        let raw = Self::resource_key(fd);
         let Some(resource) = self.world.resources.remove(&raw) else {
           return PendingAction::Complete(-(errno::EBADF as isize));
         };
@@ -2024,7 +2124,7 @@ impl DSBackend {
         }
         let Some(accepted_fd) = listener.pending_accept.pop_front() else {
           self.world.resources.insert(raw, SimResource::Socket(listener));
-          return PendingAction::KeepPending(Op::Accept { fd, addr });
+          return PendingAction::KeepPending;
         };
         let peer_addr = self
           .world
@@ -2176,13 +2276,15 @@ impl DSBackend {
     }
   }
 
-  fn complete_op(&mut self, op: Op) -> OpAction {
-    if let Some(fault) = self.maybe_inject_fault(&op) {
+  fn complete_op(&mut self, op: &Op) -> OpAction {
+    if let Some(fault) = self.maybe_inject_fault(op) {
       return OpAction::Complete(fault);
     }
 
     match op {
       Op::Read { fd, iovecs, iov_count, offset, flags } => {
+        let (iovecs, iov_count, offset, flags) =
+          (*iovecs, *iov_count, *offset, *flags);
         let position = match Self::file_position(offset) {
           Ok(position) => position,
           Err(err) => return OpAction::Complete(err),
@@ -2197,30 +2299,24 @@ impl DSBackend {
             .map(|iov| iov.len)
             .sum();
         if position.is_some() {
-          return match self.read_bytes_from_resource(&fd, total, position) {
+          return match self.read_bytes_from_resource(fd, total, position) {
             Ok(bytes) => OpAction::Complete(Self::write_to_iovecs(
               iovecs, iov_count, &bytes,
             ) as isize),
             Err(err) => OpAction::Complete(err),
           };
         }
-        let raw = Self::resource_key(&fd);
+        let raw = Self::resource_key(fd);
         if let Some(SimResource::Socket(_)) = self.world.resources.get(&raw) {
           return match self.try_read_socket_bytes(raw, total, true) {
             Ok(PendingResult::Ready(bytes)) => OpAction::Complete(
               Self::write_to_iovecs(iovecs, iov_count, &bytes) as isize,
             ),
-            Ok(PendingResult::Pending) => OpAction::Pending(Op::Read {
-              fd,
-              iovecs,
-              iov_count,
-              offset,
-              flags,
-            }),
+            Ok(PendingResult::Pending) => OpAction::Pending,
             Err(err) => OpAction::Complete(err),
           };
         }
-        match self.read_bytes_from_resource(&fd, total, None) {
+        match self.read_bytes_from_resource(fd, total, None) {
           Ok(bytes) => OpAction::Complete(Self::write_to_iovecs(
             iovecs, iov_count, &bytes,
           ) as isize),
@@ -2228,6 +2324,8 @@ impl DSBackend {
         }
       }
       Op::Write { fd, iovecs, iov_count, offset, flags } => {
+        let (iovecs, iov_count, offset, flags) =
+          (*iovecs, *iov_count, *offset, *flags);
         let position = match Self::file_position(offset) {
           Ok(position) => position,
           Err(err) => return OpAction::Complete(err),
@@ -2236,12 +2334,13 @@ impl DSBackend {
           return OpAction::Complete(-(errno::ENOTSUP as isize));
         }
         let bytes = Self::extract_iovec_bytes(iovecs, iov_count);
-        match self.write_bytes_to_resource(&fd, &bytes, position) {
+        match self.write_bytes_to_resource(fd, &bytes, position) {
           Ok(len) => OpAction::Complete(len as isize),
           Err(err) => OpAction::Complete(err),
         }
       }
       Op::Recv { fd, msg, flags } => {
+        let (msg, flags) = (*msg, *flags);
         if !flags.is_empty() {
           return OpAction::Complete(-(errno::ENOTSUP as isize));
         }
@@ -2251,7 +2350,7 @@ impl DSBackend {
             .iter()
             .map(|buf| buf.len)
             .sum();
-        let raw = Self::resource_key(&fd);
+        let raw = Self::resource_key(fd);
         if let Some(out) = msg.from {
           let addr = self
             .world
@@ -2270,10 +2369,8 @@ impl DSBackend {
           Ok(PendingResult::Ready(bytes)) => {
             OpAction::Complete(self.write_to_msg_recv(msg, &bytes) as isize)
           }
-          Ok(PendingResult::Pending) => {
-            OpAction::Pending(Op::Recv { fd, msg, flags })
-          }
-          Err(_) => match self.read_bytes_from_resource(&fd, total, None) {
+          Ok(PendingResult::Pending) => OpAction::Pending,
+          Err(_) => match self.read_bytes_from_resource(fd, total, None) {
             Ok(bytes) => {
               OpAction::Complete(self.write_to_msg_recv(msg, &bytes) as isize)
             }
@@ -2282,23 +2379,26 @@ impl DSBackend {
         }
       }
       Op::Send { fd, msg, flags } => {
+        let flags = *flags;
         if !flags.is_empty() {
           return OpAction::Complete(-(errno::ENOTSUP as isize));
         }
         let bytes = Self::read_msg_send(msg);
-        match self.write_bytes_to_resource(&fd, &bytes, None) {
+        match self.write_bytes_to_resource(fd, &bytes, None) {
           Ok(len) => OpAction::Complete(len as isize),
           Err(err) => OpAction::Complete(err),
         }
       }
       Op::Accept { fd, addr } => {
-        match self.process_pending_op(0, Op::Accept { fd, addr }) {
+        let owned = Op::Accept { fd: fd.clone(), addr: *addr };
+        match self.process_pending_op(0, &owned) {
           PendingAction::Complete(result) => OpAction::Complete(result),
-          PendingAction::KeepPending(op) => OpAction::Pending(op),
+          PendingAction::KeepPending => OpAction::Pending,
         }
       }
       Op::Connect { fd, addr } => {
-        let raw = Self::resource_key(&fd);
+        let addr = *addr;
+        let raw = Self::resource_key(fd);
         let key = Self::socket_addr_key(&addr);
         let Some(SimResource::Socket(mut socket)) =
           self.world.resources.remove(&raw)
@@ -2335,7 +2435,8 @@ impl DSBackend {
         OpAction::StartConnect { accepted_fd, listener_fd, ready_at_tick }
       }
       Op::OpenAt { dir_fd, path, flags, .. } => {
-        let path = match self.resolve_open_path(&dir_fd, &path) {
+        let flags = *flags;
+        let path = match self.resolve_open_path(dir_fd, path) {
           Ok(path) => path,
           Err(err) => return OpAction::Complete(err),
         };
@@ -2372,7 +2473,7 @@ impl DSBackend {
         OpAction::Complete(fd as isize)
       }
       Op::UnlinkAt { path, kind, .. } => {
-        let path = Self::os_path(&path);
+        let path = Self::os_path(path);
         let Some(node) = self.world.fs.get(&path) else {
           return OpAction::Complete(-(errno::ENOENT as isize));
         };
@@ -2385,8 +2486,8 @@ impl DSBackend {
         OpAction::Complete(0)
       }
       Op::RenameAt { old_path, new_path, .. } => {
-        let old_path = Self::os_path(&old_path);
-        let new_path = Self::os_path(&new_path);
+        let old_path = Self::os_path(old_path);
+        let new_path = Self::os_path(new_path);
         let Some(node) = self.world.fs.remove(&old_path) else {
           return OpAction::Complete(-(errno::ENOENT as isize));
         };
@@ -2394,7 +2495,7 @@ impl DSBackend {
         OpAction::Complete(0)
       }
       Op::MkdirAt { path, .. } => {
-        let path = Self::os_path(&path);
+        let path = Self::os_path(path);
         if self.world.fs.contains_key(&path) {
           return OpAction::Complete(-(errno::EEXIST as isize));
         }
@@ -2402,8 +2503,8 @@ impl DSBackend {
         OpAction::Complete(0)
       }
       Op::LinkAt { source_path, new_path, kind, .. } => {
-        let source_path = Self::os_path(&source_path);
-        let new_path = Self::os_path(&new_path);
+        let source_path = Self::os_path(source_path);
+        let new_path = Self::os_path(new_path);
         match kind {
           op::LinkKind::Hard => {
             let Some(node) = self.world.fs.get(&source_path).cloned() else {
@@ -2421,7 +2522,8 @@ impl DSBackend {
         OpAction::Complete(0)
       }
       Op::ReadlinkAt { path, buf, buf_len, .. } => {
-        let path = Self::os_path(&path);
+        let (buf, buf_len) = (*buf, *buf_len);
+        let path = Self::os_path(path);
         let Some(SimNode::Symlink { target, .. }) = self.world.fs.get(&path)
         else {
           return OpAction::Complete(-(errno::ENOENT as isize));
@@ -2429,6 +2531,7 @@ impl DSBackend {
         OpAction::Complete(Self::write_c_string_bytes(buf, buf_len, target))
       }
       Op::GetCwd { out } => {
+        let out = *out;
         let payload = self.fake_cwd();
         #[cfg(unix)]
         let cwd = {
@@ -2450,6 +2553,7 @@ impl DSBackend {
         OpAction::Complete(self.allocate_pid() as isize)
       }
       Op::Socket { domain, ty, proto } => {
+        let (domain, ty, proto) = (*domain, *ty, *proto);
         if !op::is_supported_socket(domain, ty, proto) {
           return OpAction::Complete(-(errno::EINVAL as isize));
         }
@@ -2458,7 +2562,8 @@ impl DSBackend {
         )
       }
       Op::Bind { fd, addr } => {
-        let raw = Self::resource_key(&fd);
+        let addr = *addr;
+        let raw = Self::resource_key(fd);
         let key = Self::socket_addr_key(&addr);
         if self.world.bound_listeners.contains_key(&key)
           || self
@@ -2486,7 +2591,8 @@ impl DSBackend {
         OpAction::Complete(0)
       }
       Op::Listen { fd, backlog } => {
-        let raw = Self::resource_key(&fd);
+        let backlog = *backlog;
+        let raw = Self::resource_key(fd);
         let Some(SimResource::Socket(mut socket)) =
           self.world.resources.remove(&raw)
         else {
@@ -2504,7 +2610,8 @@ impl DSBackend {
         OpAction::Complete(0)
       }
       Op::Shutdown { fd, how } => {
-        let raw = Self::resource_key(&fd);
+        let how = *how;
+        let raw = Self::resource_key(fd);
         let Some(SimResource::Socket(mut socket)) =
           self.world.resources.remove(&raw)
         else {
@@ -2542,7 +2649,7 @@ impl DSBackend {
         OpAction::Complete(0)
       }
       Op::Fsync { fd } => {
-        let raw = Self::resource_key(&fd);
+        let raw = Self::resource_key(fd);
         match self.world.resources.get(&raw) {
           Some(SimResource::File(_)) => OpAction::Complete(0),
           Some(SimResource::Socket(_)) => {
@@ -2562,7 +2669,8 @@ impl DSBackend {
       Op::Stat { target, out } => {
         let stat = match target {
           op::StatTarget::Path { path, follow_symlinks, .. } => {
-            let path = Self::os_path(&path);
+            let follow_symlinks = *follow_symlinks;
+            let path = Self::os_path(path);
             let Some(node) = self.resolve_path_node(&path, follow_symlinks)
             else {
               return OpAction::Complete(-(errno::ENOENT as isize));
@@ -2570,7 +2678,7 @@ impl DSBackend {
             Self::file_stat_for_node(node)
           }
           op::StatTarget::Fd { fd } => {
-            let raw = Self::resource_key(&fd);
+            let raw = Self::resource_key(fd);
             match self.world.resources.get(&raw) {
               Some(SimResource::File(handle)) => {
                 let Some(node) = self.world.fs.get(&handle.path) else {
@@ -2591,6 +2699,7 @@ impl DSBackend {
             }
           }
         };
+        let out = *out;
         // SAFETY: `out` points to caller-owned output storage.
         unsafe {
           out.as_ptr().write(stat);
@@ -2607,6 +2716,15 @@ impl DSBackend {
         out,
         ..
       } => {
+        let (raw_buf, raw_cap, entries, entries_cap, opaque, opaque_drop, out) = (
+          *raw_buf,
+          *raw_cap,
+          *entries,
+          *entries_cap,
+          *opaque,
+          *opaque_drop,
+          *out,
+        );
         let dir = self.scenario.readdir_root.as_slice();
         let mut names: Vec<Vec<u8>> = self
           .world
@@ -2710,21 +2828,20 @@ impl IoBackend for DSBackend {
     view: &mut crate::backend::loan::OpView<'_>,
     _step_bump: &mut Bump,
   ) {
-    // The simulator is the kernel for these bytes. It keeps the copy until
-    // it completes the operation, then drops it.
-    let op = view.op().clone();
+    // `flush` and `wait` lend this id again. Nothing here keeps the `Op`.
+    let _ = view;
     self.assert_initialized();
     self.assert_capacity();
-    self.queued.push((id, op, keep));
+    self.queued.push((id, keep));
   }
 
   fn cancel(&mut self, id: u64) {
-    let queued = self.queued.iter().position(|(queued, _, _)| *queued == id);
+    let queued = self.queued.iter().position(|(queued, _)| *queued == id);
     let removed = if let Some(index) = queued {
       self.queued.remove(index);
       true
     } else if let Some(index) =
-      self.world.pending.iter().position(|(pending, _, _)| *pending == id)
+      self.world.pending.iter().position(|(pending, _)| *pending == id)
     {
       self.world.pending.remove(index);
       true
@@ -2747,19 +2864,23 @@ impl IoBackend for DSBackend {
 
   fn flush(
     &mut self,
-    _loan: &mut dyn crate::backend::loan::Loan,
+    loan: &mut dyn crate::backend::loan::Loan,
   ) -> io::Result<()> {
     self.assert_initialized();
     let queued = mem::take(&mut self.queued);
-    for (id, op, keep) in queued {
-      match self.complete_op(op) {
+    for (id, keep) in queued {
+      let mut action = OpAction::Complete(-(errno::EINVAL as isize));
+      loan.lend(id, &mut |view| {
+        action = self.complete_op(view.op());
+      });
+      match action {
         OpAction::Complete(result) => self.schedule_completion(id, result),
-        OpAction::Pending(op) => {
+        OpAction::Pending => {
           self.record_trace(format!(
             "tick={} pending id={}",
             self.world.tick, id
           ));
-          self.world.pending.push((id, op, keep));
+          self.world.pending.push((id, keep));
         }
         OpAction::StartConnect {
           accepted_fd,
@@ -2788,7 +2909,7 @@ impl IoBackend for DSBackend {
     &mut self,
     timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
-    _loan: &mut dyn crate::backend::loan::Loan,
+    loan: &mut dyn crate::backend::loan::Loan,
   ) -> io::Result<()> {
     self.assert_initialized();
     completed.clear();
@@ -2796,17 +2917,17 @@ impl IoBackend for DSBackend {
     match timeout {
       Some(duration) if duration.is_zero() => {
         if self.ready.is_empty() && !self.world.events.is_empty() {
-          self.advance_tick();
+          self.advance_tick(loan);
         }
       }
       Some(_) => {
         if self.ready.is_empty() {
-          self.advance_tick();
+          self.advance_tick(loan);
         }
       }
       None => {
         while self.ready.is_empty() && !self.world.events.is_empty() {
-          self.advance_tick();
+          self.advance_tick(loan);
         }
       }
     }
@@ -3054,7 +3175,7 @@ impl DST {
   fn next_outgoing_network_op(
     &mut self,
     arbitration_round: u64,
-  ) -> Option<(DSTNodeId, u64, Op, crate::backend::Keep)> {
+  ) -> Option<(DSTNodeId, u64, NetOp, crate::backend::Keep)> {
     let tick = self.inner.borrow().tick;
     let (chosen_node, stale_nodes) = {
       let inner = self.inner.borrow();
@@ -3105,7 +3226,7 @@ impl DST {
     &mut self,
     node_id: DSTNodeId,
     id: u64,
-    op: Op,
+    op: NetOp,
     keep: crate::backend::Keep,
   ) {
     let node = self.inner.borrow().node(node_id);
@@ -3227,7 +3348,12 @@ impl DSTBackend {
     self.node.borrow().sockets.contains_key(&raw)
   }
 
-  fn queue_network_op(&mut self, id: u64, op: Op, keep: crate::backend::Keep) {
+  fn queue_network_op(
+    &mut self,
+    id: u64,
+    op: NetOp,
+    keep: crate::backend::Keep,
+  ) {
     self.queued.push((id, op, keep));
   }
 
@@ -3421,13 +3547,7 @@ impl DSTBackend {
       Ok(PendingResult::Ready(bytes)) => PendingAction::Complete(
         DSBackend::write_to_iovecs(iovecs, iov_count, &bytes) as isize,
       ),
-      Ok(PendingResult::Pending) => PendingAction::KeepPending(Op::Read {
-        fd: fd.clone(),
-        iovecs,
-        iov_count,
-        offset,
-        flags,
-      }),
+      Ok(PendingResult::Pending) => PendingAction::KeepPending,
       Err(err) => PendingAction::Complete(err),
     }
   }
@@ -3461,9 +3581,7 @@ impl DSTBackend {
       Ok(PendingResult::Ready(bytes)) => {
         PendingAction::Complete(Self::write_to_msg_recv(msg, &bytes) as isize)
       }
-      Ok(PendingResult::Pending) => {
-        PendingAction::KeepPending(Op::Recv { fd: fd.clone(), msg, flags })
-      }
+      Ok(PendingResult::Pending) => PendingAction::KeepPending,
       Err(err) => PendingAction::Complete(err),
     }
   }
@@ -3481,7 +3599,7 @@ impl DSTBackend {
       return PendingAction::Complete(-(errno::EINVAL as isize));
     }
     let Some(accepted_fd) = listener.pending_accept.pop_front() else {
-      return PendingAction::KeepPending(Op::Accept { fd: fd.clone(), addr });
+      return PendingAction::KeepPending;
     };
     let peer_addr = node
       .sockets
@@ -3500,28 +3618,25 @@ impl DSTBackend {
     let pending = mem::take(&mut node.pending);
     node.pending.reserve(pending.len());
     for (id, op, keep) in pending {
-      let action = match op {
-        Op::Read { fd, iovecs, iov_count, offset, flags } => {
+      let action = match &op {
+        NetOp::Read { fd, iovecs, iov_count, offset, flags } => {
           Self::process_network_read(
-            &mut node, &fd, iovecs, iov_count, offset, flags,
+            &mut node, fd, *iovecs, *iov_count, *offset, *flags,
           )
         }
-        Op::Recv { fd, msg, flags } => {
-          Self::process_network_recv(&mut node, &fd, msg, flags)
+        NetOp::Recv { fd, msg, flags } => {
+          Self::process_network_recv(&mut node, fd, *msg, *flags)
         }
-        Op::Accept { fd, addr } => {
-          Self::process_network_accept(&mut node, &fd, addr)
+        NetOp::Accept { fd, addr } => {
+          Self::process_network_accept(&mut node, fd, *addr)
         }
-        other => PendingAction::Complete(match other {
-          Op::Nop => 0,
-          _ => -(errno::EINVAL as isize),
-        }),
+        _ => PendingAction::Complete(-(errno::EINVAL as isize)),
       };
       match action {
         PendingAction::Complete(result) => {
           node.ready.push(OpCompleted::new(id, result));
         }
-        PendingAction::KeepPending(op) => {
+        PendingAction::KeepPending => {
           node.pending.push((id, op, keep));
         }
       }
@@ -3645,12 +3760,17 @@ impl DSTBackend {
 
   #[cfg(test)]
   fn network_complete_op(&mut self, id: u64, op: Op) {
-    self.finish_network_op(id, op, crate::backend::Keep::new());
+    self.finish_network_op(id, lower_net(&op), crate::backend::Keep::new());
   }
 
-  fn finish_network_op(&mut self, id: u64, op: Op, keep: crate::backend::Keep) {
+  fn finish_network_op(
+    &mut self,
+    id: u64,
+    op: NetOp,
+    keep: crate::backend::Keep,
+  ) {
     match op {
-      Op::Socket { domain, ty, proto } => {
+      NetOp::Socket { domain, ty, proto } => {
         if !op::is_supported_socket(domain, ty, proto) {
           self
             .node
@@ -3667,7 +3787,7 @@ impl DSTBackend {
         };
         self.node.borrow_mut().ready.push(OpCompleted::new(id, fd as isize));
       }
-      Op::Bind { fd, addr } => {
+      NetOp::Bind { fd, addr } => {
         let raw = DSBackend::resource_key(&fd);
         let key = DSBackend::socket_addr_key(&addr);
         let mut node = self.node.borrow_mut();
@@ -3690,7 +3810,7 @@ impl DSTBackend {
           .insert(key, DSTSocketRef { node_id: self.node_id, fd: raw });
         node.ready.push(OpCompleted::new(id, 0));
       }
-      Op::Listen { fd, backlog } => {
+      NetOp::Listen { fd, backlog } => {
         let raw = DSBackend::resource_key(&fd);
         let mut node = self.node.borrow_mut();
         let Some(socket) = node.sockets.get_mut(&raw) else {
@@ -3714,7 +3834,7 @@ impl DSTBackend {
           .insert(key, DSTSocketRef { node_id: self.node_id, fd: raw });
         node.ready.push(OpCompleted::new(id, 0));
       }
-      Op::Connect { fd, addr } => {
+      NetOp::Connect { fd, addr } => {
         let raw = DSBackend::resource_key(&fd);
         let key = DSBackend::socket_addr_key(&addr);
         let (domain, ty, proto, client_bound, client_state) = {
@@ -3887,7 +4007,7 @@ impl DSTBackend {
           }
         }
       }
-      Op::Send { fd, msg, flags } => {
+      NetOp::Send { fd, msg, flags } => {
         if !flags.is_empty() {
           self
             .node
@@ -3897,14 +4017,14 @@ impl DSTBackend {
           return;
         }
         let target = msg.to.map(op::socket_addr_into_buf);
-        let bytes = DSBackend::read_msg_send(msg);
+        let bytes = DSBackend::read_msg_send(&msg);
         let result = self.process_network_write(&fd, &bytes, None, target);
         self.node.borrow_mut().ready.push(OpCompleted::new(
           id,
           result.map(|len| len as isize).unwrap_or_else(|err| err),
         ));
       }
-      Op::Write { fd, iovecs, iov_count, offset, flags } => {
+      NetOp::Write { fd, iovecs, iov_count, offset, flags } => {
         let position = match DSBackend::file_position(offset) {
           Ok(position) => position,
           Err(err) => {
@@ -3927,17 +4047,19 @@ impl DSTBackend {
           result.map(|len| len as isize).unwrap_or_else(|err| err),
         ));
       }
-      Op::Recv { fd, msg, flags } => {
+      NetOp::Recv { fd, msg, flags } => {
         let mut node = self.node.borrow_mut();
         let action = Self::process_network_recv(&mut node, &fd, msg, flags);
         match action {
           PendingAction::Complete(result) => {
             node.ready.push(OpCompleted::new(id, result));
           }
-          PendingAction::KeepPending(op) => node.pending.push((id, op, keep)),
+          PendingAction::KeepPending => {
+            node.pending.push((id, NetOp::Recv { fd, msg, flags }, keep));
+          }
         }
       }
-      Op::Read { fd, iovecs, iov_count, offset, flags } => {
+      NetOp::Read { fd, iovecs, iov_count, offset, flags } => {
         let mut node = self.node.borrow_mut();
         let action = Self::process_network_read(
           &mut node, &fd, iovecs, iov_count, offset, flags,
@@ -3946,20 +4068,28 @@ impl DSTBackend {
           PendingAction::Complete(result) => {
             node.ready.push(OpCompleted::new(id, result));
           }
-          PendingAction::KeepPending(op) => node.pending.push((id, op, keep)),
+          PendingAction::KeepPending => {
+            node.pending.push((
+              id,
+              NetOp::Read { fd, iovecs, iov_count, offset, flags },
+              keep,
+            ));
+          }
         }
       }
-      Op::Accept { fd, addr } => {
+      NetOp::Accept { fd, addr } => {
         let mut node = self.node.borrow_mut();
         let action = Self::process_network_accept(&mut node, &fd, addr);
         match action {
           PendingAction::Complete(result) => {
             node.ready.push(OpCompleted::new(id, result));
           }
-          PendingAction::KeepPending(op) => node.pending.push((id, op, keep)),
+          PendingAction::KeepPending => {
+            node.pending.push((id, NetOp::Accept { fd, addr }, keep));
+          }
         }
       }
-      Op::Shutdown { fd, how } => {
+      NetOp::Shutdown { fd, how } => {
         let raw = DSBackend::resource_key(&fd);
         let peer = {
           let mut node = self.node.borrow_mut();
@@ -4006,23 +4136,12 @@ impl DSTBackend {
         }
         self.node.borrow_mut().ready.push(OpCompleted::new(id, 0));
       }
-      Op::Fsync { .. } => {
+      NetOp::Fsync { .. } => {
         self
           .node
           .borrow_mut()
           .ready
           .push(OpCompleted::new(id, -(errno::EINVAL as isize)));
-      }
-      other => {
-        // `other` was accepted by `push` and stays in flight here.
-        // The same lease goes with it. A new lease would let the driver free
-        // the model while the local backend still holds these addresses.
-        let mut view = crate::backend::loan::OpView::new(&other);
-        self
-          .local
-          .as_mut()
-          .expect("non-network DST backend op requires local backend")
-          .push(id, keep, &mut view, &mut Bump::new());
       }
     }
   }
@@ -4060,8 +4179,8 @@ impl IoBackend for DSTBackend {
     view: &mut crate::backend::loan::OpView<'_>,
     step_bump: &mut Bump,
   ) {
-    let stored = view.op().clone();
-    let use_network = match &stored {
+    let looked = view.op();
+    let use_network = match looked {
       Op::Socket { .. } => true,
       Op::Bind { fd, .. }
       | Op::Listen { fd, .. }
@@ -4080,16 +4199,15 @@ impl IoBackend for DSTBackend {
     };
 
     if use_network {
-      self.queue_network_op(id, stored, keep);
+      // The cluster runs this after `push` returns. Lower a held copy for
+      // that later step. The local backend path lends `view` directly.
+      self.queue_network_op(id, lower_net(looked), keep);
     } else {
-      // `stored` was just taken from this `InFlight`. The same lease
-      // goes with it into the local backend.
-      let mut view = crate::backend::loan::OpView::new(&stored);
       self
         .local
         .as_mut()
         .expect("non-network DST backend push requires local backend")
-        .push(id, keep, &mut view, step_bump);
+        .push(id, keep, view, step_bump);
     }
   }
 
@@ -4167,6 +4285,8 @@ mod tests {
     // backend reports the completion.
     let flight =
       unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
+    // SAFETY: the test keeps the buffers until it finishes.
+    unsafe { crate::backend::loan::Attested::remember(id, flight.as_op()) };
     let mut view = crate::backend::loan::OpView::new(flight.as_op());
     backend.push(id, flight.keep(), &mut view, bump);
   }
@@ -5526,7 +5646,8 @@ mod tests {
       )),
     );
     let file_resource = dst_resource(file_fd);
-    let file_result = backend.complete_op(Op::Fsync { fd: file_resource });
+    let file_op = Op::Fsync { fd: file_resource };
+    let file_result = backend.complete_op(&file_op);
     assert!(matches!(file_result, OpAction::Complete(0)));
 
     let socket_fd = 1_000_001;
@@ -5548,7 +5669,8 @@ mod tests {
       }),
     );
     let socket_resource = dst_resource(socket_fd);
-    let socket_result = backend.complete_op(Op::Fsync { fd: socket_resource });
+    let socket_op = Op::Fsync { fd: socket_resource };
+    let socket_result = backend.complete_op(&socket_op);
     assert!(matches!(
       socket_result,
       OpAction::Complete(result) if result == -(errno::EINVAL as isize)
