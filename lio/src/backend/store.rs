@@ -193,6 +193,10 @@ impl OpStore {
     let key = SlabKey::from_u64(id);
     out.reserve(1);
     self.slots.retire_known_with(key, |slot| {
+      // Drop the submitted copy before the registration leaves the slot.
+      // A retire that skips completion would otherwise keep those addresses
+      // and resource refs until the slot is reused.
+      slot.submitted = None;
       // SAFETY: `reserve` left a spare element, and this slot holds an
       // initialized registration. The write moves it; the slot is marked
       // retired only after this returns, and nothing else drops it.
