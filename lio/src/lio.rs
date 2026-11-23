@@ -505,7 +505,9 @@ impl Lio {
       .is_some_and(|detached| detached.registration.lease_held());
     if held {
       let Some(detached) = inner.dying.pop() else {
-        unreachable!("driver: retire moved registration {id} and dying is empty");
+        unreachable!(
+          "driver: retire moved registration {id} and dying is empty"
+        );
       };
       inner.leaked += 1;
       std::mem::forget(detached);
