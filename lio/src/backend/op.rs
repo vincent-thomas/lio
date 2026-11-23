@@ -555,6 +555,15 @@ impl ByteSpan for RawBuf<'_> {
   }
 }
 
+impl ByteSpan for (*mut u8, usize) {
+  fn bytes_ptr(&self) -> *mut u8 {
+    self.0
+  }
+  fn bytes_len(&self) -> usize {
+    self.1
+  }
+}
+
 impl ByteSpan for RawBufMut<'_> {
   fn bytes_ptr(&self) -> *mut u8 {
     self.ptr
