@@ -37,19 +37,18 @@ fn drop_cancels_a_blocked_pipe_read() {
   let mut backend = Iocp::new();
   backend.init(8).unwrap();
   // SAFETY: `buf` stays alive until this backend is dropped.
-  unsafe {
-    backend.push(
-      1,
-      lio::backend::InFlight::attest(lio::backend::op::BorrowedOp::read(
-        reader,
-        std::slice::from_ref(&raw),
-        None,
-        ReadFlags::empty(),
-      )),
-      &mut bumpalo::Bump::new(),
-    );
-  }
-  backend.flush().unwrap();
+  let flight = unsafe {
+    lio::backend::InFlight::attest(lio::backend::op::BorrowedOp::read(
+      reader,
+      std::slice::from_ref(&raw),
+      None,
+      ReadFlags::empty(),
+    ))
+  };
+  unsafe { lio::backend::loan::Attested::remember(1, flight.as_op()) };
+  let mut loan = flight.loan();
+  backend.push(1, flight.keep(), &mut loan, &mut bumpalo::Bump::new());
+  backend.flush(&mut lio::backend::loan::Attested::new()).unwrap();
   // Give a worker time to block in ReadFile on the empty pipe.
   std::thread::sleep(Duration::from_millis(50));
 
