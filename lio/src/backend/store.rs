@@ -181,17 +181,6 @@ impl OpStore {
     self.slots.release(slot);
   }
 
-  /// A stored registration still has a backend lease.
-  pub(crate) fn any_lease_held(&mut self) -> bool {
-    let mut held = false;
-    self.slots.for_each_occupied(|slot| {
-      // SAFETY: occupied slots contain an initialized registration.
-      let registration = unsafe { slot.registration.assume_init_ref() };
-      held |= registration.lease_held();
-    });
-    held
-  }
-
   /// Gets mutable access to an operation's registration.
   #[inline]
   pub fn get_mut(&mut self, id: u64) -> Option<&mut Registration> {

@@ -24,6 +24,12 @@ thread_local! {
   static GLOBAL_LIO: RefCell<Option<Lio>> = const { RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+  static STORE_DROPPED: std::cell::Cell<bool> =
+    const { std::cell::Cell::new(false) };
+}
+
 /// Guard returned by [`install_global`].
 ///
 /// Dropping the guard uninstalls the thread-local global [`Lio`] it
@@ -223,8 +229,12 @@ impl Drop for LioInner {
       // SAFETY: the backend is dropped first, so it drops the leases it
       // stored. A model whose lease is still held stays leaked with the store.
       unsafe { ManuallyDrop::drop(&mut self.io) };
-      if self.leaked == 0 && !self.store.any_lease_held() {
-        // SAFETY: no backend copy of a lease remains, and this field is not
+      // `leaked` counts registrations forgotten while a backend still held
+      // their lease. Their arenas live in the store, so the store stays too.
+      if self.leaked == 0 {
+        #[cfg(test)]
+        STORE_DROPPED.with(|dropped| dropped.set(true));
+        // SAFETY: every registration was dropped, and this field is not
         // used again.
         unsafe { ManuallyDrop::drop(&mut self.store) };
       }
@@ -946,6 +956,10 @@ mod tests {
     crate::api::nop().with_lio(&lio).when_done(|_| {});
     crate::api::nop().with_lio(&lio).when_done(|_| {});
     let (lost, other) = (backend.pushed()[0], backend.pushed()[1]);
+    // The backend has dropped its leases, so retire parks `other` in `dying`.
+    // `lost` was detached and dropped with no slot release.
+    backend.complete(lost, 0);
+    backend.complete(other, 0);
     let mut inner = lio.inner.borrow_mut();
     drop(inner.store.detach(lost).unwrap().registration);
     Lio::retire(&mut inner, other);
@@ -987,6 +1001,37 @@ mod tests {
     backend.complete_all(0);
     lio.try_run().unwrap();
     assert!(!lio.is_full(), "both slots are free again");
+  }
+
+  #[test]
+  #[cfg_attr(miri, ignore = "leaks the registration on purpose")]
+  fn a_held_lease_keeps_the_store_after_the_driver_drops() {
+    let (backend, lio) = lio(1);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let id = backend.pushed()[0];
+    {
+      let mut inner = lio.inner.borrow_mut();
+      Lio::retire(&mut inner, id);
+      assert_eq!(inner.leaked, 1, "a held lease was not counted");
+    }
+    STORE_DROPPED.with(|dropped| dropped.set(false));
+    drop(lio);
+    assert!(
+      !STORE_DROPPED.with(|dropped| dropped.get()),
+      "the store was freed while a registration was leaked"
+    );
+  }
+
+  #[test]
+  fn dropping_a_drained_driver_frees_the_store() {
+    let (backend, lio) = lio(1);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let id = backend.pushed()[0];
+    backend.complete(id, 0);
+    lio.try_run().unwrap();
+    STORE_DROPPED.with(|dropped| dropped.set(false));
+    drop(lio);
+    assert!(STORE_DROPPED.with(|dropped| dropped.get()));
   }
 
   #[test]
