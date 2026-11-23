@@ -1047,11 +1047,15 @@ impl IoBackend for Iocp {
   ) -> io::Result<()> {
     for Queued { id, keep } in mem::take(&mut self.backlog) {
       let mut result = None;
+      let mut keep = Some(keep);
       loan.lend(id, &mut |view| {
         // SAFETY: overlapped calls copy the address into a `WSABUF` here.
         // A blocking job keeps it until its worker syscall, which `drain`
         // waits for.
         let op = unsafe { view.kernel() }.clone();
+        let Some(keep) = keep.take() else {
+          panic!("lend runs once");
+        };
         result = self.submit(id, op, keep);
       });
       if let Some(result) = result {
