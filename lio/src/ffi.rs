@@ -237,7 +237,9 @@ impl CBuf {
   }
 }
 
-impl IoBuf for CBuf {
+// SAFETY: `CBuf` points at caller memory that the C contract keeps in place
+// until the operation completes.
+unsafe impl IoBuf for CBuf {
   fn as_slice(&self) -> &[u8] {
     // SAFETY: `base` is non-null, and the first `len` bytes are initialized and
     // lent for as long as `self` lives (or `len` is 0).
@@ -245,7 +247,9 @@ impl IoBuf for CBuf {
   }
 }
 
-impl IoBufMut for CBuf {
+// SAFETY: the writable region is the caller buffer. `commit` records the
+// length the completion proved.
+unsafe impl IoBufMut for CBuf {
   fn as_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
     // SAFETY: `base` is non-null, and `cap` bytes are lent exclusively for as
     // long as `self` lives (or `cap` is 0). `MaybeUninit<u8>` permits

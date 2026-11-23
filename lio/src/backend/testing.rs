@@ -159,7 +159,7 @@ impl IoBackend for ScriptedBackend {
   }
 
   fn resource_close(&self) -> ResourceClose {
-    ResourceClose::from_fn(|_| {})
+    ResourceClose::noop()
   }
 
   fn push(

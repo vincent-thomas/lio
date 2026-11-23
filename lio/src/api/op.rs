@@ -247,13 +247,9 @@ mod completion_tests {
 
   #[test]
   fn completions_compare_their_resource_close() {
-    fn other(_: crate::api::resource::RawResource) {}
     let native = Completion::new(3);
     assert_eq!(native, Completion::new(3));
-    assert_ne!(
-      native,
-      native.with_resource_close(ResourceClose::from_fn(other))
-    );
+    assert_ne!(native, native.with_resource_close(ResourceClose::noop()));
     assert!(format!("{native:?}").contains("resource_close: ResourceClose"));
   }
 }

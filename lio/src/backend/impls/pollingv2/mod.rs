@@ -276,7 +276,10 @@ impl Poller {
         return Err(err);
       }
       *opaque = dir.cast();
-      *opaque_drop = Some(Self::drop_readdir_state);
+      // SAFETY: `drop_readdir_state` frees the state this backend allocated.
+      *opaque_drop = Some(unsafe {
+        crate::backend::op::OpaqueDrop::new(Self::drop_readdir_state)
+      });
       created_here = true;
       dir
     } else {

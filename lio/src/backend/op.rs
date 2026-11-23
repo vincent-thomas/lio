@@ -748,7 +748,31 @@ pub struct ReadDirResult {
   pub eof: bool,
 }
 
-pub type OpaqueDropFn = unsafe fn(*mut ());
+/// Drops backend continuation state for one directory read.
+///
+/// Only a backend constructs this. The public API can store it and drop it.
+/// It cannot call the raw function.
+#[derive(Debug)]
+pub struct OpaqueDrop {
+  call: unsafe fn(*mut ()),
+}
+
+impl OpaqueDrop {
+  /// # Safety
+  ///
+  /// `call(ptr)` drops the allocation `ptr` owns, and it is the only drop of
+  /// that allocation.
+  pub(crate) const unsafe fn new(call: unsafe fn(*mut ())) -> Self {
+    Self { call }
+  }
+
+  pub(crate) unsafe fn call(self, ptr: *mut ()) {
+    // SAFETY: the backend paired this function with `ptr`.
+    unsafe { (self.call)(ptr) }
+  }
+}
+
+pub type OpaqueDropFn = OpaqueDrop;
 
 #[derive(Debug, Default)]
 pub struct ReadDirBuf {
@@ -772,11 +796,11 @@ impl Drop for ReadDirBuf {
     if self.opaque.is_null() {
       return;
     }
-    if let Some(drop_fn) = self.opaque_drop {
+    if let Some(drop_fn) = self.opaque_drop.take() {
       // SAFETY: `opaque` and `opaque_drop` are paired backend-owned continuation
       // state set by the backend that created this `ReadDirBuf`.
       unsafe {
-        drop_fn(self.opaque);
+        drop_fn.call(self.opaque);
       }
     }
     self.opaque = std::ptr::null_mut();

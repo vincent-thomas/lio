@@ -162,8 +162,6 @@ pub mod errno {
 
 /// Resources from the simulation are synthetic numbers, not OS descriptors:
 /// dropping them must not close anything real.
-fn close_simulated(_raw: crate::api::resource::RawResource) {}
-
 /// File-type mode bits the simulation reports; Linux values where the
 /// platform has none (Windows' CRT).
 mod sim {
@@ -2693,7 +2691,7 @@ impl DSBackend {
 
 impl IoBackend for DSBackend {
   fn resource_close(&self) -> crate::api::resource::ResourceClose {
-    crate::api::resource::ResourceClose::from_fn(close_simulated)
+    crate::api::resource::ResourceClose::noop()
   }
 
   fn init(&mut self, cap: usize) -> io::Result<()> {
@@ -4019,7 +4017,7 @@ impl DSTBackend {
 
 impl IoBackend for DSTBackend {
   fn resource_close(&self) -> crate::api::resource::ResourceClose {
-    crate::api::resource::ResourceClose::from_fn(close_simulated)
+    crate::api::resource::ResourceClose::noop()
   }
 
   fn init(&mut self, cap: usize) -> io::Result<()> {

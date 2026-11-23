@@ -893,7 +893,10 @@ impl IoUring {
           if let Some(state) = local_state.take() {
             let ptr = Box::into_raw(Box::new(state));
             *opaque = ptr.cast();
-            *opaque_drop = Some(Self::drop_read_dir_state);
+            // SAFETY: `drop_read_dir_state` frees the state this backend allocated.
+            *opaque_drop = Some(unsafe {
+              crate::backend::op::OpaqueDrop::new(Self::drop_read_dir_state)
+            });
           }
           Ok(entries)
         }

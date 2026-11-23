@@ -1516,7 +1516,8 @@ fn read_dir(
   if opaque.is_null() {
     let iter = fs::read_dir(final_path(handle_of(dir))?)?;
     *opaque = Box::into_raw(Box::new(DirState { iter, pending: None })).cast();
-    *opaque_drop = Some(drop_dir_state);
+    // SAFETY: `drop_dir_state` frees the directory state this backend allocated.
+    *opaque_drop = Some(unsafe { OpaqueDropFn::new(drop_dir_state) });
   }
   // SAFETY: `opaque` was set from a `Box<DirState>` above or on a prior call.
   let state = unsafe { &mut *opaque.cast::<DirState>() };
