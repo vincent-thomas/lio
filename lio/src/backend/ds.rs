@@ -4175,7 +4175,7 @@ mod tests {
     backend.init(4).unwrap();
     let mut bytes = [1u8; 4];
     {
-      let iov = [crate::backend::op::RawBuf::from_mut(&mut bytes)];
+      let iov = [crate::backend::op::RawBufMut::from_mut(&mut bytes)];
       let op = BorrowedOp::read(
         crate::api::resource::Resource::invalid(),
         &iov,

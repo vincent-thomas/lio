@@ -58,10 +58,10 @@ use crate::backend::impls::sockaddr::{
 };
 use crate::backend::native::CWD as CWD_HANDLE;
 use crate::backend::op::{
-  BorrowedOp, ByteSpan, DirEntryRef, FileStat, FileType, LinkKind, MsgRecv,
-  MsgSend, Op, OpaqueDropFn, OpenFlags, ReadDirResult, RecvFlags, SendFlags,
-  ShutdownHow, SocketAddrBuf, SocketAddrFamily, SpawnSpec, StatTarget,
-  UnlinkKind, is_valid_file_offset,
+  ByteSpan, DirEntryRef, FileStat, FileType, LinkKind, MsgRecv, MsgSend, Op,
+  OpaqueDropFn, OpenFlags, ReadDirResult, RecvFlags, SendFlags, ShutdownHow,
+  SocketAddrBuf, SocketAddrFamily, SpawnSpec, StatTarget, UnlinkKind,
+  is_valid_file_offset,
 };
 use crate::backend::{IoBackend, OpCompleted};
 
