@@ -49,10 +49,10 @@ run = [
 ]
 
 [tasks.check]
-description = "fmt --check, then cargo check. Skip lio-uring off Linux."
+description = "fmt --check, then cargo check. Skip lio-uring off Linux, and busybox on Windows."
 run = [
   "cargo fmt --check",
-  "cargo check --workspace{% if os() != 'linux' %} --exclude lio-uring{% endif %}",
+  "cargo check --workspace{% if os() != 'linux' %} --exclude lio-uring{% endif %}{% if os() == 'windows' %} --exclude busybox{% endif %}",
 ]
 
 [tasks.cbuild]
