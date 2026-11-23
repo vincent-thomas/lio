@@ -9,7 +9,6 @@ use std::mem::MaybeUninit;
 
 use bumpalo::Bump;
 
-#[cfg(test)]
 use crate::api::op::Action;
 use crate::registration::Registration;
 use crate::slab::{SlabKey, SlotPool};
@@ -26,6 +25,28 @@ struct StoreSlot {
 /// memory layout. Each slot owns:
 /// - a persistent model-lifetime bump reset before slot reuse
 /// - a step-lifetime bump reserved for backend-lowered state
+impl crate::backend::loan::Loan for OpStore {
+  fn lend<'a>(
+    &'a mut self,
+    id: u64,
+    f: &mut dyn FnMut(&mut crate::backend::loan::OpView<'a>),
+  ) {
+    let Some(reg) = self.get_mut(id) else {
+      panic!("backend lent operation {id}, which is not in the driver");
+    };
+    let mut ran = false;
+    reg.with_action(&mut |action| {
+      let Action::Io(op) = action else {
+        panic!("backend lent operation {id}, which is not I/O");
+      };
+      ran = true;
+      let mut view = crate::backend::loan::OpView::new(op.as_op());
+      f(&mut view);
+    });
+    assert!(ran, "backend lent operation {id}, which has no action");
+  }
+}
+
 pub(crate) struct OpStore {
   slots: SlotPool<StoreSlot, false>,
 }

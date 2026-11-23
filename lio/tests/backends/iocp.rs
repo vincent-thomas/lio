@@ -9,7 +9,13 @@ fn notify_wakes_a_blocked_wait() {
   backend.notify().unwrap();
 
   let mut completed = Vec::new();
-  backend.wait(Some(Duration::from_secs(5)), &mut completed).unwrap();
+  backend
+    .wait(
+      Some(Duration::from_secs(5)),
+      &mut completed,
+      &mut crate::backend::loan::Attested::new(),
+    )
+    .unwrap();
   assert!(completed.is_empty(), "a wake-up is not an op completion");
 }
 

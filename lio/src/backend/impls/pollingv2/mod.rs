@@ -194,10 +194,11 @@ impl Default for Poller {
 
 pub struct PendingOp {
   registration_id: u64,
-  op: crate::backend::op::Op,
-  // Held so the driver does not free the model while this entry is stored.
+  /// Pins the model. Not a caller address.
   #[allow(dead_code)]
   keep: crate::backend::Keep,
+  fd: RawFd,
+  interest: Interest,
 }
 
 // EAGAIN and EWOULDBLOCK are the same on Linux, but may differ on other systems
@@ -1151,50 +1152,79 @@ impl IoBackend for Poller {
   fn push(
     &mut self,
     id: u64,
-    op: crate::backend::InFlight<'_>,
+    keep: crate::backend::Keep,
+    _loan: &mut dyn crate::backend::loan::Loan,
     _step_bump: &mut Bump,
   ) {
-    // The model stays pinned while `keep` is stored with the operation.
-    let (op, keep) = op.into_parts();
     assert!(
       self.backlog.len() + self.pending.len() < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
-    self.backlog.push(PendingOp { registration_id: id, op, keep });
+    // fd and interest are filled at flush, inside the lend. The backlog
+    // holds the id until then.
+    self.backlog.push(PendingOp {
+      registration_id: id,
+      keep,
+      fd: 0,
+      interest: Interest::NONE,
+    });
   }
 
-  fn flush(&mut self) -> io::Result<()> {
+  fn flush(
+    &mut self,
+    loan: &mut dyn crate::backend::loan::Loan,
+  ) -> io::Result<()> {
     while let Some(entry) = self.backlog.pop() {
-      if matches!(entry.op, Op::Nop) {
+      let mut nop = false;
+      let mut validated = None;
+      let mut immediate = None;
+      let mut socket_now = None;
+      let mut connect = None;
+      let mut fd_interest = (0, Interest::NONE);
+      loan.lend(entry.registration_id, &mut |view| {
+        // SAFETY: every syscall in this flush runs before the callback
+        // returns. Nothing here is stored except the descriptor number.
+        let op = unsafe { view.kernel() };
+        nop = matches!(op, Op::Nop);
+        validated = Self::validate_op(op);
+        if Self::should_complete_immediately(op) {
+          immediate = Some(Self::exec_op(op));
+        }
+        socket_now = Self::try_socket_immediately(op);
+        if let Op::Connect { fd, addr } = op {
+          connect = Some((fd.as_raw_fd(), *addr));
+        }
+        fd_interest = self.extract_fd_interest(op);
+      });
+      if nop {
         self.queued_completed.push(OpCompleted::new(entry.registration_id, 0));
         continue;
       };
 
-      if let Some(result) = Self::validate_op(&entry.op) {
+      if let Some(result) = validated {
         self
           .queued_completed
           .push(OpCompleted::new(entry.registration_id, result));
         continue;
       }
 
-      if Self::should_complete_immediately(&entry.op) {
-        let result = Self::exec_op(&entry.op);
+      if let Some(result) = immediate {
         self
           .queued_completed
           .push(OpCompleted::new(entry.registration_id, result));
         continue;
       }
 
-      if let Some(result) = Self::try_socket_immediately(&entry.op) {
+      if let Some(result) = socket_now {
         self
           .queued_completed
           .push(OpCompleted::new(entry.registration_id, result));
         continue;
       }
 
-      if let Op::Connect { fd, addr } = &entry.op {
-        let Ok((storage, len)) = Self::lower_socket_addr(addr) else {
+      if let Some((fd, addr)) = connect {
+        let Ok((storage, len)) = Self::lower_socket_addr(&addr) else {
           self.queued_completed.push(OpCompleted::new(
             entry.registration_id,
             -(libc::EINVAL as isize),
@@ -1202,7 +1232,7 @@ impl IoBackend for Poller {
           continue;
         };
         let result = syscall!(raw connect(
-          fd.as_raw_fd(),
+          fd,
           (&storage as *const libc::sockaddr_storage).cast(),
           len,
         ));
@@ -1227,7 +1257,10 @@ impl IoBackend for Poller {
         }
       }
 
-      let (fd, interest) = self.extract_fd_interest(&entry.op);
+      let (fd, interest) = fd_interest;
+      let mut entry = entry;
+      entry.fd = fd;
+      entry.interest = interest;
 
       // Operation-local registration failures still belong to the op result
       // contract, so surface them as raw completions instead of bubbling them
@@ -1270,7 +1303,7 @@ impl IoBackend for Poller {
     let Some(entry) = key.and_then(|key| self.pending.remove_value(key)) else {
       return;
     };
-    let (fd, interest) = self.extract_fd_interest(&entry.op);
+    let (fd, interest) = (entry.fd, entry.interest);
     if !interest.is_none() {
       let _ = self.sys().delete(fd);
     }
@@ -1287,7 +1320,7 @@ impl IoBackend for Poller {
       let Some(entry) = self.pending.remove_value(key) else {
         continue;
       };
-      let (fd, interest) = self.extract_fd_interest(&entry.op);
+      let (fd, interest) = (entry.fd, entry.interest);
       if !interest.is_none()
         && let Some(sys) = self.sys.as_ref()
       {
@@ -1301,6 +1334,7 @@ impl IoBackend for Poller {
     &mut self,
     timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
+    loan: &mut dyn crate::backend::loan::Loan,
   ) -> io::Result<()> {
     completed.clear();
     if !self.queued_completed.is_empty() {
@@ -1341,14 +1375,18 @@ impl IoBackend for Poller {
         continue; // Cancelled or doesn't exist
       };
 
-      // Execute the operation
-      let result = Poller::exec_op(&entry.op);
+      // The syscall runs inside the lend. The op is not stored.
+      let mut result = 0;
+      loan.lend(entry.registration_id, &mut |view| {
+        // SAFETY: `exec_op` is the syscall. It returns before this callback.
+        result = Poller::exec_op(unsafe { view.kernel() });
+      });
 
       match result {
         #[allow(unreachable_patterns)]
         EAGAIN_NEG | EWOULDBLOCK_NEG => {
           // EAGAIN/EWOULDBLOCK - re-register for retry
-          let (fd, interest) = self.extract_fd_interest(&entry.op);
+          let (fd, interest) = (entry.fd, entry.interest);
           let registration_id = entry.registration_id;
           // The entry came out of `pending` above, freeing a slot.
           let Some((pending_key, _entry)) = self.pending.insert_get_mut(entry)
@@ -1366,7 +1404,7 @@ impl IoBackend for Poller {
           }
         }
         _ => {
-          let (fd, interest) = self.extract_fd_interest(&entry.op);
+          let (fd, interest) = (entry.fd, entry.interest);
           if !interest.is_none() {
             let _ = sys.delete(fd);
           }

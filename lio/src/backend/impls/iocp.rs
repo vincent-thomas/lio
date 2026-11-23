@@ -266,7 +266,6 @@ fn worker_loop(
 
 struct Queued {
   id: u64,
-  op: Op,
   keep: crate::backend::Keep,
 }
 
@@ -1029,23 +1028,33 @@ impl IoBackend for Iocp {
   fn push(
     &mut self,
     id: u64,
-    op: crate::backend::InFlight<'_>,
+    keep: crate::backend::Keep,
+    _loan: &mut dyn crate::backend::loan::Loan,
     _step_bump: &mut Bump,
   ) {
-    // The model stays pinned while `keep` is stored with the operation.
-    let (op, keep) = op.into_parts();
     assert!(
       self.backlog.len() + self.in_flight.len() + self.blocking_in_flight
         < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
-    self.backlog.push(Queued { id, op, keep });
+    self.backlog.push(Queued { id, keep });
   }
 
-  fn flush(&mut self) -> io::Result<()> {
-    for Queued { id, op, keep } in mem::take(&mut self.backlog) {
-      if let Some(result) = self.submit(id, op, keep) {
+  fn flush(
+    &mut self,
+    loan: &mut dyn crate::backend::loan::Loan,
+  ) -> io::Result<()> {
+    for Queued { id, keep } in mem::take(&mut self.backlog) {
+      let mut result = None;
+      loan.lend(id, &mut |view| {
+        // SAFETY: overlapped calls copy the address into a `WSABUF` here.
+        // A blocking job keeps it until its worker syscall, which `drain`
+        // waits for.
+        let op = unsafe { view.kernel() }.clone();
+        result = self.submit(id, op, keep);
+      });
+      if let Some(result) = result {
         self.ready.push(OpCompleted::new(id, result));
       }
     }
@@ -1082,6 +1091,7 @@ impl IoBackend for Iocp {
     &mut self,
     timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
+    _loan: &mut dyn crate::backend::loan::Loan,
   ) -> io::Result<()> {
     completed.clear();
     completed.append(&mut self.ready);
