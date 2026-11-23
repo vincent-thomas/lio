@@ -58,10 +58,10 @@ use crate::backend::impls::sockaddr::{
 };
 use crate::backend::native::CWD as CWD_HANDLE;
 use crate::backend::op::{
-  BorrowedOp, ByteSpan, DirEntryRef, FileStat, FileType, LinkKind, MsgRecv,
-  MsgSend, Op, OpaqueDropFn, OpenFlags, ReadDirResult, RecvFlags, SendFlags,
-  ShutdownHow, SocketAddrBuf, SocketAddrFamily, SpawnSpec, StatTarget,
-  UnlinkKind, is_valid_file_offset,
+  ByteSpan, DirEntryRef, FileStat, FileType, LinkKind, MsgRecv, MsgSend, Op,
+  OpaqueDropFn, OpenFlags, ReadDirResult, RecvFlags, SendFlags, ShutdownHow,
+  SocketAddrBuf, SocketAddrFamily, SpawnSpec, StatTarget, UnlinkKind,
+  is_valid_file_offset,
 };
 use crate::backend::{IoBackend, OpCompleted};
 
@@ -108,6 +108,7 @@ struct Overlapped {
   kind: AsyncKind,
   bufs: Vec<ws::WSABUF>,
   flags: u32,
+  keep: crate::backend::Keep,
   addr: Storage,
   addr_len: i32,
 }
@@ -130,13 +131,19 @@ enum AsyncKind {
 }
 
 impl Overlapped {
-  fn new(id: u64, resource: &Resource, kind: AsyncKind) -> Box<Self> {
+  fn new(
+    id: u64,
+    resource: &Resource,
+    kind: AsyncKind,
+    keep: crate::backend::Keep,
+  ) -> Box<Self> {
     Box::new(Self {
       // SAFETY: `OVERLAPPED` is plain old data; all-zero is its initial state.
       ov: unsafe { mem::zeroed() },
       id,
       socket: socket_of(resource),
       _resource: resource.clone(),
+      keep,
       kind,
       bufs: Vec::new(),
       flags: 0,
@@ -162,6 +169,7 @@ impl Drop for Overlapped {
 struct BlockingJob {
   id: u64,
   op: Op,
+  keep: crate::backend::Keep,
 }
 
 // SAFETY: the op's raw pointers refer to op-model storage that stays alive
@@ -235,12 +243,15 @@ fn worker_loop(
       Ok(rx) => rx.recv(),
       Err(_) => return,
     };
-    let Ok(BlockingJob { id, op }) = job else { return };
+    let Ok(BlockingJob { id, op, keep }) = job else { return };
     if shutting_down.load(Ordering::SeqCst) {
       // The backend is going away; nobody will reap this.
       return;
     }
     let result = run_blocking(op);
+    // Drop the lease before the completion is posted. The driver may reap
+    // it as soon as the post returns.
+    drop(keep);
     let done = Box::into_raw(Box::new(BlockingDone { id, result }));
     // SAFETY: the pointer is only passed through the port and turned back
     // into a `Box` by `reap`.
@@ -256,6 +267,7 @@ fn worker_loop(
 struct Queued {
   id: u64,
   op: Op,
+  keep: crate::backend::Keep,
 }
 
 /// Windows I/O completion port backend.
@@ -390,7 +402,12 @@ impl Iocp {
     None
   }
 
-  fn submit(&mut self, id: u64, op: Op) -> Option<isize> {
+  fn submit(
+    &mut self,
+    id: u64,
+    op: Op,
+    keep: crate::backend::Keep,
+  ) -> Option<isize> {
     match op {
       Op::Nop => Some(0),
       Op::Read { fd, iovecs, iov_count, offset, flags } => {
@@ -405,12 +422,16 @@ impl Iocp {
         }
         if probe_socket(socket_of(&fd)).is_ok() {
           let bufs = bufs.iter().map(|b| (b.bytes_ptr(), b.bytes_len()));
-          return self.start_recv(id, &fd, bufs, 0, None);
+          return self.start_recv(id, &fd, bufs, 0, None, keep);
         }
         if let Err(code) = check_handle(handle_of(&fd)) {
           return Some(code);
         }
-        self.offload(id, Op::Read { fd, iovecs, iov_count, offset, flags })
+        self.offload(
+          id,
+          Op::Read { fd, iovecs, iov_count, offset, flags },
+          keep,
+        )
       }
       Op::Write { fd, iovecs, iov_count, offset, flags } => {
         // SAFETY: the op model keeps `iov_count` buffers alive until done.
@@ -424,12 +445,16 @@ impl Iocp {
         }
         if probe_socket(socket_of(&fd)).is_ok() {
           let bufs = bufs.iter().map(|b| (b.bytes_ptr(), b.bytes_len()));
-          return self.start_send(id, &fd, bufs, 0, None);
+          return self.start_send(id, &fd, bufs, 0, None, keep);
         }
         if let Err(code) = check_handle(handle_of(&fd)) {
           return Some(code);
         }
-        self.offload(id, Op::Write { fd, iovecs, iov_count, offset, flags })
+        self.offload(
+          id,
+          Op::Write { fd, iovecs, iov_count, offset, flags },
+          keep,
+        )
       }
       Op::Recv { fd, msg, flags } => {
         let socket = socket_of(&fd);
@@ -437,7 +462,7 @@ impl Iocp {
           return Some(code);
         }
         let bufs = recv_bufs(&msg);
-        self.start_recv(id, &fd, bufs, recv_flags(flags), msg.from)
+        self.start_recv(id, &fd, bufs, recv_flags(flags), msg.from, keep)
       }
       Op::Send { fd, msg, flags } => {
         let socket = socket_of(&fd);
@@ -445,10 +470,10 @@ impl Iocp {
           return Some(code);
         }
         let bufs = send_bufs(&msg);
-        self.start_send(id, &fd, bufs, send_flags(flags), msg.to)
+        self.start_send(id, &fd, bufs, send_flags(flags), msg.to, keep)
       }
-      Op::Accept { fd, addr } => self.start_accept(id, &fd, addr),
-      Op::Connect { fd, addr } => self.start_connect(id, &fd, &addr),
+      Op::Accept { fd, addr } => self.start_accept(id, &fd, addr, keep),
+      Op::Connect { fd, addr } => self.start_connect(id, &fd, &addr, keep),
       Op::Socket { domain, ty, proto } => {
         Some(match socket_to_raw(domain, ty, proto) {
           Ok((domain, ty, proto)) => {
@@ -507,13 +532,18 @@ impl Iocp {
       | Op::LinkAt { .. }
       | Op::ReadlinkAt { .. }
       | Op::GetCwd { .. }
-      | Op::Spawn { .. } => self.offload(id, op),
+      | Op::Spawn { .. } => self.offload(id, op, keep),
     }
   }
 
   /// Hands an operation to the blocking pool; its result arrives through the
   /// port.
-  fn offload(&mut self, id: u64, op: Op) -> Option<isize> {
+  fn offload(
+    &mut self,
+    id: u64,
+    op: Op,
+    keep: crate::backend::Keep,
+  ) -> Option<isize> {
     if self.pool.is_none() {
       match BlockingPool::new(self.port) {
         Ok(pool) => self.pool = Some(pool),
@@ -524,7 +554,7 @@ impl Iocp {
       .pool
       .as_ref()
       .and_then(|pool| pool.jobs.as_ref())
-      .is_some_and(|jobs| jobs.send(BlockingJob { id, op }).is_ok());
+      .is_some_and(|jobs| jobs.send(BlockingJob { id, op, keep }).is_ok());
     if !sent {
       return Some(neg(ERROR_NOT_SUPPORTED));
     }
@@ -539,6 +569,7 @@ impl Iocp {
     bufs: impl Iterator<Item = (*mut u8, usize)>,
     flags: u32,
     from: Option<NonNull<SocketAddrBuf>>,
+    keep: crate::backend::Keep,
   ) -> Option<isize> {
     let socket = socket_of(fd);
     if let Err(code) = self.associate(socket as HANDLE) {
@@ -548,7 +579,7 @@ impl Iocp {
       Some(out) => AsyncKind::RecvFrom { out },
       None => AsyncKind::Transfer,
     };
-    let mut state = Overlapped::new(id, fd, kind);
+    let mut state = Overlapped::new(id, fd, kind, keep);
     state.bufs = wsa_bufs(bufs);
     state.flags = flags;
     let state_ptr: *mut Overlapped = &mut *state;
@@ -590,12 +621,13 @@ impl Iocp {
     bufs: impl Iterator<Item = (*mut u8, usize)>,
     flags: u32,
     to: Option<std::net::SocketAddr>,
+    keep: crate::backend::Keep,
   ) -> Option<isize> {
     let socket = socket_of(fd);
     if let Err(code) = self.associate(socket as HANDLE) {
       return Some(code);
     }
-    let mut state = Overlapped::new(id, fd, AsyncKind::Transfer);
+    let mut state = Overlapped::new(id, fd, AsyncKind::Transfer, keep);
     state.bufs = wsa_bufs(bufs);
     if let Some(to) = to {
       let (addr, len) = socket_addr_to_storage(to);
@@ -638,6 +670,7 @@ impl Iocp {
     id: u64,
     fd: &Resource,
     out: NonNull<SocketAddrBuf>,
+    keep: crate::backend::Keep,
   ) -> Option<isize> {
     let listener = socket_of(fd);
     if let Err(code) = probe_socket(listener) {
@@ -665,6 +698,7 @@ impl Iocp {
       id,
       fd,
       AsyncKind::Accept { accepted, out, buf: [0; 2 * ACCEPT_ADDR_LEN] },
+      keep,
     );
     if let Err(code) = self.associate(listener as HANDLE) {
       return Some(code);
@@ -697,6 +731,7 @@ impl Iocp {
     id: u64,
     fd: &Resource,
     addr: &SocketAddrBuf,
+    keep: crate::backend::Keep,
   ) -> Option<isize> {
     let socket = socket_of(fd);
     if let Err(code) = probe_socket(socket) {
@@ -727,7 +762,7 @@ impl Iocp {
     if let Err(code) = self.associate(socket as HANDLE) {
       return Some(code);
     }
-    let mut state = Overlapped::new(id, fd, AsyncKind::Connect);
+    let mut state = Overlapped::new(id, fd, AsyncKind::Connect, keep);
     state.addr = storage;
     state.addr_len = len;
     let state_ptr: *mut Overlapped = &mut *state;
@@ -991,27 +1026,26 @@ impl IoBackend for Iocp {
     Ok(())
   }
 
-  unsafe fn push(
+  fn push(
     &mut self,
     id: u64,
-    op: BorrowedOp<'_>,
+    op: crate::backend::InFlight<'_>,
     _step_bump: &mut Bump,
   ) {
-    // The submission contract keeps these addresses stable; the backend stores
-    // the descriptor, not a borrow of the caller's `BorrowedOp`.
-    let op = op.as_op().clone();
+    // The model stays pinned while `keep` is stored with the operation.
+    let (op, keep) = op.into_parts();
     assert!(
       self.backlog.len() + self.in_flight.len() + self.blocking_in_flight
         < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
-    self.backlog.push(Queued { id, op });
+    self.backlog.push(Queued { id, op, keep });
   }
 
   fn flush(&mut self) -> io::Result<()> {
-    for Queued { id, op } in mem::take(&mut self.backlog) {
-      if let Some(result) = self.submit(id, op) {
+    for Queued { id, op, keep } in mem::take(&mut self.backlog) {
+      if let Some(result) = self.submit(id, op, keep) {
         self.ready.push(OpCompleted::new(id, result));
       }
     }
@@ -1516,7 +1550,8 @@ fn read_dir(
   if opaque.is_null() {
     let iter = fs::read_dir(final_path(handle_of(dir))?)?;
     *opaque = Box::into_raw(Box::new(DirState { iter, pending: None })).cast();
-    *opaque_drop = Some(drop_dir_state);
+    // SAFETY: `drop_dir_state` frees the directory state this backend allocated.
+    *opaque_drop = Some(unsafe { OpaqueDropFn::new(drop_dir_state) });
   }
   // SAFETY: `opaque` was set from a `Box<DirState>` above or on a prior call.
   let state = unsafe { &mut *opaque.cast::<DirState>() };

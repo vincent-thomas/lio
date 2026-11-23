@@ -21,9 +21,7 @@ use lio_uring::{
 use crate::backend::{
   IoBackend, OpCompleted,
   impls::unix_stat::file_type_from_dirent_dtype,
-  op::{
-    BorrowedOp, DirEntryRef, LinkKind, Op, ReadDirResult, is_valid_file_offset,
-  },
+  op::{DirEntryRef, LinkKind, Op, ReadDirResult, is_valid_file_offset},
 };
 use crate::slab::{Slab, SlabKey};
 
@@ -47,6 +45,9 @@ mod single_socket_tests;
 struct PendingOp {
   registration_id: u64,
   op: Op,
+  // Held so the driver does not free the model while this entry is stored.
+  #[allow(dead_code)]
+  keep: crate::backend::Keep,
   lowered: LoweredState,
 }
 
@@ -895,7 +896,10 @@ impl IoUring {
           if let Some(state) = local_state.take() {
             let ptr = Box::into_raw(Box::new(state));
             *opaque = ptr.cast();
-            *opaque_drop = Some(Self::drop_read_dir_state);
+            // SAFETY: `drop_read_dir_state` frees the state this backend allocated.
+            *opaque_drop = Some(unsafe {
+              crate::backend::op::OpaqueDrop::new(Self::drop_read_dir_state)
+            });
           }
           Ok(entries)
         }
@@ -1351,10 +1355,14 @@ impl IoBackend for IoUring {
     Ok(())
   }
 
-  unsafe fn push(&mut self, id: u64, op: BorrowedOp<'_>, step_bump: &mut Bump) {
-    // The submission contract keeps these addresses stable; the backend stores
-    // the descriptor, not a borrow of the caller's `BorrowedOp`.
-    let op = op.as_op().clone();
+  fn push(
+    &mut self,
+    id: u64,
+    op: crate::backend::InFlight<'_>,
+    step_bump: &mut Bump,
+  ) {
+    // The model stays pinned while `keep` is stored with the operation.
+    let (op, keep) = op.into_parts();
     assert!(
       self.backlog.len() + self.in_flight < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
@@ -1371,7 +1379,7 @@ impl IoBackend for IoUring {
           return;
         }
       };
-    self.backlog.push(PendingOp { registration_id: id, op, lowered });
+    self.backlog.push(PendingOp { registration_id: id, op, keep, lowered });
   }
 
   fn flush(&mut self) -> io::Result<()> {

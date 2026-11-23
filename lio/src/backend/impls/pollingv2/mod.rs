@@ -195,6 +195,9 @@ impl Default for Poller {
 pub struct PendingOp {
   registration_id: u64,
   op: crate::backend::op::Op,
+  // Held so the driver does not free the model while this entry is stored.
+  #[allow(dead_code)]
+  keep: crate::backend::Keep,
 }
 
 // EAGAIN and EWOULDBLOCK are the same on Linux, but may differ on other systems
@@ -276,7 +279,10 @@ impl Poller {
         return Err(err);
       }
       *opaque = dir.cast();
-      *opaque_drop = Some(Self::drop_readdir_state);
+      // SAFETY: `drop_readdir_state` frees the state this backend allocated.
+      *opaque_drop = Some(unsafe {
+        crate::backend::op::OpaqueDrop::new(Self::drop_readdir_state)
+      });
       created_here = true;
       dir
     } else {
@@ -1142,21 +1148,20 @@ impl IoBackend for Poller {
     Ok(())
   }
 
-  unsafe fn push(
+  fn push(
     &mut self,
     id: u64,
-    op: crate::backend::op::BorrowedOp<'_>,
+    op: crate::backend::InFlight<'_>,
     _step_bump: &mut Bump,
   ) {
-    // The submission contract keeps these addresses stable; the backend stores
-    // the descriptor, not a borrow of the caller's `BorrowedOp`.
-    let op = op.as_op().clone();
+    // The model stays pinned while `keep` is stored with the operation.
+    let (op, keep) = op.into_parts();
     assert!(
       self.backlog.len() + self.pending.len() < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
-    self.backlog.push(PendingOp { registration_id: id, op });
+    self.backlog.push(PendingOp { registration_id: id, op, keep });
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -1270,6 +1275,26 @@ impl IoBackend for Poller {
       let _ = self.sys().delete(fd);
     }
     self.queued_completed.push(OpCompleted::new(id, CANCELED));
+  }
+
+  fn drain(&mut self) -> bool {
+    // Readiness interest is the only thing the kernel holds. The bytes live
+    // in `backlog` and `pending`, and this backend only dereferences them
+    // from `flush` and `wait`, so dropping them here releases every address.
+    self.backlog.clear();
+    let keys: Vec<_> = self.pending.keys_where(|_| true).collect();
+    for key in keys {
+      let Some(entry) = self.pending.remove_value(key) else {
+        continue;
+      };
+      let (fd, interest) = self.extract_fd_interest(&entry.op);
+      if !interest.is_none()
+        && let Some(sys) = self.sys.as_ref()
+      {
+        let _ = sys.delete(fd);
+      }
+    }
+    true
   }
 
   fn wait(

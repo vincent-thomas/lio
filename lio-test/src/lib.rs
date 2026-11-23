@@ -207,8 +207,13 @@ macro_rules! test_io_backend {
           step_bumps.entry((backend_key, id)).or_insert_with(Bump::new);
         step_bump.reset();
         // SAFETY: every buffer these tests submit stays alive until `wait`
-        // returns the completion, which is the `IoBackend::push` contract.
-        unsafe { IoBackend::push(backend, id, op, step_bump) };
+        // returns the completion, which is the `InFlight::attest` contract.
+        IoBackend::push(
+          backend,
+          id,
+          unsafe { __lio_test_lio::backend::InFlight::attest(op) },
+          step_bump,
+        );
       });
     }
 

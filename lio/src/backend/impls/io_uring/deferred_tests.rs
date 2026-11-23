@@ -92,9 +92,13 @@ fn trace_read_batches() {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    unsafe fn push(&mut self, id: u64, op: BorrowedOp<'_>, bump: &mut Bump) {
-      // SAFETY: this wrapper forwards the same submission the caller pushed.
-      unsafe { self.inner.push(id, op, bump) }
+    fn push(
+      &mut self,
+      id: u64,
+      op: crate::backend::InFlight<'_>,
+      bump: &mut Bump,
+    ) {
+      self.inner.push(id, op, bump)
     }
     fn flush(&mut self) -> io::Result<()> {
       let t = Instant::now();
@@ -265,13 +269,13 @@ fn nonblocking_waits_make_progress_on_file_completions() {
     unsafe {
       backend.push(
         id as u64,
-        BorrowedOp::from_op(Op::Read {
+        crate::backend::InFlight::attest(BorrowedOp::from_op(Op::Read {
           fd: file.clone(),
           iovecs: NonNull::from(raw).cast(),
           iov_count: 1,
           offset: Some(0),
           flags: ReadFlags::empty(),
-        }),
+        })),
         &mut arena,
       );
     }
@@ -324,13 +328,13 @@ fn read_with_more_iovecs_than_the_native_array_is_rejected() {
   unsafe {
     backend.push(
       1,
-      BorrowedOp::from_op(Op::Read {
+      crate::backend::InFlight::attest(BorrowedOp::from_op(Op::Read {
         fd: reader,
         iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
         iov_count: raws.len(),
         offset: None,
         flags: ReadFlags::empty(),
-      }),
+      })),
       &mut arena,
     );
   }
@@ -360,13 +364,13 @@ fn drop_waits_for_operations_in_the_kernel() {
   unsafe {
     backend.push(
       1,
-      BorrowedOp::from_op(Op::Read {
+      crate::backend::InFlight::attest(BorrowedOp::from_op(Op::Read {
         fd: reader.clone(),
         iovecs: NonNull::from(&raw).cast(),
         iov_count: 1,
         offset: None,
         flags: ReadFlags::empty(),
-      }),
+      })),
       &mut arena,
     );
   }

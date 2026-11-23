@@ -34,12 +34,12 @@ fn drop_cancels_a_blocked_pipe_read() {
   unsafe {
     backend.push(
       1,
-      lio::backend::op::BorrowedOp::read(
+      lio::backend::InFlight::attest(lio::backend::op::BorrowedOp::read(
         reader,
         std::slice::from_ref(&raw),
         None,
         ReadFlags::empty(),
-      ),
+      )),
       &mut bumpalo::Bump::new(),
     );
   }

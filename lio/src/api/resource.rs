@@ -183,6 +183,8 @@ pub struct ResourceClose {
 ///
 /// Only as [`ResourceClose::native`]: the argument is an owned descriptor
 /// closed exactly once.
+fn noop_close(_raw: RawResource) {}
+
 fn close_owned(raw: RawResource) {
   // SAFETY: the caller is `ResourceClose::call`, which runs for an owned
   // resource exactly once.
@@ -190,14 +192,11 @@ fn close_owned(raw: RawResource) {
 }
 
 impl ResourceClose {
-  /// A closer that runs `close` with the raw descriptor.
+  /// Closes nothing.
   ///
-  /// `close` runs at most once, for a descriptor the resource owns. A
-  /// simulation, which must not close a real descriptor, passes an empty
-  /// function. A backend that produced a real OS descriptor passes
-  /// [`native`](Self::native).
-  pub const fn from_fn(close: fn(RawResource)) -> Self {
-    Self { close }
+  /// A simulation uses this. The descriptor is not an OS resource.
+  pub const fn noop() -> Self {
+    Self { close: noop_close }
   }
 
   /// Closes native OS descriptors/handles.

@@ -45,8 +45,13 @@ mod immediate_sockets {
     };
     // Poller does not use the step arena. Models are boxed by the caller so
     // the buffers and message descriptors stay stable until completion.
-    // SAFETY: `model` stays borrowed by the caller until the backend finishes.
-    unsafe { backend.push(id, op, &mut Bump::new()) };
+    // `from_model` names that borrow: `model` stays alive until the backend
+    // finishes.
+    backend.push(
+      id,
+      crate::backend::InFlight::from_model(op, crate::backend::Keep::new()),
+      &mut Bump::new(),
+    );
   }
 
   #[test]
@@ -133,9 +138,13 @@ mod immediate_sockets {
     assert_eq!(backend.pending.len(), 1);
     peer.write_all(b"hello").unwrap();
     // SAFETY: a no-op borrows nothing.
-    unsafe {
-      backend.push(16, crate::backend::op::BorrowedOp::nop(), &mut Bump::new())
-    };
+    backend.push(
+      16,
+      unsafe {
+        crate::backend::InFlight::attest(crate::backend::op::BorrowedOp::nop())
+      },
+      &mut Bump::new(),
+    );
     backend.flush().unwrap();
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
@@ -144,6 +153,22 @@ mod immediate_sockets {
     ids.sort_unstable();
     assert_eq!(ids, [15, 16]);
     assert_eq!(backend.pending.len(), 0);
+  }
+
+  #[test]
+  fn drain_drops_a_registered_receive() {
+    let (socket, _peer) = pair(true);
+    let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
+    let mut backend = backend();
+    queue(&mut backend, 15, &mut *model);
+    backend.flush().unwrap();
+    assert_eq!(backend.pending.len(), 1);
+    assert!(backend.drain());
+    assert_eq!(backend.pending.len(), 0);
+    drop(model);
+    let mut completed = Vec::new();
+    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    assert!(completed.is_empty());
   }
 
   #[test]
@@ -207,13 +232,15 @@ mod immediate_sockets {
     unsafe {
       backend.push(
         18,
-        crate::backend::op::BorrowedOp::from_op(Op::Read {
-          fd: socket,
-          iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
-          iov_count: raws.len(),
-          offset: None,
-          flags: ReadFlags::empty(),
-        }),
+        crate::backend::InFlight::attest(
+          crate::backend::op::BorrowedOp::from_op(Op::Read {
+            fd: socket,
+            iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
+            iov_count: raws.len(),
+            offset: None,
+            flags: ReadFlags::empty(),
+          }),
+        ),
         &mut Bump::new(),
       );
     }

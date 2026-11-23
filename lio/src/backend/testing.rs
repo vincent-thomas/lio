@@ -25,7 +25,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hint::black_box;
 use std::io;
 use std::ptr;
@@ -35,7 +35,7 @@ use std::time::Duration;
 use bumpalo::Bump;
 
 use crate::api::resource::ResourceClose;
-use crate::backend::op::{BorrowedOp, MsgBuf, MsgBufMut, Op};
+use crate::backend::op::{MsgBuf, MsgBufMut, Op};
 use crate::backend::{IoBackend, OpCompleted};
 
 /// The byte [`ScriptedBackend`] writes into the buffers it fills.
@@ -48,6 +48,8 @@ struct Script {
   pushed: Vec<u64>,
   /// Pushed and not yet completed, in push order.
   in_flight: Vec<(u64, Op)>,
+  /// Leases for `in_flight`, dropped with those operations.
+  keeps: HashMap<u64, crate::backend::Keep>,
   cancelled: Vec<u64>,
   /// Completed, waiting for the next `wait()`.
   ready: VecDeque<OpCompleted>,
@@ -136,6 +138,7 @@ impl ScriptedBackend {
       panic!("ScriptedBackend::complete: operation {id} is not in flight");
     };
     let (_, op) = script.in_flight.remove(pos);
+    script.keeps.remove(&id);
     if !script.no_poison {
       // SAFETY: the operation is still in flight, so the driver keeps the
       // memory it points to valid until it sees this completion.
@@ -159,19 +162,20 @@ impl IoBackend for ScriptedBackend {
   }
 
   fn resource_close(&self) -> ResourceClose {
-    ResourceClose::from_fn(|_| {})
+    ResourceClose::noop()
   }
 
-  unsafe fn push(
+  fn push(
     &mut self,
     id: u64,
-    op: BorrowedOp<'_>,
+    op: crate::backend::InFlight<'_>,
     _step_bump: &mut Bump,
   ) {
-    let op = op.as_op().clone();
+    let (op, keep) = op.into_parts();
     let mut script = self.0.borrow_mut();
     script.pushed.push(id);
     script.in_flight.push((id, op));
+    script.keeps.insert(id, keep);
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -191,6 +195,7 @@ impl IoBackend for ScriptedBackend {
     if script.stuck {
       return false;
     }
+    script.keeps.clear();
     for (_, op) in std::mem::take(&mut script.in_flight) {
       if !script.no_poison {
         // SAFETY: a drained operation may still be finishing, so the driver
@@ -352,7 +357,12 @@ impl<B: IoBackend> IoBackend for Checked<B> {
     self.inner.resource_close()
   }
 
-  unsafe fn push(&mut self, id: u64, op: BorrowedOp<'_>, step_bump: &mut Bump) {
+  fn push(
+    &mut self,
+    id: u64,
+    op: crate::backend::InFlight<'_>,
+    step_bump: &mut Bump,
+  ) {
     let cap = self.cap("push");
     assert!(
       self.in_flight.len() < cap,
@@ -363,8 +373,7 @@ impl<B: IoBackend> IoBackend for Checked<B> {
       self.in_flight.insert(id),
       "contract: pushed operation {id} while it is still in flight"
     );
-    // SAFETY: this wrapper forwards the same submission the caller pushed.
-    unsafe { self.inner.push(id, op, step_bump) };
+    self.inner.push(id, op, step_bump);
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -419,11 +428,18 @@ impl<B> Drop for Checked<B> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::backend::op::BorrowedOp;
 
   fn push_op(backend: &mut impl IoBackend, id: u64, op: Op) {
     // SAFETY: every buffer these tests submit stays alive until the backend
     // completes or drains the operation.
-    unsafe { backend.push(id, BorrowedOp::from_op(op), &mut Bump::new()) };
+    unsafe {
+      backend.push(
+        id,
+        crate::backend::InFlight::attest(BorrowedOp::from_op(op)),
+        &mut Bump::new(),
+      )
+    };
   }
   use crate::backend::op::RawBuf;
 
@@ -616,7 +632,12 @@ mod tests {
       fn init(&mut self, _: usize) -> io::Result<()> {
         Ok(())
       }
-      unsafe fn push(&mut self, id: u64, _: BorrowedOp<'_>, _: &mut Bump) {
+      fn push(
+        &mut self,
+        id: u64,
+        _: crate::backend::InFlight<'_>,
+        _: &mut Bump,
+      ) {
         self.0 = Some(id);
       }
       fn flush(&mut self) -> io::Result<()> {

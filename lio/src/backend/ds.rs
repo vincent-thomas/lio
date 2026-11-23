@@ -162,8 +162,6 @@ pub mod errno {
 
 /// Resources from the simulation are synthetic numbers, not OS descriptors:
 /// dropping them must not close anything real.
-fn close_simulated(_raw: crate::api::resource::RawResource) {}
-
 /// File-type mode bits the simulation reports; Linux values where the
 /// platform has none (Windows' CRT).
 mod sim {
@@ -440,14 +438,14 @@ struct DSWorld {
   bound_listeners: BTreeMap<Vec<u8>, i32>,
   occupied_addr_keys: Vec<Vec<u8>>,
   events: Vec<ScheduledEvent>,
-  pending: Vec<(u64, Op)>,
+  pending: Vec<(u64, Op, crate::backend::Keep)>,
 }
 
 #[derive(Debug)]
 pub struct DSBackend {
   cap: usize,
   initialized: bool,
-  queued: Vec<(u64, Op)>,
+  queued: Vec<(u64, Op, crate::backend::Keep)>,
   ready: Vec<OpCompleted>,
   schedule_rng: Prng,
   fault_rng: Prng,
@@ -707,8 +705,8 @@ struct DSTNodeState {
   next_fd: i32,
   next_network_seq: u64,
   sockets: BTreeMap<i32, DSTSocketHandle>,
-  outgoing: VecDeque<(u64, Op)>,
-  pending: Vec<(u64, Op)>,
+  outgoing: VecDeque<(u64, Op, crate::backend::Keep)>,
+  pending: Vec<(u64, Op, crate::backend::Keep)>,
   ready: Vec<OpCompleted>,
 }
 
@@ -1049,7 +1047,7 @@ struct DSTBackend {
   node_id: DSTNodeId,
   node: Rc<RefCell<DSTNodeState>>,
   inner: Rc<RefCell<DSTInner>>,
-  queued: Vec<(u64, Op)>,
+  queued: Vec<(u64, Op, crate::backend::Keep)>,
 }
 
 struct DSTNodeRunner {
@@ -1937,7 +1935,7 @@ impl DSBackend {
   fn poll_pending_ops(&mut self) {
     let mut idx = 0usize;
     while idx < self.world.pending.len() {
-      let (id, op) = self.world.pending.remove(idx);
+      let (id, op, keep) = self.world.pending.remove(idx);
       match self.process_pending_op(id, op) {
         PendingAction::Complete(result) => {
           self.record_trace(format!(
@@ -1947,7 +1945,7 @@ impl DSBackend {
           self.ready.push(OpCompleted::new(id, result));
         }
         PendingAction::KeepPending(op) => {
-          self.world.pending.insert(idx, (id, op));
+          self.world.pending.insert(idx, (id, op, keep));
           idx += 1;
         }
       }
@@ -2693,7 +2691,7 @@ impl DSBackend {
 
 impl IoBackend for DSBackend {
   fn resource_close(&self) -> crate::api::resource::ResourceClose {
-    crate::api::resource::ResourceClose::from_fn(close_simulated)
+    crate::api::resource::ResourceClose::noop()
   }
 
   fn init(&mut self, cap: usize) -> io::Result<()> {
@@ -2706,25 +2704,25 @@ impl IoBackend for DSBackend {
     Ok(())
   }
 
-  unsafe fn push(
+  fn push(
     &mut self,
     id: u64,
-    op: BorrowedOp<'_>,
+    op: crate::backend::InFlight<'_>,
     _step_bump: &mut Bump,
   ) {
-    let op = op.as_op().clone();
+    let (op, keep) = op.into_parts();
     self.assert_initialized();
     self.assert_capacity();
-    self.queued.push((id, op));
+    self.queued.push((id, op, keep));
   }
 
   fn cancel(&mut self, id: u64) {
-    let queued = self.queued.iter().position(|(queued, _)| *queued == id);
+    let queued = self.queued.iter().position(|(queued, _, _)| *queued == id);
     let removed = if let Some(index) = queued {
       self.queued.remove(index);
       true
     } else if let Some(index) =
-      self.world.pending.iter().position(|(pending, _)| *pending == id)
+      self.world.pending.iter().position(|(pending, _, _)| *pending == id)
     {
       self.world.pending.remove(index);
       true
@@ -2737,10 +2735,18 @@ impl IoBackend for DSBackend {
     }
   }
 
+  fn drain(&mut self) -> bool {
+    // The simulator only dereferences stored operations from `flush` and
+    // `wait`. Dropping them here means a later call cannot see them.
+    self.queued.clear();
+    self.world.pending.clear();
+    true
+  }
+
   fn flush(&mut self) -> io::Result<()> {
     self.assert_initialized();
     let queued = mem::take(&mut self.queued);
-    for (id, op) in queued {
+    for (id, op, keep) in queued {
       match self.complete_op(op) {
         OpAction::Complete(result) => self.schedule_completion(id, result),
         OpAction::Pending(op) => {
@@ -2748,7 +2754,7 @@ impl IoBackend for DSBackend {
             "tick={} pending id={}",
             self.world.tick, id
           ));
-          self.world.pending.push((id, op));
+          self.world.pending.push((id, op, keep));
         }
         OpAction::StartConnect {
           accepted_fd,
@@ -3029,12 +3035,12 @@ impl DST {
       }
     }
 
-    while let Some((node_id, id, op)) =
+    while let Some((node_id, id, op, keep)) =
       self.next_outgoing_network_op(arbitration_round)
     {
       progressed = true;
       arbitration_round = arbitration_round.saturating_add(1);
-      self.execute_network_op(node_id, id, op);
+      self.execute_network_op(node_id, id, op, keep);
     }
     progressed
   }
@@ -3042,7 +3048,7 @@ impl DST {
   fn next_outgoing_network_op(
     &mut self,
     arbitration_round: u64,
-  ) -> Option<(DSTNodeId, u64, Op)> {
+  ) -> Option<(DSTNodeId, u64, Op, crate::backend::Keep)> {
     let tick = self.inner.borrow().tick;
     let (chosen_node, stale_nodes) = {
       let inner = self.inner.borrow();
@@ -3077,7 +3083,7 @@ impl DST {
 
     let node = self.inner.borrow().node(chosen_node);
     let mut node = node.borrow_mut();
-    let (id, op) = node
+    let (id, op, keep) = node
       .outgoing
       .pop_front()
       .expect("chosen node should have queued outgoing network op");
@@ -3086,10 +3092,16 @@ impl DST {
     if became_empty {
       self.inner.borrow_mut().active_outgoing_nodes.remove(&chosen_node);
     }
-    Some((chosen_node, id, op))
+    Some((chosen_node, id, op, keep))
   }
 
-  fn execute_network_op(&mut self, node_id: DSTNodeId, id: u64, op: Op) {
+  fn execute_network_op(
+    &mut self,
+    node_id: DSTNodeId,
+    id: u64,
+    op: Op,
+    keep: crate::backend::Keep,
+  ) {
     let node = self.inner.borrow().node(node_id);
     let mut backend = DSTBackend {
       local: None,
@@ -3098,7 +3110,7 @@ impl DST {
       inner: self.inner.clone(),
       queued: Vec::new(),
     };
-    backend.network_complete_op(id, op);
+    backend.finish_network_op(id, op, keep);
     self.mark_runner_ready(node_id);
   }
 
@@ -3209,21 +3221,21 @@ impl DSTBackend {
     self.node.borrow().sockets.contains_key(&raw)
   }
 
-  fn queue_network_op(&mut self, id: u64, op: Op) {
-    self.queued.push((id, op));
+  fn queue_network_op(&mut self, id: u64, op: Op, keep: crate::backend::Keep) {
+    self.queued.push((id, op, keep));
   }
 
   /// Removes a network operation that has not completed yet.
   fn cancel_network_op(&mut self, id: u64) -> bool {
     if let Some(index) =
-      self.queued.iter().position(|(queued, _)| *queued == id)
+      self.queued.iter().position(|(queued, _, _)| *queued == id)
     {
       self.queued.remove(index);
       return true;
     }
     let mut node = self.node.borrow_mut();
     let Some(index) =
-      node.pending.iter().position(|(pending, _)| *pending == id)
+      node.pending.iter().position(|(pending, _, _)| *pending == id)
     else {
       return false;
     };
@@ -3481,7 +3493,7 @@ impl DSTBackend {
     let mut node = node.borrow_mut();
     let pending = mem::take(&mut node.pending);
     node.pending.reserve(pending.len());
-    for (id, op) in pending {
+    for (id, op, keep) in pending {
       let action = match op {
         Op::Read { fd, iovecs, iov_count, offset, flags } => {
           Self::process_network_read(
@@ -3504,7 +3516,7 @@ impl DSTBackend {
           node.ready.push(OpCompleted::new(id, result));
         }
         PendingAction::KeepPending(op) => {
-          node.pending.push((id, op));
+          node.pending.push((id, op, keep));
         }
       }
     }
@@ -3625,7 +3637,12 @@ impl DSTBackend {
     Ok(bytes.len())
   }
 
+  #[cfg(test)]
   fn network_complete_op(&mut self, id: u64, op: Op) {
+    self.finish_network_op(id, op, crate::backend::Keep::new());
+  }
+
+  fn finish_network_op(&mut self, id: u64, op: Op, keep: crate::backend::Keep) {
     match op {
       Op::Socket { domain, ty, proto } => {
         if !op::is_supported_socket(domain, ty, proto) {
@@ -3911,7 +3928,7 @@ impl DSTBackend {
           PendingAction::Complete(result) => {
             node.ready.push(OpCompleted::new(id, result));
           }
-          PendingAction::KeepPending(op) => node.pending.push((id, op)),
+          PendingAction::KeepPending(op) => node.pending.push((id, op, keep)),
         }
       }
       Op::Read { fd, iovecs, iov_count, offset, flags } => {
@@ -3923,7 +3940,7 @@ impl DSTBackend {
           PendingAction::Complete(result) => {
             node.ready.push(OpCompleted::new(id, result));
           }
-          PendingAction::KeepPending(op) => node.pending.push((id, op)),
+          PendingAction::KeepPending(op) => node.pending.push((id, op, keep)),
         }
       }
       Op::Accept { fd, addr } => {
@@ -3933,7 +3950,7 @@ impl DSTBackend {
           PendingAction::Complete(result) => {
             node.ready.push(OpCompleted::new(id, result));
           }
-          PendingAction::KeepPending(op) => node.pending.push((id, op)),
+          PendingAction::KeepPending(op) => node.pending.push((id, op, keep)),
         }
       }
       Op::Shutdown { fd, how } => {
@@ -3992,14 +4009,18 @@ impl DSTBackend {
       }
       other => {
         // SAFETY: `other` was accepted by `push` and stays in flight here.
-        // Forwarding it does not create a new borrow.
-        unsafe {
-          self
-            .local
-            .as_mut()
-            .expect("non-network DST backend op requires local backend")
-            .push(id, BorrowedOp::from_op(other), &mut Bump::new());
-        }
+        // The same lease goes with it. A new lease would let the driver free
+        // the model while the local backend still holds these addresses.
+        let borrowed = unsafe { BorrowedOp::from_op(other) };
+        self
+          .local
+          .as_mut()
+          .expect("non-network DST backend op requires local backend")
+          .push(
+            id,
+            crate::backend::InFlight::from_model(borrowed, keep),
+            &mut Bump::new(),
+          );
       }
     }
   }
@@ -4007,7 +4028,7 @@ impl DSTBackend {
 
 impl IoBackend for DSTBackend {
   fn resource_close(&self) -> crate::api::resource::ResourceClose {
-    crate::api::resource::ResourceClose::from_fn(close_simulated)
+    crate::api::resource::ResourceClose::noop()
   }
 
   fn init(&mut self, cap: usize) -> io::Result<()> {
@@ -4030,8 +4051,13 @@ impl IoBackend for DSTBackend {
     Ok(())
   }
 
-  unsafe fn push(&mut self, id: u64, op: BorrowedOp<'_>, step_bump: &mut Bump) {
-    let stored = op.as_op().clone();
+  fn push(
+    &mut self,
+    id: u64,
+    op: crate::backend::InFlight<'_>,
+    step_bump: &mut Bump,
+  ) {
+    let (stored, keep) = op.into_parts();
     let use_network = match &stored {
       Op::Socket { .. } => true,
       Op::Bind { fd, .. }
@@ -4051,16 +4077,20 @@ impl IoBackend for DSTBackend {
     };
 
     if use_network {
-      self.queue_network_op(id, stored);
+      self.queue_network_op(id, stored, keep);
     } else {
-      // SAFETY: this forwards the same submission the caller pushed.
-      unsafe {
-        self
-          .local
-          .as_mut()
-          .expect("non-network DST backend push requires local backend")
-          .push(id, op, step_bump);
-      }
+      // SAFETY: `stored` was just taken from this `InFlight`. The same lease
+      // goes with it into the local backend.
+      let borrowed = unsafe { BorrowedOp::from_op(stored) };
+      self
+        .local
+        .as_mut()
+        .expect("non-network DST backend push requires local backend")
+        .push(
+          id,
+          crate::backend::InFlight::from_model(borrowed, keep),
+          step_bump,
+        );
     }
   }
 
@@ -4070,6 +4100,20 @@ impl IoBackend for DSTBackend {
       self.node.borrow_mut().ready.push(OpCompleted::new(id, result));
     } else if let Some(local) = self.local.as_mut() {
       local.cancel(id);
+    }
+  }
+
+  fn drain(&mut self) -> bool {
+    self.queued.clear();
+    {
+      let mut node = self.node.borrow_mut();
+      node.outgoing.clear();
+      node.pending.clear();
+    }
+    self.inner.borrow_mut().active_outgoing_nodes.remove(&self.node_id);
+    match self.local.as_mut() {
+      Some(local) => local.drain(),
+      None => true,
     }
   }
 
@@ -4116,7 +4160,40 @@ mod tests {
   fn submit(backend: &mut impl IoBackend, id: u64, op: Op, bump: &mut Bump) {
     // SAFETY: these tests keep every buffer named by `op` alive until the
     // backend reports the completion.
-    unsafe { backend.push(id, BorrowedOp::from_op(op), bump) };
+    unsafe {
+      backend.push(
+        id,
+        crate::backend::InFlight::attest(BorrowedOp::from_op(op)),
+        bump,
+      )
+    };
+  }
+
+  #[test]
+  fn drain_drops_a_queued_read() {
+    let mut backend = DSBackend::new();
+    backend.init(4).unwrap();
+    let mut bytes = [1u8; 4];
+    {
+      let iov = [crate::backend::op::RawBufMut::from_mut(&mut bytes)];
+      let op = BorrowedOp::read(
+        crate::api::resource::Resource::invalid(),
+        &iov,
+        None,
+        Default::default(),
+      );
+      // SAFETY: `drain` below drops the queued operation before `iov` and
+      // `bytes` are released.
+      unsafe {
+        backend.push(1, crate::backend::InFlight::attest(op), &mut Bump::new())
+      };
+      assert!(backend.drain());
+    }
+    backend.flush().unwrap();
+    let mut completed = Vec::new();
+    backend.wait(Some(std::time::Duration::ZERO), &mut completed).unwrap();
+    assert!(completed.is_empty());
+    assert_eq!(bytes, [1u8; 4]);
   }
 
   use super::*;

@@ -116,8 +116,9 @@ impl<'a> Action<'a> {
   /// # Safety
   ///
   /// The memory `self` borrows must remain valid for as long as the returned
-  /// action is submitted and in flight. The driver calls this while the
-  /// model is still borrowed and keeps that model pinned until completion.
+  /// action is used. Contract tests call this to inspect an action while the
+  /// model is still borrowed, and they never submit the erased action.
+  #[cfg(test)]
   pub(crate) unsafe fn erase_lifetime(self) -> Action<'static> {
     // SAFETY: `Action` stores raw pointers inside `Op` plus a `PhantomData`
     // brand. Extending the brand does not create a reference.
@@ -246,13 +247,9 @@ mod completion_tests {
 
   #[test]
   fn completions_compare_their_resource_close() {
-    fn other(_: crate::api::resource::RawResource) {}
     let native = Completion::new(3);
     assert_eq!(native, Completion::new(3));
-    assert_ne!(
-      native,
-      native.with_resource_close(ResourceClose::from_fn(other))
-    );
+    assert_ne!(native, native.with_resource_close(ResourceClose::noop()));
     assert!(format!("{native:?}").contains("resource_close: ResourceClose"));
   }
 }

@@ -12,33 +12,43 @@ use crate::api::op::{Action, Completion, OpModel, OpResult};
 ///
 /// The model that produced `action` must stay pinned, with its buffers
 /// unmoved, until the backend finishes that submission.
+#[cfg(test)]
 unsafe fn erase_action(action: Action<'_>) -> Action<'static> {
   // SAFETY: the caller keeps the producing model pinned for the submission.
   unsafe { action.erase_lifetime() }
 }
 
 /// Result of processing a completion.
+///
+/// A continuation does not carry the next action. The driver asks the model
+/// for that action while the model is still borrowed, and submits it in that
+/// same borrow, so the operation's lifetime is the model's.
 pub(crate) struct ProcessResult {
-  pub(crate) next_action: Option<Action<'static>>,
+  continues: bool,
 }
 
 impl ProcessResult {
   #[inline]
-  fn continue_with(action: Action<'static>) -> Self {
-    Self { next_action: Some(action) }
+  fn r#continue() -> Self {
+    Self { continues: true }
   }
 
   #[inline]
   fn done() -> Self {
-    Self { next_action: None }
+    Self { continues: false }
   }
 
-  #[cfg(test)]
   #[inline]
   pub(crate) fn is_done(&self) -> bool {
-    self.next_action.is_none()
+    !self.continues
   }
 }
+
+/// Calls the closure with the model's next action, for any lifetime of that action.
+///
+/// Returns whether the model still has an action to submit. A finished
+/// model does not: asking it again would queue the same step forever.
+type WithActionFn = fn(*mut (), &mut dyn for<'a> FnMut(Action<'a>)) -> bool;
 
 /// Waker-based result handler that sends typed results through a channel.
 ///
@@ -48,13 +58,18 @@ pub(crate) struct WakerResultHandler {
   payload: *mut (),
   on_completion_fn:
     fn(*mut (), Completion, &mut Option<Waker>) -> ProcessResult,
+  #[cfg(test)]
   action_fn: fn(*mut ()) -> Action<'static>,
+  with_action_fn: WithActionFn,
   drop_fn: fn(*mut ()),
 }
 
 struct WakerPayload<T: OpModel> {
   sender: mpsc::Sender<T::Item>,
   op_model: T,
+  /// Set once `complete` returns [`OpResult::Done`]. The driver must not
+  /// submit another action after that.
+  finished: bool,
 }
 
 impl WakerResultHandler {
@@ -69,19 +84,28 @@ impl WakerResultHandler {
   {
     Self {
       payload: BumpBox::into_raw(BumpBox::new_in(
-        WakerPayload { sender, op_model },
+        WakerPayload { sender, op_model, finished: false },
         arena,
       )) as *mut (),
       on_completion_fn: Self::on_completion_impl::<T>,
+      #[cfg(test)]
       action_fn: Self::action_impl::<T>,
+      with_action_fn: Self::with_action_impl::<T>,
       drop_fn: Self::drop_bump_impl::<T>,
     }
   }
 
   /// Get the next runtime action to perform.
+  #[cfg(test)]
   #[inline]
   fn action(&mut self) -> Action<'static> {
     (self.action_fn)(self.payload)
+  }
+
+  /// Runs `f` on the next action while the model that produced it is borrowed.
+  #[inline]
+  fn with_action(&mut self, f: &mut dyn for<'a> FnMut(Action<'a>)) -> bool {
+    (self.with_action_fn)(self.payload, f)
   }
 
   /// Process a completion result.
@@ -97,6 +121,7 @@ impl WakerResultHandler {
     (self.on_completion_fn)(self.payload, completion, waker)
   }
 
+  #[cfg(test)]
   #[inline]
   fn action_impl<T: OpModel>(payload_ptr: *mut ()) -> Action<'static> {
     // SAFETY: `payload_ptr` is created from `WakerPayload<T>` in `new`/`new_in`
@@ -108,6 +133,21 @@ impl WakerResultHandler {
   }
 
   #[inline]
+  fn with_action_impl<T: OpModel>(
+    payload_ptr: *mut (),
+    f: &mut dyn for<'a> FnMut(Action<'a>),
+  ) -> bool {
+    // SAFETY: `payload_ptr` is created from `WakerPayload<T>` in `new`/`new_in`
+    // and remains valid for the lifetime of this handler.
+    let payload = unsafe { &mut *(payload_ptr as *mut WakerPayload<T>) };
+    if payload.finished {
+      panic!("finished model was submitted again");
+    }
+    f(payload.op_model.action());
+    true
+  }
+
+  #[inline]
   fn on_completion_impl<T: OpModel>(
     payload_ptr: *mut (),
     completion: Completion,
@@ -116,37 +156,37 @@ impl WakerResultHandler {
     // SAFETY: `payload_ptr` is created from `WakerPayload<T>` in `new`/`new_in`
     // and remains valid while completions are dispatched.
     let payload = unsafe { &mut *(payload_ptr as *mut WakerPayload<T>) };
-    let sender = &payload.sender;
-    let op_model = &mut payload.op_model;
-
-    let result = match op_model.complete(completion) {
-      OpResult::Again => {
-        let next_action = op_model.action();
-        // The driver resubmits internal steps. Preserve the consumer's waker
-        // until an item is available instead of making it poll an empty channel.
-        // SAFETY: `op_model` stays pinned in this handler until the resubmitted
-        // action completes.
-        return ProcessResult::continue_with(unsafe {
-          erase_action(next_action)
-        });
-      }
-      OpResult::Yield(item) => {
-        if sender.send(item).is_err() {
-          // Every receiver is gone, so nothing can take another item: stop
-          // instead of resubmitting forever.
-          return ProcessResult::done();
+    // `wake` is false for an internal step, and for a yield whose receiver
+    // is already gone: there is nobody to tell.
+    let (result, wake) = {
+      let sender = &payload.sender;
+      let op_model = &mut payload.op_model;
+      match op_model.complete(completion) {
+        OpResult::Again => {
+          // The driver resubmits internal steps. Preserve the consumer's waker
+          // until an item is available instead of making it poll an empty channel.
+          // The next action is borrowed from the model when the driver submits.
+          (ProcessResult::r#continue(), false)
         }
-        let next_action = op_model.action();
-        // SAFETY: `op_model` stays pinned in this handler until the resubmitted
-        // action completes.
-        ProcessResult::continue_with(unsafe { erase_action(next_action) })
-      }
-      OpResult::Done(item) => {
-        let _ = sender.send(item);
-        ProcessResult::done()
+        OpResult::Yield(item) => {
+          if sender.send(item).is_err() {
+            // Every receiver is gone, so nothing can take another item: stop
+            // instead of resubmitting forever.
+            (ProcessResult::done(), false)
+          } else {
+            (ProcessResult::r#continue(), true)
+          }
+        }
+        OpResult::Done(item) => {
+          let _ = sender.send(item);
+          (ProcessResult::done(), true)
+        }
       }
     };
-    if let Some(waker) = waker.take() {
+    if result.is_done() {
+      payload.finished = true;
+    }
+    if wake && let Some(waker) = waker.take() {
       waker.wake();
     }
     result
@@ -180,13 +220,18 @@ unsafe impl Send for WakerResultHandler {}
 pub(crate) struct OpCallback {
   payload: *mut (),
   on_completion_fn: fn(*mut (), Completion) -> ProcessResult,
+  #[cfg(test)]
   action_fn: fn(*mut ()) -> Action<'static>,
+  with_action_fn: WithActionFn,
   drop_fn: fn(*mut ()),
 }
 
 struct CallbackPayload<T: OpModel, F: Fn(T::Item)> {
   callback: F,
   op_model: T,
+  /// Set once `complete` returns [`OpResult::Done`]. The driver must not
+  /// submit another action after that.
+  finished: bool,
 }
 
 impl OpCallback {
@@ -198,19 +243,28 @@ impl OpCallback {
   {
     Self {
       payload: BumpBox::into_raw(BumpBox::new_in(
-        CallbackPayload { callback, op_model },
+        CallbackPayload { callback, op_model, finished: false },
         arena,
       )) as *mut (),
       on_completion_fn: Self::on_completion_impl::<T, F>,
+      #[cfg(test)]
       action_fn: Self::action_impl::<T, F>,
+      with_action_fn: Self::with_action_impl::<T, F>,
       drop_fn: Self::drop_bump_impl::<T, F>,
     }
   }
 
   /// Get the next runtime action to perform.
+  #[cfg(test)]
   #[inline]
   fn action(&mut self) -> Action<'static> {
     (self.action_fn)(self.payload)
+  }
+
+  /// Runs `f` on the next action while the model that produced it is borrowed.
+  #[inline]
+  fn with_action(&mut self, f: &mut dyn for<'a> FnMut(Action<'a>)) -> bool {
+    (self.with_action_fn)(self.payload, f)
   }
 
   /// Process a completion: call complete() on OpModel and invoke callback with item.
@@ -222,6 +276,7 @@ impl OpCallback {
     (self.on_completion_fn)(self.payload, completion)
   }
 
+  #[cfg(test)]
   #[inline]
   fn action_impl<T: OpModel, F: Fn(T::Item)>(
     payload_ptr: *mut (),
@@ -232,6 +287,25 @@ impl OpCallback {
     // SAFETY: the model stays inside this handler, which the store keeps
     // pinned until the submitted action completes.
     unsafe { erase_action(payload.op_model.action()) }
+  }
+
+  #[inline]
+  fn with_action_impl<T, F>(
+    payload_ptr: *mut (),
+    f: &mut dyn for<'a> FnMut(Action<'a>),
+  ) -> bool
+  where
+    T: OpModel,
+    F: Fn(T::Item),
+  {
+    // SAFETY: `payload_ptr` is created from `CallbackPayload<T, F>` in
+    // `new`/`new_in` and remains valid for the handler lifetime.
+    let payload = unsafe { &mut *(payload_ptr as *mut CallbackPayload<T, F>) };
+    if payload.finished {
+      panic!("finished model was submitted again");
+    }
+    f(payload.op_model.action());
+    true
   }
 
   #[inline]
@@ -246,28 +320,25 @@ impl OpCallback {
     // SAFETY: `payload_ptr` is created from `CallbackPayload<T, F>` in
     // `new`/`new_in` and remains valid while completions are dispatched.
     let payload = unsafe { &mut *(payload_ptr as *mut CallbackPayload<T, F>) };
-    let callback = &payload.callback;
-    let op_model = &mut payload.op_model;
-
-    match op_model.complete(completion) {
-      OpResult::Again => {
-        let next_action = op_model.action();
-        // SAFETY: `op_model` stays pinned in this handler until the resubmitted
-        // action completes.
-        ProcessResult::continue_with(unsafe { erase_action(next_action) })
+    let result = {
+      let callback = &payload.callback;
+      let op_model = &mut payload.op_model;
+      match op_model.complete(completion) {
+        OpResult::Again => ProcessResult::r#continue(),
+        OpResult::Yield(item) => {
+          callback(item);
+          ProcessResult::r#continue()
+        }
+        OpResult::Done(item) => {
+          callback(item);
+          ProcessResult::done()
+        }
       }
-      OpResult::Yield(item) => {
-        callback(item);
-        let next_action = op_model.action();
-        // SAFETY: `op_model` stays pinned in this handler until the resubmitted
-        // action completes.
-        ProcessResult::continue_with(unsafe { erase_action(next_action) })
-      }
-      OpResult::Done(item) => {
-        callback(item);
-        ProcessResult::done()
-      }
+    };
+    if result.is_done() {
+      payload.finished = true;
     }
+    result
   }
 
   fn drop_bump_impl<T, F>(payload_ptr: *mut ())
@@ -345,6 +416,8 @@ pub struct Registration {
   /// be in the backend. The registration (and the memory the backend uses)
   /// stays alive until the operation's completion arrives.
   cancelled: bool,
+  /// The driver's share of the model lease. A backend holds the other shares.
+  lease: crate::backend::Keep,
 }
 
 /// Unified state machine for I/O operations.
@@ -377,6 +450,7 @@ impl Registration {
         handler: WakerResultHandler::new_in(arena, sender, op_model),
       },
       cancelled: false,
+      lease: crate::backend::Keep::new(),
     }
   }
 
@@ -397,6 +471,7 @@ impl Registration {
         handler: WakerResultHandler::new_in(arena, sender, op_model),
       },
       cancelled: false,
+      lease: crate::backend::Keep::new(),
     }
   }
 
@@ -414,12 +489,17 @@ impl Registration {
     Self {
       state: State::Callback(OpCallback::new_in(arena, callback, op_model)),
       cancelled: false,
+      lease: crate::backend::Keep::new(),
     }
   }
 
   /// Get the initial action to perform.
   ///
   /// This should be called once when the registration is first created.
+  /// Tests use it to inspect a step. The driver submits through
+  /// [`with_action`](Self::with_action) so the action's lifetime stays tied
+  /// to the model.
+  #[cfg(test)]
   #[inline]
   pub fn action(&mut self) -> Option<Action<'static>> {
     match &mut self.state {
@@ -427,6 +507,39 @@ impl Registration {
       State::Callback(cb) => Some(cb.action()),
       #[cfg(test)]
       State::Done => None,
+    }
+  }
+
+  /// A copy of the lease the driver holds for this model.
+  #[inline]
+  pub(crate) fn lease(&self) -> crate::backend::Keep {
+    self.lease.clone()
+  }
+
+  /// A backend still holds a copy of this model's lease.
+  #[inline]
+  pub(crate) fn lease_held(&self) -> bool {
+    self.lease.held_elsewhere()
+  }
+
+  /// Runs `f` on the next action while the model that produced it is borrowed.
+  ///
+  /// Returns `false` when the registration is already finished.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `complete` already finished the model. Submitting that model
+  /// again would queue the same step forever.
+  #[inline]
+  pub(crate) fn with_action(
+    &mut self,
+    f: &mut dyn for<'a> FnMut(Action<'a>),
+  ) -> bool {
+    match &mut self.state {
+      State::Waker { handler, .. } => handler.with_action(f),
+      State::Callback(cb) => cb.with_action(f),
+      #[cfg(test)]
+      State::Done => false,
     }
   }
 
@@ -676,12 +789,37 @@ mod tests {
       reg.action(),
       Some(action) if action.is_nop()
     ));
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(reg.on_completion(Completion::new(0)).is_done());
     assert!(reg.is_finished());
 
     let items = received.lock().unwrap();
     assert_eq!(items.len(), 1);
     assert!(matches!(items[0], Ok(())));
+  }
+
+  #[test]
+  fn a_finished_model_is_not_submitted_again() {
+    let (_arena, mut reg) = new_callback_reg(|_| {}, Nop);
+    assert!(reg.with_action(&mut |_| {}));
+    // `process_completion` leaves the state as a live callback. Only the
+    // finished flag can refuse the next action.
+    assert!(reg.process_completion(Completion::new(0)).is_done());
+    assert!(!reg.is_finished());
+    let submitted =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reg.with_action(&mut |_| {})
+      }));
+    assert!(submitted.is_err(), "a finished callback model was submitted");
+
+    let (tx, _rx) = mpsc::channel();
+    let (_arena, mut reg) =
+      new_waker_reg(test_waker(Arc::new(AtomicUsize::new(0))), tx, Nop);
+    assert!(reg.process_completion(Completion::new(0)).is_done());
+    let submitted =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reg.with_action(&mut |_| {})
+      }));
+    assert!(submitted.is_err(), "a finished waker model was submitted");
   }
 
   #[test]
@@ -695,7 +833,7 @@ mod tests {
       reg.action(),
       Some(action) if action.is_nop()
     ));
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(reg.on_completion(Completion::new(0)).is_done());
     assert!(reg.is_finished());
     assert_eq!(wake_count.load(Ordering::SeqCst), 1);
 
@@ -716,13 +854,11 @@ mod tests {
       reg.action(),
       Some(action) if action.is_nop()
     ));
-    assert!(matches!(
-      reg.on_completion(Completion::new(0)).next_action,
-      Some(action) if action.is_nop()
-    ));
+    assert!(!reg.on_completion(Completion::new(0)).is_done());
+    assert!(matches!(reg.action(), Some(action) if action.is_nop()));
     assert!(!reg.is_finished(), "Again must keep the registration live");
 
-    assert!(reg.on_completion(Completion::new(1)).next_action.is_none());
+    assert!(reg.on_completion(Completion::new(1)).is_done());
     assert!(reg.is_finished(), "Done must finish the registration");
 
     let items = received.lock().unwrap();
@@ -742,22 +878,18 @@ mod tests {
       reg.action(),
       Some(action) if action.is_nop()
     ));
-    assert!(matches!(
-      reg.on_completion(Completion::new(0)).next_action,
-      Some(action) if action.is_nop()
-    ));
+    assert!(!reg.on_completion(Completion::new(0)).is_done());
+    assert!(matches!(reg.action(), Some(action) if action.is_nop()));
     assert!(!reg.is_finished(), "Yield must keep the registration live");
 
-    assert!(matches!(
-      reg.on_completion(Completion::new(1)).next_action,
-      Some(action) if action.is_nop()
-    ));
+    assert!(!reg.on_completion(Completion::new(1)).is_done());
+    assert!(matches!(reg.action(), Some(action) if action.is_nop()));
     assert!(
       !reg.is_finished(),
       "subsequent Yield must keep the registration live"
     );
 
-    assert!(reg.on_completion(Completion::new(2)).next_action.is_none());
+    assert!(reg.on_completion(Completion::new(2)).is_done());
     assert!(reg.is_finished());
 
     let items = received.lock().unwrap();
@@ -772,15 +904,13 @@ mod tests {
     let (_arena, mut reg) =
       new_waker_reg(waker, tx, AgainThenDone { stage: 0 });
 
-    assert!(matches!(
-      reg.on_completion(Completion::new(0)).next_action,
-      Some(action) if action.is_nop()
-    ));
+    assert!(!reg.on_completion(Completion::new(0)).is_done());
+    assert!(matches!(reg.action(), Some(action) if action.is_nop()));
     assert_eq!(wake_count.load(Ordering::SeqCst), 0);
     assert!(rx.try_recv().is_err(), "Again must not send a terminal item");
     assert!(!reg.is_finished());
 
-    assert!(reg.on_completion(Completion::new(1)).next_action.is_none());
+    assert!(reg.on_completion(Completion::new(1)).is_done());
     assert_eq!(wake_count.load(Ordering::SeqCst), 1);
     let item = rx.try_recv().expect("Done result should be sent");
     assert_eq!(item, 7);
@@ -835,25 +965,21 @@ mod tests {
     let (_arena, mut reg) =
       new_waker_reg(waker, tx, YieldTwiceThenDone { stage: 0 });
 
-    assert!(matches!(
-      reg.on_completion(Completion::new(0)).next_action,
-      Some(action) if action.is_nop()
-    ));
+    assert!(!reg.on_completion(Completion::new(0)).is_done());
+    assert!(matches!(reg.action(), Some(action) if action.is_nop()));
     assert_eq!(wake_count.load(Ordering::SeqCst), 1);
     assert_eq!(rx.try_recv().unwrap(), 11);
     assert!(!reg.is_finished());
 
     reg.set_waker(test_waker(Arc::clone(&wake_count)));
-    assert!(matches!(
-      reg.on_completion(Completion::new(1)).next_action,
-      Some(action) if action.is_nop()
-    ));
+    assert!(!reg.on_completion(Completion::new(1)).is_done());
+    assert!(matches!(reg.action(), Some(action) if action.is_nop()));
     assert_eq!(wake_count.load(Ordering::SeqCst), 2);
     assert_eq!(rx.try_recv().unwrap(), 13);
     assert!(!reg.is_finished());
 
     reg.set_waker(test_waker(Arc::clone(&wake_count)));
-    assert!(reg.on_completion(Completion::new(2)).next_action.is_none());
+    assert!(reg.on_completion(Completion::new(2)).is_done());
     assert_eq!(wake_count.load(Ordering::SeqCst), 3);
     assert_eq!(rx.try_recv().unwrap(), 17);
     assert!(reg.is_finished());
@@ -866,7 +992,7 @@ mod tests {
     let (tx, _rx) = mpsc::channel();
     let (_arena, mut reg) = new_waker_reg(waker, tx, Nop);
 
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(reg.on_completion(Completion::new(0)).is_done());
     assert!(reg.is_finished());
 
     reg.set_waker(test_waker(Arc::clone(&wake_count)));
@@ -877,10 +1003,10 @@ mod tests {
   fn done_registration_has_no_further_action_or_completion() {
     let (_arena, mut reg) = new_callback_reg(|_: std::io::Result<()>| {}, Nop);
 
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(reg.on_completion(Completion::new(0)).is_done());
     assert!(reg.is_finished());
     assert!(reg.action().is_none());
-    assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
+    assert!(reg.on_completion(Completion::new(0)).is_done());
   }
 
   #[test]

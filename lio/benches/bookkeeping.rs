@@ -41,10 +41,10 @@ impl IoBackend for ImmediateBackend {
     Ok(())
   }
 
-  unsafe fn push(
+  fn push(
     &mut self,
     id: u64,
-    op: BorrowedOp<'_>,
+    op: lio::backend::InFlight<'_>,
     _step_bump: &mut Bump,
   ) {
     assert!(
@@ -86,7 +86,11 @@ fn direct_backend(criterion: &mut Criterion) {
         bencher.iter(|| {
           for id in 0..depth as u64 {
             // SAFETY: a no-op borrows nothing.
-            unsafe { backend.push(id, BorrowedOp::nop(), &mut bump) };
+            backend.push(
+              id,
+              unsafe { lio::backend::InFlight::attest(BorrowedOp::nop()) },
+              &mut bump,
+            );
           }
           backend.flush().unwrap();
           backend.wait(Some(Duration::ZERO), &mut completed).unwrap();

@@ -24,7 +24,13 @@ fn pair() -> (Resource, UdpSocket) {
 
 fn complete(backend: &mut IoUring, arena: &mut Bump, op: Op) -> isize {
   // SAFETY: `op`'s buffers stay alive until `wait` returns below.
-  unsafe { backend.push(123, BorrowedOp::from_op(op), arena) };
+  unsafe {
+    backend.push(
+      123,
+      crate::backend::InFlight::attest(BorrowedOp::from_op(op)),
+      arena,
+    )
+  };
   backend.flush().unwrap();
   let deadline = Instant::now() + Duration::from_secs(2);
   let mut completed = Vec::new();

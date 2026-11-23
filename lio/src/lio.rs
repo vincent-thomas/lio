@@ -24,6 +24,12 @@ thread_local! {
   static GLOBAL_LIO: RefCell<Option<Lio>> = const { RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+  static STORE_DROPPED: std::cell::Cell<bool> =
+    const { std::cell::Cell::new(false) };
+}
+
 /// Guard returned by [`install_global`].
 ///
 /// Dropping the guard uninstalls the thread-local global [`Lio`] it
@@ -118,6 +124,9 @@ struct LioInner {
   /// Registrations taken from `dying` and being dropped right now; their
   /// slots are released once they are gone.
   burying: usize,
+  /// Slots retired while a backend still held their lease. The registration
+  /// is leaked, and the slot is never released, so the buffers stay valid.
+  leaked: usize,
   /// Submissions made while every slot was taken, scheduled in order as
   /// slots free up. Only allocates when the driver is over capacity.
   overflow: VecDeque<PendingSubmission>,
@@ -217,11 +226,17 @@ impl Drop for LioInner {
     // They point into the store's arenas, so they go before it.
     drop(std::mem::take(&mut self.dying));
     if self.io.drain() {
-      // SAFETY: neither field is used again. The backend goes first: it may
-      // still hold `Op`s pointing into the store.
-      unsafe {
-        ManuallyDrop::drop(&mut self.io);
-        ManuallyDrop::drop(&mut self.store);
+      // SAFETY: the backend is dropped first, so it drops the leases it
+      // stored. A model whose lease is still held stays leaked with the store.
+      unsafe { ManuallyDrop::drop(&mut self.io) };
+      // `leaked` counts registrations forgotten while a backend still held
+      // their lease. Their arenas live in the store, so the store stays too.
+      if self.leaked == 0 {
+        #[cfg(test)]
+        STORE_DROPPED.with(|dropped| dropped.set(true));
+        // SAFETY: every registration was dropped, and this field is not
+        // used again.
+        unsafe { ManuallyDrop::drop(&mut self.store) };
       }
     }
     // Otherwise an operation may still be running in the kernel or on a
@@ -273,20 +288,35 @@ impl Lio {
     self.inner.borrow_mut().time.advance_by_ticks(ticks);
   }
 
-  fn dispatch_action(inner: &mut LioInner, id: u64, action: Action<'static>) {
-    let (store, io, time) = (&mut inner.store, &mut inner.io, &mut inner.time);
-    match action {
-      Action::Io(op) => {
-        let Some(step_bump) = store.step_bump_mut(id) else {
-          unreachable!("dispatching action for unknown registration {id}");
-        };
-        step_bump.reset();
-        // SAFETY: the registration that produced `op` stays in the store,
-        // with its buffers unmoved, until this completion is routed.
-        unsafe { io.push(id, op, step_bump) };
-      }
-      Action::Sleep(duration) => time.schedule(id, duration),
-    }
+  /// Submits the registration's next action while the model is borrowed.
+  ///
+  /// Returns whether the model produced an action. The buffers live in the
+  /// model, so [`InFlight::from_model`](crate::backend::InFlight::from_model)
+  /// can name them only inside this borrow. The registration stays in the
+  /// store, unmoved, until the completion is routed or the backend drains.
+  fn submit_registration(inner: &mut LioInner, id: u64) -> bool {
+    let LioInner { io, store, time, .. } = inner;
+    let Some(ran) = store.with_slot(id, |reg, step_bump| {
+      let keep = reg.lease();
+      reg.with_action(&mut |action| match action {
+        Action::Io(op) => {
+          step_bump.reset();
+          io.push(
+            id,
+            crate::backend::InFlight::from_model(op, keep.clone()),
+            step_bump,
+          );
+        }
+        Action::Sleep(duration) => time.schedule(id, duration),
+      })
+    }) else {
+      unreachable!("submitting registration {id}, which is not in the store");
+    };
+    ran
+  }
+
+  fn dispatch_action(inner: &mut LioInner, id: u64) {
+    Self::submit_registration(inner, id);
   }
 
   /// Creates a new Lio driver with the default backend and specified capacity.
@@ -352,6 +382,7 @@ impl Lio {
       ready_timers: VecDeque::new(),
       dying: Vec::new(),
       burying: 0,
+      leaked: 0,
       orphaned_wakers: Vec::new(),
       overflow: VecDeque::new(),
       capacity_waiters: Vec::new(),
@@ -421,24 +452,35 @@ impl Lio {
     inner: &mut LioInner,
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> io::Result<u64> {
-    let (store, io, time) = (&mut inner.store, &mut inner.io, &mut inner.time);
-    let (id, action, step_bump) = store.insert_with_action(init);
-    let Some(action) = action else {
-      Self::retire(inner, id);
+    let LioInner { io, store, time, .. } = inner;
+    let Some(_id) =
+      store.insert_submitting(init, |id, reg, step_bump, insert| {
+        let keep = reg.lease();
+        reg.with_action(&mut |action| {
+          // After this, a panic must not free the model: `push` may have
+          // copied its addresses. A panic inside `action` happens first and
+          // still frees the slot.
+          insert.keep_on_panic();
+          match action {
+            Action::Io(op) => {
+              step_bump.reset();
+              io.push(
+                id,
+                crate::backend::InFlight::from_model(op, keep.clone()),
+                step_bump,
+              );
+            }
+            Action::Sleep(duration) => time.schedule(id, duration),
+          }
+        });
+      })
+    else {
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "OpModel returned no action on first call",
       ));
     };
-    match action {
-      Action::Io(op) => {
-        // SAFETY: the registration that produced `op` was just inserted and
-        // stays in the store, with its buffers unmoved, until completion.
-        unsafe { io.push(id, op, step_bump) };
-      }
-      Action::Sleep(duration) => time.schedule(id, duration),
-    }
-    Ok(id)
+    Ok(_id)
   }
 
   /// Removes registration `id`, to be dropped by
@@ -450,7 +492,14 @@ impl Lio {
       "driver: removed registration {id} with its timer still scheduled"
     );
     let detached = inner.store.detach_known(id);
-    inner.dying.push(detached);
+    if detached.registration.lease_held() {
+      // The backend still has a copy. Leak the registration and keep the
+      // slot, whose arena holds the buffers.
+      inner.leaked += 1;
+      std::mem::forget(detached);
+    } else {
+      inner.dying.push(detached);
+    }
     Self::assert_retired_slots_tracked(inner);
   }
 
@@ -460,7 +509,7 @@ impl Lio {
   /// is never reused.
   #[inline]
   fn assert_retired_slots_tracked(inner: &LioInner) {
-    let tracked = inner.dying.len() + inner.burying;
+    let tracked = inner.dying.len() + inner.burying + inner.leaked;
     assert_eq!(
       inner.store.retired(),
       tracked,
@@ -751,31 +800,30 @@ impl Lio {
     let mut inner = self.inner.borrow_mut();
 
     let inner_ref = &mut *inner;
-    let Some(reg) = inner_ref.store.get_mut(id) else {
-      panic!("driver: registration {id} was removed while its handler ran");
+    let continues = {
+      let Some(reg) = inner_ref.store.get_mut(id) else {
+        panic!("driver: registration {id} was removed while its handler ran");
+      };
+      // A cancelled operation takes no further step; its consumer may also
+      // have been dropped by the wake-up just now.
+      let continues = !result.is_done() && !reg.is_cancelled();
+      if continues && let Some(waker) = waker {
+        reg.restore_waker(waker);
+      }
+      continues
     };
-    // A cancelled operation takes no further step; its consumer may also
-    // have been dropped by the wake-up just now.
-    let next_action =
-      if reg.is_cancelled() { None } else { result.next_action };
-    match next_action {
-      Some(action) => {
-        if let Some(waker) = waker {
-          reg.restore_waker(waker);
-        }
-        timed!(
-          PROFILE,
-          stats,
-          dispatch_time,
-          Self::dispatch_action(inner_ref, id, action)
-        );
-        stats.count_dispatch();
-      }
-      None => {
-        // Dropped by `bury_and_wake` once the driver is not borrowed.
-        timed!(PROFILE, stats, remove_time, Self::retire(inner_ref, id));
-        stats.count_remove();
-      }
+    if continues {
+      timed!(
+        PROFILE,
+        stats,
+        dispatch_time,
+        Self::dispatch_action(inner_ref, id)
+      );
+      stats.count_dispatch();
+    } else {
+      // Dropped by `bury_and_wake` once the driver is not borrowed.
+      timed!(PROFILE, stats, remove_time, Self::retire(inner_ref, id));
+      stats.count_remove();
     }
     (inner, true)
   }
@@ -908,6 +956,10 @@ mod tests {
     crate::api::nop().with_lio(&lio).when_done(|_| {});
     crate::api::nop().with_lio(&lio).when_done(|_| {});
     let (lost, other) = (backend.pushed()[0], backend.pushed()[1]);
+    // The backend has dropped its leases, so retire parks `other` in `dying`.
+    // `lost` was detached and dropped with no slot release.
+    backend.complete(lost, 0);
+    backend.complete(other, 0);
     let mut inner = lio.inner.borrow_mut();
     drop(inner.store.detach(lost).unwrap().registration);
     Lio::retire(&mut inner, other);
@@ -952,6 +1004,50 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(miri, ignore = "leaks the registration on purpose")]
+  fn a_held_lease_keeps_the_store_after_the_driver_drops() {
+    let (backend, lio) = lio(1);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let id = backend.pushed()[0];
+    {
+      let mut inner = lio.inner.borrow_mut();
+      Lio::retire(&mut inner, id);
+      assert_eq!(inner.leaked, 1, "a held lease was not counted");
+    }
+    STORE_DROPPED.with(|dropped| dropped.set(false));
+    drop(lio);
+    assert!(
+      !STORE_DROPPED.with(|dropped| dropped.get()),
+      "the store was freed while a registration was leaked"
+    );
+  }
+
+  #[test]
+  fn completing_one_op_drops_only_its_lease() {
+    let (backend, lio) = lio(2);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let first = backend.in_flight()[0];
+    let second = backend.in_flight()[1];
+    backend.complete(first, 0);
+    lio.try_run().unwrap();
+    assert_eq!(lio.inner.borrow().leaked, 0);
+    assert_eq!(backend.in_flight(), vec![second]);
+  }
+
+  #[test]
+  fn dropping_a_drained_driver_frees_the_store() {
+    let (backend, lio) = lio(1);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let id = backend.pushed()[0];
+    backend.complete(id, 0);
+    lio.try_run().unwrap();
+    STORE_DROPPED.with(|dropped| dropped.set(false));
+    drop(lio);
+    assert!(STORE_DROPPED.with(|dropped| dropped.get()));
+  }
+
+  #[test]
   fn a_waker_set_between_retiring_and_burying_is_woken_once_buried() {
     use std::sync::{Arc, mpsc};
 
@@ -968,6 +1064,9 @@ mod tests {
       })
       .unwrap();
     let id = backend.pushed()[0];
+    // The backend drops its lease on completion. Retire then parks the
+    // registration in `dying` until bury.
+    backend.complete(id, 0);
     Lio::retire(&mut lio.inner.borrow_mut(), id);
 
     // The channel is still open, so a stream polled now waits.
@@ -993,12 +1092,7 @@ mod tests {
     fn init(&mut self, _: usize) -> io::Result<()> {
       Ok(())
     }
-    unsafe fn push(
-      &mut self,
-      id: u64,
-      _: crate::backend::op::BorrowedOp<'_>,
-      _: &mut Bump,
-    ) {
+    fn push(&mut self, id: u64, _: crate::backend::InFlight<'_>, _: &mut Bump) {
       self.0.extend([id, id]);
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -1135,16 +1229,15 @@ mod tests {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    unsafe fn push(
+    fn push(
       &mut self,
       id: u64,
-      op: crate::backend::op::BorrowedOp<'_>,
+      op: crate::backend::InFlight<'_>,
       bump: &mut Bump,
     ) {
       let at = bump.alloc(0u64) as *mut u64 as usize;
       self.first_allocs.borrow_mut().push(at);
-      // SAFETY: this wrapper forwards the same submission the caller pushed.
-      unsafe { self.inner.push(id, op, bump) };
+      self.inner.push(id, op, bump);
     }
     fn flush(&mut self) -> io::Result<()> {
       self.inner.flush()
@@ -1250,14 +1343,13 @@ mod tests {
     fn resource_close(&self) -> crate::api::resource::ResourceClose {
       self.inner.resource_close()
     }
-    unsafe fn push(
+    fn push(
       &mut self,
       id: u64,
-      op: crate::backend::op::BorrowedOp<'_>,
+      op: crate::backend::InFlight<'_>,
       bump: &mut Bump,
     ) {
-      // SAFETY: this wrapper forwards the same submission the caller pushed.
-      unsafe { self.inner.push(id, op, bump) };
+      self.inner.push(id, op, bump);
     }
     fn flush(&mut self) -> io::Result<()> {
       self.inner.flush()
