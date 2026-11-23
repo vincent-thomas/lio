@@ -24,34 +24,23 @@ fn pair() -> (Resource, UdpSocket) {
 
 fn complete(backend: &mut IoUring, arena: &mut Bump, op: Op) -> isize {
   // SAFETY: `op`'s buffers stay alive until `wait` returns below.
-  unsafe { crate::backend::loan::Attested::remember(123, &op) };
-  // SAFETY: the same buffers stay alive for this attested flight.
-  let flight =
-    unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
-  let mut view = crate::backend::loan::OpView::new(flight.as_op());
-  backend.push(123, flight.keep(), &mut view, arena);
-  backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
+  unsafe {
+    backend.push(
+      123,
+      crate::backend::InFlight::attest(BorrowedOp::from_op(op)),
+      arena,
+    )
+  };
+  backend.flush().unwrap();
   let deadline = Instant::now() + Duration::from_secs(2);
   let mut completed = Vec::new();
   loop {
-    backend
-      .wait(
-        Some(Duration::from_millis(10)),
-        &mut completed,
-        &mut crate::backend::loan::Attested::new(),
-      )
-      .unwrap();
+    backend.wait(Some(Duration::from_millis(10)), &mut completed).unwrap();
     if !completed.is_empty() {
       assert_eq!(completed.len(), 1);
       assert_eq!(completed[0].registration_id(), 123);
       let result = completed[0].result();
-      backend
-        .wait(
-          Some(Duration::ZERO),
-          &mut completed,
-          &mut crate::backend::loan::Attested::new(),
-        )
-        .unwrap();
+      backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
       assert!(completed.is_empty(), "completion must be delivered only once");
       return result;
     }

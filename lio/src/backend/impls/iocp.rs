@@ -165,81 +165,10 @@ impl Drop for Overlapped {
   }
 }
 
-/// What a pool worker needs after the lend. Buffer addresses point at the
-/// caller's bytes. `drain` waits until the worker drops this.
-enum Blocked {
-  Read {
-    fd: Resource,
-    bufs: Vec<(*mut u8, usize)>,
-    offset: Option<u64>,
-  },
-  Write {
-    fd: Resource,
-    bufs: Vec<(*mut u8, usize)>,
-    offset: Option<u64>,
-  },
-  Fsync {
-    fd: Resource,
-  },
-  OpenAt {
-    dir_fd: Resource,
-    path: std::ffi::OsString,
-    flags: crate::backend::op::OpenFlags,
-  },
-  Stat {
-    target: crate::backend::op::StatTarget,
-    out: NonNull<crate::backend::op::FileStat>,
-  },
-  ReadDir {
-    fd: Resource,
-    raw_buf: NonNull<u8>,
-    raw_cap: usize,
-    entries: NonNull<crate::backend::op::DirEntryRef>,
-    entries_cap: usize,
-    opaque: NonNull<*mut ()>,
-    opaque_drop: NonNull<Option<crate::backend::op::OpaqueDropFn>>,
-    out: NonNull<crate::backend::op::ReadDirResult>,
-  },
-  UnlinkAt {
-    dir_fd: Resource,
-    path: std::ffi::OsString,
-    kind: crate::backend::op::UnlinkKind,
-  },
-  RenameAt {
-    old_dir_fd: Resource,
-    old_path: std::ffi::OsString,
-    new_dir_fd: Resource,
-    new_path: std::ffi::OsString,
-  },
-  MkdirAt {
-    dir_fd: Resource,
-    path: std::ffi::OsString,
-  },
-  LinkAt {
-    kind: crate::backend::op::LinkKind,
-    source_dir_fd: Resource,
-    source_path: std::ffi::OsString,
-    new_dir_fd: Resource,
-    new_path: std::ffi::OsString,
-  },
-  ReadlinkAt {
-    dir_fd: Resource,
-    path: std::ffi::OsString,
-    buf: NonNull<u8>,
-    buf_len: usize,
-  },
-  GetCwd {
-    out: NonNull<std::ffi::OsString>,
-  },
-  Spawn {
-    spec: crate::backend::op::SpawnSpec,
-  },
-}
-
 /// An operation with no overlapped form, run on a pool worker.
 struct BlockingJob {
   id: u64,
-  op: Blocked,
+  op: Op,
   keep: crate::backend::Keep,
 }
 
@@ -337,6 +266,7 @@ fn worker_loop(
 
 struct Queued {
   id: u64,
+  op: Op,
   keep: crate::backend::Keep,
 }
 
@@ -475,14 +405,12 @@ impl Iocp {
   fn submit(
     &mut self,
     id: u64,
-    op: &Op,
+    op: Op,
     keep: crate::backend::Keep,
   ) -> Option<isize> {
     match op {
       Op::Nop => Some(0),
       Op::Read { fd, iovecs, iov_count, offset, flags } => {
-        let (iovecs, iov_count, offset, flags) =
-          (*iovecs, *iov_count, *offset, *flags);
         // SAFETY: the op model keeps `iov_count` buffers alive until done.
         let bufs =
           unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) };
@@ -492,18 +420,20 @@ impl Iocp {
         if !flags.is_empty() {
           return Some(neg(ERROR_NOT_SUPPORTED));
         }
-        if probe_socket(socket_of(fd)).is_ok() {
+        if probe_socket(socket_of(&fd)).is_ok() {
           let bufs = bufs.iter().map(|b| (b.bytes_ptr(), b.bytes_len()));
-          return self.start_recv(id, fd, bufs, 0, None, keep);
+          return self.start_recv(id, &fd, bufs, 0, None, keep);
         }
-        if let Err(code) = check_handle(handle_of(fd)) {
+        if let Err(code) = check_handle(handle_of(&fd)) {
           return Some(code);
         }
-        self.offload(id, block_op(op), keep)
+        self.offload(
+          id,
+          Op::Read { fd, iovecs, iov_count, offset, flags },
+          keep,
+        )
       }
       Op::Write { fd, iovecs, iov_count, offset, flags } => {
-        let (iovecs, iov_count, offset, flags) =
-          (*iovecs, *iov_count, *offset, *flags);
         // SAFETY: the op model keeps `iov_count` buffers alive until done.
         let bufs =
           unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) };
@@ -513,37 +443,38 @@ impl Iocp {
         if !flags.is_empty() {
           return Some(neg(ERROR_NOT_SUPPORTED));
         }
-        if probe_socket(socket_of(fd)).is_ok() {
+        if probe_socket(socket_of(&fd)).is_ok() {
           let bufs = bufs.iter().map(|b| (b.bytes_ptr(), b.bytes_len()));
-          return self.start_send(id, fd, bufs, 0, None, keep);
+          return self.start_send(id, &fd, bufs, 0, None, keep);
         }
-        if let Err(code) = check_handle(handle_of(fd)) {
+        if let Err(code) = check_handle(handle_of(&fd)) {
           return Some(code);
         }
-        self.offload(id, block_op(op), keep)
+        self.offload(
+          id,
+          Op::Write { fd, iovecs, iov_count, offset, flags },
+          keep,
+        )
       }
       Op::Recv { fd, msg, flags } => {
-        let flags = *flags;
-        let socket = socket_of(fd);
+        let socket = socket_of(&fd);
         if let Err(code) = probe_socket(socket) {
           return Some(code);
         }
-        let bufs = recv_bufs(msg);
-        self.start_recv(id, fd, bufs, recv_flags(flags), msg.from, keep)
+        let bufs = recv_bufs(&msg);
+        self.start_recv(id, &fd, bufs, recv_flags(flags), msg.from, keep)
       }
       Op::Send { fd, msg, flags } => {
-        let flags = *flags;
-        let socket = socket_of(fd);
+        let socket = socket_of(&fd);
         if let Err(code) = probe_socket(socket) {
           return Some(code);
         }
-        let bufs = send_bufs(msg);
-        self.start_send(id, fd, bufs, send_flags(flags), msg.to, keep)
+        let bufs = send_bufs(&msg);
+        self.start_send(id, &fd, bufs, send_flags(flags), msg.to, keep)
       }
-      Op::Accept { fd, addr } => self.start_accept(id, fd, *addr, keep),
-      Op::Connect { fd, addr } => self.start_connect(id, fd, addr, keep),
+      Op::Accept { fd, addr } => self.start_accept(id, &fd, addr, keep),
+      Op::Connect { fd, addr } => self.start_connect(id, &fd, &addr, keep),
       Op::Socket { domain, ty, proto } => {
-        let (domain, ty, proto) = (*domain, *ty, *proto);
         Some(match socket_to_raw(domain, ty, proto) {
           Ok((domain, ty, proto)) => {
             // SAFETY: plain socket creation; no pointers are passed.
@@ -566,20 +497,19 @@ impl Iocp {
           Err(code) => -(code as isize),
         })
       }
-      Op::Bind { fd, addr } => Some(match socket_addr_buf_to_storage(addr) {
+      Op::Bind { fd, addr } => Some(match socket_addr_buf_to_storage(&addr) {
         Ok((storage, len)) => {
           // SAFETY: `storage` holds a valid address of `len` bytes.
           let rc = unsafe {
-            ws::bind(socket_of(fd), (&storage as *const Storage).cast(), len)
+            ws::bind(socket_of(&fd), (&storage as *const Storage).cast(), len)
           };
           if rc == 0 { 0 } else { last_wsa_error() }
         }
         Err(err) => io_error(err),
       }),
       Op::Listen { fd, backlog } => {
-        let backlog = *backlog;
         // SAFETY: no pointers are passed.
-        let rc = unsafe { ws::listen(socket_of(fd), backlog) };
+        let rc = unsafe { ws::listen(socket_of(&fd), backlog) };
         Some(if rc == 0 { 0 } else { last_wsa_error() })
       }
       Op::Shutdown { fd, how } => {
@@ -589,7 +519,7 @@ impl Iocp {
           ShutdownHow::Both => ws::SD_BOTH,
         };
         // SAFETY: no pointers are passed.
-        let rc = unsafe { ws::shutdown(socket_of(fd), how) };
+        let rc = unsafe { ws::shutdown(socket_of(&fd), how) };
         Some(if rc == 0 { 0 } else { last_wsa_error() })
       }
       Op::Fsync { .. }
@@ -602,7 +532,7 @@ impl Iocp {
       | Op::LinkAt { .. }
       | Op::ReadlinkAt { .. }
       | Op::GetCwd { .. }
-      | Op::Spawn { .. } => self.offload(id, block_op(op), keep),
+      | Op::Spawn { .. } => self.offload(id, op, keep),
     }
   }
 
@@ -611,7 +541,7 @@ impl Iocp {
   fn offload(
     &mut self,
     id: u64,
-    op: Blocked,
+    op: Op,
     keep: crate::backend::Keep,
   ) -> Option<isize> {
     if self.pool.is_none() {
@@ -1069,7 +999,10 @@ impl Iocp {
   }
 }
 
-impl IoBackend for Iocp {
+// SAFETY: each started op and blocking job stores its `Keep` until its
+// packet or worker result. `drain` stops workers and reaps cancelled packets
+// before it returns `true`.
+unsafe impl IoBackend for Iocp {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     ensure_wsa()?;
     // SAFETY: creating a fresh completion port.
@@ -1099,37 +1032,23 @@ impl IoBackend for Iocp {
   fn push(
     &mut self,
     id: u64,
-    keep: crate::backend::Keep,
-    _view: &mut crate::backend::loan::OpView<'_>,
+    op: crate::backend::InFlight<'_>,
     _step_bump: &mut Bump,
   ) {
+    // The model stays pinned while `keep` is stored with the operation.
+    let (op, keep) = op.into_parts();
     assert!(
       self.backlog.len() + self.in_flight.len() + self.blocking_in_flight
         < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
-    self.backlog.push(Queued { id, keep });
+    self.backlog.push(Queued { id, op, keep });
   }
 
-  fn flush(
-    &mut self,
-    loan: &mut dyn crate::backend::loan::Loan,
-  ) -> io::Result<()> {
-    for Queued { id, keep } in mem::take(&mut self.backlog) {
-      let mut result = None;
-      let mut keep = Some(keep);
-      loan.lend(id, &mut |view| {
-        // Overlapped calls copy the address into a `WSABUF` here.
-        // A blocking job keeps it until its worker syscall, which `drain`
-        // waits for.
-        let op = view.op();
-        let Some(keep) = keep.take() else {
-          panic!("lend runs once");
-        };
-        result = self.submit(id, op, keep);
-      });
-      if let Some(result) = result {
+  fn flush(&mut self) -> io::Result<()> {
+    for Queued { id, op, keep } in mem::take(&mut self.backlog) {
+      if let Some(result) = self.submit(id, op, keep) {
         self.ready.push(OpCompleted::new(id, result));
       }
     }
@@ -1166,7 +1085,6 @@ impl IoBackend for Iocp {
     &mut self,
     timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
-    _loan: &mut dyn crate::backend::loan::Loan,
   ) -> io::Result<()> {
     completed.clear();
     completed.append(&mut self.ready);
@@ -1202,116 +1120,33 @@ impl IoBackend for Iocp {
 }
 
 /// Runs an operation that has no overlapped form on a pool worker.
-fn block_op(op: &Op) -> Blocked {
-  match op {
-    Op::Read { fd, iovecs, iov_count, offset, .. } => {
-      // SAFETY: the descriptor array is live for this lend. The worker
-      // keeps the addresses until `drain`.
-      let bufs =
-        unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), *iov_count) };
-      Blocked::Read {
-        fd: fd.clone(),
-        bufs: bufs.iter().map(|buf| (buf.as_ptr(), buf.len())).collect(),
-        offset: *offset,
-      }
-    }
-    Op::Write { fd, iovecs, iov_count, offset, .. } => {
-      // SAFETY: the descriptor array is live for this lend. The worker
-      // keeps the addresses until `drain`.
-      let bufs =
-        unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), *iov_count) };
-      Blocked::Write {
-        fd: fd.clone(),
-        bufs: bufs.iter().map(|buf| (buf.as_ptr(), buf.len())).collect(),
-        offset: *offset,
-      }
-    }
-    Op::Fsync { fd } => Blocked::Fsync { fd: fd.clone() },
-    Op::OpenAt { dir_fd, path, flags, .. } => Blocked::OpenAt {
-      dir_fd: dir_fd.clone(),
-      path: path.clone(),
-      flags: *flags,
-    },
-    Op::Stat { target, out } => {
-      Blocked::Stat { target: target.clone(), out: *out }
-    }
-    Op::ReadDir {
-      fd,
-      raw_buf,
-      raw_cap,
-      entries,
-      entries_cap,
-      opaque,
-      opaque_drop,
-      out,
-    } => Blocked::ReadDir {
-      fd: fd.clone(),
-      raw_buf: *raw_buf,
-      raw_cap: *raw_cap,
-      entries: *entries,
-      entries_cap: *entries_cap,
-      opaque: *opaque,
-      opaque_drop: *opaque_drop,
-      out: *out,
-    },
-    Op::UnlinkAt { dir_fd, path, kind } => Blocked::UnlinkAt {
-      dir_fd: dir_fd.clone(),
-      path: path.clone(),
-      kind: *kind,
-    },
-    Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => {
-      Blocked::RenameAt {
-        old_dir_fd: old_dir_fd.clone(),
-        old_path: old_path.clone(),
-        new_dir_fd: new_dir_fd.clone(),
-        new_path: new_path.clone(),
-      }
-    }
-    Op::MkdirAt { dir_fd, path, .. } => {
-      Blocked::MkdirAt { dir_fd: dir_fd.clone(), path: path.clone() }
-    }
-    Op::LinkAt { kind, source_dir_fd, source_path, new_dir_fd, new_path } => {
-      Blocked::LinkAt {
-        kind: *kind,
-        source_dir_fd: source_dir_fd.clone(),
-        source_path: source_path.clone(),
-        new_dir_fd: new_dir_fd.clone(),
-        new_path: new_path.clone(),
-      }
-    }
-    Op::ReadlinkAt { dir_fd, path, buf, buf_len } => Blocked::ReadlinkAt {
-      dir_fd: dir_fd.clone(),
-      path: path.clone(),
-      buf: *buf,
-      buf_len: *buf_len,
-    },
-    Op::GetCwd { out } => Blocked::GetCwd { out: *out },
-    Op::Spawn { spec } => Blocked::Spawn { spec: spec.clone() },
-    _ => unreachable!("only blocking operations are lowered for the pool"),
-  }
-}
-
-fn run_blocking(op: Blocked) -> isize {
+fn run_blocking(op: Op) -> isize {
   blocking_result(op).unwrap_or(neg(ERROR_NOT_SUPPORTED))
 }
 
-fn blocking_result(op: Blocked) -> Option<isize> {
+fn blocking_result(op: Op) -> Option<isize> {
   match op {
-    Blocked::Read { fd, bufs, offset } => {
-      Some(file_transfer(handle_of(&fd), &bufs, offset, false))
+    Op::Read { fd, iovecs, iov_count, offset, .. } => {
+      // SAFETY: the op model keeps `iov_count` buffers alive until done.
+      let bufs =
+        unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) };
+      Some(file_transfer(handle_of(&fd), bufs, offset, false))
     }
-    Blocked::Write { fd, bufs, offset } => {
-      Some(file_transfer(handle_of(&fd), &bufs, offset, true))
+    Op::Write { fd, iovecs, iov_count, offset, .. } => {
+      // SAFETY: the op model keeps `iov_count` buffers alive until done.
+      let bufs =
+        unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), iov_count) };
+      Some(file_transfer(handle_of(&fd), bufs, offset, true))
     }
-    Blocked::Fsync { fd } => {
+    Op::Fsync { fd } => {
       // SAFETY: no pointers are passed.
       let ok = unsafe { FlushFileBuffers(handle_of(&fd)) };
       Some(if ok == FALSE { last_error() } else { 0 })
     }
-    Blocked::OpenAt { dir_fd, path, flags } => {
+    Op::OpenAt { dir_fd, path, flags, mode: _ } => {
       Some(open_at(&dir_fd, &path, flags).unwrap_or_else(io_error))
     }
-    Blocked::Stat { target, out } => Some(match stat(&target) {
+    Op::Stat { target, out } => Some(match stat(&target) {
       Ok(stat) => {
         // SAFETY: `out` is op-owned output storage valid until completion.
         unsafe { out.as_ptr().write(stat) };
@@ -1319,7 +1154,7 @@ fn blocking_result(op: Blocked) -> Option<isize> {
       }
       Err(err) => io_error(err),
     }),
-    Blocked::ReadDir {
+    Op::ReadDir {
       fd,
       raw_buf,
       raw_cap,
@@ -1348,7 +1183,7 @@ fn blocking_result(op: Blocked) -> Option<isize> {
         Err(err) => io_error(err),
       })
     }
-    Blocked::UnlinkAt { dir_fd, path, kind } => Some(
+    Op::UnlinkAt { dir_fd, path, kind } => Some(
       resolve(&dir_fd, &path)
         .and_then(|path| match kind {
           UnlinkKind::File => fs::remove_file(path),
@@ -1356,27 +1191,23 @@ fn blocking_result(op: Blocked) -> Option<isize> {
         })
         .map_or_else(io_error, |()| 0),
     ),
-    Blocked::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => Some(
+    Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path } => Some(
       resolve(&old_dir_fd, &old_path)
         .and_then(|old| fs::rename(old, resolve(&new_dir_fd, &new_path)?))
         .map_or_else(io_error, |()| 0),
     ),
-    Blocked::MkdirAt { dir_fd, path } => Some(
+    Op::MkdirAt { dir_fd, path, mode: _ } => Some(
       resolve(&dir_fd, &path)
         .and_then(fs::create_dir)
         .map_or_else(io_error, |()| 0),
     ),
-    Blocked::LinkAt {
-      kind,
-      source_dir_fd,
-      source_path,
-      new_dir_fd,
-      new_path,
-    } => Some(
-      link_at(kind, &source_dir_fd, &source_path, &new_dir_fd, &new_path)
-        .map_or_else(io_error, |()| 0),
-    ),
-    Blocked::ReadlinkAt { dir_fd, path, buf, buf_len } => {
+    Op::LinkAt { kind, source_dir_fd, source_path, new_dir_fd, new_path } => {
+      Some(
+        link_at(kind, &source_dir_fd, &source_path, &new_dir_fd, &new_path)
+          .map_or_else(io_error, |()| 0),
+      )
+    }
+    Op::ReadlinkAt { dir_fd, path, buf, buf_len } => {
       Some(resolve(&dir_fd, &path).and_then(fs::read_link).map_or_else(
         io_error,
         |target| {
@@ -1390,7 +1221,7 @@ fn blocking_result(op: Blocked) -> Option<isize> {
         },
       ))
     }
-    Blocked::GetCwd { out } => Some(match std::env::current_dir() {
+    Op::GetCwd { out } => Some(match std::env::current_dir() {
       Ok(cwd) => {
         // SAFETY: `out` is op-owned output storage.
         unsafe { out.as_ptr().write(cwd.into_os_string()) };
@@ -1398,7 +1229,8 @@ fn blocking_result(op: Blocked) -> Option<isize> {
       }
       Err(err) => io_error(err),
     }),
-    Blocked::Spawn { spec } => Some(spawn(&spec).unwrap_or_else(io_error)),
+    Op::Spawn { spec } => Some(spawn(&spec).unwrap_or_else(io_error)),
+    _ => None,
   }
 }
 

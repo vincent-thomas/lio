@@ -9,19 +9,15 @@ use std::mem::MaybeUninit;
 
 use bumpalo::Bump;
 
-use crate::registration::Registration;
-
 #[cfg(test)]
 use crate::api::op::Action;
+use crate::registration::Registration;
 use crate::slab::{SlabKey, SlotPool};
 
 struct StoreSlot {
   registration: MaybeUninit<Registration>,
   model_bump: Bump,
   step_bump: Bump,
-  /// The operation from the one `action` call for this submission.
-  /// `flush` and `wait` lend this copy. They do not call `action` again.
-  submitted: Option<crate::backend::op::Op>,
 }
 
 /// Store for in-flight I/O operations using contiguous memory.
@@ -30,24 +26,6 @@ struct StoreSlot {
 /// memory layout. Each slot owns:
 /// - a persistent model-lifetime bump reset before slot reuse
 /// - a step-lifetime bump reserved for backend-lowered state
-impl crate::backend::loan::Loan for OpStore {
-  fn lend(
-    &mut self,
-    id: u64,
-    f: &mut dyn for<'v> FnMut(&mut crate::backend::loan::OpView<'v>),
-  ) {
-    let key = SlabKey::from_u64(id);
-    let Some(slot) = self.slots.get_mut(key) else {
-      panic!("backend lent operation {id}, which is not in the driver");
-    };
-    let Some(op) = slot.submitted.as_ref() else {
-      panic!("backend lent operation {id}, which has no submitted action");
-    };
-    let mut view = crate::backend::loan::OpView::new(op);
-    f(&mut view);
-  }
-}
-
 pub(crate) struct OpStore {
   slots: SlotPool<StoreSlot, false>,
 }
@@ -80,7 +58,6 @@ impl OpStore {
         registration: MaybeUninit::uninit(),
         model_bump: Bump::new(),
         step_bump: Bump::new(),
-        submitted: None,
       }),
     }
   }
@@ -103,7 +80,6 @@ impl OpStore {
     let Some((key, _)) = self.slots.allocate_with(|slot| {
       slot.model_bump.reset();
       slot.step_bump.reset();
-      slot.submitted = None;
       slot.registration.write(init(&mut slot.model_bump));
     }) else {
       return Err(StoreAtCapacity);
@@ -136,7 +112,6 @@ impl OpStore {
     let Some((key, slot)) = self.slots.allocate_with(|slot| {
       slot.model_bump.reset();
       slot.step_bump.reset();
-      slot.submitted = None;
       let registration = slot.registration.write(init(&mut slot.model_bump));
       let mut guard = DropOnUnwind { registration, armed: true };
       action = guard.registration.action();
@@ -174,7 +149,6 @@ impl OpStore {
   pub fn detach(&mut self, id: u64) -> Option<Detached> {
     let key = SlabKey::from_u64(id);
     let registration = self.slots.retire_with(key, |slot| {
-      slot.submitted = None;
       // SAFETY: occupied slots always contain an initialized registration,
       // and the slot no longer counts as initialized once this returns.
       unsafe { slot.registration.assume_init_read() }
@@ -193,10 +167,6 @@ impl OpStore {
     let key = SlabKey::from_u64(id);
     out.reserve(1);
     self.slots.retire_known_with(key, |slot| {
-      // Drop the submitted copy before the registration leaves the slot.
-      // A retire that skips completion would otherwise keep those addresses
-      // and resource refs until the slot is reused.
-      slot.submitted = None;
       // SAFETY: `reserve` left a spare element, and this slot holds an
       // initialized registration. The write moves it; the slot is marked
       // retired only after this returns, and nothing else drops it.
@@ -243,34 +213,17 @@ impl OpStore {
   pub fn with_slot<R>(
     &mut self,
     id: u64,
-    f: impl FnOnce(
-      &mut Registration,
-      &mut Bump,
-      &mut Option<crate::backend::op::Op>,
-    ) -> R,
+    f: impl FnOnce(&mut Registration, &mut Bump) -> R,
   ) -> Option<R> {
     let key = SlabKey::from_u64(id);
     let slot = self.slots.get_mut(key)?;
-    // SAFETY: an occupied slot's registration is initialized. The three
-    // fields do not alias.
-    let (registration, step_bump, submitted) = unsafe {
+    // SAFETY: an occupied slot's registration is initialized. `registration`
+    // and `step_bump` are different fields, so the two references do not alias.
+    let (registration, step_bump) = unsafe {
       let slot = slot as *mut StoreSlot;
-      (
-        (*slot).registration.assume_init_mut(),
-        &mut (*slot).step_bump,
-        &mut (*slot).submitted,
-      )
+      ((*slot).registration.assume_init_mut(), &mut (*slot).step_bump)
     };
-    Some(f(registration, step_bump, submitted))
-  }
-
-  /// Drops the operation remembered for `id`. The next `action` may free
-  /// the buffers that operation named.
-  pub fn clear_submitted(&mut self, id: u64) {
-    let key = SlabKey::from_u64(id);
-    if let Some(slot) = self.slots.get_mut(key) {
-      slot.submitted = None;
-    }
+    Some(f(registration, step_bump))
   }
 
   /// Inserts an operation and submits it while its model is borrowed.
@@ -286,13 +239,7 @@ impl OpStore {
   pub fn insert_submitting(
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
-    submit: impl FnOnce(
-      u64,
-      &mut Registration,
-      &mut Bump,
-      &mut Insert,
-      &mut Option<crate::backend::op::Op>,
-    ),
+    submit: impl FnOnce(u64, &mut Registration, &mut Bump, &mut Insert),
   ) -> Option<u64> {
     let Some(slot_idx) = self.slots.peek_free() else {
       panic!("insert on a full store: check is_full first");
@@ -306,7 +253,6 @@ impl OpStore {
       let slot = (*slots).state_mut(slot_idx);
       slot.model_bump.reset();
       slot.step_bump.reset();
-      slot.submitted = None;
       slot.registration.write(init(&mut slot.model_bump));
     }
     // SAFETY: same pointer as above, still the only use of this pool.
@@ -321,15 +267,7 @@ impl OpStore {
       let slot = (*slots).state_mut(slot_idx);
       let registration = slot.registration.assume_init_mut();
       let step_bump = &mut slot.step_bump as *mut Bump;
-      let submitted =
-        &mut slot.submitted as *mut Option<crate::backend::op::Op>;
-      submit(
-        id,
-        registration,
-        &mut *step_bump,
-        &mut guard.token(),
-        &mut *submitted,
-      );
+      submit(id, registration, &mut *step_bump, &mut guard.token());
     }
     if !guard.keep {
       if guard.drop_registration {
@@ -675,7 +613,7 @@ mod tests {
     let mut store = OpStore::with_capacity(1);
     let id = store.insert_submitting(
       |arena| Registration::new_waker_in(arena, dummy_waker(), tx, Nop),
-      |_id, _reg, _bump, _insert, _submitted| {},
+      |_id, _reg, _bump, _insert| {},
     );
     assert!(id.is_none());
     assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
@@ -689,7 +627,7 @@ mod tests {
     let id = store
       .insert_submitting(
         |arena| Registration::new_waker_in(arena, dummy_waker(), tx, Nop),
-        |_id, _reg, _bump, insert, _submitted| insert.keep_on_panic(),
+        |_id, _reg, _bump, insert| insert.keep_on_panic(),
       )
       .expect("the slot was claimed");
     assert!(store.is_full());
@@ -704,7 +642,7 @@ mod tests {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       store.insert_submitting(
         |arena| Registration::new_waker_in(arena, dummy_waker(), tx, Nop),
-        |_id, _reg, _bump, _insert, _submitted| panic!("action failed"),
+        |_id, _reg, _bump, _insert| panic!("action failed"),
       );
     }));
     assert!(result.is_err());
@@ -723,7 +661,7 @@ mod tests {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       store.insert_submitting(
         |arena| Registration::new_waker_in(arena, dummy_waker(), tx, Nop),
-        |new_id, _reg, _bump, insert, _submitted| {
+        |new_id, _reg, _bump, insert| {
           id.set(new_id);
           insert.keep_on_panic();
           panic!("push failed");

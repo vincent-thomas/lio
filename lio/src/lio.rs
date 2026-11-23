@@ -299,18 +299,16 @@ impl Lio {
   /// store, unmoved, until the completion is routed or the backend drains.
   fn submit_registration(inner: &mut LioInner, id: u64) -> bool {
     let LioInner { io, store, time, .. } = inner;
-    let Some(ran) = store.with_slot(id, |reg, step_bump, submitted| {
-      // The previous submission is finished. Drop its copy before `action`
-      // may replace the buffers.
-      *submitted = None;
+    let Some(ran) = store.with_slot(id, |reg, step_bump| {
       let keep = reg.lease();
       reg.with_action(&mut |action| match action {
         Action::Io(op) => {
           step_bump.reset();
-          let flight = crate::backend::InFlight::from_model(op, keep.clone());
-          *submitted = Some(flight.as_op().clone());
-          let mut view = crate::backend::loan::OpView::new(flight.as_op());
-          io.push(id, flight.keep(), &mut view, step_bump);
+          io.push(
+            id,
+            crate::backend::InFlight::from_model(op, keep.clone()),
+            step_bump,
+          );
         }
         Action::Sleep(duration) => time.schedule(id, duration),
       })
@@ -460,7 +458,7 @@ impl Lio {
   ) -> io::Result<u64> {
     let LioInner { io, store, time, .. } = inner;
     let Some(_id) =
-      store.insert_submitting(init, |id, reg, step_bump, insert, submitted| {
+      store.insert_submitting(init, |id, reg, step_bump, insert| {
         let keep = reg.lease();
         reg.with_action(&mut |action| {
           // After this, a panic must not free the model: `push` may have
@@ -470,11 +468,11 @@ impl Lio {
           match action {
             Action::Io(op) => {
               step_bump.reset();
-              let flight =
-                crate::backend::InFlight::from_model(op, keep.clone());
-              *submitted = Some(flight.as_op().clone());
-              let mut view = crate::backend::loan::OpView::new(flight.as_op());
-              io.push(id, flight.keep(), &mut view, step_bump);
+              io.push(
+                id,
+                crate::backend::InFlight::from_model(op, keep.clone()),
+                step_bump,
+              );
             }
             Action::Sleep(duration) => time.schedule(id, duration),
           }
@@ -762,10 +760,7 @@ impl Lio {
     let mut stats = LioProfile::default();
     let inner_ref = &mut *inner;
 
-    timed!(PROFILE, stats, flush_time, {
-      let (io, store) = (&mut inner_ref.io, &mut inner_ref.store);
-      io.flush(store)
-    })?;
+    timed!(PROFILE, stats, flush_time, inner_ref.io.flush())?;
 
     // Work already queued is ready now; don't block on the backend first.
     let queued =
@@ -782,11 +777,9 @@ impl Lio {
     };
 
     inner_ref.completed.clear();
-    let waited = timed!(PROFILE, stats, wait_time, {
-      let (io, store, completed) =
-        (&mut inner_ref.io, &mut inner_ref.store, &mut inner_ref.completed);
-      io.wait(effective_timeout, completed, store)
-    });
+    let (io, completed) = (&mut inner_ref.io, &mut inner_ref.completed);
+    let waited =
+      timed!(PROFILE, stats, wait_time, io.wait(effective_timeout, completed));
     // Queue what the backend reported even if it then failed, so those
     // operations are not lost.
     inner_ref.ready_io.extend(inner_ref.completed.drain(..));
@@ -865,8 +858,6 @@ impl Lio {
       completion_store_lookup_time,
       inner.store.get_mut(id).map(|reg| reg.begin_completion())
     );
-    // The handler may free the buffers this submission named.
-    inner.store.clear_submitted(id);
     let Some((handler, mut waker)) = begun else {
       // An earlier handler may have cancelled a sleep whose timer already
       // fired. An I/O registration, though, lives until its completion
@@ -1226,30 +1217,22 @@ mod tests {
   #[derive(Default)]
   struct Twice(Vec<u64>);
 
-  impl IoBackend for Twice {
+  // SAFETY: test backend. It never dereferences an address. It completes
+  // twice on purpose.
+  unsafe impl IoBackend for Twice {
     fn init(&mut self, _: usize) -> io::Result<()> {
       Ok(())
     }
-    fn push(
-      &mut self,
-      id: u64,
-      _: crate::backend::Keep,
-      _: &mut crate::backend::loan::OpView<'_>,
-      _: &mut Bump,
-    ) {
+    fn push(&mut self, id: u64, _: crate::backend::InFlight<'_>, _: &mut Bump) {
       self.0.extend([id, id]);
     }
-    fn flush(
-      &mut self,
-      _: &mut dyn crate::backend::loan::Loan,
-    ) -> io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
       Ok(())
     }
     fn wait(
       &mut self,
       _: Option<Duration>,
       completed: &mut Vec<OpCompleted>,
-      _: &mut dyn crate::backend::loan::Loan,
     ) -> io::Result<()> {
       completed.clear();
       completed.extend(self.0.drain(..).map(|id| OpCompleted::new(id, 0)));
@@ -1320,41 +1303,6 @@ mod tests {
 
   impl crate::api::op::OneshotOpModel for TwoSteps {}
 
-  #[test]
-  fn a_later_lend_does_not_call_action_again() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    use crate::backend::loan::Loan;
-
-    struct Counts(Arc<AtomicU32>);
-
-    impl crate::api::op::OpModel for Counts {
-      type Item = ();
-
-      fn action(&mut self) -> Action<'_> {
-        self.0.fetch_add(1, Ordering::Relaxed);
-        action_io!(crate::backend::op::Op::Nop)
-      }
-
-      fn complete(&mut self, _: Completion) -> crate::api::op::OpResult<()> {
-        crate::api::op::OpResult::Done(())
-      }
-    }
-
-    impl crate::api::op::OneshotOpModel for Counts {}
-
-    let calls = Arc::new(AtomicU32::new(0));
-    let (backend, lio) = lio(1);
-    crate::api::Io::from_op(Counts(calls.clone()))
-      .with_lio(&lio)
-      .when_done(|_| {});
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
-    let id = backend.pushed()[0];
-    lio.inner.borrow_mut().store.lend(id, &mut |_| {});
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
-  }
-
   /// Counts its wakes.
   #[derive(Default)]
   struct Wakes(std::sync::atomic::AtomicUsize);
@@ -1408,26 +1356,23 @@ mod tests {
     first_allocs: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
   }
 
-  impl IoBackend for Lowering {
+  // SAFETY: every call goes to the inner `ScriptedBackend`.
+  unsafe impl IoBackend for Lowering {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
     fn push(
       &mut self,
       id: u64,
-      keep: crate::backend::Keep,
-      view: &mut crate::backend::loan::OpView<'_>,
+      op: crate::backend::InFlight<'_>,
       bump: &mut Bump,
     ) {
       let at = bump.alloc(0u64) as *mut u64 as usize;
       self.first_allocs.borrow_mut().push(at);
-      self.inner.push(id, keep, view, bump);
+      self.inner.push(id, op, bump);
     }
-    fn flush(
-      &mut self,
-      loan: &mut dyn crate::backend::loan::Loan,
-    ) -> io::Result<()> {
-      self.inner.flush(loan)
+    fn flush(&mut self) -> io::Result<()> {
+      self.inner.flush()
     }
     fn drain(&mut self) -> bool {
       self.inner.drain()
@@ -1436,9 +1381,8 @@ mod tests {
       &mut self,
       timeout: Option<Duration>,
       completed: &mut Vec<OpCompleted>,
-      loan: &mut dyn crate::backend::loan::Loan,
     ) -> io::Result<()> {
-      self.inner.wait(timeout, completed, loan)
+      self.inner.wait(timeout, completed)
     }
   }
 
@@ -1524,7 +1468,8 @@ mod tests {
     timeouts: Rc<RefCell<Vec<Option<Duration>>>>,
   }
 
-  impl IoBackend for Recording {
+  // SAFETY: every call goes to the inner `ScriptedBackend`.
+  unsafe impl IoBackend for Recording {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
@@ -1534,26 +1479,21 @@ mod tests {
     fn push(
       &mut self,
       id: u64,
-      keep: crate::backend::Keep,
-      view: &mut crate::backend::loan::OpView<'_>,
+      op: crate::backend::InFlight<'_>,
       bump: &mut Bump,
     ) {
-      self.inner.push(id, keep, view, bump);
+      self.inner.push(id, op, bump);
     }
-    fn flush(
-      &mut self,
-      loan: &mut dyn crate::backend::loan::Loan,
-    ) -> io::Result<()> {
-      self.inner.flush(loan)
+    fn flush(&mut self) -> io::Result<()> {
+      self.inner.flush()
     }
     fn wait(
       &mut self,
       timeout: Option<Duration>,
       completed: &mut Vec<OpCompleted>,
-      loan: &mut dyn crate::backend::loan::Loan,
     ) -> io::Result<()> {
       self.timeouts.borrow_mut().push(timeout);
-      self.inner.wait(timeout, completed, loan)
+      self.inner.wait(timeout, completed)
     }
   }
 

@@ -44,7 +44,8 @@ mod single_socket_tests;
 #[derive(Debug)]
 struct PendingOp {
   registration_id: u64,
-  /// Pins the model. Not a caller address.
+  op: Op,
+  // Held so the driver does not free the model while this entry is stored.
   #[allow(dead_code)]
   keep: crate::backend::Keep,
   lowered: LoweredState,
@@ -1158,7 +1159,6 @@ impl IoUring {
   fn push_entry(
     &mut self,
     pending: &PendingOp,
-    op: &Op,
     id: u64,
     sq_space_left: &mut usize,
   ) -> io::Result<()> {
@@ -1166,7 +1166,7 @@ impl IoUring {
       self.ring().submit()?;
       *sq_space_left = self.ring().sq_space_left();
     }
-    let io_uring_entry = pending.lowered.create_entry(op);
+    let io_uring_entry = pending.lowered.create_entry(&pending.op);
     // SAFETY: `io_uring_entry` references buffers owned by `pending`, which
     // stays in the slab until completion processing removes it.
     unsafe { self.ring().push(io_uring_entry, id) }?;
@@ -1334,7 +1334,9 @@ impl IoUring {
   }
 }
 
-impl IoBackend for IoUring {
+// SAFETY: each `PendingOp` stores its `Keep` until its CQE is reaped.
+// `drain` returns `true` only when `drain_in_flight` saw every entry finish.
+unsafe impl IoBackend for IoUring {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.ring = Some(if self.deferred_completions {
       Self::create_ring_with(cap as u32, LioUring::with_params)?
@@ -1358,40 +1360,31 @@ impl IoBackend for IoUring {
   fn push(
     &mut self,
     id: u64,
-    keep: crate::backend::Keep,
-    view: &mut crate::backend::loan::OpView<'_>,
+    op: crate::backend::InFlight<'_>,
     step_bump: &mut Bump,
   ) {
+    // The model stays pinned while `keep` is stored with the operation.
+    let (op, keep) = op.into_parts();
     assert!(
       self.backlog.len() + self.in_flight < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
-    let mut lowered = None;
-    let mut failed = None;
-    // The address is copied into the bump iovec for the kernel.
-    // It is not stored on this backend beside that kernel structure.
-    let op = view.op();
-    match LoweredState::lower_in(op, step_bump, self.single_socket) {
-      Ok(state) => lowered = Some(state),
-      Err(err) => {
-        failed = Some(-(err.raw_os_error().unwrap_or(libc::EIO) as isize))
-      }
-    }
-    if let Some(result) = failed {
-      self.queued_completed.push(OpCompleted::new(id, result));
-      return;
-    }
-    let Some(lowered) = lowered else {
-      unreachable!("lower builds a state or an error");
-    };
-    self.backlog.push(PendingOp { registration_id: id, keep, lowered });
+    let lowered =
+      match LoweredState::lower_in(&op, step_bump, self.single_socket) {
+        Ok(lowered) => lowered,
+        Err(err) => {
+          self.queued_completed.push(OpCompleted::new(
+            id,
+            -(err.raw_os_error().unwrap_or(libc::EIO) as isize),
+          ));
+          return;
+        }
+      };
+    self.backlog.push(PendingOp { registration_id: id, op, keep, lowered });
   }
 
-  fn flush(
-    &mut self,
-    loan: &mut dyn crate::backend::loan::Loan,
-  ) -> io::Result<()> {
+  fn flush(&mut self) -> io::Result<()> {
     let profiling_enabled = self.profile.is_some();
     let mut backlog_stage_time = Duration::ZERO;
     let mut validate_time = Duration::ZERO;
@@ -1428,20 +1421,7 @@ impl IoBackend for IoUring {
     for entry in processing_backlog {
       let validate_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
-      let mut validated = None;
-      let mut is_nop = false;
-      let mut immediate = None;
-      loan.lend(entry.registration_id, &mut |view| {
-        // Validate, the immediate syscall, and the SQE fill all finish
-        // before this callback returns.
-        let op = view.op();
-        validated = Self::validate_op(op);
-        is_nop = matches!(op, Op::Nop);
-        if validated.is_none() && !is_nop {
-          immediate = Self::execute_immediate(op);
-        }
-      });
-      if let Some(result) = validated {
+      if let Some(result) = Self::validate_op(&entry.op) {
         if let Some(started) = validate_started {
           validate_time += started.elapsed();
         }
@@ -1455,7 +1435,7 @@ impl IoBackend for IoUring {
         validate_time += started.elapsed();
       }
 
-      if is_nop {
+      if matches!(&entry.op, Op::Nop) {
         nop_ops += 1;
         self.queued_completed.push(OpCompleted::new(entry.registration_id, 0));
         continue;
@@ -1463,7 +1443,7 @@ impl IoBackend for IoUring {
 
       let immediate_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
-      if let Some(result) = immediate {
+      if let Some(result) = Self::execute_immediate(&entry.op) {
         if let Some(started) = immediate_started {
           immediate_time += started.elapsed();
         }
@@ -1508,19 +1488,7 @@ impl IoBackend for IoUring {
       let pending = unsafe { &*pending_ptr };
       let push_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
-      let mut push_result = Ok(());
-      loan.lend(pending.registration_id, &mut |view| {
-        // `create_entry` copies the caller address into the SQE before this
-        // callback returns. The kernel holds it after that.
-        let op = view.op();
-        push_result = self.push_entry(
-          pending,
-          op,
-          pending_key.as_u64(),
-          &mut sq_space_left,
-        );
-      });
-      push_result?;
+      self.push_entry(pending, pending_key.as_u64(), &mut sq_space_left)?;
       if let Some(started) = push_started {
         push_time += started.elapsed();
       }
@@ -1589,7 +1557,6 @@ impl IoBackend for IoUring {
     &mut self,
     timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
-    _loan: &mut dyn crate::backend::loan::Loan,
   ) -> io::Result<()> {
     completed.clear();
 

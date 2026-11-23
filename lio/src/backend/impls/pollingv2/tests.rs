@@ -47,11 +47,11 @@ mod immediate_sockets {
     // the buffers and message descriptors stay stable until completion.
     // `from_model` names that borrow: `model` stays alive until the backend
     // finishes.
-    // SAFETY: `model` stays alive until the backend finishes, which is the
-    // attest rule. `remember` is what a later flush lends.
-    unsafe { crate::backend::loan::Attested::remember(id, op.as_op()) };
-    let mut view = crate::backend::loan::OpView::new(op.as_op());
-    backend.push(id, crate::backend::Keep::new(), &mut view, &mut Bump::new());
+    backend.push(
+      id,
+      crate::backend::InFlight::from_model(op, crate::backend::Keep::new()),
+      &mut Bump::new(),
+    );
   }
 
   #[test]
@@ -61,12 +61,10 @@ mod immediate_sockets {
     let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
     let mut backend = backend();
     queue(&mut backend, 11, &mut *model);
-    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
+    backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 0);
     let mut completed = Vec::new();
-    backend
-      .wait(None, &mut completed, &mut crate::backend::loan::Attested::new())
-      .unwrap();
+    backend.wait(None, &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].registration_id(), 11);
     let OpResult::Done((result, buf)) =
@@ -84,25 +82,13 @@ mod immediate_sockets {
     let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
     let mut backend = backend();
     queue(&mut backend, 12, &mut *model);
-    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
+    backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 1);
     let mut completed = Vec::new();
-    backend
-      .wait(
-        Some(Duration::ZERO),
-        &mut completed,
-        &mut crate::backend::loan::Attested::new(),
-      )
-      .unwrap();
+    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
     assert!(completed.is_empty());
     peer.write_all(b"hello").unwrap();
-    backend
-      .wait(
-        Some(Duration::from_secs(1)),
-        &mut completed,
-        &mut crate::backend::loan::Attested::new(),
-      )
-      .unwrap();
+    backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].result(), 5);
     assert_eq!(backend.pending.len(), 0);
@@ -114,18 +100,12 @@ mod immediate_sockets {
     let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
     let mut backend = backend();
     queue(&mut backend, 13, &mut *model);
-    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
+    backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 1);
     assert!(backend.queued_completed.is_empty());
     peer.write_all(b"hello").unwrap();
     let mut completed = Vec::new();
-    backend
-      .wait(
-        Some(Duration::from_secs(1)),
-        &mut completed,
-        &mut crate::backend::loan::Attested::new(),
-      )
-      .unwrap();
+    backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].result(), 5);
   }
@@ -137,12 +117,10 @@ mod immediate_sockets {
       Box::new(api::send(&socket, b"hello".to_vec(), None).into_inner());
     let mut backend = backend();
     queue(&mut backend, 14, &mut *model);
-    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
+    backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 0);
     let mut completed = Vec::new();
-    backend
-      .wait(None, &mut completed, &mut crate::backend::loan::Attested::new())
-      .unwrap();
+    backend.wait(None, &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].result(), 5);
     let mut bytes = [0; 5];
@@ -156,22 +134,20 @@ mod immediate_sockets {
     let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
     let mut backend = backend();
     queue(&mut backend, 15, &mut *model);
-    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
+    backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 1);
     peer.write_all(b"hello").unwrap();
     // SAFETY: a no-op borrows nothing.
-    let flight = unsafe {
-      crate::backend::InFlight::attest(crate::backend::op::BorrowedOp::nop())
-    };
-    // SAFETY: this nop has no buffer. It stays alive through the next flush.
-    unsafe { crate::backend::loan::Attested::remember(16, flight.as_op()) };
-    let mut view = crate::backend::loan::OpView::new(flight.as_op());
-    backend.push(16, flight.keep(), &mut view, &mut Bump::new());
-    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
+    backend.push(
+      16,
+      unsafe {
+        crate::backend::InFlight::attest(crate::backend::op::BorrowedOp::nop())
+      },
+      &mut Bump::new(),
+    );
+    backend.flush().unwrap();
     let mut completed = Vec::new();
-    backend
-      .wait(None, &mut completed, &mut crate::backend::loan::Attested::new())
-      .unwrap();
+    backend.wait(None, &mut completed).unwrap();
     let mut ids: Vec<_> =
       completed.iter().map(|c| c.registration_id()).collect();
     ids.sort_unstable();
@@ -185,19 +161,13 @@ mod immediate_sockets {
     let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
     let mut backend = backend();
     queue(&mut backend, 15, &mut *model);
-    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
+    backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 1);
     assert!(backend.drain());
     assert_eq!(backend.pending.len(), 0);
     drop(model);
     let mut completed = Vec::new();
-    backend
-      .wait(
-        Some(Duration::ZERO),
-        &mut completed,
-        &mut crate::backend::loan::Attested::new(),
-      )
-      .unwrap();
+    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
     assert!(completed.is_empty());
   }
 
@@ -222,7 +192,7 @@ mod immediate_sockets {
       Box::new(api::send(&socket, b"hello".to_vec(), None).into_inner());
     let mut backend = backend();
     queue(&mut backend, 17, &mut *model);
-    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
+    backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 1);
     assert!(backend.queued_completed.is_empty());
     let mut drain = [0u8; 8192];
@@ -234,13 +204,7 @@ mod immediate_sockets {
       }
     }
     let mut completed = Vec::new();
-    backend
-      .wait(
-        Some(Duration::from_secs(1)),
-        &mut completed,
-        &mut crate::backend::loan::Attested::new(),
-      )
-      .unwrap();
+    backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].result(), 5);
     assert_eq!(backend.pending.len(), 0);
@@ -264,32 +228,25 @@ mod immediate_sockets {
       })
       .collect();
     let mut backend = backend();
-    let op = Op::Read {
-      fd: socket,
-      iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
-      iov_count: raws.len(),
-      offset: None,
-      flags: ReadFlags::empty(),
-    };
     // SAFETY: `raws` and `socket` stay alive until this backend finishes.
-    unsafe { crate::backend::loan::Attested::remember(18, &op) };
-    // SAFETY: the same buffers stay alive for this attested flight.
-    let flight = unsafe {
-      crate::backend::InFlight::attest(crate::backend::op::BorrowedOp::from_op(
-        op,
-      ))
-    };
-    let mut view = crate::backend::loan::OpView::new(flight.as_op());
-    backend.push(18, flight.keep(), &mut view, &mut Bump::new());
-    backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
+    unsafe {
+      backend.push(
+        18,
+        crate::backend::InFlight::attest(
+          crate::backend::op::BorrowedOp::from_op(Op::Read {
+            fd: socket,
+            iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
+            iov_count: raws.len(),
+            offset: None,
+            flags: ReadFlags::empty(),
+          }),
+        ),
+        &mut Bump::new(),
+      );
+    }
+    backend.flush().unwrap();
     let mut completed = Vec::new();
-    backend
-      .wait(
-        Some(Duration::from_secs(1)),
-        &mut completed,
-        &mut crate::backend::loan::Attested::new(),
-      )
-      .unwrap();
+    backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].result(), -(libc::EINVAL as isize));
     assert!(buffers.iter().flatten().all(|&byte| byte == 0));
