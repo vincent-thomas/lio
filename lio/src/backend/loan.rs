@@ -1,49 +1,45 @@
 //! One-call view of an operation.
 //!
-//! A backend never receives an [`Op`](crate::backend::op::Op) it can store.
-//! [`Loan::lend`] builds an [`OpView`] for the body of one callback. Safe
-//! code only gets borrows that end with that callback. Any backend, in this
-//! crate or outside it, gets the raw [`Op`] for that same call through
-//! [`OpView::kernel`], so it can hand an address to the kernel or a syscall.
-//! That address is not a value the view can keep.
-
-use std::marker::PhantomData;
+//! This module is the implementor surface. Callers use [`crate::Lio`] and
+//! [`crate::api`]. They do not build an [`OpView`] or a [`Loan`].
+//!
+//! [`IoBackend::push`](super::IoBackend::push) receives the [`OpView`] for
+//! that call. [`flush`](super::IoBackend::flush) and
+//! [`wait`](super::IoBackend::wait) receive a [`Loan`], because the backend
+//! names an id and the driver still owns the model.
+//!
+//! [`OpView::op`] borrows the portable [`Op`](crate::backend::op::Op) for the
+//! view. The backend copies a buffer address into its own kernel structure
+//! before that borrow ends. This crate does not choose that format.
 
 use super::op::Op;
 
-/// The operation the driver is willing to show for one call.
+/// The operation the driver shows for one call.
 ///
-/// The borrow lasts for the call. A safe caller cannot store it on the
-/// backend: the only safe buffer access returns a slice tied to `&mut self`.
+/// The borrow lasts for the view. [`op`](Self::op) is the portable operation.
+/// A backend lowers it into its own kernel structure before the borrow ends.
 pub struct OpView<'a> {
-  op: *const Op,
-  _lt: PhantomData<&'a mut ()>,
+  op: &'a Op,
 }
 
 impl<'a> OpView<'a> {
-  pub(crate) fn new(op: &Op) -> Self {
-    Self { op, _lt: PhantomData }
+  /// A view of `op`. The view ends when `op` does.
+  pub fn new(op: &'a Op) -> Self {
+    Self { op }
   }
 
-  /// The operation, for this call only.
+  /// The portable operation for this call.
   ///
-  /// # Safety
-  ///
-  /// Copy a buffer address into a kernel structure or pass it to a syscall
-  /// before this call returns. Do not store it in the backend. The model
-  /// behind the pointer stays pinned for the call, and the driver frees it
-  /// only after [`drain`](super::IoBackend::drain) says the kernel is done.
-  pub unsafe fn kernel(&self) -> &'a Op {
-    // SAFETY: the driver built this view from a live model and lends it
-    // only while that model is borrowed.
-    unsafe { &*self.op }
+  /// Copy a buffer address into the backend's kernel structure before this
+  /// borrow ends. [`drain`](super::IoBackend::drain) says when the kernel is
+  /// finished with that address.
+  pub fn op(&self) -> &Op {
+    self.op
   }
 
   /// Byte `index` of a read, for this borrow only.
   pub fn read_buf(&mut self, index: usize) -> Option<&mut [u8]> {
-    // SAFETY: the model is borrowed for this view, and `&mut self` is the
-    // only borrow of that buffer for this call.
-    let op = unsafe { &*self.op };
+    let op = self.op;
     let Op::Read { iovecs, iov_count, .. } = op else {
       return None;
     };
@@ -62,42 +58,12 @@ impl<'a> OpView<'a> {
 /// The driver implements this. A backend calls [`lend`](Self::lend) when it
 /// fills a submission or runs a syscall. It does not keep the view.
 pub trait Loan {
-  fn lend<'a>(&'a mut self, id: u64, f: &mut dyn FnMut(&mut OpView<'a>));
+  fn lend(&mut self, id: u64, f: &mut dyn for<'v> FnMut(&mut OpView<'v>));
 }
 
 impl<T: Loan + ?Sized> Loan for std::mem::ManuallyDrop<T> {
-  fn lend<'a>(&'a mut self, id: u64, f: &mut dyn FnMut(&mut OpView<'a>)) {
+  fn lend(&mut self, id: u64, f: &mut dyn for<'v> FnMut(&mut OpView<'v>)) {
     (**self).lend(id, f)
-  }
-}
-
-/// The one operation a `push` is submitting.
-pub struct PushLoan<'b> {
-  id: Option<u64>,
-  op: &'b Op,
-}
-
-impl<'b> PushLoan<'b> {
-  pub(crate) fn new(id: u64, op: &'b Op) -> Self {
-    Self { id: Some(id), op }
-  }
-
-  /// One attested operation. The test chooses the id at `push`.
-  pub(crate) fn any(op: &'b Op) -> Self {
-    Self { id: None, op }
-  }
-}
-
-impl Loan for PushLoan<'_> {
-  fn lend<'a>(&'a mut self, id: u64, f: &mut dyn FnMut(&mut OpView<'a>)) {
-    if let Some(expected) = self.id {
-      assert_eq!(
-        id, expected,
-        "backend lent operation {id} while submitting {expected}"
-      );
-    }
-    let mut view = OpView::new(self.op);
-    f(&mut view);
   }
 }
 
@@ -151,7 +117,7 @@ impl Attested {
 }
 
 impl Loan for Attested {
-  fn lend<'a>(&'a mut self, id: u64, f: &mut dyn FnMut(&mut OpView<'a>)) {
+  fn lend(&mut self, id: u64, f: &mut dyn for<'v> FnMut(&mut OpView<'v>)) {
     if let Some(op) = self.ops.get(&id) {
       let mut view = OpView::new(op);
       f(&mut view);

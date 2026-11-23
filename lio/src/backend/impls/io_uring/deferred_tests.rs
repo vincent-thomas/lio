@@ -96,10 +96,10 @@ fn trace_read_batches() {
       &mut self,
       id: u64,
       keep: crate::backend::Keep,
-      loan: &mut dyn crate::backend::loan::Loan,
+      view: &mut crate::backend::loan::OpView<'_>,
       bump: &mut Bump,
     ) {
-      self.inner.push(id, keep, loan, bump)
+      self.inner.push(id, keep, view, bump)
     }
     fn flush(
       &mut self,
@@ -282,8 +282,8 @@ fn nonblocking_waits_make_progress_on_file_completions() {
     // SAFETY: the same buffers stay alive for this attested flight.
     let flight =
       unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
-    let mut loan = flight.loan();
-    backend.push(id as u64, flight.keep(), &mut loan, &mut arena);
+    let mut view = crate::backend::loan::OpView::new(flight.as_op());
+    backend.push(id as u64, flight.keep(), &mut view, &mut arena);
   }
   backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
   let mut seen = [false; DEPTH];
@@ -353,8 +353,8 @@ fn read_with_more_iovecs_than_the_native_array_is_rejected() {
   // SAFETY: the same buffers stay alive for this attested flight.
   let flight =
     unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
-  let mut loan = flight.loan();
-  backend.push(1, flight.keep(), &mut loan, &mut arena);
+  let mut view = crate::backend::loan::OpView::new(flight.as_op());
+  backend.push(1, flight.keep(), &mut view, &mut arena);
   backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
   let mut completed = Vec::new();
   backend
@@ -395,8 +395,8 @@ fn drop_waits_for_operations_in_the_kernel() {
   // SAFETY: the same buffers stay alive for this attested flight.
   let flight =
     unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
-  let mut loan = flight.loan();
-  backend.push(1, flight.keep(), &mut loan, &mut arena);
+  let mut view = crate::backend::loan::OpView::new(flight.as_op());
+  backend.push(1, flight.keep(), &mut view, &mut arena);
   backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
   let mut completed = Vec::new();
   backend

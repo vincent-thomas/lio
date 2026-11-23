@@ -105,7 +105,7 @@ impl IoBackend for BenchBackend {
     &mut self,
     id: u64,
     _keep: lio::backend::Keep,
-    _loan: &mut dyn lio::backend::loan::Loan,
+    _view: &mut lio::backend::loan::OpView<'_>,
     _step_bump: &mut Bump,
   ) {
     let result = self.result;
@@ -192,8 +192,8 @@ fn no_driver(criterion: &mut Criterion) {
             // SAFETY: a no-op borrows nothing.
             let flight =
               unsafe { lio::backend::InFlight::attest(BorrowedOp::nop()) };
-            let mut loan = flight.loan();
-            backend.push(id, flight.keep(), &mut loan, &mut bump);
+            let mut view = lio::backend::loan::OpView::new(flight.as_op());
+            backend.push(id, flight.keep(), &mut view, &mut bump);
           }
           backend.flush(&mut lio::backend::loan::Attested::new()).unwrap();
           backend

@@ -305,9 +305,8 @@ impl Lio {
         Action::Io(op) => {
           step_bump.reset();
           let flight = crate::backend::InFlight::from_model(op, keep.clone());
-          let mut loan =
-            crate::backend::loan::PushLoan::new(id, flight.as_op());
-          io.push(id, flight.keep(), &mut loan, step_bump);
+          let mut view = crate::backend::loan::OpView::new(flight.as_op());
+          io.push(id, flight.keep(), &mut view, step_bump);
         }
         Action::Sleep(duration) => time.schedule(id, duration),
       })
@@ -469,9 +468,8 @@ impl Lio {
               step_bump.reset();
               let flight =
                 crate::backend::InFlight::from_model(op, keep.clone());
-              let mut loan =
-                crate::backend::loan::PushLoan::new(id, flight.as_op());
-              io.push(id, flight.keep(), &mut loan, step_bump);
+              let mut view = crate::backend::loan::OpView::new(flight.as_op());
+              io.push(id, flight.keep(), &mut view, step_bump);
             }
             Action::Sleep(duration) => time.schedule(id, duration),
           }
@@ -1229,7 +1227,7 @@ mod tests {
       &mut self,
       id: u64,
       _: crate::backend::Keep,
-      _: &mut dyn crate::backend::loan::Loan,
+      _: &mut crate::backend::loan::OpView<'_>,
       _: &mut Bump,
     ) {
       self.0.extend([id, id]);
@@ -1376,12 +1374,12 @@ mod tests {
       &mut self,
       id: u64,
       keep: crate::backend::Keep,
-      loan: &mut dyn crate::backend::loan::Loan,
+      view: &mut crate::backend::loan::OpView<'_>,
       bump: &mut Bump,
     ) {
       let at = bump.alloc(0u64) as *mut u64 as usize;
       self.first_allocs.borrow_mut().push(at);
-      self.inner.push(id, keep, loan, bump);
+      self.inner.push(id, keep, view, bump);
     }
     fn flush(
       &mut self,
@@ -1495,10 +1493,10 @@ mod tests {
       &mut self,
       id: u64,
       keep: crate::backend::Keep,
-      loan: &mut dyn crate::backend::loan::Loan,
+      view: &mut crate::backend::loan::OpView<'_>,
       bump: &mut Bump,
     ) {
-      self.inner.push(id, keep, loan, bump);
+      self.inner.push(id, keep, view, bump);
     }
     fn flush(
       &mut self,

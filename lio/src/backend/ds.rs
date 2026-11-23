@@ -2707,16 +2707,12 @@ impl IoBackend for DSBackend {
     &mut self,
     id: u64,
     keep: crate::backend::Keep,
-    loan: &mut dyn crate::backend::loan::Loan,
+    view: &mut crate::backend::loan::OpView<'_>,
     _step_bump: &mut Bump,
   ) {
-    let mut op = None;
-    loan.lend(id, &mut |view| {
-      // SAFETY: the simulator is the kernel for these bytes. It keeps the
-      // copy until it completes the operation, then drops it.
-      op = Some(unsafe { view.kernel() }.clone());
-    });
-    let Some(op) = op else { unreachable!("lend runs the callback") };
+    // The simulator is the kernel for these bytes. It keeps the copy until
+    // it completes the operation, then drops it.
+    let op = view.op().clone();
     self.assert_initialized();
     self.assert_capacity();
     self.queued.push((id, op, keep));
@@ -4021,12 +4017,12 @@ impl DSTBackend {
         // `other` was accepted by `push` and stays in flight here.
         // The same lease goes with it. A new lease would let the driver free
         // the model while the local backend still holds these addresses.
-        let mut loan = crate::backend::loan::PushLoan::any(&other);
+        let mut view = crate::backend::loan::OpView::new(&other);
         self
           .local
           .as_mut()
           .expect("non-network DST backend op requires local backend")
-          .push(id, keep, &mut loan, &mut Bump::new());
+          .push(id, keep, &mut view, &mut Bump::new());
       }
     }
   }
@@ -4061,14 +4057,10 @@ impl IoBackend for DSTBackend {
     &mut self,
     id: u64,
     keep: crate::backend::Keep,
-    loan: &mut dyn crate::backend::loan::Loan,
+    view: &mut crate::backend::loan::OpView<'_>,
     step_bump: &mut Bump,
   ) {
-    let mut stored = None;
-    loan.lend(id, &mut |view| {
-      stored = Some(unsafe { view.kernel() }.clone());
-    });
-    let Some(stored) = stored else { unreachable!("lend runs the callback") };
+    let stored = view.op().clone();
     let use_network = match &stored {
       Op::Socket { .. } => true,
       Op::Bind { fd, .. }
@@ -4092,12 +4084,12 @@ impl IoBackend for DSTBackend {
     } else {
       // `stored` was just taken from this `InFlight`. The same lease
       // goes with it into the local backend.
-      let mut loan = crate::backend::loan::PushLoan::any(&stored);
+      let mut view = crate::backend::loan::OpView::new(&stored);
       self
         .local
         .as_mut()
         .expect("non-network DST backend push requires local backend")
-        .push(id, keep, &mut loan, step_bump);
+        .push(id, keep, &mut view, step_bump);
     }
   }
 
@@ -4175,8 +4167,8 @@ mod tests {
     // backend reports the completion.
     let flight =
       unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
-    let mut loan = flight.loan();
-    backend.push(id, flight.keep(), &mut loan, bump);
+    let mut view = crate::backend::loan::OpView::new(flight.as_op());
+    backend.push(id, flight.keep(), &mut view, bump);
   }
 
   #[test]
@@ -4195,8 +4187,8 @@ mod tests {
       // SAFETY: `drain` below drops the queued operation before `iov` and
       // `bytes` are released.
       let flight = unsafe { crate::backend::InFlight::attest(op) };
-      let mut loan = flight.loan();
-      backend.push(1, flight.keep(), &mut loan, &mut Bump::new());
+      let mut view = crate::backend::loan::OpView::new(flight.as_op());
+      backend.push(1, flight.keep(), &mut view, &mut Bump::new());
       assert!(backend.drain());
     }
     let mut loan = crate::backend::loan::Attested::new();

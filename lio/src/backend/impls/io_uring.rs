@@ -1359,7 +1359,7 @@ impl IoBackend for IoUring {
     &mut self,
     id: u64,
     keep: crate::backend::Keep,
-    loan: &mut dyn crate::backend::loan::Loan,
+    view: &mut crate::backend::loan::OpView<'_>,
     step_bump: &mut Bump,
   ) {
     assert!(
@@ -1369,23 +1369,21 @@ impl IoBackend for IoUring {
     );
     let mut lowered = None;
     let mut failed = None;
-    loan.lend(id, &mut |view| {
-      // SAFETY: the address is copied into the bump iovec for the kernel.
-      // It is not stored on this backend beside that kernel structure.
-      let op = unsafe { view.kernel() };
-      match LoweredState::lower_in(op, step_bump, self.single_socket) {
-        Ok(state) => lowered = Some(state),
-        Err(err) => {
-          failed = Some(-(err.raw_os_error().unwrap_or(libc::EIO) as isize))
-        }
+    // The address is copied into the bump iovec for the kernel.
+    // It is not stored on this backend beside that kernel structure.
+    let op = view.op();
+    match LoweredState::lower_in(op, step_bump, self.single_socket) {
+      Ok(state) => lowered = Some(state),
+      Err(err) => {
+        failed = Some(-(err.raw_os_error().unwrap_or(libc::EIO) as isize))
       }
-    });
+    }
     if let Some(result) = failed {
       self.queued_completed.push(OpCompleted::new(id, result));
       return;
     }
     let Some(lowered) = lowered else {
-      unreachable!("lend builds a lowered op or an error");
+      unreachable!("lower builds a state or an error");
     };
     self.backlog.push(PendingOp { registration_id: id, keep, lowered });
   }
@@ -1434,9 +1432,9 @@ impl IoBackend for IoUring {
       let mut is_nop = false;
       let mut immediate = None;
       loan.lend(entry.registration_id, &mut |view| {
-        // SAFETY: validate, the immediate syscall, and the SQE fill all
-        // finish before this callback returns.
-        let op = unsafe { view.kernel() };
+        // Validate, the immediate syscall, and the SQE fill all finish
+        // before this callback returns.
+        let op = view.op();
         validated = Self::validate_op(op);
         is_nop = matches!(op, Op::Nop);
         if validated.is_none() && !is_nop {
@@ -1512,9 +1510,9 @@ impl IoBackend for IoUring {
         if profiling_enabled { Some(Instant::now()) } else { None };
       let mut push_result = Ok(());
       loan.lend(pending.registration_id, &mut |view| {
-        // SAFETY: `create_entry` copies the caller address into the SQE
-        // before this callback returns. The kernel holds it after that.
-        let op = unsafe { view.kernel() };
+        // `create_entry` copies the caller address into the SQE before this
+        // callback returns. The kernel holds it after that.
+        let op = view.op();
         push_result = self.push_entry(
           pending,
           op,
