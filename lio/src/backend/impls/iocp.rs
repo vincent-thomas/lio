@@ -1029,7 +1029,7 @@ impl IoBackend for Iocp {
     &mut self,
     id: u64,
     keep: crate::backend::Keep,
-    _loan: &mut dyn crate::backend::loan::Loan,
+    _view: &mut crate::backend::loan::OpView<'_>,
     _step_bump: &mut Bump,
   ) {
     assert!(
@@ -1049,10 +1049,10 @@ impl IoBackend for Iocp {
       let mut result = None;
       let mut keep = Some(keep);
       loan.lend(id, &mut |view| {
-        // SAFETY: overlapped calls copy the address into a `WSABUF` here.
+        // Overlapped calls copy the address into a `WSABUF` here.
         // A blocking job keeps it until its worker syscall, which `drain`
         // waits for.
-        let op = unsafe { view.kernel() }.clone();
+        let op = view.op().clone();
         let Some(keep) = keep.take() else {
           panic!("lend runs once");
         };

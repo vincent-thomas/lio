@@ -50,8 +50,8 @@ mod immediate_sockets {
     // SAFETY: `model` stays alive until the backend finishes, which is the
     // attest rule. `remember` is what a later flush lends.
     unsafe { crate::backend::loan::Attested::remember(id, op.as_op()) };
-    let mut loan = crate::backend::loan::PushLoan::new(id, op.as_op());
-    backend.push(id, crate::backend::Keep::new(), &mut loan, &mut Bump::new());
+    let mut view = crate::backend::loan::OpView::new(op.as_op());
+    backend.push(id, crate::backend::Keep::new(), &mut view, &mut Bump::new());
   }
 
   #[test]
@@ -165,8 +165,8 @@ mod immediate_sockets {
     };
     // SAFETY: this nop has no buffer. It stays alive through the next flush.
     unsafe { crate::backend::loan::Attested::remember(16, flight.as_op()) };
-    let mut loan = flight.loan();
-    backend.push(16, flight.keep(), &mut loan, &mut Bump::new());
+    let mut view = crate::backend::loan::OpView::new(flight.as_op());
+    backend.push(16, flight.keep(), &mut view, &mut Bump::new());
     backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
     let mut completed = Vec::new();
     backend
@@ -279,8 +279,8 @@ mod immediate_sockets {
         op,
       ))
     };
-    let mut loan = flight.loan();
-    backend.push(18, flight.keep(), &mut loan, &mut Bump::new());
+    let mut view = crate::backend::loan::OpView::new(flight.as_op());
+    backend.push(18, flight.keep(), &mut view, &mut Bump::new());
     backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
     let mut completed = Vec::new();
     backend

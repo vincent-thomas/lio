@@ -175,19 +175,13 @@ impl IoBackend for ScriptedBackend {
     &mut self,
     id: u64,
     keep: crate::backend::Keep,
-    loan: &mut dyn crate::backend::loan::Loan,
+    view: &mut crate::backend::loan::OpView<'_>,
     _step_bump: &mut Bump,
   ) {
-    let mut seen = None;
-    loan.lend(id, &mut |view| {
-      // SAFETY: the pointer is recorded as this test kernel's buffer, the
-      // way `iov_base` is. The stored `Op` has those pointers cleared.
-      let op = unsafe { view.kernel() };
-      seen = Some((scrub(op), kern_bufs(op)));
-    });
-    let Some((op, bufs)) = seen else {
-      unreachable!("lend runs the callback");
-    };
+    // The pointer is recorded as this test kernel's buffer, the way
+    // `iov_base` is. The stored `Op` has those pointers cleared.
+    let op = view.op();
+    let (op, bufs) = (scrub(op), kern_bufs(op));
     let mut script = self.0.borrow_mut();
     script.pushed.push(id);
     script.in_flight.push((id, op, bufs));
@@ -477,7 +471,7 @@ impl<B: IoBackend> IoBackend for Checked<B> {
     &mut self,
     id: u64,
     keep: crate::backend::Keep,
-    loan: &mut dyn crate::backend::loan::Loan,
+    view: &mut crate::backend::loan::OpView<'_>,
     step_bump: &mut Bump,
   ) {
     let cap = self.cap("push");
@@ -490,7 +484,7 @@ impl<B: IoBackend> IoBackend for Checked<B> {
       self.in_flight.insert(id),
       "contract: pushed operation {id} while it is still in flight"
     );
-    self.inner.push(id, keep, loan, step_bump);
+    self.inner.push(id, keep, view, step_bump);
   }
 
   fn flush(
@@ -558,8 +552,8 @@ mod tests {
     // SAFETY: the same buffers stay alive for this attested flight.
     let flight =
       unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
-    let mut loan = flight.loan();
-    backend.push(id, flight.keep(), &mut loan, &mut Bump::new());
+    let mut view = crate::backend::loan::OpView::new(flight.as_op());
+    backend.push(id, flight.keep(), &mut view, &mut Bump::new());
   }
   use crate::backend::op::RawBuf;
 
@@ -869,7 +863,7 @@ mod tests {
         &mut self,
         id: u64,
         _: crate::backend::Keep,
-        _: &mut dyn crate::backend::loan::Loan,
+        _: &mut crate::backend::loan::OpView<'_>,
         _: &mut Bump,
       ) {
         self.0 = Some(id);

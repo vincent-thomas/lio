@@ -26,10 +26,10 @@ struct StoreSlot {
 /// - a persistent model-lifetime bump reset before slot reuse
 /// - a step-lifetime bump reserved for backend-lowered state
 impl crate::backend::loan::Loan for OpStore {
-  fn lend<'a>(
-    &'a mut self,
+  fn lend(
+    &mut self,
     id: u64,
-    f: &mut dyn FnMut(&mut crate::backend::loan::OpView<'a>),
+    f: &mut dyn for<'v> FnMut(&mut crate::backend::loan::OpView<'v>),
   ) {
     let Some(reg) = self.get_mut(id) else {
       panic!("backend lent operation {id}, which is not in the driver");

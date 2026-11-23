@@ -268,7 +268,7 @@ impl lio::backend::IoBackend for InOrderBackend {
     &mut self,
     id: u64,
     _keep: lio::backend::Keep,
-    _loan: &mut dyn lio::backend::loan::Loan,
+    _view: &mut lio::backend::loan::OpView<'_>,
     _step_bump: &mut bumpalo::Bump,
   ) {
     self.queued.push(id);

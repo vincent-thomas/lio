@@ -18,6 +18,8 @@ You:
 
 That is the center of the crate. Everything else makes more sense once you see `lio` as explicit submission plus explicit progress.
 
+[`backend`] is the surface for a person who implements [`backend::IoBackend`]. A caller stays on `Lio` and [`api`].
+
 ## What you can control
 
 From the current public source, `lio` lets you control:

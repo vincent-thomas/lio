@@ -1153,7 +1153,7 @@ impl IoBackend for Poller {
     &mut self,
     id: u64,
     keep: crate::backend::Keep,
-    _loan: &mut dyn crate::backend::loan::Loan,
+    _view: &mut crate::backend::loan::OpView<'_>,
     _step_bump: &mut Bump,
   ) {
     assert!(
@@ -1183,9 +1183,9 @@ impl IoBackend for Poller {
       let mut connect = None;
       let mut fd_interest = (0, Interest::NONE);
       loan.lend(entry.registration_id, &mut |view| {
-        // SAFETY: every syscall in this flush runs before the callback
-        // returns. Nothing here is stored except the descriptor number.
-        let op = unsafe { view.kernel() };
+        // Every syscall in this flush runs before the callback returns.
+        // Nothing here is stored except the descriptor number.
+        let op = view.op();
         nop = matches!(op, Op::Nop);
         validated = Self::validate_op(op);
         // A rejected offset must not reach `pwrite`. `u64::MAX` is `-1`
@@ -1383,8 +1383,8 @@ impl IoBackend for Poller {
       // The syscall runs inside the lend. The op is not stored.
       let mut result = 0;
       loan.lend(entry.registration_id, &mut |view| {
-        // SAFETY: `exec_op` is the syscall. It returns before this callback.
-        result = Poller::exec_op(unsafe { view.kernel() });
+        // `exec_op` is the syscall. It returns before this callback.
+        result = Poller::exec_op(view.op());
       });
 
       match result {

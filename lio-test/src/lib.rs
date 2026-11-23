@@ -213,8 +213,8 @@ macro_rules! test_io_backend {
           __lio_test_lio::backend::loan::Attested::remember(id, op.as_op());
         }
         let flight = unsafe { __lio_test_lio::backend::InFlight::attest(op) };
-        let mut loan = flight.loan();
-        IoBackend::push(backend, id, flight.keep(), &mut loan, step_bump);
+        let mut view = __lio_test_lio::backend::loan::OpView::new(flight.as_op());
+        IoBackend::push(backend, id, flight.keep(), &mut view, step_bump);
       });
     }
 

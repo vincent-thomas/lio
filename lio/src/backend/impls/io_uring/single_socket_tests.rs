@@ -28,8 +28,8 @@ fn complete(backend: &mut IoUring, arena: &mut Bump, op: Op) -> isize {
   // SAFETY: the same buffers stay alive for this attested flight.
   let flight =
     unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
-  let mut loan = flight.loan();
-  backend.push(123, flight.keep(), &mut loan, arena);
+  let mut view = crate::backend::loan::OpView::new(flight.as_op());
+  backend.push(123, flight.keep(), &mut view, arena);
   backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
   let deadline = Instant::now() + Duration::from_secs(2);
   let mut completed = Vec::new();
