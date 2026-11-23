@@ -50,3 +50,6 @@ run = [
 
 [tasks.cbuild]
 run = "cargo rustc -p lio --crate-type dylib,staticlib --features unstable_ffi --release"
+
+[tasks.test]
+run = "cargo test"
