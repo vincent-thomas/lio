@@ -34,9 +34,9 @@ lio-uring = { path = "../lio-uring", version = "0.3.1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
-  "Win32_Foundation",
+  "Win32_Foundation",            # DuplicateHandle
   "Win32_System_IO",
-  "Win32_System_Threading",      # CreateTimerQueueTimer, DeleteTimerQueueTimer, GetCurrentProcess, DuplicateHandle
+  "Win32_System_Threading",      # CreateTimerQueueTimer, DeleteTimerQueueTimer, GetCurrentProcess
   "Win32_System_Console",        # GetStdHandle, STD_*_HANDLE
   "Win32_Storage_FileSystem",    # ReadFile, WriteFile, CreateFileW
   "Win32_Networking_WinSock",    # WSARecv, WSASend, AcceptEx, ConnectEx

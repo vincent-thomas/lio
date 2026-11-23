@@ -45,6 +45,9 @@ mod single_socket_tests;
 struct PendingOp {
   registration_id: u64,
   op: Op,
+  // Held so the driver does not free the model while this entry is stored.
+  #[allow(dead_code)]
+  keep: crate::backend::Keep,
   lowered: LoweredState,
 }
 
@@ -175,8 +178,8 @@ impl ReadDirState {
 }
 
 impl NativeRwState {
-  fn from_raws(
-    iovecs: std::ptr::NonNull<crate::backend::op::RawBuf>,
+  fn from_raws<B: crate::backend::op::ByteSpan>(
+    iovecs: std::ptr::NonNull<B>,
     iov_count: usize,
   ) -> Option<Self> {
     // The native iovec array is fixed-size; a longer list would make the
@@ -193,8 +196,8 @@ impl NativeRwState {
         crate::buf::MAX_IOV_COUNT],
     };
     for (dst, src) in state.iovecs.iter_mut().zip(raws.iter()) {
-      dst.iov_base = src.ptr.cast();
-      dst.iov_len = src.len;
+      dst.iov_base = src.bytes_ptr().cast();
+      dst.iov_len = src.bytes_len();
     }
     Some(state)
   }
@@ -893,7 +896,10 @@ impl IoUring {
           if let Some(state) = local_state.take() {
             let ptr = Box::into_raw(Box::new(state));
             *opaque = ptr.cast();
-            *opaque_drop = Some(Self::drop_read_dir_state);
+            // SAFETY: `drop_read_dir_state` frees the state this backend allocated.
+            *opaque_drop = Some(unsafe {
+              crate::backend::op::OpaqueDrop::new(Self::drop_read_dir_state)
+            });
           }
           Ok(entries)
         }
@@ -1349,7 +1355,14 @@ impl IoBackend for IoUring {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump) {
+  fn push(
+    &mut self,
+    id: u64,
+    op: crate::backend::InFlight<'_>,
+    step_bump: &mut Bump,
+  ) {
+    // The model stays pinned while `keep` is stored with the operation.
+    let (op, keep) = op.into_parts();
     assert!(
       self.backlog.len() + self.in_flight < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
@@ -1366,7 +1379,7 @@ impl IoBackend for IoUring {
           return;
         }
       };
-    self.backlog.push(PendingOp { registration_id: id, op, lowered });
+    self.backlog.push(PendingOp { registration_id: id, op, keep, lowered });
   }
 
   fn flush(&mut self) -> io::Result<()> {

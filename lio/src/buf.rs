@@ -11,8 +11,9 @@
 //!
 //! The traits expose memory as slices rather than raw pointers, so implementing
 //! them requires no `unsafe` and an implementation cannot hand the kernel memory
-//! it does not own. Only [`IoBufMut::set_len`] is `unsafe`, and only to *call*:
-//! lio calls it after the kernel has initialized the bytes.
+//! it does not own. After a read, lio passes an [`Initialized`] proof to
+//! [`IoBufMut::commit`]; that proof is the only way to publish the bytes the
+//! kernel wrote.
 //!
 //! # Constants
 //!
@@ -28,7 +29,69 @@
 //! This uses the [`zeroize`](https://docs.rs/zeroize) crate, which guarantees that
 //! compiler optimizations won't eliminate the zeroing operation.
 
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
+
+/// Proof that the first [`len`](Self::len) bytes of one buffer region were
+/// initialized.
+///
+/// Only lio mints this, after a read has written those bytes. Applying it to
+/// a [`Vec<u8>`](Initialized::apply_to_vec) is safe: the proof cannot be
+/// forged, and it is rejected unless it names that `Vec`'s allocation.
+pub struct Initialized<'a> {
+  ptr: *mut u8,
+  len: usize,
+  region: usize,
+  _lt: PhantomData<&'a mut [MaybeUninit<u8>]>,
+}
+
+impl<'a> Initialized<'a> {
+  pub(crate) fn new(ptr: *mut u8, region: usize, len: usize) -> Self {
+    assert!(
+      len <= region,
+      "initialized length {len} exceeds the buffer region {region}"
+    );
+    Self { ptr, len, region, _lt: PhantomData }
+  }
+
+  /// How many bytes were initialized.
+  pub fn len(&self) -> usize {
+    self.len
+  }
+
+  /// Whether no bytes were initialized.
+  pub fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+
+  /// The region this proof describes.
+  pub fn region_len(&self) -> usize {
+    self.region
+  }
+
+  /// Start of the initialized region.
+  pub fn as_ptr(&self) -> *mut u8 {
+    self.ptr
+  }
+
+  /// Publishes `self` as `vec`'s initialized length.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `self` does not describe `vec`'s current allocation, or if the
+  /// initialized length exceeds `vec`'s capacity. A proof minted for one
+  /// buffer cannot resize another.
+  pub fn apply_to_vec(self, vec: &mut Vec<u8>) {
+    assert!(
+      vec.as_mut_ptr() == self.ptr && self.len <= vec.capacity(),
+      "initialized proof does not match this Vec"
+    );
+    // SAFETY: this proof was minted for this allocation after `len` bytes
+    // were initialized, and `len` is within capacity. The exclusive borrow
+    // keeps the allocation in place, so the pointer check identifies it.
+    unsafe { vec.set_len(self.len) }
+  }
+}
 
 /// Maximum number of buffers supported for vectored I/O operations.
 ///
@@ -63,10 +126,14 @@ pub type BufResult<T, B> = (std::io::Result<T>, B);
 /// The slice returned by [`as_slice`](IoBuf::as_slice) must stay at the same
 /// address for as long as the buffer is owned by an in-flight operation. lio
 /// never moves a buffer while the kernel may be reading it, and only calls
-/// `&self` methods on it in that time, so any buffer whose bytes do not change
-/// address under `&self` (heap storage, or inline storage of the buffer
-/// itself) satisfies this.
-pub trait IoBuf: Send + Sync + 'static {
+/// `&self` methods on it in that time.
+///
+/// # Safety
+///
+/// `as_slice` returns bytes that stay at that address until the buffer is
+/// dropped or the operation completes. A shared borrow does not reallocate
+/// or move them.
+pub unsafe trait IoBuf: Send + Sync + 'static {
   /// Returns the bytes to write.
   fn as_slice(&self) -> &[u8];
 }
@@ -76,7 +143,13 @@ pub trait IoBuf: Send + Sync + 'static {
 /// This trait extends [`IoBuf`] for operations that receive data (read, recv, etc.).
 /// It provides mutable access to the buffer's whole capacity and the ability to
 /// set the length after a read completes.
-pub trait IoBufMut: IoBuf {
+///
+/// # Safety
+///
+/// `as_uninit_mut` is the whole writable region. Its prefix of length
+/// [`as_slice().len()`](IoBuf::as_slice) is initialized. `commit` publishes
+/// only the prefix [`Initialized`] proves.
+pub unsafe trait IoBufMut: IoBuf {
   /// Returns the entire writable region of the buffer, from its start up to
   /// its capacity. Reads fill this region from the beginning.
   ///
@@ -84,24 +157,25 @@ pub trait IoBufMut: IoBuf {
   /// the rest may not be.
   fn as_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>];
 
-  /// Sets the length of valid data in the buffer.
+  /// Publishes `initialized` as the buffer's valid prefix.
   ///
-  /// Called after a read operation completes to indicate how many bytes were read.
-  ///
-  /// # Safety
-  ///
-  /// `len` must be at most `as_uninit_mut().len()`, and the first `len` bytes of
-  /// [`as_uninit_mut`](IoBufMut::as_uninit_mut) must be initialized.
-  unsafe fn set_len(&mut self, len: usize);
+  /// lio calls this after a read with a proof for the region
+  /// [`as_uninit_mut`](IoBufMut::as_uninit_mut) returned. Implementors that
+  /// store bytes in a [`Vec<u8>`] should call
+  /// [`Initialized::apply_to_vec`].
+  fn commit(&mut self, initialized: Initialized<'_>);
 }
 
-impl IoBuf for Vec<u8> {
+// SAFETY: `Vec<u8>` does not move its allocation under a shared borrow.
+unsafe impl IoBuf for Vec<u8> {
   fn as_slice(&self) -> &[u8] {
     self
   }
 }
 
-impl IoBufMut for Vec<u8> {
+// SAFETY: `as_uninit_mut` covers the allocation. `commit` accepts only a
+// proof for that allocation.
+unsafe impl IoBufMut for Vec<u8> {
   fn as_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
     let cap = self.capacity();
     // SAFETY: the allocation holds `cap` bytes, and `MaybeUninit<u8>` permits
@@ -109,14 +183,13 @@ impl IoBufMut for Vec<u8> {
     unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr().cast(), cap) }
   }
 
-  unsafe fn set_len(&mut self, len: usize) {
-    // SAFETY: the caller guarantees `len <= capacity` and that the first `len`
-    // bytes are initialized.
-    unsafe { Vec::set_len(self, len) }
+  fn commit(&mut self, initialized: Initialized<'_>) {
+    initialized.apply_to_vec(self);
   }
 }
 
-impl IoBuf for Box<[u8]> {
+// SAFETY: a boxed slice does not move its allocation under a shared borrow.
+unsafe impl IoBuf for Box<[u8]> {
   fn as_slice(&self) -> &[u8] {
     self
   }
@@ -131,7 +204,12 @@ impl IoBuf for Box<[u8]> {
 /// Implemented for any single [`IoBuf`], and for tuples, arrays, and `Vec<B>`
 /// of them. The address stability requirement of [`IoBuf`] applies to every
 /// buffer.
-pub trait IoBufVec {
+///
+/// # Safety
+///
+/// Every buffer `buf` returns stays at that address while this collection is
+/// owned by an in-flight operation.
+pub unsafe trait IoBufVec {
   /// Returns the number of buffers in the collection.
   fn buf_count(&self) -> usize;
 
@@ -202,9 +280,15 @@ impl<'a> IntoIterator for IoSlicesMut<'a> {
 /// [`IoBuf`], they must stay in place while the collection is owned by an
 /// in-flight operation; lio does not touch the collection in that time.
 ///
+/// # Safety
+///
+/// `bufs_mut` yields every region, and they stay at those addresses until the
+/// operation completes. `commit` publishes only the prefix the proof names.
+///
 /// # Example
 ///
-/// A header/body pair implemented without `unsafe`:
+/// A header/body pair. The impl is `unsafe` because it promises those
+/// regions stay put for the whole operation:
 ///
 /// ```
 /// use lio::{IoBufMut, IoBufMutVec, IoSlicesMut};
@@ -214,16 +298,15 @@ impl<'a> IntoIterator for IoSlicesMut<'a> {
 ///   body: Vec<u8>,
 /// }
 ///
-/// impl IoBufMutVec for Frame {
+/// unsafe impl IoBufMutVec for Frame {
 ///   fn bufs_mut<'a>(&'a mut self, out: &mut IoSlicesMut<'a>) {
 ///     out.push(self.header.as_uninit_mut());
 ///     out.push(self.body.as_uninit_mut());
 ///   }
 ///
-///   unsafe fn set_buf_len(&mut self, i: usize, len: usize) {
-///     let buf = if i == 0 { &mut self.header } else { &mut self.body };
-///     // SAFETY: forwarded from the caller.
-///     unsafe { IoBufMut::set_len(buf, len) }
+///   fn commit(&mut self, index: usize, initialized: lio::Initialized<'_>) {
+///     let buf = if index == 0 { &mut self.header } else { &mut self.body };
+///     initialized.apply_to_vec(buf);
 ///   }
 /// }
 ///
@@ -233,25 +316,25 @@ impl<'a> IntoIterator for IoSlicesMut<'a> {
 /// frame.bufs_mut(&mut regions);
 /// assert_eq!(regions.len(), 2);
 /// ```
-pub trait IoBufMutVec: Send + Sync + 'static {
+pub unsafe trait IoBufMutVec: Send + Sync + 'static {
   /// Pushes the writable region of each buffer, in order, as
   /// [`IoBufMut::as_uninit_mut`] does for a single buffer.
   fn bufs_mut<'a>(&'a mut self, out: &mut IoSlicesMut<'a>);
 
-  /// Sets the length of buffer at index `i`.
+  /// Publishes `initialized` as the length of the buffer at `index`.
   ///
-  /// # Safety
-  ///
-  /// As [`IoBufMut::set_len`], for the `i`-th region pushed by the most recent
-  /// [`bufs_mut`](IoBufMutVec::bufs_mut) call.
-  unsafe fn set_buf_len(&mut self, i: usize, len: usize);
+  /// `index` is the position of that buffer in the most recent
+  /// [`bufs_mut`](IoBufMutVec::bufs_mut) call. The proof describes that
+  /// region.
+  fn commit(&mut self, index: usize, initialized: Initialized<'_>);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Single buffer implements vectored traits (a buffer is a 1-element collection)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-impl<B: IoBuf> IoBufVec for B {
+// SAFETY: the buffer's `IoBuf` promise covers this one-element collection.
+unsafe impl<B: IoBuf> IoBufVec for B {
   fn buf_count(&self) -> usize {
     1
   }
@@ -260,13 +343,13 @@ impl<B: IoBuf> IoBufVec for B {
   }
 }
 
-impl<B: IoBufMut> IoBufMutVec for B {
+// SAFETY: the buffer's `IoBufMut` promise covers this one-element collection.
+unsafe impl<B: IoBufMut> IoBufMutVec for B {
   fn bufs_mut<'a>(&'a mut self, out: &mut IoSlicesMut<'a>) {
     out.push(self.as_uninit_mut());
   }
-  unsafe fn set_buf_len(&mut self, _i: usize, len: usize) {
-    // SAFETY: forwarded from the caller.
-    unsafe { self.set_len(len) }
+  fn commit(&mut self, _index: usize, initialized: Initialized<'_>) {
+    IoBufMut::commit(self, initialized);
   }
 }
 
@@ -276,7 +359,8 @@ impl<B: IoBufMut> IoBufMutVec for B {
 
 macro_rules! impl_io_buf_vec_tuple {
   ($count:expr, $($idx:tt: $T:ident),+) => {
-    impl<$($T: IoBuf),+> IoBufVec for ($($T,)+) {
+    // SAFETY: each element is an `IoBuf`, so its bytes stay put.
+    unsafe impl<$($T: IoBuf),+> IoBufVec for ($($T,)+) {
       fn buf_count(&self) -> usize { $count }
 
       fn buf(&self, i: usize) -> &[u8] {
@@ -287,15 +371,15 @@ macro_rules! impl_io_buf_vec_tuple {
       }
     }
 
-    impl<$($T: IoBufMut),+> IoBufMutVec for ($($T,)+) {
+    // SAFETY: each element is an `IoBufMut`, so its region and `commit` stay honest.
+    unsafe impl<$($T: IoBufMut),+> IoBufMutVec for ($($T,)+) {
       fn bufs_mut<'a>(&'a mut self, out: &mut IoSlicesMut<'a>) {
         $(out.push(self.$idx.as_uninit_mut());)+
       }
 
-      unsafe fn set_buf_len(&mut self, i: usize, len: usize) {
-        match i {
-          // SAFETY: forwarded from the caller.
-          $($idx => unsafe { self.$idx.set_len(len) },)+
+      fn commit(&mut self, index: usize, initialized: Initialized<'_>) {
+        match index {
+          $($idx => IoBufMut::commit(&mut self.$idx, initialized),)+
           _ => panic!("index out of bounds"),
         }
       }
@@ -319,7 +403,8 @@ impl_io_buf_vec_tuple!(8, 0: B0, 1: B1, 2: B2, 3: B3, 4: B4, 5: B5, 6: B6, 7: B7
 macro_rules! impl_io_buf_vec_array {
   ($($n:expr),+) => {
     $(
-      impl<B: IoBuf> IoBufVec for [B; $n] {
+      // SAFETY: each element is an `IoBuf`, so its bytes stay put.
+      unsafe impl<B: IoBuf> IoBufVec for [B; $n] {
         fn buf_count(&self) -> usize { $n }
 
         fn buf(&self, i: usize) -> &[u8] {
@@ -327,16 +412,16 @@ macro_rules! impl_io_buf_vec_array {
         }
       }
 
-      impl<B: IoBufMut> IoBufMutVec for [B; $n] {
+      // SAFETY: each element is an `IoBufMut`, so its region and `commit` stay honest.
+      unsafe impl<B: IoBufMut> IoBufMutVec for [B; $n] {
         fn bufs_mut<'a>(&'a mut self, out: &mut IoSlicesMut<'a>) {
           for buf in self {
             out.push(buf.as_uninit_mut());
           }
         }
 
-        unsafe fn set_buf_len(&mut self, i: usize, len: usize) {
-          // SAFETY: forwarded from the caller.
-          unsafe { self[i].set_len(len) }
+        fn commit(&mut self, index: usize, initialized: Initialized<'_>) {
+          IoBufMut::commit(&mut self[index], initialized);
         }
       }
     )+
@@ -349,7 +434,8 @@ impl_io_buf_vec_array!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
 // Vec implementations for IoBufVec/IoBufMutVec (dynamic buffer count)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-impl<B: IoBuf> IoBufVec for Vec<B> {
+// SAFETY: each element is an `IoBuf`, so its bytes stay put.
+unsafe impl<B: IoBuf> IoBufVec for Vec<B> {
   fn buf_count(&self) -> usize {
     self.len()
   }
@@ -359,7 +445,8 @@ impl<B: IoBuf> IoBufVec for Vec<B> {
   }
 }
 
-impl<B: IoBuf> IoBufVec for &'static mut Vec<B> {
+// SAFETY: each element is an `IoBuf`, so its bytes stay put.
+unsafe impl<B: IoBuf> IoBufVec for &'static mut Vec<B> {
   fn buf_count(&self) -> usize {
     self.len()
   }
@@ -369,15 +456,42 @@ impl<B: IoBuf> IoBufVec for &'static mut Vec<B> {
   }
 }
 
-impl<B: IoBufMut> IoBufMutVec for Vec<B> {
+// SAFETY: each element is an `IoBufMut`, so its region and `commit` stay honest.
+unsafe impl<B: IoBufMut> IoBufMutVec for Vec<B> {
   fn bufs_mut<'a>(&'a mut self, out: &mut IoSlicesMut<'a>) {
     for buf in self {
       out.push(buf.as_uninit_mut());
     }
   }
 
-  unsafe fn set_buf_len(&mut self, i: usize, len: usize) {
-    // SAFETY: forwarded from the caller.
-    unsafe { self[i].set_len(len) }
+  fn commit(&mut self, index: usize, initialized: Initialized<'_>) {
+    IoBufMut::commit(&mut self[index], initialized);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::Initialized;
+
+  #[test]
+  fn proof_sets_the_length_of_its_own_vec() {
+    let mut bytes = vec![9u8; 4];
+    bytes.clear();
+    let proof = Initialized::new(bytes.as_mut_ptr(), bytes.capacity(), 2);
+    proof.apply_to_vec(&mut bytes);
+    assert_eq!(bytes, [9, 9]);
+  }
+
+  #[test]
+  fn proof_rejects_a_different_allocation() {
+    let mut owned = vec![1u8, 2, 3];
+    let mut other = vec![0u8; 3];
+    let proof = Initialized::new(owned.as_mut_ptr(), owned.capacity(), 2);
+    let panicked =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        proof.apply_to_vec(&mut other);
+      }));
+    assert!(panicked.is_err());
+    assert_eq!(other, [0, 0, 0]);
   }
 }

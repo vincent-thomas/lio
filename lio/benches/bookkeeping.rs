@@ -48,7 +48,7 @@ use criterion::{
 };
 use lio::api::op::{Action, Completion, OpModel, OpResult, StreamOpModel};
 use lio::api::resource::Resource;
-use lio::backend::op::Op;
+use lio::backend::op::{BorrowedOp, Op};
 use lio::backend::{IoBackend, OpCompleted};
 use lio::time::Clock;
 use lio::{Lio, api};
@@ -99,8 +99,13 @@ impl IoBackend for BenchBackend {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
-    let result = match op {
+  fn push(
+    &mut self,
+    id: u64,
+    op: lio::backend::InFlight<'_>,
+    _step_bump: &mut Bump,
+  ) {
+    let result = match op.as_op() {
       Op::Nop => 0,
       Op::Read { .. } => BUFFER_LEN as isize,
       _ => panic!("bench backend only supports nop and read"),
@@ -184,7 +189,12 @@ fn no_driver(criterion: &mut Criterion) {
       |bencher, &depth| {
         bencher.iter(|| {
           for id in 0..depth as u64 {
-            backend.push(id, Op::Nop, &mut bump);
+            // SAFETY: a no-op borrows nothing.
+            backend.push(
+              id,
+              unsafe { lio::backend::InFlight::attest(BorrowedOp::nop()) },
+              &mut bump,
+            );
           }
           backend.flush().unwrap();
           backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
@@ -307,8 +317,8 @@ struct SteppedNop {
 impl OpModel for SteppedNop {
   type Item = ();
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Nop)
+  fn action(&mut self) -> Action<'_> {
+    Action::nop()
   }
 
   fn complete(&mut self, _: Completion) -> OpResult<()> {

@@ -53,7 +53,7 @@ impl SocketAccept {
 impl OpModel for SocketAccept {
   type Item = io::Result<(Socket, SocketAddr)>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     self.inner.action()
   }
 
@@ -96,8 +96,8 @@ impl SocketNew {
 impl OpModel for SocketNew {
   type Item = io::Result<Socket>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(crate::backend::op::Op::Socket {
+  fn action(&mut self) -> Action<'_> {
+    action_io!(crate::backend::op::Op::Socket {
       domain: self.domain,
       ty: self.ty,
       proto: self.proto,
@@ -127,7 +127,7 @@ impl TcpAccept {
 impl OpModel for TcpAccept {
   type Item = io::Result<(TcpStream, SocketAddr)>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     self.inner.action()
   }
 
@@ -199,17 +199,17 @@ impl<T: FromResource + std::marker::Send + 'static> OpModel
 {
   type Item = io::Result<T>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     match &mut self.state {
       BindListenerState::Socket(inner) => inner.action(),
       BindListenerState::Bind { resource } => {
-        Action::Io(crate::backend::op::Op::Bind {
+        action_io!(crate::backend::op::Op::Bind {
           fd: resource.clone(),
           addr: self.addr,
         })
       }
       BindListenerState::Listen { resource } => {
-        Action::Io(crate::backend::op::Op::Listen {
+        action_io!(crate::backend::op::Op::Listen {
           fd: resource.clone(),
           backlog: 128,
         })
@@ -318,11 +318,11 @@ impl<T: FromResource + std::marker::Send + 'static> OpModel
 {
   type Item = io::Result<T>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     match &mut self.state {
       StreamConnectState::Socket(inner) => inner.action(),
       StreamConnectState::Connect { resource } => {
-        Action::Io(crate::backend::op::Op::Connect {
+        action_io!(crate::backend::op::Op::Connect {
           fd: resource.clone(),
           addr: self.addr,
         })
@@ -386,7 +386,7 @@ impl UnixAccept {
 impl OpModel for UnixAccept {
   type Item = io::Result<UnixStream>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     self.inner.action()
   }
 
@@ -428,11 +428,11 @@ impl UdpBindSocket {
 impl OpModel for UdpBindSocket {
   type Item = io::Result<UdpSocket>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     match &mut self.state {
       UdpBindState::Socket(inner) => inner.action(),
       UdpBindState::Bind { resource } => {
-        Action::Io(crate::backend::op::Op::Bind {
+        action_io!(crate::backend::op::Op::Bind {
           fd: resource.clone(),
           addr: crate::backend::op::socket_addr_into_buf(self.addr),
         })
@@ -504,11 +504,11 @@ impl UdpConnectSocket {
 impl OpModel for UdpConnectSocket {
   type Item = io::Result<UdpSocket>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     match &mut self.state {
       UdpConnectState::Socket(inner) => inner.action(),
       UdpConnectState::Connect { resource } => {
-        Action::Io(crate::backend::op::Op::Connect {
+        action_io!(crate::backend::op::Op::Connect {
           fd: resource.clone(),
           addr: crate::backend::op::socket_addr_into_buf(self.addr),
         })

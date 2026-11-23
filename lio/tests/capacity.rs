@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use lio::api::op::{Action, Completion, OpModel, OpResult, StreamOpModel};
 use lio::api::{Io, IoStream};
-use lio::backend::op::Op;
 use lio::backend::testing::{Checked, ScriptedBackend};
 use lio::{Lio, api};
 
@@ -122,8 +121,8 @@ struct OneShotStream {
 impl OpModel for OneShotStream {
   type Item = u32;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Nop)
+  fn action(&mut self) -> Action<'_> {
+    Action::nop()
   }
 
   fn complete(&mut self, _: Completion) -> OpResult<u32> {
@@ -184,7 +183,7 @@ impl Drop for PanicsOnAction {
 impl OpModel for PanicsOnAction {
   type Item = ();
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     panic!("no action for you");
   }
 

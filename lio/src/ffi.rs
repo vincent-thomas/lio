@@ -138,7 +138,9 @@ unsafe fn handle(ptr: *mut lio_handle_t) -> &'static mut lio_handle_t {
 #[cfg(unix)]
 unsafe fn fd_to_borrowed_resource(fd: libc::intptr_t) -> Resource {
   // SAFETY: caller guarantees fd is valid and will outlive this Resource
-  unsafe { Resource::borrow(fd as RawFd) }
+  // SAFETY: the C caller transferred an open descriptor, or passed a sentinel
+  // the FFI documents. `borrow_raw` does not close it; the FFI owns that.
+  unsafe { Resource::borrow_raw(fd as RawFd) }
 }
 
 /// Convert a `Resource` to a C `intptr_t`.
@@ -235,7 +237,9 @@ impl CBuf {
   }
 }
 
-impl IoBuf for CBuf {
+// SAFETY: `CBuf` points at caller memory that the C contract keeps in place
+// until the operation completes.
+unsafe impl IoBuf for CBuf {
   fn as_slice(&self) -> &[u8] {
     // SAFETY: `base` is non-null, and the first `len` bytes are initialized and
     // lent for as long as `self` lives (or `len` is 0).
@@ -243,7 +247,9 @@ impl IoBuf for CBuf {
   }
 }
 
-impl IoBufMut for CBuf {
+// SAFETY: the writable region is the caller buffer. `commit` records the
+// length the completion proved.
+unsafe impl IoBufMut for CBuf {
   fn as_uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
     // SAFETY: `base` is non-null, and `cap` bytes are lent exclusively for as
     // long as `self` lives (or `cap` is 0). `MaybeUninit<u8>` permits
@@ -251,9 +257,17 @@ impl IoBufMut for CBuf {
     unsafe { std::slice::from_raw_parts_mut(self.base().cast(), self.cap) }
   }
 
-  unsafe fn set_len(&mut self, len: usize) {
-    assert!(len <= self.cap);
-    self.len = len;
+  fn commit(&mut self, initialized: crate::Initialized<'_>) {
+    assert!(
+      initialized.len() <= self.cap,
+      "commit length exceeds the C buffer"
+    );
+    assert_eq!(
+      initialized.as_ptr(),
+      self.base(),
+      "initialized proof does not match this C buffer"
+    );
+    self.len = initialized.len();
   }
 }
 

@@ -84,14 +84,16 @@ mod tests {
 
     let mut pipe_fds = [0; 2];
     unsafe { assert_eq!(libc::pipe(pipe_fds.as_mut_ptr()), 0) };
-    let output =
-      unsafe { lio::api::resource::Resource::from_raw_fd(pipe_fds[1]) };
+    let output = lio::api::resource::Resource::from(unsafe {
+      std::os::fd::OwnedFd::from_raw_fd(pipe_fds[1])
+    });
 
     stream_base64_output(ctx.lio(), &input, &output, 76).unwrap();
     drop(output);
 
-    let reader =
-      unsafe { lio::api::resource::Resource::from_raw_fd(pipe_fds[0]) };
+    let reader = lio::api::resource::Resource::from(unsafe {
+      std::os::fd::OwnedFd::from_raw_fd(pipe_fds[0])
+    });
     let streamed = io_util::read_to_string_fd(ctx.lio(), &reader).unwrap();
     let expected = wrap_encoded(&encode_base64(data), 76);
     assert_eq!(streamed, expected);

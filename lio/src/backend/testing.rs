@@ -25,7 +25,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hint::black_box;
 use std::io;
 use std::ptr;
@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use bumpalo::Bump;
 
-use crate::api::resource::CloseFn;
+use crate::api::resource::ResourceClose;
 use crate::backend::op::{MsgBuf, MsgBufMut, Op};
 use crate::backend::{IoBackend, OpCompleted};
 
@@ -48,6 +48,8 @@ struct Script {
   pushed: Vec<u64>,
   /// Pushed and not yet completed, in push order.
   in_flight: Vec<(u64, Op)>,
+  /// Leases for `in_flight`, dropped with those operations.
+  keeps: HashMap<u64, crate::backend::Keep>,
   cancelled: Vec<u64>,
   /// Completed, waiting for the next `wait()`.
   ready: VecDeque<OpCompleted>,
@@ -136,6 +138,7 @@ impl ScriptedBackend {
       panic!("ScriptedBackend::complete: operation {id} is not in flight");
     };
     let (_, op) = script.in_flight.remove(pos);
+    script.keeps.remove(&id);
     if !script.no_poison {
       // SAFETY: the operation is still in flight, so the driver keeps the
       // memory it points to valid until it sees this completion.
@@ -158,14 +161,21 @@ impl IoBackend for ScriptedBackend {
     Ok(())
   }
 
-  fn resource_close(&self) -> CloseFn {
-    |_| {}
+  fn resource_close(&self) -> ResourceClose {
+    ResourceClose::noop()
   }
 
-  fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
+  fn push(
+    &mut self,
+    id: u64,
+    op: crate::backend::InFlight<'_>,
+    _step_bump: &mut Bump,
+  ) {
+    let (op, keep) = op.into_parts();
     let mut script = self.0.borrow_mut();
     script.pushed.push(id);
     script.in_flight.push((id, op));
+    script.keeps.insert(id, keep);
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -185,6 +195,7 @@ impl IoBackend for ScriptedBackend {
     if script.stuck {
       return false;
     }
+    script.keeps.clear();
     for (_, op) in std::mem::take(&mut script.in_flight) {
       if !script.no_poison {
         // SAFETY: a drained operation may still be finishing, so the driver
@@ -221,7 +232,9 @@ unsafe fn touch(op: &Op) {
   match op {
     Op::Read { iovecs, iov_count, .. } => {
       // SAFETY: the caller guarantees the descriptor array is valid.
-      let bufs = unsafe { raw_parts(iovecs.as_ptr(), *iov_count) };
+      // A shared borrow inspects each descriptor. It does not copy one.
+      let bufs =
+        unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), *iov_count) };
       for buf in bufs {
         // SAFETY: the caller guarantees the buffer is valid for writes.
         unsafe { ptr::write_bytes(buf.ptr, POISON, buf.len) };
@@ -340,11 +353,16 @@ impl<B: IoBackend> IoBackend for Checked<B> {
     Ok(())
   }
 
-  fn resource_close(&self) -> CloseFn {
+  fn resource_close(&self) -> ResourceClose {
     self.inner.resource_close()
   }
 
-  fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump) {
+  fn push(
+    &mut self,
+    id: u64,
+    op: crate::backend::InFlight<'_>,
+    step_bump: &mut Bump,
+  ) {
     let cap = self.cap("push");
     assert!(
       self.in_flight.len() < cap,
@@ -410,6 +428,19 @@ impl<B> Drop for Checked<B> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::backend::op::BorrowedOp;
+
+  fn push_op(backend: &mut impl IoBackend, id: u64, op: Op) {
+    // SAFETY: every buffer these tests submit stays alive until the backend
+    // completes or drains the operation.
+    unsafe {
+      backend.push(
+        id,
+        crate::backend::InFlight::attest(BorrowedOp::from_op(op)),
+        &mut Bump::new(),
+      )
+    };
+  }
   use crate::backend::op::RawBuf;
 
   fn init(cap: usize) -> (ScriptedBackend, Checked<ScriptedBackend>) {
@@ -428,8 +459,8 @@ mod tests {
   #[test]
   fn holds_operations_until_completed() {
     let (backend, mut checked) = init(4);
-    checked.push(1, Op::Nop, &mut Bump::new());
-    checked.push(2, Op::Nop, &mut Bump::new());
+    push_op(&mut checked, 1, Op::Nop);
+    push_op(&mut checked, 2, Op::Nop);
     checked.flush().unwrap();
     assert!(wait(&mut checked).is_empty());
 
@@ -448,7 +479,7 @@ mod tests {
     let mut backend = Checked::new(ScriptedBackend::auto(7));
     backend.init(4).unwrap();
     for id in [3, 1, 2] {
-      backend.push(id, Op::Nop, &mut Bump::new());
+      push_op(&mut backend, id, Op::Nop);
     }
     assert!(wait(&mut backend).is_empty(), "nothing before the flush");
     backend.flush().unwrap();
@@ -467,33 +498,27 @@ mod tests {
   fn poisons_received_bytes_and_reads_sent_bytes() {
     let (backend, mut checked) = init(2);
     let mut into = [0u8; 8];
-    let read_buf = [RawBuf { ptr: into.as_mut_ptr(), len: into.len() }];
+    let read_buf = [crate::backend::op::RawBufMut::from_mut(&mut into)];
     let from = *b"payload!";
     let write_buf = [RawBuf::new(&from)];
-    let op = |iovecs: &[RawBuf; 1], write: bool| {
-      let iovecs = ptr::NonNull::from(&iovecs[0]);
-      let fd = crate::api::resource::Resource::stdout();
-      if write {
-        Op::Write {
-          fd,
-          iovecs,
-          iov_count: 1,
-          offset: None,
-          flags: Default::default(),
-        }
-      } else {
-        Op::Read {
-          fd,
-          iovecs,
-          iov_count: 1,
-          offset: None,
-          flags: Default::default(),
-        }
-      }
+    let fd = crate::api::resource::Resource::stdout();
+    let read = Op::Read {
+      fd: fd.clone(),
+      iovecs: ptr::NonNull::from(&read_buf[0]).cast(),
+      iov_count: 1,
+      offset: None,
+      flags: Default::default(),
+    };
+    let write = Op::Write {
+      fd,
+      iovecs: ptr::NonNull::from(&write_buf[0]).cast(),
+      iov_count: 1,
+      offset: None,
+      flags: Default::default(),
     };
 
-    checked.push(1, op(&read_buf, false), &mut Bump::new());
-    checked.push(2, op(&write_buf, true), &mut Bump::new());
+    push_op(&mut checked, 1, read);
+    push_op(&mut checked, 2, write);
     backend.complete_all(8);
     assert_eq!(into, [POISON; 8]);
     assert_eq!(&from, b"payload!", "sent bytes are only read");
@@ -501,11 +526,15 @@ mod tests {
   }
 
   /// A read of one byte into `into`.
-  fn read_into(into: &mut u8, iovec: &mut RawBuf) -> Op {
-    *iovec = RawBuf { ptr: into, len: 1 };
+  fn read_into(
+    into: &mut u8,
+    iovec: &mut crate::backend::op::RawBufMut<'_>,
+  ) -> Op {
+    // SAFETY: `into` is one live byte, and the caller keeps it for the read.
+    *iovec = unsafe { crate::backend::op::RawBufMut::from_raw_parts(into, 1) };
     Op::Read {
       fd: crate::api::resource::Resource::stdout(),
-      iovecs: ptr::NonNull::from(&*iovec),
+      iovecs: ptr::NonNull::from(&*iovec).cast(),
       iov_count: 1,
       offset: None,
       flags: Default::default(),
@@ -525,9 +554,8 @@ mod tests {
       let backend = ScriptedBackend::new();
       let mut backend = if poison { backend } else { backend.without_poison() };
       backend.init(1).unwrap();
-      let (mut into, mut iovec) =
-        (0u8, RawBuf { ptr: ptr::null_mut(), len: 0 });
-      backend.push(1, read_into(&mut into, &mut iovec), &mut Bump::new());
+      let (mut into, mut iovec) = (0u8, crate::backend::op::RawBufMut::empty());
+      push_op(&mut backend, 1, read_into(&mut into, &mut iovec));
       assert!(backend.drain());
       assert_eq!(into, if poison { POISON } else { 0 }, "poison: {poison}");
     }
@@ -538,8 +566,8 @@ mod tests {
     let backend = ScriptedBackend::new().without_poison();
     let mut driver = backend.clone();
     driver.init(1).unwrap();
-    let (mut into, mut iovec) = (0u8, RawBuf { ptr: ptr::null_mut(), len: 0 });
-    driver.push(1, read_into(&mut into, &mut iovec), &mut Bump::new());
+    let (mut into, mut iovec) = (0u8, crate::backend::op::RawBufMut::empty());
+    push_op(&mut driver, 1, read_into(&mut into, &mut iovec));
     backend.complete(1, 1);
     assert_eq!(into, 0);
     assert_eq!(wait(&mut driver), vec![1]);
@@ -548,7 +576,7 @@ mod tests {
   #[test]
   fn records_cancels_and_drains() {
     let (backend, mut checked) = init(2);
-    checked.push(1, Op::Nop, &mut Bump::new());
+    push_op(&mut checked, 1, Op::Nop);
     checked.cancel(1);
     checked.cancel(99);
     assert_eq!(backend.cancelled(), vec![1, 99]);
@@ -570,7 +598,7 @@ mod tests {
   #[test]
   #[should_panic(expected = "before `init`")]
   fn push_before_init_breaks_the_contract() {
-    Checked::new(ScriptedBackend::new()).push(1, Op::Nop, &mut Bump::new());
+    push_op(&mut Checked::new(ScriptedBackend::new()), 1, Op::Nop);
   }
 
   #[test]
@@ -584,16 +612,16 @@ mod tests {
   #[should_panic(expected = "still in flight")]
   fn pushing_an_in_flight_id_breaks_the_contract() {
     let (_, mut checked) = init(2);
-    checked.push(1, Op::Nop, &mut Bump::new());
-    checked.push(1, Op::Nop, &mut Bump::new());
+    push_op(&mut checked, 1, Op::Nop);
+    push_op(&mut checked, 1, Op::Nop);
   }
 
   #[test]
   #[should_panic(expected = "already in flight (capacity 1)")]
   fn pushing_over_capacity_breaks_the_contract() {
     let (_, mut checked) = init(1);
-    checked.push(1, Op::Nop, &mut Bump::new());
-    checked.push(2, Op::Nop, &mut Bump::new());
+    push_op(&mut checked, 1, Op::Nop);
+    push_op(&mut checked, 2, Op::Nop);
   }
 
   #[test]
@@ -604,7 +632,12 @@ mod tests {
       fn init(&mut self, _: usize) -> io::Result<()> {
         Ok(())
       }
-      fn push(&mut self, id: u64, _: Op, _: &mut Bump) {
+      fn push(
+        &mut self,
+        id: u64,
+        _: crate::backend::InFlight<'_>,
+        _: &mut Bump,
+      ) {
         self.0 = Some(id);
       }
       fn flush(&mut self) -> io::Result<()> {
@@ -623,7 +656,7 @@ mod tests {
 
     let mut checked = Checked::new(Twice(None));
     checked.init(1).unwrap();
-    checked.push(1, Op::Nop, &mut Bump::new());
+    push_op(&mut checked, 1, Op::Nop);
     wait(&mut checked);
     wait(&mut checked);
   }
@@ -632,6 +665,6 @@ mod tests {
   #[should_panic(expected = "no successful `drain`")]
   fn dropping_with_operations_in_flight_breaks_the_contract() {
     let (_, mut checked) = init(1);
-    checked.push(1, Op::Nop, &mut Bump::new());
+    push_op(&mut checked, 1, Op::Nop);
   }
 }

@@ -1,7 +1,7 @@
 //! Type-safe operation traits for bridging user types to backend execution.
 
-use crate::api::resource::CloseFn;
-use crate::backend::op::Op;
+use crate::api::resource::ResourceClose;
+use crate::backend::op::{BorrowedOp, Op};
 use std::time::Duration;
 
 /// Completion metadata routed from the backend to one `OpModel`.
@@ -21,22 +21,21 @@ impl Completion {
   }
 
   pub const fn with_flags(result: isize, flags: CompletionFlags) -> Self {
-    Self {
-      result,
-      flags,
-      resource_close: ResourceClose(crate::backend::native::close),
-    }
+    Self { result, flags, resource_close: ResourceClose::native() }
   }
 
   /// Sets how a resource carried by this completion is closed.
-  pub(crate) const fn with_resource_close(mut self, close: CloseFn) -> Self {
-    self.resource_close = ResourceClose(close);
+  pub(crate) const fn with_resource_close(
+    mut self,
+    close: ResourceClose,
+  ) -> Self {
+    self.resource_close = close;
     self
   }
 
   /// How a resource carried by this completion is closed.
-  pub(crate) const fn resource_close(&self) -> CloseFn {
-    self.resource_close.0
+  pub(crate) const fn resource_close(&self) -> ResourceClose {
+    self.resource_close
   }
   /// The error a failed completion (a negative `result`) reports.
   ///
@@ -53,24 +52,6 @@ impl Completion {
     }
   }
 }
-
-/// A [`CloseFn`] compared by address.
-#[derive(Clone, Copy)]
-struct ResourceClose(CloseFn);
-
-impl std::fmt::Debug for ResourceClose {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str("ResourceClose")
-  }
-}
-
-impl PartialEq for ResourceClose {
-  fn eq(&self, other: &Self) -> bool {
-    std::ptr::fn_addr_eq(self.0, other.0)
-  }
-}
-
-impl Eq for ResourceClose {}
 
 /// Completion flags understood by higher-level operation models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,18 +100,54 @@ pub enum OpResult<T> {
 ///
 /// `Io` actions are submitted to the backend, while `Sleep` actions are driven
 /// directly by `Lio`'s timer machinery.
-pub enum Action {
-  Io(Op),
+pub enum Action<'a> {
+  Io(BorrowedOp<'a>),
   Sleep(Duration),
 }
 
-impl From<Op> for Action {
-  fn from(value: Op) -> Self {
+impl<'a> Action<'a> {
+  /// A no-op submission.
+  pub fn nop() -> Action<'static> {
+    Action::Io(BorrowedOp::nop())
+  }
+
+  /// Drops the borrow brand.
+  ///
+  /// # Safety
+  ///
+  /// The memory `self` borrows must remain valid for as long as the returned
+  /// action is used. Contract tests call this to inspect an action while the
+  /// model is still borrowed, and they never submit the erased action.
+  #[cfg(test)]
+  pub(crate) unsafe fn erase_lifetime(self) -> Action<'static> {
+    // SAFETY: `Action` stores raw pointers inside `Op` plus a `PhantomData`
+    // brand. Extending the brand does not create a reference.
+    unsafe { std::mem::transmute(self) }
+  }
+}
+
+impl<'a> Action<'a> {
+  /// The submitted operation, when this action is I/O.
+  pub fn as_op(&self) -> Option<&Op> {
+    match self {
+      Action::Io(op) => Some(op.as_op()),
+      Action::Sleep(_) => None,
+    }
+  }
+
+  /// Whether this action submits [`Op::Nop`](crate::backend::op::Op::Nop).
+  pub fn is_nop(&self) -> bool {
+    matches!(self.as_op(), Some(Op::Nop))
+  }
+}
+
+impl<'a> From<BorrowedOp<'a>> for Action<'a> {
+  fn from(value: BorrowedOp<'a>) -> Self {
     Action::Io(value)
   }
 }
 
-impl From<Duration> for Action {
+impl<'a> From<Duration> for Action<'a> {
   fn from(value: Duration) -> Self {
     Action::Sleep(value)
   }
@@ -143,7 +160,11 @@ pub trait OpModel: Send + 'static {
   type Item: Send;
 
   /// Describe the next runtime action to perform.
-  fn action(&mut self) -> Action;
+  ///
+  /// Pointers in the returned action borrow `self`. The driver keeps `self`
+  /// pinned, and does not call `action` again, until the backend has finished
+  /// that submission.
+  fn action(&mut self) -> Action<'_>;
 
   /// Interpret the completion of the previously submitted low-level step.
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item>;
@@ -164,8 +185,39 @@ pub trait OneshotOpModel: OpModel {}
 pub trait StreamOpModel: OpModel {}
 
 #[cfg(test)]
+mod action_tests {
+  use super::Action;
+  use crate::backend::op::{BorrowedOp, Op};
+  use std::time::Duration;
+
+  #[test]
+  fn nop_is_a_nop() {
+    let action = Action::nop();
+    assert!(action.is_nop());
+    assert!(matches!(action.as_op(), Some(Op::Nop)));
+  }
+
+  #[test]
+  fn sleep_is_not_io() {
+    let action = Action::from(Duration::from_millis(3));
+    assert!(action.as_op().is_none());
+    assert!(!action.is_nop());
+    assert!(
+      matches!(action, Action::Sleep(duration) if duration == Duration::from_millis(3))
+    );
+  }
+
+  #[test]
+  fn borrowed_nop_round_trips() {
+    let action = Action::from(BorrowedOp::nop());
+    assert!(action.is_nop());
+  }
+}
+
+#[cfg(test)]
 mod completion_tests {
   use super::{Completion, CompletionFlags};
+  use crate::api::resource::ResourceClose;
 
   const FLAGS: [CompletionFlags; 5] = [
     CompletionFlags::MORE,
@@ -195,10 +247,9 @@ mod completion_tests {
 
   #[test]
   fn completions_compare_their_resource_close() {
-    fn other(_: crate::api::resource::RawResource) {}
     let native = Completion::new(3);
     assert_eq!(native, Completion::new(3));
-    assert_ne!(native, native.with_resource_close(other));
+    assert_ne!(native, native.with_resource_close(ResourceClose::noop()));
     assert!(format!("{native:?}").contains("resource_close: ResourceClose"));
   }
 }

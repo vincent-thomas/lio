@@ -1,7 +1,8 @@
 use super::*;
 use crate::api::resource::Resource;
 use crate::backend::op::{
-  MsgBuf, MsgBufMut, MsgRecv, MsgSend, RecvFlags, SendFlags, SocketAddrBuf,
+  BorrowedOp, MsgBuf, MsgBufMut, MsgRecv, MsgSend, RecvFlags, SendFlags,
+  SocketAddrBuf,
 };
 use std::net::UdpSocket;
 use std::os::fd::{FromRawFd, IntoRawFd};
@@ -13,11 +14,23 @@ fn pair() -> (Resource, UdpSocket) {
   sender.connect(receiver.local_addr().unwrap()).unwrap();
   sender.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
   // SAFETY: ownership of this socket descriptor is transferred exactly once.
-  (unsafe { Resource::from_raw_fd(receiver.into_raw_fd()) }, sender)
+  (
+    Resource::from(unsafe {
+      std::os::fd::OwnedFd::from_raw_fd(receiver.into_raw_fd())
+    }),
+    sender,
+  )
 }
 
 fn complete(backend: &mut IoUring, arena: &mut Bump, op: Op) -> isize {
-  backend.push(123, op, arena);
+  // SAFETY: `op`'s buffers stay alive until `wait` returns below.
+  unsafe {
+    backend.push(
+      123,
+      crate::backend::InFlight::attest(BorrowedOp::from_op(op)),
+      arena,
+    )
+  };
   backend.flush().unwrap();
   let deadline = Instant::now() + Duration::from_secs(2);
   let mut completed = Vec::new();

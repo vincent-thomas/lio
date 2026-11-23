@@ -6,6 +6,8 @@
 use crate::api::resource::Resource;
 use std::ffi::OsString;
 use std::io;
+use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
@@ -389,46 +391,183 @@ pub fn is_supported_socket(
 // ErasedBuffer - Type-erased buffer storage
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Non-owning raw byte span used by all backends.
+/// Non-owning span of initialized bytes a backend may read.
 ///
-/// The actual buffer is owned by the typed op (e.g., `Send<Vec<u8>>`). This struct
-/// holds only a pointer + length so backends can lower it to native descriptors
-/// without taking ownership, leaving the buffer available for result extraction.
+/// A write submits this. The bytes stay owned by the op model. This holds
+/// only a pointer and a length so a backend can lower it without taking
+/// ownership.
+///
+/// A read does not use this type. A shared `&[u8]` is not writable, so it
+/// cannot be a read destination. Use [`RawBufMut`] for bytes the backend
+/// fills.
 #[derive(Clone, Copy, Debug)]
-pub struct RawBuf {
-  pub ptr: *mut u8,
-  pub len: usize,
+pub struct RawBuf<'a> {
+  pub(crate) ptr: *mut u8,
+  pub(crate) len: usize,
+  _lt: PhantomData<&'a [u8]>,
 }
 
-impl RawBuf {
-  /// Creates a RawBuf from a pointer and length.
+impl<'a> RawBuf<'a> {
+  /// A descriptor of `buf`. Valid for as long as `buf` is.
   #[inline]
-  pub const fn new(buf: &[u8]) -> Self {
-    Self { ptr: buf.as_ptr().cast_mut(), len: buf.len() }
+  pub const fn new(buf: &'a [u8]) -> Self {
+    Self { ptr: buf.as_ptr().cast_mut(), len: buf.len(), _lt: PhantomData }
   }
 
-  /// Creates a RawBuf from raw parts.
+  /// A descriptor of initialized `buf`. The backend may read those bytes.
+  #[inline]
+  pub fn from_mut(buf: &'a mut [u8]) -> Self {
+    Self { ptr: buf.as_mut_ptr(), len: buf.len(), _lt: PhantomData }
+  }
+
+  /// An empty descriptor. Nothing is read or written through it.
+  #[inline]
+  pub const fn empty() -> Self {
+    Self { ptr: NonNull::<u8>::dangling().as_ptr(), len: 0, _lt: PhantomData }
+  }
+
+  /// The address of the bytes.
+  #[inline]
+  pub const fn as_ptr(self) -> *mut u8 {
+    self.ptr
+  }
+
+  /// The number of bytes.
+  #[inline]
+  pub const fn len(self) -> usize {
+    self.len
+  }
+
+  /// Whether the descriptor covers no bytes.
+  #[inline]
+  pub const fn is_empty(self) -> bool {
+    self.len == 0
+  }
+
+  /// Creates a descriptor that outlives the borrow of its bytes.
   ///
   /// # Safety
   ///
-  /// `ptr` must be valid for reads or writes of `len` bytes for the duration of
-  /// the submitted operation.
+  /// `ptr` must be valid for reads of `len` initialized bytes for as long as
+  /// the descriptor is used, including after this call returns. A null `ptr`
+  /// is only valid when `len` is 0.
   #[inline]
-  pub const unsafe fn from_raw_parts(ptr: *mut u8, len: usize) -> Self {
-    Self { ptr, len }
+  pub(crate) const unsafe fn from_raw_parts(
+    ptr: *mut u8,
+    len: usize,
+  ) -> RawBuf<'static> {
+    RawBuf { ptr, len, _lt: PhantomData }
   }
 }
 
-// SAFETY: The pointed-to data is owned by a TypedOp which is Send + Sync.
-// We only use this pointer from the thread that scheduled the operation.
-unsafe impl Send for RawBuf {}
-// SAFETY: Same as Send - we only access through the owning TypedOp.
-unsafe impl Sync for RawBuf {}
+// SAFETY: the descriptor is a pointer and a length. Sending it does not
+// move the bytes. The owner of those bytes is `Send`.
+unsafe impl Send for RawBuf<'_> {}
+// SAFETY: sharing the descriptor does not alias the bytes by itself.
+unsafe impl Sync for RawBuf<'_> {}
+
+/// Non-owning span of bytes a backend may write.
+///
+/// A read submits this. The memory may be uninitialized. A shared `&[u8]`
+/// cannot construct it, so a read cannot target read-only memory.
+///
+/// The descriptor is not `Copy` or `Clone`. Copying it would let two
+/// operations write the same bytes. It is `Send` and not `Sync`, like
+/// `&mut [u8]`: the owner may move it to another thread, and a shared
+/// reference may not.
+#[derive(Debug)]
+pub struct RawBufMut<'a> {
+  pub(crate) ptr: *mut u8,
+  pub(crate) len: usize,
+  _lt: PhantomData<&'a mut [u8]>,
+}
+
+impl<'a> RawBufMut<'a> {
+  /// A descriptor of `buf`. The backend may overwrite those bytes.
+  #[inline]
+  pub fn from_mut(buf: &'a mut [u8]) -> Self {
+    Self { ptr: buf.as_mut_ptr(), len: buf.len(), _lt: PhantomData }
+  }
+
+  /// A descriptor of an uninitialized region a read may fill.
+  #[inline]
+  pub fn from_uninit(buf: &'a mut [MaybeUninit<u8>]) -> Self {
+    Self { ptr: buf.as_mut_ptr().cast(), len: buf.len(), _lt: PhantomData }
+  }
+
+  /// An empty descriptor. Nothing is written through it.
+  #[inline]
+  pub const fn empty() -> Self {
+    Self { ptr: NonNull::<u8>::dangling().as_ptr(), len: 0, _lt: PhantomData }
+  }
+
+  /// The address of the bytes.
+  #[inline]
+  pub const fn as_ptr(&self) -> *mut u8 {
+    self.ptr
+  }
+
+  /// The number of bytes.
+  #[inline]
+  pub const fn len(&self) -> usize {
+    self.len
+  }
+
+  /// Whether the descriptor covers no bytes.
+  #[inline]
+  pub const fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+
+  /// Creates a descriptor that outlives the borrow of its bytes.
+  ///
+  /// # Safety
+  ///
+  /// `ptr` must be valid for writes of `len` bytes for as long as the
+  /// descriptor is used, including after this call returns. A null `ptr` is
+  /// only valid when `len` is 0.
+  #[inline]
+  pub(crate) const unsafe fn from_raw_parts(
+    ptr: *mut u8,
+    len: usize,
+  ) -> RawBufMut<'static> {
+    RawBufMut { ptr, len, _lt: PhantomData }
+  }
+}
+
+// SAFETY: `RawBufMut` is a unique borrow of the bytes, like `&mut [u8]`.
+// Moving that borrow to another thread does not create an alias. A shared
+// reference must not cross threads, so this type is not `Sync`.
+unsafe impl Send for RawBufMut<'_> {}
+
+/// Pointer and length shared by [`RawBuf`] and [`RawBufMut`].
+pub(crate) trait ByteSpan {
+  fn bytes_ptr(&self) -> *mut u8;
+  fn bytes_len(&self) -> usize;
+}
+
+impl ByteSpan for RawBuf<'_> {
+  fn bytes_ptr(&self) -> *mut u8 {
+    self.ptr
+  }
+  fn bytes_len(&self) -> usize {
+    self.len
+  }
+}
+
+impl ByteSpan for RawBufMut<'_> {
+  fn bytes_ptr(&self) -> *mut u8 {
+    self.ptr
+  }
+  fn bytes_len(&self) -> usize {
+    self.len
+  }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MsgBuf {
-  pub ptr: NonNull<u8>,
-  pub len: usize,
+  pub(crate) ptr: NonNull<u8>,
+  pub(crate) len: usize,
 }
 
 impl MsgBuf {
@@ -437,10 +576,29 @@ impl MsgBuf {
     Self { ptr: NonNull::from(buf).cast(), len: buf.len() }
   }
 
-  /// # Safety
-  /// `ptr` must be non-null and valid for reads of `len` bytes for the operation lifetime.
   #[inline]
-  pub const unsafe fn from_raw_parts(ptr: NonNull<u8>, len: usize) -> Self {
+  pub const fn as_ptr(self) -> *const u8 {
+    self.ptr.as_ptr()
+  }
+
+  #[inline]
+  pub const fn len(self) -> usize {
+    self.len
+  }
+
+  #[inline]
+  pub const fn is_empty(self) -> bool {
+    self.len == 0
+  }
+
+  /// # Safety
+  /// `ptr` must be non-null and valid for reads of `len` bytes for as long as
+  /// the descriptor is used.
+  #[inline]
+  pub(crate) const unsafe fn from_raw_parts(
+    ptr: NonNull<u8>,
+    len: usize,
+  ) -> Self {
     Self { ptr, len }
   }
 }
@@ -453,8 +611,8 @@ unsafe impl Sync for MsgBuf {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MsgBufMut {
-  pub ptr: NonNull<u8>,
-  pub len: usize,
+  pub(crate) ptr: NonNull<u8>,
+  pub(crate) len: usize,
 }
 
 impl MsgBufMut {
@@ -463,10 +621,34 @@ impl MsgBufMut {
     Self { ptr: NonNull::from(&mut *buf).cast(), len: buf.len() }
   }
 
-  /// # Safety
-  /// `ptr` must be non-null and valid for writes of `len` bytes for the operation lifetime.
   #[inline]
-  pub const unsafe fn from_raw_parts(ptr: NonNull<u8>, len: usize) -> Self {
+  pub const fn as_ptr(self) -> *mut u8 {
+    self.ptr.as_ptr()
+  }
+
+  #[inline]
+  pub const fn len(self) -> usize {
+    self.len
+  }
+
+  #[inline]
+  pub const fn is_empty(self) -> bool {
+    self.len == 0
+  }
+
+  #[inline]
+  pub(crate) const fn empty() -> Self {
+    Self { ptr: NonNull::dangling(), len: 0 }
+  }
+
+  /// # Safety
+  /// `ptr` must be non-null and valid for writes of `len` bytes for as long as
+  /// the descriptor is used.
+  #[inline]
+  pub(crate) const unsafe fn from_raw_parts(
+    ptr: NonNull<u8>,
+    len: usize,
+  ) -> Self {
     Self { ptr, len }
   }
 }
@@ -480,8 +662,8 @@ unsafe impl Sync for MsgBufMut {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MsgSend {
-  pub bufs: NonNull<MsgBuf>,
-  pub buf_count: NonZeroUsize,
+  pub(crate) bufs: NonNull<MsgBuf>,
+  pub(crate) buf_count: NonZeroUsize,
   pub to: Option<SocketAddr>,
 }
 
@@ -505,9 +687,9 @@ unsafe impl Sync for MsgSend {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MsgRecv {
-  pub bufs: NonNull<MsgBufMut>,
-  pub buf_count: NonZeroUsize,
-  pub from: Option<NonNull<SocketAddrBuf>>,
+  pub(crate) bufs: NonNull<MsgBufMut>,
+  pub(crate) buf_count: NonZeroUsize,
+  pub(crate) from: Option<NonNull<SocketAddrBuf>>,
 }
 
 impl MsgRecv {
@@ -566,7 +748,31 @@ pub struct ReadDirResult {
   pub eof: bool,
 }
 
-pub type OpaqueDropFn = unsafe fn(*mut ());
+/// Drops backend continuation state for one directory read.
+///
+/// Only a backend constructs this. The public API can store it and drop it.
+/// It cannot call the raw function.
+#[derive(Debug)]
+pub struct OpaqueDrop {
+  call: unsafe fn(*mut ()),
+}
+
+impl OpaqueDrop {
+  /// # Safety
+  ///
+  /// `call(ptr)` drops the allocation `ptr` owns, and it is the only drop of
+  /// that allocation.
+  pub(crate) const unsafe fn new(call: unsafe fn(*mut ())) -> Self {
+    Self { call }
+  }
+
+  pub(crate) unsafe fn call(self, ptr: *mut ()) {
+    // SAFETY: the backend paired this function with `ptr`.
+    unsafe { (self.call)(ptr) }
+  }
+}
+
+pub type OpaqueDropFn = OpaqueDrop;
 
 #[derive(Debug, Default)]
 pub struct ReadDirBuf {
@@ -590,11 +796,11 @@ impl Drop for ReadDirBuf {
     if self.opaque.is_null() {
       return;
     }
-    if let Some(drop_fn) = self.opaque_drop {
+    if let Some(drop_fn) = self.opaque_drop.take() {
       // SAFETY: `opaque` and `opaque_drop` are paired backend-owned continuation
       // state set by the backend that created this `ReadDirBuf`.
       unsafe {
-        drop_fn(self.opaque);
+        drop_fn.call(self.opaque);
       }
     }
     self.opaque = std::ptr::null_mut();
@@ -702,6 +908,7 @@ pub enum StatTarget {
 ///
 /// Each variant contains only the data needed to execute the operation.
 /// Backends match on this enum to create submission entries or execute syscalls.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum Op {
   // ═══════════════════════════════════════════════════════════════════════════════
@@ -718,8 +925,8 @@ pub enum Op {
   Read {
     /// File descriptor to read from
     fd: Resource,
-    /// Scatter buffers
-    iovecs: NonNull<RawBuf>,
+    /// Scatter buffers. Each one is writable.
+    iovecs: NonNull<RawBufMut<'static>>,
     /// Number of iovecs
     iov_count: usize,
     /// Absolute file offset, or `None` for the current file position.
@@ -743,7 +950,7 @@ pub enum Op {
     /// File descriptor to write to
     fd: Resource,
     /// Gather buffers
-    iovecs: NonNull<RawBuf>,
+    iovecs: NonNull<RawBuf<'static>>,
     /// Number of iovecs
     iov_count: usize,
     /// Absolute file offset, or `None` for the current file position.
@@ -999,4 +1206,442 @@ pub enum Op {
     fd: Resource,
   },
   Nop,
+}
+
+/// An [`Op`] whose buffers are borrowed for `'a`.
+///
+/// Constructing one does not require `unsafe`. The addresses stay valid for
+/// `'a`. Passing it to [`IoBackend::push`](crate::backend::IoBackend::push)
+/// is `unsafe` because the backend may use those addresses after `push`
+/// returns; the caller promises they outlive the submission.
+#[derive(Clone, Debug)]
+pub struct BorrowedOp<'a> {
+  op: Op,
+  _lt: PhantomData<&'a ()>,
+}
+
+fn descriptor_list<T>(bufs: &[T]) -> (NonNull<T>, usize) {
+  let count = bufs.len();
+  let ptr =
+    if count == 0 { NonNull::dangling() } else { NonNull::from(bufs).cast() };
+  (ptr, count)
+}
+
+/// Scratch a [`BorrowedOp::recv_buf`] or [`BorrowedOp::recv_from_buf`] fills
+/// with descriptors of the buffer being received into.
+pub struct RecvSlots {
+  bufs: [MsgBufMut; crate::buf::MAX_IOV_COUNT],
+  count: usize,
+}
+
+impl RecvSlots {
+  /// Empty scratch. [`BorrowedOp::recv_buf`] fills it.
+  pub fn new() -> Self {
+    Self { bufs: [MsgBufMut::empty(); crate::buf::MAX_IOV_COUNT], count: 0 }
+  }
+}
+
+impl Default for RecvSlots {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+/// Scratch a [`BorrowedOp::send_buf`] fills with descriptors of the bytes
+/// being sent.
+pub struct SendSlots {
+  bufs: [MsgBuf; crate::buf::MAX_IOV_COUNT],
+  count: usize,
+}
+
+impl SendSlots {
+  /// Empty scratch. [`BorrowedOp::send_buf`] fills it.
+  pub fn new() -> Self {
+    // SAFETY: length 0 means the dangling address is never read. `send_buf`
+    // overwrites every descriptor it submits.
+    let empty = unsafe { MsgBuf::from_raw_parts(NonNull::dangling(), 0) };
+    Self { bufs: [empty; crate::buf::MAX_IOV_COUNT], count: 0 }
+  }
+}
+
+impl Default for SendSlots {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+fn branded<'b>(op: Op) -> BorrowedOp<'b> {
+  BorrowedOp { op, _lt: PhantomData }
+}
+
+impl<'a> BorrowedOp<'a> {
+  /// The operation a backend matches on.
+  ///
+  /// Cloning this [`Op`] copies addresses and drops the `'a` brand. Keeping
+  /// the copy, and dereferencing it after `'a` ends, is the
+  /// [`IoBackend::push`](crate::backend::IoBackend::push) contract.
+  pub fn as_op(&self) -> &Op {
+    &self.op
+  }
+
+  /// Brands `op` as `'static`.
+  ///
+  /// # Safety
+  ///
+  /// Every address in `op` must remain valid for as long as the result is
+  /// used. This does not check that.
+  pub(crate) unsafe fn from_op(op: Op) -> BorrowedOp<'static> {
+    BorrowedOp { op, _lt: PhantomData }
+  }
+
+  /// A no-op. It borrows nothing.
+  pub fn nop() -> BorrowedOp<'static> {
+    branded(Op::Nop)
+  }
+
+  /// Reads into `iovecs`.
+  ///
+  /// Each descriptor is a [`RawBufMut`]: the backend may write those bytes.
+  /// A shared slice cannot build one.
+  pub fn read(
+    fd: Resource,
+    iovecs: &'a [RawBufMut<'a>],
+    offset: Option<u64>,
+    flags: ReadFlags,
+  ) -> Self {
+    let (iovecs, iov_count) = descriptor_list(iovecs);
+    let iovecs = iovecs.cast::<RawBufMut<'static>>();
+    branded(Op::Read { fd, iovecs, iov_count, offset, flags })
+  }
+
+  /// Writes `iovecs`.
+  ///
+  /// Each descriptor is a [`RawBuf`]: the bytes are initialized, and the
+  /// backend may read them. An uninitialized buffer cannot build one.
+  pub fn write(
+    fd: Resource,
+    iovecs: &'a [RawBuf<'a>],
+    offset: Option<u64>,
+    flags: WriteFlags,
+  ) -> Self {
+    let (iovecs, iov_count) = descriptor_list(iovecs);
+    let iovecs = iovecs.cast::<RawBuf<'static>>();
+    branded(Op::Write { fd, iovecs, iov_count, offset, flags })
+  }
+
+  /// Receives into `buf`, recording the descriptors in `slots`.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `buf` exposes no regions. A message needs at least one
+  /// descriptor.
+  pub fn recv_buf<B: crate::buf::IoBufMutVec>(
+    fd: Resource,
+    buf: &'a mut B,
+    slots: &'a mut RecvSlots,
+    flags: RecvFlags,
+  ) -> Self {
+    fill_recv_slots(buf, slots);
+    let msg = MsgRecv::new(&slots.bufs[..slots.count]);
+    branded(Op::Recv { fd, msg, flags })
+  }
+
+  /// Receives into `buf` and writes the sender address to `from`.
+  ///
+  /// # Panics
+  ///
+  /// As [`recv_buf`](Self::recv_buf).
+  pub fn recv_from_buf<B: crate::buf::IoBufMutVec>(
+    fd: Resource,
+    buf: &'a mut B,
+    slots: &'a mut RecvSlots,
+    from: &'a mut SocketAddrBuf,
+    flags: RecvFlags,
+  ) -> Self {
+    fill_recv_slots(buf, slots);
+    let msg =
+      MsgRecv::with_from(&slots.bufs[..slots.count], NonNull::from(from));
+    branded(Op::Recv { fd, msg, flags })
+  }
+
+  /// Receives into `bufs`. Each descriptor borrows the bytes it names.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `bufs` is empty.
+  pub fn recv(
+    fd: Resource,
+    bufs: &'a [BorrowedMsgBufMut<'a>],
+    flags: RecvFlags,
+  ) -> Self {
+    branded(Op::Recv { fd, msg: MsgRecv::new(as_msg_buf_mut(bufs)), flags })
+  }
+
+  /// Sends `buf`, recording the descriptors in `slots`.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `buf` exposes no regions.
+  pub fn send_buf<B: crate::buf::IoBufVec>(
+    fd: Resource,
+    buf: &'a B,
+    slots: &'a mut SendSlots,
+    to: Option<SocketAddr>,
+    flags: SendFlags,
+  ) -> Self {
+    fill_send_slots(buf, slots);
+    let msg = MsgSend::new(&slots.bufs[..slots.count], to);
+    branded(Op::Send { fd, msg, flags })
+  }
+
+  /// Sends `bufs`. Each descriptor borrows the bytes it names.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `bufs` is empty.
+  pub fn send(
+    fd: Resource,
+    bufs: &'a [BorrowedMsgBuf<'a>],
+    to: Option<SocketAddr>,
+    flags: SendFlags,
+  ) -> Self {
+    branded(Op::Send { fd, msg: MsgSend::new(as_msg_buf(bufs), to), flags })
+  }
+
+  /// Stats `target`, writing the result to `out`.
+  pub fn stat(target: StatTarget, out: &'a mut FileStat) -> Self {
+    branded(Op::Stat { target, out: NonNull::from(out) })
+  }
+
+  /// Reads directory entries.
+  ///
+  /// `raw`, `entries` and `result` are the buffers the backend fills.
+  /// `opaque` and `opaque_drop` are continuation slots the backend may set;
+  /// [`ReadDirBuf`] owns that pair when the higher-level API is used.
+  pub fn read_dir(
+    fd: Resource,
+    raw: &'a mut [u8],
+    entries: &'a mut [DirEntryRef],
+    result: &'a mut ReadDirResult,
+    opaque: &'a mut *mut (),
+    opaque_drop: &'a mut Option<OpaqueDropFn>,
+  ) -> Self {
+    branded(Op::ReadDir {
+      fd,
+      raw_buf: nonnull_mut(raw),
+      raw_cap: raw.len(),
+      entries: nonnull_mut(entries),
+      entries_cap: entries.len(),
+      opaque: NonNull::from(opaque),
+      opaque_drop: NonNull::from(opaque_drop),
+      out: NonNull::from(result),
+    })
+  }
+
+  /// Accepts a connection, writing the peer address to `addr`.
+  pub fn accept(fd: Resource, addr: &'a mut SocketAddrBuf) -> Self {
+    branded(Op::Accept { fd, addr: NonNull::from(addr) })
+  }
+
+  /// Connects `fd` to `addr`.
+  pub fn connect(fd: Resource, addr: SocketAddrBuf) -> BorrowedOp<'static> {
+    branded(Op::Connect { fd, addr })
+  }
+
+  /// Opens `path` relative to `dir_fd`.
+  pub fn open_at(
+    dir_fd: Resource,
+    path: OsString,
+    flags: OpenFlags,
+    mode: FileMode,
+  ) -> BorrowedOp<'static> {
+    branded(Op::OpenAt { dir_fd, path, flags, mode })
+  }
+
+  /// Unlinks `path` relative to `dir_fd`.
+  pub fn unlink_at(
+    dir_fd: Resource,
+    path: OsString,
+    kind: UnlinkKind,
+  ) -> BorrowedOp<'static> {
+    branded(Op::UnlinkAt { dir_fd, path, kind })
+  }
+
+  /// Renames `old_path` to `new_path`.
+  pub fn rename_at(
+    old_dir_fd: Resource,
+    old_path: OsString,
+    new_dir_fd: Resource,
+    new_path: OsString,
+  ) -> BorrowedOp<'static> {
+    branded(Op::RenameAt { old_dir_fd, old_path, new_dir_fd, new_path })
+  }
+
+  /// Creates a directory.
+  pub fn mkdir_at(
+    dir_fd: Resource,
+    path: OsString,
+    mode: FileMode,
+  ) -> BorrowedOp<'static> {
+    branded(Op::MkdirAt { dir_fd, path, mode })
+  }
+
+  /// Creates a link.
+  pub fn link_at(
+    kind: LinkKind,
+    source_dir_fd: Resource,
+    source_path: OsString,
+    new_dir_fd: Resource,
+    new_path: OsString,
+  ) -> BorrowedOp<'static> {
+    branded(Op::LinkAt {
+      kind,
+      source_dir_fd,
+      source_path,
+      new_dir_fd,
+      new_path,
+    })
+  }
+
+  /// Reads a symlink into `buf`.
+  pub fn readlink_at(
+    dir_fd: Resource,
+    path: OsString,
+    buf: &'a mut [u8],
+  ) -> Self {
+    branded(Op::ReadlinkAt {
+      dir_fd,
+      path,
+      buf: nonnull_mut(buf),
+      buf_len: buf.len(),
+    })
+  }
+
+  /// Writes the current directory into `out`.
+  pub fn getcwd(out: &'a mut OsString) -> Self {
+    branded(Op::GetCwd { out: NonNull::from(out) })
+  }
+
+  /// Spawns a process.
+  pub fn spawn(spec: SpawnSpec) -> BorrowedOp<'static> {
+    branded(Op::Spawn { spec })
+  }
+
+  /// Creates a socket.
+  pub fn socket(
+    domain: SockDomain,
+    ty: SockType,
+    proto: SockProto,
+  ) -> BorrowedOp<'static> {
+    branded(Op::Socket { domain, ty, proto })
+  }
+
+  /// Binds `fd` to `addr`.
+  pub fn bind(fd: Resource, addr: SocketAddrBuf) -> BorrowedOp<'static> {
+    branded(Op::Bind { fd, addr })
+  }
+
+  /// Listens on `fd`.
+  pub fn listen(fd: Resource, backlog: i32) -> BorrowedOp<'static> {
+    branded(Op::Listen { fd, backlog })
+  }
+
+  /// Shuts down `fd`.
+  pub fn shutdown(fd: Resource, how: ShutdownHow) -> BorrowedOp<'static> {
+    branded(Op::Shutdown { fd, how })
+  }
+
+  /// Syncs `fd`.
+  pub fn fsync(fd: Resource) -> BorrowedOp<'static> {
+    branded(Op::Fsync { fd })
+  }
+}
+
+/// A [`MsgBuf`] that borrows the bytes it describes.
+#[repr(transparent)]
+pub struct BorrowedMsgBuf<'a> {
+  inner: MsgBuf,
+  _lt: PhantomData<&'a [u8]>,
+}
+
+impl<'a> BorrowedMsgBuf<'a> {
+  /// Describes `buf`.
+  pub fn from_slice(buf: &'a [u8]) -> Self {
+    Self { inner: MsgBuf::from_slice(buf), _lt: PhantomData }
+  }
+}
+
+/// A [`MsgBufMut`] that borrows the bytes it describes.
+#[repr(transparent)]
+pub struct BorrowedMsgBufMut<'a> {
+  inner: MsgBufMut,
+  _lt: PhantomData<&'a mut [u8]>,
+}
+
+impl<'a> BorrowedMsgBufMut<'a> {
+  /// Describes `buf`.
+  pub fn from_slice(buf: &'a mut [u8]) -> Self {
+    Self { inner: MsgBufMut::from_slice(buf), _lt: PhantomData }
+  }
+
+  /// Describes uninitialized `buf`.
+  pub fn from_uninit(buf: &'a mut [MaybeUninit<u8>]) -> Self {
+    let len = buf.len();
+    let ptr = NonNull::from(buf).cast();
+    Self {
+      // SAFETY: `ptr` addresses `buf` for `len` bytes, and the descriptor
+      // cannot outlive `buf`.
+      inner: unsafe { MsgBufMut::from_raw_parts(ptr, len) },
+      _lt: PhantomData,
+    }
+  }
+}
+
+fn as_msg_buf<'a>(bufs: &'a [BorrowedMsgBuf<'a>]) -> &'a [MsgBuf] {
+  // SAFETY: `BorrowedMsgBuf` is `repr(transparent)` over `MsgBuf`. The
+  // lifetime brand is zero-sized, so the slice has the same layout.
+  unsafe { &*(bufs as *const [BorrowedMsgBuf<'a>] as *const [MsgBuf]) }
+}
+
+fn as_msg_buf_mut<'a>(bufs: &'a [BorrowedMsgBufMut<'a>]) -> &'a [MsgBufMut] {
+  // SAFETY: `BorrowedMsgBufMut` is `repr(transparent)` over `MsgBufMut`.
+  unsafe { &*(bufs as *const [BorrowedMsgBufMut<'a>] as *const [MsgBufMut]) }
+}
+
+fn nonnull_mut<T>(buf: &mut [T]) -> NonNull<T> {
+  if buf.is_empty() { NonNull::dangling() } else { NonNull::from(&mut buf[0]) }
+}
+
+fn fill_recv_slots(
+  buf: &mut impl crate::buf::IoBufMutVec,
+  slots: &mut RecvSlots,
+) {
+  let mut regions = crate::buf::IoSlicesMut::new();
+  buf.bufs_mut(&mut regions);
+  let count = regions.len();
+  assert!(count > 0, "recv requires at least one buffer");
+  for (slot, region) in slots.bufs.iter_mut().zip(regions) {
+    let len = region.len();
+    let ptr = NonNull::from(region).cast();
+    // SAFETY: `region` borrows `buf`, and the `BorrowedOp` this fills borrows
+    // both `buf` and `slots` until the backend is finished with the op. The
+    // pointer stays inside that allocation; `len` is the region's length.
+    *slot = unsafe { MsgBufMut::from_raw_parts(ptr, len) };
+  }
+  slots.count = count;
+}
+
+fn fill_send_slots(buf: &impl crate::buf::IoBufVec, slots: &mut SendSlots) {
+  let count = buf.buf_count().min(crate::buf::MAX_IOV_COUNT);
+  assert!(count > 0, "send requires at least one buffer");
+  for (slot, bytes) in slots.bufs.iter_mut().zip((0..count).map(|i| buf.buf(i)))
+  {
+    // SAFETY: `bytes` borrows `buf`, and the `BorrowedOp` this fills borrows
+    // `buf` and `slots` for the submission. The descriptor only copies the
+    // address and length.
+    *slot = unsafe {
+      MsgBuf::from_raw_parts(NonNull::from(bytes).cast(), bytes.len())
+    };
+  }
+  slots.count = count;
 }

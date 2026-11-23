@@ -187,14 +187,16 @@ fn run_available(criterion: &mut Criterion) -> bool {
 fn into_resource(socket: UdpSocket) -> Resource {
   #[cfg(unix)]
   {
-    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     // SAFETY: the socket hands its owned descriptor to exactly one Resource.
-    unsafe { Resource::from_raw_fd(socket.into_raw_fd()) }
+    Resource::from(unsafe { OwnedFd::from_raw_fd(socket.into_raw_fd()) })
   }
   #[cfg(windows)]
   {
-    use std::os::windows::io::{FromRawHandle, IntoRawSocket};
+    use std::os::windows::io::{FromRawHandle, IntoRawSocket, OwnedHandle};
     // SAFETY: the socket hands its owned handle to exactly one Resource.
-    unsafe { Resource::from_raw_handle(socket.into_raw_socket() as _) }
+    Resource::from(unsafe {
+      OwnedHandle::from_raw_handle(socket.into_raw_socket() as _)
+    })
   }
 }
