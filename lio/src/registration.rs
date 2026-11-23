@@ -6,14 +6,25 @@ use bumpalo::boxed::Box as BumpBox;
 
 use crate::api::op::{Action, Completion, OpModel, OpResult};
 
+/// Extends an action's borrow to `'static` while its model is still borrowed.
+///
+/// # Safety
+///
+/// The model that produced `action` must stay pinned, with its buffers
+/// unmoved, until the backend finishes that submission.
+unsafe fn erase_action(action: Action<'_>) -> Action<'static> {
+  // SAFETY: the caller keeps the producing model pinned for the submission.
+  unsafe { action.erase_lifetime() }
+}
+
 /// Result of processing a completion.
 pub(crate) struct ProcessResult {
-  pub(crate) next_action: Option<Action>,
+  pub(crate) next_action: Option<Action<'static>>,
 }
 
 impl ProcessResult {
   #[inline]
-  fn continue_with(action: Action) -> Self {
+  fn continue_with(action: Action<'static>) -> Self {
     Self { next_action: Some(action) }
   }
 
@@ -37,7 +48,7 @@ pub(crate) struct WakerResultHandler {
   payload: *mut (),
   on_completion_fn:
     fn(*mut (), Completion, &mut Option<Waker>) -> ProcessResult,
-  action_fn: fn(*mut ()) -> Action,
+  action_fn: fn(*mut ()) -> Action<'static>,
   drop_fn: fn(*mut ()),
 }
 
@@ -69,7 +80,7 @@ impl WakerResultHandler {
 
   /// Get the next runtime action to perform.
   #[inline]
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'static> {
     (self.action_fn)(self.payload)
   }
 
@@ -87,11 +98,13 @@ impl WakerResultHandler {
   }
 
   #[inline]
-  fn action_impl<T: OpModel>(payload_ptr: *mut ()) -> Action {
+  fn action_impl<T: OpModel>(payload_ptr: *mut ()) -> Action<'static> {
     // SAFETY: `payload_ptr` is created from `WakerPayload<T>` in `new`/`new_in`
     // and remains valid for the lifetime of this handler.
     let payload = unsafe { &mut *(payload_ptr as *mut WakerPayload<T>) };
-    payload.op_model.action()
+    // SAFETY: the model stays inside this handler, which the store keeps
+    // pinned until the submitted action completes.
+    unsafe { erase_action(payload.op_model.action()) }
   }
 
   #[inline]
@@ -111,7 +124,11 @@ impl WakerResultHandler {
         let next_action = op_model.action();
         // The driver resubmits internal steps. Preserve the consumer's waker
         // until an item is available instead of making it poll an empty channel.
-        return ProcessResult::continue_with(next_action);
+        // SAFETY: `op_model` stays pinned in this handler until the resubmitted
+        // action completes.
+        return ProcessResult::continue_with(unsafe {
+          erase_action(next_action)
+        });
       }
       OpResult::Yield(item) => {
         if sender.send(item).is_err() {
@@ -120,7 +137,9 @@ impl WakerResultHandler {
           return ProcessResult::done();
         }
         let next_action = op_model.action();
-        ProcessResult::continue_with(next_action)
+        // SAFETY: `op_model` stays pinned in this handler until the resubmitted
+        // action completes.
+        ProcessResult::continue_with(unsafe { erase_action(next_action) })
       }
       OpResult::Done(item) => {
         let _ = sender.send(item);
@@ -161,7 +180,7 @@ unsafe impl Send for WakerResultHandler {}
 pub(crate) struct OpCallback {
   payload: *mut (),
   on_completion_fn: fn(*mut (), Completion) -> ProcessResult,
-  action_fn: fn(*mut ()) -> Action,
+  action_fn: fn(*mut ()) -> Action<'static>,
   drop_fn: fn(*mut ()),
 }
 
@@ -190,7 +209,7 @@ impl OpCallback {
 
   /// Get the next runtime action to perform.
   #[inline]
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'static> {
     (self.action_fn)(self.payload)
   }
 
@@ -204,11 +223,15 @@ impl OpCallback {
   }
 
   #[inline]
-  fn action_impl<T: OpModel, F: Fn(T::Item)>(payload_ptr: *mut ()) -> Action {
+  fn action_impl<T: OpModel, F: Fn(T::Item)>(
+    payload_ptr: *mut (),
+  ) -> Action<'static> {
     // SAFETY: `payload_ptr` is created from `CallbackPayload<T, F>` in
     // `new`/`new_in` and remains valid for the handler lifetime.
     let payload = unsafe { &mut *(payload_ptr as *mut CallbackPayload<T, F>) };
-    payload.op_model.action()
+    // SAFETY: the model stays inside this handler, which the store keeps
+    // pinned until the submitted action completes.
+    unsafe { erase_action(payload.op_model.action()) }
   }
 
   #[inline]
@@ -229,12 +252,16 @@ impl OpCallback {
     match op_model.complete(completion) {
       OpResult::Again => {
         let next_action = op_model.action();
-        ProcessResult::continue_with(next_action)
+        // SAFETY: `op_model` stays pinned in this handler until the resubmitted
+        // action completes.
+        ProcessResult::continue_with(unsafe { erase_action(next_action) })
       }
       OpResult::Yield(item) => {
         callback(item);
         let next_action = op_model.action();
-        ProcessResult::continue_with(next_action)
+        // SAFETY: `op_model` stays pinned in this handler until the resubmitted
+        // action completes.
+        ProcessResult::continue_with(unsafe { erase_action(next_action) })
       }
       OpResult::Done(item) => {
         callback(item);
@@ -394,7 +421,7 @@ impl Registration {
   ///
   /// This should be called once when the registration is first created.
   #[inline]
-  pub fn action(&mut self) -> Option<Action> {
+  pub fn action(&mut self) -> Option<Action<'static>> {
     match &mut self.state {
       State::Waker { handler, .. } => Some(handler.action()),
       State::Callback(cb) => Some(cb.action()),
@@ -552,8 +579,8 @@ mod tests {
   impl OpModel for AgainThenDone {
     type Item = i32;
 
-    fn action(&mut self) -> Action {
-      Action::Io(crate::backend::op::Op::Nop)
+    fn action(&mut self) -> Action<'_> {
+      action_io!(crate::backend::op::Op::Nop)
     }
 
     fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -579,8 +606,8 @@ mod tests {
   impl OpModel for YieldTwiceThenDone {
     type Item = i32;
 
-    fn action(&mut self) -> Action {
-      Action::Io(crate::backend::op::Op::Nop)
+    fn action(&mut self) -> Action<'_> {
+      action_io!(crate::backend::op::Op::Nop)
     }
 
     fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -647,7 +674,7 @@ mod tests {
 
     assert!(matches!(
       reg.action(),
-      Some(Action::Io(crate::backend::op::Op::Nop))
+      Some(action) if action.is_nop()
     ));
     assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
     assert!(reg.is_finished());
@@ -666,7 +693,7 @@ mod tests {
 
     assert!(matches!(
       reg.action(),
-      Some(Action::Io(crate::backend::op::Op::Nop))
+      Some(action) if action.is_nop()
     ));
     assert!(reg.on_completion(Completion::new(0)).next_action.is_none());
     assert!(reg.is_finished());
@@ -687,11 +714,11 @@ mod tests {
 
     assert!(matches!(
       reg.action(),
-      Some(Action::Io(crate::backend::op::Op::Nop))
+      Some(action) if action.is_nop()
     ));
     assert!(matches!(
       reg.on_completion(Completion::new(0)).next_action,
-      Some(Action::Io(crate::backend::op::Op::Nop))
+      Some(action) if action.is_nop()
     ));
     assert!(!reg.is_finished(), "Again must keep the registration live");
 
@@ -713,17 +740,17 @@ mod tests {
 
     assert!(matches!(
       reg.action(),
-      Some(Action::Io(crate::backend::op::Op::Nop))
+      Some(action) if action.is_nop()
     ));
     assert!(matches!(
       reg.on_completion(Completion::new(0)).next_action,
-      Some(Action::Io(crate::backend::op::Op::Nop))
+      Some(action) if action.is_nop()
     ));
     assert!(!reg.is_finished(), "Yield must keep the registration live");
 
     assert!(matches!(
       reg.on_completion(Completion::new(1)).next_action,
-      Some(Action::Io(crate::backend::op::Op::Nop))
+      Some(action) if action.is_nop()
     ));
     assert!(
       !reg.is_finished(),
@@ -747,7 +774,7 @@ mod tests {
 
     assert!(matches!(
       reg.on_completion(Completion::new(0)).next_action,
-      Some(Action::Io(crate::backend::op::Op::Nop))
+      Some(action) if action.is_nop()
     ));
     assert_eq!(wake_count.load(Ordering::SeqCst), 0);
     assert!(rx.try_recv().is_err(), "Again must not send a terminal item");
@@ -767,8 +794,8 @@ mod tests {
     impl OpModel for AgainThenYield {
       type Item = i32;
 
-      fn action(&mut self) -> Action {
-        Action::Io(crate::backend::op::Op::Nop)
+      fn action(&mut self) -> Action<'_> {
+        action_io!(crate::backend::op::Op::Nop)
       }
 
       fn complete(&mut self, _: Completion) -> OpResult<i32> {
@@ -810,7 +837,7 @@ mod tests {
 
     assert!(matches!(
       reg.on_completion(Completion::new(0)).next_action,
-      Some(Action::Io(crate::backend::op::Op::Nop))
+      Some(action) if action.is_nop()
     ));
     assert_eq!(wake_count.load(Ordering::SeqCst), 1);
     assert_eq!(rx.try_recv().unwrap(), 11);
@@ -819,7 +846,7 @@ mod tests {
     reg.set_waker(test_waker(Arc::clone(&wake_count)));
     assert!(matches!(
       reg.on_completion(Completion::new(1)).next_action,
-      Some(Action::Io(crate::backend::op::Op::Nop))
+      Some(action) if action.is_nop()
     ));
     assert_eq!(wake_count.load(Ordering::SeqCst), 2);
     assert_eq!(rx.try_recv().unwrap(), 13);

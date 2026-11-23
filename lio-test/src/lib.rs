@@ -50,6 +50,8 @@
 /// - completion is surfaced on the next `wait()` and never replayed
 ///
 /// `Op::Read`:
+/// - the destination is a [`RawBufMut`](lio::backend::op::RawBufMut): writable
+///   memory, including uninitialized memory, never a shared `&[u8]`
 /// - success may return short positive byte counts, but repeated successful
 ///   submissions must eventually transfer the exact total byte count
 /// - vectored success may return short positive byte counts, but repeated
@@ -60,10 +62,12 @@
 ///   `-EINVAL`; it is never truncated, wrapped or taken as the current
 ///   position
 /// - unsupported flags return exact raw `-ENOTSUP`
-/// - null iovec pointer returns exact raw `-EINVAL`
+/// - a buffer list is never a null pointer; an empty descriptor has length 0
 /// - invalid fd returns exact raw `-EBADF`
 ///
 /// `Op::Write`:
+/// - the source is a [`RawBuf`](lio::backend::op::RawBuf): initialized bytes
+///   the backend may read
 /// - success may return short positive byte counts, but repeated successful
 ///   submissions must eventually transfer the exact total byte count
 /// - vectored success may return short positive byte counts, but repeated
@@ -72,7 +76,7 @@
 ///   `-EINVAL`; it is never truncated, wrapped or taken as the current
 ///   position
 /// - unsupported flags return exact raw `-ENOTSUP`
-/// - null iovec pointer returns exact raw `-EINVAL`
+/// - a buffer list is never a null pointer; an empty descriptor has length 0
 /// - invalid fd returns exact raw `-EBADF`
 ///
 /// `Op::Recv`:
@@ -179,9 +183,9 @@ macro_rules! test_io_backend {
     use __lio_test_lio::backend::{
       IoBackend,
       op::{
-        FileMode, FileStat, LinkKind, MsgBuf, MsgBufMut, MsgRecv, MsgSend,
-        Op, OpenFlags, RawBuf, ReadFlags, RecvFlags, SendFlags, SpawnSpec,
-        UnlinkKind, WriteFlags,
+        BorrowedMsgBuf, BorrowedMsgBufMut, BorrowedOp, FileMode, FileStat,
+        LinkKind, OpenFlags, RawBuf, RawBufMut, ReadFlags, RecvFlags, SendFlags,
+        SpawnSpec, UnlinkKind, WriteFlags,
       },
     };
     use std::ptr::NonNull;
@@ -191,14 +195,20 @@ macro_rules! test_io_backend {
         RefCell::new(HashMap::new());
     }
 
-    fn push_op(backend: &mut impl IoBackend, id: u64, op: Op) {
+    fn push_op<'a>(
+      backend: &mut impl IoBackend,
+      id: u64,
+      op: __lio_test_lio::backend::op::BorrowedOp<'a>,
+    ) {
       let backend_key = (backend as *mut _ as *mut ()) as usize;
       STEP_BUMPS.with(|step_bumps| {
         let mut step_bumps = step_bumps.borrow_mut();
         let step_bump =
           step_bumps.entry((backend_key, id)).or_insert_with(Bump::new);
         step_bump.reset();
-        IoBackend::push(backend, id, op, step_bump);
+        // SAFETY: every buffer these tests submit stays alive until `wait`
+        // returns the completion, which is the `IoBackend::push` contract.
+        unsafe { IoBackend::push(backend, id, op, step_bump) };
       });
     }
 
@@ -210,10 +220,8 @@ macro_rules! test_io_backend {
       NonNull::new(ptr.cast_mut()).expect("test pointer must be non-null")
     }
 
-    fn raw_buf_from_mut_slice(buf: &mut [u8]) -> RawBuf {
-      // SAFETY: the returned `RawBuf` borrows the caller-provided slice, and
-      // every test only submits it while that slice remains alive.
-      unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) }
+    fn raw_buf_from_mut_slice(buf: &mut [u8]) -> RawBufMut<'_> {
+      RawBufMut::from_mut(buf)
     }
 
     fn new_backend() -> impl IoBackend {
@@ -286,13 +294,7 @@ macro_rules! test_io_backend {
 
       push_op(&mut backend,
         3,
-        Op::Read {
-          fd: read_res.clone(),
-          iovecs: nonnull(&mut raw_buf),
-          iov_count: 1,
-          offset: None,
-          flags: ReadFlags::empty(),
-        },
+        BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
       );
       backend.flush().unwrap();
 
@@ -342,10 +344,7 @@ macro_rules! test_io_backend {
 
       push_op(&mut backend,
         90,
-        Op::Connect {
-          fd: invalid_fd_resource(),
-          addr: storage,
-        },
+        BorrowedOp::connect(invalid_fd_resource(), storage),
       );
 
       let completed = wait_completions(&mut backend, Some(Duration::ZERO));
@@ -367,18 +366,11 @@ macro_rules! test_io_backend {
       backend.init(64).unwrap();
 
       let invalid_fd = invalid_fd_resource();
-      // SAFETY: a null pointer with zero length is a valid empty raw buffer.
-      let mut raw_buf = unsafe { RawBuf::from_raw_parts(std::ptr::null_mut(), 0) };
+      let mut raw_buf = RawBufMut::empty();
 
       push_op(&mut backend,
         91,
-        Op::Read {
-          fd: invalid_fd,
-          iovecs: nonnull(&mut raw_buf),
-          iov_count: 1,
-          offset: Some(u64::MAX),
-          flags: ReadFlags::empty(),
-        },
+        BorrowedOp::read(invalid_fd, std::slice::from_ref(&raw_buf), Some(u64::MAX), ReadFlags::empty()),
       );
 
       backend.flush().unwrap();
@@ -404,8 +396,8 @@ macro_rules! test_io_backend {
       let mut backend = new_backend();
       backend.init(1).unwrap();
 
-      push_op(&mut backend, 1, Op::Nop);
-      push_op(&mut backend, 2, Op::Nop);
+      push_op(&mut backend, 1, BorrowedOp::nop());
+      push_op(&mut backend, 2, BorrowedOp::nop());
     }
 
     /// Raw error codes a conforming backend reports. Windows backends report
@@ -466,10 +458,12 @@ macro_rules! test_io_backend {
     fn own_raw(raw: isize) -> Resource {
       #[cfg(unix)]
       // SAFETY: the backend hands out a fresh descriptor the test now owns.
-      return unsafe { Resource::from_raw_fd(raw as RawFd) };
+      return Resource::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as RawFd) });
       #[cfg(windows)]
       // SAFETY: the backend hands out a fresh handle the test now owns.
-      return unsafe { Resource::from_raw_handle(raw as RawHandle) };
+      return Resource::from(unsafe {
+        std::os::windows::io::OwnedHandle::from_raw_handle(raw as RawHandle)
+      });
     }
 
     /// Closes a raw descriptor/handle returned by the backend.
@@ -799,10 +793,10 @@ macro_rules! test_io_backend {
     fn invalid_fd_resource() -> Resource {
       #[cfg(unix)]
       // SAFETY: this intentionally uses an invalid fd to verify raw errors.
-      return unsafe { Resource::borrow(-1) };
+      return Resource::invalid();
       #[cfg(windows)]
       // SAFETY: the null handle is never valid; it is borrowed, never closed.
-      return unsafe { Resource::borrow(std::ptr::null_mut()) };
+      return Resource::invalid();
     }
 
     fn wait_for_positive_completion(
@@ -842,13 +836,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           95,
-          Op::Read {
-            fd: reader.clone(),
-            iovecs: nonnull(&mut raw_buf),
-            iov_count: 1,
-            offset: None,
-            flags: ReadFlags::empty(),
-          },
+          BorrowedOp::read(reader.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
         );
 
         // Neither submitting nor polling may wait for the pipe.
@@ -892,31 +880,33 @@ macro_rules! test_io_backend {
 
         let (read_res, write_res) = socket_pair();
         let mut buf = [0_u8; 4];
-        let bufs = [MsgBufMut::from_slice(&mut buf)];
-        push_op(&mut backend,
-          97,
-          Op::Recv { fd: read_res.clone(), msg: MsgRecv::new(&bufs), flags: RecvFlags::empty() },
-        );
-        backend.flush().unwrap();
-        assert!(
-          wait_completions(&mut backend, Some(Duration::ZERO)).is_empty(),
-          "recv without data must stay pending"
-        );
+        {
+          let bufs = [BorrowedMsgBufMut::from_slice(&mut buf)];
+          push_op(
+            &mut backend,
+            97,
+            BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
+          );
+          backend.flush().unwrap();
+          assert!(
+            wait_completions(&mut backend, Some(Duration::ZERO)).is_empty(),
+            "recv without data must stay pending"
+          );
 
-        backend.cancel(97);
-        let completed = wait_for_single_completion(&mut backend);
-        assert_eq!(completed.registration_id(), 97);
-        assert!(
-          completed.result() < 0,
-          "a cancelled recv reports an error, got {}",
-          completed.result()
-        );
+          backend.cancel(97);
+          let completed = wait_for_single_completion(&mut backend);
+          assert_eq!(completed.registration_id(), 97);
+          assert!(
+            completed.result() < 0,
+            "a cancelled recv reports an error, got {}",
+            completed.result()
+          );
 
-        // Data arriving afterwards belongs to no operation.
-        assert_eq!(send_payload(&write_res, b"late"), 4);
-        let extra = drain_for(&mut backend, Duration::from_millis(100));
-        assert!(extra.is_empty(), "cancelled op completed again: {extra:?}");
-        drop(bufs);
+          // Data arriving afterwards belongs to no operation.
+          assert_eq!(send_payload(&write_res, b"late"), 4);
+          let extra = drain_for(&mut backend, Duration::from_millis(100));
+          assert!(extra.is_empty(), "cancelled op completed again: {extra:?}");
+        }
         assert_eq!(buf, [0; 4], "a cancelled recv must not fill its buffer");
       }
 
@@ -927,10 +917,10 @@ macro_rules! test_io_backend {
 
         let (read_res, _write_res) = socket_pair();
         let mut buf = [0_u8; 4];
-        let bufs = [MsgBufMut::from_slice(&mut buf)];
+        let bufs = [BorrowedMsgBufMut::from_slice(&mut buf)];
         push_op(&mut backend,
           98,
-          Op::Recv { fd: read_res.clone(), msg: MsgRecv::new(&bufs), flags: RecvFlags::empty() },
+          BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
         );
         backend.cancel(98);
         backend.flush().unwrap();
@@ -948,7 +938,7 @@ macro_rules! test_io_backend {
         backend.init(64).unwrap();
 
         backend.cancel(12_345);
-        push_op(&mut backend, 99, Op::Nop);
+        push_op(&mut backend, 99, BorrowedOp::nop());
         backend.flush().unwrap();
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 99, 0);
@@ -965,17 +955,17 @@ macro_rules! test_io_backend {
         let mut backend = new_backend();
         backend.init(64).unwrap();
 
-        push_op(&mut backend, 40, Op::Nop);
+        push_op(&mut backend, 40, BorrowedOp::nop());
         backend.flush().unwrap();
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
-        assert_eq!(completed.len(), 1, "Op::Nop must complete immediately");
+        assert_eq!(completed.len(), 1, "nop must complete immediately");
         assert_exact_result(&completed[0], 40, 0);
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert!(
           completed.is_empty(),
-          "Op::Nop completion must not be replayed on later wait() calls"
+          "BorrowedOp::nop() completion must not be replayed on later wait() calls"
         );
       }
     }
@@ -999,22 +989,11 @@ macro_rules! test_io_backend {
         while total < payload.len() {
           // SAFETY: this slice points into `buf`, which stays alive until the
           // backend completes the submitted read operation.
-          let mut raw_buf = unsafe {
-            RawBuf::from_raw_parts(
-              buf[total..].as_mut_ptr(),
-              buf.len() - total,
-            )
-          };
+          let mut raw_buf = RawBufMut::from_mut(&mut buf[total..]);
 
           push_op(&mut backend,
             id,
-            Op::Read {
-              fd: read_res.clone(),
-              iovecs: nonnull(&mut raw_buf),
-              iov_count: 1,
-              offset: None,
-              flags: ReadFlags::empty(),
-            },
+            BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
           );
           backend.flush().unwrap();
 
@@ -1047,13 +1026,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           54,
-          Op::Read {
-            fd: read_res.clone(),
-            iovecs: nonnull(&mut raw_buf),
-            iov_count: 1,
-            offset: None,
-            flags: ReadFlags::empty(),
-          },
+          BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
         );
         backend.flush().unwrap();
 
@@ -1080,21 +1053,10 @@ macro_rules! test_io_backend {
         while total < payload.len() {
           // SAFETY: this slice points into `buf`, which stays alive until the
           // backend completes the submitted read operation.
-          let mut raw_buf = unsafe {
-            RawBuf::from_raw_parts(
-              buf[total..].as_mut_ptr(),
-              buf.len() - total,
-            )
-          };
+          let mut raw_buf = RawBufMut::from_mut(&mut buf[total..]);
           push_op(&mut backend,
             id,
-            Op::Read {
-              fd: read_res.clone(),
-              iovecs: nonnull(&mut raw_buf),
-              iov_count: 1,
-              offset: None,
-              flags: ReadFlags::empty(),
-            },
+            BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
           );
           backend.flush().unwrap();
 
@@ -1127,13 +1089,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           541,
-          Op::Read {
-            fd: read_res.clone(),
-            iovecs: nonnull(&mut raw_buf),
-            iov_count: 1,
-            offset: None,
-            flags: ReadFlags::empty(),
-          },
+          BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
         );
         backend.flush().unwrap();
 
@@ -1177,31 +1133,15 @@ macro_rules! test_io_backend {
           let mut bufs = [
             // SAFETY: each slice points into `left`, which remains valid until
             // the submitted vectored read completes.
-            unsafe {
-              RawBuf::from_raw_parts(
-                left[left_written..].as_mut_ptr(),
-                left.len() - left_written,
-              )
-            },
+            RawBufMut::from_mut(&mut left[left_written..]),
             // SAFETY: each slice points into `right`, which remains valid until
             // the submitted vectored read completes.
-            unsafe {
-              RawBuf::from_raw_parts(
-                right[right_written..].as_mut_ptr(),
-                right.len() - right_written,
-              )
-            },
+            RawBufMut::from_mut(&mut right[right_written..]),
           ];
 
           push_op(&mut backend,
             id,
-            Op::Read {
-              fd: read_res.clone(),
-              iovecs: nonnull(bufs.as_mut_ptr()),
-              iov_count: bufs.len(),
-              offset: None,
-              flags: ReadFlags::empty(),
-            },
+            BorrowedOp::read(read_res.clone(), &bufs, None, ReadFlags::empty()),
           );
           backend.flush().unwrap();
 
@@ -1234,13 +1174,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           55,
-          Op::Read {
-            fd: read_res.clone(),
-            iovecs: nonnull(&mut raw_buf),
-            iov_count: 1,
-            offset: None,
-            flags: ReadFlags::empty(),
-          },
+          BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
         );
         backend.flush().unwrap();
         drop(write_res);
@@ -1259,13 +1193,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           47,
-          Op::Read {
-            fd: invalid_fd_resource(),
-            iovecs: nonnull(&mut raw_buf),
-            iov_count: 1,
-            offset: None,
-            flags: ReadFlags::empty(),
-          },
+          BorrowedOp::read(invalid_fd_resource(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
         );
         backend.flush().unwrap();
 
@@ -1287,13 +1215,7 @@ macro_rules! test_io_backend {
         for (id, offset) in [(69, i64::MAX as u64 + 1), (70, u64::MAX)] {
           push_op(&mut backend,
             id,
-            Op::Read {
-              fd: read_res.clone(),
-              iovecs: nonnull(&mut raw_buf),
-              iov_count: 1,
-              offset: Some(offset),
-              flags: ReadFlags::empty(),
-            },
+            BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), Some(offset), ReadFlags::empty()),
           );
           backend.flush().unwrap();
 
@@ -1320,22 +1242,11 @@ macro_rules! test_io_backend {
         while total < payload.len() {
           // SAFETY: this slice points into `payload`, which remains valid until
           // the backend completes the submitted write operation.
-          let raw_buf = unsafe {
-            RawBuf::from_raw_parts(
-              payload[total..].as_mut_ptr(),
-              payload.len() - total,
-            )
-          };
+          let raw_buf = RawBuf::from_mut(&mut payload[total..]);
 
           push_op(&mut backend,
             id,
-          Op::Write {
-            fd: write_res.clone(),
-            iovecs: nonnull_const(&raw_buf),
-              iov_count: 1,
-              offset: None,
-              flags: WriteFlags::empty(),
-            },
+          BorrowedOp::write(write_res.clone(), std::slice::from_ref(&raw_buf), None, WriteFlags::empty()),
           );
           backend.flush().unwrap();
 
@@ -1380,13 +1291,7 @@ macro_rules! test_io_backend {
 
           push_op(&mut backend,
             id,
-          Op::Write {
-            fd: write_res.clone(),
-            iovecs: nonnull_const(bufs.as_ptr()),
-              iov_count: bufs.len(),
-              offset: None,
-              flags: WriteFlags::empty(),
-            },
+          BorrowedOp::write(write_res.clone(), &bufs, None, WriteFlags::empty()),
           );
           backend.flush().unwrap();
 
@@ -1414,17 +1319,11 @@ macro_rules! test_io_backend {
         let payload = *b"err!";
         // SAFETY: `payload` remains alive for the duration of this submitted
         // write operation and is only read from.
-        let raw_buf = unsafe { RawBuf::from_raw_parts(payload.as_ptr().cast_mut(), payload.len()) };
+        let raw_buf = RawBuf::new(&payload);
 
         push_op(&mut backend,
           48,
-          Op::Write {
-            fd: invalid_fd_resource(),
-            iovecs: nonnull_const(&raw_buf),
-            iov_count: 1,
-            offset: None,
-            flags: WriteFlags::empty(),
-          },
+          BorrowedOp::write(invalid_fd_resource(), std::slice::from_ref(&raw_buf), None, WriteFlags::empty()),
         );
         backend.flush().unwrap();
 
@@ -1441,20 +1340,14 @@ macro_rules! test_io_backend {
         let payload = *b"arg!";
         // SAFETY: `payload` remains alive for the duration of this submitted
         // write operation and is only read from.
-        let raw_buf = unsafe { RawBuf::from_raw_parts(payload.as_ptr().cast_mut(), payload.len()) };
+        let raw_buf = RawBuf::new(&payload);
 
         // The first offset past `i64::MAX`, and the one whose bits read as
         // `-1` (the kernel's "current position").
         for (id, offset) in [(72, i64::MAX as u64 + 1), (73, u64::MAX)] {
           push_op(&mut backend,
             id,
-            Op::Write {
-              fd: write_res.clone(),
-              iovecs: nonnull_const(&raw_buf),
-              iov_count: 1,
-              offset: Some(offset),
-              flags: WriteFlags::empty(),
-            },
+            BorrowedOp::write(write_res.clone(), std::slice::from_ref(&raw_buf), Some(offset), WriteFlags::empty()),
           );
           backend.flush().unwrap();
 
@@ -1481,13 +1374,7 @@ macro_rules! test_io_backend {
         // APPEND overrides the offset.
         push_op(&mut backend,
           73,
-          Op::Write {
-            fd: file,
-            iovecs: nonnull_const(&raw_buf),
-            iov_count: 1,
-            offset: Some(0),
-            flags: WriteFlags::APPEND,
-          },
+          BorrowedOp::write(file, std::slice::from_ref(&raw_buf), Some(0), WriteFlags::APPEND),
         );
         backend.flush().unwrap();
 
@@ -1519,15 +1406,11 @@ macro_rules! test_io_backend {
         let mut total = 0usize;
         let mut id = 42_u64;
         while total < payload.len() {
-          let bufs = [MsgBufMut::from_slice(&mut buf[total..])];
+          let bufs = [BorrowedMsgBufMut::from_slice(&mut buf[total..])];
 
           push_op(&mut backend,
             id,
-            Op::Recv {
-              fd: read_res.clone(),
-              msg: MsgRecv::new(&bufs),
-              flags: RecvFlags::empty(),
-            },
+            BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
           );
           backend.flush().unwrap();
 
@@ -1553,15 +1436,11 @@ macro_rules! test_io_backend {
         assert_eq!(wrote, payload.len() as isize);
 
         let mut peeked = [0_u8; 4];
-        let bufs = [MsgBufMut::from_slice(&mut peeked)];
+        let bufs = [BorrowedMsgBufMut::from_slice(&mut peeked)];
 
         push_op(&mut backend,
           47,
-          Op::Recv {
-            fd: read_res.clone(),
-            msg: MsgRecv::new(&bufs),
-            flags: RecvFlags::PEEK,
-          },
+          BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::PEEK),
         );
         backend.flush().unwrap();
 
@@ -1585,15 +1464,11 @@ macro_rules! test_io_backend {
         let (read_res, write_res) = socket_pair();
         let payload = *b"wait";
         let mut buf = [0_u8; 4];
-        let bufs = [MsgBufMut::from_slice(&mut buf)];
+        let bufs = [BorrowedMsgBufMut::from_slice(&mut buf)];
 
         push_op(&mut backend,
           56,
-          Op::Recv {
-            fd: read_res.clone(),
-            msg: MsgRecv::new(&bufs),
-            flags: RecvFlags::empty(),
-          },
+          BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
         );
         backend.flush().unwrap();
 
@@ -1618,15 +1493,11 @@ macro_rules! test_io_backend {
 
         let mut id = 57_u64;
         while total < payload.len() {
-          let bufs = [MsgBufMut::from_slice(&mut buf[total..])];
+          let bufs = [BorrowedMsgBufMut::from_slice(&mut buf[total..])];
 
           push_op(&mut backend,
             id,
-            Op::Recv {
-              fd: read_res.clone(),
-              msg: MsgRecv::new(&bufs),
-              flags: RecvFlags::empty(),
-            },
+            BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
           );
           backend.flush().unwrap();
 
@@ -1650,15 +1521,11 @@ macro_rules! test_io_backend {
         let (read_res, write_res) = socket_pair();
         let payload = *b"once";
         let mut buf = [0_u8; 4];
-        let bufs = [MsgBufMut::from_slice(&mut buf)];
+        let bufs = [BorrowedMsgBufMut::from_slice(&mut buf)];
 
         push_op(&mut backend,
           561,
-          Op::Recv {
-            fd: read_res.clone(),
-            msg: MsgRecv::new(&bufs),
-            flags: RecvFlags::empty(),
-          },
+          BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
         );
         backend.flush().unwrap();
 
@@ -1701,17 +1568,13 @@ macro_rules! test_io_backend {
           let left_done = total.min(left.len());
           let right_done = total.saturating_sub(left.len()).min(right.len());
           let bufs = [
-            MsgBufMut::from_slice(&mut left[left_done..]),
-            MsgBufMut::from_slice(&mut right[right_done..]),
+            BorrowedMsgBufMut::from_slice(&mut left[left_done..]),
+            BorrowedMsgBufMut::from_slice(&mut right[right_done..]),
           ];
 
           push_op(&mut backend,
             id,
-            Op::Recv {
-              fd: read_res.clone(),
-              msg: MsgRecv::new(&bufs),
-              flags: RecvFlags::empty(),
-            },
+            BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
           );
           backend.flush().unwrap();
 
@@ -1735,15 +1598,11 @@ macro_rules! test_io_backend {
 
         let (read_res, write_res) = socket_pair();
         let mut buf = [0_u8; 4];
-        let bufs = [MsgBufMut::from_slice(&mut buf)];
+        let bufs = [BorrowedMsgBufMut::from_slice(&mut buf)];
 
         push_op(&mut backend,
           57,
-          Op::Recv {
-            fd: read_res.clone(),
-            msg: MsgRecv::new(&bufs),
-            flags: RecvFlags::empty(),
-          },
+          BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
         );
         backend.flush().unwrap();
         drop(write_res);
@@ -1758,15 +1617,11 @@ macro_rules! test_io_backend {
         backend.init(64).unwrap();
 
         let mut buf = [0_u8; 4];
-        let bufs = [MsgBufMut::from_slice(&mut buf)];
+        let bufs = [BorrowedMsgBufMut::from_slice(&mut buf)];
 
         push_op(&mut backend,
           49,
-          Op::Recv {
-            fd: invalid_fd_resource(),
-            msg: MsgRecv::new(&bufs),
-            flags: RecvFlags::empty(),
-          },
+          BorrowedOp::recv(invalid_fd_resource(), &bufs, RecvFlags::empty()),
         );
         backend.flush().unwrap();
 
@@ -1788,15 +1643,11 @@ macro_rules! test_io_backend {
         let mut total = 0usize;
         let mut id = 41_u64;
         while total < payload.len() {
-          let bufs = [MsgBuf::from_slice(&payload[total..])];
+          let bufs = [BorrowedMsgBuf::from_slice(&payload[total..])];
 
           push_op(&mut backend,
             id,
-            Op::Send {
-              fd: write_res.clone(),
-              msg: MsgSend::new(&bufs, None),
-              flags: SendFlags::empty(),
-            },
+            BorrowedOp::send(write_res.clone(), &bufs, None, SendFlags::empty()),
           );
           backend.flush().unwrap();
 
@@ -1830,17 +1681,13 @@ macro_rules! test_io_backend {
           let left_done = total.min(left.len());
           let right_done = total.saturating_sub(left.len()).min(right.len());
           let bufs = [
-            MsgBuf::from_slice(&left[left_done..]),
-            MsgBuf::from_slice(&right[right_done..]),
+            BorrowedMsgBuf::from_slice(&left[left_done..]),
+            BorrowedMsgBuf::from_slice(&right[right_done..]),
           ];
 
           push_op(&mut backend,
             id,
-            Op::Send {
-              fd: write_res.clone(),
-              msg: MsgSend::new(&bufs, None),
-              flags: SendFlags::empty(),
-            },
+            BorrowedOp::send(write_res.clone(), &bufs, None, SendFlags::empty()),
           );
           backend.flush().unwrap();
 
@@ -1866,15 +1713,11 @@ macro_rules! test_io_backend {
         backend.init(64).unwrap();
 
         let payload = *b"oops";
-        let bufs = [MsgBuf::from_slice(&payload)];
+        let bufs = [BorrowedMsgBuf::from_slice(&payload)];
 
         push_op(&mut backend,
           50,
-          Op::Send {
-            fd: invalid_fd_resource(),
-            msg: MsgSend::new(&bufs, None),
-            flags: SendFlags::empty(),
-          },
+          BorrowedOp::send(invalid_fd_resource(), &bufs, None, SendFlags::empty()),
         );
         backend.flush().unwrap();
 
@@ -1898,10 +1741,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           52,
-          Op::Accept {
-            fd: listener_res,
-            addr: NonNull::from(&mut storage),
-          },
+          BorrowedOp::accept(listener_res, &mut storage),
         );
         backend.flush().unwrap();
 
@@ -1931,10 +1771,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           58,
-          Op::Accept {
-            fd: listener_res,
-            addr: NonNull::from(&mut storage),
-          },
+          BorrowedOp::accept(listener_res, &mut storage),
         );
         backend.flush().unwrap();
 
@@ -1967,10 +1804,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           51,
-          Op::Accept {
-            fd: invalid_fd_resource(),
-            addr: NonNull::from(&mut storage),
-          },
+          BorrowedOp::accept(invalid_fd_resource(), &mut storage),
         );
         backend.flush().unwrap();
 
@@ -1995,10 +1829,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           46,
-          Op::Connect {
-            fd: client_res.clone(),
-            addr: storage,
-          },
+          BorrowedOp::connect(client_res.clone(), storage),
         );
         backend.flush().unwrap();
 
@@ -2019,10 +1850,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           53,
-          Op::Connect {
-            fd: client_res,
-            addr: storage,
-          },
+          BorrowedOp::connect(client_res, storage),
         );
         backend.flush().unwrap();
 
@@ -2042,10 +1870,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           59,
-          Op::Connect {
-            fd: invalid_fd_resource(),
-            addr: storage,
-          },
+          BorrowedOp::connect(invalid_fd_resource(), storage),
         );
         backend.flush().unwrap();
 
@@ -2066,10 +1891,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           63,
-          Op::Connect {
-            fd: client_res,
-            addr: storage,
-          },
+          BorrowedOp::connect(client_res, storage),
         );
         backend.flush().unwrap();
 
@@ -2089,11 +1911,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           69,
-          Op::Socket {
-            domain: __lio_test_lio::backend::op::SockDomain::IPV4,
-            ty: __lio_test_lio::backend::op::SockType::STREAM,
-            proto: __lio_test_lio::backend::op::SockProto::DEFAULT,
-          },
+          BorrowedOp::socket(__lio_test_lio::backend::op::SockDomain::IPV4, __lio_test_lio::backend::op::SockType::STREAM, __lio_test_lio::backend::op::SockProto::DEFAULT),
         );
         backend.flush().unwrap();
 
@@ -2114,11 +1932,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           79,
-          Op::Socket {
-            domain: __lio_test_lio::backend::op::SockDomain::UNIX,
-            ty: __lio_test_lio::backend::op::SockType::STREAM,
-            proto: __lio_test_lio::backend::op::SockProto::TCP,
-          },
+          BorrowedOp::socket(__lio_test_lio::backend::op::SockDomain::UNIX, __lio_test_lio::backend::op::SockType::STREAM, __lio_test_lio::backend::op::SockProto::TCP),
         );
         backend.flush().unwrap();
 
@@ -2140,12 +1954,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           80,
-          Op::OpenAt {
-            dir_fd: Resource::cwd(),
-            path: path.as_os_str().to_os_string(),
-            flags: OpenFlags::READ,
-            mode: FileMode::empty(),
-          },
+          BorrowedOp::open_at(Resource::cwd(), path.as_os_str().to_os_string(), OpenFlags::READ, FileMode::empty()),
         );
         backend.flush().unwrap();
 
@@ -2169,12 +1978,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           81,
-          Op::OpenAt {
-            dir_fd: Resource::cwd(),
-            path: path.as_os_str().to_os_string(),
-            flags: OpenFlags::READ,
-            mode: FileMode::empty(),
-          },
+          BorrowedOp::open_at(Resource::cwd(), path.as_os_str().to_os_string(), OpenFlags::READ, FileMode::empty()),
         );
         backend.flush().unwrap();
 
@@ -2197,14 +2001,11 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           82,
-          Op::Stat {
-            target: __lio_test_lio::backend::op::StatTarget::Path {
+          BorrowedOp::stat(__lio_test_lio::backend::op::StatTarget::Path {
               dir_fd: Resource::cwd(),
               path: path.as_os_str().to_os_string(),
               follow_symlinks: true,
-            },
-            out: nonnull(&mut out),
-          },
+            }, &mut out),
         );
         backend.flush().unwrap();
 
@@ -2225,14 +2026,11 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           83,
-          Op::Stat {
-            target: __lio_test_lio::backend::op::StatTarget::Path {
+          BorrowedOp::stat(__lio_test_lio::backend::op::StatTarget::Path {
               dir_fd: Resource::cwd(),
               path: path.as_os_str().to_os_string(),
               follow_symlinks: true,
-            },
-            out: nonnull(&mut out),
-          },
+            }, &mut out),
         );
         backend.flush().unwrap();
 
@@ -2253,14 +2051,11 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           84,
-          Op::Stat {
-            target: __lio_test_lio::backend::op::StatTarget::Path {
+          BorrowedOp::stat(__lio_test_lio::backend::op::StatTarget::Path {
               dir_fd: Resource::cwd(),
               path: link.as_os_str().to_os_string(),
               follow_symlinks: false,
-            },
-            out: nonnull(&mut out),
-          },
+            }, &mut out),
         );
         backend.flush().unwrap();
 
@@ -2296,16 +2091,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           85,
-          Op::ReadDir {
-            fd: dir_fd,
-            raw_buf: nonnull(raw.as_mut_ptr()),
-            raw_cap: raw.len(),
-            entries: nonnull(out.as_mut_ptr()),
-            entries_cap: out.len(),
-            opaque: nonnull(&mut opaque),
-            opaque_drop: nonnull(&mut opaque_drop),
-            out: nonnull(&mut result),
-          },
+          BorrowedOp::read_dir(dir_fd, &mut raw[..], &mut out[..], &mut result, &mut opaque, &mut opaque_drop),
         );
         backend.flush().unwrap();
 
@@ -2355,11 +2141,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           70,
-          Op::UnlinkAt {
-            dir_fd: Resource::cwd(),
-            path: path.as_os_str().to_os_string(),
-            kind: UnlinkKind::File,
-          },
+          BorrowedOp::unlink_at(Resource::cwd(), path.as_os_str().to_os_string(), UnlinkKind::File),
         );
         backend.flush().unwrap();
 
@@ -2377,11 +2159,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           71,
-          Op::UnlinkAt {
-            dir_fd: Resource::cwd(),
-            path: path.as_os_str().to_os_string(),
-            kind: UnlinkKind::File,
-          },
+          BorrowedOp::unlink_at(Resource::cwd(), path.as_os_str().to_os_string(), UnlinkKind::File),
         );
         backend.flush().unwrap();
 
@@ -2405,12 +2183,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           72,
-          Op::RenameAt {
-            old_dir_fd: Resource::cwd(),
-            old_path: source.as_os_str().to_os_string(),
-            new_dir_fd: Resource::cwd(),
-            new_path: dest.as_os_str().to_os_string(),
-          },
+          BorrowedOp::rename_at(Resource::cwd(), source.as_os_str().to_os_string(), Resource::cwd(), dest.as_os_str().to_os_string()),
         );
         backend.flush().unwrap();
 
@@ -2432,12 +2205,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           73,
-          Op::RenameAt {
-            old_dir_fd: Resource::cwd(),
-            old_path: source.as_os_str().to_os_string(),
-            new_dir_fd: Resource::cwd(),
-            new_path: dest.as_os_str().to_os_string(),
-          },
+          BorrowedOp::rename_at(Resource::cwd(), source.as_os_str().to_os_string(), Resource::cwd(), dest.as_os_str().to_os_string()),
         );
         backend.flush().unwrap();
 
@@ -2459,11 +2227,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           74,
-          Op::MkdirAt {
-            dir_fd: Resource::cwd(),
-            path: path.as_os_str().to_os_string(),
-            mode: FileMode::from_octal(0o755).unwrap(),
-          },
+          BorrowedOp::mkdir_at(Resource::cwd(), path.as_os_str().to_os_string(), FileMode::from_octal(0o755).unwrap()),
         );
         backend.flush().unwrap();
 
@@ -2483,11 +2247,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           75,
-          Op::MkdirAt {
-            dir_fd: Resource::cwd(),
-            path: path.as_os_str().to_os_string(),
-            mode: FileMode::from_octal(0o755).unwrap(),
-          },
+          BorrowedOp::mkdir_at(Resource::cwd(), path.as_os_str().to_os_string(), FileMode::from_octal(0o755).unwrap()),
         );
         backend.flush().unwrap();
 
@@ -2512,13 +2272,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           76,
-          Op::LinkAt {
-            kind: LinkKind::Hard,
-            source_dir_fd: Resource::cwd(),
-            source_path: source.as_os_str().to_os_string(),
-            new_dir_fd: Resource::cwd(),
-            new_path: dest.as_os_str().to_os_string(),
-          },
+          BorrowedOp::link_at(LinkKind::Hard, Resource::cwd(), source.as_os_str().to_os_string(), Resource::cwd(), dest.as_os_str().to_os_string()),
         );
         backend.flush().unwrap();
 
@@ -2541,13 +2295,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           77,
-          Op::LinkAt {
-            kind: LinkKind::Soft,
-            source_dir_fd: Resource::cwd(),
-            source_path: source.as_os_str().to_os_string(),
-            new_dir_fd: Resource::cwd(),
-            new_path: dest.as_os_str().to_os_string(),
-          },
+          BorrowedOp::link_at(LinkKind::Soft, Resource::cwd(), source.as_os_str().to_os_string(), Resource::cwd(), dest.as_os_str().to_os_string()),
         );
         backend.flush().unwrap();
 
@@ -2572,13 +2320,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           78,
-          Op::LinkAt {
-            kind: LinkKind::Hard,
-            source_dir_fd: Resource::cwd(),
-            source_path: source.as_os_str().to_os_string(),
-            new_dir_fd: Resource::cwd(),
-            new_path: dest.as_os_str().to_os_string(),
-          },
+          BorrowedOp::link_at(LinkKind::Hard, Resource::cwd(), source.as_os_str().to_os_string(), Resource::cwd(), dest.as_os_str().to_os_string()),
         );
         backend.flush().unwrap();
 
@@ -2603,12 +2345,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           79,
-          Op::ReadlinkAt {
-            dir_fd: Resource::cwd(),
-            path: link.as_os_str().to_os_string(),
-            buf: nonnull(buf.as_mut_ptr()),
-            buf_len: buf.len(),
-          },
+          BorrowedOp::readlink_at(Resource::cwd(), link.as_os_str().to_os_string(), &mut buf),
         );
         backend.flush().unwrap();
 
@@ -2633,12 +2370,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           80,
-          Op::ReadlinkAt {
-            dir_fd: Resource::cwd(),
-            path: link.as_os_str().to_os_string(),
-            buf: nonnull(buf.as_mut_ptr()),
-            buf_len: buf.len(),
-          },
+          BorrowedOp::readlink_at(Resource::cwd(), link.as_os_str().to_os_string(), &mut buf),
         );
         backend.flush().unwrap();
 
@@ -2658,7 +2390,7 @@ macro_rules! test_io_backend {
         let expected = std::env::current_dir().unwrap().into_os_string();
         let mut out = OsString::new();
 
-        push_op(&mut backend, 81, Op::GetCwd { out: nonnull(&mut out) });
+        push_op(&mut backend, 81, BorrowedOp::getcwd(&mut out));
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
@@ -2674,7 +2406,7 @@ macro_rules! test_io_backend {
         let expected = std::env::current_dir().unwrap().into_os_string();
         let mut out = OsString::from("stale");
 
-        push_op(&mut backend, 82, Op::GetCwd { out: nonnull(&mut out) });
+        push_op(&mut backend, 82, BorrowedOp::getcwd(&mut out));
         backend.flush().unwrap();
 
         let completed = wait_for_single_completion(&mut backend);
@@ -2693,7 +2425,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           83,
-          Op::Spawn { spec: success_spawn_spec() },
+          BorrowedOp::spawn(success_spawn_spec()),
         );
         backend.flush().unwrap();
 
@@ -2710,13 +2442,11 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           84,
-          Op::Spawn {
-            spec: SpawnSpec {
+          BorrowedOp::spawn(SpawnSpec {
               program: OsString::from("/definitely/missing/spawn-binary"),
               args: vec![OsString::from("spawn-binary")],
               env: None,
-            },
-          },
+            }),
         );
         backend.flush().unwrap();
 
@@ -2741,20 +2471,11 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           60,
-          Op::Connect {
-            fd: invalid_fd_resource(),
-            addr: storage,
-          },
+          BorrowedOp::connect(invalid_fd_resource(), storage),
         );
         push_op(&mut backend,
           61,
-          Op::Read {
-            fd: invalid_fd_resource(),
-            iovecs: nonnull(&mut raw_buf),
-            iov_count: 1,
-            offset: None,
-            flags: ReadFlags::empty(),
-          },
+          BorrowedOp::read(invalid_fd_resource(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
         );
         backend.flush().unwrap();
 
@@ -2777,10 +2498,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           62,
-          Op::Connect {
-            fd: invalid_fd_resource(),
-            addr: storage,
-          },
+          BorrowedOp::connect(invalid_fd_resource(), storage),
         );
         backend.flush().unwrap();
 
@@ -2805,10 +2523,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           63,
-          Op::Connect {
-            fd: invalid_fd_resource(),
-            addr: storage,
-          },
+          BorrowedOp::connect(invalid_fd_resource(), storage),
         );
         backend.flush().unwrap();
         backend.flush().unwrap();
@@ -2834,10 +2549,7 @@ macro_rules! test_io_backend {
 
         push_op(&mut backend,
           64,
-          Op::Connect {
-            fd: invalid_fd_resource(),
-            addr: storage,
-          },
+          BorrowedOp::connect(invalid_fd_resource(), storage),
         );
         backend.flush().unwrap();
 
@@ -2866,30 +2578,18 @@ macro_rules! test_io_backend {
         let mut buf_b = [0_u8; 2];
         // SAFETY: `buf_a` is a live stack buffer that remains valid until the
         // read completion is collected in this test.
-        let mut raw_a = unsafe { RawBuf::from_raw_parts(buf_a.as_mut_ptr(), buf_a.len()) };
+        let mut raw_a = RawBufMut::from_mut(&mut buf_a);
         // SAFETY: `buf_b` is a live stack buffer that remains valid until the
         // read completion is collected in this test.
-        let mut raw_b = unsafe { RawBuf::from_raw_parts(buf_b.as_mut_ptr(), buf_b.len()) };
+        let mut raw_b = RawBufMut::from_mut(&mut buf_b);
 
         push_op(&mut backend,
           701,
-          Op::Read {
-            fd: read_a.clone(),
-            iovecs: nonnull(&mut raw_a),
-            iov_count: 1,
-            offset: None,
-            flags: ReadFlags::empty(),
-          },
+          BorrowedOp::read(read_a.clone(), std::slice::from_ref(&raw_a), None, ReadFlags::empty()),
         );
         push_op(&mut backend,
           702,
-          Op::Read {
-            fd: read_b.clone(),
-            iovecs: nonnull(&mut raw_b),
-            iov_count: 1,
-            offset: None,
-            flags: ReadFlags::empty(),
-          },
+          BorrowedOp::read(read_b.clone(), std::slice::from_ref(&raw_b), None, ReadFlags::empty()),
         );
         backend.flush().unwrap();
 

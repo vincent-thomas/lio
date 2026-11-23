@@ -25,7 +25,12 @@ mod immediate_sockets {
     let (socket, peer) = UnixStream::pair().unwrap();
     socket.set_nonblocking(nonblocking).unwrap();
     // SAFETY: the UnixStream transfers exclusive ownership of its descriptor.
-    (unsafe { Resource::from_raw_fd(socket.into_raw_fd()) }, peer)
+    (
+      Resource::from(unsafe {
+        std::os::fd::OwnedFd::from_raw_fd(socket.into_raw_fd())
+      }),
+      peer,
+    )
   }
 
   fn backend() -> Poller {
@@ -40,7 +45,8 @@ mod immediate_sockets {
     };
     // Poller does not use the step arena. Models are boxed by the caller so
     // the buffers and message descriptors stay stable until completion.
-    backend.push(id, op, &mut Bump::new());
+    // SAFETY: `model` stays borrowed by the caller until the backend finishes.
+    unsafe { backend.push(id, op, &mut Bump::new()) };
   }
 
   #[test]
@@ -126,7 +132,10 @@ mod immediate_sockets {
     backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 1);
     peer.write_all(b"hello").unwrap();
-    backend.push(16, Op::Nop, &mut Bump::new());
+    // SAFETY: a no-op borrows nothing.
+    unsafe {
+      backend.push(16, crate::backend::op::BorrowedOp::nop(), &mut Bump::new())
+    };
     backend.flush().unwrap();
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
@@ -151,7 +160,9 @@ mod immediate_sockets {
       }
     }
     // SAFETY: transfer the socket's owned descriptor to Resource.
-    let socket = unsafe { Resource::from_raw_fd(socket.into_raw_fd()) };
+    let socket = Resource::from(unsafe {
+      std::os::fd::OwnedFd::from_raw_fd(socket.into_raw_fd())
+    });
     let mut model =
       Box::new(api::send(&socket, b"hello".to_vec(), None).into_inner());
     let mut backend = backend();
@@ -178,29 +189,34 @@ mod immediate_sockets {
 
   #[test]
   fn read_with_more_iovecs_than_the_native_array_is_rejected() {
-    use crate::backend::op::{RawBuf, ReadFlags};
+    use crate::backend::op::{RawBufMut, ReadFlags};
     use std::ptr::NonNull;
 
     let (socket, mut peer) = pair(true);
     peer.write_all(b"hello").unwrap();
     let mut buffers = [[0u8; 4]; crate::buf::MAX_IOV_COUNT + 1];
-    let raws: Vec<RawBuf> = buffers
+    let raws: Vec<RawBufMut<'static>> = buffers
       .iter_mut()
       // SAFETY: the buffers outlive every use of the backend below.
-      .map(|buf| unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) })
+      .map(|buf| unsafe {
+        RawBufMut::from_raw_parts(buf.as_mut_ptr(), buf.len())
+      })
       .collect();
     let mut backend = backend();
-    backend.push(
-      18,
-      Op::Read {
-        fd: socket,
-        iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
-        iov_count: raws.len(),
-        offset: None,
-        flags: ReadFlags::empty(),
-      },
-      &mut Bump::new(),
-    );
+    // SAFETY: `raws` and `socket` stay alive until this backend finishes.
+    unsafe {
+      backend.push(
+        18,
+        crate::backend::op::BorrowedOp::from_op(Op::Read {
+          fd: socket,
+          iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
+          iov_count: raws.len(),
+          offset: None,
+          flags: ReadFlags::empty(),
+        }),
+        &mut Bump::new(),
+      );
+    }
     backend.flush().unwrap();
     let mut completed = Vec::new();
     backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();

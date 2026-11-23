@@ -154,3 +154,27 @@ macro_rules! doc_op {
         $($rest)*
     };
 }
+
+/// Builds an [`Action::Io`](crate::api::op::Action::Io) from an [`Op`](crate::backend::op::Op)
+/// whose addresses the surrounding model owns.
+///
+/// Crate-private. [`BorrowedOp::from_op`](crate::backend::op::BorrowedOp::from_op)
+/// brands the operation `'static`. A public macro would let a downstream
+/// model clone an [`Op`](crate::backend::op::Op) and submit stack memory
+/// after `action` returns. External models build a [`BorrowedOp`](crate::backend::op::BorrowedOp)
+/// with the safe constructors and convert it with [`From`].
+///
+/// The operation is bound outside the `unsafe` block. The driver keeps the
+/// model pinned until the backend finishes the submission.
+macro_rules! action_io {
+  ($op:expr) => {{
+    let op = $op;
+    // SAFETY: `op` points only at memory owned by the model that builds this
+    // action, or it borrows nothing. The driver keeps that model pinned, and
+    // does not move those buffers, until the backend reports the operation
+    // finished.
+    $crate::api::op::Action::Io(unsafe {
+      $crate::backend::op::BorrowedOp::from_op(op)
+    })
+  }};
+}

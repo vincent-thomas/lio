@@ -22,9 +22,9 @@ use lio::{Lio, api::io::Receiver, api::resource::Resource};
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn socket_resource(socket: impl std::os::fd::IntoRawFd) -> Resource {
-  use std::os::fd::FromRawFd;
+  use std::os::fd::{FromRawFd, OwnedFd};
   // SAFETY: the socket hands its owned descriptor to exactly one Resource.
-  unsafe { Resource::from_raw_fd(socket.into_raw_fd()) }
+  Resource::from(unsafe { OwnedFd::from_raw_fd(socket.into_raw_fd()) })
 }
 
 /// Transfers ownership of a std socket to a `Resource`.
@@ -33,9 +33,11 @@ pub fn socket_resource(socket: impl std::os::fd::IntoRawFd) -> Resource {
 pub fn socket_resource(
   socket: impl std::os::windows::io::IntoRawSocket,
 ) -> Resource {
-  use std::os::windows::io::FromRawHandle;
+  use std::os::windows::io::{FromRawHandle, OwnedHandle};
   // SAFETY: the socket hands its owned handle to exactly one Resource.
-  unsafe { Resource::from_raw_handle(socket.into_raw_socket() as _) }
+  Resource::from(unsafe {
+    OwnedHandle::from_raw_handle(socket.into_raw_socket() as _)
+  })
 }
 
 /// Transfers ownership of a file to a `Resource`.
@@ -43,15 +45,17 @@ pub fn socket_resource(
 pub fn file_resource(file: File) -> Resource {
   #[cfg(unix)]
   {
-    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     // SAFETY: the file hands its owned descriptor to exactly one Resource.
-    unsafe { Resource::from_raw_fd(file.into_raw_fd()) }
+    Resource::from(unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) })
   }
   #[cfg(windows)]
   {
-    use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+    use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
     // SAFETY: the file hands its owned handle to exactly one Resource.
-    unsafe { Resource::from_raw_handle(file.into_raw_handle()) }
+    Resource::from(unsafe {
+      OwnedHandle::from_raw_handle(file.into_raw_handle())
+    })
   }
 }
 
@@ -79,12 +83,7 @@ pub fn open_dir(path: &std::path::Path) -> Resource {
 /// dropping it never closes anything.
 #[allow(dead_code)]
 pub fn invalid_resource() -> Resource {
-  #[cfg(unix)]
-  // SAFETY: -1 is never a valid descriptor and is never closed.
-  return unsafe { Resource::borrow(-1) };
-  #[cfg(windows)]
-  // SAFETY: the null handle is never valid and is never closed.
-  return unsafe { Resource::borrow(std::ptr::null_mut()) };
+  Resource::invalid()
 }
 
 /// Borrows a socket `Resource` as a std `TcpStream`, for inspecting it or for
@@ -179,7 +178,7 @@ enum Family {
 
 #[cfg(unix)]
 fn create_socket(family: Family, kind: SocketKind) -> Resource {
-  use std::os::fd::FromRawFd;
+  use std::os::fd::{FromRawFd, OwnedFd};
   let domain = match family {
     Family::Ipv4 => libc::AF_INET,
     Family::Ipv6 => libc::AF_INET6,
@@ -193,12 +192,12 @@ fn create_socket(family: Family, kind: SocketKind) -> Resource {
   let fd = unsafe { libc::socket(domain, ty, 0) };
   assert!(fd >= 0, "socket() failed: {}", std::io::Error::last_os_error());
   // SAFETY: `fd` is a fresh descriptor owned by the returned Resource.
-  unsafe { Resource::from_raw_fd(fd) }
+  Resource::from(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 #[cfg(windows)]
 fn create_socket(family: Family, kind: SocketKind) -> Resource {
-  use std::os::windows::io::FromRawHandle;
+  use std::os::windows::io::{FromRawHandle, OwnedHandle};
   use windows_sys::Win32::Networking::WinSock as ws;
   // std initializes Winsock on first use.
   drop(UdpSocket::bind("127.0.0.1:0"));
@@ -229,7 +228,7 @@ fn create_socket(family: Family, kind: SocketKind) -> Resource {
     std::io::Error::last_os_error()
   );
   // SAFETY: `socket` is fresh and owned by the returned Resource.
-  unsafe { Resource::from_raw_handle(socket as _) }
+  Resource::from(unsafe { OwnedHandle::from_raw_handle(socket as _) })
 }
 
 /// Creates a Unix stream socket resource.

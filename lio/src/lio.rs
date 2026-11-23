@@ -100,7 +100,7 @@ struct LioInner {
   io: ManuallyDrop<Box<dyn IoBackend>>,
   store: ManuallyDrop<OpStore>,
   /// The backend's close for resources its completions carry.
-  resource_close: crate::api::resource::CloseFn,
+  resource_close: crate::api::resource::ResourceClose,
   time: TimeManager,
   /// Reused buffer the backend reports completions into.
   completed: Vec<OpCompleted>,
@@ -273,7 +273,7 @@ impl Lio {
     self.inner.borrow_mut().time.advance_by_ticks(ticks);
   }
 
-  fn dispatch_action(inner: &mut LioInner, id: u64, action: Action) {
+  fn dispatch_action(inner: &mut LioInner, id: u64, action: Action<'static>) {
     let (store, io, time) = (&mut inner.store, &mut inner.io, &mut inner.time);
     match action {
       Action::Io(op) => {
@@ -281,7 +281,9 @@ impl Lio {
           unreachable!("dispatching action for unknown registration {id}");
         };
         step_bump.reset();
-        io.push(id, op, step_bump);
+        // SAFETY: the registration that produced `op` stays in the store,
+        // with its buffers unmoved, until this completion is routed.
+        unsafe { io.push(id, op, step_bump) };
       }
       Action::Sleep(duration) => time.schedule(id, duration),
     }
@@ -429,7 +431,11 @@ impl Lio {
       ));
     };
     match action {
-      Action::Io(op) => io.push(id, op, step_bump),
+      Action::Io(op) => {
+        // SAFETY: the registration that produced `op` was just inserted and
+        // stays in the store, with its buffers unmoved, until completion.
+        unsafe { io.push(id, op, step_bump) };
+      }
       Action::Sleep(duration) => time.schedule(id, duration),
     }
     Ok(id)
@@ -987,7 +993,12 @@ mod tests {
     fn init(&mut self, _: usize) -> io::Result<()> {
       Ok(())
     }
-    fn push(&mut self, id: u64, _: crate::backend::op::Op, _: &mut Bump) {
+    unsafe fn push(
+      &mut self,
+      id: u64,
+      _: crate::backend::op::BorrowedOp<'_>,
+      _: &mut Bump,
+    ) {
       self.0.extend([id, id]);
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -1052,8 +1063,8 @@ mod tests {
   impl crate::api::op::OpModel for TwoSteps {
     type Item = ();
 
-    fn action(&mut self) -> Action {
-      Action::Io(crate::backend::op::Op::Nop)
+    fn action(&mut self) -> Action<'_> {
+      action_io!(crate::backend::op::Op::Nop)
     }
 
     fn complete(&mut self, _: Completion) -> crate::api::op::OpResult<()> {
@@ -1124,10 +1135,16 @@ mod tests {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    fn push(&mut self, id: u64, op: crate::backend::op::Op, bump: &mut Bump) {
+    unsafe fn push(
+      &mut self,
+      id: u64,
+      op: crate::backend::op::BorrowedOp<'_>,
+      bump: &mut Bump,
+    ) {
       let at = bump.alloc(0u64) as *mut u64 as usize;
       self.first_allocs.borrow_mut().push(at);
-      self.inner.push(id, op, bump);
+      // SAFETY: this wrapper forwards the same submission the caller pushed.
+      unsafe { self.inner.push(id, op, bump) };
     }
     fn flush(&mut self) -> io::Result<()> {
       self.inner.flush()
@@ -1230,11 +1247,17 @@ mod tests {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    fn resource_close(&self) -> crate::api::resource::CloseFn {
+    fn resource_close(&self) -> crate::api::resource::ResourceClose {
       self.inner.resource_close()
     }
-    fn push(&mut self, id: u64, op: crate::backend::op::Op, bump: &mut Bump) {
-      self.inner.push(id, op, bump);
+    unsafe fn push(
+      &mut self,
+      id: u64,
+      op: crate::backend::op::BorrowedOp<'_>,
+      bump: &mut Bump,
+    ) {
+      // SAFETY: this wrapper forwards the same submission the caller pushed.
+      unsafe { self.inner.push(id, op, bump) };
     }
     fn flush(&mut self) -> io::Result<()> {
       self.inner.flush()

@@ -16,7 +16,7 @@ use criterion::{
   BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
 use lio::api::op::{Action, Completion, OpModel, OpResult, StreamOpModel};
-use lio::backend::op::Op;
+use lio::backend::op::{BorrowedOp, Op};
 use lio::backend::{IoBackend, OpCompleted};
 use lio::time::Clock;
 use lio::{Lio, api};
@@ -41,8 +41,16 @@ impl IoBackend for ImmediateBackend {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, _step_bump: &mut Bump) {
-    assert!(matches!(op, Op::Nop), "benchmark backend only supports NOP");
+  unsafe fn push(
+    &mut self,
+    id: u64,
+    op: BorrowedOp<'_>,
+    _step_bump: &mut Bump,
+  ) {
+    assert!(
+      matches!(op.as_op(), Op::Nop),
+      "benchmark backend only supports NOP"
+    );
     self.queued.push(id);
   }
 
@@ -77,7 +85,8 @@ fn direct_backend(criterion: &mut Criterion) {
       |bencher, &depth| {
         bencher.iter(|| {
           for id in 0..depth as u64 {
-            backend.push(id, Op::Nop, &mut bump);
+            // SAFETY: a no-op borrows nothing.
+            unsafe { backend.push(id, BorrowedOp::nop(), &mut bump) };
           }
           backend.flush().unwrap();
           backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
@@ -157,8 +166,8 @@ struct SteppedStream {
 impl OpModel for SteppedStream {
   type Item = ();
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Nop)
+  fn action(&mut self) -> Action<'_> {
+    Action::nop()
   }
 
   fn complete(&mut self, _: Completion) -> OpResult<()> {

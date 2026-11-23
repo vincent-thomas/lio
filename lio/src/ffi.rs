@@ -138,7 +138,9 @@ unsafe fn handle(ptr: *mut lio_handle_t) -> &'static mut lio_handle_t {
 #[cfg(unix)]
 unsafe fn fd_to_borrowed_resource(fd: libc::intptr_t) -> Resource {
   // SAFETY: caller guarantees fd is valid and will outlive this Resource
-  unsafe { Resource::borrow(fd as RawFd) }
+  // SAFETY: the C caller transferred an open descriptor, or passed a sentinel
+  // the FFI documents. `borrow_raw` does not close it; the FFI owns that.
+  unsafe { Resource::borrow_raw(fd as RawFd) }
 }
 
 /// Convert a `Resource` to a C `intptr_t`.
@@ -251,9 +253,17 @@ impl IoBufMut for CBuf {
     unsafe { std::slice::from_raw_parts_mut(self.base().cast(), self.cap) }
   }
 
-  unsafe fn set_len(&mut self, len: usize) {
-    assert!(len <= self.cap);
-    self.len = len;
+  fn commit(&mut self, initialized: crate::Initialized<'_>) {
+    assert!(
+      initialized.len() <= self.cap,
+      "commit length exceeds the C buffer"
+    );
+    assert_eq!(
+      initialized.as_ptr(),
+      self.base(),
+      "initialized proof does not match this C buffer"
+    );
+    self.len = initialized.len();
   }
 }
 

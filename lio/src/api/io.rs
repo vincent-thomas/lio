@@ -1128,8 +1128,8 @@ mod tests {
   impl OpModel for Counter {
     type Item = u32;
 
-    fn action(&mut self) -> Action {
-      Action::Io(crate::backend::op::Op::Nop)
+    fn action(&mut self) -> Action<'_> {
+      action_io!(crate::backend::op::Op::Nop)
     }
 
     fn complete(&mut self, _: Completion) -> OpResult<u32> {
@@ -1175,8 +1175,8 @@ mod tests {
   impl OpModel for AgainThenDone {
     type Item = u32;
 
-    fn action(&mut self) -> Action {
-      Action::Io(crate::backend::op::Op::Nop)
+    fn action(&mut self) -> Action<'_> {
+      action_io!(crate::backend::op::Op::Nop)
     }
 
     fn complete(&mut self, _: Completion) -> OpResult<u32> {

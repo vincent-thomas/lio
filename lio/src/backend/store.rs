@@ -105,7 +105,7 @@ impl OpStore {
   pub fn insert_with_action(
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
-  ) -> (u64, Option<Action>, &mut Bump) {
+  ) -> (u64, Option<Action<'static>>, &mut Bump) {
     let mut action = None;
     let Some((key, slot)) = self.slots.allocate_with(|slot| {
       slot.model_bump.reset();

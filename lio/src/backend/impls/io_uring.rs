@@ -21,7 +21,9 @@ use lio_uring::{
 use crate::backend::{
   IoBackend, OpCompleted,
   impls::unix_stat::file_type_from_dirent_dtype,
-  op::{DirEntryRef, LinkKind, Op, ReadDirResult, is_valid_file_offset},
+  op::{
+    BorrowedOp, DirEntryRef, LinkKind, Op, ReadDirResult, is_valid_file_offset,
+  },
 };
 use crate::slab::{Slab, SlabKey};
 
@@ -175,8 +177,8 @@ impl ReadDirState {
 }
 
 impl NativeRwState {
-  fn from_raws(
-    iovecs: std::ptr::NonNull<crate::backend::op::RawBuf>,
+  fn from_raws<B: crate::backend::op::ByteSpan>(
+    iovecs: std::ptr::NonNull<B>,
     iov_count: usize,
   ) -> Option<Self> {
     // The native iovec array is fixed-size; a longer list would make the
@@ -193,8 +195,8 @@ impl NativeRwState {
         crate::buf::MAX_IOV_COUNT],
     };
     for (dst, src) in state.iovecs.iter_mut().zip(raws.iter()) {
-      dst.iov_base = src.ptr.cast();
-      dst.iov_len = src.len;
+      dst.iov_base = src.bytes_ptr().cast();
+      dst.iov_len = src.bytes_len();
     }
     Some(state)
   }
@@ -1349,7 +1351,10 @@ impl IoBackend for IoUring {
     Ok(())
   }
 
-  fn push(&mut self, id: u64, op: Op, step_bump: &mut Bump) {
+  unsafe fn push(&mut self, id: u64, op: BorrowedOp<'_>, step_bump: &mut Bump) {
+    // The submission contract keeps these addresses stable; the backend stores
+    // the descriptor, not a borrow of the caller's `BorrowedOp`.
+    let op = op.as_op().clone();
     assert!(
       self.backlog.len() + self.in_flight < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",

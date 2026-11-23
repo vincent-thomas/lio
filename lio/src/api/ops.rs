@@ -63,12 +63,15 @@ fn cstring_to_osstring(path: &CString) -> OsString {
 #[cfg(test)]
 macro_rules! impl_op_model_contract_runtime {
   () => {
-    type Action = Action;
+    type Action = crate::api::op::Action<'static>;
     type Completion = Completion;
     type Result = OpResult<<Self as OpModel>::Item>;
 
     fn action(&mut self) -> Self::Action {
-      <Self as OpModel>::action(self)
+      let action = <Self as OpModel>::action(self);
+      // SAFETY: the contract inspects this action while `self` is still
+      // borrowed and never submits it past that borrow.
+      unsafe { action.erase_lifetime() }
     }
 
     fn complete(&mut self, completion: Self::Completion) -> Self::Result {
@@ -119,8 +122,8 @@ impl Socket {
 impl OpModel for Socket {
   type Item = io::Result<Resource>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Socket {
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Socket {
       domain: self.domain,
       ty: self.ty,
       proto: self.proto,
@@ -148,10 +151,10 @@ impl OpModelContract for Socket {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| {
+      |action: &Action<'static>| {
         matches!(
-          action,
-          Action::Io(Op::Socket {
+          action.as_op(),
+          Some(Op::Socket {
             domain: SockDomain::IPV4,
             ty: SockType::STREAM,
             proto: SockProto::TCP,
@@ -198,8 +201,8 @@ impl Accept {
 impl OpModel for Accept {
   type Item = io::Result<(Resource, SocketAddr)>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Accept {
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Accept {
       fd: self.res.clone(),
       addr: NonNull::from(&mut self.addr),
     })
@@ -300,7 +303,7 @@ impl AcceptUnix {
 impl OpModel for AcceptUnix {
   type Item = io::Result<(Resource, UnixAddr)>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     OpModel::action(&mut self.inner)
   }
 
@@ -330,7 +333,9 @@ impl OpModelContract for AcceptUnix {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
-      |action| matches!(action, Action::Io(Op::Accept { .. })),
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Accept { .. }))
+      },
       |model| {
         model.inner.addr =
           crate::backend::op::unix_socket_addr_buf(b"/tmp/peer.sock").unwrap();
@@ -369,7 +374,9 @@ impl OpModelContract for Accept {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
-      |action| matches!(action, Action::Io(Op::Accept { .. })),
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Accept { .. }))
+      },
       |model| model.stage_peer_addr("127.0.0.1:8080".parse().unwrap()),
       #[cfg(unix)]
       // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
@@ -410,8 +417,8 @@ impl Connect {
 impl OpModel for Connect {
   type Item = std::io::Result<()>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Connect { fd: self.res.clone(), addr: self.addr })
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Connect { fd: self.res.clone(), addr: self.addr })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -438,7 +445,9 @@ impl OpModelContract for Connect {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| matches!(action, Action::Io(Op::Connect { .. })),
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Connect { .. }))
+      },
       Completion::new(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
@@ -467,8 +476,8 @@ impl Bind {
 impl OpModel for Bind {
   type Item = io::Result<()>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Bind { fd: self.res.clone(), addr: self.addr })
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Bind { fd: self.res.clone(), addr: self.addr })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -500,8 +509,8 @@ impl Listen {
 impl OpModel for Listen {
   type Item = io::Result<()>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Listen { fd: self.res.clone(), backlog: self.backlog })
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Listen { fd: self.res.clone(), backlog: self.backlog })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -533,8 +542,8 @@ impl Shutdown {
 impl OpModel for Shutdown {
   type Item = io::Result<()>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Shutdown { fd: self.res.clone(), how: self.how })
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Shutdown { fd: self.res.clone(), how: self.how })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -565,8 +574,8 @@ impl Fsync {
 impl OpModel for Fsync {
   type Item = io::Result<()>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Fsync { fd: self.res.clone() })
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Fsync { fd: self.res.clone() })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -593,7 +602,9 @@ impl OpModelContract for Fsync {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| matches!(action, Action::Io(Op::Fsync { .. })),
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Fsync { .. }))
+      },
       Completion::new(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
@@ -609,8 +620,8 @@ pub struct Nop;
 impl OpModel for Nop {
   type Item = std::io::Result<()>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Nop)
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Nop)
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -638,7 +649,7 @@ impl OpModelContract for Nop {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| matches!(action, Action::Io(Op::Nop)),
+      |action: &Action<'static>| matches!(action.as_op(), Some(Op::Nop)),
       Completion::new(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
@@ -714,7 +725,7 @@ fn offset_out_of_range_error() -> io::Error {
 pub struct Read<B: IoBufMutVec> {
   res: Resource,
   buf: Option<B>,
-  raws: [RawBuf; MAX_IOV_COUNT],
+  raws: [crate::backend::op::RawBufMut<'static>; MAX_IOV_COUNT],
   iov_count: usize,
   offset: Option<u64>,
 }
@@ -730,7 +741,7 @@ impl<B: IoBufMutVec> Read<B> {
     Self {
       res,
       buf: Some(buf),
-      // SAFETY: `RawBuf` is a plain pointer/length pair and is immediately
+      // SAFETY: `RawBufMut` is a plain pointer/length pair and is immediately
       // overwritten before submission.
       raws: unsafe { mem::zeroed() },
       iov_count: 0,
@@ -747,18 +758,20 @@ impl<B: IoBufMutVec> Read<B> {
 impl<B: IoBufMutVec> OpModel for Read<B> {
   type Item = BufResult<usize, B>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     if !is_valid_file_offset(self.offset) {
-      return Action::Io(Op::Nop);
+      return action_io!(Op::Nop);
     }
     let buf = held(self.buf.as_mut());
     self.iov_count = collect_regions(buf, &mut self.raws, |ptr, len| {
       // SAFETY: the region is model-owned storage that stays valid in place
       // until `complete()` consumes the buffer.
-      unsafe { RawBuf::from_raw_parts(ptr.as_ptr(), len) }
+      unsafe {
+        crate::backend::op::RawBufMut::from_raw_parts(ptr.as_ptr(), len)
+      }
     });
 
-    Action::Io(Op::Read {
+    action_io!(Op::Read {
       fd: self.res.clone(),
       iovecs: NonNull::from(&mut self.raws).cast(),
       iov_count: self.iov_count,
@@ -779,9 +792,9 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
       for (i, raw) in self.raws.iter().take(self.iov_count).enumerate() {
         let cap = raw.len;
         let len = remaining.min(cap);
-        // SAFETY: the kernel filled the regions submitted in `action()` in
-        // order, so the first `len <= cap` bytes of region `i` are initialized.
-        unsafe { buf.set_buf_len(i, len) };
+        // The kernel filled the regions submitted in `action()` in order, so
+        // the first `len <= cap` bytes of region `i` are initialized.
+        buf.commit(i, crate::Initialized::new(raw.ptr, cap, len));
         remaining = remaining.saturating_sub(cap);
       }
       Ok(completion.result as usize)
@@ -806,10 +819,8 @@ impl OpModelContract for Read<Vec<u8>> {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
-      |action| {
-        matches!(
-          action,
-          Action::Io(Op::Read {
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Read {
             iov_count: 1,
             offset: None,
             flags,
@@ -842,10 +853,8 @@ impl OpModelContract for Read<(Vec<u8>, Vec<u8>)> {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
-      |action| {
-        matches!(
-          action,
-          Action::Io(Op::Read {
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Read {
             iov_count: 2,
             offset: None,
             flags,
@@ -872,7 +881,7 @@ impl OpModelContract for Read<(Vec<u8>, Vec<u8>)> {
 pub struct Write<B: IoBufVec + std::marker::Send + Sync> {
   res: Resource,
   buf: Option<B>,
-  raws: [RawBuf; MAX_IOV_COUNT],
+  raws: [RawBuf<'static>; MAX_IOV_COUNT],
   offset: Option<u64>,
 }
 
@@ -898,18 +907,23 @@ impl<B: IoBufVec + std::marker::Send + Sync> Write<B> {
 impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
   type Item = BufResult<usize, B>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     if !is_valid_file_offset(self.offset) {
-      return Action::Io(Op::Nop);
+      return action_io!(Op::Nop);
     }
     let buf = held(self.buf.as_ref());
     let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
 
     for (raw, i) in self.raws.iter_mut().zip(0..buf_count) {
-      *raw = RawBuf::new(buf.buf(i));
+      let bytes = buf.buf(i);
+      // SAFETY: `bytes` addresses model-owned storage that stays in place
+      // until `complete` consumes the buffer.
+      *raw = unsafe {
+        RawBuf::from_raw_parts(bytes.as_ptr().cast_mut(), bytes.len())
+      };
     }
 
-    Action::Io(Op::Write {
+    action_io!(Op::Write {
       fd: self.res.clone(),
       iovecs: NonNull::from(&mut self.raws).cast(),
       iov_count: buf_count,
@@ -949,10 +963,8 @@ impl OpModelContract for Write<Vec<u8>> {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| {
-        matches!(
-          action,
-          Action::Io(Op::Write {
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Write {
             iov_count: 1,
             offset: None,
             flags,
@@ -982,10 +994,8 @@ impl OpModelContract for Write<(Vec<u8>, Vec<u8>)> {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| {
-        matches!(
-          action,
-          Action::Io(Op::Write {
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Write {
             iov_count: 2,
             offset: None,
             flags,
@@ -1037,7 +1047,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
     }
   }
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     let buf = held(self.buf.as_mut());
     let buf_count = collect_regions(buf, &mut self.bufs, |ptr, len| {
       // SAFETY: the region is model-owned storage that stays valid in place
@@ -1054,7 +1064,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
       None => MsgRecv::new(regions),
     };
 
-    Action::Io(Op::Recv { fd: self.res.clone(), msg, flags: self.flags })
+    action_io!(Op::Recv { fd: self.res.clone(), msg, flags: self.flags })
   }
 
   fn complete_buf(
@@ -1070,9 +1080,9 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
       for (i, region) in self.bufs.iter().take(self.iov_count).enumerate() {
         let cap = region.len;
         let len = remaining.min(cap);
-        // SAFETY: the kernel filled the regions submitted in `action()` in
-        // order, so the first `len <= cap` bytes of region `i` are initialized.
-        unsafe { buf.set_buf_len(i, len) };
+        // The kernel filled the regions submitted in `action()` in order, so
+        // the first `len <= cap` bytes of region `i` are initialized.
+        buf.commit(i, crate::Initialized::new(region.ptr.as_ptr(), cap, len));
         remaining = remaining.saturating_sub(cap);
       }
       Ok(completion.result as usize)
@@ -1108,7 +1118,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> Recv<B> {
 impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Recv<B> {
   type Item = BufResult<usize, B>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     self.core.action()
   }
 
@@ -1132,7 +1142,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> RecvFrom<B> {
 impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for RecvFrom<B> {
   type Item = (std::io::Result<usize>, B, Option<SocketAddr>);
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     self.core.action()
   }
 
@@ -1162,8 +1172,10 @@ impl OpModelContract for Recv<Vec<u8>> {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
-      |action| match action {
-        Action::Io(Op::Recv { flags, .. }) => *flags == TEST_RECV_FLAGS,
+      |action: &Action<'static>| match action {
+        Action::Io(op) => {
+          matches!(op.as_op(), Op::Recv { flags, .. } if *flags == TEST_RECV_FLAGS)
+        }
         _ => false,
       },
       |model| model.core.stage_recv_data(b"recv"),
@@ -1193,8 +1205,10 @@ impl OpModelContract for Recv<(Vec<u8>, Vec<u8>)> {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
-      |action| match action {
-        Action::Io(Op::Recv { flags, .. }) => *flags == TEST_RECV_FLAGS,
+      |action: &Action<'static>| match action {
+        Action::Io(op) => {
+          matches!(op.as_op(), Op::Recv { flags, .. } if *flags == TEST_RECV_FLAGS)
+        }
         _ => false,
       },
       |model| model.core.stage_recv_data(b"hello"),
@@ -1222,8 +1236,10 @@ impl OpModelContract for RecvFrom<Vec<u8>> {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
-      |action| match action {
-        Action::Io(Op::Recv { flags, .. }) => *flags == TEST_RECV_FLAGS,
+      |action: &Action<'static>| match action {
+        Action::Io(op) => {
+          matches!(op.as_op(), Op::Recv { flags, .. } if *flags == TEST_RECV_FLAGS)
+        }
         _ => false,
       },
       |model| {
@@ -1306,9 +1322,9 @@ impl<B: IoBufVec + std::marker::Send + Sync> Send<B> {
 impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Send<B> {
   type Item = BufResult<usize, B>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     let msg = self.hydrate_msg();
-    Action::Io(Op::Send { fd: self.res.clone(), msg, flags: self.flags })
+    action_io!(Op::Send { fd: self.res.clone(), msg, flags: self.flags })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -1340,8 +1356,10 @@ impl OpModelContract for Send<Vec<u8>> {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| match action {
-        Action::Io(Op::Send { flags, .. }) => *flags == TEST_SEND_FLAGS,
+      |action: &Action<'static>| match action {
+        Action::Io(op) => {
+          matches!(op.as_op(), Op::Send { flags, .. } if *flags == TEST_SEND_FLAGS)
+        }
         _ => false,
       },
       Completion::new(4),
@@ -1371,8 +1389,10 @@ impl OpModelContract for Send<(Vec<u8>, Vec<u8>)> {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| match action {
-        Action::Io(Op::Send { flags, .. }) => *flags == TEST_SEND_FLAGS,
+      |action: &Action<'static>| match action {
+        Action::Io(op) => {
+          matches!(op.as_op(), Op::Send { flags, .. } if *flags == TEST_SEND_FLAGS)
+        }
         _ => false,
       },
       Completion::new(5),
@@ -1407,7 +1427,7 @@ impl Sleep {
 impl OpModel for Sleep {
   type Item = io::Result<()>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     Action::Sleep(self.duration)
   }
 
@@ -1436,7 +1456,7 @@ impl OpModelContract for Sleep {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| matches!(action, Action::Sleep(duration) if *duration == Duration::from_millis(10)),
+      |action: &Action<'static>| matches!(action, Action::Sleep(duration) if *duration == Duration::from_millis(10)),
       Completion::with_flags(0, CompletionFlags::TIMER),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
@@ -1464,7 +1484,7 @@ impl Interval {
 impl OpModel for Interval {
   type Item = io::Result<()>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     Action::Sleep(self.period)
   }
 
@@ -1494,12 +1514,12 @@ impl OpModelContract for Interval {
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![
       ContractStep::new(
-        |action| matches!(action, Action::Sleep(duration) if *duration == Duration::from_millis(5)),
+        |action: &Action<'static>| matches!(action, Action::Sleep(duration) if *duration == Duration::from_millis(5)),
         Completion::with_flags(0, CompletionFlags::TIMER),
         |result| matches!(result, OpResult::Yield(Ok(()))),
       ),
       ContractStep::new(
-        |action| matches!(action, Action::Sleep(duration) if *duration == Duration::from_millis(5)),
+        |action: &Action<'static>| matches!(action, Action::Sleep(duration) if *duration == Duration::from_millis(5)),
         Completion::with_flags(0, CompletionFlags::TIMER),
         |result| matches!(result, OpResult::Yield(Ok(()))),
       ),
@@ -1528,8 +1548,8 @@ impl OpenAt {
 impl OpModel for OpenAt {
   type Item = std::io::Result<Resource>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::OpenAt {
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::OpenAt {
       dir_fd: self.dir_res.clone(),
       path: cstring_to_osstring(&self.pathname),
       flags: self.flags,
@@ -1599,7 +1619,7 @@ impl Stat {
 impl OpModel for Stat {
   type Item = std::io::Result<FileStat>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     let target = match &mut self.target {
       StatModelTarget::Path { dir_res, pathname, follow_symlinks } => {
         StatTarget::Path {
@@ -1609,9 +1629,9 @@ impl OpModel for Stat {
         }
       }
       StatModelTarget::Fd { fd } => StatTarget::Fd { fd: fd.clone() },
-      StatModelTarget::InvalidPath => return Action::Io(Op::Nop),
+      StatModelTarget::InvalidPath => return action_io!(Op::Nop),
     };
-    Action::Io(Op::Stat { target, out: NonNull::from(&mut self.out) })
+    action_io!(Op::Stat { target, out: NonNull::from(&mut self.out) })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -1642,8 +1662,8 @@ impl ReadDir {
 impl OpModel for ReadDir {
   type Item = std::io::Result<ReadDirBuf>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::ReadDir {
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::ReadDir {
       fd: self.fd.clone(),
       raw_buf: NonNull::from(self.buf.raw.as_mut_slice()).cast(),
       raw_cap: self.buf.raw.len(),
@@ -1680,7 +1700,9 @@ impl OpModelContract for ReadDir {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
-      |action| matches!(action, Action::Io(Op::ReadDir { .. })),
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::ReadDir { .. }))
+      },
       |model| {
         model.buf.raw[..5].copy_from_slice(b"child");
         model.buf.entries[0] = crate::backend::op::DirEntryRef {
@@ -1721,10 +1743,10 @@ impl OpModelContract for Stat {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
-      |action| {
+      |action: &Action<'static>| {
         matches!(
-          action,
-          Action::Io(Op::Stat {
+          action.as_op(),
+          Some(Op::Stat {
             target: StatTarget::Path { follow_symlinks: true, .. },
             ..
           })
@@ -1774,8 +1796,8 @@ impl UnlinkAt {
 impl OpModel for UnlinkAt {
   type Item = std::io::Result<()>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::UnlinkAt {
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::UnlinkAt {
       dir_fd: self.dir_res.clone(),
       path: cstring_to_osstring(&self.pathname),
       kind: self.kind,
@@ -1808,10 +1830,10 @@ impl OpModelContract for UnlinkAt {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| {
+      |action: &Action<'static>| {
         matches!(
-          action,
-          Action::Io(Op::UnlinkAt { kind: UnlinkKind::Directory, .. })
+          action.as_op(),
+          Some(Op::UnlinkAt { kind: UnlinkKind::Directory, .. })
         )
       },
       Completion::new(0),
@@ -1841,8 +1863,8 @@ impl RenameAt {
 impl OpModel for RenameAt {
   type Item = std::io::Result<()>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::RenameAt {
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::RenameAt {
       old_dir_fd: self.old_dir_res.clone(),
       old_path: cstring_to_osstring(&self.old_pathname),
       new_dir_fd: self.new_dir_res.clone(),
@@ -1877,7 +1899,9 @@ impl OpModelContract for RenameAt {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| matches!(action, Action::Io(Op::RenameAt { .. })),
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::RenameAt { .. }))
+      },
       Completion::new(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
@@ -1903,8 +1927,8 @@ impl MkdirAt {
 impl OpModel for MkdirAt {
   type Item = std::io::Result<()>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::MkdirAt {
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::MkdirAt {
       dir_fd: self.dir_res.clone(),
       path: cstring_to_osstring(&self.pathname),
       mode: self.mode,
@@ -1937,7 +1961,7 @@ impl OpModelContract for MkdirAt {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| matches!(action, Action::Io(Op::MkdirAt { mode, .. }) if mode.octal() == 0o755),
+      |action: &Action<'static>| matches!(action.as_op(), Some(Op::MkdirAt { mode, .. }) if mode.octal() == 0o755),
       Completion::new(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
     )]
@@ -1967,8 +1991,8 @@ impl LinkAt {
 impl OpModel for LinkAt {
   type Item = std::io::Result<()>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::LinkAt {
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::LinkAt {
       kind: self.kind,
       source_dir_fd: self.source_dir_res.clone(),
       source_path: cstring_to_osstring(&self.source_pathname),
@@ -2005,8 +2029,8 @@ impl OpModelContract for LinkAt {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| {
-        matches!(action, Action::Io(Op::LinkAt { kind: LinkKind::Hard, .. }))
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::LinkAt { kind: LinkKind::Hard, .. }))
       },
       Completion::new(0),
       |result| matches!(result, OpResult::Done(Ok(()))),
@@ -2018,7 +2042,7 @@ pub struct ReadlinkAt<B: IoBufMutVec + std::marker::Send + Sync> {
   dir_res: Resource,
   pathname: CString,
   buf: Option<B>,
-  raw: RawBuf,
+  raw: RawBuf<'static>,
   raw_len: usize,
 }
 
@@ -2038,7 +2062,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> ReadlinkAt<B> {
 impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
   type Item = BufResult<usize, B>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     let buf = held(self.buf.as_mut());
     let mut regions = IoSlicesMut::new();
     buf.bufs_mut(&mut regions);
@@ -2052,7 +2076,7 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
     self.raw = unsafe { RawBuf::from_raw_parts(ptr.as_ptr(), len) };
     self.raw_len = len;
 
-    Action::Io(Op::ReadlinkAt {
+    action_io!(Op::ReadlinkAt {
       dir_fd: self.dir_res.clone(),
       path: cstring_to_osstring(&self.pathname),
       buf: ptr,
@@ -2066,9 +2090,9 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
       Err(completion.os_error())
     } else {
       let len = (completion.result as usize).min(self.raw_len);
-      // SAFETY: the kernel wrote `len <= raw_len` bytes into the region
-      // submitted in `action()`.
-      unsafe { buf.set_buf_len(0, len) };
+      // The kernel wrote `len <= raw_len` bytes into the region submitted
+      // in `action()`.
+      buf.commit(0, crate::Initialized::new(self.raw.ptr, self.raw_len, len));
       Ok(completion.result as usize)
     };
     OpResult::Done((result, buf))
@@ -2094,8 +2118,8 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> GetCwd<B> {
 impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
   type Item = BufResult<usize, B>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::GetCwd { out: NonNull::from(&mut self.out) })
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::GetCwd { out: NonNull::from(&mut self.out) })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -2110,12 +2134,14 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
       let first = regions.into_iter().next();
       match first {
         Some(region) if bytes.len() <= region.len() => {
+          let len = bytes.len();
+          let ptr = region.as_mut_ptr().cast::<u8>();
+          let region_len = region.len();
           for (dst, src) in region.iter_mut().zip(bytes) {
             dst.write(*src);
           }
-          // SAFETY: the first `bytes.len()` bytes of region 0 were just
-          // initialized above.
-          unsafe { buf.set_buf_len(0, bytes.len()) };
+          // The first `len` bytes of region 0 were just initialized above.
+          buf.commit(0, crate::Initialized::new(ptr, region_len, len));
           Ok(bytes.len())
         }
         _ => Err(std::io::Error::from_raw_os_error(
@@ -2142,7 +2168,9 @@ impl OpModelContract for GetCwd<Vec<u8>> {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
-      |action| matches!(action, Action::Io(Op::GetCwd { .. })),
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::GetCwd { .. }))
+      },
       |model| {
         #[cfg(unix)]
         {
@@ -2186,8 +2214,8 @@ impl Spawn {
 impl OpModel for Spawn {
   type Item = std::io::Result<crate::api::Pid>;
 
-  fn action(&mut self) -> Action {
-    Action::Io(Op::Spawn { spec: self.spec.clone() })
+  fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Spawn { spec: self.spec.clone() })
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
@@ -2219,7 +2247,9 @@ impl OpModelContract for Spawn {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::new(
-      |action| matches!(action, Action::Io(Op::Spawn { .. })),
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Spawn { .. }))
+      },
       Completion::new(1234),
       |result: &OpResult<std::io::Result<crate::api::Pid>>| matches!(result, OpResult::Done(Ok(pid)) if pid.as_raw() == 1234),
     )]
@@ -2243,7 +2273,9 @@ impl OpModelContract for ReadlinkAt<Vec<u8>> {
 
   fn contract_steps() -> Vec<ContractStep<Self>> {
     vec![ContractStep::with_setup(
-      |action| matches!(action, Action::Io(Op::ReadlinkAt { .. })),
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::ReadlinkAt { .. }))
+      },
       |model| {
         model.buf.as_mut().expect("buffer available")[..4]
           .copy_from_slice(b"dest");
@@ -2431,7 +2463,10 @@ mod tests {
   fn empty_buffer_collections_submit_one_empty_region() {
     let mut send =
       Send::new(Resource::stdin(), Vec::<Vec<u8>>::new(), None, None);
-    let Action::Io(Op::Send { msg, .. }) = OpModel::action(&mut send) else {
+    let Action::Io(op) = OpModel::action(&mut send) else {
+      panic!("send must submit a send");
+    };
+    let Op::Send { msg, .. } = op.as_op() else {
       panic!("send must submit a send");
     };
     assert_eq!(msg.buf_count.get(), 1);
@@ -2439,7 +2474,10 @@ mod tests {
     assert_eq!(unsafe { msg.bufs.as_ref() }.len, 0);
 
     let mut recv = Recv::new(Resource::stdin(), Vec::<Vec<u8>>::new(), None);
-    let Action::Io(Op::Recv { msg, .. }) = OpModel::action(&mut recv) else {
+    let Action::Io(op) = OpModel::action(&mut recv) else {
+      panic!("recv must submit a recv");
+    };
+    let Op::Recv { msg, .. } = op.as_op() else {
       panic!("recv must submit a recv");
     };
     assert_eq!(msg.buf_count.get(), 1);

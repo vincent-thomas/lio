@@ -32,6 +32,63 @@ pub(crate) const BUFFER_TOO_SMALL: i32 = libc::ERANGE;
 pub(crate) const BUFFER_TOO_SMALL: i32 =
   windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER as i32;
 
+/// A descriptor/handle that is never open. Borrowing it does not close
+/// anything; submitting I/O on it fails with a bad-handle error.
+#[cfg(unix)]
+pub(crate) const INVALID: RawResource = -1;
+
+/// A descriptor/handle that is never open. Borrowing it does not close
+/// anything; submitting I/O on it fails with a bad-handle error.
+#[cfg(windows)]
+pub(crate) const INVALID: RawResource = std::ptr::null_mut();
+
+/// Whether `raw` can be a real OS descriptor/handle rather than a sentinel
+/// (`AT_FDCWD`, the invalid placeholder, or a Windows pseudo-handle stand-in).
+#[cfg(unix)]
+pub(crate) const fn is_os_descriptor(raw: RawResource) -> bool {
+  raw >= 0
+}
+
+/// Whether `raw` can be a real OS descriptor/handle rather than a sentinel.
+#[cfg(windows)]
+pub(crate) fn is_os_descriptor(raw: RawResource) -> bool {
+  !raw.is_null() && raw != CWD
+}
+
+/// Duplicates an open descriptor/handle. The caller owns the result.
+pub(crate) fn duplicate(raw: RawResource) -> std::io::Result<RawResource> {
+  #[cfg(unix)]
+  {
+    // SAFETY: `dup` only requires a descriptor number; a bad one returns
+    // `EBADF` and does not touch other descriptors.
+    let fd = unsafe { libc::dup(raw) };
+    if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(fd) }
+  }
+  #[cfg(windows)]
+  {
+    use std::io;
+    use windows_sys::Win32::Foundation::{
+      DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut out: HANDLE = std::ptr::null_mut();
+    // SAFETY: duplicating the process's own handle. Failure leaves `out`
+    // untouched and is reported as an error; success transfers one new handle.
+    let ok = unsafe {
+      DuplicateHandle(
+        GetCurrentProcess(),
+        raw,
+        GetCurrentProcess(),
+        &mut out,
+        0,
+        0,
+        DUPLICATE_SAME_ACCESS,
+      )
+    };
+    if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(out) }
+  }
+}
+
 /// Closes a native descriptor/handle.
 ///
 /// # Safety

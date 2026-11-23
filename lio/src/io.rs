@@ -175,7 +175,7 @@ impl Copy {
 impl OpModel for Copy {
   type Item = io::Result<u64>;
 
-  fn action(&mut self) -> Action {
+  fn action(&mut self) -> Action<'_> {
     match &mut self.state {
       CopyState::Reading(read) => read.action(),
       CopyState::Writing(write) => write.action(),
@@ -270,10 +270,12 @@ impl IoBufMut for CappedBuf {
     &mut self.buf.as_uninit_mut()[..cap]
   }
 
-  unsafe fn set_len(&mut self, len: usize) {
-    // SAFETY: `len <= self.cap <= capacity`, and the caller guarantees the
-    // first `len` bytes are initialized.
-    unsafe { IoBufMut::set_len(&mut self.buf, len) }
+  fn commit(&mut self, initialized: crate::Initialized<'_>) {
+    assert!(
+      initialized.len() <= self.cap,
+      "commit length exceeds the capped buffer"
+    );
+    initialized.apply_to_vec(&mut self.buf);
   }
 }
 
