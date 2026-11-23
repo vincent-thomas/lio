@@ -752,9 +752,7 @@ enum NetOp {
     fd: crate::api::resource::Resource,
     how: crate::backend::op::ShutdownHow,
   },
-  Fsync {
-    fd: crate::api::resource::Resource,
-  },
+  Fsync,
 }
 
 fn lower_net(op: &Op) -> NetOp {
@@ -791,7 +789,7 @@ fn lower_net(op: &Op) -> NetOp {
       NetOp::Listen { fd: fd.clone(), backlog: *backlog }
     }
     Op::Shutdown { fd, how } => NetOp::Shutdown { fd: fd.clone(), how: *how },
-    Op::Fsync { fd } => NetOp::Fsync { fd: fd.clone() },
+    Op::Fsync { .. } => NetOp::Fsync,
     _ => unreachable!("only network operations are lowered for the cluster"),
   }
 }
@@ -4136,7 +4134,7 @@ impl DSTBackend {
         }
         self.node.borrow_mut().ready.push(OpCompleted::new(id, 0));
       }
-      NetOp::Fsync { .. } => {
+      NetOp::Fsync => {
         self
           .node
           .borrow_mut()
