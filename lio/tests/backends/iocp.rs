@@ -13,7 +13,7 @@ fn notify_wakes_a_blocked_wait() {
     .wait(
       Some(Duration::from_secs(5)),
       &mut completed,
-      &mut crate::backend::loan::Attested::new(),
+      &mut lio::backend::loan::Attested::new(),
     )
     .unwrap();
   assert!(completed.is_empty(), "a wake-up is not an op completion");
@@ -47,7 +47,7 @@ fn drop_cancels_a_blocked_pipe_read() {
   };
   // SAFETY: `buf` stays alive until this backend is dropped.
   unsafe { lio::backend::loan::Attested::remember(1, flight.as_op()) };
-  let mut view = crate::backend::loan::OpView::new(flight.as_op());
+  let mut view = lio::backend::loan::OpView::new(flight.as_op());
   backend.push(1, flight.keep(), &mut view, &mut bumpalo::Bump::new());
   backend.flush(&mut lio::backend::loan::Attested::new()).unwrap();
   // Give a worker time to block in ReadFile on the empty pipe.
