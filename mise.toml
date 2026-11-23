@@ -33,6 +33,75 @@ fi
 '''
 run_windows = "git rev-parse --is-inside-work-tree >NUL 2>&1 && git submodule sync && git submodule update --init"
 
+# One command surface. Local and GitHub run these tasks.
+# A failed task fails the job.
+#
+# Pull request and main: no-debug-assert, fmt, check, check-clean (Linux),
+# clippy, test, and mutants-diff (pull requests).
+# Nightly: search, miri, mutants.
+# Release: release (runs test first).
+
+[tasks.fmt]
+description = "Fail if rustfmt would change a file."
+run = "cargo fmt --check"
+
+[tasks.check]
+description = "Type-check every target. Skip lio-uring off Linux. Skip busybox on Windows."
+env = { RUSTFLAGS = "-Dwarnings" }
+run = "cargo check --workspace --all-targets{% if os() != 'linux' %} --exclude lio-uring{% endif %}{% if os() == 'windows' %} --exclude busybox --features lio/high{% else %} --all-features{% endif %}"
+
+[tasks.check-clean]
+description = "On Linux, a second cargo check must compile nothing. Same flags as check."
+env = { RUSTFLAGS = "-Dwarnings" }
+run = "scripts/check-clean.sh"
+
+[tasks.clippy]
+description = "Clippy, with the same packages and features as check."
+env = { RUSTFLAGS = "-Dwarnings" }
+run = "cargo clippy --workspace --all-targets{% if os() != 'linux' %} --exclude lio-uring{% endif %}{% if os() == 'windows' %} --exclude busybox --features lio/high{% else %} --all-features{% endif %}"
+
+[tasks.test]
+description = "Library and integration tests with high, plus doctests. Includes this OS's backends."
+env = { RUSTFLAGS = "-Dwarnings" }
+run = [
+  "cargo test -p lio --features high --tests",
+  "cargo test --doc -p lio -p lio-test{% if os() == 'windows' %} --features lio/high{% else %} --all-features{% endif %}",
+]
+
+[tasks.no-debug-assert]
+description = "Reject debug_assert!. It is compiled out of release builds."
+run = "scripts/no-debug-assert.sh"
+
+[tasks.mutants-diff]
+description = "Fail if a mutant in the diff survives. CI sets GITHUB_BASE_REF. Locally set BASE."
+run = "scripts/mutants-diff.sh"
+
+[tasks.search]
+description = "Model and lifecycle tests at the nightly sizes."
+env = { PROPTEST_CASES = "20000", LIO_LIFECYCLE_DEPTH = "8" }
+run = "cargo test -p lio --release --lib -- model lifecycle"
+
+[tasks.miri]
+description = "Core bookkeeping under Miri. Honors SEED, BORROWS, MIRIFLAGS, and SHARD."
+run = "scripts/test-miri.sh"
+
+[tasks.mutants]
+description = "Every core mutant from .cargo/mutants.toml. Set SHARD=k/n for one slice."
+run = "scripts/mutants.sh"
+
+[tasks.ffi]
+description = "Build the C ABI and compile the FFI tests. Needs clang++ or g++ on PATH. Not a CI job."
+run = "scripts/test-ffi.sh"
+
+[tasks.lint]
+description = "fmt, check, clippy, then cargo-deny."
+run = [
+  "mise run fmt",
+  "mise run check",
+  "mise run clippy",
+  "cargo deny check",
+]
+
 [tasks.bench]
 description = "Bookkeeping (no kernel I/O), then each real backend"
 run = [
@@ -40,23 +109,11 @@ run = [
   "cargo bench -p lio --bench backends",
 ]
 
-[tasks.lint]
-run = [
-  "cargo fmt --check",
-  "cargo check --all-features",
-  "cargo clippy --all-features",
-  "cargo deny check"
-]
-
-[tasks.check]
-description = "fmt --check, then cargo check. Skip lio-uring off Linux, and busybox on Windows."
-run = [
-  "cargo fmt --check",
-  "cargo check --workspace{% if os() != 'linux' %} --exclude lio-uring{% endif %}{% if os() == 'windows' %} --exclude busybox{% endif %}",
-]
-
 [tasks.cbuild]
+description = "Build the C ABI as a release dylib and staticlib."
 run = "cargo rustc -p lio --crate-type dylib,staticlib --features unstable_ffi --release"
 
-[tasks.test]
-run = "cargo test"
+[tasks.release]
+description = "Run test, then bump, tag, and publish. Set BUMP to patch, minor, or major."
+depends = ["test"]
+run = "scripts/release.sh"

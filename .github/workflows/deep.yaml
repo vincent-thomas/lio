@@ -1,8 +1,7 @@
 name: Deep tests
 
-# The searches CI runs small on every PR, run large: more random cases,
-# deeper lifecycle orderings, Miri across many seeds, and every mutant of
-# the core rather than only those in a diff.
+# Nightly sizes, Miri, and every core mutant. These are slow, so they are
+# not on the pull-request path. A failed task fails the job.
 on:
   schedule:
     - cron: "0 3 * * *"
@@ -20,21 +19,24 @@ jobs:
         with:
           submodules: true
 
-      # Rust and the other dev tools come from mise.toml.
+      # Checked downloads. The action does not restore an install tree.
+      # https://mise.jdx.dev/continuous-integration.html#trusted-cache
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/mise/downloads-cas
+          key: mise-downloads-${{ runner.os }}-${{ hashFiles('mise.lock') }}
+
       - uses: jdx/mise-action@v5
         with:
           version: "2026.11.12"
+          cache: false
 
-      - name: model and lifecycle tests, large
-        env:
-          PROPTEST_CASES: "20000"
-          LIO_LIFECYCLE_DEPTH: "8"
-        run: cargo test -p lio --release --lib -- model lifecycle
+      - name: search
+        run: mise run search
 
-  # Each borrow model's tests run in four parts side by side, under one
-  # seed per run. The seed moves on with every run, so nightly runs keep
-  # trying new ones instead of repeating the same few. SHARD deals the
-  # sorted tests out in turn, so the heavy lifecycle pairings split evenly.
+  # Each borrow model runs in four parts, under one seed per workflow run.
+  # The seed moves with the run number. SHARD deals the sorted tests out
+  # in turn, so the heavy lifecycle pairings split evenly.
   miri:
     name: miri-${{ matrix.borrows }}-part-${{ matrix.part }}
     runs-on: ubuntu-latest
@@ -49,29 +51,28 @@ jobs:
         with:
           submodules: true
 
-      # Rust and the other dev tools come from mise.toml, including nightly Miri.
+      # Checked downloads. The action does not restore an install tree.
+      # https://mise.jdx.dev/continuous-integration.html#trusted-cache
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/mise/downloads-cas
+          key: mise-downloads-${{ runner.os }}-${{ hashFiles('mise.lock') }}
+
       - uses: jdx/mise-action@v5
         with:
           version: "2026.11.12"
+          cache: false
 
-      # Restores dependency builds, so the first build starts warm.
       - uses: Swatinem/rust-cache@v2
         with:
           key: miri
 
-      - name: miri (core bookkeeping)
+      - name: miri
         env:
           BORROWS: ${{ matrix.borrows == 'tree' && '-Zmiri-tree-borrows' || '' }}
           SEED: ${{ github.run_number }}
-          PROPTEST_CASES: "16"
-          # Each ordering is a fresh driver, so keep it shallow under Miri.
-          LIO_LIFECYCLE_DEPTH: "2"
-          RUSTFLAGS: ""
           SHARD: ${{ matrix.part }}/4
-        run: |
-          echo "Miri seed $SEED"
-          MIRIFLAGS="-Zmiri-seed=$SEED $BORROWS" \
-            scripts/test-miri.sh
+        run: mise run miri
 
   mutants:
     name: mutants-${{ matrix.shard }}
@@ -87,30 +88,26 @@ jobs:
         with:
           submodules: true
 
-      # Rust and cargo-mutants come from mise.toml.
+      # Checked downloads. The action does not restore an install tree.
+      # https://mise.jdx.dev/continuous-integration.html#trusted-cache
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/mise/downloads-cas
+          key: mise-downloads-${{ runner.os }}-${{ hashFiles('mise.lock') }}
+
       - uses: jdx/mise-action@v5
         with:
           version: "2026.11.12"
+          cache: false
 
-      # Restores dependency builds, so the first build starts warm.
       - uses: Swatinem/rust-cache@v2
         with:
           key: mutants
 
-      - name: every core mutant, shard ${{ matrix.shard }} of 11
+      - name: mutants
         env:
-          # A mutant is almost always caught within a few cases; the deep
-          # search job runs the large searches.
-          PROPTEST_CASES: "64"
-          LIO_LIFECYCLE_DEPTH: "4"
-          # Each mutant is a rebuild; debug info only slows compiling and
-          # linking.
-          CARGO_PROFILE_DEV_DEBUG: "0"
-        # A mutant can loop while allocating. Capping each process's address
-        # space (8 GiB) makes that test fail instead of taking the runner down.
-        run: |
-          ulimit -v 8388608
-          cargo mutants --shard ${{ matrix.shard }}/11 --no-shuffle --jobs 2
+          SHARD: ${{ matrix.shard }}/11
+        run: mise run mutants
 
       - uses: actions/upload-artifact@v7
         if: always()
