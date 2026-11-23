@@ -48,7 +48,7 @@ use criterion::{
 };
 use lio::api::op::{Action, Completion, OpModel, OpResult, StreamOpModel};
 use lio::api::resource::Resource;
-use lio::backend::op::BorrowedOp;
+use lio::backend::op::{BorrowedOp, Op};
 use lio::backend::{IoBackend, OpCompleted};
 use lio::time::Clock;
 use lio::{Lio, api};
@@ -77,8 +77,6 @@ struct BenchBackend {
   queued: Vec<(u64, isize)>,
   ready: Vec<(u64, isize)>,
   hold: bool,
-  /// Completion result for every op. The bench does not read the lent op.
-  result: isize,
   slots: Vec<u8>,
   slot_id: Vec<u64>,
 }
@@ -90,7 +88,8 @@ impl BenchBackend {
   }
 }
 
-impl IoBackend for BenchBackend {
+// SAFETY: it never dereferences an address, so no lease needs to be held.
+unsafe impl IoBackend for BenchBackend {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.queued.reserve(cap);
     self.ready.reserve(cap);
@@ -104,11 +103,14 @@ impl IoBackend for BenchBackend {
   fn push(
     &mut self,
     id: u64,
-    _keep: lio::backend::Keep,
-    _view: &mut lio::backend::loan::OpView<'_>,
+    op: lio::backend::InFlight<'_>,
     _step_bump: &mut Bump,
   ) {
-    let result = self.result;
+    let result = match op.as_op() {
+      Op::Nop => 0,
+      Op::Read { .. } => BUFFER_LEN as isize,
+      _ => panic!("bench backend only supports nop and read"),
+    };
     if self.hold {
       let slot = id as u32 as usize;
       assert!(
@@ -126,7 +128,7 @@ impl IoBackend for BenchBackend {
     }
   }
 
-  fn flush(&mut self, _: &mut dyn lio::backend::loan::Loan) -> io::Result<()> {
+  fn flush(&mut self) -> io::Result<()> {
     if self.hold {
       for state in &mut self.slots {
         if *state == SLOT_QUEUED {
@@ -164,7 +166,6 @@ impl IoBackend for BenchBackend {
     &mut self,
     _timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
-    _: &mut dyn lio::backend::loan::Loan,
   ) -> io::Result<()> {
     completed.clear();
     completed.extend(
@@ -190,19 +191,14 @@ fn no_driver(criterion: &mut Criterion) {
         bencher.iter(|| {
           for id in 0..depth as u64 {
             // SAFETY: a no-op borrows nothing.
-            let flight =
-              unsafe { lio::backend::InFlight::attest(BorrowedOp::nop()) };
-            let mut view = lio::backend::loan::OpView::new(flight.as_op());
-            backend.push(id, flight.keep(), &mut view, &mut bump);
+            backend.push(
+              id,
+              unsafe { lio::backend::InFlight::attest(BorrowedOp::nop()) },
+              &mut bump,
+            );
           }
-          backend.flush(&mut lio::backend::loan::Attested::new()).unwrap();
-          backend
-            .wait(
-              Some(Duration::ZERO),
-              &mut completed,
-              &mut lio::backend::loan::Attested::new(),
-            )
-            .unwrap();
+          backend.flush().unwrap();
+          backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
           assert_eq!(completed.len(), depth);
           black_box(&completed);
         });
@@ -278,11 +274,7 @@ fn buffer(criterion: &mut Criterion) {
   // reads it.
   let file = Resource::stdout();
   for depth in QUEUE_DEPTHS {
-    let lio = Lio::new_with_backend(
-      BenchBackend { result: BUFFER_LEN as isize, ..BenchBackend::default() },
-      depth,
-    )
-    .unwrap();
+    let lio = Lio::new_with_backend(BenchBackend::default(), depth).unwrap();
     let buffers = Rc::new(RefCell::new(
       (0..depth).map(|_| vec![0u8; BUFFER_LEN]).collect::<Vec<_>>(),
     ));

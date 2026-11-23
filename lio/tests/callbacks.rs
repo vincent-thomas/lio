@@ -259,7 +259,8 @@ struct InOrderBackend {
   queued: Vec<u64>,
 }
 
-impl lio::backend::IoBackend for InOrderBackend {
+// SAFETY: it never dereferences an address, so no lease needs to be held.
+unsafe impl lio::backend::IoBackend for InOrderBackend {
   fn init(&mut self, _cap: usize) -> std::io::Result<()> {
     Ok(())
   }
@@ -267,17 +268,13 @@ impl lio::backend::IoBackend for InOrderBackend {
   fn push(
     &mut self,
     id: u64,
-    _keep: lio::backend::Keep,
-    _view: &mut lio::backend::loan::OpView<'_>,
+    _op: lio::backend::InFlight<'_>,
     _step_bump: &mut bumpalo::Bump,
   ) {
     self.queued.push(id);
   }
 
-  fn flush(
-    &mut self,
-    _loan: &mut dyn lio::backend::loan::Loan,
-  ) -> std::io::Result<()> {
+  fn flush(&mut self) -> std::io::Result<()> {
     Ok(())
   }
 
@@ -285,7 +282,6 @@ impl lio::backend::IoBackend for InOrderBackend {
     &mut self,
     timeout: Option<Duration>,
     completed: &mut Vec<lio::backend::OpCompleted>,
-    _loan: &mut dyn lio::backend::loan::Loan,
   ) -> std::io::Result<()> {
     completed.clear();
     if self.queued.is_empty() {

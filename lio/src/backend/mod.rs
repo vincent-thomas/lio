@@ -31,21 +31,14 @@
 //! // `Lio` calls `InFlight::from_model` while that model is borrowed.
 //! // SAFETY: this nop has no buffer for the backend to retain.
 //! let op = unsafe { InFlight::attest(BorrowedOp::nop()) };
-//! let mut view = lio::backend::loan::OpView::new(op.as_op());
-//! backend.push(1, op.keep(), &mut view, &mut bumpalo::Bump::new());
-//! // SAFETY: `op` stays alive through `flush` and `wait`.
-//! unsafe { lio::backend::loan::Attested::remember(1, op.as_op()) };
-//! let mut loan = lio::backend::loan::Attested::new();
-//! backend.flush(&mut loan).unwrap();
+//! backend.push(1, op, &mut bumpalo::Bump::new());
+//! backend.flush().unwrap();
 //!
 //! let mut completions = Vec::new();
-//! backend
-//!   .wait(Some(Duration::ZERO), &mut completions, &mut loan)
-//!   .unwrap();
+//! backend.wait(Some(Duration::ZERO), &mut completions).unwrap();
 //! ```
 
 pub mod ds;
-pub mod loan;
 pub mod op;
 pub mod testing;
 
@@ -194,12 +187,24 @@ impl OpCompleted {
 /// # Usage
 ///
 /// [`Lio`](crate::Lio) is what submits. It owns the op model, and the model
-/// owns the buffers. [`push`](IoBackend::push) receives an
-/// [`OpView`](loan::OpView) for that call. Later [`flush`](IoBackend::flush)
-/// and [`wait`](IoBackend::wait) look the model up through
-/// [`Loan`](loan::Loan). The backend stores the id, the [`Keep`], and its
-/// own lowered kernel state.
-pub trait IoBackend {
+/// owns the buffers. While that model is borrowed, the driver builds an
+/// [`InFlight`] and passes it to [`push`](IoBackend::push). The borrow is
+/// what ties the operation to the memory the backend may keep using until
+/// the completion comes back.
+///
+/// # Safety
+///
+/// The driver frees an op model's buffers based on what the backend reports.
+/// The compiler cannot check that, so the implementor must uphold it:
+///
+/// - Store the [`Keep`] from [`push`](IoBackend::push) for as long as this
+///   backend, the kernel, or a worker thread may use an address copied from
+///   that [`Op`].
+/// - Report each pushed operation at most once from [`wait`](IoBackend::wait),
+///   and only after nothing outside the backend can use its addresses.
+/// - Return `true` from [`drain`](IoBackend::drain) only when the kernel and
+///   every worker thread are finished with every pushed address.
+pub unsafe trait IoBackend {
   /// Initialize backend with capacity for `cap` concurrent operations.
   ///
   /// Pre-allocates all resources for zero-allocation runtime.
@@ -220,25 +225,17 @@ pub trait IoBackend {
   ///
   /// Call `flush()` to submit queued operations.
   ///
-  /// `keep` pins the caller's model until the backend drops it. `view` is the
-  /// portable operation for this call. Copy an address into the backend's
-  /// kernel structure before `view` ends.
-  /// [`drain`](IoBackend::drain) still reports whether the kernel and any
-  /// worker are finished with those addresses. They do not hold a [`Keep`].
-  /// A `false` drain means the model must not be freed.
-  fn push(
-    &mut self,
-    id: u64,
-    keep: Keep,
-    view: &mut loan::OpView<'_>,
-    step_bump: &mut Bump,
-  );
+  /// `op` borrows the op model that owns its buffers. [`Lio`](crate::Lio)
+  /// builds it with [`InFlight::from_model`](InFlight::from_model) while that
+  /// model is borrowed. Take [`InFlight::into_parts`] and store the [`Keep`]
+  /// for as long as any address copied from the [`Op`] is used. The driver
+  /// frees the model when it holds the last [`Keep`]. [`drain`](IoBackend::drain)
+  /// still has to stop kernel and worker threads, which do not hold a
+  /// [`Keep`].
+  fn push(&mut self, id: u64, op: InFlight<'_>, step_bump: &mut Bump);
 
   /// Submit all queued operations to kernel.
-  ///
-  /// `loan` is how a submit fills a kernel structure from the caller's
-  /// buffer. The view does not outlive the callback.
-  fn flush(&mut self, loan: &mut dyn loan::Loan) -> io::Result<()>;
+  fn flush(&mut self) -> io::Result<()>;
 
   /// Asks the backend to finish operation `id` early: its consumer is gone.
   ///
@@ -284,7 +281,6 @@ pub trait IoBackend {
     &mut self,
     timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
-    loan: &mut dyn loan::Loan,
   ) -> io::Result<()>;
 }
 
@@ -313,8 +309,7 @@ impl Keep {
 /// One operation borrowed from the op model that owns its buffers.
 ///
 /// [`Lio`](crate::Lio) builds this with [`from_model`](Self::from_model)
-/// while that model is borrowed, then lends [`as_op`](Self::as_op) to
-/// [`IoBackend::push`]. The
+/// while that model is borrowed, then passes it to [`IoBackend::push`]. The
 /// model stays pinned in the driver until the last [`Keep`] is dropped. A
 /// buffer that lives only on the caller's stack cannot be turned into an
 /// `InFlight` without [`attest`](Self::attest), because nothing would keep
@@ -343,22 +338,24 @@ impl<'a> InFlight<'a> {
   /// # Safety
   ///
   /// The addresses in `op` stay allocated and unmoved, and nothing but the
-  /// backend mutates them, until this value is dropped. The backend does not
-  /// receive those addresses. [`loan`](Self::loan) shows them for one call.
-  /// This keep is not tied to a driver registration.
+  /// backend mutates them, until every [`Keep`] from [`into_parts`](Self::into_parts)
+  /// is dropped. This keep is not tied to a driver registration.
   pub unsafe fn attest(op: BorrowedOp<'a>) -> Self {
     Self { op, keep: Keep::new() }
   }
 
-  /// The attested operation. Tests use it with [`Attested::remember`](loan::Attested::remember).
+  /// The operation the backend copies addresses out of.
   #[inline]
   pub fn as_op(&self) -> &Op {
     self.op.as_op()
   }
 
-  /// The lease the backend stores so the model is not freed early.
+  /// The operation and the lease that keeps its buffers allocated.
+  ///
+  /// Store the [`Keep`] with every copy of the addresses. Drop it when those
+  /// copies are gone.
   #[inline]
-  pub fn keep(&self) -> Keep {
-    self.keep.clone()
+  pub fn into_parts(self) -> (Op, Keep) {
+    (self.op.as_op().clone(), self.keep)
   }
 }

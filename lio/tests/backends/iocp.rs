@@ -9,13 +9,7 @@ fn notify_wakes_a_blocked_wait() {
   backend.notify().unwrap();
 
   let mut completed = Vec::new();
-  backend
-    .wait(
-      Some(Duration::from_secs(5)),
-      &mut completed,
-      &mut lio::backend::loan::Attested::new(),
-    )
-    .unwrap();
+  backend.wait(Some(Duration::from_secs(5)), &mut completed).unwrap();
   assert!(completed.is_empty(), "a wake-up is not an op completion");
 }
 
@@ -37,19 +31,19 @@ fn drop_cancels_a_blocked_pipe_read() {
   let mut backend = Iocp::new();
   backend.init(8).unwrap();
   // SAFETY: `buf` stays alive until this backend is dropped.
-  let flight = unsafe {
-    lio::backend::InFlight::attest(lio::backend::op::BorrowedOp::read(
-      reader,
-      std::slice::from_ref(&raw),
-      None,
-      ReadFlags::empty(),
-    ))
-  };
-  // SAFETY: `buf` stays alive until this backend is dropped.
-  unsafe { lio::backend::loan::Attested::remember(1, flight.as_op()) };
-  let mut view = lio::backend::loan::OpView::new(flight.as_op());
-  backend.push(1, flight.keep(), &mut view, &mut bumpalo::Bump::new());
-  backend.flush(&mut lio::backend::loan::Attested::new()).unwrap();
+  unsafe {
+    backend.push(
+      1,
+      lio::backend::InFlight::attest(lio::backend::op::BorrowedOp::read(
+        reader,
+        std::slice::from_ref(&raw),
+        None,
+        ReadFlags::empty(),
+      )),
+      &mut bumpalo::Bump::new(),
+    );
+  }
+  backend.flush().unwrap();
   // Give a worker time to block in ReadFile on the empty pipe.
   std::thread::sleep(Duration::from_millis(50));
 
