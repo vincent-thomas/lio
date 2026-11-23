@@ -619,34 +619,26 @@ impl Resource {
     Arc::strong_count(&self.0)
   }
 
-  /// Checks if this is the last reference to the resource.
+  /// Whether dropping this value closes the underlying descriptor.
   ///
-  /// When this returns `true`, dropping this `Resource` will cause the underlying
-  /// file descriptor or handle to be closed. This is useful for determining when
-  /// cleanup will occur.
-  ///
-  /// # Returns
-  ///
-  /// `true` if this is the only remaining reference (count == 1), meaning the
-  /// resource will be closed when this `Resource` is dropped.
+  /// That is true only for the last clone of an owned resource. A borrowed
+  /// resource never closes: stdout, stdin, stderr, [`cwd`](Self::cwd), and
+  /// [`invalid`](Self::invalid).
   ///
   /// # Examples
   ///
   /// ```
   /// use lio::api::resource::Resource;
   ///
-  /// let resource = Resource::stdout();
-  /// assert!(resource.will_close()); // Only reference
+  /// let stdout = Resource::stdout();
+  /// assert!(!stdout.will_close());
   ///
-  /// let clone = resource.clone();
-  /// assert!(!resource.will_close()); // Multiple references
+  /// let clone = stdout.clone();
+  /// assert!(!stdout.will_close());
   /// assert!(!clone.will_close());
-  ///
-  /// drop(clone);
-  /// assert!(resource.will_close()); // Last reference again
   /// ```
   pub fn will_close(&self) -> bool {
-    self.count() == 1
+    self.0.close.is_some() && self.count() == 1
   }
 }
 
@@ -676,6 +668,11 @@ mod tests {
 
     // Borrowed: dropping it must not close the process stdout.
     drop(stdout);
+    assert!(!Resource::stdout().will_close());
+    assert!(!Resource::stdin().will_close());
+    assert!(!Resource::stderr().will_close());
+    assert!(!Resource::cwd().will_close());
+    assert!(!Resource::invalid().will_close());
   }
 
   #[test]

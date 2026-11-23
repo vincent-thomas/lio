@@ -480,33 +480,27 @@ mod tests {
   fn poisons_received_bytes_and_reads_sent_bytes() {
     let (backend, mut checked) = init(2);
     let mut into = [0u8; 8];
-    let read_buf = [RawBuf::from_mut(&mut into)];
+    let read_buf = [crate::backend::op::RawBufMut::from_mut(&mut into)];
     let from = *b"payload!";
     let write_buf = [RawBuf::new(&from)];
-    let op = |iovecs: &[RawBuf<'_>; 1], write: bool| {
-      let iovecs = ptr::NonNull::from(&iovecs[0]).cast::<RawBuf<'static>>();
-      let fd = crate::api::resource::Resource::stdout();
-      if write {
-        Op::Write {
-          fd,
-          iovecs,
-          iov_count: 1,
-          offset: None,
-          flags: Default::default(),
-        }
-      } else {
-        Op::Read {
-          fd,
-          iovecs,
-          iov_count: 1,
-          offset: None,
-          flags: Default::default(),
-        }
-      }
+    let fd = crate::api::resource::Resource::stdout();
+    let read = Op::Read {
+      fd: fd.clone(),
+      iovecs: ptr::NonNull::from(&read_buf[0]).cast(),
+      iov_count: 1,
+      offset: None,
+      flags: Default::default(),
+    };
+    let write = Op::Write {
+      fd,
+      iovecs: ptr::NonNull::from(&write_buf[0]).cast(),
+      iov_count: 1,
+      offset: None,
+      flags: Default::default(),
     };
 
-    push_op(&mut checked, 1, op(&read_buf, false));
-    push_op(&mut checked, 2, op(&write_buf, true));
+    push_op(&mut checked, 1, read);
+    push_op(&mut checked, 2, write);
     backend.complete_all(8);
     assert_eq!(into, [POISON; 8]);
     assert_eq!(&from, b"payload!", "sent bytes are only read");
@@ -514,9 +508,12 @@ mod tests {
   }
 
   /// A read of one byte into `into`.
-  fn read_into(into: &mut u8, iovec: &mut RawBuf<'_>) -> Op {
+  fn read_into(
+    into: &mut u8,
+    iovec: &mut crate::backend::op::RawBufMut<'_>,
+  ) -> Op {
     // SAFETY: `into` is one live byte, and the caller keeps it for the read.
-    *iovec = unsafe { RawBuf::from_raw_parts(into, 1) };
+    *iovec = unsafe { crate::backend::op::RawBufMut::from_raw_parts(into, 1) };
     Op::Read {
       fd: crate::api::resource::Resource::stdout(),
       iovecs: ptr::NonNull::from(&*iovec).cast(),
@@ -539,7 +536,7 @@ mod tests {
       let backend = ScriptedBackend::new();
       let mut backend = if poison { backend } else { backend.without_poison() };
       backend.init(1).unwrap();
-      let (mut into, mut iovec) = (0u8, RawBuf::empty());
+      let (mut into, mut iovec) = (0u8, crate::backend::op::RawBufMut::empty());
       push_op(&mut backend, 1, read_into(&mut into, &mut iovec));
       assert!(backend.drain());
       assert_eq!(into, if poison { POISON } else { 0 }, "poison: {poison}");
@@ -551,7 +548,7 @@ mod tests {
     let backend = ScriptedBackend::new().without_poison();
     let mut driver = backend.clone();
     driver.init(1).unwrap();
-    let (mut into, mut iovec) = (0u8, RawBuf::empty());
+    let (mut into, mut iovec) = (0u8, crate::backend::op::RawBufMut::empty());
     push_op(&mut driver, 1, read_into(&mut into, &mut iovec));
     backend.complete(1, 1);
     assert_eq!(into, 0);

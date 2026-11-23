@@ -189,16 +189,18 @@ mod immediate_sockets {
 
   #[test]
   fn read_with_more_iovecs_than_the_native_array_is_rejected() {
-    use crate::backend::op::{RawBuf, ReadFlags};
+    use crate::backend::op::{RawBufMut, ReadFlags};
     use std::ptr::NonNull;
 
     let (socket, mut peer) = pair(true);
     peer.write_all(b"hello").unwrap();
     let mut buffers = [[0u8; 4]; crate::buf::MAX_IOV_COUNT + 1];
-    let raws: Vec<RawBuf<'static>> = buffers
+    let raws: Vec<RawBufMut<'static>> = buffers
       .iter_mut()
       // SAFETY: the buffers outlive every use of the backend below.
-      .map(|buf| unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) })
+      .map(|buf| unsafe {
+        RawBufMut::from_raw_parts(buf.as_mut_ptr(), buf.len())
+      })
       .collect();
     let mut backend = backend();
     // SAFETY: `raws` and `socket` stay alive until this backend finishes.

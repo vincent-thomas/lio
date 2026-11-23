@@ -58,8 +58,8 @@ use crate::backend::impls::sockaddr::{
 };
 use crate::backend::native::CWD as CWD_HANDLE;
 use crate::backend::op::{
-  BorrowedOp, DirEntryRef, FileStat, FileType, LinkKind, MsgRecv, MsgSend, Op,
-  OpaqueDropFn, OpenFlags, RawBuf, ReadDirResult, RecvFlags, SendFlags,
+  BorrowedOp, ByteSpan, DirEntryRef, FileStat, FileType, LinkKind, MsgRecv,
+  MsgSend, Op, OpaqueDropFn, OpenFlags, ReadDirResult, RecvFlags, SendFlags,
   ShutdownHow, SocketAddrBuf, SocketAddrFamily, SpawnSpec, StatTarget,
   UnlinkKind, is_valid_file_offset,
 };
@@ -404,7 +404,7 @@ impl Iocp {
           return Some(neg(ERROR_NOT_SUPPORTED));
         }
         if probe_socket(socket_of(&fd)).is_ok() {
-          let bufs = bufs.iter().map(|b| (b.ptr, b.len));
+          let bufs = bufs.iter().map(|b| (b.bytes_ptr(), b.bytes_len()));
           return self.start_recv(id, &fd, bufs, 0, None);
         }
         if let Err(code) = check_handle(handle_of(&fd)) {
@@ -423,7 +423,7 @@ impl Iocp {
           return Some(neg(ERROR_NOT_SUPPORTED));
         }
         if probe_socket(socket_of(&fd)).is_ok() {
-          let bufs = bufs.iter().map(|b| (b.ptr, b.len));
+          let bufs = bufs.iter().map(|b| (b.bytes_ptr(), b.bytes_len()));
           return self.start_send(id, &fd, bufs, 0, None);
         }
         if let Err(code) = check_handle(handle_of(&fd)) {
@@ -1305,17 +1305,17 @@ fn ensure_bound(socket: ws::SOCKET, family: u16) -> Result<(), isize> {
 }
 
 /// Synchronous read/write on a non-socket handle.
-fn file_transfer(
+fn file_transfer<B: crate::backend::op::ByteSpan>(
   handle: HANDLE,
-  bufs: &[RawBuf<'_>],
+  bufs: &[B],
   offset: Option<u64>,
   write: bool,
 ) -> isize {
   let mut total = 0usize;
   for buf in bufs {
     let at = offset.map(|offset| offset + total as u64);
-    let len = buf.len.min(u32::MAX as usize) as u32;
-    match transfer_once(handle, buf.ptr, len, at, write) {
+    let len = buf.bytes_len().min(u32::MAX as usize) as u32;
+    match transfer_once(handle, buf.bytes_ptr(), len, at, write) {
       Ok(n) => {
         total += n as usize;
         if n < len {

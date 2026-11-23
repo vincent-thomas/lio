@@ -1,6 +1,6 @@
 use super::*;
 use crate::api::resource::Resource;
-use crate::backend::op::{BorrowedOp, RawBuf, ReadFlags};
+use crate::backend::op::{BorrowedOp, RawBufMut, ReadFlags};
 use std::os::fd::{FromRawFd, IntoRawFd};
 
 mod contract {
@@ -257,7 +257,7 @@ fn nonblocking_waits_make_progress_on_file_completions() {
     .iter_mut()
     .map(|buffer| {
       // SAFETY: buffers remain live and exclusively owned until all reads finish.
-      unsafe { RawBuf::from_raw_parts(buffer.as_mut_ptr(), buffer.len()) }
+      unsafe { RawBufMut::from_raw_parts(buffer.as_mut_ptr(), buffer.len()) }
     })
     .collect();
   for (id, raw) in raws.iter().enumerate() {
@@ -313,10 +313,12 @@ fn read_with_more_iovecs_than_the_native_array_is_rejected() {
   backend.init(8).unwrap();
   let mut arena = Bump::new();
   let mut buffers = [[0u8; 4]; crate::buf::MAX_IOV_COUNT + 1];
-  let raws: Vec<RawBuf<'static>> = buffers
+  let raws: Vec<RawBufMut<'static>> = buffers
     .iter_mut()
     // SAFETY: the buffers outlive every use of the backend below.
-    .map(|buf| unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) })
+    .map(|buf| unsafe {
+      RawBufMut::from_raw_parts(buf.as_mut_ptr(), buf.len())
+    })
     .collect();
   // SAFETY: `raws` and `reader` stay alive until this backend finishes the read.
   unsafe {
@@ -353,7 +355,7 @@ fn drop_waits_for_operations_in_the_kernel() {
   let mut arena = Bump::new();
   let mut buf = [0u8; 4];
   // SAFETY: `buf` outlives every use of the backend below.
-  let raw = unsafe { RawBuf::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
+  let raw = unsafe { RawBufMut::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
   // SAFETY: `raw` and `reader` stay alive until this backend is dropped.
   unsafe {
     backend.push(

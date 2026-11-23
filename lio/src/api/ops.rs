@@ -725,7 +725,7 @@ fn offset_out_of_range_error() -> io::Error {
 pub struct Read<B: IoBufMutVec> {
   res: Resource,
   buf: Option<B>,
-  raws: [RawBuf<'static>; MAX_IOV_COUNT],
+  raws: [crate::backend::op::RawBufMut<'static>; MAX_IOV_COUNT],
   iov_count: usize,
   offset: Option<u64>,
 }
@@ -741,7 +741,7 @@ impl<B: IoBufMutVec> Read<B> {
     Self {
       res,
       buf: Some(buf),
-      // SAFETY: `RawBuf` is a plain pointer/length pair and is immediately
+      // SAFETY: `RawBufMut` is a plain pointer/length pair and is immediately
       // overwritten before submission.
       raws: unsafe { mem::zeroed() },
       iov_count: 0,
@@ -766,7 +766,9 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
     self.iov_count = collect_regions(buf, &mut self.raws, |ptr, len| {
       // SAFETY: the region is model-owned storage that stays valid in place
       // until `complete()` consumes the buffer.
-      unsafe { RawBuf::from_raw_parts(ptr.as_ptr(), len) }
+      unsafe {
+        crate::backend::op::RawBufMut::from_raw_parts(ptr.as_ptr(), len)
+      }
     });
 
     action_io!(Op::Read {

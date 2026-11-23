@@ -16,7 +16,7 @@ fn notify_wakes_a_blocked_wait() {
 #[test]
 fn drop_cancels_a_blocked_pipe_read() {
   use lio::api::resource::Resource;
-  use lio::backend::op::{RawBuf, ReadFlags};
+  use lio::backend::op::{RawBufMut, ReadFlags};
   use std::os::windows::io::{FromRawHandle, IntoRawHandle};
 
   let (reader, _writer) = std::io::pipe().unwrap();
@@ -26,7 +26,7 @@ fn drop_cancels_a_blocked_pipe_read() {
     OwnedHandle::from_raw_handle(reader.into_raw_handle())
   });
   let mut buf = [0_u8; 4];
-  let raw = RawBuf::from_mut(&mut buf);
+  let raw = RawBufMut::from_mut(&mut buf);
 
   let mut backend = Iocp::new();
   backend.init(8).unwrap();

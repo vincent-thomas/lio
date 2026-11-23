@@ -391,11 +391,15 @@ pub fn is_supported_socket(
 // ErasedBuffer - Type-erased buffer storage
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Non-owning raw byte span used by all backends.
+/// Non-owning span of initialized bytes a backend may read.
 ///
-/// The actual buffer is owned by the typed op (e.g., `Send<Vec<u8>>`). This struct
-/// holds only a pointer + length so backends can lower it to native descriptors
-/// without taking ownership, leaving the buffer available for result extraction.
+/// A write submits this. The bytes stay owned by the op model. This holds
+/// only a pointer and a length so a backend can lower it without taking
+/// ownership.
+///
+/// A read does not use this type. A shared `&[u8]` is not writable, so it
+/// cannot be a read destination. Use [`RawBufMut`] for bytes the backend
+/// fills.
 #[derive(Clone, Copy, Debug)]
 pub struct RawBuf<'a> {
   pub(crate) ptr: *mut u8,
@@ -410,17 +414,10 @@ impl<'a> RawBuf<'a> {
     Self { ptr: buf.as_ptr().cast_mut(), len: buf.len(), _lt: PhantomData }
   }
 
-  /// A descriptor of `buf`, including its spare capacity when `buf` is a
-  /// [`Vec`](Vec<u8>)'s uninitialized tail viewed as a slice.
+  /// A descriptor of initialized `buf`. The backend may read those bytes.
   #[inline]
   pub fn from_mut(buf: &'a mut [u8]) -> Self {
     Self { ptr: buf.as_mut_ptr(), len: buf.len(), _lt: PhantomData }
-  }
-
-  /// A descriptor of an uninitialized region a read may fill.
-  #[inline]
-  pub fn from_uninit(buf: &'a mut [MaybeUninit<u8>]) -> Self {
-    Self { ptr: buf.as_mut_ptr().cast(), len: buf.len(), _lt: PhantomData }
   }
 
   /// An empty descriptor. Nothing is read or written through it.
@@ -451,7 +448,7 @@ impl<'a> RawBuf<'a> {
   ///
   /// # Safety
   ///
-  /// `ptr` must be valid for reads or writes of `len` bytes for as long as
+  /// `ptr` must be valid for reads of `len` initialized bytes for as long as
   /// the descriptor is used, including after this call returns. A null `ptr`
   /// is only valid when `len` is 0.
   #[inline]
@@ -468,6 +465,100 @@ impl<'a> RawBuf<'a> {
 unsafe impl Send for RawBuf<'_> {}
 // SAFETY: sharing the descriptor does not alias the bytes by itself.
 unsafe impl Sync for RawBuf<'_> {}
+
+/// Non-owning span of bytes a backend may write.
+///
+/// A read submits this. The memory may be uninitialized. A shared `&[u8]`
+/// cannot construct it, so a read cannot target read-only memory.
+#[derive(Clone, Copy, Debug)]
+pub struct RawBufMut<'a> {
+  pub(crate) ptr: *mut u8,
+  pub(crate) len: usize,
+  _lt: PhantomData<&'a mut [u8]>,
+}
+
+impl<'a> RawBufMut<'a> {
+  /// A descriptor of `buf`. The backend may overwrite those bytes.
+  #[inline]
+  pub fn from_mut(buf: &'a mut [u8]) -> Self {
+    Self { ptr: buf.as_mut_ptr(), len: buf.len(), _lt: PhantomData }
+  }
+
+  /// A descriptor of an uninitialized region a read may fill.
+  #[inline]
+  pub fn from_uninit(buf: &'a mut [MaybeUninit<u8>]) -> Self {
+    Self { ptr: buf.as_mut_ptr().cast(), len: buf.len(), _lt: PhantomData }
+  }
+
+  /// An empty descriptor. Nothing is written through it.
+  #[inline]
+  pub const fn empty() -> Self {
+    Self { ptr: NonNull::<u8>::dangling().as_ptr(), len: 0, _lt: PhantomData }
+  }
+
+  /// The address of the bytes.
+  #[inline]
+  pub const fn as_ptr(self) -> *mut u8 {
+    self.ptr
+  }
+
+  /// The number of bytes.
+  #[inline]
+  pub const fn len(self) -> usize {
+    self.len
+  }
+
+  /// Whether the descriptor covers no bytes.
+  #[inline]
+  pub const fn is_empty(self) -> bool {
+    self.len == 0
+  }
+
+  /// Creates a descriptor that outlives the borrow of its bytes.
+  ///
+  /// # Safety
+  ///
+  /// `ptr` must be valid for writes of `len` bytes for as long as the
+  /// descriptor is used, including after this call returns. A null `ptr` is
+  /// only valid when `len` is 0.
+  #[inline]
+  pub(crate) const unsafe fn from_raw_parts(
+    ptr: *mut u8,
+    len: usize,
+  ) -> RawBufMut<'static> {
+    RawBufMut { ptr, len, _lt: PhantomData }
+  }
+}
+
+// SAFETY: the descriptor is a pointer and a length. Sending it does not
+// move the bytes. The owner of those bytes is `Send`.
+unsafe impl Send for RawBufMut<'_> {}
+// SAFETY: sharing the descriptor does not alias the bytes by itself.
+unsafe impl Sync for RawBufMut<'_> {}
+
+/// Pointer and length shared by [`RawBuf`] and [`RawBufMut`].
+pub(crate) trait ByteSpan {
+  fn bytes_ptr(&self) -> *mut u8;
+  fn bytes_len(&self) -> usize;
+}
+
+impl ByteSpan for RawBuf<'_> {
+  fn bytes_ptr(&self) -> *mut u8 {
+    self.ptr
+  }
+  fn bytes_len(&self) -> usize {
+    self.len
+  }
+}
+
+impl ByteSpan for RawBufMut<'_> {
+  fn bytes_ptr(&self) -> *mut u8 {
+    self.ptr
+  }
+  fn bytes_len(&self) -> usize {
+    self.len
+  }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MsgBuf {
@@ -806,8 +897,8 @@ pub enum Op {
   Read {
     /// File descriptor to read from
     fd: Resource,
-    /// Scatter buffers
-    iovecs: NonNull<RawBuf<'static>>,
+    /// Scatter buffers. Each one is writable.
+    iovecs: NonNull<RawBufMut<'static>>,
     /// Number of iovecs
     iov_count: usize,
     /// Absolute file offset, or `None` for the current file position.
@@ -1101,7 +1192,7 @@ pub struct BorrowedOp<'a> {
   _lt: PhantomData<&'a ()>,
 }
 
-fn raw_iovecs(bufs: &[RawBuf<'_>]) -> (NonNull<RawBuf<'static>>, usize) {
+fn descriptor_list<T>(bufs: &[T]) -> (NonNull<T>, usize) {
   let count = bufs.len();
   let ptr =
     if count == 0 { NonNull::dangling() } else { NonNull::from(bufs).cast() };
@@ -1181,24 +1272,32 @@ impl<'a> BorrowedOp<'a> {
   }
 
   /// Reads into `iovecs`.
+  ///
+  /// Each descriptor is a [`RawBufMut`]: the backend may write those bytes.
+  /// A shared slice cannot build one.
   pub fn read(
     fd: Resource,
-    iovecs: &'a [RawBuf<'a>],
+    iovecs: &'a [RawBufMut<'a>],
     offset: Option<u64>,
     flags: ReadFlags,
   ) -> Self {
-    let (iovecs, iov_count) = raw_iovecs(iovecs);
+    let (iovecs, iov_count) = descriptor_list(iovecs);
+    let iovecs = iovecs.cast::<RawBufMut<'static>>();
     branded(Op::Read { fd, iovecs, iov_count, offset, flags })
   }
 
   /// Writes `iovecs`.
+  ///
+  /// Each descriptor is a [`RawBuf`]: the bytes are initialized, and the
+  /// backend may read them. An uninitialized buffer cannot build one.
   pub fn write(
     fd: Resource,
     iovecs: &'a [RawBuf<'a>],
     offset: Option<u64>,
     flags: WriteFlags,
   ) -> Self {
-    let (iovecs, iov_count) = raw_iovecs(iovecs);
+    let (iovecs, iov_count) = descriptor_list(iovecs);
+    let iovecs = iovecs.cast::<RawBuf<'static>>();
     branded(Op::Write { fd, iovecs, iov_count, offset, flags })
   }
 

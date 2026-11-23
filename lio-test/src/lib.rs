@@ -50,6 +50,8 @@
 /// - completion is surfaced on the next `wait()` and never replayed
 ///
 /// `Op::Read`:
+/// - the destination is a [`RawBufMut`](lio::backend::op::RawBufMut): writable
+///   memory, including uninitialized memory, never a shared `&[u8]`
 /// - success may return short positive byte counts, but repeated successful
 ///   submissions must eventually transfer the exact total byte count
 /// - vectored success may return short positive byte counts, but repeated
@@ -64,6 +66,8 @@
 /// - invalid fd returns exact raw `-EBADF`
 ///
 /// `Op::Write`:
+/// - the source is a [`RawBuf`](lio::backend::op::RawBuf): initialized bytes
+///   the backend may read
 /// - success may return short positive byte counts, but repeated successful
 ///   submissions must eventually transfer the exact total byte count
 /// - vectored success may return short positive byte counts, but repeated
@@ -180,7 +184,7 @@ macro_rules! test_io_backend {
       IoBackend,
       op::{
         BorrowedMsgBuf, BorrowedMsgBufMut, BorrowedOp, FileMode, FileStat,
-        LinkKind, OpenFlags, RawBuf, ReadFlags, RecvFlags, SendFlags,
+        LinkKind, OpenFlags, RawBuf, RawBufMut, ReadFlags, RecvFlags, SendFlags,
         SpawnSpec, UnlinkKind, WriteFlags,
       },
     };
@@ -216,8 +220,8 @@ macro_rules! test_io_backend {
       NonNull::new(ptr.cast_mut()).expect("test pointer must be non-null")
     }
 
-    fn raw_buf_from_mut_slice(buf: &mut [u8]) -> RawBuf<'_> {
-      RawBuf::from_mut(buf)
+    fn raw_buf_from_mut_slice(buf: &mut [u8]) -> RawBufMut<'_> {
+      RawBufMut::from_mut(buf)
     }
 
     fn new_backend() -> impl IoBackend {
@@ -362,7 +366,7 @@ macro_rules! test_io_backend {
       backend.init(64).unwrap();
 
       let invalid_fd = invalid_fd_resource();
-      let mut raw_buf = RawBuf::empty();
+      let mut raw_buf = RawBufMut::empty();
 
       push_op(&mut backend,
         91,
@@ -985,7 +989,7 @@ macro_rules! test_io_backend {
         while total < payload.len() {
           // SAFETY: this slice points into `buf`, which stays alive until the
           // backend completes the submitted read operation.
-          let mut raw_buf = RawBuf::from_mut(&mut buf[total..]);
+          let mut raw_buf = RawBufMut::from_mut(&mut buf[total..]);
 
           push_op(&mut backend,
             id,
@@ -1049,7 +1053,7 @@ macro_rules! test_io_backend {
         while total < payload.len() {
           // SAFETY: this slice points into `buf`, which stays alive until the
           // backend completes the submitted read operation.
-          let mut raw_buf = RawBuf::from_mut(&mut buf[total..]);
+          let mut raw_buf = RawBufMut::from_mut(&mut buf[total..]);
           push_op(&mut backend,
             id,
             BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
@@ -1129,10 +1133,10 @@ macro_rules! test_io_backend {
           let mut bufs = [
             // SAFETY: each slice points into `left`, which remains valid until
             // the submitted vectored read completes.
-            RawBuf::from_mut(&mut left[left_written..]),
+            RawBufMut::from_mut(&mut left[left_written..]),
             // SAFETY: each slice points into `right`, which remains valid until
             // the submitted vectored read completes.
-            RawBuf::from_mut(&mut right[right_written..]),
+            RawBufMut::from_mut(&mut right[right_written..]),
           ];
 
           push_op(&mut backend,
@@ -2574,10 +2578,10 @@ macro_rules! test_io_backend {
         let mut buf_b = [0_u8; 2];
         // SAFETY: `buf_a` is a live stack buffer that remains valid until the
         // read completion is collected in this test.
-        let mut raw_a = RawBuf::from_mut(&mut buf_a);
+        let mut raw_a = RawBufMut::from_mut(&mut buf_a);
         // SAFETY: `buf_b` is a live stack buffer that remains valid until the
         // read completion is collected in this test.
-        let mut raw_b = RawBuf::from_mut(&mut buf_b);
+        let mut raw_b = RawBufMut::from_mut(&mut buf_b);
 
         push_op(&mut backend,
           701,

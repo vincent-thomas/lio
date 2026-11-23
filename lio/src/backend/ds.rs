@@ -1720,7 +1720,7 @@ impl DSBackend {
   }
 
   fn write_to_iovecs(
-    iovecs: NonNull<RawBuf<'static>>,
+    iovecs: NonNull<op::RawBufMut<'static>>,
     iov_count: usize,
     bytes: &[u8],
   ) -> usize {
@@ -3375,7 +3375,7 @@ impl DSTBackend {
   fn process_network_read(
     node: &mut DSTNodeState,
     fd: &Resource,
-    iovecs: NonNull<RawBuf<'static>>,
+    iovecs: NonNull<op::RawBufMut<'static>>,
     iov_count: usize,
     offset: Option<u64>,
     flags: ReadFlags,

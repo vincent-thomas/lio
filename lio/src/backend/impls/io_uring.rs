@@ -177,8 +177,8 @@ impl ReadDirState {
 }
 
 impl NativeRwState {
-  fn from_raws(
-    iovecs: std::ptr::NonNull<crate::backend::op::RawBuf<'static>>,
+  fn from_raws<B: crate::backend::op::ByteSpan>(
+    iovecs: std::ptr::NonNull<B>,
     iov_count: usize,
   ) -> Option<Self> {
     // The native iovec array is fixed-size; a longer list would make the
@@ -195,8 +195,8 @@ impl NativeRwState {
         crate::buf::MAX_IOV_COUNT],
     };
     for (dst, src) in state.iovecs.iter_mut().zip(raws.iter()) {
-      dst.iov_base = src.ptr.cast();
-      dst.iov_len = src.len;
+      dst.iov_base = src.bytes_ptr().cast();
+      dst.iov_len = src.bytes_len();
     }
     Some(state)
   }

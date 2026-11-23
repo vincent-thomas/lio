@@ -399,8 +399,8 @@ impl Poller {
     crate::backend::impls::sockaddr::socket_addr_buf_from_storage(storage, len)
   }
 
-  fn lower_raw_iovecs(
-    iovecs: std::ptr::NonNull<crate::backend::op::RawBuf<'static>>,
+  fn lower_raw_iovecs<B: crate::backend::op::ByteSpan>(
+    iovecs: std::ptr::NonNull<B>,
     iov_count: usize,
   ) -> Option<[libc::iovec; crate::buf::MAX_IOV_COUNT]> {
     // The native iovec array is fixed-size; a longer list would make the
@@ -415,8 +415,8 @@ impl Poller {
       [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
         crate::buf::MAX_IOV_COUNT];
     for (dst, src) in native.iter_mut().zip(raws.iter()) {
-      dst.iov_base = src.ptr.cast();
-      dst.iov_len = src.len;
+      dst.iov_base = src.bytes_ptr().cast();
+      dst.iov_len = src.bytes_len();
     }
     Some(native)
   }
