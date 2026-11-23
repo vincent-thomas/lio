@@ -270,7 +270,6 @@ fn nonblocking_waits_make_progress_on_file_completions() {
     })
     .collect();
   for (id, raw) in raws.iter().enumerate() {
-    // SAFETY: `raw` and `file` stay alive until this backend is dropped.
     let op = Op::Read {
       fd: file.clone(),
       iovecs: NonNull::from(raw).cast(),
@@ -278,7 +277,9 @@ fn nonblocking_waits_make_progress_on_file_completions() {
       offset: Some(0),
       flags: ReadFlags::empty(),
     };
+    // SAFETY: `raw` and `file` stay alive until this backend is dropped.
     unsafe { crate::backend::loan::Attested::remember(id as u64, &op) };
+    // SAFETY: the same buffers stay alive for this attested flight.
     let flight =
       unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
     let mut loan = flight.loan();
@@ -340,7 +341,6 @@ fn read_with_more_iovecs_than_the_native_array_is_rejected() {
       RawBufMut::from_raw_parts(buf.as_mut_ptr(), buf.len())
     })
     .collect();
-  // SAFETY: `raws` and `reader` stay alive until this backend finishes the read.
   let op = Op::Read {
     fd: reader,
     iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
@@ -348,7 +348,9 @@ fn read_with_more_iovecs_than_the_native_array_is_rejected() {
     offset: None,
     flags: ReadFlags::empty(),
   };
+  // SAFETY: `raws` and `reader` stay alive until this backend finishes the read.
   unsafe { crate::backend::loan::Attested::remember(1, &op) };
+  // SAFETY: the same buffers stay alive for this attested flight.
   let flight =
     unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
   let mut loan = flight.loan();
@@ -381,7 +383,6 @@ fn drop_waits_for_operations_in_the_kernel() {
   let mut buf = [0u8; 4];
   // SAFETY: `buf` outlives every use of the backend below.
   let raw = unsafe { RawBufMut::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
-  // SAFETY: `raw` and `reader` stay alive until this backend is dropped.
   let op = Op::Read {
     fd: reader.clone(),
     iovecs: NonNull::from(&raw).cast(),
@@ -389,7 +390,9 @@ fn drop_waits_for_operations_in_the_kernel() {
     offset: None,
     flags: ReadFlags::empty(),
   };
+  // SAFETY: `raw` and `reader` stay alive until this backend is dropped.
   unsafe { crate::backend::loan::Attested::remember(1, &op) };
+  // SAFETY: the same buffers stay alive for this attested flight.
   let flight =
     unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
   let mut loan = flight.loan();

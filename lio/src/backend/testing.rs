@@ -264,6 +264,7 @@ fn kern_bufs(op: &Op) -> Vec<Kern> {
 unsafe fn collect_kern(op: &Op, out: &mut Vec<Kern>) {
   match op {
     Op::Read { iovecs, iov_count, .. } => {
+      // SAFETY: the caller guarantees this descriptor array is live.
       let bufs =
         unsafe { std::slice::from_raw_parts(iovecs.as_ptr(), *iov_count) };
       for buf in bufs {
@@ -271,12 +272,14 @@ unsafe fn collect_kern(op: &Op, out: &mut Vec<Kern>) {
       }
     }
     Op::Write { iovecs, iov_count, .. } => {
+      // SAFETY: the caller guarantees this descriptor array is live.
       let bufs = unsafe { raw_parts(iovecs.as_ptr(), *iov_count) };
       for buf in bufs {
         out.push(Kern { ptr: buf.as_ptr(), len: buf.len(), write: false });
       }
     }
     Op::Recv { msg, .. } => {
+      // SAFETY: the caller guarantees this message buffer array is live.
       let bufs = unsafe {
         raw_parts::<MsgBufMut>(msg.bufs.as_ptr(), msg.buf_count.get())
       };
@@ -285,6 +288,7 @@ unsafe fn collect_kern(op: &Op, out: &mut Vec<Kern>) {
       }
     }
     Op::Send { msg, .. } => {
+      // SAFETY: the caller guarantees this message buffer array is live.
       let bufs =
         unsafe { raw_parts::<MsgBuf>(msg.bufs.as_ptr(), msg.buf_count.get()) };
       for buf in bufs {
@@ -330,8 +334,10 @@ fn scrub(op: &Op) -> Op {
 unsafe fn touch_kern(bufs: &[Kern]) {
   for buf in bufs {
     if buf.write {
+      // SAFETY: the caller guarantees this buffer is writable for `len` bytes.
       unsafe { ptr::write_bytes(buf.ptr, POISON, buf.len) };
     } else {
+      // SAFETY: the caller guarantees this buffer is readable for `len` bytes.
       unsafe { read_bytes(buf.ptr, buf.len) };
     }
   }
@@ -549,6 +555,7 @@ mod tests {
     // SAFETY: every buffer these tests submit stays alive until the backend
     // completes or drains the operation.
     unsafe { crate::backend::loan::Attested::remember(id, &op) };
+    // SAFETY: the same buffers stay alive for this attested flight.
     let flight =
       unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
     let mut loan = flight.loan();
