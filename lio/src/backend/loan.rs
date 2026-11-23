@@ -2,9 +2,10 @@
 //!
 //! A backend never receives an [`Op`](crate::backend::op::Op) it can store.
 //! [`Loan::lend`] builds an [`OpView`] for the body of one callback. Safe
-//! code only gets borrows that end with that callback. The raw [`Op`] is
-//! visible to backend code for the same call, so it can hand an address to
-//! the kernel or a syscall. That address is not a value the view can keep.
+//! code only gets borrows that end with that callback. Any backend, in this
+//! crate or outside it, gets the raw [`Op`] for that same call through
+//! [`OpView::kernel`], so it can hand an address to the kernel or a syscall.
+//! That address is not a value the view can keep.
 
 use std::marker::PhantomData;
 
@@ -32,7 +33,7 @@ impl<'a> OpView<'a> {
   /// before this call returns. Do not store it in the backend. The model
   /// behind the pointer stays pinned for the call, and the driver frees it
   /// only after [`drain`](super::IoBackend::drain) says the kernel is done.
-  pub(crate) unsafe fn kernel(&self) -> &'a Op {
+  pub unsafe fn kernel(&self) -> &'a Op {
     // SAFETY: the driver built this view from a live model and lends it
     // only while that model is borrowed.
     unsafe { &*self.op }
