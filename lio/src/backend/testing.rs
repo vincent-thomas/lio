@@ -49,7 +49,7 @@ struct Script {
   /// Pushed and not yet completed, in push order.
   in_flight: Vec<(u64, Op)>,
   /// Leases for `in_flight`, dropped with those operations.
-  keeps: HashMap<u64, crate::backend::Keep>,
+  keeps: HashMap<u64, crate::backend::StageKeep>,
   cancelled: Vec<u64>,
   /// Completed, waiting for the next `wait()`.
   ready: VecDeque<OpCompleted>,
@@ -138,12 +138,16 @@ impl ScriptedBackend {
       panic!("ScriptedBackend::complete: operation {id} is not in flight");
     };
     let (_, op) = script.in_flight.remove(pos);
-    script.keeps.remove(&id);
+    let mut keep = script.keeps.remove(&id);
     if !script.no_poison {
-      // SAFETY: the operation is still in flight, so the driver keeps the
-      // memory it points to valid until it sees this completion.
+      // SAFETY: the staged buffers are alive until `keep` drops below.
       unsafe { touch(&op) };
+      if let Some(keep) = keep.as_mut() {
+        keep.publish();
+      }
     }
+    drop(op);
+    drop(keep);
     script.ready.push_back(OpCompleted::new(id, result));
   }
 
@@ -195,12 +199,18 @@ impl IoBackend for ScriptedBackend {
     if script.stuck {
       return false;
     }
-    script.keeps.clear();
+    let keeps = std::mem::take(&mut script.keeps);
+    let poison = !script.no_poison;
     for (_, op) in std::mem::take(&mut script.in_flight) {
-      if !script.no_poison {
-        // SAFETY: a drained operation may still be finishing, so the driver
-        // keeps its memory valid until `drain` returns.
+      if poison {
+        // SAFETY: the staged buffers are alive until `keeps` drops below.
         unsafe { touch(&op) };
+      }
+      drop(op);
+    }
+    for (_, mut keep) in keeps {
+      if poison {
+        keep.publish();
       }
     }
     script.ready.clear();
@@ -519,6 +529,15 @@ mod tests {
 
     push_op(&mut checked, 1, read);
     push_op(&mut checked, 2, write);
+    let Op::Read { iovecs, .. } = backend.op(1).unwrap() else {
+      panic!("read was not staged");
+    };
+    // The backend holds the staged copy, not the caller's address.
+    assert_ne!(unsafe { iovecs.as_ref() }.as_ptr(), into.as_mut_ptr());
+    let Op::Write { iovecs, .. } = backend.op(2).unwrap() else {
+      panic!("write was not staged");
+    };
+    assert_ne!(unsafe { iovecs.as_ref() }.as_ptr(), from.as_ptr().cast_mut());
     backend.complete_all(8);
     assert_eq!(into, [POISON; 8]);
     assert_eq!(&from, b"payload!", "sent bytes are only read");

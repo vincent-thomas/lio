@@ -40,6 +40,7 @@
 
 pub mod ds;
 pub mod op;
+mod stage;
 pub mod testing;
 
 /// Test utilities for IoBackend implementations.
@@ -130,6 +131,7 @@ pub(crate) mod native;
 pub(crate) mod sockaddr;
 
 use std::io;
+use std::marker::PhantomData;
 use std::time::Duration;
 
 use bumpalo::Bump;
@@ -212,13 +214,16 @@ pub trait IoBackend {
   ///
   /// Call `flush()` to submit queued operations.
   ///
-  /// `op` borrows the op model that owns its buffers. [`Lio`](crate::Lio)
-  /// builds it with [`InFlight::from_model`](InFlight::from_model) while that
-  /// model is borrowed. Take [`InFlight::into_parts`] and store the [`Keep`]
-  /// for as long as any address copied from the [`Op`] is used. The driver
-  /// frees the model when it holds the last [`Keep`]. [`drain`](IoBackend::drain)
-  /// still has to stop kernel and worker threads, which do not hold a
-  /// [`Keep`].
+  /// `op` is staged. Every buffer address in it points at memory owned by the
+  /// [`StageKeep`] from [`InFlight::into_parts`], not at the caller.
+  /// [`Lio`](crate::Lio) builds that staging in
+  /// [`InFlight::from_model`](InFlight::from_model) while the model is
+  /// borrowed. Store the [`StageKeep`] for as long as any of those addresses
+  /// is used. [`StageKeep::publish`](StageKeep::publish) copies inbound bytes
+  /// back to the caller. Dropping the lease then drops the [`Keep`] that
+  /// pins the model. The kernel does not hold a
+  /// [`Keep`]. [`drain`](IoBackend::drain) still has to stop kernel and
+  /// worker threads, which write the staged memory.
   fn push(&mut self, id: u64, op: InFlight<'_>, step_bump: &mut Bump);
 
   /// Submit all queued operations to kernel.
@@ -302,47 +307,89 @@ impl Keep {
 /// `InFlight` without [`attest`](Self::attest), because nothing would keep
 /// it alive after the call returned.
 pub struct InFlight<'a> {
-  op: BorrowedOp<'a>,
+  op: BorrowedOp<'static>,
+  back: stage::CopyBack,
   keep: Keep,
+  _lt: PhantomData<&'a ()>,
 }
 
 impl<'a> InFlight<'a> {
-  /// Wraps an operation borrowed from a model the driver has pinned.
+  /// Copies `op`'s caller bytes into backend-owned memory and wraps that copy.
   ///
-  /// The driver calls this inside the borrow of [`OpModel::action`] and does
-  /// not move or drop that model until the backend is finished with it.
+  /// The driver calls this inside the borrow of [`OpModel::action`]. The
+  /// model stays pinned until the [`StageKeep`] from [`into_parts`] is
+  /// dropped.
   ///
   /// [`OpModel::action`]: crate::api::op::OpModel::action
   pub(crate) fn from_model(op: BorrowedOp<'a>, keep: Keep) -> Self {
-    Self { op, keep }
+    Self::stage(op, keep)
   }
 
-  /// Wraps an operation whose buffers the caller keeps alive itself.
+  /// Stages `op` the same way [`from_model`](Self::from_model) does.
   ///
   /// Contract tests use this. [`Lio`](crate::Lio) does not: it submits the
-  /// model it owns, through [`from_model`](Self::from_model).
+  /// model it owns, through [`from_model`](Self::from_model). The staged
+  /// copy is what the backend sees. Dropping the [`StageKeep`] writes
+  /// inbound bytes back to the buffers the test kept alive.
   ///
   /// # Safety
   ///
-  /// The addresses in `op` stay allocated and unmoved, and nothing but the
-  /// backend mutates them, until every [`Keep`] from [`into_parts`](Self::into_parts)
-  /// is dropped. This keep is not tied to a driver registration.
+  /// The addresses in `op` stay allocated and unmoved until the
+  /// [`StageKeep`] from [`into_parts`](Self::into_parts) is dropped. This
+  /// keep is not tied to a driver registration. The backend still does not
+  /// receive those caller addresses: it receives the staged copy.
   pub unsafe fn attest(op: BorrowedOp<'a>) -> Self {
-    Self { op, keep: Keep::new() }
+    Self::stage(op, Keep::new())
   }
 
-  /// The operation the backend copies addresses out of.
+  /// Passes an operation that was already staged, with the same lease.
+  ///
+  /// A second copy would publish into the first stage and leave the caller
+  /// unchanged.
+  pub(crate) fn relay(op: BorrowedOp<'static>, staged: StageKeep) -> Self {
+    let staged = std::mem::ManuallyDrop::new(staged);
+    Self {
+      op,
+      // SAFETY: `staged` is wrapped in `ManuallyDrop`, so reading each field
+      // moves it out once and `StageKeep`'s drop does not run.
+      back: unsafe { std::ptr::read(&staged.back) },
+      // SAFETY: same move as `back`.
+      keep: unsafe { std::ptr::read(&staged.keep) },
+      _lt: PhantomData,
+    }
+  }
+
+  fn stage(op: BorrowedOp<'a>, keep: Keep) -> Self {
+    let (staged, back) = stage::stage(op.as_op());
+    Self {
+      // SAFETY: `staged` points only at `back`, which this value owns.
+      op: unsafe { BorrowedOp::from_op(staged) },
+      back,
+      keep,
+      _lt: PhantomData,
+    }
+  }
+
+  /// The staged operation a backend matches on.
+  ///
+  /// Its buffer addresses point at the [`StageKeep`] from [`into_parts`],
+  /// not at the caller.
   #[inline]
   pub fn as_op(&self) -> &Op {
     self.op.as_op()
   }
 
-  /// The operation and the lease that keeps its buffers allocated.
+  /// The staged operation and the lease that owns its buffers.
   ///
-  /// Store the [`Keep`] with every copy of the addresses. Drop it when those
-  /// copies are gone.
+  /// Store the [`StageKeep`] with every copy of the addresses. Drop it when
+  /// those copies are gone. [`StageKeep::publish`](StageKeep::publish) copies
+  /// inbound bytes back to the caller before that drop.
   #[inline]
-  pub fn into_parts(self) -> (Op, Keep) {
-    (self.op.as_op().clone(), self.keep)
+  pub fn into_parts(self) -> (Op, StageKeep) {
+    let op = self.op.as_op().clone();
+    let staged = StageKeep { back: self.back, keep: self.keep };
+    (op, staged)
   }
 }
+
+pub use stage::StageKeep;

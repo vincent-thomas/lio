@@ -438,14 +438,14 @@ struct DSWorld {
   bound_listeners: BTreeMap<Vec<u8>, i32>,
   occupied_addr_keys: Vec<Vec<u8>>,
   events: Vec<ScheduledEvent>,
-  pending: Vec<(u64, Op, crate::backend::Keep)>,
+  pending: Vec<(u64, Op, crate::backend::StageKeep)>,
 }
 
 #[derive(Debug)]
 pub struct DSBackend {
   cap: usize,
   initialized: bool,
-  queued: Vec<(u64, Op, crate::backend::Keep)>,
+  queued: Vec<(u64, Op, crate::backend::StageKeep)>,
   ready: Vec<OpCompleted>,
   schedule_rng: Prng,
   fault_rng: Prng,
@@ -705,8 +705,8 @@ struct DSTNodeState {
   next_fd: i32,
   next_network_seq: u64,
   sockets: BTreeMap<i32, DSTSocketHandle>,
-  outgoing: VecDeque<(u64, Op, crate::backend::Keep)>,
-  pending: Vec<(u64, Op, crate::backend::Keep)>,
+  outgoing: VecDeque<(u64, Op, crate::backend::StageKeep)>,
+  pending: Vec<(u64, Op, crate::backend::StageKeep)>,
   ready: Vec<OpCompleted>,
 }
 
@@ -1047,7 +1047,7 @@ struct DSTBackend {
   node_id: DSTNodeId,
   node: Rc<RefCell<DSTNodeState>>,
   inner: Rc<RefCell<DSTInner>>,
-  queued: Vec<(u64, Op, crate::backend::Keep)>,
+  queued: Vec<(u64, Op, crate::backend::StageKeep)>,
 }
 
 struct DSTNodeRunner {
@@ -1935,9 +1935,10 @@ impl DSBackend {
   fn poll_pending_ops(&mut self) {
     let mut idx = 0usize;
     while idx < self.world.pending.len() {
-      let (id, op, keep) = self.world.pending.remove(idx);
+      let (id, op, mut keep) = self.world.pending.remove(idx);
       match self.process_pending_op(id, op) {
         PendingAction::Complete(result) => {
+          keep.publish();
           self.record_trace(format!(
             "tick={} deliver-pending id={} result={}",
             self.world.tick, id, result
@@ -2746,9 +2747,12 @@ impl IoBackend for DSBackend {
   fn flush(&mut self) -> io::Result<()> {
     self.assert_initialized();
     let queued = mem::take(&mut self.queued);
-    for (id, op, keep) in queued {
+    for (id, op, mut keep) in queued {
       match self.complete_op(op) {
-        OpAction::Complete(result) => self.schedule_completion(id, result),
+        OpAction::Complete(result) => {
+          keep.publish();
+          self.schedule_completion(id, result);
+        }
         OpAction::Pending(op) => {
           self.record_trace(format!(
             "tick={} pending id={}",
@@ -3048,7 +3052,7 @@ impl DST {
   fn next_outgoing_network_op(
     &mut self,
     arbitration_round: u64,
-  ) -> Option<(DSTNodeId, u64, Op, crate::backend::Keep)> {
+  ) -> Option<(DSTNodeId, u64, Op, crate::backend::StageKeep)> {
     let tick = self.inner.borrow().tick;
     let (chosen_node, stale_nodes) = {
       let inner = self.inner.borrow();
@@ -3100,7 +3104,7 @@ impl DST {
     node_id: DSTNodeId,
     id: u64,
     op: Op,
-    keep: crate::backend::Keep,
+    keep: crate::backend::StageKeep,
   ) {
     let node = self.inner.borrow().node(node_id);
     let mut backend = DSTBackend {
@@ -3221,7 +3225,12 @@ impl DSTBackend {
     self.node.borrow().sockets.contains_key(&raw)
   }
 
-  fn queue_network_op(&mut self, id: u64, op: Op, keep: crate::backend::Keep) {
+  fn queue_network_op(
+    &mut self,
+    id: u64,
+    op: Op,
+    keep: crate::backend::StageKeep,
+  ) {
     self.queued.push((id, op, keep));
   }
 
@@ -3493,7 +3502,7 @@ impl DSTBackend {
     let mut node = node.borrow_mut();
     let pending = mem::take(&mut node.pending);
     node.pending.reserve(pending.len());
-    for (id, op, keep) in pending {
+    for (id, op, mut keep) in pending {
       let action = match op {
         Op::Read { fd, iovecs, iov_count, offset, flags } => {
           Self::process_network_read(
@@ -3513,6 +3522,7 @@ impl DSTBackend {
       };
       match action {
         PendingAction::Complete(result) => {
+          keep.publish();
           node.ready.push(OpCompleted::new(id, result));
         }
         PendingAction::KeepPending(op) => {
@@ -3639,10 +3649,15 @@ impl DSTBackend {
 
   #[cfg(test)]
   fn network_complete_op(&mut self, id: u64, op: Op) {
-    self.finish_network_op(id, op, crate::backend::Keep::new());
+    self.finish_network_op(id, op, crate::backend::StageKeep::empty());
   }
 
-  fn finish_network_op(&mut self, id: u64, op: Op, keep: crate::backend::Keep) {
+  fn finish_network_op(
+    &mut self,
+    id: u64,
+    op: Op,
+    keep: crate::backend::StageKeep,
+  ) {
     match op {
       Op::Socket { domain, ty, proto } => {
         if !op::is_supported_socket(domain, ty, proto) {
@@ -4018,7 +4033,7 @@ impl DSTBackend {
           .expect("non-network DST backend op requires local backend")
           .push(
             id,
-            crate::backend::InFlight::from_model(borrowed, keep),
+            crate::backend::InFlight::relay(borrowed, keep),
             &mut Bump::new(),
           );
       }
@@ -4086,11 +4101,7 @@ impl IoBackend for DSTBackend {
         .local
         .as_mut()
         .expect("non-network DST backend push requires local backend")
-        .push(
-          id,
-          crate::backend::InFlight::from_model(borrowed, keep),
-          step_bump,
-        );
+        .push(id, crate::backend::InFlight::relay(borrowed, keep), step_bump);
     }
   }
 

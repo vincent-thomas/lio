@@ -108,7 +108,7 @@ struct Overlapped {
   kind: AsyncKind,
   bufs: Vec<ws::WSABUF>,
   flags: u32,
-  keep: crate::backend::Keep,
+  keep: crate::backend::StageKeep,
   addr: Storage,
   addr_len: i32,
 }
@@ -135,7 +135,7 @@ impl Overlapped {
     id: u64,
     resource: &Resource,
     kind: AsyncKind,
-    keep: crate::backend::Keep,
+    keep: crate::backend::StageKeep,
   ) -> Box<Self> {
     Box::new(Self {
       // SAFETY: `OVERLAPPED` is plain old data; all-zero is its initial state.
@@ -169,7 +169,7 @@ impl Drop for Overlapped {
 struct BlockingJob {
   id: u64,
   op: Op,
-  keep: crate::backend::Keep,
+  keep: crate::backend::StageKeep,
 }
 
 // SAFETY: the op's raw pointers refer to op-model storage that stays alive
@@ -243,14 +243,16 @@ fn worker_loop(
       Ok(rx) => rx.recv(),
       Err(_) => return,
     };
-    let Ok(BlockingJob { id, op, keep }) = job else { return };
+    let Ok(BlockingJob { id, op, mut keep }) = job else { return };
     if shutting_down.load(Ordering::SeqCst) {
       // The backend is going away; nobody will reap this.
       return;
     }
     let result = run_blocking(op);
-    // Drop the lease before the completion is posted. The driver may reap
-    // it as soon as the post returns.
+    // The worker wrote the staged bytes. Publish them before the lease
+    // drops, and before the completion is posted: the driver may reap it
+    // as soon as the post returns.
+    keep.publish();
     drop(keep);
     let done = Box::into_raw(Box::new(BlockingDone { id, result }));
     // SAFETY: the pointer is only passed through the port and turned back
@@ -267,7 +269,7 @@ fn worker_loop(
 struct Queued {
   id: u64,
   op: Op,
-  keep: crate::backend::Keep,
+  keep: crate::backend::StageKeep,
 }
 
 /// Windows I/O completion port backend.
@@ -406,7 +408,7 @@ impl Iocp {
     &mut self,
     id: u64,
     op: Op,
-    keep: crate::backend::Keep,
+    keep: crate::backend::StageKeep,
   ) -> Option<isize> {
     match op {
       Op::Nop => Some(0),
@@ -542,7 +544,7 @@ impl Iocp {
     &mut self,
     id: u64,
     op: Op,
-    keep: crate::backend::Keep,
+    keep: crate::backend::StageKeep,
   ) -> Option<isize> {
     if self.pool.is_none() {
       match BlockingPool::new(self.port) {
@@ -569,7 +571,7 @@ impl Iocp {
     bufs: impl Iterator<Item = (*mut u8, usize)>,
     flags: u32,
     from: Option<NonNull<SocketAddrBuf>>,
-    keep: crate::backend::Keep,
+    keep: crate::backend::StageKeep,
   ) -> Option<isize> {
     let socket = socket_of(fd);
     if let Err(code) = self.associate(socket as HANDLE) {
@@ -621,7 +623,7 @@ impl Iocp {
     bufs: impl Iterator<Item = (*mut u8, usize)>,
     flags: u32,
     to: Option<std::net::SocketAddr>,
-    keep: crate::backend::Keep,
+    keep: crate::backend::StageKeep,
   ) -> Option<isize> {
     let socket = socket_of(fd);
     if let Err(code) = self.associate(socket as HANDLE) {
@@ -670,7 +672,7 @@ impl Iocp {
     id: u64,
     fd: &Resource,
     out: NonNull<SocketAddrBuf>,
-    keep: crate::backend::Keep,
+    keep: crate::backend::StageKeep,
   ) -> Option<isize> {
     let listener = socket_of(fd);
     if let Err(code) = probe_socket(listener) {
@@ -731,7 +733,7 @@ impl Iocp {
     id: u64,
     fd: &Resource,
     addr: &SocketAddrBuf,
-    keep: crate::backend::Keep,
+    keep: crate::backend::StageKeep,
   ) -> Option<isize> {
     let socket = socket_of(fd);
     if let Err(code) = probe_socket(socket) {
@@ -812,7 +814,7 @@ impl Iocp {
   }
 
   /// Turns a completed overlapped operation into its raw result.
-  fn finish(&mut self, mut state: Box<Overlapped>) -> isize {
+  fn finish(&mut self, state: &mut Overlapped) -> isize {
     let mut bytes = 0u32;
     let mut flags = 0u32;
     // SAFETY: the operation has completed, so querying its result does not
@@ -939,9 +941,11 @@ impl Iocp {
       }
       // SAFETY: `ptr` came from `Box::into_raw` in `track` and the kernel is
       // done with it.
-      let state = unsafe { Box::from_raw(ptr) };
+      let mut state = unsafe { Box::from_raw(ptr) };
       let id = state.id;
-      completed.push(OpCompleted::new(id, self.finish(state)));
+      let result = self.finish(&mut state);
+      state.keep.publish();
+      completed.push(OpCompleted::new(id, result));
     }
     self.entries = Vec::with_capacity(MAX_ENTRIES);
     Ok(true)

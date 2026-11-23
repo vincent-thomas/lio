@@ -47,7 +47,7 @@ struct PendingOp {
   op: Op,
   // Held so the driver does not free the model while this entry is stored.
   #[allow(dead_code)]
-  keep: crate::backend::Keep,
+  keep: crate::backend::StageKeep,
   lowered: LoweredState,
 }
 
@@ -695,10 +695,11 @@ impl IoUring {
       return;
     }
     self.in_flight = self.in_flight.saturating_sub(1);
-    if let Some(pending) =
+    if let Some(mut pending) =
       self.pending.remove_value(SlabKey::from_u64(user_data))
     {
       pending.lowered.finalize(result);
+      pending.keep.publish();
       completed
         .push(OpCompleted::new(pending.registration_id, result as isize));
     }
@@ -1450,6 +1451,8 @@ impl IoBackend for IoUring {
           Ok(value) => value,
           Err(err) => -(err.raw_os_error().unwrap_or(libc::EIO) as isize),
         };
+        let mut entry = entry;
+        entry.keep.publish();
         self
           .queued_completed
           .push(OpCompleted::new(entry.registration_id, result));

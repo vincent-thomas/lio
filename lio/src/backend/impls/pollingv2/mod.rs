@@ -197,7 +197,7 @@ pub struct PendingOp {
   op: crate::backend::op::Op,
   // Held so the driver does not free the model while this entry is stored.
   #[allow(dead_code)]
-  keep: crate::backend::Keep,
+  keep: crate::backend::StageKeep,
 }
 
 // EAGAIN and EWOULDBLOCK are the same on Linux, but may differ on other systems
@@ -1179,7 +1179,9 @@ impl IoBackend for Poller {
       }
 
       if Self::should_complete_immediately(&entry.op) {
+        let mut entry = entry;
         let result = Self::exec_op(&entry.op);
+        entry.keep.publish();
         self
           .queued_completed
           .push(OpCompleted::new(entry.registration_id, result));
@@ -1187,6 +1189,8 @@ impl IoBackend for Poller {
       }
 
       if let Some(result) = Self::try_socket_immediately(&entry.op) {
+        let mut entry = entry;
+        entry.keep.publish();
         self
           .queued_completed
           .push(OpCompleted::new(entry.registration_id, result));
@@ -1337,7 +1341,7 @@ impl IoBackend for Poller {
 
     while let Some(event) = self.events.pop() {
       let key = SlabKey::from_u64(event.key);
-      let Some(entry) = self.pending.remove_value(key) else {
+      let Some(mut entry) = self.pending.remove_value(key) else {
         continue; // Cancelled or doesn't exist
       };
 
@@ -1370,6 +1374,7 @@ impl IoBackend for Poller {
           if !interest.is_none() {
             let _ = sys.delete(fd);
           }
+          entry.keep.publish();
           // Success or real error - add to completions
           self.completed.push(OpCompleted::new(entry.registration_id, result));
         }
