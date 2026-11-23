@@ -38,7 +38,12 @@ impl<'a> OpView<'a> {
   }
 
   /// Byte `index` of a read, for this borrow only.
-  pub fn read_buf(&mut self, index: usize) -> Option<&mut [u8]> {
+  ///
+  /// # Safety
+  ///
+  /// The bytes are not borrowed anywhere else for this call. `OpView` is
+  /// built from a shared `Op`, so two views do not keep each other out.
+  pub unsafe fn read_buf(&mut self, index: usize) -> Option<&mut [u8]> {
     let op = self.op;
     let Op::Read { iovecs, iov_count, .. } = op else {
       return None;
