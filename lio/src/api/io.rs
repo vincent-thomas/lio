@@ -55,6 +55,7 @@ use crate::{
 
 use std::{
   cell::RefCell,
+  collections::VecDeque,
   future::Future,
   pin::Pin,
   rc::Rc,
@@ -623,9 +624,66 @@ where
   Pending(T),
   /// Submitted and awaiting completion, on the driver resolved at submission:
   /// `id` only means something there, even if the global `Lio` changes.
-  Inflight { id: u64, receiver: std::sync::mpsc::Receiver<T::Item>, lio: Lio },
+  ///
+  /// Items land in `slot`, the same kind of slot a oneshot future uses, so a
+  /// polled stream does not allocate a channel.
+  Inflight { id: u64, slot: Rc<RefCell<StreamSlot<T::Item>>>, lio: Lio },
   /// Stream is done, no more items.
   Done,
+}
+
+/// Where a polled stream's items wait for `next`.
+///
+/// `slot` is the oneshot future's slot. `queued` holds items that arrived
+/// before the consumer took `slot.item`, so a run that completes more than
+/// once does not drop them.
+struct StreamSlot<T> {
+  slot: LocalFutureSlot<T>,
+  queued: VecDeque<T>,
+  /// The registration has been dropped, so no further item will arrive.
+  ended: bool,
+}
+
+impl<T> StreamSlot<T> {
+  fn push_item(&mut self, item: T) {
+    if self.slot.item.is_some() {
+      self.queued.push_back(item);
+    } else {
+      self.slot.item = Some(item);
+    }
+  }
+
+  fn pop_item(&mut self) -> Option<T> {
+    let item = self.slot.item.take()?;
+    if let Some(next) = self.queued.pop_front() {
+      self.slot.item = Some(next);
+    }
+    Some(item)
+  }
+}
+
+/// Dropped with the stream's registration. Marks the slot ended and wakes a
+/// consumer that polled, found no item, and is waiting to hear that.
+struct StreamEnd<T> {
+  slot: Rc<RefCell<StreamSlot<T>>>,
+}
+
+impl<T> Drop for StreamEnd<T> {
+  fn drop(&mut self) {
+    let waker = {
+      let mut wait = self.slot.borrow_mut();
+      wait.ended = true;
+      // Queued items sit behind `slot.item`, so one waiting item means the
+      // consumer will see it on the next poll. The callback already woke.
+      if wait.slot.item.is_some() {
+        return;
+      }
+      wait.slot.waker.take()
+    };
+    if let Some(waker) = waker {
+      waker.wake();
+    }
+  }
 }
 
 impl<T> IoStream<T>
@@ -734,11 +792,34 @@ impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
           stream.state = IoStreamState::Pending(stream_op);
           return Poll::Pending;
         }
-        // First poll - create channel and schedule operation
-        let (tx, rx) = std::sync::mpsc::channel();
+        let slot = Rc::new(RefCell::new(StreamSlot {
+          slot: LocalFutureSlot { item: None, waker: Some(cx.waker().clone()) },
+          queued: VecDeque::new(),
+          ended: false,
+        }));
+        let callback_slot = Rc::clone(&slot);
+        // Owns a clone of the slot so dropping the registration, not the
+        // stream, is what marks the stream ended.
+        let end = StreamEnd { slot: Rc::clone(&slot) };
 
         let scheduled = lio.schedule_with(move |arena| {
-          Registration::new_waker_in(arena, cx.waker().clone(), tx, stream_op)
+          Registration::new_callback_in(
+            arena,
+            move |item| {
+              let _end = &end;
+              let waker = {
+                let mut wait = callback_slot.borrow_mut();
+                wait.push_item(item);
+                wait.slot.waker.take()
+              };
+              // Wake with the slot released: the waker may poll this stream
+              // inline, and that poll borrows the slot.
+              if let Some(waker) = waker {
+                waker.wake();
+              }
+            },
+            stream_op,
+          )
         });
         let id = match scheduled {
           Ok(id) => id,
@@ -746,29 +827,28 @@ impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
             unreachable!("lio rejected an operation it had capacity for: {err}")
           }
         };
-        stream.state = IoStreamState::Inflight { id, receiver: rx, lio };
+        stream.state = IoStreamState::Inflight { id, slot, lio };
         Poll::Pending
       }
 
-      IoStreamState::Inflight { id, receiver, lio } => {
-        // Try to receive typed result from channel
-        match receiver.try_recv() {
-          Ok(item) => {
-            // Got a result! Stay in Inflight for next call (multishot)
-            stream.state = IoStreamState::Inflight { id, receiver, lio };
-            Poll::Ready(Some(item))
+      IoStreamState::Inflight { id, slot, lio } => {
+        let mut wait = slot.borrow_mut();
+        if let Some(item) = wait.pop_item() {
+          drop(wait);
+          stream.state = IoStreamState::Inflight { id, slot, lio };
+          Poll::Ready(Some(item))
+        } else if wait.ended {
+          drop(wait);
+          stream.state = IoStreamState::Done;
+          Poll::Ready(None)
+        } else {
+          match &wait.slot.waker {
+            Some(waker) if waker.will_wake(cx.waker()) => {}
+            _ => wait.slot.waker = Some(cx.waker().clone()),
           }
-          Err(std::sync::mpsc::TryRecvError::Empty) => {
-            // No result yet, update waker and stay in Inflight
-            lio.set_waker(id, cx.waker().clone());
-            stream.state = IoStreamState::Inflight { id, receiver, lio };
-            Poll::Pending
-          }
-          Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-            // Sender dropped - stream is done
-            stream.state = IoStreamState::Done;
-            Poll::Ready(None)
-          }
+          drop(wait);
+          stream.state = IoStreamState::Inflight { id, slot, lio };
+          Poll::Pending
         }
       }
 
@@ -781,14 +861,14 @@ impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
 impl<T: OpModel> Drop for IoStream<T> {
   fn drop(&mut self) {
     // If the stream is inflight, cancel the operation
-    if let IoStreamState::Inflight { id, receiver, lio } = &self.state {
-      // The registration holds the sender. Once it is gone, `id` is stale: a
-      // later operation may reuse it.
-      if let Err(std::sync::mpsc::TryRecvError::Disconnected) =
-        receiver.try_recv()
-      {
+    if let IoStreamState::Inflight { id, slot, lio } = &self.state {
+      // The callback shares the slot. Once the registration (and with it the
+      // callback) is gone, `id` is stale: a later operation may reuse it.
+      if Rc::strong_count(slot) == 1 {
         return;
       }
+      // The operation may still complete; nobody is left to wake then.
+      slot.borrow_mut().slot.waker = None;
       lio.cancel_stream(*id);
     }
   }
@@ -1169,6 +1249,24 @@ mod tests {
     assert_eq!(item, Poll::Ready(Some(1)));
   }
 
+  #[test]
+  fn a_stream_polled_again_with_the_same_waker_keeps_it() {
+    let (_backend, lio) = scripted(1);
+    let mut stream = IoStream::from_op(Counter(0)).with_lio(&lio);
+    let mut next = Box::pin(stream.next());
+    let counts = Arc::default();
+    let waker = counting_waker(&counts);
+    let mut cx = Context::from_waker(&waker);
+    assert!(next.as_mut().poll(&mut cx).is_pending());
+    let clones = counts.clones.load(Ordering::SeqCst);
+    assert!(next.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(
+      counts.clones.load(Ordering::SeqCst),
+      clones,
+      "polled again with the same waker, the stream keeps the one it has"
+    );
+  }
+
   /// Takes a step without an item, then finishes with 7.
   struct AgainThenDone(bool);
 
@@ -1259,6 +1357,27 @@ mod tests {
       .as_mut()
       .poll(&mut Context::from_waker(&inline.next));
     assert_eq!(end, Poll::Ready(None));
+  }
+
+  #[test]
+  fn a_stream_keeps_items_that_arrive_before_they_are_polled() {
+    let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 1).unwrap();
+    let mut stream = IoStream::from_op(Counter(0)).with_lio(&lio);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(Box::pin(stream.next()).as_mut().poll(&mut cx).is_pending());
+    for _ in 0..3 {
+      lio.try_run().unwrap();
+    }
+    let mut items = Vec::new();
+    loop {
+      match Box::pin(stream.next()).as_mut().poll(&mut cx) {
+        Poll::Ready(Some(item)) => items.push(item),
+        Poll::Ready(None) => break,
+        Poll::Pending => panic!("a stream item was dropped"),
+      }
+    }
+    assert_eq!(items, [1, 2, 3]);
   }
 
   #[test]
