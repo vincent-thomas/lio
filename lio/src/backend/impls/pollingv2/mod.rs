@@ -1188,6 +1188,11 @@ impl IoBackend for Poller {
         let op = unsafe { view.kernel() };
         nop = matches!(op, Op::Nop);
         validated = Self::validate_op(op);
+        // A rejected offset must not reach `pwrite`. `u64::MAX` is `-1`
+        // there, which means the current file position.
+        if nop || validated.is_some() {
+          return;
+        }
         if Self::should_complete_immediately(op) {
           immediate = Some(Self::exec_op(op));
         }
