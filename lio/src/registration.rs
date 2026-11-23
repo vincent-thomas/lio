@@ -141,7 +141,7 @@ impl WakerResultHandler {
     // and remains valid for the lifetime of this handler.
     let payload = unsafe { &mut *(payload_ptr as *mut WakerPayload<T>) };
     if payload.finished {
-      return false;
+      panic!("finished model was submitted again");
     }
     f(payload.op_model.action());
     true
@@ -302,7 +302,7 @@ impl OpCallback {
     // `new`/`new_in` and remains valid for the handler lifetime.
     let payload = unsafe { &mut *(payload_ptr as *mut CallbackPayload<T, F>) };
     if payload.finished {
-      return false;
+      panic!("finished model was submitted again");
     }
     f(payload.op_model.action());
     true
@@ -508,6 +508,11 @@ impl Registration {
   /// Runs `f` on the next action while the model that produced it is borrowed.
   ///
   /// Returns `false` when the registration is already finished.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `complete` already finished the model. Submitting that model
+  /// again would queue the same step forever.
   #[inline]
   pub(crate) fn with_action(
     &mut self,
@@ -783,9 +788,21 @@ mod tests {
     // finished flag can refuse the next action.
     assert!(reg.process_completion(Completion::new(0)).is_done());
     assert!(!reg.is_finished());
-    assert!(!reg.with_action(&mut |_| {
-      panic!("a finished model was submitted again")
-    }));
+    let submitted =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reg.with_action(&mut |_| {})
+      }));
+    assert!(submitted.is_err(), "a finished callback model was submitted");
+
+    let (tx, _rx) = mpsc::channel();
+    let (_arena, mut reg) =
+      new_waker_reg(test_waker(Arc::new(AtomicUsize::new(0))), tx, Nop);
+    assert!(reg.process_completion(Completion::new(0)).is_done());
+    let submitted =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reg.with_action(&mut |_| {})
+      }));
+    assert!(submitted.is_err(), "a finished waker model was submitted");
   }
 
   #[test]
