@@ -51,6 +51,7 @@ impl<'a> OpView<'a> {
     }
     // SAFETY: the descriptor array has `iov_count` live entries.
     let desc = unsafe { &*iovecs.as_ptr().add(index) };
+    // SAFETY: that descriptor names bytes the model still owns.
     Some(unsafe { std::slice::from_raw_parts_mut(desc.as_ptr(), desc.len()) })
   }
 }
@@ -65,7 +66,7 @@ pub trait Loan {
 
 impl<T: Loan + ?Sized> Loan for std::mem::ManuallyDrop<T> {
   fn lend<'a>(&'a mut self, id: u64, f: &mut dyn FnMut(&mut OpView<'a>)) {
-    (&mut **self).lend(id, f)
+    (**self).lend(id, f)
   }
 }
 

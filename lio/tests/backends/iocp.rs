@@ -45,6 +45,7 @@ fn drop_cancels_a_blocked_pipe_read() {
       ReadFlags::empty(),
     ))
   };
+  // SAFETY: `buf` stays alive until this backend is dropped.
   unsafe { lio::backend::loan::Attested::remember(1, flight.as_op()) };
   let mut loan = flight.loan();
   backend.push(1, flight.keep(), &mut loan, &mut bumpalo::Bump::new());

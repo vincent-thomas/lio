@@ -25,6 +25,7 @@ fn pair() -> (Resource, UdpSocket) {
 fn complete(backend: &mut IoUring, arena: &mut Bump, op: Op) -> isize {
   // SAFETY: `op`'s buffers stay alive until `wait` returns below.
   unsafe { crate::backend::loan::Attested::remember(123, &op) };
+  // SAFETY: the same buffers stay alive for this attested flight.
   let flight =
     unsafe { crate::backend::InFlight::attest(BorrowedOp::from_op(op)) };
   let mut loan = flight.loan();

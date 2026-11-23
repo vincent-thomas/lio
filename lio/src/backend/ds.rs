@@ -4018,7 +4018,7 @@ impl DSTBackend {
           .push(OpCompleted::new(id, -(errno::EINVAL as isize)));
       }
       other => {
-        // SAFETY: `other` was accepted by `push` and stays in flight here.
+        // `other` was accepted by `push` and stays in flight here.
         // The same lease goes with it. A new lease would let the driver free
         // the model while the local backend still holds these addresses.
         let mut loan = crate::backend::loan::PushLoan::any(&other);
@@ -4090,7 +4090,7 @@ impl IoBackend for DSTBackend {
     if use_network {
       self.queue_network_op(id, stored, keep);
     } else {
-      // SAFETY: `stored` was just taken from this `InFlight`. The same lease
+      // `stored` was just taken from this `InFlight`. The same lease
       // goes with it into the local backend.
       let mut loan = crate::backend::loan::PushLoan::any(&stored);
       self

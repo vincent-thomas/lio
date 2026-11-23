@@ -163,6 +163,7 @@ mod immediate_sockets {
     let flight = unsafe {
       crate::backend::InFlight::attest(crate::backend::op::BorrowedOp::nop())
     };
+    // SAFETY: this nop has no buffer. It stays alive through the next flush.
     unsafe { crate::backend::loan::Attested::remember(16, flight.as_op()) };
     let mut loan = flight.loan();
     backend.push(16, flight.keep(), &mut loan, &mut Bump::new());
@@ -263,7 +264,6 @@ mod immediate_sockets {
       })
       .collect();
     let mut backend = backend();
-    // SAFETY: `raws` and `socket` stay alive until this backend finishes.
     let op = Op::Read {
       fd: socket,
       iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
@@ -271,7 +271,9 @@ mod immediate_sockets {
       offset: None,
       flags: ReadFlags::empty(),
     };
+    // SAFETY: `raws` and `socket` stay alive until this backend finishes.
     unsafe { crate::backend::loan::Attested::remember(18, &op) };
+    // SAFETY: the same buffers stay alive for this attested flight.
     let flight = unsafe {
       crate::backend::InFlight::attest(crate::backend::op::BorrowedOp::from_op(
         op,
