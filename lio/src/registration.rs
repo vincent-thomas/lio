@@ -45,7 +45,10 @@ impl ProcessResult {
 }
 
 /// Calls the closure with the model's next action, for any lifetime of that action.
-type WithActionFn = fn(*mut (), &mut dyn for<'a> FnMut(Action<'a>));
+///
+/// Returns whether the model still has an action to submit. A finished
+/// model does not: asking it again would queue the same step forever.
+type WithActionFn = fn(*mut (), &mut dyn for<'a> FnMut(Action<'a>)) -> bool;
 
 /// Waker-based result handler that sends typed results through a channel.
 ///
@@ -64,6 +67,9 @@ pub(crate) struct WakerResultHandler {
 struct WakerPayload<T: OpModel> {
   sender: mpsc::Sender<T::Item>,
   op_model: T,
+  /// Set once `complete` returns [`OpResult::Done`]. The driver must not
+  /// submit another action after that.
+  finished: bool,
 }
 
 impl WakerResultHandler {
@@ -78,7 +84,7 @@ impl WakerResultHandler {
   {
     Self {
       payload: BumpBox::into_raw(BumpBox::new_in(
-        WakerPayload { sender, op_model },
+        WakerPayload { sender, op_model, finished: false },
         arena,
       )) as *mut (),
       on_completion_fn: Self::on_completion_impl::<T>,
@@ -98,8 +104,8 @@ impl WakerResultHandler {
 
   /// Runs `f` on the next action while the model that produced it is borrowed.
   #[inline]
-  fn with_action(&mut self, f: &mut dyn for<'a> FnMut(Action<'a>)) {
-    (self.with_action_fn)(self.payload, f);
+  fn with_action(&mut self, f: &mut dyn for<'a> FnMut(Action<'a>)) -> bool {
+    (self.with_action_fn)(self.payload, f)
   }
 
   /// Process a completion result.
@@ -130,11 +136,15 @@ impl WakerResultHandler {
   fn with_action_impl<T: OpModel>(
     payload_ptr: *mut (),
     f: &mut dyn for<'a> FnMut(Action<'a>),
-  ) {
+  ) -> bool {
     // SAFETY: `payload_ptr` is created from `WakerPayload<T>` in `new`/`new_in`
     // and remains valid for the lifetime of this handler.
     let payload = unsafe { &mut *(payload_ptr as *mut WakerPayload<T>) };
+    if payload.finished {
+      return false;
+    }
     f(payload.op_model.action());
+    true
   }
 
   #[inline]
@@ -146,30 +156,37 @@ impl WakerResultHandler {
     // SAFETY: `payload_ptr` is created from `WakerPayload<T>` in `new`/`new_in`
     // and remains valid while completions are dispatched.
     let payload = unsafe { &mut *(payload_ptr as *mut WakerPayload<T>) };
-    let sender = &payload.sender;
-    let op_model = &mut payload.op_model;
-
-    let result = match op_model.complete(completion) {
-      OpResult::Again => {
-        // The driver resubmits internal steps. Preserve the consumer's waker
-        // until an item is available instead of making it poll an empty channel.
-        // The next action is borrowed from the model when the driver submits.
-        return ProcessResult::r#continue();
-      }
-      OpResult::Yield(item) => {
-        if sender.send(item).is_err() {
-          // Every receiver is gone, so nothing can take another item: stop
-          // instead of resubmitting forever.
-          return ProcessResult::done();
+    // `wake` is false for an internal step, and for a yield whose receiver
+    // is already gone: there is nobody to tell.
+    let (result, wake) = {
+      let sender = &payload.sender;
+      let op_model = &mut payload.op_model;
+      match op_model.complete(completion) {
+        OpResult::Again => {
+          // The driver resubmits internal steps. Preserve the consumer's waker
+          // until an item is available instead of making it poll an empty channel.
+          // The next action is borrowed from the model when the driver submits.
+          (ProcessResult::r#continue(), false)
         }
-        ProcessResult::r#continue()
-      }
-      OpResult::Done(item) => {
-        let _ = sender.send(item);
-        ProcessResult::done()
+        OpResult::Yield(item) => {
+          if sender.send(item).is_err() {
+            // Every receiver is gone, so nothing can take another item: stop
+            // instead of resubmitting forever.
+            (ProcessResult::done(), false)
+          } else {
+            (ProcessResult::r#continue(), true)
+          }
+        }
+        OpResult::Done(item) => {
+          let _ = sender.send(item);
+          (ProcessResult::done(), true)
+        }
       }
     };
-    if let Some(waker) = waker.take() {
+    if result.is_done() {
+      payload.finished = true;
+    }
+    if wake && let Some(waker) = waker.take() {
       waker.wake();
     }
     result
@@ -212,6 +229,9 @@ pub(crate) struct OpCallback {
 struct CallbackPayload<T: OpModel, F: Fn(T::Item)> {
   callback: F,
   op_model: T,
+  /// Set once `complete` returns [`OpResult::Done`]. The driver must not
+  /// submit another action after that.
+  finished: bool,
 }
 
 impl OpCallback {
@@ -223,7 +243,7 @@ impl OpCallback {
   {
     Self {
       payload: BumpBox::into_raw(BumpBox::new_in(
-        CallbackPayload { callback, op_model },
+        CallbackPayload { callback, op_model, finished: false },
         arena,
       )) as *mut (),
       on_completion_fn: Self::on_completion_impl::<T, F>,
@@ -243,8 +263,8 @@ impl OpCallback {
 
   /// Runs `f` on the next action while the model that produced it is borrowed.
   #[inline]
-  fn with_action(&mut self, f: &mut dyn for<'a> FnMut(Action<'a>)) {
-    (self.with_action_fn)(self.payload, f);
+  fn with_action(&mut self, f: &mut dyn for<'a> FnMut(Action<'a>)) -> bool {
+    (self.with_action_fn)(self.payload, f)
   }
 
   /// Process a completion: call complete() on OpModel and invoke callback with item.
@@ -273,14 +293,19 @@ impl OpCallback {
   fn with_action_impl<T, F>(
     payload_ptr: *mut (),
     f: &mut dyn for<'a> FnMut(Action<'a>),
-  ) where
+  ) -> bool
+  where
     T: OpModel,
     F: Fn(T::Item),
   {
     // SAFETY: `payload_ptr` is created from `CallbackPayload<T, F>` in
     // `new`/`new_in` and remains valid for the handler lifetime.
     let payload = unsafe { &mut *(payload_ptr as *mut CallbackPayload<T, F>) };
+    if payload.finished {
+      return false;
+    }
     f(payload.op_model.action());
+    true
   }
 
   #[inline]
@@ -295,20 +320,25 @@ impl OpCallback {
     // SAFETY: `payload_ptr` is created from `CallbackPayload<T, F>` in
     // `new`/`new_in` and remains valid while completions are dispatched.
     let payload = unsafe { &mut *(payload_ptr as *mut CallbackPayload<T, F>) };
-    let callback = &payload.callback;
-    let op_model = &mut payload.op_model;
-
-    match op_model.complete(completion) {
-      OpResult::Again => ProcessResult::r#continue(),
-      OpResult::Yield(item) => {
-        callback(item);
-        ProcessResult::r#continue()
+    let result = {
+      let callback = &payload.callback;
+      let op_model = &mut payload.op_model;
+      match op_model.complete(completion) {
+        OpResult::Again => ProcessResult::r#continue(),
+        OpResult::Yield(item) => {
+          callback(item);
+          ProcessResult::r#continue()
+        }
+        OpResult::Done(item) => {
+          callback(item);
+          ProcessResult::done()
+        }
       }
-      OpResult::Done(item) => {
-        callback(item);
-        ProcessResult::done()
-      }
+    };
+    if result.is_done() {
+      payload.finished = true;
     }
+    result
   }
 
   fn drop_bump_impl<T, F>(payload_ptr: *mut ())
@@ -487,9 +517,8 @@ impl Registration {
       State::Waker { handler, .. } => handler.with_action(f),
       State::Callback(cb) => cb.with_action(f),
       #[cfg(test)]
-      State::Done => return false,
+      State::Done => false,
     }
-    true
   }
 
   /// Sets the waker, replacing any existing waker.
@@ -744,6 +773,19 @@ mod tests {
     let items = received.lock().unwrap();
     assert_eq!(items.len(), 1);
     assert!(matches!(items[0], Ok(())));
+  }
+
+  #[test]
+  fn a_finished_model_is_not_submitted_again() {
+    let (_arena, mut reg) = new_callback_reg(|_| {}, Nop);
+    assert!(reg.with_action(&mut |_| {}));
+    // `process_completion` leaves the state as a live callback. Only the
+    // finished flag can refuse the next action.
+    assert!(reg.process_completion(Completion::new(0)).is_done());
+    assert!(!reg.is_finished());
+    assert!(!reg.with_action(&mut |_| {
+      panic!("a finished model was submitted again")
+    }));
   }
 
   #[test]
