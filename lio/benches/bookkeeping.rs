@@ -48,7 +48,7 @@ use criterion::{
 };
 use lio::api::op::{Action, Completion, OpModel, OpResult, StreamOpModel};
 use lio::api::resource::Resource;
-use lio::backend::op::{BorrowedOp, Op};
+use lio::backend::op::BorrowedOp;
 use lio::backend::{IoBackend, OpCompleted};
 use lio::time::Clock;
 use lio::{Lio, api};
@@ -77,6 +77,8 @@ struct BenchBackend {
   queued: Vec<(u64, isize)>,
   ready: Vec<(u64, isize)>,
   hold: bool,
+  /// Completion result for every op. The bench does not read the lent op.
+  result: isize,
   slots: Vec<u8>,
   slot_id: Vec<u64>,
 }
@@ -103,18 +105,10 @@ impl IoBackend for BenchBackend {
     &mut self,
     id: u64,
     _keep: lio::backend::Keep,
-    loan: &mut dyn lio::backend::loan::Loan,
+    _loan: &mut dyn lio::backend::loan::Loan,
     _step_bump: &mut Bump,
   ) {
-    let mut result = 0;
-    loan.lend(id, &mut |view| {
-      // SAFETY: the bench only matches the variant. It does not keep the address.
-      result = match unsafe { view.kernel() } {
-        Op::Nop => 0,
-        Op::Read { .. } => BUFFER_LEN as isize,
-        _ => panic!("bench backend only supports nop and read"),
-      };
-    });
+    let result = self.result;
     if self.hold {
       let slot = id as u32 as usize;
       assert!(
@@ -201,12 +195,12 @@ fn no_driver(criterion: &mut Criterion) {
             let mut loan = flight.loan();
             backend.push(id, flight.keep(), &mut loan, &mut bump);
           }
-          backend.flush(&mut crate::backend::loan::Attested::new()).unwrap();
+          backend.flush(&mut lio::backend::loan::Attested::new()).unwrap();
           backend
             .wait(
               Some(Duration::ZERO),
               &mut completed,
-              &mut crate::backend::loan::Attested::new(),
+              &mut lio::backend::loan::Attested::new(),
             )
             .unwrap();
           assert_eq!(completed.len(), depth);
@@ -284,7 +278,11 @@ fn buffer(criterion: &mut Criterion) {
   // reads it.
   let file = Resource::stdout();
   for depth in QUEUE_DEPTHS {
-    let lio = Lio::new_with_backend(BenchBackend::default(), depth).unwrap();
+    let lio = Lio::new_with_backend(
+      BenchBackend { result: BUFFER_LEN as isize, ..BenchBackend::default() },
+      depth,
+    )
+    .unwrap();
     let buffers = Rc::new(RefCell::new(
       (0..depth).map(|_| vec![0u8; BUFFER_LEN]).collect::<Vec<_>>(),
     ));

@@ -571,6 +571,111 @@ mod tests {
   }
 
   #[test]
+  fn stored_op_drops_caller_pointers() {
+    use std::ffi::OsString;
+    use std::ptr::NonNull;
+
+    use crate::api::resource::Resource;
+    use crate::backend::op::{
+      FileStat, MsgBuf, MsgBufMut, MsgRecv, MsgSend, RawBuf, RawBufMut,
+      ReadDirResult, ReadFlags, RecvFlags, SendFlags, SocketAddrBuf, StatTarget,
+    };
+
+    let fd = Resource::stdout();
+    let mut byte = [1u8];
+    // SAFETY: `byte` stays alive until this test returns. Nothing reads it.
+    let mut read_iov =
+      [unsafe { RawBufMut::from_raw_parts(byte.as_mut_ptr(), 1) }];
+    let write_bytes = [1u8];
+    // SAFETY: `write_bytes` stays alive until this test returns.
+    let write_iov =
+      [unsafe { RawBuf::from_raw_parts(write_bytes.as_ptr().cast_mut(), 1) }];
+    let mut recv_bytes = [1u8];
+    let recv_buf = [MsgBufMut::from_slice(&mut recv_bytes)];
+    let send_buf = [MsgBuf::from_slice(&write_bytes)];
+    let mut stat = FileStat::zeroed();
+    let mut raw = [0u8; 8];
+    let mut entries = [crate::backend::op::DirEntryRef::default()];
+    let mut opaque: *mut () = std::ptr::null_mut();
+    let mut opaque_drop: Option<crate::backend::op::OpaqueDropFn> = None;
+    let mut dir_out = ReadDirResult::default();
+    let mut addr = SocketAddrBuf::unspecified();
+    let mut link = [0u8; 4];
+    let mut cwd = OsString::new();
+
+    let ops = [
+      Op::Read {
+        fd: fd.clone(),
+        iovecs: NonNull::from(&mut read_iov[0]),
+        iov_count: 1,
+        offset: None,
+        flags: ReadFlags::empty(),
+      },
+      Op::Write {
+        fd: fd.clone(),
+        iovecs: NonNull::from(&write_iov[0]),
+        iov_count: 1,
+        offset: None,
+        flags: crate::backend::op::WriteFlags::empty(),
+      },
+      Op::Recv {
+        fd: fd.clone(),
+        msg: MsgRecv::new(&recv_buf),
+        flags: RecvFlags::empty(),
+      },
+      Op::Send {
+        fd: fd.clone(),
+        msg: MsgSend::new(&send_buf, None),
+        flags: SendFlags::empty(),
+      },
+      Op::Stat {
+        target: StatTarget::Fd { fd: fd.clone() },
+        out: NonNull::from(&mut stat),
+      },
+      Op::ReadDir {
+        fd: fd.clone(),
+        raw_buf: NonNull::from(&mut raw).cast(),
+        raw_cap: raw.len(),
+        entries: NonNull::from(&mut entries[0]),
+        entries_cap: 1,
+        opaque: NonNull::from(&mut opaque),
+        opaque_drop: NonNull::from(&mut opaque_drop),
+        out: NonNull::from(&mut dir_out),
+      },
+      Op::Accept { fd: fd.clone(), addr: NonNull::from(&mut addr) },
+      Op::ReadlinkAt {
+        dir_fd: fd.clone(),
+        path: OsString::from("link"),
+        buf: NonNull::from(&mut link).cast(),
+        buf_len: link.len(),
+      },
+      Op::GetCwd { out: NonNull::from(&mut cwd) },
+    ];
+
+    let (backend, mut checked) = init(ops.len());
+    for (id, op) in ops.into_iter().enumerate() {
+      push_op(&mut checked, id as u64, op);
+    }
+    for id in 0..9u64 {
+      let stored = backend.op(id).expect("op stays in flight");
+      let cleared = match &stored {
+        Op::Read { iovecs, .. } => *iovecs == NonNull::dangling(),
+        Op::Write { iovecs, .. } => *iovecs == NonNull::dangling(),
+        Op::Recv { msg, .. } => msg.bufs == NonNull::dangling(),
+        Op::Send { msg, .. } => msg.bufs == NonNull::dangling(),
+        Op::Stat { out, .. } => *out == NonNull::dangling(),
+        Op::ReadDir { raw_buf, .. } => *raw_buf == NonNull::dangling(),
+        Op::Accept { addr, .. } => *addr == NonNull::dangling(),
+        Op::ReadlinkAt { buf, .. } => *buf == NonNull::dangling(),
+        Op::GetCwd { out } => *out == NonNull::dangling(),
+        other => panic!("unexpected stored op {other:?}"),
+      };
+      assert!(cleared, "stored op {id} still has a caller pointer");
+    }
+    assert!(checked.drain());
+  }
+
+  #[test]
   fn holds_operations_until_completed() {
     let (backend, mut checked) = init(4);
     push_op(&mut checked, 1, Op::Nop);
