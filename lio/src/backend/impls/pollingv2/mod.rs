@@ -1142,14 +1142,14 @@ impl IoBackend for Poller {
     Ok(())
   }
 
-  unsafe fn push(
+  fn push(
     &mut self,
     id: u64,
-    op: crate::backend::op::BorrowedOp<'_>,
+    op: crate::backend::InFlight<'_>,
     _step_bump: &mut Bump,
   ) {
-    // The submission contract keeps these addresses stable; the backend stores
-    // the descriptor, not a borrow of the caller's `BorrowedOp`.
+    // The model stays pinned, so these addresses stay stable. The backend
+    // stores the descriptor, not the `InFlight` borrow.
     let op = op.as_op().clone();
     assert!(
       self.backlog.len() + self.pending.len() < self.capacity,

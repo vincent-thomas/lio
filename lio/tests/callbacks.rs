@@ -264,10 +264,10 @@ impl lio::backend::IoBackend for InOrderBackend {
     Ok(())
   }
 
-  unsafe fn push(
+  fn push(
     &mut self,
     id: u64,
-    _op: lio::backend::op::BorrowedOp<'_>,
+    _op: lio::backend::InFlight<'_>,
     _step_bump: &mut bumpalo::Bump,
   ) {
     self.queued.push(id);

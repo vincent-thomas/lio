@@ -124,31 +124,44 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     self.allocate_with(|_| {})
   }
 
-  /// Allocates a slot after `init` has prepared its state.
+  /// `slot_idx` is free.
   ///
-  /// The slot is only marked occupied once `init` returns, so a panicking
-  /// `init` leaves the pool unchanged instead of holding an occupied slot
-  /// whose state was never initialized.
+  /// # Panics
+  ///
+  /// It is not.
   #[inline]
-  pub(crate) fn allocate_with(
-    &mut self,
-    init: impl FnOnce(&mut T),
-  ) -> Option<(SlabKey, &mut T)> {
-    let slot_idx = if self.free_head != u32::MAX {
-      self.free_head
-    } else if self.next_slot < self.capacity {
-      self.next_slot
-    } else {
-      return None;
-    };
-    // Before `init`: on a corrupt free list it would overwrite a live slot.
+  pub(crate) fn assert_free(&mut self, slot_idx: u32) {
     assert_eq!(
       self.at(slot_idx).status,
       Status::Free,
       "slot pool: allocated slot {slot_idx}, which is not free"
     );
-    init(&mut self.at(slot_idx).state);
+  }
 
+  /// The next free slot, without taking it.
+  #[inline]
+  pub(crate) fn peek_free(&self) -> Option<u32> {
+    if self.free_head != u32::MAX {
+      Some(self.free_head)
+    } else if self.next_slot < self.capacity {
+      Some(self.next_slot)
+    } else {
+      None
+    }
+  }
+
+  /// Marks a slot from [`peek_free`](Self::peek_free) occupied.
+  ///
+  /// # Panics
+  ///
+  /// `slot_idx` is not a free slot.
+  #[inline]
+  pub(crate) fn commit(&mut self, slot_idx: u32) -> SlabKey {
+    assert_eq!(
+      self.at(slot_idx).status,
+      Status::Free,
+      "slot pool: allocated slot {slot_idx}, which is not free"
+    );
     if self.free_head == slot_idx {
       self.free_head = self.at(slot_idx).next_free;
     } else {
@@ -159,8 +172,49 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     }
     let slot = self.at(slot_idx);
     slot.status = Status::Occupied;
-    let key = SlabKey { slot: slot_idx, generation: slot.generation };
-    Some((key, &mut slot.state))
+    SlabKey { slot: slot_idx, generation: slot.generation }
+  }
+
+  /// The state of a slot that exists.
+  #[inline]
+  pub(crate) fn state_mut(&mut self, index: u32) -> &mut T {
+    &mut self.at(index).state
+  }
+
+  /// The key a free slot will have once [`commit`](Self::commit)ted.
+  #[inline]
+  pub(crate) fn pending_key(&self, slot_idx: u32) -> SlabKey {
+    let Some(slot) = self.slot_ref(slot_idx) else {
+      unreachable!("slot pool: no slot at index {slot_idx}");
+    };
+    SlabKey { slot: slot_idx, generation: slot.generation }
+  }
+
+  #[inline]
+  fn slot_ref(&self, index: u32) -> Option<&Slot<T>> {
+    let index = index as usize;
+    match index.checked_sub(self.slots.len()) {
+      None => Some(&self.slots[index]),
+      Some(spare) => self.spares.get(spare).map(|spare| &**spare),
+    }
+  }
+
+  /// Allocates a slot after `init` has prepared its state.
+  ///
+  /// The slot is only marked occupied once `init` returns, so a panicking
+  /// `init` leaves the pool unchanged instead of holding an occupied slot
+  /// whose state was never initialized.
+  #[inline]
+  pub(crate) fn allocate_with(
+    &mut self,
+    init: impl FnOnce(&mut T),
+  ) -> Option<(SlabKey, &mut T)> {
+    let slot_idx = self.peek_free()?;
+    // Before `init`: on a corrupt free list it would overwrite a live slot.
+    self.assert_free(slot_idx);
+    init(self.state_mut(slot_idx));
+    let key = self.commit(slot_idx);
+    Some((key, self.state_mut(slot_idx)))
   }
 
   #[inline]

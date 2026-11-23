@@ -273,22 +273,30 @@ impl Lio {
     self.inner.borrow_mut().time.advance_by_ticks(ticks);
   }
 
-  fn dispatch_action(inner: &mut LioInner, id: u64, action: Action<'static>) {
-    let (store, io, time) = (&mut inner.store, &mut inner.io, &mut inner.time);
-    match action {
-      Action::Io(op) => {
-        let Some(step_bump) = store.step_bump_mut(id) else {
-          unreachable!("dispatching action for unknown registration {id}");
-        };
-        step_bump.reset();
-        // SAFETY: the registration that produced `op` stays in the store,
-        // with its buffers unmoved, until this completion is routed. This is
-        // not `drive`: the operation outlives the `try_run` that queued it,
-        // and its buffers are owned by the pinned registration.
-        unsafe { io.push(id, op, step_bump) };
-      }
-      Action::Sleep(duration) => time.schedule(id, duration),
-    }
+  /// Submits the registration's next action while the model is borrowed.
+  ///
+  /// Returns whether the model produced an action. The buffers live in the
+  /// model, so [`InFlight::from_model`](crate::backend::InFlight::from_model)
+  /// can name them only inside this borrow. The registration stays in the
+  /// store, unmoved, until the completion is routed or the backend drains.
+  fn submit_registration(inner: &mut LioInner, id: u64) -> bool {
+    let LioInner { io, store, time, .. } = inner;
+    let Some(ran) = store.with_slot(id, |reg, step_bump| {
+      reg.with_action(&mut |action| match action {
+        Action::Io(op) => {
+          step_bump.reset();
+          io.push(id, crate::backend::InFlight::from_model(op), step_bump);
+        }
+        Action::Sleep(duration) => time.schedule(id, duration),
+      })
+    }) else {
+      unreachable!("submitting registration {id}, which is not in the store");
+    };
+    ran
+  }
+
+  fn dispatch_action(inner: &mut LioInner, id: u64) {
+    Self::submit_registration(inner, id);
   }
 
   /// Creates a new Lio driver with the default backend and specified capacity.
@@ -423,24 +431,30 @@ impl Lio {
     inner: &mut LioInner,
     init: impl FnOnce(&mut Bump) -> Registration,
   ) -> io::Result<u64> {
-    let (store, io, time) = (&mut inner.store, &mut inner.io, &mut inner.time);
-    let (id, action, step_bump) = store.insert_with_action(init);
-    let Some(action) = action else {
-      Self::retire(inner, id);
+    let LioInner { io, store, time, .. } = inner;
+    let Some(_id) =
+      store.insert_submitting(init, |id, reg, step_bump, insert| {
+        reg.with_action(&mut |action| {
+          // After this, a panic must not free the model: `push` may have
+          // copied its addresses. A panic inside `action` happens first and
+          // still frees the slot.
+          insert.keep_on_panic();
+          match action {
+            Action::Io(op) => {
+              step_bump.reset();
+              io.push(id, crate::backend::InFlight::from_model(op), step_bump);
+            }
+            Action::Sleep(duration) => time.schedule(id, duration),
+          }
+        });
+      })
+    else {
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "OpModel returned no action on first call",
       ));
     };
-    match action {
-      Action::Io(op) => {
-        // SAFETY: the registration that produced `op` was just inserted and
-        // stays in the store, with its buffers unmoved, until completion.
-        unsafe { io.push(id, op, step_bump) };
-      }
-      Action::Sleep(duration) => time.schedule(id, duration),
-    }
-    Ok(id)
+    Ok(_id)
   }
 
   /// Removes registration `id`, to be dropped by
@@ -753,31 +767,30 @@ impl Lio {
     let mut inner = self.inner.borrow_mut();
 
     let inner_ref = &mut *inner;
-    let Some(reg) = inner_ref.store.get_mut(id) else {
-      panic!("driver: registration {id} was removed while its handler ran");
+    let continues = {
+      let Some(reg) = inner_ref.store.get_mut(id) else {
+        panic!("driver: registration {id} was removed while its handler ran");
+      };
+      // A cancelled operation takes no further step; its consumer may also
+      // have been dropped by the wake-up just now.
+      let continues = !result.is_done() && !reg.is_cancelled();
+      if continues && let Some(waker) = waker {
+        reg.restore_waker(waker);
+      }
+      continues
     };
-    // A cancelled operation takes no further step; its consumer may also
-    // have been dropped by the wake-up just now.
-    let next_action =
-      if reg.is_cancelled() { None } else { result.next_action };
-    match next_action {
-      Some(action) => {
-        if let Some(waker) = waker {
-          reg.restore_waker(waker);
-        }
-        timed!(
-          PROFILE,
-          stats,
-          dispatch_time,
-          Self::dispatch_action(inner_ref, id, action)
-        );
-        stats.count_dispatch();
-      }
-      None => {
-        // Dropped by `bury_and_wake` once the driver is not borrowed.
-        timed!(PROFILE, stats, remove_time, Self::retire(inner_ref, id));
-        stats.count_remove();
-      }
+    if continues {
+      timed!(
+        PROFILE,
+        stats,
+        dispatch_time,
+        Self::dispatch_action(inner_ref, id)
+      );
+      stats.count_dispatch();
+    } else {
+      // Dropped by `bury_and_wake` once the driver is not borrowed.
+      timed!(PROFILE, stats, remove_time, Self::retire(inner_ref, id));
+      stats.count_remove();
     }
     (inner, true)
   }
@@ -995,12 +1008,7 @@ mod tests {
     fn init(&mut self, _: usize) -> io::Result<()> {
       Ok(())
     }
-    unsafe fn push(
-      &mut self,
-      id: u64,
-      _: crate::backend::op::BorrowedOp<'_>,
-      _: &mut Bump,
-    ) {
+    fn push(&mut self, id: u64, _: crate::backend::InFlight<'_>, _: &mut Bump) {
       self.0.extend([id, id]);
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -1137,16 +1145,15 @@ mod tests {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    unsafe fn push(
+    fn push(
       &mut self,
       id: u64,
-      op: crate::backend::op::BorrowedOp<'_>,
+      op: crate::backend::InFlight<'_>,
       bump: &mut Bump,
     ) {
       let at = bump.alloc(0u64) as *mut u64 as usize;
       self.first_allocs.borrow_mut().push(at);
-      // SAFETY: this wrapper forwards the same submission the caller pushed.
-      unsafe { self.inner.push(id, op, bump) };
+      self.inner.push(id, op, bump);
     }
     fn flush(&mut self) -> io::Result<()> {
       self.inner.flush()
@@ -1252,14 +1259,13 @@ mod tests {
     fn resource_close(&self) -> crate::api::resource::ResourceClose {
       self.inner.resource_close()
     }
-    unsafe fn push(
+    fn push(
       &mut self,
       id: u64,
-      op: crate::backend::op::BorrowedOp<'_>,
+      op: crate::backend::InFlight<'_>,
       bump: &mut Bump,
     ) {
-      // SAFETY: this wrapper forwards the same submission the caller pushed.
-      unsafe { self.inner.push(id, op, bump) };
+      self.inner.push(id, op, bump);
     }
     fn flush(&mut self) -> io::Result<()> {
       self.inner.flush()

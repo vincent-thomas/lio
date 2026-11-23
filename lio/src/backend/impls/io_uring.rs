@@ -21,9 +21,7 @@ use lio_uring::{
 use crate::backend::{
   IoBackend, OpCompleted,
   impls::unix_stat::file_type_from_dirent_dtype,
-  op::{
-    BorrowedOp, DirEntryRef, LinkKind, Op, ReadDirResult, is_valid_file_offset,
-  },
+  op::{DirEntryRef, LinkKind, Op, ReadDirResult, is_valid_file_offset},
 };
 use crate::slab::{Slab, SlabKey};
 
@@ -1351,9 +1349,14 @@ impl IoBackend for IoUring {
     Ok(())
   }
 
-  unsafe fn push(&mut self, id: u64, op: BorrowedOp<'_>, step_bump: &mut Bump) {
-    // The submission contract keeps these addresses stable; the backend stores
-    // the descriptor, not a borrow of the caller's `BorrowedOp`.
+  fn push(
+    &mut self,
+    id: u64,
+    op: crate::backend::InFlight<'_>,
+    step_bump: &mut Bump,
+  ) {
+    // The model stays pinned, so these addresses stay stable. The backend
+    // stores the descriptor, not the `InFlight` borrow.
     let op = op.as_op().clone();
     assert!(
       self.backlog.len() + self.in_flight < self.capacity,

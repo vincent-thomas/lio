@@ -45,8 +45,13 @@ mod immediate_sockets {
     };
     // Poller does not use the step arena. Models are boxed by the caller so
     // the buffers and message descriptors stay stable until completion.
-    // SAFETY: `model` stays borrowed by the caller until the backend finishes.
-    unsafe { backend.push(id, op, &mut Bump::new()) };
+    // `from_model` names that borrow: `model` stays alive until the backend
+    // finishes.
+    backend.push(
+      id,
+      crate::backend::InFlight::from_model(op),
+      &mut Bump::new(),
+    );
   }
 
   #[test]
@@ -133,9 +138,13 @@ mod immediate_sockets {
     assert_eq!(backend.pending.len(), 1);
     peer.write_all(b"hello").unwrap();
     // SAFETY: a no-op borrows nothing.
-    unsafe {
-      backend.push(16, crate::backend::op::BorrowedOp::nop(), &mut Bump::new())
-    };
+    backend.push(
+      16,
+      unsafe {
+        crate::backend::InFlight::attest(crate::backend::op::BorrowedOp::nop())
+      },
+      &mut Bump::new(),
+    );
     backend.flush().unwrap();
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
@@ -223,13 +232,15 @@ mod immediate_sockets {
     unsafe {
       backend.push(
         18,
-        crate::backend::op::BorrowedOp::from_op(Op::Read {
-          fd: socket,
-          iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
-          iov_count: raws.len(),
-          offset: None,
-          flags: ReadFlags::empty(),
-        }),
+        crate::backend::InFlight::attest(
+          crate::backend::op::BorrowedOp::from_op(Op::Read {
+            fd: socket,
+            iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
+            iov_count: raws.len(),
+            offset: None,
+            flags: ReadFlags::empty(),
+          }),
+        ),
         &mut Bump::new(),
       );
     }

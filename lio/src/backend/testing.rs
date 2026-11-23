@@ -35,7 +35,7 @@ use std::time::Duration;
 use bumpalo::Bump;
 
 use crate::api::resource::ResourceClose;
-use crate::backend::op::{BorrowedOp, MsgBuf, MsgBufMut, Op};
+use crate::backend::op::{MsgBuf, MsgBufMut, Op};
 use crate::backend::{IoBackend, OpCompleted};
 
 /// The byte [`ScriptedBackend`] writes into the buffers it fills.
@@ -162,10 +162,10 @@ impl IoBackend for ScriptedBackend {
     ResourceClose::from_fn(|_| {})
   }
 
-  unsafe fn push(
+  fn push(
     &mut self,
     id: u64,
-    op: BorrowedOp<'_>,
+    op: crate::backend::InFlight<'_>,
     _step_bump: &mut Bump,
   ) {
     let op = op.as_op().clone();
@@ -352,7 +352,12 @@ impl<B: IoBackend> IoBackend for Checked<B> {
     self.inner.resource_close()
   }
 
-  unsafe fn push(&mut self, id: u64, op: BorrowedOp<'_>, step_bump: &mut Bump) {
+  fn push(
+    &mut self,
+    id: u64,
+    op: crate::backend::InFlight<'_>,
+    step_bump: &mut Bump,
+  ) {
     let cap = self.cap("push");
     assert!(
       self.in_flight.len() < cap,
@@ -363,8 +368,7 @@ impl<B: IoBackend> IoBackend for Checked<B> {
       self.in_flight.insert(id),
       "contract: pushed operation {id} while it is still in flight"
     );
-    // SAFETY: this wrapper forwards the same submission the caller pushed.
-    unsafe { self.inner.push(id, op, step_bump) };
+    self.inner.push(id, op, step_bump);
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -419,11 +423,18 @@ impl<B> Drop for Checked<B> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::backend::op::BorrowedOp;
 
   fn push_op(backend: &mut impl IoBackend, id: u64, op: Op) {
     // SAFETY: every buffer these tests submit stays alive until the backend
     // completes or drains the operation.
-    unsafe { backend.push(id, BorrowedOp::from_op(op), &mut Bump::new()) };
+    unsafe {
+      backend.push(
+        id,
+        crate::backend::InFlight::attest(BorrowedOp::from_op(op)),
+        &mut Bump::new(),
+      )
+    };
   }
   use crate::backend::op::RawBuf;
 
@@ -616,7 +627,12 @@ mod tests {
       fn init(&mut self, _: usize) -> io::Result<()> {
         Ok(())
       }
-      unsafe fn push(&mut self, id: u64, _: BorrowedOp<'_>, _: &mut Bump) {
+      fn push(
+        &mut self,
+        id: u64,
+        _: crate::backend::InFlight<'_>,
+        _: &mut Bump,
+      ) {
         self.0 = Some(id);
       }
       fn flush(&mut self) -> io::Result<()> {
@@ -645,103 +661,5 @@ mod tests {
   fn dropping_with_operations_in_flight_breaks_the_contract() {
     let (_, mut checked) = init(1);
     push_op(&mut checked, 1, Op::Nop);
-  }
-
-  #[test]
-  fn drive_releases_the_buffer_after_drain() {
-    let mut backend = ScriptedBackend::auto(4).without_poison();
-    backend.init(1).unwrap();
-    let mut buf = [9u8; 4];
-    let n = {
-      let iov = [RawBuf::from_mut(&mut buf)];
-      crate::backend::drive(&mut backend, |submit| {
-        submit.push(
-          3,
-          BorrowedOp::read(
-            crate::api::resource::Resource::invalid(),
-            &iov,
-            None,
-            Default::default(),
-          ),
-          &mut Bump::new(),
-        );
-        submit.flush().unwrap();
-        let mut done = Vec::new();
-        submit.wait(None, &mut done).unwrap();
-        done[0].result()
-      })
-    };
-    assert_eq!(n, 4);
-    assert_eq!(buf, [9u8; 4]);
-    buf[0] = 1;
-    assert_eq!(buf[0], 1);
-    assert!(backend.in_flight().is_empty());
-  }
-
-  #[test]
-  fn drive_poisons_a_buffer_it_drains() {
-    let mut backend = ScriptedBackend::new();
-    backend.init(1).unwrap();
-    let mut buf = [1u8; 4];
-    {
-      let iov = [RawBuf::from_mut(&mut buf)];
-      crate::backend::drive(&mut backend, |submit| {
-        submit.push(
-          1,
-          BorrowedOp::read(
-            crate::api::resource::Resource::invalid(),
-            &iov,
-            None,
-            Default::default(),
-          ),
-          &mut Bump::new(),
-        );
-      });
-    }
-    assert_eq!(buf, [POISON; 4]);
-    assert!(backend.in_flight().is_empty());
-  }
-
-  #[test]
-  fn drive_drains_when_the_body_panics() {
-    let backend = ScriptedBackend::new();
-    let mut checked = Checked::new(backend.clone());
-    checked.init(1).unwrap();
-    let mut buf = [1u8; 4];
-    let panicked = {
-      let iov = [RawBuf::from_mut(&mut buf)];
-      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::backend::drive(&mut checked, |submit| {
-          submit.push(
-            1,
-            BorrowedOp::read(
-              crate::api::resource::Resource::invalid(),
-              &iov,
-              None,
-              Default::default(),
-            ),
-            &mut Bump::new(),
-          );
-          panic!("unwind");
-        });
-      }))
-    };
-    assert!(panicked.is_err());
-    assert!(backend.in_flight().is_empty());
-    assert_eq!(buf, [POISON; 4]);
-  }
-
-  #[test]
-  fn drive_accepts_a_trait_object() {
-    let mut backend = ScriptedBackend::new();
-    backend.init(1).unwrap();
-    {
-      let backend: &mut dyn IoBackend = &mut backend;
-      crate::backend::drive(backend, |submit| {
-        submit.push(1, BorrowedOp::nop(), &mut Bump::new());
-      });
-    }
-    assert!(backend.in_flight().is_empty());
-    assert_eq!(backend.pushed(), vec![1]);
   }
 }

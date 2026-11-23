@@ -2706,10 +2706,10 @@ impl IoBackend for DSBackend {
     Ok(())
   }
 
-  unsafe fn push(
+  fn push(
     &mut self,
     id: u64,
-    op: BorrowedOp<'_>,
+    op: crate::backend::InFlight<'_>,
     _step_bump: &mut Bump,
   ) {
     let op = op.as_op().clone();
@@ -4006,7 +4006,11 @@ impl DSTBackend {
             .local
             .as_mut()
             .expect("non-network DST backend op requires local backend")
-            .push(id, BorrowedOp::from_op(other), &mut Bump::new());
+            .push(
+              id,
+              crate::backend::InFlight::attest(BorrowedOp::from_op(other)),
+              &mut Bump::new(),
+            );
         }
       }
     }
@@ -4038,7 +4042,12 @@ impl IoBackend for DSTBackend {
     Ok(())
   }
 
-  unsafe fn push(&mut self, id: u64, op: BorrowedOp<'_>, step_bump: &mut Bump) {
+  fn push(
+    &mut self,
+    id: u64,
+    op: crate::backend::InFlight<'_>,
+    step_bump: &mut Bump,
+  ) {
     let stored = op.as_op().clone();
     let use_network = match &stored {
       Op::Socket { .. } => true,
@@ -4061,14 +4070,11 @@ impl IoBackend for DSTBackend {
     if use_network {
       self.queue_network_op(id, stored);
     } else {
-      // SAFETY: this forwards the same submission the caller pushed.
-      unsafe {
-        self
-          .local
-          .as_mut()
-          .expect("non-network DST backend push requires local backend")
-          .push(id, op, step_bump);
-      }
+      self
+        .local
+        .as_mut()
+        .expect("non-network DST backend push requires local backend")
+        .push(id, op, step_bump);
     }
   }
 
@@ -4138,7 +4144,13 @@ mod tests {
   fn submit(backend: &mut impl IoBackend, id: u64, op: Op, bump: &mut Bump) {
     // SAFETY: these tests keep every buffer named by `op` alive until the
     // backend reports the completion.
-    unsafe { backend.push(id, BorrowedOp::from_op(op), bump) };
+    unsafe {
+      backend.push(
+        id,
+        crate::backend::InFlight::attest(BorrowedOp::from_op(op)),
+        bump,
+      )
+    };
   }
 
   #[test]
@@ -4156,7 +4168,9 @@ mod tests {
       );
       // SAFETY: `drain` below drops the queued operation before `iov` and
       // `bytes` are released.
-      unsafe { backend.push(1, op, &mut Bump::new()) };
+      unsafe {
+        backend.push(1, crate::backend::InFlight::attest(op), &mut Bump::new())
+      };
       assert!(backend.drain());
     }
     backend.flush().unwrap();
