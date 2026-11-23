@@ -48,6 +48,13 @@ run = [
   "cargo deny check"
 ]
 
+[tasks.check]
+description = "fmt --check, then cargo check. Skip lio-uring off Linux."
+run = [
+  "cargo fmt --check",
+  "cargo check --workspace{% if os() != 'linux' %} --exclude lio-uring{% endif %}",
+]
+
 [tasks.cbuild]
 run = "cargo rustc -p lio --crate-type dylib,staticlib --features unstable_ffi --release"
 
