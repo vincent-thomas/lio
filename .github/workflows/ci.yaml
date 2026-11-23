@@ -57,22 +57,9 @@ jobs:
           version: "2026.11.12"
           cache: false
 
-      - name: fmt
-        run: mise run fmt
-
-      - name: check
-        run: mise run check
-
-      # A build script that always reruns would still pass the first check.
-      - name: check-clean
-        if: runner.os == 'Linux'
-        run: mise run check-clean
-
-      - name: clippy
-        run: mise run clippy
-
-      - name: test
-        run: mise run test
+      # fmt, check, check-clean, clippy, then test. check-clean exits on its own off Linux.
+      - name: ci
+        run: mise run ci
 
   # Slow, and still a merge gate: a mutant that survives in the diff fails CI.
   mutants:
