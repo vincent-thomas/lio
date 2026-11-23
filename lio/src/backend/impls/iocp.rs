@@ -492,11 +492,11 @@ impl Iocp {
         if !flags.is_empty() {
           return Some(neg(ERROR_NOT_SUPPORTED));
         }
-        if probe_socket(socket_of(&fd)).is_ok() {
+        if probe_socket(socket_of(fd)).is_ok() {
           let bufs = bufs.iter().map(|b| (b.bytes_ptr(), b.bytes_len()));
-          return self.start_recv(id, &fd, bufs, 0, None, keep);
+          return self.start_recv(id, fd, bufs, 0, None, keep);
         }
-        if let Err(code) = check_handle(handle_of(&fd)) {
+        if let Err(code) = check_handle(handle_of(fd)) {
           return Some(code);
         }
         self.offload(id, block_op(op), keep)
@@ -513,11 +513,11 @@ impl Iocp {
         if !flags.is_empty() {
           return Some(neg(ERROR_NOT_SUPPORTED));
         }
-        if probe_socket(socket_of(&fd)).is_ok() {
+        if probe_socket(socket_of(fd)).is_ok() {
           let bufs = bufs.iter().map(|b| (b.bytes_ptr(), b.bytes_len()));
-          return self.start_send(id, &fd, bufs, 0, None, keep);
+          return self.start_send(id, fd, bufs, 0, None, keep);
         }
-        if let Err(code) = check_handle(handle_of(&fd)) {
+        if let Err(code) = check_handle(handle_of(fd)) {
           return Some(code);
         }
         self.offload(id, block_op(op), keep)
@@ -528,8 +528,8 @@ impl Iocp {
         if let Err(code) = probe_socket(socket) {
           return Some(code);
         }
-        let bufs = recv_bufs(&msg);
-        self.start_recv(id, &fd, bufs, recv_flags(flags), msg.from, keep)
+        let bufs = recv_bufs(msg);
+        self.start_recv(id, fd, bufs, recv_flags(flags), msg.from, keep)
       }
       Op::Send { fd, msg, flags } => {
         let flags = *flags;
@@ -537,8 +537,8 @@ impl Iocp {
         if let Err(code) = probe_socket(socket) {
           return Some(code);
         }
-        let bufs = send_bufs(&msg);
-        self.start_send(id, &fd, bufs, send_flags(flags), msg.to, keep)
+        let bufs = send_bufs(msg);
+        self.start_send(id, fd, bufs, send_flags(flags), msg.to, keep)
       }
       Op::Accept { fd, addr } => self.start_accept(id, fd, *addr, keep),
       Op::Connect { fd, addr } => self.start_connect(id, fd, addr, keep),
@@ -566,11 +566,11 @@ impl Iocp {
           Err(code) => -(code as isize),
         })
       }
-      Op::Bind { fd, addr } => Some(match socket_addr_buf_to_storage(&addr) {
+      Op::Bind { fd, addr } => Some(match socket_addr_buf_to_storage(addr) {
         Ok((storage, len)) => {
           // SAFETY: `storage` holds a valid address of `len` bytes.
           let rc = unsafe {
-            ws::bind(socket_of(&fd), (&storage as *const Storage).cast(), len)
+            ws::bind(socket_of(fd), (&storage as *const Storage).cast(), len)
           };
           if rc == 0 { 0 } else { last_wsa_error() }
         }
@@ -589,7 +589,7 @@ impl Iocp {
           ShutdownHow::Both => ws::SD_BOTH,
         };
         // SAFETY: no pointers are passed.
-        let rc = unsafe { ws::shutdown(socket_of(&fd), how) };
+        let rc = unsafe { ws::shutdown(socket_of(fd), how) };
         Some(if rc == 0 { 0 } else { last_wsa_error() })
       }
       Op::Fsync { .. }
