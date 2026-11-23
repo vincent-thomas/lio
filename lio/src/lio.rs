@@ -299,12 +299,16 @@ impl Lio {
   /// store, unmoved, until the completion is routed or the backend drains.
   fn submit_registration(inner: &mut LioInner, id: u64) -> bool {
     let LioInner { io, store, time, .. } = inner;
-    let Some(ran) = store.with_slot(id, |reg, step_bump| {
+    let Some(ran) = store.with_slot(id, |reg, step_bump, submitted| {
+      // The previous submission is finished. Drop its copy before `action`
+      // may replace the buffers.
+      *submitted = None;
       let keep = reg.lease();
       reg.with_action(&mut |action| match action {
         Action::Io(op) => {
           step_bump.reset();
           let flight = crate::backend::InFlight::from_model(op, keep.clone());
+          *submitted = Some(flight.as_op().clone());
           let mut view = crate::backend::loan::OpView::new(flight.as_op());
           io.push(id, flight.keep(), &mut view, step_bump);
         }
@@ -456,7 +460,7 @@ impl Lio {
   ) -> io::Result<u64> {
     let LioInner { io, store, time, .. } = inner;
     let Some(_id) =
-      store.insert_submitting(init, |id, reg, step_bump, insert| {
+      store.insert_submitting(init, |id, reg, step_bump, insert, submitted| {
         let keep = reg.lease();
         reg.with_action(&mut |action| {
           // After this, a panic must not free the model: `push` may have
@@ -468,6 +472,7 @@ impl Lio {
               step_bump.reset();
               let flight =
                 crate::backend::InFlight::from_model(op, keep.clone());
+              *submitted = Some(flight.as_op().clone());
               let mut view = crate::backend::loan::OpView::new(flight.as_op());
               io.push(id, flight.keep(), &mut view, step_bump);
             }
@@ -860,6 +865,8 @@ impl Lio {
       completion_store_lookup_time,
       inner.store.get_mut(id).map(|reg| reg.begin_completion())
     );
+    // The handler may free the buffers this submission named.
+    inner.store.clear_submitted(id);
     let Some((handler, mut waker)) = begun else {
       // An earlier handler may have cancelled a sleep whose timer already
       // fired. An I/O registration, though, lives until its completion
@@ -1312,6 +1319,41 @@ mod tests {
   }
 
   impl crate::api::op::OneshotOpModel for TwoSteps {}
+
+  #[test]
+  fn a_later_lend_does_not_call_action_again() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::backend::loan::Loan;
+
+    struct Counts(Arc<AtomicU32>);
+
+    impl crate::api::op::OpModel for Counts {
+      type Item = ();
+
+      fn action(&mut self) -> Action<'_> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        action_io!(crate::backend::op::Op::Nop)
+      }
+
+      fn complete(&mut self, _: Completion) -> crate::api::op::OpResult<()> {
+        crate::api::op::OpResult::Done(())
+      }
+    }
+
+    impl crate::api::op::OneshotOpModel for Counts {}
+
+    let calls = Arc::new(AtomicU32::new(0));
+    let (backend, lio) = lio(1);
+    crate::api::Io::from_op(Counts(calls.clone()))
+      .with_lio(&lio)
+      .when_done(|_| {});
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let id = backend.pushed()[0];
+    lio.inner.borrow_mut().store.lend(id, &mut |_| {});
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+  }
 
   /// Counts its wakes.
   #[derive(Default)]
