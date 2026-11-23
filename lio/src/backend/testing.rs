@@ -25,7 +25,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hint::black_box;
 use std::io;
 use std::ptr;
@@ -49,7 +49,7 @@ struct Script {
   /// Pushed and not yet completed, in push order.
   in_flight: Vec<(u64, Op)>,
   /// Leases for `in_flight`, dropped with those operations.
-  keeps: Vec<(u64, crate::backend::Keep)>,
+  keeps: HashMap<u64, crate::backend::Keep>,
   cancelled: Vec<u64>,
   /// Completed, waiting for the next `wait()`.
   ready: VecDeque<OpCompleted>,
@@ -138,9 +138,7 @@ impl ScriptedBackend {
       panic!("ScriptedBackend::complete: operation {id} is not in flight");
     };
     let (_, op) = script.in_flight.remove(pos);
-    if let Some(kept) = script.keeps.iter().position(|(kept, _)| *kept == id) {
-      script.keeps.swap_remove(kept);
-    }
+    script.keeps.remove(&id);
     if !script.no_poison {
       // SAFETY: the operation is still in flight, so the driver keeps the
       // memory it points to valid until it sees this completion.
@@ -177,7 +175,7 @@ impl IoBackend for ScriptedBackend {
     let mut script = self.0.borrow_mut();
     script.pushed.push(id);
     script.in_flight.push((id, op));
-    script.keeps.push((id, keep));
+    script.keeps.insert(id, keep);
   }
 
   fn flush(&mut self) -> io::Result<()> {
