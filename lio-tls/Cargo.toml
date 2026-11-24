@@ -2,11 +2,11 @@
 name = "lio-tls"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 lio = { path = "../lio", features = ["high"] }
-rustls = { version = "0.23", features = ["aws-lc-rs"] }
+rustls = { version = "0.23.46", features = ["aws-lc-rs"] }
 
 [dev-dependencies]
 rcgen = "0.13"
-rustls-pemfile = "2"
