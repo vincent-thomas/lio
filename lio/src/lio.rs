@@ -9,7 +9,7 @@ use crate::{
 };
 
 use std::{
-  cell::{RefCell, RefMut},
+  cell::{Cell, RefCell, RefMut},
   collections::VecDeque,
   io,
   mem::ManuallyDrop,
@@ -132,18 +132,50 @@ struct LioInner {
   leaked: usize,
   /// Submissions made while every slot was taken, scheduled in order as
   /// slots free up. Only allocates when the driver is over capacity.
-  overflow: VecDeque<PendingSubmission>,
+  overflow: VecDeque<Queued>,
+  /// Queued submissions whose consumer was dropped before a slot freed up.
+  /// They hold user values, so they are dropped once the driver is not
+  /// borrowed.
+  abandoned: Vec<Queued>,
+  /// Models with a finished operation, polled once the run that routed it
+  /// has released that operation's slot.
+  woken: VecDeque<Rc<dyn crate::model::Wake>>,
   /// Futures waiting for a free slot.
   capacity_waiters: Vec<Waker>,
-  /// Tasks that polled an operation after it was removed but before its
-  /// registration (and with it the stream's sender) was dropped. Woken once
-  /// it is, so their next poll sees the stream end.
-  orphaned_wakers: Vec<Waker>,
   profile: Option<LioProfile>,
 }
 
 /// A registration to build once a slot is free.
 type PendingSubmission = Box<dyn FnOnce(&mut Bump) -> Registration>;
+
+/// A submission waiting for a slot.
+struct Queued {
+  init: PendingSubmission,
+  /// Shared with a consumer that may give up before a slot frees up.
+  token: Option<Rc<QueueToken>>,
+}
+
+/// What a queued submission and its consumer tell each other.
+#[derive(Default)]
+pub(crate) struct QueueToken {
+  /// Set by the consumer: do not submit this.
+  abandoned: Cell<bool>,
+  /// Set by the driver once the submission has a slot.
+  id: Cell<Option<u64>>,
+}
+
+impl QueueToken {
+  /// The operation's id, once it has left the queue.
+  pub(crate) fn id(&self) -> Option<u64> {
+    self.id.get()
+  }
+
+  /// Keeps the submission from ever reaching the backend. Only has an
+  /// effect while it is still queued.
+  pub(crate) fn abandon(&self) {
+    self.abandoned.set(true);
+  }
+}
 
 #[derive(Debug, Default)]
 struct LioProfile {
@@ -151,7 +183,6 @@ struct LioProfile {
   completions_returned: usize,
   stale_completions: usize,
   timer_expirations: usize,
-  dispatch_count: usize,
   remove_count: usize,
   flush_time: Duration,
   next_deadline_time: Duration,
@@ -162,7 +193,6 @@ struct LioProfile {
   completion_is_finished_time: Duration,
   timer_poll_time: Duration,
   timer_loop_time: Duration,
-  dispatch_time: Duration,
   remove_time: Duration,
 }
 
@@ -173,10 +203,6 @@ impl LioProfile {
 
   fn count_stale_completion(&mut self) {
     self.stale_completions += 1;
-  }
-
-  fn count_dispatch(&mut self) {
-    self.dispatch_count += 1;
   }
 
   fn count_remove(&mut self) {
@@ -194,7 +220,6 @@ impl LioProfile {
     self.completions_returned += run.completions_returned;
     self.stale_completions += run.stale_completions;
     self.timer_expirations += run.timer_expirations;
-    self.dispatch_count += run.dispatch_count;
     self.remove_count += run.remove_count;
     self.flush_time += run.flush_time;
     self.next_deadline_time += run.next_deadline_time;
@@ -205,7 +230,6 @@ impl LioProfile {
     self.completion_is_finished_time += run.completion_is_finished_time;
     self.timer_poll_time += run.timer_poll_time;
     self.timer_loop_time += run.timer_loop_time;
-    self.dispatch_time += run.dispatch_time;
     self.remove_time += run.remove_time;
   }
 }
@@ -251,12 +275,11 @@ impl Drop for LioInner {
       return;
     };
     eprintln!(
-      "\nlio-profile run_inner_calls={} completions_returned={} stale_completions={} timer_expirations={} dispatch_count={} remove_count={} flush_ms={:.3} next_deadline_ms={:.3} wait_ms={:.3} completion_loop_ms={:.3} completion_store_lookup_ms={:.3} completion_on_completion_ms={:.3} completion_is_finished_ms={:.3} timer_poll_ms={:.3} timer_loop_ms={:.3} dispatch_ms={:.3} remove_ms={:.3}",
+      "\nlio-profile run_inner_calls={} completions_returned={} stale_completions={} timer_expirations={} remove_count={} flush_ms={:.3} next_deadline_ms={:.3} wait_ms={:.3} completion_loop_ms={:.3} completion_store_lookup_ms={:.3} completion_on_completion_ms={:.3} completion_is_finished_ms={:.3} timer_poll_ms={:.3} timer_loop_ms={:.3} remove_ms={:.3}",
       profile.run_inner_calls,
       profile.completions_returned,
       profile.stale_completions,
       profile.timer_expirations,
-      profile.dispatch_count,
       profile.remove_count,
       profile.flush_time.as_secs_f64() * 1000.0,
       profile.next_deadline_time.as_secs_f64() * 1000.0,
@@ -267,7 +290,6 @@ impl Drop for LioInner {
       profile.completion_is_finished_time.as_secs_f64() * 1000.0,
       profile.timer_poll_time.as_secs_f64() * 1000.0,
       profile.timer_loop_time.as_secs_f64() * 1000.0,
-      profile.dispatch_time.as_secs_f64() * 1000.0,
       profile.remove_time.as_secs_f64() * 1000.0,
     );
   }
@@ -278,7 +300,26 @@ pub struct Lio {
   inner: Rc<RefCell<LioInner>>,
 }
 
+/// A handle that does not keep the driver alive.
+///
+/// What the driver itself stores (a model waiting on its operations) holds
+/// this, so dropping the last [`Lio`] still drops the driver.
+#[derive(Clone)]
+pub(crate) struct WeakLio {
+  inner: Weak<RefCell<LioInner>>,
+}
+
+impl WeakLio {
+  pub(crate) fn upgrade(&self) -> Option<Lio> {
+    self.inner.upgrade().map(|inner| Lio { inner })
+  }
+}
+
 impl Lio {
+  pub(crate) fn downgrade(&self) -> WeakLio {
+    WeakLio { inner: Rc::downgrade(&self.inner) }
+  }
+
   pub(crate) fn pause_time(&self) {
     self.inner.borrow_mut().time.pause();
   }
@@ -289,37 +330,6 @@ impl Lio {
 
   pub(crate) fn advance_time_by_ticks(&self, ticks: u64) {
     self.inner.borrow_mut().time.advance_by_ticks(ticks);
-  }
-
-  /// Submits the registration's next action while the model is borrowed.
-  ///
-  /// Returns whether the model produced an action. The buffers live in the
-  /// model, so [`InFlight::from_model`](crate::backend::InFlight::from_model)
-  /// can name them only inside this borrow. The registration stays in the
-  /// store, unmoved, until the completion is routed or the backend drains.
-  fn submit_registration(inner: &mut LioInner, id: u64) -> bool {
-    let LioInner { io, store, time, .. } = inner;
-    let Some(ran) = store.with_slot(id, |reg, step_bump| {
-      let keep = reg.lease();
-      reg.with_action(&mut |action| match action {
-        Action::Io(op) => {
-          step_bump.reset();
-          io.push(
-            id,
-            crate::backend::InFlight::from_model(op, keep.clone()),
-            step_bump,
-          );
-        }
-        Action::Sleep(duration) => time.schedule(id, duration),
-      })
-    }) else {
-      unreachable!("submitting registration {id}, which is not in the store");
-    };
-    ran
-  }
-
-  fn dispatch_action(inner: &mut LioInner, id: u64) {
-    Self::submit_registration(inner, id);
   }
 
   /// Creates a new Lio driver with the default backend and specified capacity.
@@ -387,8 +397,9 @@ impl Lio {
       released_slots: Vec::with_capacity(cap),
       burying: 0,
       leaked: 0,
-      orphaned_wakers: Vec::new(),
       overflow: VecDeque::new(),
+      abandoned: Vec::new(),
+      woken: VecDeque::new(),
       capacity_waiters: Vec::new(),
       profile: std::env::var_os("LIO_PROFILE").map(|_| LioProfile::default()),
     };
@@ -430,7 +441,40 @@ impl Lio {
         self.bury_and_wake();
       }
     } else {
-      Self::enqueue(&mut inner, init);
+      Self::enqueue(&mut inner, init, None);
+    }
+  }
+
+  /// Queues `init` until a slot frees up, for a consumer that may give up
+  /// first. The driver must be full.
+  pub(crate) fn queue_abandonable(
+    &self,
+    init: impl FnOnce(&mut Bump) -> Registration + 'static,
+  ) -> Rc<QueueToken> {
+    let token = Rc::new(QueueToken::default());
+    let mut inner = self.inner.borrow_mut();
+    Self::enqueue(&mut inner, init, Some(Rc::clone(&token)));
+    token
+  }
+
+  /// Polls `root` once the current run has released the slots of the
+  /// operations it routed.
+  ///
+  /// A model polled from inside a completion handler would find that
+  /// operation's slot still taken, and queue its next step behind it.
+  pub(crate) fn wake_later(&self, root: Rc<dyn crate::model::Wake>) {
+    self.inner.borrow_mut().woken.push_back(root);
+  }
+
+  /// Polls the models whose operations this run finished.
+  fn poll_woken(&self) {
+    loop {
+      // One at a time: a poll may run the driver, which polls the rest.
+      let next = self.inner.borrow_mut().woken.pop_front();
+      let Some(root) = next else { return };
+      root.wake();
+      // The poll may have dropped operations.
+      self.bury_and_wake();
     }
   }
 
@@ -441,12 +485,13 @@ impl Lio {
   fn enqueue(
     inner: &mut LioInner,
     init: impl FnOnce(&mut Bump) -> Registration + 'static,
+    token: Option<Rc<QueueToken>>,
   ) {
     assert!(
       !inner.overflow.is_empty() || inner.store.is_full(),
       "driver: queued a submission while a slot is free"
     );
-    inner.overflow.push_back(Box::new(init));
+    inner.overflow.push_back(Queued { init: Box::new(init), token });
   }
 
   /// Inserts a registration and dispatches its first action. The store must
@@ -461,9 +506,9 @@ impl Lio {
       store.insert_submitting(init, |id, reg, step_bump, insert| {
         let keep = reg.lease();
         reg.with_action(&mut |action| {
-          // After this, a panic must not free the model: `push` may have
-          // copied its addresses. A panic inside `action` happens first and
-          // still frees the slot.
+          // After this, a panic must not free the operation's memory: `push`
+          // may have copied its addresses. A panic while building the action
+          // happens first and still frees the slot.
           insert.keep_on_panic();
           match action {
             Action::Io(op) => {
@@ -481,7 +526,7 @@ impl Lio {
     else {
       return Err(io::Error::new(
         io::ErrorKind::InvalidInput,
-        "OpModel returned no action on first call",
+        "operation submitted no action",
       ));
     };
     Ok(_id)
@@ -572,11 +617,20 @@ impl Lio {
       return Vec::new();
     }
     while !inner.store.is_full()
-      && let Some(init) = inner.overflow.pop_front()
+      && let Some(queued) = inner.overflow.pop_front()
     {
+      if queued.token.as_ref().is_some_and(|token| token.abandoned.get()) {
+        inner.abandoned.push(queued);
+        continue;
+      }
+      let Queued { init, token } = queued;
       // An op without a first action is dropped, as `schedule_with` reports
       // for direct submissions.
-      let _ = Self::schedule_now(inner, init);
+      if let Ok(id) = Self::schedule_now(inner, init)
+        && let Some(token) = token
+      {
+        token.id.set(Some(id));
+      }
     }
     if inner.store.is_full() {
       Vec::new()
@@ -618,6 +672,7 @@ impl Lio {
     };
     // Also after an error: what this run removed is dropped either way.
     self.bury_and_wake();
+    self.poll_woken();
     let (processed, waiters) = ran?;
     for waker in waiters {
       waker.wake();
@@ -640,29 +695,27 @@ impl Lio {
   fn bury_and_wake(&self) {
     loop {
       let mut inner = self.inner.borrow_mut();
+      if !inner.abandoned.is_empty() {
+        let abandoned = std::mem::take(&mut inner.abandoned);
+        drop(inner);
+        drop(abandoned);
+        continue;
+      }
       if inner.dying.is_empty() {
         return;
       }
       if inner.dying.len() == 1 {
-        let Some(Detached { mut registration, slot }) = inner.dying.pop()
-        else {
+        let Some(Detached { registration, slot }) = inner.dying.pop() else {
           unreachable!(
             "driver: dying reported one registration and did not have one"
           );
         };
         inner.burying += 1;
         drop(inner);
-        // A task may have polled after the final item was sent, and found
-        // the channel empty but still open. Wake it once the registration,
-        // which holds the sender, is gone.
-        let waker = registration.take_waker();
         {
           // Released even if the drop panics.
           let _release = ReleaseSlot { lio: self, slot };
           drop(registration);
-        }
-        if let Some(waker) = waker {
-          waker.wake();
         }
       } else {
         // One borrow drains every registration removed so far. Drops happen
@@ -673,17 +726,13 @@ impl Lio {
         inner.burying += pending.len();
         drop(inner);
         let mut batch = BuryBatch { lio: self, pending, slots, dropping: None };
-        let mut wakers = Vec::new();
         // Up to 256 slots, one release borrow after every drop is cheaper
         // than borrowing per registration. Past that, a second pass walks
         // slots that have left the cache, so release every 64 while the
         // registrations just dropped are still hot.
         let release_every =
           if batch.pending.len() > 256 { 64 } else { usize::MAX };
-        while let Some(Detached { mut registration, slot }) =
-          batch.pending.pop()
-        {
-          let waker = registration.take_waker();
+        while let Some(Detached { registration, slot }) = batch.pending.pop() {
           batch.dropping = Some(slot);
           drop(registration);
           batch.dropping = None;
@@ -691,12 +740,9 @@ impl Lio {
           if batch.slots.len() == release_every {
             self.release_buried_slots(&mut batch.slots);
           }
-          if let Some(waker) = waker {
-            wakers.push(waker);
-          }
         }
         self.release_buried_slots(&mut batch.slots);
-        let (waiters, orphaned) = {
+        let waiters = {
           let mut inner = self.inner.borrow_mut();
           // Hand the buffers back. A nested bury may already have retired
           // something into the fresh `dying` queue; keep those.
@@ -705,14 +751,13 @@ impl Lio {
             inner.dying = spare_dying;
           }
           inner.released_slots = std::mem::take(&mut batch.slots);
-          let waiters = Self::release_capacity(&mut inner);
-          (waiters, std::mem::take(&mut inner.orphaned_wakers))
+          Self::release_capacity(&mut inner)
         };
         // Slots are released and the buffers are back in the driver.
         // Skipping `Drop` avoids that out-of-line call on the path that
         // already finished.
         std::mem::forget(batch);
-        for waker in wakers.into_iter().chain(waiters).chain(orphaned) {
+        for waker in waiters {
           waker.wake();
         }
         continue;
@@ -720,12 +765,11 @@ impl Lio {
 
       // Scheduling queued submissions may remove ops without a first action,
       // so go around again until nothing is left to bury.
-      let (waiters, orphaned) = {
+      let waiters = {
         let mut inner = self.inner.borrow_mut();
-        let waiters = Self::release_capacity(&mut inner);
-        (waiters, std::mem::take(&mut inner.orphaned_wakers))
+        Self::release_capacity(&mut inner)
       };
-      for waker in waiters.into_iter().chain(orphaned) {
+      for waker in waiters {
         waker.wake();
       }
     }
@@ -858,7 +902,7 @@ impl Lio {
       completion_store_lookup_time,
       inner.store.get_mut(id).map(|reg| reg.begin_completion())
     );
-    let Some((handler, mut waker)) = begun else {
+    let Some(handler) = begun else {
       // An earlier handler may have cancelled a sleep whose timer already
       // fired. An I/O registration, though, lives until its completion
       // arrives: one without it was completed twice, or never pushed.
@@ -871,60 +915,26 @@ impl Lio {
 
     drop(inner);
     batch.current = Some(id);
-    let result = timed!(PROFILE, stats, completion_on_completion_time, {
+    timed!(PROFILE, stats, completion_on_completion_time, {
       // SAFETY: the registration was alive above, and stays alive until
-      // removed below: dropping its consumer only marks it cancelled. For a
-      // cancelled operation the op model still sees the result, so what it
-      // produced (an accepted socket, say) is released, but nobody is woken.
-      unsafe { handler.complete(completion, &mut waker) }
+      // retired below: dropping its consumer only asks the backend to finish
+      // early. This is its one completion: a second one finds no
+      // registration. A cancelled operation's result is still read, so what
+      // it produced (an accepted socket, say) is released.
+      unsafe { handler.complete(completion) }
     });
     batch.current = None;
     let mut inner = self.inner.borrow_mut();
 
     let inner_ref = &mut *inner;
-    let continues = {
-      let Some(reg) = inner_ref.store.get_mut(id) else {
-        panic!("driver: registration {id} was removed while its handler ran");
-      };
-      // A cancelled operation takes no further step; its consumer may also
-      // have been dropped by the wake-up just now.
-      let continues = !result.is_done() && !reg.is_cancelled();
-      if continues && let Some(waker) = waker {
-        reg.restore_waker(waker);
-      }
-      continues
-    };
-    if continues {
-      timed!(
-        PROFILE,
-        stats,
-        dispatch_time,
-        Self::dispatch_action(inner_ref, id)
-      );
-      stats.count_dispatch();
-    } else {
-      // Dropped by `bury_and_wake` once the driver is not borrowed.
-      timed!(PROFILE, stats, remove_time, Self::retire(inner_ref, id));
-      stats.count_remove();
-    }
+    assert!(
+      inner_ref.store.get_mut(id).is_some(),
+      "driver: registration {id} was removed while its handler ran"
+    );
+    // Dropped by `bury_and_wake` once the driver is not borrowed.
+    timed!(PROFILE, stats, remove_time, Self::retire(inner_ref, id));
+    stats.count_remove();
     (inner, true)
-  }
-
-  /// Records `waker` on a waker registration. Polled streams do not use this:
-  /// their waker lives in the stream's slot. Tests call it around bury.
-  #[cfg(test)]
-  pub(crate) fn set_waker(&self, id: u64, waker: Waker) {
-    let mut inner = self.inner.borrow_mut();
-    if let Some(entry) = inner.store.get_mut(id) {
-      entry.set_waker(waker);
-    } else if !inner.dying.is_empty() || inner.burying > 0 {
-      // Removed, but perhaps not dropped yet: the task's channel may still
-      // be open, so wake it once it is not.
-      inner.orphaned_wakers.push(waker);
-    } else {
-      drop(inner);
-      waker.wake();
-    }
   }
 
   /// Cancels an operation whose consumer (a future or stream) was dropped.
@@ -937,13 +947,12 @@ impl Lio {
     {
       let mut inner = self.inner.borrow_mut();
       let inner = &mut *inner;
-      let Some(reg) = inner.store.get_mut(id) else {
+      if inner.store.get_mut(id).is_none() {
         return;
-      };
+      }
       if inner.time.remove(id) {
         Self::retire(inner, id);
       } else {
-        reg.cancel();
         inner.io.cancel(id);
         return;
       }
@@ -1176,43 +1185,6 @@ mod tests {
     assert!(STORE_DROPPED.with(|dropped| dropped.get()));
   }
 
-  #[test]
-  fn a_waker_set_between_retiring_and_burying_is_woken_once_buried() {
-    use std::sync::{Arc, mpsc};
-
-    let (backend, lio) = lio(1);
-    let (tx, rx) = mpsc::channel();
-    lio
-      .schedule_with(|arena| {
-        crate::registration::Registration::new_waker_in(
-          arena,
-          Waker::noop().clone(),
-          tx,
-          crate::api::ops::Nop,
-        )
-      })
-      .unwrap();
-    let id = backend.pushed()[0];
-    // The backend drops its lease on completion. Retire then parks the
-    // registration in `dying` until bury.
-    backend.complete(id, 0);
-    Lio::retire(&mut lio.inner.borrow_mut(), id);
-
-    // The channel is still open, so a stream polled now waits.
-    let wakes = Arc::new(Wakes::default());
-    lio.set_waker(id, Waker::from(wakes.clone()));
-    assert_eq!(wakes.count(), 0, "woken before the channel closed");
-    lio.bury_and_wake();
-    assert_eq!(wakes.count(), 1);
-    assert!(
-      rx.try_recv().is_err_and(|e| e == mpsc::TryRecvError::Disconnected)
-    );
-
-    // With nothing left to drop, a waker for a gone operation is woken now.
-    lio.set_waker(id, Waker::from(wakes.clone()));
-    assert_eq!(wakes.count(), 2);
-  }
-
   /// Reports a completion for every pushed op, twice.
   #[derive(Default)]
   struct Twice(Vec<u64>);
@@ -1282,41 +1254,46 @@ mod tests {
     lio.wait_for_capacity(Waker::noop());
   }
 
-  /// Takes one more step, then finishes.
-  struct TwoSteps(bool);
+  /// The memory of an op that panics when asked for its action, and records
+  /// being dropped.
+  struct PanicsOnAction(Rc<Cell<bool>>);
 
-  impl crate::api::op::OpModel for TwoSteps {
-    type Item = ();
-
+  impl PanicsOnAction {
     fn action(&mut self) -> Action<'_> {
-      action_io!(crate::backend::op::Op::Nop)
+      panic!("no action for you");
     }
 
-    fn complete(&mut self, _: Completion) -> crate::api::op::OpResult<()> {
-      if std::mem::replace(&mut self.0, true) {
-        crate::api::op::OpResult::Done(())
-      } else {
-        crate::api::op::OpResult::Again
-      }
+    fn complete(&mut self, _: Completion) {}
+  }
+
+  impl Drop for PanicsOnAction {
+    fn drop(&mut self) {
+      self.0.set(true);
     }
   }
 
-  impl crate::api::op::OneshotOpModel for TwoSteps {}
+  leaf!([] struct Panicking(PanicsOnAction) => ());
 
-  /// Counts its wakes.
-  #[derive(Default)]
-  struct Wakes(std::sync::atomic::AtomicUsize);
+  #[test]
+  fn a_panic_while_building_the_action_does_not_keep_its_slot() {
+    // Capacity 1: if the panicking op kept its slot, nothing more would run.
+    let (backend, lio) = lio(1);
+    let dropped = Rc::new(Cell::new(false));
+    let op: Panicking = PanicsOnAction(dropped.clone()).into();
 
-  impl std::task::Wake for Wakes {
-    fn wake(self: std::sync::Arc<Self>) {
-      self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-  }
+    let submit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      crate::api::Io::from_op(op).with_lio(&lio).when_done(|_| {});
+    }));
+    assert!(submit.is_err(), "the panic reaches the submitter");
+    assert!(dropped.get(), "the op was released");
+    assert!(!lio.is_full(), "and its slot with it");
 
-  impl Wakes {
-    fn count(&self) -> usize {
-      self.0.load(std::sync::atomic::Ordering::SeqCst)
-    }
+    let done = Rc::new(Cell::new(false));
+    let set = done.clone();
+    crate::api::nop().with_lio(&lio).when_done(move |_| set.set(true));
+    backend.complete_all(0);
+    lio.try_run().unwrap();
+    assert!(done.get());
   }
 
   #[test]
@@ -1324,32 +1301,13 @@ mod tests {
     let (_, lio) = lio(1);
     crate::api::nop().with_lio(&lio).when_done(|_| {});
     let refused = lio.schedule_with(|arena| {
-      Registration::new_callback_in(arena, |_| {}, crate::api::ops::Nop)
+      use crate::api::ops::raw::Nop;
+      Registration::new_in(arena, Nop, Nop::action, Nop::complete, |_| {})
     });
     assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::WouldBlock);
   }
 
-  #[test]
-  fn a_step_without_an_item_keeps_the_waker_for_the_last() {
-    use std::future::{Future, IntoFuture};
-    use std::task::Context;
-
-    let (backend, lio) = lio(1);
-    let wakes = std::sync::Arc::new(Wakes::default());
-    let waker = Waker::from(wakes.clone());
-    let mut future =
-      crate::api::Io::from_op(TwoSteps(false)).with_lio(&lio).into_future();
-    let mut cx = Context::from_waker(&waker);
-    assert!(std::pin::Pin::new(&mut future).poll(&mut cx).is_pending());
-    for _ in 0..2 {
-      backend.complete_all(0);
-      lio.try_run().unwrap();
-    }
-    assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert!(std::pin::Pin::new(&mut future).poll(&mut cx).is_ready());
-  }
-
-  /// Records where each step's first lowering allocation lands.
+  /// Records where each operation's first lowering allocation lands.
   #[derive(Clone, Default)]
   struct Lowering {
     inner: ScriptedBackend,
@@ -1387,15 +1345,20 @@ mod tests {
   }
 
   #[test]
-  fn every_step_lowers_into_its_slot_s_reset_arena() {
+  fn every_operation_lowers_into_its_slot_s_reset_arena() {
     let backend = Lowering::default();
     let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
-    crate::api::Io::from_op(TwoSteps(false)).with_lio(&lio).when_done(|_| {});
-    backend.inner.complete_all(0);
-    lio.try_run().unwrap();
+    for _ in 0..2 {
+      crate::api::nop().with_lio(&lio).when_done(|_| {});
+      backend.inner.complete_all(0);
+      lio.try_run().unwrap();
+    }
     let allocs = backend.first_allocs.borrow().clone();
     assert_eq!(allocs.len(), 2);
-    assert_eq!(allocs[0], allocs[1], "the second step reused the slot's arena");
+    assert_eq!(
+      allocs[0], allocs[1],
+      "the second operation reused the slot's arena"
+    );
   }
 
   #[test]
@@ -1431,7 +1394,7 @@ mod tests {
   #[should_panic(expected = "queued a submission while a slot is free")]
   fn queueing_with_a_free_slot_panics() {
     let (_, lio) = lio(1);
-    Lio::enqueue(&mut lio.inner.borrow_mut(), |_| unreachable!());
+    Lio::enqueue(&mut lio.inner.borrow_mut(), |_| unreachable!(), None);
   }
 
   #[test]

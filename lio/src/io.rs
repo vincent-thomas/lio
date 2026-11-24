@@ -25,12 +25,13 @@
 use std::io;
 use std::mem::MaybeUninit;
 
+use crate::api::ops::raw;
 use crate::api::{
   io::Io,
   ops,
   resource::{AsResource, Resource},
 };
-use crate::model::{Cx, Model, Op, Step};
+use crate::model::{Cx, OpModel, Step};
 use crate::ready;
 use crate::{IoBuf, IoBufMut, IoBufVec};
 
@@ -145,8 +146,8 @@ pub struct Copy {
 }
 
 enum CopyState {
-  Reading(Op<ops::Read<CappedBuf>>),
-  Writing(Op<ops::Write<Vec<u8>>>),
+  Reading(ops::Read<CappedBuf>),
+  Writing(ops::Write<Vec<u8>>),
 }
 
 impl Copy {
@@ -157,7 +158,7 @@ impl Copy {
     let initial = limit.min(DEFAULT_BUF_SIZE as u64) as usize;
     let buf = CappedBuf::new(Vec::with_capacity(initial), initial);
     Self {
-      state: CopyState::Reading(Op::new(ops::Read::new(
+      state: CopyState::Reading(ops::Read::from(raw::Read::new(
         reader.clone(),
         buf,
         None,
@@ -178,11 +179,15 @@ impl Copy {
   }
 
   fn writing(&self, buf: Vec<u8>) -> CopyState {
-    CopyState::Writing(Op::new(ops::Write::new(self.writer.clone(), buf, None)))
+    CopyState::Writing(ops::Write::from(raw::Write::new(
+      self.writer.clone(),
+      buf,
+      None,
+    )))
   }
 }
 
-impl Model for Copy {
+impl OpModel for Copy {
   type Item = io::Result<u64>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -210,7 +215,7 @@ impl Model for Copy {
           (Ok(_), mut buf) => {
             buf.clear();
             let buf = CappedBuf::new(buf, self.next_read_len());
-            CopyState::Reading(Op::new(ops::Read::new(
+            CopyState::Reading(ops::Read::from(raw::Read::new(
               self.reader.clone(),
               buf,
               None,

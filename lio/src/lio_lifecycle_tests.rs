@@ -23,53 +23,71 @@ use std::task::{Context, Waker};
 use std::time::Duration;
 
 use crate::Lio;
-use crate::api::op::{
-  Action, Completion, OneshotOpModel, OpModel, OpResult, StreamOpModel,
-};
+use crate::api::op::{Action, Completion};
 use crate::api::resource::Resource;
 use crate::api::{Io, IoStream};
 use crate::backend::op::Op;
 use crate::backend::testing::{Checked, ScriptedBackend};
+use crate::model::{Cx, OpModel, Step};
 
 /// A stream ends after this many items, or at its first error.
 const STREAM_ITEMS: u32 = 3;
 const EIO: isize = -5;
 
-/// An op whose submissions carry its tag, and which logs being dropped.
-struct Tagged {
+/// Logs its tag when dropped.
+struct DropLog {
   tag: u32,
-  stream: bool,
-  completions: u32,
   drops: Arc<Mutex<Vec<u32>>>,
 }
 
-impl OpModel for Tagged {
-  type Item = (u32, isize);
+impl Drop for DropLog {
+  fn drop(&mut self) {
+    self.drops.lock().unwrap().push(self.tag);
+  }
+}
 
+/// The memory of an op whose submission carries its tag.
+struct TaggedOp {
+  tag: u32,
+  /// Present on an op run on its own. A stream logs its own drop.
+  _log: Option<DropLog>,
+}
+
+impl TaggedOp {
   fn action(&mut self) -> Action<'_> {
     action_io!(Op::Listen { fd: Resource::stdin(), backlog: self.tag as i32 })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<(u32, isize)> {
-    self.completions += 1;
-    let item = (self.tag, completion.result());
-    if self.stream
-      && completion.result() >= 0
-      && self.completions < STREAM_ITEMS
-    {
-      OpResult::Yield(item)
-    } else {
-      OpResult::Done(item)
-    }
+  fn complete(&mut self, completion: Completion) -> (u32, isize) {
+    (self.tag, completion.result())
   }
 }
 
-impl OneshotOpModel for Tagged {}
-impl StreamOpModel for Tagged {}
+leaf!(
+  /// An op whose submissions carry its tag, and which logs being dropped.
+  [] struct Tagged(TaggedOp) => (u32, isize)
+);
 
-impl Drop for Tagged {
-  fn drop(&mut self) {
-    self.drops.lock().unwrap().push(self.tag);
+/// One tagged op after another: every result is an item.
+struct TaggedStream {
+  tag: u32,
+  completions: u32,
+  step: Tagged,
+  _log: DropLog,
+}
+
+impl OpModel for TaggedStream {
+  type Item = (u32, isize);
+
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    let item = crate::ready!(self.step.poll(cx));
+    self.completions += 1;
+    if item.1 >= 0 && self.completions < STREAM_ITEMS {
+      self.step = TaggedOp { tag: self.tag, _log: None }.into();
+      Step::Yield(item)
+    } else {
+      Step::Done(item)
+    }
   }
 }
 
@@ -174,17 +192,23 @@ impl Harness {
       .collect()
   }
 
-  fn tagged(&self, index: usize, stream: bool) -> Tagged {
-    Tagged {
+  fn log(&self, index: usize) -> DropLog {
+    DropLog { tag: index as u32, drops: self.drops.clone() }
+  }
+
+  fn tagged(&self, index: usize) -> Tagged {
+    TaggedOp { tag: index as u32, _log: Some(self.log(index)) }.into()
+  }
+
+  fn tagged_stream(&self, index: usize) -> TaggedStream {
+    TaggedStream {
       tag: index as u32,
-      stream,
       completions: 0,
-      drops: self.drops.clone(),
+      step: TaggedOp { tag: index as u32, _log: None }.into(),
+      _log: self.log(index),
     }
   }
 
-  /// The events that can happen now, skipping ones that would only repeat
-  /// the previous event to no effect.
   fn events(&self, last: Option<Event>) -> Vec<Event> {
     if self.lio.is_none() {
       return Vec::new();
@@ -263,13 +287,13 @@ impl Harness {
     let delivered = self.ops[index].delivered.clone();
     let consumer: Option<Pending> = match self.kinds[index] {
       Kind::Callback => {
-        Io::from_op(self.tagged(index, false)).with_lio(&lio).when_done(
+        Io::from_op(self.tagged(index)).with_lio(&lio).when_done(
           move |(_, result)| delivered.borrow_mut().push(Delivered::Io(result)),
         );
         None
       }
       Kind::Future => {
-        let io = Io::from_op(self.tagged(index, false)).with_lio(&lio);
+        let io = Io::from_op(self.tagged(index)).with_lio(&lio);
         Some(Box::pin(async move {
           let (_, result) = io.await;
           delivered.borrow_mut().push(Delivered::Io(result));
@@ -277,7 +301,7 @@ impl Harness {
       }
       Kind::Stream => {
         let mut stream =
-          IoStream::from_op(self.tagged(index, true)).with_lio(&lio);
+          IoStream::from_op(self.tagged_stream(index)).with_lio(&lio);
         Some(Box::pin(async move {
           while let Some((_, result)) = stream.next().await {
             delivered.borrow_mut().push(Delivered::Io(result));

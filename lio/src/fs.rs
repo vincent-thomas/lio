@@ -9,13 +9,14 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 
+use crate::api::ops::raw;
 use crate::api::{
   FileMode, FileStat, FileType, OpenFlags, ReadDirBuf, UnlinkKind,
   io::Io,
   ops,
   resource::{AsResource, FromResource, IntoResource, Resource},
 };
-use crate::model::{Cx, Model, Op, Step};
+use crate::model::{Cx, OpModel, Step};
 use crate::ready;
 
 const DEFAULT_READ_DIR_SCRATCH_BYTES: usize = 4096;
@@ -105,7 +106,7 @@ impl Directory {
   /// Opens a directory relative to the current working directory.
   pub fn open(path: std::ffi::CString) -> Io<OpenDirectory> {
     Io::from_op(OpenDirectory {
-      inner: Op::new(open_dir(Resource::cwd(), path)),
+      inner: From::from(open_dir(Resource::cwd(), path)),
     })
   }
 
@@ -259,13 +260,10 @@ impl OpenOptions {
   pub fn open(self, path: std::ffi::CString) -> Io<OpenFile> {
     Io::from_op(OpenFile {
       state: match self.flags() {
-        Ok(flags) => OpenFileState::Opening(Op::new(ops::OpenAt::new(
-          Resource::cwd(),
-          path,
-          flags,
-          self.mode,
-        ))),
-        Err(msg) => OpenFileState::Invalid(msg, Op::new(ops::Nop)),
+        Ok(flags) => OpenFileState::Opening(ops::OpenAt::from(
+          raw::OpenAt::new(Resource::cwd(), path, flags, self.mode),
+        )),
+        Err(msg) => OpenFileState::Invalid(msg, ops::Nop::from(raw::Nop)),
       },
     })
   }
@@ -304,8 +302,8 @@ impl OpenOptions {
 }
 
 /// Opens a directory for reading.
-fn open_dir(parent: Resource, name: CString) -> ops::OpenAt {
-  ops::OpenAt::new(
+fn open_dir(parent: Resource, name: CString) -> raw::OpenAt {
+  raw::OpenAt::new(
     parent,
     name,
     OpenFlags::READ | OpenFlags::DIRECTORY,
@@ -319,13 +317,13 @@ pub struct OpenFile {
 }
 
 enum OpenFileState {
-  Opening(Op<ops::OpenAt>),
+  Opening(ops::OpenAt),
   /// The options were invalid: completes with this `InvalidInput` message,
   /// from the driver like any other result.
-  Invalid(&'static str, Op<ops::Nop>),
+  Invalid(&'static str, ops::Nop),
 }
 
-impl Model for OpenFile {
+impl OpModel for OpenFile {
   type Item = io::Result<File>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -345,10 +343,10 @@ model_io!(OpenFile);
 
 /// Open-directory operation specialized to return a typed [`Directory`].
 pub struct OpenDirectory {
-  inner: Op<ops::OpenAt>,
+  inner: ops::OpenAt,
 }
 
-impl Model for OpenDirectory {
+impl OpModel for OpenDirectory {
   type Item = io::Result<Directory>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -367,15 +365,15 @@ pub struct OpenReadDir {
 
 enum OpenReadDirState {
   /// The path could not be represented; completes with `InvalidInput`.
-  InvalidPath(Op<ops::Nop>),
-  Opening(Op<ops::OpenAt>),
+  InvalidPath(ops::Nop),
+  Opening(ops::OpenAt),
   Reading {
     fd: Resource,
-    read: Op<ops::ReadDir>,
+    read: ops::ReadDir,
   },
 }
 
-impl Model for OpenReadDir {
+impl OpModel for OpenReadDir {
   type Item = io::Result<ReadDir>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -383,7 +381,7 @@ impl Model for OpenReadDir {
       let (fd, buf) = match &mut self.state {
         OpenReadDirState::InvalidPath(nop) => {
           let _ = ready!(nop.poll(cx));
-          return Step::Done(Err(ops::nul_path_error()));
+          return Step::Done(Err(raw::nul_path_error()));
         }
         OpenReadDirState::Opening(open) => match ready!(open.poll(cx)) {
           Ok(fd) => {
@@ -419,7 +417,7 @@ impl Model for OpenReadDir {
         }
       };
       self.state = OpenReadDirState::Reading {
-        read: Op::new(ops::ReadDir::new(fd.clone(), buf)),
+        read: ops::ReadDir::from(raw::ReadDir::new(fd.clone(), buf)),
         fd,
       };
     }
@@ -458,11 +456,11 @@ impl RemoveDirFrame {
     }
   }
 
-  fn next_read(&mut self) -> Op<ops::ReadDir> {
+  fn next_read(&mut self) -> ops::ReadDir {
     let Some(buf) = self.buf.take() else {
       unreachable!("remove_dir_all buffer missing");
     };
-    Op::new(ops::ReadDir::new(self.fd.clone(), buf))
+    ops::ReadDir::from(raw::ReadDir::new(self.fd.clone(), buf))
   }
 
   fn push_entries(&mut self, buf: ReadDirBuf) {
@@ -490,33 +488,35 @@ enum RemoveDirAllState {
   Opening {
     parent: Resource,
     name: CString,
-    open: Op<ops::OpenAt>,
+    open: ops::OpenAt,
   },
   Reading {
-    read: Op<ops::ReadDir>,
+    read: ops::ReadDir,
   },
   Stating {
     parent: Resource,
     name: CString,
-    stat: Op<ops::Stat>,
+    stat: ops::Stat,
   },
   /// Removing a file, or a directory that has been emptied.
   Removing {
-    unlink: Op<ops::UnlinkAt>,
+    unlink: ops::UnlinkAt,
   },
 }
 
 impl RemoveDirAllState {
   fn opening(parent: Resource, name: CString) -> Self {
     Self::Opening {
-      open: Op::new(open_dir(parent.clone(), name.clone())),
+      open: From::from(open_dir(parent.clone(), name.clone())),
       parent,
       name,
     }
   }
 
   fn removing(parent: Resource, name: CString, kind: UnlinkKind) -> Self {
-    Self::Removing { unlink: Op::new(ops::UnlinkAt::new(parent, name, kind)) }
+    Self::Removing {
+      unlink: ops::UnlinkAt::from(raw::UnlinkAt::new(parent, name, kind)),
+    }
   }
 }
 
@@ -543,7 +543,7 @@ impl RemoveDirAll {
           RemoveDirAllState::removing(parent, entry.name, UnlinkKind::File)
         }
         None => RemoveDirAllState::Stating {
-          stat: Op::new(ops::Stat::new_at(
+          stat: ops::Stat::from(raw::Stat::new_at(
             parent.clone(),
             entry.name.clone(),
             false,
@@ -567,7 +567,7 @@ impl RemoveDirAll {
   }
 }
 
-impl Model for RemoveDirAll {
+impl OpModel for RemoveDirAll {
   type Item = io::Result<()>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -637,8 +637,8 @@ pub struct ReadLink {
 
 enum ReadLinkState {
   /// The path could not be represented; completes with `InvalidInput`.
-  InvalidPath(Op<ops::Nop>),
-  Reading(Op<ops::ReadlinkAt<Vec<u8>>>),
+  InvalidPath(ops::Nop),
+  Reading(ops::ReadlinkAt<Vec<u8>>),
 }
 
 impl ReadLink {
@@ -650,7 +650,7 @@ impl ReadLink {
 
 impl ReadLinkState {
   fn reading(path: &CString, len: usize) -> Self {
-    Self::Reading(Op::new(ops::ReadlinkAt::new(
+    Self::Reading(ops::ReadlinkAt::from(raw::ReadlinkAt::new(
       Resource::cwd(),
       path.clone(),
       vec![0u8; len],
@@ -658,7 +658,7 @@ impl ReadLinkState {
   }
 }
 
-impl Model for ReadLink {
+impl OpModel for ReadLink {
   type Item = io::Result<PathBuf>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -666,7 +666,7 @@ impl Model for ReadLink {
       match &mut self.state {
         ReadLinkState::InvalidPath(nop) => {
           let _ = ready!(nop.poll(cx));
-          return Step::Done(Err(ops::nul_path_error()));
+          return Step::Done(Err(raw::nul_path_error()));
         }
         ReadLinkState::Reading(read) => match ready!(read.poll(cx)) {
           // The target may have been cut off: try again with more room.
@@ -695,18 +695,18 @@ pub struct ReadToString {
 #[allow(clippy::large_enum_variant)]
 enum ReadToStringState {
   /// The path could not be represented; completes with `InvalidInput`.
-  InvalidPath(Op<ops::Nop>),
-  Opening(Op<ops::OpenAt>),
+  InvalidPath(ops::Nop),
+  Opening(ops::OpenAt),
   Reading {
     fd: Resource,
-    read: Op<ops::Read<Vec<u8>>>,
+    read: ops::Read<Vec<u8>>,
   },
 }
 
 impl ReadToString {
   fn new(path: CString) -> Self {
     Self {
-      state: ReadToStringState::Opening(Op::new(ops::OpenAt::new(
+      state: ReadToStringState::Opening(ops::OpenAt::from(raw::OpenAt::new(
         Resource::cwd(),
         path,
         OpenFlags::READ,
@@ -717,7 +717,7 @@ impl ReadToString {
   }
 }
 
-impl Model for ReadToString {
+impl OpModel for ReadToString {
   type Item = io::Result<String>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -725,7 +725,7 @@ impl Model for ReadToString {
       let (fd, buf) = match &mut self.state {
         ReadToStringState::InvalidPath(nop) => {
           let _ = ready!(nop.poll(cx));
-          return Step::Done(Err(ops::nul_path_error()));
+          return Step::Done(Err(raw::nul_path_error()));
         }
         ReadToStringState::Opening(open) => match ready!(open.poll(cx)) {
           Ok(fd) => (fd, vec![0u8; DEFAULT_READ_TO_STRING_BYTES]),
@@ -748,7 +748,7 @@ impl Model for ReadToString {
         }
       };
       self.state = ReadToStringState::Reading {
-        read: Op::new(ops::Read::new(fd.clone(), buf, None)),
+        read: ops::Read::from(raw::Read::new(fd.clone(), buf, None)),
         fd,
       };
     }
@@ -764,9 +764,9 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> Io<OpenReadDir> {
   let parent = path.as_ref().to_path_buf();
   let state = match path_to_cstring(path.as_ref()) {
     Some(path) => {
-      OpenReadDirState::Opening(Op::new(open_dir(Resource::cwd(), path)))
+      OpenReadDirState::Opening(From::from(open_dir(Resource::cwd(), path)))
     }
-    None => OpenReadDirState::InvalidPath(Op::new(ops::Nop)),
+    None => OpenReadDirState::InvalidPath(ops::Nop::from(raw::Nop)),
   };
   Io::from_op(OpenReadDir { state, parent, entries: Vec::new() })
 }
@@ -777,7 +777,7 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> Io<OpenReadDir> {
 pub fn metadata<P: AsRef<Path>>(path: P) -> Io<ops::Stat> {
   match path_to_cstring(path.as_ref()) {
     Some(path) => metadata_cstring(path, true),
-    None => Io::from_op(ops::Stat::invalid_path()),
+    None => Io::leaf(raw::Stat::invalid_path()),
   }
 }
 
@@ -787,7 +787,7 @@ pub fn metadata<P: AsRef<Path>>(path: P) -> Io<ops::Stat> {
 pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> Io<ops::Stat> {
   match path_to_cstring(path.as_ref()) {
     Some(path) => metadata_cstring(path, false),
-    None => Io::from_op(ops::Stat::invalid_path()),
+    None => Io::leaf(raw::Stat::invalid_path()),
   }
 }
 
@@ -807,7 +807,7 @@ pub fn read_link<P: AsRef<Path>>(path: P) -> Io<ReadLink> {
     Some(path) => ReadLink::new(path),
     None => ReadLink {
       path: CString::default(),
-      state: ReadLinkState::InvalidPath(Op::new(ops::Nop)),
+      state: ReadLinkState::InvalidPath(ops::Nop::from(raw::Nop)),
     },
   })
 }
@@ -819,7 +819,7 @@ pub fn read_to_string<P: AsRef<Path>>(path: P) -> Io<ReadToString> {
   Io::from_op(match path_to_cstring(path.as_ref()) {
     Some(path) => ReadToString::new(path),
     None => ReadToString {
-      state: ReadToStringState::InvalidPath(Op::new(ops::Nop)),
+      state: ReadToStringState::InvalidPath(ops::Nop::from(raw::Nop)),
       bytes: Vec::new(),
     },
   })

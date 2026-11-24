@@ -1,45 +1,38 @@
-//! Poll-shaped operation models. **Prototype.**
+//! Operation models: I/O work the driver runs by polling it.
 //!
-//! A [`Model`] is a state machine that describes a piece of I/O work. The
-//! driver asks it one question, [`poll`](Model::poll): given what has
+//! An [`OpModel`] is a state machine that describes a piece of I/O work. The
+//! driver asks it one question, [`poll`](OpModel::poll): given what has
 //! finished so far, can you make progress?
 //!
-//! - A *leaf* ([`Read`], [`Write`], [`Sleep`]) submits one operation through
-//!   the [`Cx`] and keeps the [`Ticket`] it gets back. The buffer moves into
-//!   the driver with the operation and comes back with the result.
-//! - A *composite* ([`Join`], [`io::copy`](crate::io::copy), anything you
-//!   write) holds other models and polls them. It never sees a completion, so it cannot hand one
-//!   operation's result to another.
+//! - Every single operation in [`api`](crate::api) is a model (a *leaf*).
+//!   Polling it submits the operation, with the buffer it owns, to the
+//!   driver. The buffer comes back with the result.
+//! - A *composite* ([`Join`], [`io::copy`](crate::io::copy), everything in
+//!   `fs` and `net` that takes more than one step, anything you write) holds
+//!   other models and polls them. It only ever sees their items, so it
+//!   cannot hand one operation's result to another.
 //!
-//! No model here contains `unsafe`, and a model you write needs none.
+//! A model you write needs no `unsafe`: the only way to start an operation
+//! is to poll one of lio's leaves, and a leaf only produces the result of
+//! the operation it started.
 //!
-//! lio's own multi-step operations ([`io::copy`](crate::io::copy), and
-//! everything in `fs` and `net` that takes more than one step) are models.
-//! Any single operation becomes a leaf with
-//! [`Io::into_model`](crate::api::Io::into_model). The operation itself is
-//! not handed out, so a result cannot be given to an operation that did not
-//! run:
-//!
-//! ```compile_fail
-//! # let file = lio::api::resource::Resource::stdin();
-//! // A read is not a model, and `into_inner` only returns models.
-//! let read = lio::api::read(&file, Vec::<u8>::with_capacity(4096)).into_inner();
-//! ```
+//! [`Io`](crate::api::Io) runs lio's own models. [`spawn`] and [`run`] run
+//! any model, including yours.
 //!
 //! ```
 //! use lio::Lio;
-//! use lio::api::resource::Resource;
+//! use lio::api::{self, ops, resource::Resource};
 //! use lio::backend::testing::ScriptedBackend;
-//! use lio::model::{self, Cx, Model, Read, Step};
+//! use lio::model::{self, Cx, OpModel, Step};
 //!
 //! /// Reads twice from the same resource, one read after the other.
 //! struct ReadTwice {
 //!   from: Resource,
 //!   first: Option<usize>,
-//!   read: Read<Vec<u8>>,
+//!   read: ops::Read<Vec<u8>>,
 //! }
 //!
-//! impl Model for ReadTwice {
+//! impl OpModel for ReadTwice {
 //!   type Item = std::io::Result<usize>;
 //!
 //!   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -53,7 +46,7 @@
 //!         Some(first) => return Step::Done(Ok(first + n)),
 //!         None => {
 //!           self.first = Some(n);
-//!           self.read = Read::new(&self.from, buf);
+//!           self.read = api::read(&self.from, buf).into_inner();
 //!         }
 //!       }
 //!     }
@@ -64,7 +57,7 @@
 //! let lio = Lio::new_with_backend(backend, 4).unwrap();
 //! let from = Resource::stdin();
 //! let model = ReadTwice {
-//!   read: Read::new(&from, Vec::with_capacity(8)),
+//!   read: api::read(&from, Vec::with_capacity(8)).into_inner(),
 //!   from,
 //!   first: None,
 //! };
@@ -72,30 +65,25 @@
 //! while lio.try_run().unwrap() > 0 {}
 //! ```
 //!
-//! # What is prototype about this
+//! # Cost
 //!
-//! Each [`Ticket`] is backed by one ordinary driver registration, which owns
-//! the buffer and the operation's scratch memory until the backend reports
-//! it. That is the "driver-owned slot". A finished design would have the
-//! driver poll the root model itself and keep the slots in one arena per
-//! root, instead of going through a callback and two `Rc`s per operation.
+//! An operation run on its own through [`Io`](crate::api::Io) is registered
+//! with the driver directly and allocates nothing. Inside a composite, each
+//! operation is one driver registration plus one small allocation that
+//! carries its result back to the model.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
-use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
 
-use crate::api::op::OneshotOpModel;
-use crate::api::ops;
-use crate::api::resource::{AsResource, Resource};
-use crate::registration::Registration;
-use crate::{BufResult, IoBufMutVec, IoBufVec, Lio};
+use crate::Lio;
+use crate::driver::{QueueToken, WeakLio};
+use crate::registration::{ActionFn, CompleteFn, Registration};
 
 /// A piece of I/O work the driver runs by polling it.
-pub trait Model {
+pub trait OpModel {
   /// What the model produces.
   type Item;
 
@@ -111,7 +99,7 @@ pub trait Model {
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item>;
 }
 
-/// What one [`Model::poll`] call reports.
+/// What one [`OpModel::poll`] call reports.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step<T> {
   /// Nothing to report. The model is polled again when something it
@@ -124,7 +112,7 @@ pub enum Step<T> {
 }
 
 /// Takes the item out of a [`Step`], or returns [`Step::Pending`] from the
-/// surrounding [`Model::poll`].
+/// surrounding [`OpModel::poll`].
 ///
 /// For a child that produces one item. A [`Step::Yield`] is unwrapped the
 /// same way as a [`Step::Done`].
@@ -140,113 +128,103 @@ macro_rules! ready {
   };
 }
 
-/// The driver's side of one [`Model::poll`] call.
+/// The driver's side of one [`OpModel::poll`] call.
 ///
-/// The only way to start an operation, and the only place a result comes
-/// from. Only the driver creates one.
+/// Operations start through it and results come back through it. Only the
+/// driver creates one, and only lio's own operation types use it: a model
+/// passes it on to the models it polls.
 pub struct Cx<'a> {
   lio: &'a Lio,
   root: &'a Rc<dyn Wake>,
 }
 
 impl Cx<'_> {
-  /// Starts a read into `buf`, at `offset` or at the current position.
-  pub fn read<B>(
-    &mut self,
-    from: &impl AsResource,
-    buf: B,
-    offset: Option<u64>,
-  ) -> Ticket<BufResult<usize, B>>
-  where
-    B: IoBufMutVec + Send + Sync + 'static,
-  {
-    self.submit(ops::Read::new(from.as_resource().clone(), buf, offset))
-  }
-
-  /// Starts a write of `buf`, at `offset` or at the current position.
-  pub fn write<B>(
-    &mut self,
-    to: &impl AsResource,
-    buf: B,
-    offset: Option<u64>,
-  ) -> Ticket<BufResult<usize, B>>
-  where
-    B: IoBufVec + Send + Sync + 'static,
-  {
-    self.submit(ops::Write::new(to.as_resource().clone(), buf, offset))
-  }
-
-  /// Starts a timer.
-  pub fn sleep(&mut self, duration: Duration) -> Ticket<io::Result<()>> {
-    self.submit(ops::Sleep::new(duration))
-  }
-
   /// The result of the operation `ticket` stands for, once, when it has
   /// finished.
-  pub fn take<T>(&mut self, ticket: &mut Ticket<T>) -> Option<T> {
+  fn take<T>(&mut self, ticket: &mut Ticket<T>) -> Option<T> {
     ticket.slot.borrow_mut().take()
   }
 
-  /// Moves `op`, with the buffers it owns, into a driver registration.
+  /// Moves `state`, the memory one operation uses, into a driver
+  /// registration, and submits the operation `action` builds from it.
   ///
-  /// Crate-private: the request types are lio's own, so the result a ticket
-  /// yields is always the result of the operation that was submitted for it.
-  fn submit<T>(&mut self, op: T) -> Ticket<T::Item>
-  where
-    T: OneshotOpModel,
-  {
+  /// `complete` reads the result out of that same memory. The pair is fixed
+  /// here, by lio's own operation types, so the result a ticket yields is
+  /// always the result of the operation that was submitted for it.
+  fn submit<S: 'static, Out: 'static>(
+    &mut self,
+    state: S,
+    action: ActionFn<S>,
+    complete: CompleteFn<S, Out>,
+  ) -> Ticket<Out> {
     let slot = Rc::new(RefCell::new(None));
     let filled = Rc::clone(&slot);
     let root = Rc::clone(self.root);
-    let on_done = move |item: T::Item| {
-      *filled.borrow_mut() = Some(item);
-      Rc::clone(&root).wake();
+    let on_done = move |out: Out| {
+      *filled.borrow_mut() = Some(out);
+      Rc::clone(&root).notify();
     };
 
     let id = if self.lio.is_full() {
-      // Over capacity the operation waits in the driver's queue. It has no
-      // id until it leaves the queue, so it cannot be cancelled early.
-      self.lio.schedule_or_queue(move |arena| {
-        Registration::new_callback_in(arena, on_done, op)
-      });
-      None
+      // Over capacity the operation waits in the driver's queue.
+      TicketId::Queued(self.lio.queue_abandonable(move |arena| {
+        Registration::new_in(arena, state, action, complete, on_done)
+      }))
     } else {
       let scheduled = self.lio.schedule_with(move |arena| {
-        Registration::new_callback_in(arena, on_done, op)
+        Registration::new_in(arena, state, action, complete, on_done)
       });
       match scheduled {
-        Ok(id) => Some(id),
+        Ok(id) => TicketId::Scheduled(id),
         Err(err) => {
           unreachable!("lio rejected an operation it had capacity for: {err}")
         }
       }
     };
 
-    Ticket { slot, id, lio: self.lio.clone() }
+    Ticket { slot, id, lio: self.lio.downgrade() }
   }
 }
 
 /// A receipt for one submitted operation.
 ///
-/// Created by a [`Cx`], and neither copied nor built by hand. Its type is
-/// the result that operation produces. Dropping it before the result is
-/// taken cancels the operation; the driver frees the buffer once the backend
-/// is done with it.
-pub struct Ticket<T> {
+/// Its type is the result that operation produces. Dropping it before the
+/// result is taken cancels the operation; the driver frees the buffer once
+/// the backend is done with it.
+pub(crate) struct Ticket<T> {
   slot: Rc<RefCell<Option<T>>>,
-  id: Option<u64>,
-  lio: Lio,
+  id: TicketId,
+  lio: WeakLio,
+}
+
+enum TicketId {
+  /// In a driver slot.
+  Scheduled(u64),
+  /// Waiting for a slot, or in one since.
+  Queued(Rc<QueueToken>),
 }
 
 impl<T> Drop for Ticket<T> {
   fn drop(&mut self) {
-    let Some(id) = self.id else { return };
     // The registration's callback shares the slot. Once it is gone the
-    // operation has finished and `id` may belong to a later one.
+    // operation has finished and its id may belong to a later one.
     if Rc::strong_count(&self.slot) == 1 || self.slot.borrow().is_some() {
       return;
     }
-    self.lio.cancel_stream(id);
+    let id = match &self.id {
+      TicketId::Scheduled(id) => Some(*id),
+      TicketId::Queued(token) => {
+        // Still queued: it never reaches the backend.
+        token.abandon();
+        token.id()
+      }
+    };
+    // Without a driver there is nothing left to cancel.
+    if let Some(id) = id
+      && let Some(lio) = self.lio.upgrade()
+    {
+      lio.cancel_stream(id);
+    }
   }
 }
 
@@ -254,18 +232,28 @@ impl<T> Drop for Ticket<T> {
 // Running a root model
 // ============================================================================
 
-trait Wake {
-  /// Polls the root model again: one of its operations finished.
+pub(crate) trait Wake {
+  /// One of the root model's operations finished: have the driver poll it
+  /// once the run that routed the completion has released its slot.
+  fn notify(self: Rc<Self>);
+
+  /// Polls the root model.
   fn wake(self: Rc<Self>);
 
   /// Drops the root model, cancelling what it has in flight.
   fn cancel(&self);
 }
 
-struct Root<M: Model, F> {
-  lio: Lio,
+struct Root<M: OpModel, F> {
+  /// Weak: the driver's registrations hold this root through their
+  /// callbacks.
+  lio: WeakLio,
   model: RefCell<Option<M>>,
-  on_item: RefCell<F>,
+  /// Receives the items. Dropped as soon as the model is: a stream's
+  /// consumer learns from that drop that no further item is coming.
+  on_item: RefCell<Option<F>>,
+  /// Already waiting for the driver to poll it.
+  notified: Cell<bool>,
   /// A poll is running further up the stack.
   polling: Cell<bool>,
   /// An operation finished while a poll was running: poll once more.
@@ -275,10 +263,19 @@ struct Root<M: Model, F> {
 
 impl<M, F> Wake for Root<M, F>
 where
-  M: Model + 'static,
-  F: FnMut(M::Item) + 'static,
+  M: OpModel + 'static,
+  F: FnMut(M::Item) -> bool + 'static,
 {
+  fn notify(self: Rc<Self>) {
+    if !self.notified.replace(true)
+      && let Some(lio) = self.lio.upgrade()
+    {
+      lio.wake_later(self);
+    }
+  }
+
   fn wake(self: Rc<Self>) {
+    self.notified.set(false);
     if self.polling.replace(true) {
       self.woken.set(true);
       return;
@@ -286,22 +283,36 @@ where
     let root: Rc<dyn Wake> = self.clone();
     loop {
       self.woken.set(false);
-      if self.cancelled.get() {
-        self.take_model();
+      // A model cannot outlive its driver: nothing would ever finish.
+      let lio = self.lio.upgrade();
+      let (false, Some(lio)) = (self.cancelled.get(), lio) else {
+        self.finish();
         break;
-      }
+      };
       let step = {
         let mut model = self.model.borrow_mut();
         let Some(model) = model.as_mut() else { break };
-        model.poll(&mut Cx { lio: &self.lio, root: &root })
+        model.poll(&mut Cx { lio: &lio, root: &root })
       };
       match step {
         Step::Pending if self.woken.get() => {}
         Step::Pending => break,
-        Step::Yield(item) => (self.on_item.borrow_mut())(item),
+        Step::Yield(item) => {
+          let wanted = match self.on_item.borrow_mut().as_mut() {
+            Some(on_item) => on_item(item),
+            None => false,
+          };
+          if !wanted {
+            self.cancelled.set(true);
+          }
+        }
         Step::Done(item) => {
-          self.take_model();
-          (self.on_item.borrow_mut())(item);
+          let model = self.model.borrow_mut().take();
+          drop(model);
+          let on_item = self.on_item.borrow_mut().take();
+          if let Some(mut on_item) = on_item {
+            on_item(item);
+          }
           break;
         }
       }
@@ -311,18 +322,22 @@ where
 
   fn cancel(&self) {
     self.cancelled.set(true);
+    // A running poll sees the flag when it returns.
     if !self.polling.get() {
-      self.take_model();
+      self.finish();
     }
   }
 }
 
-impl<M: Model, F> Root<M, F> {
-  /// Drops the model with the cell released: dropping its tickets calls
-  /// back into the driver.
-  fn take_model(&self) {
+impl<M: OpModel, F> Root<M, F> {
+  /// Drops the model and the item sink, each with its cell released:
+  /// dropping tickets calls back into the driver, and dropping the sink may
+  /// wake a consumer that polls inline.
+  fn finish(&self) {
     let model = self.model.borrow_mut().take();
     drop(model);
+    let on_item = self.on_item.borrow_mut().take();
+    drop(on_item);
   }
 }
 
@@ -340,6 +355,11 @@ impl Task {
   pub fn cancel(self) {
     self.root.cancel();
   }
+
+  /// [`cancel`](Self::cancel) for a handle that cannot be consumed.
+  pub(crate) fn stop(&self) {
+    self.root.cancel();
+  }
 }
 
 /// Runs `model` on `lio`, calling `on_item` with every item it produces.
@@ -348,15 +368,31 @@ impl Task {
 pub fn spawn<M>(
   lio: &Lio,
   model: M,
-  on_item: impl FnMut(M::Item) + 'static,
+  mut on_item: impl FnMut(M::Item) + 'static,
 ) -> Task
 where
-  M: Model + 'static,
+  M: OpModel + 'static,
+{
+  spawn_while(lio, model, move |item| {
+    on_item(item);
+    true
+  })
+}
+
+/// [`spawn`] that stops the model once `on_item` returns `false`.
+pub(crate) fn spawn_while<M>(
+  lio: &Lio,
+  model: M,
+  on_item: impl FnMut(M::Item) -> bool + 'static,
+) -> Task
+where
+  M: OpModel + 'static,
 {
   let root: Rc<dyn Wake> = Rc::new(Root {
-    lio: lio.clone(),
+    lio: lio.downgrade(),
     model: RefCell::new(Some(model)),
-    on_item: RefCell::new(on_item),
+    on_item: RefCell::new(Some(on_item)),
+    notified: Cell::new(false),
     polling: Cell::new(false),
     woken: Cell::new(false),
     cancelled: Cell::new(false),
@@ -370,17 +406,17 @@ where
 /// The model starts on the first poll. Dropping the future cancels it.
 pub fn run<M>(lio: &Lio, model: M) -> Run<M>
 where
-  M: Model + Unpin + 'static,
+  M: OpModel + Unpin + 'static,
 {
   Run { state: RunState::Idle(lio.clone(), model) }
 }
 
 /// The future [`run`] returns.
-pub struct Run<M: Model> {
+pub struct Run<M: OpModel> {
   state: RunState<M>,
 }
 
-enum RunState<M: Model> {
+enum RunState<M: OpModel> {
   Idle(Lio, M),
   Running { shared: Rc<RefCell<Shared<M::Item>>>, task: Task },
   Done,
@@ -393,7 +429,7 @@ struct Shared<T> {
 
 impl<M> Future for Run<M>
 where
-  M: Model + Unpin + 'static,
+  M: OpModel + Unpin + 'static,
 {
   type Output = M::Item;
 
@@ -441,7 +477,7 @@ where
   }
 }
 
-impl<M: Model> Drop for Run<M> {
+impl<M: OpModel> Drop for Run<M> {
   fn drop(&mut self) {
     if let RunState::Running { task, .. } =
       std::mem::replace(&mut self.state, RunState::Done)
@@ -456,22 +492,26 @@ impl<M: Model> Drop for Run<M> {
 // ============================================================================
 
 /// One operation: not started, in flight, or finished.
-enum Leaf<Req, Out> {
-  Idle(Req),
+///
+/// Every operation type in [`api::ops`](crate::api::ops) is one of these
+/// around the memory the operation uses.
+pub(crate) enum Leaf<S, Out> {
+  Idle(S),
   InFlight(Ticket<Out>),
   Done,
 }
 
-impl<Req, Out> Leaf<Req, Out> {
-  fn poll(
+impl<S: 'static, Out: 'static> Leaf<S, Out> {
+  pub(crate) fn poll(
     &mut self,
     cx: &mut Cx<'_>,
-    submit: impl FnOnce(&mut Cx<'_>, Req) -> Ticket<Out>,
+    action: ActionFn<S>,
+    complete: CompleteFn<S, Out>,
   ) -> Step<Out> {
     let mut ticket = match std::mem::replace(self, Leaf::Done) {
-      Leaf::Idle(request) => submit(cx, request),
+      Leaf::Idle(state) => cx.submit(state, action, complete),
       Leaf::InFlight(ticket) => ticket,
-      Leaf::Done => panic!("model polled after it was done"),
+      Leaf::Done => panic!("operation polled after it was done"),
     };
     match cx.take(&mut ticket) {
       Some(out) => Step::Done(out),
@@ -481,107 +521,13 @@ impl<Req, Out> Leaf<Req, Out> {
       }
     }
   }
-}
 
-/// One of lio's operations as a leaf.
-///
-/// Made with [`Io::into_model`](crate::api::Io::into_model). The operation
-/// inside cannot be taken back out, so the result this leaf yields is always
-/// the result of the operation it submitted.
-pub struct Op<T: OneshotOpModel> {
-  leaf: Leaf<T, T::Item>,
-}
-
-impl<T: OneshotOpModel> Op<T> {
-  pub(crate) fn new(op: T) -> Self {
-    Self { leaf: Leaf::Idle(op) }
-  }
-}
-
-impl<T: OneshotOpModel> Model for Op<T> {
-  type Item = T::Item;
-
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-    self.leaf.poll(cx, |cx, op| cx.submit(op))
-  }
-}
-
-/// Reads into an owned buffer.
-///
-/// Produces the number of bytes read and the buffer.
-pub struct Read<B> {
-  leaf: Leaf<(Resource, B, Option<u64>), BufResult<usize, B>>,
-}
-
-impl<B> Read<B> {
-  /// Reads from the current position.
-  pub fn new(from: &impl AsResource, buf: B) -> Self {
-    Self { leaf: Leaf::Idle((from.as_resource().clone(), buf, None)) }
-  }
-
-  /// Reads at `offset`.
-  pub fn at(from: &impl AsResource, buf: B, offset: u64) -> Self {
-    Self { leaf: Leaf::Idle((from.as_resource().clone(), buf, Some(offset))) }
-  }
-}
-
-impl<B> Model for Read<B>
-where
-  B: IoBufMutVec + Send + Sync + 'static,
-{
-  type Item = BufResult<usize, B>;
-
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-    self.leaf.poll(cx, |cx, (from, buf, offset)| cx.read(&from, buf, offset))
-  }
-}
-
-/// Writes an owned buffer.
-///
-/// Produces the number of bytes written and the buffer.
-pub struct Write<B> {
-  leaf: Leaf<(Resource, B, Option<u64>), BufResult<usize, B>>,
-}
-
-impl<B> Write<B> {
-  /// Writes at the current position.
-  pub fn new(to: &impl AsResource, buf: B) -> Self {
-    Self { leaf: Leaf::Idle((to.as_resource().clone(), buf, None)) }
-  }
-
-  /// Writes at `offset`.
-  pub fn at(to: &impl AsResource, buf: B, offset: u64) -> Self {
-    Self { leaf: Leaf::Idle((to.as_resource().clone(), buf, Some(offset))) }
-  }
-}
-
-impl<B> Model for Write<B>
-where
-  B: IoBufVec + Send + Sync + 'static,
-{
-  type Item = BufResult<usize, B>;
-
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-    self.leaf.poll(cx, |cx, (to, buf, offset)| cx.write(&to, buf, offset))
-  }
-}
-
-/// Completes after a duration.
-pub struct Sleep {
-  leaf: Leaf<Duration, io::Result<()>>,
-}
-
-impl Sleep {
-  pub fn new(duration: Duration) -> Self {
-    Self { leaf: Leaf::Idle(duration) }
-  }
-}
-
-impl Model for Sleep {
-  type Item = io::Result<()>;
-
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-    self.leaf.poll(cx, |cx, duration| cx.sleep(duration))
+  /// The operation's memory, when it has not been submitted yet.
+  pub(crate) fn into_idle(self) -> Option<S> {
+    match self {
+      Leaf::Idle(state) => Some(state),
+      Leaf::InFlight(_) | Leaf::Done => None,
+    }
   }
 }
 
@@ -593,18 +539,18 @@ impl Model for Sleep {
 ///
 /// Both are polled in the same call, so their operations are in flight
 /// together.
-pub struct Join<A: Model, B: Model> {
+pub struct Join<A: OpModel, B: OpModel> {
   a: Side<A>,
   b: Side<B>,
 }
 
-enum Side<M: Model> {
+enum Side<M: OpModel> {
   Running(M),
   Finished(M::Item),
   Taken,
 }
 
-impl<M: Model> Side<M> {
+impl<M: OpModel> Side<M> {
   fn poll(&mut self, cx: &mut Cx<'_>) {
     if let Side::Running(model) = self
       && let Step::Yield(item) | Step::Done(item) = model.poll(cx)
@@ -614,13 +560,13 @@ impl<M: Model> Side<M> {
   }
 }
 
-impl<A: Model, B: Model> Join<A, B> {
+impl<A: OpModel, B: OpModel> Join<A, B> {
   pub fn new(a: A, b: B) -> Self {
     Self { a: Side::Running(a), b: Side::Running(b) }
   }
 }
 
-impl<A: Model, B: Model> Model for Join<A, B> {
+impl<A: OpModel, B: OpModel> OpModel for Join<A, B> {
   type Item = (A::Item, B::Item);
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {

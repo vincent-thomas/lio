@@ -18,8 +18,9 @@
 //! - `bookkeeping/buffer_256` — the round trip for `qd` reads of a 256-byte
 //!   buffer. The backend does not write the buffer, so the gap above
 //!   `round_trip` is building the iovec and handing the buffer back.
-//! - `bookkeeping/resubmit` — one yielded stream item with `steps` extra nops
-//!   before it. A step rearms the same registration instead of releasing it.
+//! - `bookkeeping/resubmit` — one yielded stream item from a model that
+//!   completes `steps` extra nops before it. Every nop is its own operation,
+//!   submitted when the model is polled after the one before it.
 //!   Throughput is items per second. The other groups count every operation.
 //! - `bookkeeping/timer` — insert and fire `qd` timers on the wheel, advanced
 //!   one tick with no driver. A sleep through `Lio` waits out a real 1 ms
@@ -46,10 +47,10 @@ use bumpalo::Bump;
 use criterion::{
   BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
-use lio::api::op::{Action, Completion, OpModel, OpResult, StreamOpModel};
 use lio::api::resource::Resource;
 use lio::backend::op::{BorrowedOp, Op};
 use lio::backend::{IoBackend, OpCompleted};
+use lio::model::{Cx, OpModel, Step};
 use lio::time::Clock;
 use lio::{Lio, api};
 
@@ -313,27 +314,30 @@ fn buffer(criterion: &mut Criterion) {
 struct SteppedNop {
   steps: usize,
   left: usize,
+  nop: api::ops::Nop,
+}
+
+impl SteppedNop {
+  fn new(steps: usize) -> Self {
+    Self { steps, left: steps, nop: api::nop().into_inner() }
+  }
 }
 
 impl OpModel for SteppedNop {
   type Item = ();
 
-  fn action(&mut self) -> Action<'_> {
-    Action::nop()
-  }
-
-  fn complete(&mut self, _: Completion) -> OpResult<()> {
-    if self.left > 0 {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
+    loop {
+      let _ = lio::ready!(self.nop.poll(cx));
+      self.nop = api::nop().into_inner();
+      if self.left == 0 {
+        self.left = self.steps;
+        return Step::Yield(());
+      }
       self.left -= 1;
-      OpResult::Again
-    } else {
-      self.left = self.steps;
-      OpResult::Yield(())
     }
   }
 }
-
-impl StreamOpModel for SteppedNop {}
 
 #[derive(Default)]
 struct NopWaker(AtomicBool);
@@ -353,8 +357,7 @@ fn resubmit(criterion: &mut Criterion) {
   for steps in [0usize, 1, 8] {
     let lio = Lio::new_with_backend(BenchBackend::default(), 1).unwrap();
     let mut stream =
-      api::io::IoStream::from_op(SteppedNop { steps, left: steps })
-        .with_lio(&lio);
+      api::io::IoStream::from_op(SteppedNop::new(steps)).with_lio(&lio);
     let ready = Arc::new(NopWaker::default());
     let waker = Waker::from(Arc::clone(&ready));
     let mut cx = Context::from_waker(&waker);

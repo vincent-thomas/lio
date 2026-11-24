@@ -8,38 +8,36 @@ use std::cell::RefCell;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use lio::api::op::{
-  Action, Completion, OneshotOpModel, OpModel, OpResult, StreamOpModel,
-};
+use lio::api::IoStream;
 use lio::api::resource::Resource;
-use lio::api::{Io, IoStream};
 use lio::backend::testing::{Checked, POISON, ScriptedBackend};
-use lio::{Lio, api};
+use lio::model::{Cx, OpModel, Step};
+use lio::{IoBuf, Lio, api};
 
-/// An op model that reports what happens to it.
+/// A write buffer that reports being dropped. A write owns its buffer, so
+/// the buffer lives exactly as long as the operation's memory does.
 struct Tracked {
+  bytes: Vec<u8>,
   dropped: Arc<AtomicBool>,
-  completions: Arc<AtomicUsize>,
 }
 
-impl OpModel for Tracked {
-  type Item = isize;
-
-  fn action(&mut self) -> Action<'_> {
-    Action::nop()
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<isize> {
-    self.completions.fetch_add(1, Ordering::SeqCst);
-    OpResult::Done(completion.result())
+impl Tracked {
+  fn new(dropped: &Arc<AtomicBool>) -> Self {
+    Self { bytes: vec![7; 16], dropped: dropped.clone() }
   }
 }
 
-impl OneshotOpModel for Tracked {}
+// SAFETY: the bytes are a `Vec`'s heap allocation, which stays in place when
+// `Tracked` moves and is not freed before `Tracked` is dropped.
+unsafe impl IoBuf for Tracked {
+  fn as_slice(&self) -> &[u8] {
+    &self.bytes
+  }
+}
 
 impl Drop for Tracked {
   fn drop(&mut self) {
@@ -52,15 +50,11 @@ fn dropped_future_keeps_its_op_alive_until_completion() {
   let backend = ScriptedBackend::new();
   let lio = Lio::new_with_backend(Checked::new(backend.clone()), 1).unwrap();
   let dropped = Arc::new(AtomicBool::new(false));
-  let completions = Arc::new(AtomicUsize::new(0));
 
   let mut future = Box::pin(
-    Io::from_op(Tracked {
-      dropped: dropped.clone(),
-      completions: completions.clone(),
-    })
-    .with_lio(&lio)
-    .into_future(),
+    api::write(&Resource::stdout(), Tracked::new(&dropped))
+      .with_lio(&lio)
+      .into_future(),
   );
   let mut cx = Context::from_waker(Waker::noop());
   assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -78,11 +72,6 @@ fn dropped_future_keeps_its_op_alive_until_completion() {
   backend.complete(id, -1);
   lio.try_run().unwrap();
   assert!(dropped.load(Ordering::SeqCst), "freed once the backend is done");
-  assert_eq!(
-    completions.load(Ordering::SeqCst),
-    1,
-    "the op model still sees the result, to release what it produced"
-  );
   assert!(!lio.is_full());
 }
 
@@ -91,12 +80,9 @@ fn drop_driver_with_op_in_flight(backend: &ScriptedBackend) -> Arc<AtomicBool> {
   let lio = Lio::new_with_backend(Checked::new(backend.clone()), 1).unwrap();
   let dropped = Arc::new(AtomicBool::new(false));
   let mut future = Box::pin(
-    Io::from_op(Tracked {
-      dropped: dropped.clone(),
-      completions: Arc::new(AtomicUsize::new(0)),
-    })
-    .with_lio(&lio)
-    .into_future(),
+    api::write(&Resource::stdout(), Tracked::new(&dropped))
+      .with_lio(&lio)
+      .into_future(),
   );
   let mut cx = Context::from_waker(Waker::noop());
   assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -164,22 +150,24 @@ fn dropped_sleep_is_removed_at_once() {
   assert!(!lio.is_full());
 }
 
-/// Yields a value for every completion, forever.
-struct Endless;
+/// Yields a value for every nop that completes, forever.
+struct Endless(api::ops::Nop);
+
+impl Endless {
+  fn new() -> Self {
+    Self(api::nop().into_inner())
+  }
+}
 
 impl OpModel for Endless {
   type Item = ();
 
-  fn action(&mut self) -> Action<'_> {
-    Action::nop()
-  }
-
-  fn complete(&mut self, _: Completion) -> OpResult<()> {
-    OpResult::Yield(())
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
+    let _ = lio::ready!(self.0.poll(cx));
+    self.0 = api::nop().into_inner();
+    Step::Yield(())
   }
 }
-
-impl StreamOpModel for Endless {}
 
 /// Drops the stream it holds when woken.
 struct DropOnWake(RefCell<Option<IoStream<Endless>>>);
@@ -203,7 +191,7 @@ fn stream_dropped_by_its_wake_up_is_not_resubmitted() {
   let holder = Arc::new(DropOnWake(RefCell::new(None)));
   let waker = Waker::from(holder.clone());
   let mut cx = Context::from_waker(&waker);
-  let mut stream = IoStream::from_op(Endless).with_lio(&lio);
+  let mut stream = IoStream::from_op(Endless::new()).with_lio(&lio);
   {
     let mut next = Box::pin(stream.next());
     assert!(next.as_mut().poll(&mut cx).is_pending());

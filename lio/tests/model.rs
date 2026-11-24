@@ -1,4 +1,4 @@
-//! The poll-shaped `lio::model` prototype: leaves, composites, parallel I/O
+//! Operation models: single operations, composites, parallel I/O
 //! and cancellation, without real I/O where the order of completions matters.
 
 use std::cell::RefCell;
@@ -7,12 +7,13 @@ use std::future::Future;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use lio::api::ops::{Read, Write};
 use lio::api::resource::Resource;
 use lio::api::{self, OpenFlags};
 use lio::backend::ds::{DSBackend, DSConfig};
 use lio::backend::op::Op;
 use lio::backend::testing::{Checked, POISON, ScriptedBackend};
-use lio::model::{self, Cx, Join, Model, Read, Step, Task, Write};
+use lio::model::{self, Cx, Join, OpModel, Step, Task};
 use lio::{BufResult, Lio};
 
 fn scripted(cap: usize) -> (ScriptedBackend, Lio) {
@@ -24,7 +25,7 @@ fn scripted(cap: usize) -> (ScriptedBackend, Lio) {
 /// Spawns `model` and collects every item it produces.
 fn collect<M>(lio: &Lio, model: M) -> (Rc<RefCell<Vec<M::Item>>>, Task)
 where
-  M: Model + 'static,
+  M: OpModel + 'static,
 {
   let items = Rc::new(RefCell::new(Vec::new()));
   let sink = Rc::clone(&items);
@@ -55,7 +56,7 @@ fn read_gives_back_the_buffer_with_what_was_written() {
   let stdin = Resource::stdin();
   // Uninitialized capacity: only the bytes the backend wrote come back.
   let (items, _task) =
-    collect(&lio, Read::new(&stdin, Vec::<u8>::with_capacity(8)));
+    collect(&lio, api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner());
 
   assert!(items.borrow().is_empty());
   finish_only(&backend, &lio, 3);
@@ -109,8 +110,8 @@ fn join_has_both_operations_in_flight_and_waits_for_both() {
   let (backend, lio) = scripted(4);
   let stdin = Resource::stdin();
   let join = Join::new(
-    Read::new(&stdin, Vec::<u8>::with_capacity(8)),
-    Read::new(&stdin, Vec::<u8>::with_capacity(8)),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
   );
   let (items, _task) = collect(&lio, join);
   lio.try_run().unwrap();
@@ -137,7 +138,7 @@ fn composites_nest() {
   let (stdin, stdout) = (Resource::stdin(), Resource::stdout());
   let model = Join::new(
     lio::io::copy(&stdin, &stdout).into_inner(),
-    Write::new(&stdout, b"hi".to_vec()),
+    api::write(&stdout, b"hi".to_vec()).into_inner(),
   );
   let (items, _task) = collect(&lio, model);
   lio.try_run().unwrap();
@@ -158,8 +159,8 @@ fn cancelling_a_task_cancels_what_it_has_in_flight() {
   let (backend, lio) = scripted(4);
   let stdin = Resource::stdin();
   let join = Join::new(
-    Read::new(&stdin, Vec::<u8>::with_capacity(8)),
-    Read::new(&stdin, Vec::<u8>::with_capacity(8)),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
   );
   let (items, task) = collect(&lio, join);
   lio.try_run().unwrap();
@@ -180,8 +181,10 @@ fn cancelling_a_task_cancels_what_it_has_in_flight() {
 fn a_dropped_future_cancels_its_model() {
   let (backend, lio) = scripted(4);
   let stdin = Resource::stdin();
-  let mut future =
-    Box::pin(model::run(&lio, Read::new(&stdin, Vec::<u8>::with_capacity(8))));
+  let mut future = Box::pin(model::run(
+    &lio,
+    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
+  ));
   let mut cx = Context::from_waker(Waker::noop());
   assert!(future.as_mut().poll(&mut cx).is_pending());
   lio.try_run().unwrap();
@@ -197,8 +200,10 @@ fn a_dropped_future_cancels_its_model() {
 fn a_future_resolves_to_the_item() {
   let (backend, lio) = scripted(4);
   let stdin = Resource::stdin();
-  let mut future =
-    Box::pin(model::run(&lio, Read::new(&stdin, Vec::<u8>::with_capacity(8))));
+  let mut future = Box::pin(model::run(
+    &lio,
+    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
+  ));
   let mut cx = Context::from_waker(Waker::noop());
   assert!(future.as_mut().poll(&mut cx).is_pending());
 
@@ -217,14 +222,15 @@ struct Chunks {
   read: Read<Vec<u8>>,
 }
 
-impl Model for Chunks {
+impl OpModel for Chunks {
   type Item = BufResult<usize, Vec<u8>>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     let (result, buf) = lio::ready!(self.read.poll(cx));
     match result {
       Ok(n) if n > 0 => {
-        self.read = Read::new(&self.from, Vec::<u8>::with_capacity(4));
+        self.read =
+          api::read(&self.from, Vec::<u8>::with_capacity(4)).into_inner();
         Step::Yield((Ok(n), buf))
       }
       other => Step::Done((other, buf)),
@@ -236,7 +242,7 @@ impl Model for Chunks {
 fn a_stream_yields_until_it_is_done() {
   let (backend, lio) = scripted(4);
   let from = Resource::stdin();
-  let read = Read::new(&from, Vec::<u8>::with_capacity(4));
+  let read = api::read(&from, Vec::<u8>::with_capacity(4)).into_inner();
   let (items, _task) = collect(&lio, Chunks { from, read });
 
   finish_only(&backend, &lio, 4);
@@ -282,11 +288,15 @@ struct WriteAll {
 
 impl WriteAll {
   fn new(to: &Resource, data: Vec<u8>) -> Self {
-    Self { to: to.clone(), offset: 0, write: Write::at(to, data, 0) }
+    Self {
+      to: to.clone(),
+      offset: 0,
+      write: api::write_at(to, data, 0).into_inner(),
+    }
   }
 }
 
-impl Model for WriteAll {
+impl OpModel for WriteAll {
   type Item = std::io::Result<u64>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -301,7 +311,7 @@ impl Model for WriteAll {
       if buf.is_empty() {
         return Step::Done(Ok(self.offset));
       }
-      self.write = Write::at(&self.to, buf, self.offset);
+      self.write = api::write_at(&self.to, buf, self.offset).into_inner();
     }
   }
 }
@@ -315,12 +325,12 @@ struct ReadToEnd {
 
 impl ReadToEnd {
   fn new(from: &Resource) -> Self {
-    let read = Read::at(from, Vec::with_capacity(512), 0);
+    let read = api::read_at(from, Vec::with_capacity(512), 0).into_inner();
     Self { from: from.clone(), bytes: Vec::new(), read }
   }
 }
 
-impl Model for ReadToEnd {
+impl OpModel for ReadToEnd {
   type Item = std::io::Result<Vec<u8>>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -332,7 +342,8 @@ impl Model for ReadToEnd {
         Err(err) => return Step::Done(Err(err)),
       }
       buf.clear();
-      self.read = Read::at(&self.from, buf, self.bytes.len() as u64);
+      self.read =
+        api::read_at(&self.from, buf, self.bytes.len() as u64).into_inner();
     }
   }
 }
@@ -361,4 +372,105 @@ fn copy_moves_a_file_through_a_simulated_backend() {
   let dst = open(&lio, "/tmp/lio_model_copy_dst", OpenFlags::READ);
   let (read_back, _task) = collect(&lio, ReadToEnd::new(&dst));
   assert_eq!(run_to_item(&lio, &read_back).unwrap(), data);
+}
+
+#[test]
+fn a_step_waiting_for_a_slot_is_never_submitted_once_its_model_is_dropped() {
+  let (backend, lio) = scripted(1);
+  let stdin = Resource::stdin();
+  // One slot: the second read waits in the driver's queue.
+  let join = Join::new(
+    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
+  );
+  let (items, task) = collect(&lio, join);
+  lio.try_run().unwrap();
+  let first = backend.in_flight();
+  assert_eq!(first.len(), 1);
+
+  task.cancel();
+  assert_eq!(backend.cancelled(), first);
+  backend.complete_all(-125);
+  lio.try_run().unwrap();
+  lio.try_run().unwrap();
+
+  assert_eq!(backend.pushed(), first, "the queued read never ran");
+  assert!(items.borrow().is_empty());
+  assert!(!lio.is_full());
+}
+
+#[test]
+fn a_step_that_left_the_queue_is_cancelled_when_its_model_is_dropped() {
+  let (backend, lio) = scripted(1);
+  let stdin = Resource::stdin();
+  // Takes the only slot, so the model's read has to queue.
+  api::nop().with_lio(&lio).when_done(|_| {});
+  lio.try_run().unwrap();
+  let blocker = backend.in_flight();
+  let (items, task) =
+    collect(&lio, api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner());
+  assert_eq!(backend.pushed(), blocker, "the read is waiting for a slot");
+
+  backend.complete_all(0);
+  lio.try_run().unwrap();
+  lio.try_run().unwrap();
+  let read = backend.in_flight();
+  assert_eq!(read.len(), 1, "the read took the freed slot");
+
+  task.cancel();
+  assert_eq!(backend.cancelled(), read);
+  backend.complete_all(-125);
+  lio.try_run().unwrap();
+  assert!(items.borrow().is_empty());
+  assert!(!lio.is_full());
+}
+
+#[test]
+fn a_model_s_next_step_reuses_the_slot_its_last_one_freed() {
+  let (backend, lio) = scripted(1);
+  let stdin = Resource::stdin();
+  let stdout = Resource::stdout();
+  // Read, then write, then read: with one slot, each step needs the slot
+  // the step before it held.
+  let (items, _task) =
+    collect(&lio, lio::io::copy(&stdin, &stdout).into_inner());
+  finish_only(&backend, &lio, 3);
+  assert!(matches!(only_op(&backend, &lio), Op::Write { .. }));
+  finish_only(&backend, &lio, 3);
+  assert!(matches!(only_op(&backend, &lio), Op::Read { .. }));
+  finish_only(&backend, &lio, 0);
+  assert_eq!(items.borrow_mut().pop().unwrap().unwrap(), 3);
+  assert!(!lio.is_full());
+}
+
+/// Polls its read once, then hands it out while it is in flight.
+struct Leaks {
+  read: Option<Read<Vec<u8>>>,
+  out: Rc<RefCell<Option<Read<Vec<u8>>>>>,
+}
+
+impl OpModel for Leaks {
+  type Item = ();
+
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
+    let mut read = self.read.take().unwrap();
+    assert!(matches!(read.poll(cx), Step::Pending));
+    *self.out.borrow_mut() = Some(read);
+    Step::Done(())
+  }
+}
+
+#[test]
+#[should_panic(expected = "already polled")]
+fn an_operation_in_flight_cannot_be_run_again_through_io() {
+  let (_backend, lio) = scripted(2);
+  let out = Rc::new(RefCell::new(None));
+  let read = api::read(&Resource::stdin(), Vec::with_capacity(8)).into_inner();
+  let _task = model::spawn(
+    &lio,
+    Leaks { read: Some(read), out: Rc::clone(&out) },
+    |()| {},
+  );
+  let in_flight = out.borrow_mut().take().unwrap();
+  lio::api::Io::from_op(in_flight).with_lio(&lio).when_done(|_| {});
 }

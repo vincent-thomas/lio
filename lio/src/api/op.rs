@@ -1,28 +1,18 @@
-//! Type-safe operation traits for bridging user types to backend execution.
+//! What the driver passes between an operation's memory and the backend.
 
 use crate::api::resource::ResourceClose;
-use crate::backend::op::{BorrowedOp, Op};
+use crate::backend::op::BorrowedOp;
+#[cfg(test)]
+use crate::backend::op::Op;
 use std::time::Duration;
 
-/// What the backend reported for one submitted [`Action`], routed to the
-/// [`OpModel`] that submitted it.
+/// What the backend reported for one submitted [`Action`].
 ///
-/// Only the driver creates one, from the result an [`IoBackend`] reported for
-/// that action. It cannot be built, copied or cloned outside this crate, so
-/// holding one is the proof [`OpModel::complete`] relies on: that the backend
-/// wrote the bytes `result` counts, or created the resource it names. To
-/// complete a model with a chosen result in a test, drive it through
-/// [`ScriptedBackend`].
-///
-///
-/// ```compile_fail
-/// // A read that never ran cannot be completed: nothing outside lio can
-/// // make the completion.
-/// let forged = lio::api::op::Completion::new(4096);
-/// ```
+/// The driver creates one from the result an [`IoBackend`] reported, and
+/// hands it to the function that reads the result of the operation it
+/// submitted for that action. Nothing outside this crate sees one.
 ///
 /// [`IoBackend`]: crate::backend::IoBackend
-/// [`ScriptedBackend`]: crate::backend::testing::ScriptedBackend
 #[derive(Debug, PartialEq, Eq)]
 pub struct Completion {
   result: isize,
@@ -85,15 +75,12 @@ impl Completion {
   }
 }
 
-/// Completion flags understood by higher-level operation models.
+/// Flags the driver sets on a completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompletionFlags(u32);
 
 impl CompletionFlags {
-  pub const MORE: Self = Self(1 << 0);
-  pub const CANCELLED: Self = Self(1 << 1);
-  pub const TERMINAL: Self = Self(1 << 2);
-  pub const TIMEOUT: Self = Self(1 << 3);
+  /// The completion is a timer firing, not a backend result.
   pub const TIMER: Self = Self(1 << 4);
 
   pub const fn empty() -> Self {
@@ -105,30 +92,7 @@ impl CompletionFlags {
   }
 }
 
-impl std::ops::BitOr for CompletionFlags {
-  type Output = Self;
-
-  fn bitor(self, rhs: Self) -> Self::Output {
-    Self(self.0 | rhs.0)
-  }
-}
-
-/// Result of one completion.
-pub enum OpResult<T> {
-  /// Model doesn't have an [`Item`](OpModel::Item) to return. The caller should
-  /// run [`action`](OpModel::action) again.
-  Again,
-  /// Model returns an [`Item`](OpModel::Item), while also wanting
-  /// [`action`](OpModel::action) to be called again.
-  ///
-  /// Models are required to implement [`StreamOpModel`] to return this.
-  Yield(T),
-  /// Return a final [`Item`](OpModel::Item), the model is now done and should
-  /// be dropped.
-  Done(T),
-}
-
-/// One action requested by an [`OpModel`].
+/// What one operation asks the driver to do.
 ///
 /// `Io` actions are submitted to the backend, while `Sleep` actions are driven
 /// directly by `Lio`'s timer machinery.
@@ -139,6 +103,7 @@ pub enum Action<'a> {
 
 impl<'a> Action<'a> {
   /// A no-op submission.
+  #[cfg(test)]
   pub fn nop() -> Action<'static> {
     Action::Io(BorrowedOp::nop())
   }
@@ -158,6 +123,7 @@ impl<'a> Action<'a> {
   }
 }
 
+#[cfg(test)]
 impl<'a> Action<'a> {
   /// The submitted operation, when this action is I/O.
   pub fn as_op(&self) -> Option<&Op> {
@@ -185,45 +151,12 @@ impl<'a> From<Duration> for Action<'a> {
   }
 }
 
-/// Contract for the execution of one or many [`Action`]s. See [`OpResult`] for
-/// complete contract.
-pub trait OpModel: Send + 'static {
-  /// The item yielded or completed by this logical operation.
-  type Item: Send;
-
-  /// Describe the next runtime action to perform.
-  ///
-  /// Pointers in the returned action borrow `self`. The driver keeps `self`
-  /// pinned, and does not call `action` again, until the backend has finished
-  /// that submission.
-  fn action(&mut self) -> Action<'_>;
-
-  /// Interpret the completion of the previously submitted low-level step.
-  ///
-  /// `completion` is what the backend reported for the [`Action`] the last
-  /// [`action`](Self::action) call returned. A model that wraps other models
-  /// must pass it on only to the inner model whose action it submitted.
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item>;
-}
-
-/// Marker trait for logical operations that produce exactly one final item.
-///
-/// Types implementing this trait are suitable for the [`Io`](crate::api::Io)
-/// wrapper and can be
-/// consumed with `.await`.
-pub trait OneshotOpModel: OpModel {}
-
-/// Marker trait for logical operations that may yield multiple items over time.
-///
-/// Types implementing this trait are suitable for the
-/// [`IoStream`](crate::api::IoStream) wrapper and
-/// are consumed through `.next().await`.
-pub trait StreamOpModel: OpModel {}
-
 #[cfg(test)]
 mod action_tests {
   use super::Action;
-  use crate::backend::op::{BorrowedOp, Op};
+  use crate::backend::op::BorrowedOp;
+  #[cfg(test)]
+  use crate::backend::op::Op;
   use std::time::Duration;
 
   #[test]
@@ -255,30 +188,16 @@ mod completion_tests {
   use super::{Completion, CompletionFlags};
   use crate::api::resource::ResourceClose;
 
-  const FLAGS: [CompletionFlags; 5] = [
-    CompletionFlags::MORE,
-    CompletionFlags::CANCELLED,
-    CompletionFlags::TERMINAL,
-    CompletionFlags::TIMEOUT,
-    CompletionFlags::TIMER,
-  ];
-
   #[test]
-  fn flags_are_distinct_bits() {
+  fn the_timer_flag_is_set_only_when_asked_for() {
     let empty = CompletionFlags::empty();
-    for (i, a) in FLAGS.into_iter().enumerate() {
-      assert_ne!(a, empty);
-      assert!(a.contains(a));
-      assert!(a.contains(empty));
-      assert!(!empty.contains(a));
-      assert_eq!(a | a, a);
-      for b in FLAGS.into_iter().skip(i + 1) {
-        assert_ne!(a, b);
-        assert!(!a.contains(b) && !b.contains(a));
-        assert!((a | b).contains(a) && (a | b).contains(b));
-        assert!(!a.contains(a | b));
-      }
-    }
+    let timer = CompletionFlags::TIMER;
+    assert_ne!(timer, empty);
+    assert!(timer.contains(timer));
+    assert!(timer.contains(empty));
+    assert!(!empty.contains(timer));
+    assert!(!Completion::new(0).flags().contains(timer));
+    assert!(Completion::with_flags(0, timer).flags().contains(timer));
   }
 
   #[test]
