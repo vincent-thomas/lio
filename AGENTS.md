@@ -30,19 +30,24 @@ contracts come before features or speed.
 ```
 api::read(..)            -> Io<ops::Read<B>>             (user handle)
   .with_lio(&lio) / global, then .await | .when_done | .send
-OpModel::action()        -> Action::Io(Op::Read{..}) | Action::Sleep(d)
-Lio driver               -> OpStore slot + Registration, IoBackend::push/flush
+OpModel::action(&mut self) -> Action::Io(BorrowedOp) | Action::Sleep(d)
+Lio driver               -> OpStore slot + Registration, IoBackend::push(InFlight)/flush
 IoBackend::wait()        -> OpCompleted { registration_id, result: isize }
 OpModel::complete(Completion) -> OpResult::{Again, Yield(item), Done(item)}
 ```
 
 Negative `result` is a raw negated OS error code. Buffers move into the op
-and come back with the result; nothing borrows across an in-flight op.
+model and come back with the result. `action()` returns a `BorrowedOp` tied
+to the model's borrow (built with the `action_io!` macro); the driver keeps
+the model pinned until the backend reports the op finished.
 
-Backend contract (see the `IoBackend` docs in `lio/src/backend/mod.rs`):
-`push` only queues; `flush` submits; every pushed id yields **exactly one**
-completion, including after `cancel`; an `Op`'s memory must stay valid until
-that completion; `drain` returns `false` if anything may still touch it.
+`IoBackend` is an **`unsafe trait`** (contract in `lio/src/backend/mod.rs`):
+`push` only queues; `flush` submits; store the `Keep` from each `InFlight`
+for as long as the backend, kernel or a worker thread may use an address
+from that `Op`; report each pushed id **at most once** from `wait`, and only
+when nothing outside the backend can still use its addresses; a cancelled
+op still completes once; `drain` returns `true` only when the kernel and
+every worker are done with every pushed address.
 
 ## Hard rules
 
@@ -76,7 +81,10 @@ initialises the `liburing` submodule). Rust is pinned to 1.100.0; nightly is
 only for Miri.
 
 ```bash
+mise run check                                  # fmt --check + workspace check (skips per OS)
 mise run lint                                   # fmt --check, check, clippy, cargo deny
+mise run test                                   # full cargo test, as CI
+mise run bench                                  # bookkeeping, then each real backend
 cargo clippy --workspace --all-targets --all-features
 cargo nextest run -p lio --lib                  # core bookkeeping tests (fast)
 cargo nextest run -p lio --features high        # + integration tests

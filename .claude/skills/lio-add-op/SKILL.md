@@ -31,6 +31,9 @@ platform truly cannot, and say so in the contract docs.
 - `pollingv2/mod.rs`: the interest mapping, the "runs immediately" check,
   and the syscall (via `syscall!`).
 - `iocp.rs`: the dispatch and the Win32 implementation.
+- `IoBackend` is an `unsafe trait`: hold the `Keep` from `push` for as
+  long as the kernel or a worker may touch the op's addresses, and report
+  the id from `wait` only after that.
 - If the op can block indefinitely (accept, recv), make sure `cancel`
   reaches it.
 
@@ -43,7 +46,9 @@ Also the non-OS backends in `lio/src/backend/`:
 ## 3. Op model: `lio/src/api/ops.rs` and `lio/src/api/mod.rs`
 
 - A struct holding owned inputs (buffers move in and come back out).
-- `impl OpModel`: `action()` builds the `Op`; `complete()` maps
+- `impl OpModel`: `action(&mut self) -> Action<'_>` builds the `Op` with
+  `action_io!(Op::..)`, pointing only at memory the model owns;
+  `complete()` maps
   `Completion` to `OpResult`. Use `completion.os_error()` for negative
   results and `Resource::from_completion` for new descriptors.
 - `impl OneshotOpModel` or `StreamOpModel`.
