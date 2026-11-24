@@ -322,7 +322,7 @@ impl OpModel for SteppedNop {
     Action::nop()
   }
 
-  fn complete(&mut self, _: Completion) -> OpResult<()> {
+  unsafe fn complete(&mut self, _: Completion) -> OpResult<()> {
     if self.left > 0 {
       self.left -= 1;
       OpResult::Again

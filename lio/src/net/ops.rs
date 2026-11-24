@@ -57,8 +57,9 @@ impl OpModel for SocketAccept {
     self.inner.action()
   }
 
-  fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
-    match self.inner.complete(res) {
+  unsafe fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
+    // SAFETY: `res` is the backend result for the inner step this model submitted.
+    match unsafe { self.inner.complete(res) } {
       OpResult::Done(Ok((resource, addr))) => {
         OpResult::Done(Ok((Socket::from_resource(resource), addr)))
       }
@@ -104,7 +105,10 @@ impl OpModel for SocketNew {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     // SAFETY: a successful socket completion carries a new owned socket.
     let resource =
       unsafe { crate::api::resource::Resource::from_completion(&completion) };
@@ -131,8 +135,9 @@ impl OpModel for TcpAccept {
     self.inner.action()
   }
 
-  fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
-    match self.inner.complete(res) {
+  unsafe fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
+    // SAFETY: `res` is the backend result for the inner step this model submitted.
+    match unsafe { self.inner.complete(res) } {
       OpResult::Done(Ok((resource, addr))) => {
         OpResult::Done(Ok((TcpStream::from_resource(resource), addr)))
       }
@@ -218,22 +223,28 @@ impl<T: FromResource + std::marker::Send + 'static> OpModel
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match &mut self.state {
-      BindListenerState::Socket(inner) => match inner.complete(completion) {
-        OpResult::Done(Ok(resource)) => {
-          self.state = BindListenerState::Bind { resource };
-          OpResult::Again
+      BindListenerState::Socket(inner) => {
+        // SAFETY: `completion` is the backend result for the inner step this model submitted.
+        match unsafe { inner.complete(completion) } {
+          OpResult::Done(Ok(resource)) => {
+            self.state = BindListenerState::Bind { resource };
+            OpResult::Again
+          }
+          OpResult::Done(Err(err)) => {
+            self.state = BindListenerState::Done;
+            OpResult::Done(Err(err))
+          }
+          OpResult::Again => {
+            panic!("socket creation unexpectedly requested Again")
+          }
+          OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
         }
-        OpResult::Done(Err(err)) => {
-          self.state = BindListenerState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
+      }
       BindListenerState::Bind { resource } => {
         if completion.result < 0 {
           self.state = BindListenerState::Done;
@@ -333,22 +344,28 @@ impl<T: FromResource + std::marker::Send + 'static> OpModel
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match &mut self.state {
-      StreamConnectState::Socket(inner) => match inner.complete(completion) {
-        OpResult::Done(Ok(resource)) => {
-          self.state = StreamConnectState::Connect { resource };
-          OpResult::Again
+      StreamConnectState::Socket(inner) => {
+        // SAFETY: `completion` is the backend result for the inner step this model submitted.
+        match unsafe { inner.complete(completion) } {
+          OpResult::Done(Ok(resource)) => {
+            self.state = StreamConnectState::Connect { resource };
+            OpResult::Again
+          }
+          OpResult::Done(Err(err)) => {
+            self.state = StreamConnectState::Done;
+            OpResult::Done(Err(err))
+          }
+          OpResult::Again => {
+            panic!("socket creation unexpectedly requested Again")
+          }
+          OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
         }
-        OpResult::Done(Err(err)) => {
-          self.state = StreamConnectState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
+      }
       StreamConnectState::Connect { resource } => {
         let resource = resource.clone();
         self.state = StreamConnectState::Done;
@@ -390,7 +407,10 @@ impl OpModel for UnixAccept {
     self.inner.action()
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(
       self.inner.complete_resource(completion).map(UnixStream::from_resource),
     )
@@ -441,22 +461,28 @@ impl OpModel for UdpBindSocket {
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match &mut self.state {
-      UdpBindState::Socket(inner) => match inner.complete(completion) {
-        OpResult::Done(Ok(resource)) => {
-          self.state = UdpBindState::Bind { resource };
-          OpResult::Again
+      UdpBindState::Socket(inner) => {
+        // SAFETY: `completion` is the backend result for the inner step this model submitted.
+        match unsafe { inner.complete(completion) } {
+          OpResult::Done(Ok(resource)) => {
+            self.state = UdpBindState::Bind { resource };
+            OpResult::Again
+          }
+          OpResult::Done(Err(err)) => {
+            self.state = UdpBindState::Done;
+            OpResult::Done(Err(err))
+          }
+          OpResult::Again => {
+            panic!("socket creation unexpectedly requested Again")
+          }
+          OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
         }
-        OpResult::Done(Err(err)) => {
-          self.state = UdpBindState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
+      }
       UdpBindState::Bind { resource } => {
         let resource = resource.clone();
         self.state = UdpBindState::Done;
@@ -519,22 +545,28 @@ impl OpModel for UdpConnectSocket {
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match &mut self.state {
-      UdpConnectState::Socket(inner) => match inner.complete(completion) {
-        OpResult::Done(Ok(resource)) => {
-          self.state = UdpConnectState::Connect { resource };
-          OpResult::Again
+      UdpConnectState::Socket(inner) => {
+        // SAFETY: `completion` is the backend result for the inner step this model submitted.
+        match unsafe { inner.complete(completion) } {
+          OpResult::Done(Ok(resource)) => {
+            self.state = UdpConnectState::Connect { resource };
+            OpResult::Again
+          }
+          OpResult::Done(Err(err)) => {
+            self.state = UdpConnectState::Done;
+            OpResult::Done(Err(err))
+          }
+          OpResult::Again => {
+            panic!("socket creation unexpectedly requested Again")
+          }
+          OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
         }
-        OpResult::Done(Err(err)) => {
-          self.state = UdpConnectState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
+      }
       UdpConnectState::Connect { resource } => {
         let resource = resource.clone();
         self.state = UdpConnectState::Done;

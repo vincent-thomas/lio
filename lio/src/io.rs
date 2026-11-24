@@ -185,54 +185,66 @@ impl OpModel for Copy {
     }
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     match std::mem::replace(&mut self.state, CopyState::Done) {
-      CopyState::Reading(mut read) => match read.complete(completion) {
-        OpResult::Done((Ok(0), _buf)) => OpResult::Done(Ok(self.total)),
-        OpResult::Done((Ok(n), buf)) => {
-          self.total += n as u64;
-          let buf = buf.into_inner();
-          self.state =
-            CopyState::Writing(ops::Write::new(self.writer.clone(), buf, None));
-          OpResult::Again
-        }
-        OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
-        OpResult::Again | OpResult::Yield(_) => unreachable!(),
-      },
-      CopyState::Writing(mut write) => match write.complete(completion) {
-        OpResult::Done((Ok(0), _buf)) => {
-          OpResult::Done(Err(Self::write_zero()))
-        }
-        OpResult::Done((Ok(n), mut buf)) => {
-          let written = n;
-          if written < buf.len() {
-            let remaining = buf.len() - written;
-            buf.copy_within(written.., 0);
-            buf.truncate(remaining);
+      CopyState::Reading(mut read) => {
+        // SAFETY: `completion` is the backend result for the read this copy submitted.
+        match unsafe { read.complete(completion) } {
+          OpResult::Done((Ok(0), _buf)) => OpResult::Done(Ok(self.total)),
+          OpResult::Done((Ok(n), buf)) => {
+            self.total += n as u64;
+            let buf = buf.into_inner();
             self.state = CopyState::Writing(ops::Write::new(
               self.writer.clone(),
               buf,
               None,
             ));
-            return OpResult::Again;
-          }
-
-          if self.total >= self.limit {
-            OpResult::Done(Ok(self.total))
-          } else {
-            buf.clear();
-            let buf = CappedBuf::new(buf, self.next_read_len());
-            self.state = CopyState::Reading(ops::Read::new(
-              self.reader.clone(),
-              buf,
-              None,
-            ));
             OpResult::Again
           }
+          OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
+          OpResult::Again | OpResult::Yield(_) => unreachable!(),
         }
-        OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
-        OpResult::Again | OpResult::Yield(_) => unreachable!(),
-      },
+      }
+      CopyState::Writing(mut write) => {
+        // SAFETY: `completion` is the backend result for the write this copy submitted.
+        match unsafe { write.complete(completion) } {
+          OpResult::Done((Ok(0), _buf)) => {
+            OpResult::Done(Err(Self::write_zero()))
+          }
+          OpResult::Done((Ok(n), mut buf)) => {
+            let written = n;
+            if written < buf.len() {
+              let remaining = buf.len() - written;
+              buf.copy_within(written.., 0);
+              buf.truncate(remaining);
+              self.state = CopyState::Writing(ops::Write::new(
+                self.writer.clone(),
+                buf,
+                None,
+              ));
+              return OpResult::Again;
+            }
+
+            if self.total >= self.limit {
+              OpResult::Done(Ok(self.total))
+            } else {
+              buf.clear();
+              let buf = CappedBuf::new(buf, self.next_read_len());
+              self.state = CopyState::Reading(ops::Read::new(
+                self.reader.clone(),
+                buf,
+                None,
+              ));
+              OpResult::Again
+            }
+          }
+          OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
+          OpResult::Again | OpResult::Yield(_) => unreachable!(),
+        }
+      }
       CopyState::Done => panic!("CopyN completed after terminal state"),
     }
   }

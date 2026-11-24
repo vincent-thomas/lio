@@ -161,7 +161,9 @@ impl WakerResultHandler {
     let (result, wake) = {
       let sender = &payload.sender;
       let op_model = &mut payload.op_model;
-      match op_model.complete(completion) {
+      // SAFETY: the driver passes the completion the backend reported for
+      // the action this model submitted.
+      match unsafe { op_model.complete(completion) } {
         OpResult::Again => {
           // The driver resubmits internal steps. Preserve the consumer's waker
           // until an item is available instead of making it poll an empty channel.
@@ -323,7 +325,9 @@ impl OpCallback {
     let result = {
       let callback = &payload.callback;
       let op_model = &mut payload.op_model;
-      match op_model.complete(completion) {
+      // SAFETY: the driver passes the completion the backend reported for
+      // the action this model submitted.
+      match unsafe { op_model.complete(completion) } {
         OpResult::Again => ProcessResult::r#continue(),
         OpResult::Yield(item) => {
           callback(item);
@@ -701,7 +705,10 @@ mod tests {
       action_io!(crate::backend::op::Op::Nop)
     }
 
-    fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    unsafe fn complete(
+      &mut self,
+      completion: Completion,
+    ) -> OpResult<Self::Item> {
       assert_eq!(completion.result, self.stage as isize);
       match self.stage {
         0 => {
@@ -728,7 +735,10 @@ mod tests {
       action_io!(crate::backend::op::Op::Nop)
     }
 
-    fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+    unsafe fn complete(
+      &mut self,
+      completion: Completion,
+    ) -> OpResult<Self::Item> {
       assert_eq!(completion.result, self.stage as isize);
       match self.stage {
         0 => {
@@ -933,7 +943,7 @@ mod tests {
         action_io!(crate::backend::op::Op::Nop)
       }
 
-      fn complete(&mut self, _: Completion) -> OpResult<i32> {
+      unsafe fn complete(&mut self, _: Completion) -> OpResult<i32> {
         self.0 += 1;
         match self.0 {
           1..=8 => OpResult::Again,

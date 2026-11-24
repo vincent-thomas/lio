@@ -1212,7 +1212,7 @@ mod tests {
       action_io!(crate::backend::op::Op::Nop)
     }
 
-    fn complete(&mut self, _: Completion) -> OpResult<u32> {
+    unsafe fn complete(&mut self, _: Completion) -> OpResult<u32> {
       self.0 += 1;
       if self.0 < 3 { OpResult::Yield(self.0) } else { OpResult::Done(self.0) }
     }
@@ -1277,7 +1277,7 @@ mod tests {
       action_io!(crate::backend::op::Op::Nop)
     }
 
-    fn complete(&mut self, _: Completion) -> OpResult<u32> {
+    unsafe fn complete(&mut self, _: Completion) -> OpResult<u32> {
       if std::mem::replace(&mut self.0, true) {
         OpResult::Done(7)
       } else {

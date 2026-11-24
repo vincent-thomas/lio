@@ -125,7 +125,7 @@ impl OpModel for OneShotStream {
     Action::nop()
   }
 
-  fn complete(&mut self, _: Completion) -> OpResult<u32> {
+  unsafe fn complete(&mut self, _: Completion) -> OpResult<u32> {
     if self.done {
       OpResult::Done(2)
     } else {
@@ -187,7 +187,7 @@ impl OpModel for PanicsOnAction {
     panic!("no action for you");
   }
 
-  fn complete(&mut self, _: Completion) -> OpResult<()> {
+  unsafe fn complete(&mut self, _: Completion) -> OpResult<()> {
     OpResult::Done(())
   }
 }

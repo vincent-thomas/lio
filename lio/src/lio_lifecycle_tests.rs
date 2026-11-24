@@ -50,7 +50,10 @@ impl OpModel for Tagged {
     action_io!(Op::Listen { fd: Resource::stdin(), backlog: self.tag as i32 })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<(u32, isize)> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<(u32, isize)> {
     self.completions += 1;
     let item = (self.tag, completion.result);
     if self.stream && completion.result >= 0 && self.completions < STREAM_ITEMS

@@ -167,7 +167,16 @@ pub trait OpModel: Send + 'static {
   fn action(&mut self) -> Action<'_>;
 
   /// Interpret the completion of the previously submitted low-level step.
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item>;
+  ///
+  /// # Safety
+  ///
+  /// `completion` is the backend result for the [`Action`] returned by the
+  /// matching [`action`](Self::action) call, and the buffers that action
+  /// named are still in place. For a read, `result` is the number of bytes
+  /// the backend wrote into those buffers. For an operation that returns a
+  /// resource, `result` is a descriptor or handle this completion owns.
+  unsafe fn complete(&mut self, completion: Completion)
+  -> OpResult<Self::Item>;
 }
 
 /// Marker trait for logical operations that produce exactly one final item.

@@ -33,7 +33,10 @@ impl OpModel for Tagged {
     action_io!(Op::Listen { fd: Resource::stdin(), backlog: self.0 as i32 })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<(u32, isize)> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<(u32, isize)> {
     OpResult::Done((self.0, completion.result))
   }
 }

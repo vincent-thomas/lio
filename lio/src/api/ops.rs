@@ -75,7 +75,9 @@ macro_rules! impl_op_model_contract_runtime {
     }
 
     fn complete(&mut self, completion: Self::Completion) -> Self::Result {
-      <Self as OpModel>::complete(self, completion)
+      // SAFETY: the contract script completes the action this step just
+      // produced, and the model still holds its buffers.
+      unsafe { <Self as OpModel>::complete(self, completion) }
     }
 
     fn is_again(result: &Self::Result) -> bool {
@@ -130,7 +132,10 @@ impl OpModel for Socket {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     // SAFETY: a successful socket completion carries a new owned socket.
     OpResult::Done(unsafe { Resource::from_completion(&completion) })
   }
@@ -208,7 +213,10 @@ impl OpModel for Accept {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let resource = match self.complete_resource(completion) {
       Ok(resource) => resource,
       Err(err) => return OpResult::Done(Err(err)),
@@ -307,7 +315,10 @@ impl OpModel for AcceptUnix {
     OpModel::action(&mut self.inner)
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let resource = match self.inner.complete_resource(completion) {
       Ok(resource) => resource,
       Err(err) => return OpResult::Done(Err(err)),
@@ -421,7 +432,10 @@ impl OpModel for Connect {
     action_io!(Op::Connect { fd: self.res.clone(), addr: self.addr })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(completion.os_error())
     } else {
@@ -480,7 +494,10 @@ impl OpModel for Bind {
     action_io!(Op::Bind { fd: self.res.clone(), addr: self.addr })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(completion.os_error())
     } else {
@@ -513,7 +530,10 @@ impl OpModel for Listen {
     action_io!(Op::Listen { fd: self.res.clone(), backlog: self.backlog })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(completion.os_error())
     } else {
@@ -546,7 +566,10 @@ impl OpModel for Shutdown {
     action_io!(Op::Shutdown { fd: self.res.clone(), how: self.how })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(completion.os_error())
     } else {
@@ -578,7 +601,10 @@ impl OpModel for Fsync {
     action_io!(Op::Fsync { fd: self.res.clone() })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(if completion.result < 0 {
       Err(completion.os_error())
     } else {
@@ -624,7 +650,10 @@ impl OpModel for Nop {
     action_io!(Op::Nop)
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     // A nop cancelled before it ran completes with an error (`-ECANCELED`).
     OpResult::Done(if completion.result < 0 {
       Err(completion.os_error())
@@ -780,7 +809,10 @@ impl<B: IoBufMutVec> OpModel for Read<B> {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let mut buf = held(self.buf.take());
 
     let result = if !is_valid_file_offset(self.offset) {
@@ -932,7 +964,10 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Write<B> {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let buf = held(self.buf.take());
     let result = if !is_valid_file_offset(self.offset) {
       Err(offset_out_of_range_error())
@@ -1122,7 +1157,10 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for Recv<B> {
     self.core.action()
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     OpResult::Done(self.core.complete_buf(completion))
   }
 }
@@ -1146,7 +1184,10 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for RecvFrom<B> {
     self.core.action()
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let (result, buf) = self.core.complete_buf(completion);
     let addr = result
       .as_ref()
@@ -1327,7 +1368,10 @@ impl<B: IoBufVec + std::marker::Send + Sync + 'static> OpModel for Send<B> {
     action_io!(Op::Send { fd: self.res.clone(), msg, flags: self.flags })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let buf = held(self.buf.take());
     let result = if completion.result < 0 {
       Err(completion.os_error())
@@ -1431,7 +1475,10 @@ impl OpModel for Sleep {
     Action::Sleep(self.duration)
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     assert!(completion.flags.contains(CompletionFlags::TIMER));
 
     let result =
@@ -1488,7 +1535,10 @@ impl OpModel for Interval {
     Action::Sleep(self.period)
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     assert!(completion.flags.contains(CompletionFlags::TIMER));
 
     let result =
@@ -1557,7 +1607,10 @@ impl OpModel for OpenAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     // SAFETY: a successful open completion carries a new owned handle.
     OpResult::Done(unsafe { Resource::from_completion(&completion) })
   }
@@ -1634,7 +1687,10 @@ impl OpModel for Stat {
     action_io!(Op::Stat { target, out: NonNull::from(&mut self.out) })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if matches!(self.target, StatModelTarget::InvalidPath) {
       Err(nul_path_error())
     } else if completion.result < 0 {
@@ -1675,7 +1731,10 @@ impl OpModel for ReadDir {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res = if completion.result < 0 {
       Err(completion.os_error())
     } else {
@@ -1804,7 +1863,10 @@ impl OpModel for UnlinkAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res =
       if completion.result < 0 { Err(completion.os_error()) } else { Ok(()) };
     OpResult::Done(res)
@@ -1872,7 +1934,10 @@ impl OpModel for RenameAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res =
       if completion.result < 0 { Err(completion.os_error()) } else { Ok(()) };
     OpResult::Done(res)
@@ -1935,7 +2000,10 @@ impl OpModel for MkdirAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res =
       if completion.result < 0 { Err(completion.os_error()) } else { Ok(()) };
     OpResult::Done(res)
@@ -2001,7 +2069,10 @@ impl OpModel for LinkAt {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let res =
       if completion.result < 0 { Err(completion.os_error()) } else { Ok(()) };
     OpResult::Done(res)
@@ -2084,7 +2155,10 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for ReadlinkAt<B> {
     })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let mut buf = held(self.buf.take());
     let result = if completion.result < 0 {
       Err(completion.os_error())
@@ -2122,7 +2196,10 @@ impl<B: IoBufMutVec + std::marker::Send + Sync> OpModel for GetCwd<B> {
     action_io!(Op::GetCwd { out: NonNull::from(&mut self.out) })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let mut buf = held(self.buf.take());
     let result = if completion.result < 0 {
       Err(completion.os_error())
@@ -2218,7 +2295,10 @@ impl OpModel for Spawn {
     action_io!(Op::Spawn { spec: self.spec.clone() })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
+  unsafe fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> OpResult<Self::Item> {
     let result = if completion.result < 0 {
       Err(completion.os_error())
     } else {
@@ -2300,8 +2380,10 @@ mod tests {
 
     #[test]
     fn cancelled_nop_completes_with_its_error() {
+      // SAFETY: the nop has no buffer. The result is the error this test
+      // is checking.
       let OpResult::Done(Err(err)) =
-        OpModel::complete(&mut Nop, Completion::new(-125))
+        (unsafe { OpModel::complete(&mut Nop, Completion::new(-125)) })
       else {
         panic!("a failed nop must complete with an error");
       };
@@ -2483,8 +2565,9 @@ mod tests {
     assert_eq!(msg.buf_count.get(), 1);
     // SAFETY: `msg` points into `recv`, which is still alive.
     assert_eq!(unsafe { msg.bufs.as_ref() }.len, 0);
+    // SAFETY: the result is zero bytes, so the empty buffer stays empty.
     let OpResult::Done((Ok(0), bufs)) =
-      OpModel::complete(&mut recv, Completion::new(0))
+      (unsafe { OpModel::complete(&mut recv, Completion::new(0)) })
     else {
       panic!("an empty recv must complete with zero bytes");
     };

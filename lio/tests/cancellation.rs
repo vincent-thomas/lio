@@ -33,7 +33,7 @@ impl OpModel for Tracked {
     Action::nop()
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<isize> {
+  unsafe fn complete(&mut self, completion: Completion) -> OpResult<isize> {
     self.completions.fetch_add(1, Ordering::SeqCst);
     OpResult::Done(completion.result)
   }
@@ -174,7 +174,7 @@ impl OpModel for Endless {
     Action::nop()
   }
 
-  fn complete(&mut self, _: Completion) -> OpResult<()> {
+  unsafe fn complete(&mut self, _: Completion) -> OpResult<()> {
     OpResult::Yield(())
   }
 }

@@ -1292,7 +1292,10 @@ mod tests {
       action_io!(crate::backend::op::Op::Nop)
     }
 
-    fn complete(&mut self, _: Completion) -> crate::api::op::OpResult<()> {
+    unsafe fn complete(
+      &mut self,
+      _: Completion,
+    ) -> crate::api::op::OpResult<()> {
       if std::mem::replace(&mut self.0, true) {
         crate::api::op::OpResult::Done(())
       } else {
