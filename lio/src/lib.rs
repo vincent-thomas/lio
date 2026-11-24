@@ -23,6 +23,7 @@ pub mod buf;
 #[cfg(feature = "high")]
 pub mod fs;
 pub mod io;
+pub mod model;
 #[cfg(feature = "high")]
 pub mod net;
 pub mod time;
