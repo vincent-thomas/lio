@@ -156,6 +156,9 @@ impl OpCompleted {
   ///
   /// - `op_id`: The unique ID of the operation
   /// - `result`: The operation result (non-negative for success, negative errno for error)
+  ///
+  /// The driver trusts `result` once [`IoBackend::wait`] reports it. See the
+  /// safety contract of [`IoBackend`].
   #[inline]
   pub fn new(op_id: u64, result: isize) -> Self {
     Self { registration_id: op_id, result }
@@ -204,6 +207,11 @@ impl OpCompleted {
 ///   that [`Op`].
 /// - Report each pushed operation at most once from [`wait`](IoBackend::wait),
 ///   and only after nothing outside the backend can use its addresses.
+/// - Report only what happened. The driver hands each result to the op model
+///   as proof, without checking it: a non-negative result for an operation
+///   that fills memory means that many bytes of it were written, and for an
+///   operation that creates a resource it is a new descriptor or handle that
+///   nothing else owns, closed by [`resource_close`](IoBackend::resource_close).
 /// - Return `true` from [`drain`](IoBackend::drain) only when the kernel and
 ///   every worker thread are finished with every pushed address.
 pub unsafe trait IoBackend {

@@ -4,11 +4,29 @@ use crate::api::resource::ResourceClose;
 use crate::backend::op::{BorrowedOp, Op};
 use std::time::Duration;
 
-/// Completion metadata routed from the backend to one `OpModel`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the backend reported for one submitted [`Action`], routed to the
+/// [`OpModel`] that submitted it.
+///
+/// Only the driver creates one, from the result an [`IoBackend`] reported for
+/// that action. It cannot be built, copied or cloned outside this crate, so
+/// holding one is the proof [`OpModel::complete`] relies on: that the backend
+/// wrote the bytes `result` counts, or created the resource it names. To
+/// complete a model with a chosen result in a test, drive it through
+/// [`ScriptedBackend`].
+///
+///
+/// ```compile_fail
+/// // A read that never ran cannot be completed: nothing outside lio can
+/// // make the completion.
+/// let forged = lio::api::op::Completion::new(4096);
+/// ```
+///
+/// [`IoBackend`]: crate::backend::IoBackend
+/// [`ScriptedBackend`]: crate::backend::testing::ScriptedBackend
+#[derive(Debug, PartialEq, Eq)]
 pub struct Completion {
-  pub result: isize,
-  pub flags: CompletionFlags,
+  result: isize,
+  flags: CompletionFlags,
   /// How a resource carried by `result` is closed: the producing backend's
   /// close function.
   resource_close: ResourceClose,
@@ -16,12 +34,26 @@ pub struct Completion {
 
 impl Completion {
   /// A completion whose resources (if any) are native OS descriptors/handles.
-  pub const fn new(result: isize) -> Self {
+  pub(crate) const fn new(result: isize) -> Self {
     Self::with_flags(result, CompletionFlags::empty())
   }
 
-  pub const fn with_flags(result: isize, flags: CompletionFlags) -> Self {
+  pub(crate) const fn with_flags(
+    result: isize,
+    flags: CompletionFlags,
+  ) -> Self {
     Self { result, flags, resource_close: ResourceClose::native() }
+  }
+
+  /// The operation's result: non-negative on success, a negated OS error
+  /// code on failure.
+  pub const fn result(&self) -> isize {
+    self.result
+  }
+
+  /// The flags the driver set on this completion.
+  pub const fn flags(&self) -> CompletionFlags {
+    self.flags
   }
 
   /// Sets how a resource carried by this completion is closed.
@@ -167,6 +199,10 @@ pub trait OpModel: Send + 'static {
   fn action(&mut self) -> Action<'_>;
 
   /// Interpret the completion of the previously submitted low-level step.
+  ///
+  /// `completion` is what the backend reported for the [`Action`] the last
+  /// [`action`](Self::action) call returned. A model that wraps other models
+  /// must pass it on only to the inner model whose action it submitted.
   fn complete(&mut self, completion: Completion) -> OpResult<Self::Item>;
 }
 
@@ -249,8 +285,11 @@ mod completion_tests {
   fn completions_compare_their_resource_close() {
     let native = Completion::new(3);
     assert_eq!(native, Completion::new(3));
-    assert_ne!(native, native.with_resource_close(ResourceClose::noop()));
     assert!(format!("{native:?}").contains("resource_close: ResourceClose"));
+    assert_ne!(
+      Completion::new(3),
+      native.with_resource_close(ResourceClose::noop())
+    );
   }
 }
 

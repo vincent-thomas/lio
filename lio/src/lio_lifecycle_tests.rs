@@ -52,8 +52,10 @@ impl OpModel for Tagged {
 
   fn complete(&mut self, completion: Completion) -> OpResult<(u32, isize)> {
     self.completions += 1;
-    let item = (self.tag, completion.result);
-    if self.stream && completion.result >= 0 && self.completions < STREAM_ITEMS
+    let item = (self.tag, completion.result());
+    if self.stream
+      && completion.result() >= 0
+      && self.completions < STREAM_ITEMS
     {
       OpResult::Yield(item)
     } else {

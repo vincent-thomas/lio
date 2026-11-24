@@ -404,7 +404,7 @@ impl Resource {
   ///
   /// # Safety
   ///
-  /// A non-negative `completion.result` must carry a newly created
+  /// A non-negative `completion.result()` must carry a newly created
   /// descriptor/handle owned by the caller.
   ///
   /// # Errors
@@ -415,10 +415,10 @@ impl Resource {
   pub(crate) unsafe fn from_completion(
     completion: &crate::api::op::Completion,
   ) -> io::Result<Self> {
-    if completion.result < 0 {
+    if completion.result() < 0 {
       return Err(completion.os_error());
     }
-    let raw = raw_from_result(completion.result).ok_or_else(|| {
+    let raw = raw_from_result(completion.result()).ok_or_else(|| {
       io::Error::new(
         io::ErrorKind::InvalidData,
         "backend completed with an invalid resource",

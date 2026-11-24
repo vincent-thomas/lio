@@ -34,7 +34,7 @@ impl OpModel for Tagged {
   }
 
   fn complete(&mut self, completion: Completion) -> OpResult<(u32, isize)> {
-    OpResult::Done((self.0, completion.result))
+    OpResult::Done((self.0, completion.result()))
   }
 }
 

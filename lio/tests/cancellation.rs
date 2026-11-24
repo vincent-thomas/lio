@@ -35,7 +35,7 @@ impl OpModel for Tracked {
 
   fn complete(&mut self, completion: Completion) -> OpResult<isize> {
     self.completions.fetch_add(1, Ordering::SeqCst);
-    OpResult::Done(completion.result)
+    OpResult::Done(completion.result())
   }
 }
 

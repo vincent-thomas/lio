@@ -702,7 +702,7 @@ mod tests {
     }
 
     fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-      assert_eq!(completion.result, self.stage as isize);
+      assert_eq!(completion.result(), self.stage as isize);
       match self.stage {
         0 => {
           self.stage = 1;
@@ -729,7 +729,7 @@ mod tests {
     }
 
     fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-      assert_eq!(completion.result, self.stage as isize);
+      assert_eq!(completion.result(), self.stage as isize);
       match self.stage {
         0 => {
           self.stage = 1;
