@@ -36,9 +36,10 @@ run_windows = "git rev-parse --is-inside-work-tree >NUL 2>&1 && git submodule sy
 # One command surface. Local and GitHub run these tasks.
 # A failed task fails the job.
 #
-# Pull request and main: no-debug-assert, ci, and mutants-diff (pull requests).
-# ci runs fmt, check, check-clean, clippy, and test, in that order.
-# Windows skips check-clean.
+# Pull request and main: no-debug-assert, ci, ffi (Linux and macOS),
+# and mutants-diff (pull requests).
+# ci runs fmt, check, check-clean, clippy, lint, and test, in that order.
+# Windows skips check-clean. lint also runs fmt, check, and clippy, then cargo deny.
 # Nightly: search, miri, mutants.
 # Release: test, then release, then publish.
 # Publish tokens are only on the publish step.
@@ -95,16 +96,17 @@ description = "Every core mutant from .cargo/mutants.toml. Set SHARD=k/n for one
 run = "scripts/mutants.sh"
 
 [tasks.ffi]
-description = "Build the C ABI and compile the FFI tests. Needs clang++ or g++ on PATH. Not a CI job."
+description = "Build the C ABI, then compile and run the C and C++ tests. Needs clang++ or g++ on PATH."
 run = "scripts/test-ffi.sh"
 
 [tasks.ci]
-description = "Pull-request checks for this OS: fmt, check, check-clean, clippy, then test."
+description = "Pull-request checks for this OS: fmt, check, check-clean, clippy, lint, then test."
 run = [
   { task = "fmt" },
   { task = "check" },
   { task = "check-clean" },
   { task = "clippy" },
+  { task = "lint" },
   { task = "test" },
 ]
 
