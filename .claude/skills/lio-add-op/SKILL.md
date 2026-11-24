@@ -77,7 +77,7 @@ Also the non-OS backends in `lio/src/backend/`:
 
 ## 6. Verify
 
-Run the `lio-check` skill. Changing `Op` means the full suite including
-doctests (`cargo test --doc`), not just `-p lio --lib`, and each backend's
-contract suite on the platforms you can reach (`cargo test -p lio --test
-backends <io_uring|poller|iocp>`). Say which platforms you could not run.
+Run the `lio-check` skill. Changing `Op` needs all of `mise run test`
+(integration tests and doctests build raw `Op` values), not just
+`cargo test -p lio --lib`. `mise run test` runs only this OS's backend
+suites, so say which of io_uring, poller and IOCP you could not run.

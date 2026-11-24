@@ -12,12 +12,16 @@ limits each run to the core suites (`--lib`, `cancellation`, `capacity`).
 ## Reproduce
 
 ```bash
-git diff origin/main...HEAD > "$TMPDIR/pr.diff"
-PROPTEST_CASES=64 LIO_LIFECYCLE_DEPTH=4 CARGO_PROFILE_DEV_DEBUG=0 \
-  cargo mutants --in-diff "$TMPDIR/pr.diff" --no-shuffle --jobs 2
+git fetch origin main
+BASE=main mise run mutants-diff
 ```
 
-For a single file: `cargo mutants -f lio/src/slab.rs`. For a CI failure,
+This is exactly the CI job: it diffs `origin/$BASE...HEAD` into `pr.diff`
+(untracked; don't commit it) and runs `cargo mutants --in-diff` with the PR
+sizes (`PROPTEST_CASES=64`, `LIO_LIFECYCLE_DEPTH=4`).
+
+For a single file: `cargo mutants -f lio/src/slab.rs`. Every core mutant,
+as nightly: `mise run mutants` (set `SHARD=k/n` for a slice). For a CI failure,
 read `mutants.out/missed.txt` from the job's `mutants-out` artifact
 instead of rerunning everything.
 

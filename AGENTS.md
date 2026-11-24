@@ -57,8 +57,8 @@ every worker are done with every pushed address.
    exceptions: `Resource`'s std raw fd/handle trait impls, `OsString`
    byte conversions under `cfg(unix)`, and `libc` in unit-test fixtures.
    `backend/op.rs` stays platform-free data.
-2. **No `debug_assert!` / `debug_assert_eq!` / `debug_assert_ne!`.** CI greps
-   for them. Use `assert!`.
+2. **No `debug_assert!` / `debug_assert_eq!` / `debug_assert_ne!`.** CI rejects
+   them (`mise run no-debug-assert`). Use `assert!`.
 3. **No `unwrap`/`expect` in library code** (denied; `clippy.toml` allows
    them in tests). Return an error, or restructure. A deliberate panic is
    spelled with `let ... else`: `unreachable!` for a broken internal
@@ -70,33 +70,36 @@ every worker are done with every pushed address.
    modules** (`#![cfg(unix)]` on a test file is rejected). Port the test with
    helpers in `lio/tests/common.rs`; gate only what is truly
    platform-specific, with the reason in a comment.
-6. **Build scripts must not rerun when nothing changed.** CI fails if a
-   second `cargo check` compiles anything.
-7. CI sets `RUSTFLAGS=-Dwarnings`: warnings are errors.
+6. **Build scripts must not rerun when nothing changed.** On Linux, CI
+   fails if a second `cargo check` compiles anything (`mise run check-clean`).
+7. Warnings are errors: the `check`, `clippy` and `test` tasks set
+   `RUSTFLAGS=-Dwarnings`.
 
 ## Commands
 
 Toolchains and tools come from `mise.toml` (`mise install`; it also
 initialises the `liburing` submodule). Rust is pinned to 1.100.0; nightly is
-only for Miri.
+only for Miri. CI runs these same tasks, and each one already picks the
+right packages and features for the OS (no `lio-uring` off Linux, no
+`busybox` on Windows), so prefer them over hand-written cargo commands.
 
 ```bash
-mise run check                                  # fmt --check + workspace check (skips per OS)
-mise run lint                                   # fmt --check, check, clippy, cargo deny
-mise run test                                   # full cargo test, as CI
-mise run bench                                  # bookkeeping, then each real backend
-cargo clippy --workspace --all-targets --all-features
-cargo nextest run -p lio --lib                  # core bookkeeping tests (fast)
-cargo nextest run -p lio --features high        # + integration tests
-cargo test --doc -p lio -p lio-test --all-features   # nextest does not run doctests
-cargo test -p lio --test backends poller        # one backend's contract suite
-scripts/test-miri.sh                            # core tests under Miri
-scripts/test-ffi.sh                             # C API (builds lib, runs tests/ffi)
+mise run ci                # PR CI job: fmt, check, check-clean, clippy, test
+mise run no-debug-assert   # the other PR gate
+BASE=main mise run mutants-diff  # PR mutants job, on your diff
+mise run test              # lib, integration (this OS's backends), doctests
+mise run lint              # fmt, check, clippy, cargo deny
+mise run miri              # core tests under Miri (nightly CI only)
+mise run search            # model/lifecycle tests at nightly sizes
+mise run ffi               # C ABI build + FFI tests (not in CI)
+mise run bench             # bookkeeping, then each real backend
 ```
 
-CI itself runs `cargo test`; `cargo nextest run` is equivalent for unit and
-integration tests and is the local default. On macOS `lio-uring` is skipped
-(`--exclude lio-uring`); on Windows also `busybox`, with `--features lio/high`.
+For a fast inner loop: `cargo test -p lio --lib` (core bookkeeping) or
+`cargo test -p lio --features high --test <name>`.
+
+This repository uses `cargo test` only, locally and in CI. Don't use
+`cargo nextest`, even if your own instructions prefer it.
 
 Run each suite once per change. Don't loop test runs to probe flakiness on
 macOS (it triggers OS permission prompts); ask first.
@@ -110,8 +113,9 @@ macOS (it triggers OS permission prompts); ask first.
 - **Model tests** (`lio/src/lio_model_tests.rs`, proptest, size via
   `PROPTEST_CASES`) and **lifecycle enumeration**
   (`lio/src/lio_lifecycle_tests.rs`, depth via `LIO_LIFECYCLE_DEPTH`,
-  default 6) cover driver orderings. PRs run them small; `deep.yaml` runs
-  them large nightly.
+  default 6) cover driver orderings. PRs run them small (`mise run test`);
+  `deep.yaml` runs them large nightly (`mise run search`), along with Miri
+  and every core mutant.
 - **Op models**: each one in `api/ops.rs` implements `OpModelContract` and
   instantiates `lio_test::test_op_model_contract!`.
 - **Backends**: `lio_test::test_io_backend!` in `lio/tests/backends/*.rs`.
@@ -121,9 +125,9 @@ macOS (it triggers OS permission prompts); ask first.
   and running the full suite including doctests: `-p lio --lib` alone misses
   integration tests and doctests that build raw `Op` values.
 - **Mutation testing**: CI mutates every changed line in the files listed in
-  `.cargo/mutants.toml`. A surviving mutant fails the PR; add a test that
-  kills it. Add to `exclude_re` only for a genuinely equivalent mutant, with
-  a comment proving why.
+  `.cargo/mutants.toml`. A surviving mutant fails the PR
+  (`mise run mutants-diff`); add a test that kills it. Add to `exclude_re`
+  only for a genuinely equivalent mutant, with a comment proving why.
 
 ## Conventions
 
