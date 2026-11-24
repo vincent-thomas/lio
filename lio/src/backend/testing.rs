@@ -88,7 +88,14 @@ impl ScriptedBackend {
   ///
   /// Only for tests that check buffer contents the scripted results do not
   /// fill in.
-  pub fn without_poison(self) -> Self {
+  ///
+  /// # Safety
+  ///
+  /// Without the poison, nothing writes the memory a scripted result claims
+  /// was written. Every operation completed with a non-negative result must
+  /// point at memory that is already initialized for at least that many
+  /// bytes.
+  pub unsafe fn without_poison(self) -> Self {
     self.0.borrow_mut().no_poison = true;
     self
   }
@@ -555,7 +562,12 @@ mod tests {
   fn drain_poisons_unless_told_not_to() {
     for poison in [true, false] {
       let backend = ScriptedBackend::new();
-      let mut backend = if poison { backend } else { backend.without_poison() };
+      let mut backend = if poison {
+        backend
+      } else {
+        // SAFETY: the operation below is drained, never completed.
+        unsafe { backend.without_poison() }
+      };
       backend.init(1).unwrap();
       let (mut into, mut iovec) = (0u8, crate::backend::op::RawBufMut::empty());
       push_op(&mut backend, 1, read_into(&mut into, &mut iovec));
@@ -566,7 +578,8 @@ mod tests {
 
   #[test]
   fn without_poison_completes_without_touching_buffers() {
-    let backend = ScriptedBackend::new().without_poison();
+    // SAFETY: the one read completed below points at an initialized byte.
+    let backend = unsafe { ScriptedBackend::new().without_poison() };
     let mut driver = backend.clone();
     driver.init(1).unwrap();
     let (mut into, mut iovec) = (0u8, crate::backend::op::RawBufMut::empty());

@@ -235,7 +235,7 @@ impl<T: FromResource + std::marker::Send + 'static> OpModel
         OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
       },
       BindListenerState::Bind { resource } => {
-        if completion.result < 0 {
+        if completion.result() < 0 {
           self.state = BindListenerState::Done;
           OpResult::Done(Err(completion.os_error()))
         } else {
@@ -247,7 +247,7 @@ impl<T: FromResource + std::marker::Send + 'static> OpModel
       BindListenerState::Listen { resource } => {
         let resource = resource.clone();
         self.state = BindListenerState::Done;
-        if completion.result < 0 {
+        if completion.result() < 0 {
           OpResult::Done(Err(completion.os_error()))
         } else {
           OpResult::Done(Ok(T::from_resource(resource)))
@@ -352,7 +352,7 @@ impl<T: FromResource + std::marker::Send + 'static> OpModel
       StreamConnectState::Connect { resource } => {
         let resource = resource.clone();
         self.state = StreamConnectState::Done;
-        if completion.result < 0 {
+        if completion.result() < 0 {
           OpResult::Done(Err(completion.os_error()))
         } else {
           OpResult::Done(Ok(T::from_resource(resource)))
@@ -460,7 +460,7 @@ impl OpModel for UdpBindSocket {
       UdpBindState::Bind { resource } => {
         let resource = resource.clone();
         self.state = UdpBindState::Done;
-        if completion.result < 0 {
+        if completion.result() < 0 {
           OpResult::Done(Err(completion.os_error()))
         } else {
           OpResult::Done(Ok(UdpSocket::from_resource(resource)))
@@ -538,7 +538,7 @@ impl OpModel for UdpConnectSocket {
       UdpConnectState::Connect { resource } => {
         let resource = resource.clone();
         self.state = UdpConnectState::Done;
-        if completion.result < 0 {
+        if completion.result() < 0 {
           OpResult::Done(Err(completion.os_error()))
         } else {
           OpResult::Done(Ok(UdpSocket::from_resource(resource)))
