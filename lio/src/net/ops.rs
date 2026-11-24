@@ -1,8 +1,8 @@
 //! Internal operation types for network I/O.
 //!
 //! This module contains specialized operation types that adapt low-level I/O operations
-//! to work with the high-level [`Socket`] type. These types implement
-//! [`OpModel`] and are used internally by the networking API.
+//! to work with the high-level [`Socket`] type. These types are
+//! [models](crate::model) and are used internally by the networking API.
 //!
 //! Most users will not need to use these types directly, as they are returned by methods
 //! on [`Socket`], [`TcpListener`], and [`TcpSocket`].
@@ -24,15 +24,20 @@ use std::{io, marker::PhantomData, net::SocketAddr};
 #[allow(unused_imports)] // TcpListener used in doc links
 use crate::{
   api::{
-    op::{Action, Completion, OneshotOpModel, OpModel, OpResult},
     ops,
-    resource::FromResource,
+    resource::{FromResource, Resource},
   },
   backend::op::{
     SockDomain, SockProto, SockType, SocketAddrBuf, socket_addr_into_buf,
   },
+  model::{Cx, Model, Op, Step},
   net::{Socket, TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream},
+  ready,
 };
+
+fn ip_domain(addr: &SocketAddr) -> SockDomain {
+  if addr.is_ipv4() { SockDomain::IPV4 } else { SockDomain::IPV6 }
+}
 
 /// Accept operation specialized for [`Socket`].
 ///
@@ -41,35 +46,27 @@ use crate::{
 ///
 /// You typically won't create this directly; it's returned by [`Socket::accept()`](crate::net::Socket::accept).
 pub struct SocketAccept {
-  inner: ops::Accept,
+  inner: Op<ops::Accept>,
 }
 
 impl SocketAccept {
-  pub(crate) fn new(res: crate::api::resource::Resource) -> Self {
-    Self { inner: ops::Accept::new(res) }
+  pub(crate) fn new(res: Resource) -> Self {
+    Self { inner: Op::new(ops::Accept::new(res)) }
   }
 }
 
-impl OpModel for SocketAccept {
+impl Model for SocketAccept {
   type Item = io::Result<(Socket, SocketAddr)>;
 
-  fn action(&mut self) -> Action<'_> {
-    self.inner.action()
-  }
-
-  fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
-    match self.inner.complete(res) {
-      OpResult::Done(Ok((resource, addr))) => {
-        OpResult::Done(Ok((Socket::from_resource(resource), addr)))
-      }
-      OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-      OpResult::Again => OpResult::Again,
-      OpResult::Yield(item) => OpResult::Yield(
-        item.map(|(resource, addr)| (Socket::from_resource(resource), addr)),
-      ),
-    }
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    Step::Done(
+      ready!(self.inner.poll(cx))
+        .map(|(resource, addr)| (Socket::from_resource(resource), addr)),
+    )
   }
 }
+
+model_io!(SocketAccept);
 
 /// Socket creation operation specialized for [`Socket`].
 ///
@@ -78,9 +75,7 @@ impl OpModel for SocketAccept {
 ///
 /// You typically won't create this directly; it's returned by [`Socket::new()`](crate::net::Socket::new).
 pub struct SocketNew {
-  domain: SockDomain,
-  ty: SockType,
-  proto: SockProto,
+  inner: Op<ops::Socket>,
 }
 
 impl SocketNew {
@@ -89,61 +84,42 @@ impl SocketNew {
     ty: SockType,
     proto: SockProto,
   ) -> Self {
-    Self { domain, ty, proto }
+    Self { inner: Op::new(ops::Socket::new(domain, ty, proto)) }
   }
 }
 
-impl OpModel for SocketNew {
+impl Model for SocketNew {
   type Item = io::Result<Socket>;
 
-  fn action(&mut self) -> Action<'_> {
-    action_io!(crate::backend::op::Op::Socket {
-      domain: self.domain,
-      ty: self.ty,
-      proto: self.proto,
-    })
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    // SAFETY: a successful socket completion carries a new owned socket.
-    let resource =
-      unsafe { crate::api::resource::Resource::from_completion(&completion) };
-    OpResult::Done(resource.map(Socket::from_resource))
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    Step::Done(ready!(self.inner.poll(cx)).map(Socket::from_resource))
   }
 }
 
+model_io!(SocketNew);
+
 pub struct TcpAccept {
-  inner: ops::Accept,
+  inner: Op<ops::Accept>,
 }
 
 impl TcpAccept {
-  pub(crate) fn new(res: crate::api::resource::Resource) -> Self {
-    Self { inner: ops::Accept::new(res) }
+  pub(crate) fn new(res: Resource) -> Self {
+    Self { inner: Op::new(ops::Accept::new(res)) }
   }
 }
 
-// LEGACY `OpModel` impl parked during the serial-contract migration.
-//
-impl OpModel for TcpAccept {
+impl Model for TcpAccept {
   type Item = io::Result<(TcpStream, SocketAddr)>;
 
-  fn action(&mut self) -> Action<'_> {
-    self.inner.action()
-  }
-
-  fn complete(&mut self, res: Completion) -> OpResult<Self::Item> {
-    match self.inner.complete(res) {
-      OpResult::Done(Ok((resource, addr))) => {
-        OpResult::Done(Ok((TcpStream::from_resource(resource), addr)))
-      }
-      OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-      OpResult::Again => OpResult::Again,
-      OpResult::Yield(item) => OpResult::Yield(
-        item.map(|(resource, addr)| (TcpStream::from_resource(resource), addr)),
-      ),
-    }
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    Step::Done(
+      ready!(self.inner.poll(cx))
+        .map(|(resource, addr)| (TcpStream::from_resource(resource), addr)),
+    )
   }
 }
+
+model_io!(TcpAccept);
 
 /// Socket-create/bind/listen operation that returns a listener of type `T`.
 pub struct BindListener<T> {
@@ -156,10 +132,9 @@ pub struct BindListener<T> {
 pub type TcpBindListener = BindListener<TcpListener>;
 
 enum BindListenerState {
-  Socket(ops::Socket),
-  Bind { resource: crate::api::resource::Resource },
-  Listen { resource: crate::api::resource::Resource },
-  Done,
+  Socket(Op<ops::Socket>),
+  Bind { resource: Resource, bind: Op<ops::Bind> },
+  Listen { resource: Resource, listen: Op<ops::Listen> },
 }
 
 impl<T> BindListener<T> {
@@ -169,11 +144,11 @@ impl<T> BindListener<T> {
     addr: SocketAddrBuf,
   ) -> Self {
     Self {
-      state: BindListenerState::Socket(ops::Socket::new(
+      state: BindListenerState::Socket(Op::new(ops::Socket::new(
         domain,
         SockType::STREAM,
         proto,
-      )),
+      ))),
       addr,
       _listener: PhantomData,
     }
@@ -182,9 +157,11 @@ impl<T> BindListener<T> {
 
 impl TcpBindListener {
   pub(crate) fn new(addr: SocketAddr) -> Self {
-    let domain =
-      if addr.is_ipv4() { SockDomain::IPV4 } else { SockDomain::IPV6 };
-    Self::with_addr(domain, SockProto::TCP, socket_addr_into_buf(addr))
+    Self::with_addr(
+      ip_domain(&addr),
+      SockProto::TCP,
+      socket_addr_into_buf(addr),
+    )
   }
 }
 
@@ -194,210 +171,169 @@ impl BindListener<UnixListener> {
   }
 }
 
-impl<T: FromResource + std::marker::Send + 'static> OpModel
-  for BindListener<T>
-{
+impl<T: FromResource + 'static> Model for BindListener<T> {
   type Item = io::Result<T>;
 
-  fn action(&mut self) -> Action<'_> {
-    match &mut self.state {
-      BindListenerState::Socket(inner) => inner.action(),
-      BindListenerState::Bind { resource } => {
-        action_io!(crate::backend::op::Op::Bind {
-          fd: resource.clone(),
-          addr: self.addr,
-        })
-      }
-      BindListenerState::Listen { resource } => {
-        action_io!(crate::backend::op::Op::Listen {
-          fd: resource.clone(),
-          backlog: 128,
-        })
-      }
-      BindListenerState::Done => panic!("BindListener polled after completion"),
-    }
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    match &mut self.state {
-      BindListenerState::Socket(inner) => match inner.complete(completion) {
-        OpResult::Done(Ok(resource)) => {
-          self.state = BindListenerState::Bind { resource };
-          OpResult::Again
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    loop {
+      self.state = match &mut self.state {
+        BindListenerState::Socket(socket) => match ready!(socket.poll(cx)) {
+          Ok(resource) => BindListenerState::Bind {
+            bind: Op::new(ops::Bind::from_buf(resource.clone(), self.addr)),
+            resource,
+          },
+          Err(err) => return Step::Done(Err(err)),
+        },
+        BindListenerState::Bind { resource, bind } => {
+          match ready!(bind.poll(cx)) {
+            Ok(()) => BindListenerState::Listen {
+              listen: Op::new(ops::Listen::new(resource.clone(), 128)),
+              resource: resource.clone(),
+            },
+            Err(err) => return Step::Done(Err(err)),
+          }
         }
-        OpResult::Done(Err(err)) => {
-          self.state = BindListenerState::Done;
-          OpResult::Done(Err(err))
+        BindListenerState::Listen { resource, listen } => {
+          let listening = ready!(listen.poll(cx));
+          return Step::Done(
+            listening.map(|()| T::from_resource(resource.clone())),
+          );
         }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
-      BindListenerState::Bind { resource } => {
-        if completion.result() < 0 {
-          self.state = BindListenerState::Done;
-          OpResult::Done(Err(completion.os_error()))
-        } else {
-          let resource = resource.clone();
-          self.state = BindListenerState::Listen { resource };
-          OpResult::Again
-        }
-      }
-      BindListenerState::Listen { resource } => {
-        let resource = resource.clone();
-        self.state = BindListenerState::Done;
-        if completion.result() < 0 {
-          OpResult::Done(Err(completion.os_error()))
-        } else {
-          OpResult::Done(Ok(T::from_resource(resource)))
-        }
-      }
-      BindListenerState::Done => {
-        panic!("BindListener received completion after finish")
-      }
+      };
     }
   }
 }
 
-impl<T: FromResource + std::marker::Send + 'static> OneshotOpModel
-  for BindListener<T>
-{
+model_io!(generic [T: FromResource + 'static] BindListener<T>);
+
+/// A socket created and then connected to an address.
+///
+/// The step [`StreamConnect`] and [`UdpConnectSocket`] share.
+struct Connecting {
+  state: ConnectingState,
+  addr: SocketAddrBuf,
+}
+
+enum ConnectingState {
+  Socket(Op<ops::Socket>),
+  Connect { resource: Resource, connect: Op<ops::Connect> },
+}
+
+impl Connecting {
+  fn new(
+    domain: SockDomain,
+    ty: SockType,
+    proto: SockProto,
+    addr: SocketAddrBuf,
+  ) -> Self {
+    Self {
+      state: ConnectingState::Socket(Op::new(ops::Socket::new(
+        domain, ty, proto,
+      ))),
+      addr,
+    }
+  }
+}
+
+impl Model for Connecting {
+  type Item = io::Result<Resource>;
+
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    loop {
+      match &mut self.state {
+        ConnectingState::Socket(socket) => match ready!(socket.poll(cx)) {
+          Ok(resource) => {
+            self.state = ConnectingState::Connect {
+              connect: Op::new(ops::Connect::from_buf(
+                resource.clone(),
+                self.addr,
+              )),
+              resource,
+            };
+          }
+          Err(err) => return Step::Done(Err(err)),
+        },
+        ConnectingState::Connect { resource, connect } => {
+          let connected = ready!(connect.poll(cx));
+          return Step::Done(connected.map(|()| resource.clone()));
+        }
+      }
+    }
+  }
 }
 
 /// Socket-create/connect operation that returns a stream of type `T`.
 pub struct StreamConnect<T> {
-  state: StreamConnectState,
-  addr: SocketAddrBuf,
+  inner: Connecting,
   _stream: PhantomData<fn() -> T>,
 }
 
 /// Socket-create/connect operation that returns a [`TcpStream`].
 pub type TcpStreamConnect = StreamConnect<TcpStream>;
 
-enum StreamConnectState {
-  Socket(ops::Socket),
-  Connect { resource: crate::api::resource::Resource },
-  Done,
-}
-
-impl<T> StreamConnect<T> {
-  fn with_addr(
-    domain: SockDomain,
-    proto: SockProto,
-    addr: SocketAddrBuf,
-  ) -> Self {
+impl TcpStreamConnect {
+  pub(crate) fn new(addr: SocketAddr) -> Self {
     Self {
-      state: StreamConnectState::Socket(ops::Socket::new(
-        domain,
+      inner: Connecting::new(
+        ip_domain(&addr),
         SockType::STREAM,
-        proto,
-      )),
-      addr,
+        SockProto::TCP,
+        socket_addr_into_buf(addr),
+      ),
       _stream: PhantomData,
     }
   }
 }
 
-impl TcpStreamConnect {
-  pub(crate) fn new(addr: SocketAddr) -> Self {
-    let domain =
-      if addr.is_ipv4() { SockDomain::IPV4 } else { SockDomain::IPV6 };
-    Self::with_addr(domain, SockProto::TCP, socket_addr_into_buf(addr))
-  }
-}
-
 impl StreamConnect<UnixStream> {
   pub(crate) fn unix(addr: SocketAddrBuf) -> Self {
-    Self::with_addr(SockDomain::UNIX, SockProto::DEFAULT, addr)
+    Self {
+      inner: Connecting::new(
+        SockDomain::UNIX,
+        SockType::STREAM,
+        SockProto::DEFAULT,
+        addr,
+      ),
+      _stream: PhantomData,
+    }
   }
 }
 
-impl<T: FromResource + std::marker::Send + 'static> OpModel
-  for StreamConnect<T>
-{
+impl<T: FromResource + 'static> Model for StreamConnect<T> {
   type Item = io::Result<T>;
 
-  fn action(&mut self) -> Action<'_> {
-    match &mut self.state {
-      StreamConnectState::Socket(inner) => inner.action(),
-      StreamConnectState::Connect { resource } => {
-        action_io!(crate::backend::op::Op::Connect {
-          fd: resource.clone(),
-          addr: self.addr,
-        })
-      }
-      StreamConnectState::Done => {
-        panic!("StreamConnect polled after completion")
-      }
-    }
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    match &mut self.state {
-      StreamConnectState::Socket(inner) => match inner.complete(completion) {
-        OpResult::Done(Ok(resource)) => {
-          self.state = StreamConnectState::Connect { resource };
-          OpResult::Again
-        }
-        OpResult::Done(Err(err)) => {
-          self.state = StreamConnectState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
-      StreamConnectState::Connect { resource } => {
-        let resource = resource.clone();
-        self.state = StreamConnectState::Done;
-        if completion.result() < 0 {
-          OpResult::Done(Err(completion.os_error()))
-        } else {
-          OpResult::Done(Ok(T::from_resource(resource)))
-        }
-      }
-      StreamConnectState::Done => {
-        panic!("StreamConnect received completion after finish")
-      }
-    }
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    Step::Done(ready!(self.inner.poll(cx)).map(T::from_resource))
   }
 }
 
-impl<T: FromResource + std::marker::Send + 'static> OneshotOpModel
-  for StreamConnect<T>
-{
-}
+model_io!(generic [T: FromResource + 'static] StreamConnect<T>);
 
 /// Accept operation specialized for [`UnixStream`].
 ///
-/// Unix peers are usually unnamed, so the peer address is not decoded.
+/// Unix peers are usually unnamed, so the peer address is not reported.
 pub struct UnixAccept {
-  inner: ops::Accept,
+  inner: Op<ops::AcceptUnix>,
 }
 
 impl UnixAccept {
-  pub(crate) fn new(res: crate::api::resource::Resource) -> Self {
-    Self { inner: ops::Accept::new(res) }
+  pub(crate) fn new(res: Resource) -> Self {
+    Self { inner: Op::new(ops::AcceptUnix::new(res)) }
   }
 }
 
-impl OpModel for UnixAccept {
+impl Model for UnixAccept {
   type Item = io::Result<UnixStream>;
 
-  fn action(&mut self) -> Action<'_> {
-    self.inner.action()
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    OpResult::Done(
-      self.inner.complete_resource(completion).map(UnixStream::from_resource),
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    Step::Done(
+      ready!(self.inner.poll(cx))
+        .map(|(resource, _peer)| UnixStream::from_resource(resource)),
     )
   }
 }
 
-impl OneshotOpModel for UnixAccept {}
+model_io!(UnixAccept);
 
 pub struct UdpBindSocket {
   state: UdpBindState,
@@ -405,150 +341,74 @@ pub struct UdpBindSocket {
 }
 
 enum UdpBindState {
-  Socket(ops::Socket),
-  Bind { resource: crate::api::resource::Resource },
-  Done,
+  Socket(Op<ops::Socket>),
+  Bind { resource: Resource, bind: Op<ops::Bind> },
 }
 
 impl UdpBindSocket {
   pub(crate) fn new(addr: SocketAddr) -> Self {
-    let domain =
-      if addr.is_ipv4() { SockDomain::IPV4 } else { SockDomain::IPV6 };
     Self {
-      state: UdpBindState::Socket(ops::Socket::new(
-        domain,
+      state: UdpBindState::Socket(Op::new(ops::Socket::new(
+        ip_domain(&addr),
         SockType::DGRAM,
         SockProto::DEFAULT,
-      )),
+      ))),
       addr,
     }
   }
 }
 
-impl OpModel for UdpBindSocket {
+impl Model for UdpBindSocket {
   type Item = io::Result<UdpSocket>;
 
-  fn action(&mut self) -> Action<'_> {
-    match &mut self.state {
-      UdpBindState::Socket(inner) => inner.action(),
-      UdpBindState::Bind { resource } => {
-        action_io!(crate::backend::op::Op::Bind {
-          fd: resource.clone(),
-          addr: crate::backend::op::socket_addr_into_buf(self.addr),
-        })
-      }
-      UdpBindState::Done => panic!("UdpBindSocket polled after completion"),
-    }
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    match &mut self.state {
-      UdpBindState::Socket(inner) => match inner.complete(completion) {
-        OpResult::Done(Ok(resource)) => {
-          self.state = UdpBindState::Bind { resource };
-          OpResult::Again
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    loop {
+      match &mut self.state {
+        UdpBindState::Socket(socket) => match ready!(socket.poll(cx)) {
+          Ok(resource) => {
+            self.state = UdpBindState::Bind {
+              bind: Op::new(ops::Bind::new(resource.clone(), self.addr)),
+              resource,
+            };
+          }
+          Err(err) => return Step::Done(Err(err)),
+        },
+        UdpBindState::Bind { resource, bind } => {
+          let bound = ready!(bind.poll(cx));
+          return Step::Done(
+            bound.map(|()| UdpSocket::from_resource(resource.clone())),
+          );
         }
-        OpResult::Done(Err(err)) => {
-          self.state = UdpBindState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
-      UdpBindState::Bind { resource } => {
-        let resource = resource.clone();
-        self.state = UdpBindState::Done;
-        if completion.result() < 0 {
-          OpResult::Done(Err(completion.os_error()))
-        } else {
-          OpResult::Done(Ok(UdpSocket::from_resource(resource)))
-        }
-      }
-      UdpBindState::Done => {
-        panic!("UdpBindSocket received completion after finish")
       }
     }
   }
 }
 
-impl OneshotOpModel for UdpBindSocket {}
+model_io!(UdpBindSocket);
 
 pub struct UdpConnectSocket {
-  state: UdpConnectState,
-  addr: SocketAddr,
-}
-
-enum UdpConnectState {
-  Socket(ops::Socket),
-  Connect { resource: crate::api::resource::Resource },
-  Done,
+  inner: Connecting,
 }
 
 impl UdpConnectSocket {
   pub(crate) fn new(addr: SocketAddr) -> Self {
-    let domain =
-      if addr.is_ipv4() { SockDomain::IPV4 } else { SockDomain::IPV6 };
     Self {
-      state: UdpConnectState::Socket(ops::Socket::new(
-        domain,
+      inner: Connecting::new(
+        ip_domain(&addr),
         SockType::DGRAM,
         SockProto::DEFAULT,
-      )),
-      addr,
+        socket_addr_into_buf(addr),
+      ),
     }
   }
 }
 
-impl OpModel for UdpConnectSocket {
+impl Model for UdpConnectSocket {
   type Item = io::Result<UdpSocket>;
 
-  fn action(&mut self) -> Action<'_> {
-    match &mut self.state {
-      UdpConnectState::Socket(inner) => inner.action(),
-      UdpConnectState::Connect { resource } => {
-        action_io!(crate::backend::op::Op::Connect {
-          fd: resource.clone(),
-          addr: crate::backend::op::socket_addr_into_buf(self.addr),
-        })
-      }
-      UdpConnectState::Done => {
-        panic!("UdpConnectSocket polled after completion")
-      }
-    }
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    match &mut self.state {
-      UdpConnectState::Socket(inner) => match inner.complete(completion) {
-        OpResult::Done(Ok(resource)) => {
-          self.state = UdpConnectState::Connect { resource };
-          OpResult::Again
-        }
-        OpResult::Done(Err(err)) => {
-          self.state = UdpConnectState::Done;
-          OpResult::Done(Err(err))
-        }
-        OpResult::Again => {
-          panic!("socket creation unexpectedly requested Again")
-        }
-        OpResult::Yield(_) => panic!("socket creation unexpectedly yielded"),
-      },
-      UdpConnectState::Connect { resource } => {
-        let resource = resource.clone();
-        self.state = UdpConnectState::Done;
-        if completion.result() < 0 {
-          OpResult::Done(Err(completion.os_error()))
-        } else {
-          OpResult::Done(Ok(UdpSocket::from_resource(resource)))
-        }
-      }
-      UdpConnectState::Done => {
-        panic!("UdpConnectSocket received completion after finish")
-      }
-    }
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    Step::Done(ready!(self.inner.poll(cx)).map(UdpSocket::from_resource))
   }
 }
 
-impl OneshotOpModel for UdpConnectSocket {}
+model_io!(UdpConnectSocket);

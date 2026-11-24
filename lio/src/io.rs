@@ -27,10 +27,11 @@ use std::mem::MaybeUninit;
 
 use crate::api::{
   io::Io,
-  op::{Action, Completion, OneshotOpModel, OpModel, OpResult},
   ops,
   resource::{AsResource, Resource},
 };
+use crate::model::{Cx, Model, Op, Step};
+use crate::ready;
 use crate::{IoBuf, IoBufMut, IoBufVec};
 
 /// Default buffer size for I/O operations (64 KB).
@@ -144,9 +145,8 @@ pub struct Copy {
 }
 
 enum CopyState {
-  Reading(ops::Read<CappedBuf>),
-  Writing(ops::Write<Vec<u8>>),
-  Done,
+  Reading(Op<ops::Read<CappedBuf>>),
+  Writing(Op<ops::Write<Vec<u8>>>),
 }
 
 impl Copy {
@@ -157,11 +157,15 @@ impl Copy {
     let initial = limit.min(DEFAULT_BUF_SIZE as u64) as usize;
     let buf = CappedBuf::new(Vec::with_capacity(initial), initial);
     Self {
-      reader: reader.clone(),
-      writer: writer.clone(),
+      state: CopyState::Reading(Op::new(ops::Read::new(
+        reader.clone(),
+        buf,
+        None,
+      ))),
+      reader,
+      writer,
       total: 0,
       limit,
-      state: CopyState::Reading(ops::Read::new(reader, buf, None)),
     }
   }
 
@@ -172,73 +176,54 @@ impl Copy {
   fn next_read_len(&self) -> usize {
     (self.limit - self.total).min(DEFAULT_BUF_SIZE as u64) as usize
   }
+
+  fn writing(&self, buf: Vec<u8>) -> CopyState {
+    CopyState::Writing(Op::new(ops::Write::new(self.writer.clone(), buf, None)))
+  }
 }
 
-impl OpModel for Copy {
+impl Model for Copy {
   type Item = io::Result<u64>;
 
-  fn action(&mut self) -> Action<'_> {
-    match &mut self.state {
-      CopyState::Reading(read) => read.action(),
-      CopyState::Writing(write) => write.action(),
-      CopyState::Done => panic!("CopyN polled after completion"),
-    }
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    match std::mem::replace(&mut self.state, CopyState::Done) {
-      CopyState::Reading(mut read) => match read.complete(completion) {
-        OpResult::Done((Ok(0), _buf)) => OpResult::Done(Ok(self.total)),
-        OpResult::Done((Ok(n), buf)) => {
-          self.total += n as u64;
-          let buf = buf.into_inner();
-          self.state =
-            CopyState::Writing(ops::Write::new(self.writer.clone(), buf, None));
-          OpResult::Again
-        }
-        OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
-        OpResult::Again | OpResult::Yield(_) => unreachable!(),
-      },
-      CopyState::Writing(mut write) => match write.complete(completion) {
-        OpResult::Done((Ok(0), _buf)) => {
-          OpResult::Done(Err(Self::write_zero()))
-        }
-        OpResult::Done((Ok(n), mut buf)) => {
-          let written = n;
-          if written < buf.len() {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    loop {
+      self.state = match &mut self.state {
+        CopyState::Reading(read) => match ready!(read.poll(cx)) {
+          (Ok(0), _buf) => return Step::Done(Ok(self.total)),
+          (Ok(n), buf) => {
+            self.total += n as u64;
+            self.writing(buf.into_inner())
+          }
+          (Err(err), _buf) => return Step::Done(Err(err)),
+        },
+        CopyState::Writing(write) => match ready!(write.poll(cx)) {
+          (Ok(0), _buf) => return Step::Done(Err(Self::write_zero())),
+          (Ok(written), mut buf) if written < buf.len() => {
             let remaining = buf.len() - written;
             buf.copy_within(written.., 0);
             buf.truncate(remaining);
-            self.state = CopyState::Writing(ops::Write::new(
-              self.writer.clone(),
-              buf,
-              None,
-            ));
-            return OpResult::Again;
+            self.writing(buf)
           }
-
-          if self.total >= self.limit {
-            OpResult::Done(Ok(self.total))
-          } else {
+          (Ok(_), _buf) if self.total >= self.limit => {
+            return Step::Done(Ok(self.total));
+          }
+          (Ok(_), mut buf) => {
             buf.clear();
             let buf = CappedBuf::new(buf, self.next_read_len());
-            self.state = CopyState::Reading(ops::Read::new(
+            CopyState::Reading(Op::new(ops::Read::new(
               self.reader.clone(),
               buf,
               None,
-            ));
-            OpResult::Again
+            )))
           }
-        }
-        OpResult::Done((Err(err), _buf)) => OpResult::Done(Err(err)),
-        OpResult::Again | OpResult::Yield(_) => unreachable!(),
-      },
-      CopyState::Done => panic!("CopyN completed after terminal state"),
+          (Err(err), _buf) => return Step::Done(Err(err)),
+        },
+      };
     }
   }
 }
 
-impl OneshotOpModel for Copy {}
+model_io!(Copy);
 
 /// A read buffer whose writable region is capped below the `Vec`'s capacity.
 ///

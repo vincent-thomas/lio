@@ -7,11 +7,24 @@
 //! - A *leaf* ([`Read`], [`Write`], [`Sleep`]) submits one operation through
 //!   the [`Cx`] and keeps the [`Ticket`] it gets back. The buffer moves into
 //!   the driver with the operation and comes back with the result.
-//! - A *composite* ([`Copy`], [`Join`], anything you write) holds other
-//!   models and polls them. It never sees a completion, so it cannot hand one
+//! - A *composite* ([`Join`], [`io::copy`](crate::io::copy), anything you
+//!   write) holds other models and polls them. It never sees a completion, so it cannot hand one
 //!   operation's result to another.
 //!
 //! No model here contains `unsafe`, and a model you write needs none.
+//!
+//! lio's own multi-step operations ([`io::copy`](crate::io::copy), and
+//! everything in `fs` and `net` that takes more than one step) are models.
+//! Any single operation becomes a leaf with
+//! [`Io::into_model`](crate::api::Io::into_model). The operation itself is
+//! not handed out, so a result cannot be given to an operation that did not
+//! run:
+//!
+//! ```compile_fail
+//! # let file = lio::api::resource::Resource::stdin();
+//! // A read is not a model, and `into_inner` only returns models.
+//! let read = lio::api::read(&file, Vec::<u8>::with_capacity(4096)).into_inner();
+//! ```
 //!
 //! ```
 //! use lio::Lio;
@@ -470,6 +483,29 @@ impl<Req, Out> Leaf<Req, Out> {
   }
 }
 
+/// One of lio's operations as a leaf.
+///
+/// Made with [`Io::into_model`](crate::api::Io::into_model). The operation
+/// inside cannot be taken back out, so the result this leaf yields is always
+/// the result of the operation it submitted.
+pub struct Op<T: OneshotOpModel> {
+  leaf: Leaf<T, T::Item>,
+}
+
+impl<T: OneshotOpModel> Op<T> {
+  pub(crate) fn new(op: T) -> Self {
+    Self { leaf: Leaf::Idle(op) }
+  }
+}
+
+impl<T: OneshotOpModel> Model for Op<T> {
+  type Item = T::Item;
+
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    self.leaf.poll(cx, |cx, op| cx.submit(op))
+  }
+}
+
 /// Reads into an owned buffer.
 ///
 /// Produces the number of bytes read and the buffer.
@@ -552,76 +588,6 @@ impl Model for Sleep {
 // ============================================================================
 // Composites
 // ============================================================================
-
-/// Copies from one resource to another until the source is at its end.
-///
-/// Produces the number of bytes copied. Written with the public [`Model`]
-/// API only: it is what a user-written composite looks like.
-pub struct Copy {
-  from: Resource,
-  to: Resource,
-  copied: u64,
-  state: CopyState,
-}
-
-enum CopyState {
-  Reading(Read<Vec<u8>>),
-  Writing(Write<Vec<u8>>),
-}
-
-impl Copy {
-  /// Copies through a buffer of `buf_len` bytes.
-  pub fn new(
-    from: &impl AsResource,
-    to: &impl AsResource,
-    buf_len: usize,
-  ) -> Self {
-    let from = from.as_resource().clone();
-    Self {
-      // Uninitialized capacity: the read reports how much of it was written.
-      state: CopyState::Reading(Read::new(&from, Vec::with_capacity(buf_len))),
-      from,
-      to: to.as_resource().clone(),
-      copied: 0,
-    }
-  }
-}
-
-impl Model for Copy {
-  type Item = io::Result<u64>;
-
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-    loop {
-      match &mut self.state {
-        CopyState::Reading(read) => {
-          let (result, buf) = ready!(read.poll(cx));
-          match result {
-            Ok(0) => return Step::Done(Ok(self.copied)),
-            Ok(_) => self.state = CopyState::Writing(Write::new(&self.to, buf)),
-            Err(err) => return Step::Done(Err(err)),
-          }
-        }
-        CopyState::Writing(write) => {
-          let (result, mut buf) = ready!(write.poll(cx));
-          let written = match result {
-            Ok(0) => {
-              return Step::Done(Err(io::ErrorKind::WriteZero.into()));
-            }
-            Ok(written) => written,
-            Err(err) => return Step::Done(Err(err)),
-          };
-          self.copied += written as u64;
-          buf.drain(..written);
-          self.state = if buf.is_empty() {
-            CopyState::Reading(Read::new(&self.from, buf))
-          } else {
-            CopyState::Writing(Write::new(&self.to, buf))
-          };
-        }
-      }
-    }
-  }
-}
 
 /// Runs two models at the same time and produces both items.
 ///

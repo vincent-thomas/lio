@@ -410,7 +410,11 @@ pub struct Connect {
 
 impl Connect {
   pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {
-    Self { res, addr: socket_addr_into_buf(addr) }
+    Self::from_buf(res, socket_addr_into_buf(addr))
+  }
+
+  pub(crate) fn from_buf(res: Resource, addr: SocketAddrBuf) -> Self {
+    Self { res, addr }
   }
 }
 
