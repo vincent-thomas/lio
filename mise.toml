@@ -38,8 +38,11 @@ run_windows = "git rev-parse --is-inside-work-tree >NUL 2>&1 && git submodule sy
 #
 # Pull request and main: no-debug-assert, ci, ffi (Linux and macOS),
 # and mutants-diff (pull requests).
-# ci runs fmt, check, check-clean, clippy, lint, and test, in that order.
-# Windows skips check-clean. lint also runs fmt, check, and clippy, then cargo deny.
+# ci runs each check once, in this order: fmt, check, check-clean, clippy,
+# cargo deny, then test. lint depends on fmt, check, and clippy, then runs
+# cargo deny. wait_for puts check-clean between check and clippy, and test
+# after lint, without running those tasks a second time.
+# Windows skips check-clean.
 # Nightly: search, miri, mutants.
 # Release: test, then release, then publish.
 # Publish tokens are only on the publish step.
@@ -50,11 +53,15 @@ run = "cargo fmt --check"
 
 [tasks.check]
 description = "Type-check every target. Skip lio-uring off Linux. Skip busybox on Windows."
+# After fmt when both are in the same run. mise run check does not run fmt.
+wait_for = ["fmt"]
 env = { RUSTFLAGS = "-Dwarnings" }
 run = "cargo check --workspace --all-targets{% if os() != 'linux' %} --exclude lio-uring{% endif %}{% if os() == 'windows' %} --exclude busybox --features lio/high{% else %} --all-features{% endif %}"
 
 [tasks.check-clean]
 description = "On Linux, a second cargo check must compile nothing. Same flags as check."
+# After check when both are in the same run.
+wait_for = ["check"]
 env = { RUSTFLAGS = "-Dwarnings" }
 # Windows starts a TOML command with cmd, which cannot run this bash script.
 # An empty list skips the task there.
@@ -63,11 +70,16 @@ run_windows = []
 
 [tasks.clippy]
 description = "Clippy, with the same packages and features as check."
+# After check-clean when both are in the same run, so clippy cannot rebuild
+# between the two checks. mise run clippy does not run check-clean.
+wait_for = ["check-clean"]
 env = { RUSTFLAGS = "-Dwarnings" }
 run = "cargo clippy --workspace --all-targets{% if os() != 'linux' %} --exclude lio-uring{% endif %}{% if os() == 'windows' %} --exclude busybox --features lio/high{% else %} --all-features{% endif %}"
 
 [tasks.test]
 description = "Library and integration tests with high, plus doctests. Includes this OS's backends."
+# After lint when both are in the same run. mise run test does not run lint.
+wait_for = ["lint"]
 env = { RUSTFLAGS = "-Dwarnings" }
 run = [
   "cargo test -p lio --features high --tests",
@@ -100,15 +112,8 @@ description = "Build the C ABI, then compile and run the C and C++ tests. Needs 
 run = "scripts/test-ffi.sh"
 
 [tasks.ci]
-description = "Pull-request checks for this OS: fmt, check, check-clean, clippy, lint, then test."
-run = [
-  { task = "fmt" },
-  { task = "check" },
-  { task = "check-clean" },
-  { task = "clippy" },
-  { task = "lint" },
-  { task = "test" },
-]
+description = "Pull-request checks for this OS. fmt, check, clippy, and cargo deny run once through lint. check-clean and test run once too."
+depends = ["check-clean", "lint", "test"]
 
 [tasks.lint]
 description = "fmt, check, clippy, then cargo-deny."
