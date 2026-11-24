@@ -193,7 +193,7 @@ macro_rules! model_io {
     impl<$($generics)*> $crate::api::io::sealed::Sealed for $ty {}
 
     impl<$($generics)*> $crate::api::io::Runnable for $ty {
-      type Item = <$ty as $crate::model::Model>::Item;
+      type Item = <$ty as $crate::model::OpModel>::Item;
       type Future = $crate::model::Run<$ty>;
 
       fn run_callback<F>(self, lio: $crate::Lio, f: F)
@@ -206,6 +206,99 @@ macro_rules! model_io {
 
       fn run_future(self, lio: $crate::Lio) -> Self::Future {
         $crate::model::run(&lio, self)
+      }
+    }
+  };
+}
+
+/// Declares the public type of one operation around the memory it uses.
+///
+/// The memory type has two functions, `action` and `complete`: what the
+/// operation submits, and how its result is read. The generated type is an
+/// [`OpModel`](crate::model::OpModel) that pairs them, and an
+/// [`Io`](crate::api::Io) of it is registered with the driver as it is.
+macro_rules! leaf {
+  (
+    $(#[$meta:meta])*
+    [$($generics:tt)*] $vis:vis struct $name:ident $(<$param:ident>)? ($raw:ty)
+      => $item:ty
+  ) => {
+    $(#[$meta])*
+    $vis struct $name<$($generics)*> {
+      leaf: $crate::model::Leaf<$raw, $item>,
+    }
+
+    impl<$($generics)*> From<$raw> for $name$(<$param>)? {
+      #[inline]
+      fn from(raw: $raw) -> Self {
+        Self { leaf: $crate::model::Leaf::Idle(raw) }
+      }
+    }
+
+    impl<$($generics)*> $crate::model::OpModel for $name$(<$param>)? {
+      type Item = $item;
+
+      #[inline]
+      fn poll(
+        &mut self,
+        cx: &mut $crate::model::Cx<'_>,
+      ) -> $crate::model::Step<Self::Item> {
+        self.leaf.poll(cx, <$raw>::action, <$raw>::complete)
+      }
+    }
+
+    impl<$($generics)*> $crate::api::io::sealed::Sealed for $name$(<$param>)? {}
+
+    impl<$($generics)*> $crate::api::io::Runnable for $name$(<$param>)? {
+      type Item = $item;
+      type Future = $crate::api::io::OpFuture<Self>;
+
+      #[inline]
+      fn run_callback<F>(self, lio: $crate::Lio, f: F)
+      where
+        F: Fn(Self::Item) + 'static,
+      {
+        let state = $crate::api::io::unsubmitted(self.leaf.into_idle());
+        // Over capacity, the operation waits in a queue (see `Lio::is_full`).
+        lio.schedule_or_queue(move |arena| {
+          $crate::registration::Registration::new_in(
+            arena,
+            state,
+            <$raw>::action,
+            <$raw>::complete,
+            f,
+          )
+        });
+      }
+
+      #[inline]
+      fn run_future(self, lio: $crate::Lio) -> Self::Future {
+        $crate::api::io::OpFuture::new(self, lio)
+      }
+    }
+
+    impl<$($generics)*> $crate::api::io::sealed::Direct for $name$(<$param>)? {
+      #[inline]
+      fn start<F>(self, lio: &$crate::Lio, f: F) -> u64
+      where
+        F: Fn(Self::Item) + 'static,
+      {
+        let state = $crate::api::io::unsubmitted(self.leaf.into_idle());
+        let scheduled = lio.schedule_with(move |arena| {
+          $crate::registration::Registration::new_in(
+            arena,
+            state,
+            <$raw>::action,
+            <$raw>::complete,
+            f,
+          )
+        });
+        match scheduled {
+          Ok(id) => id,
+          Err(err) => {
+            unreachable!("lio rejected an operation it had capacity for: {err}")
+          }
+        }
       }
     }
   };

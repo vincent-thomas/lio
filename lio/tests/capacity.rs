@@ -1,7 +1,7 @@
 //! Going over `Lio::new(cap)` must not panic: futures wait for a free slot,
 //! and `when_done` / `send` / `send_with` queue the operation.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use lio::api::op::{Action, Completion, OpModel, OpResult, StreamOpModel};
-use lio::api::{Io, IoStream};
+use lio::api::IoStream;
 use lio::backend::testing::{Checked, ScriptedBackend};
+use lio::model::{Cx, OpModel, Step};
 use lio::{Lio, api};
 
 fn lio(cap: usize) -> Lio {
@@ -113,29 +113,32 @@ fn cancelling_a_future_frees_its_slot_for_a_waiter() {
   panic!("the waiting future never completed");
 }
 
-/// Yields one item, then finishes.
+/// Yields one item, then finishes, with one nop before each.
 struct OneShotStream {
   done: bool,
+  nop: lio::api::ops::Nop,
+}
+
+impl OneShotStream {
+  fn new() -> Self {
+    Self { done: false, nop: api::nop().into_inner() }
+  }
 }
 
 impl OpModel for OneShotStream {
   type Item = u32;
 
-  fn action(&mut self) -> Action<'_> {
-    Action::nop()
-  }
-
-  fn complete(&mut self, _: Completion) -> OpResult<u32> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<u32> {
+    let _ = lio::ready!(self.nop.poll(cx));
     if self.done {
-      OpResult::Done(2)
+      Step::Done(2)
     } else {
       self.done = true;
-      OpResult::Yield(1)
+      self.nop = api::nop().into_inner();
+      Step::Yield(1)
     }
   }
 }
-
-impl StreamOpModel for OneShotStream {}
 
 #[test]
 fn stream_over_capacity_waits_instead_of_ending() {
@@ -146,11 +149,10 @@ fn stream_over_capacity_waits_instead_of_ending() {
 
   // Occupy the only slot.
   let mut blocker: Pin<Box<_>> =
-    Box::pin(Io::from_op(lio::api::ops::Nop).with_lio(&lio).into_future());
+    Box::pin(api::nop().with_lio(&lio).into_future());
   assert!(blocker.as_mut().poll(&mut cx).is_pending());
 
-  let mut stream =
-    IoStream::from_op(OneShotStream { done: false }).with_lio(&lio);
+  let mut stream = IoStream::from_op(OneShotStream::new()).with_lio(&lio);
   let mut next = Box::pin(stream.next());
   // Previously this reported `None`, ending the stream early.
   assert!(next.as_mut().poll(&mut cx).is_pending());
@@ -169,48 +171,6 @@ fn stream_over_capacity_waits_instead_of_ending() {
     }
   }
   panic!("the stream never produced its item");
-}
-
-/// Panics in its first `action`; records being dropped.
-struct PanicsOnAction(Arc<AtomicBool>);
-
-impl Drop for PanicsOnAction {
-  fn drop(&mut self) {
-    self.0.store(true, Ordering::SeqCst);
-  }
-}
-
-impl OpModel for PanicsOnAction {
-  type Item = ();
-
-  fn action(&mut self) -> Action<'_> {
-    panic!("no action for you");
-  }
-
-  fn complete(&mut self, _: Completion) -> OpResult<()> {
-    OpResult::Done(())
-  }
-}
-
-#[test]
-fn panicking_first_action_does_not_keep_its_slot() {
-  // Capacity 1: if the panicking op kept its slot, nothing more would run.
-  let lio = lio(1);
-  let dropped = Arc::new(AtomicBool::new(false));
-  let op = PanicsOnAction(dropped.clone());
-
-  let submit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-    Io::from_op(op).with_lio(&lio).when_done(|_| {});
-  }));
-  assert!(submit.is_err(), "the panic reaches the submitter");
-  assert!(dropped.load(Ordering::SeqCst), "the op was released");
-  assert!(!lio.is_full(), "and its slot with it");
-
-  let done = Rc::new(Cell::new(false));
-  let set = done.clone();
-  api::nop().with_lio(&lio).when_done(move |_| set.set(true));
-  lio.try_run().unwrap();
-  assert!(done.get());
 }
 
 #[test]

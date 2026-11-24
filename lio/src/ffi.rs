@@ -1254,7 +1254,7 @@ pub unsafe extern "C" fn lio_sendto(
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  crate::api::io::Io::from_op(api::ops::Send::new(
+  crate::api::io::Io::<api::ops::Send<_>>::leaf(api::ops::raw::Send::new(
     resource.clone(),
     buf,
     Some(socket_addr),
@@ -1647,11 +1647,9 @@ pub unsafe extern "C" fn lio_readlinkat(
     return;
   };
   let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
-  crate::api::io::Io::from_op(api::ops::ReadlinkAt::new(
-    dir_res.clone(),
-    path,
-    buf,
-  ))
+  crate::api::io::Io::<api::ops::ReadlinkAt<_>>::leaf(
+    api::ops::raw::ReadlinkAt::new(dir_res.clone(), path, buf),
+  )
   .with_lio(&unsafe { handle(lio) }.inner)
   .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
@@ -1678,9 +1676,11 @@ pub unsafe extern "C" fn lio_getcwd(
   let Some(buf) = (unsafe { lend_empty(buf, buf_len, callback) }) else {
     return;
   };
-  crate::api::io::Io::from_op(api::ops::GetCwd::new(buf))
-    .with_lio(&unsafe { handle(lio) }.inner)
-    .when_done(move |(res, buf)| return_buf(callback, res, buf));
+  crate::api::io::Io::<api::ops::GetCwd<_>>::leaf(api::ops::raw::GetCwd::new(
+    buf,
+  ))
+  .with_lio(&unsafe { handle(lio) }.inner)
+  .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
 
 /// Reads one batch of directory entries from an open directory descriptor.

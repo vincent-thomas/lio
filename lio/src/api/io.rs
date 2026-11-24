@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! Io<T>
-//!   ├─> IntoFuture ──> IoFuture<T> (async/await)
+//!   ├─> IntoFuture ──> T::Future   (async/await)
 //!   ├─> when_done(F)  (callback)
 //!   ├─> send()    ──> Receiver<T>        (channel-based blocking)
 //!   └─> send_with(Sender<T>)             (custom channel)
@@ -45,12 +45,14 @@
 //!
 //! # Thread Safety
 //!
-//! All types in this module are `Send`, allowing results to be consumed on different
-//! threads than where operations were initiated. This is particularly useful for
-//! delegating I/O completion handling to dedicated threads.
+//! An [`Io`] stays on the thread of the [`Lio`] that runs it. Results can
+//! leave it: [`Receiver`] and [`StreamReceiver`] are `Send`, so an operation's
+//! result can be consumed on another thread than the one that started it.
 
 use crate::{
-  api::op::OpModel, driver, driver::Lio, registration::Registration,
+  driver,
+  driver::Lio,
+  model::{self, OpModel, Task},
 };
 
 use std::{
@@ -79,11 +81,42 @@ pub struct Io<T> {
 }
 
 pub(crate) mod sealed {
+  use crate::driver::Lio;
+
   pub trait Sealed {}
+
+  /// A single operation, which the driver registers as it is.
+  pub trait Direct: super::Runnable {
+    /// Submits the operation now and returns its id. The driver must have a
+    /// free slot.
+    fn start<F>(self, lio: &Lio, f: F) -> u64
+    where
+      F: Fn(Self::Item) + 'static;
+  }
 }
 
-/// What an [`Io`] can run: one of lio's operations, or one of its built-in
-/// [models](crate::model). Sealed.
+/// The memory of an operation that has not been submitted.
+///
+/// # Panics
+///
+/// Panics for an operation that was already polled: its memory is in the
+/// driver, so it cannot be submitted again.
+pub(crate) fn unsubmitted<S>(state: Option<S>) -> S {
+  let Some(state) = state else {
+    panic!(
+      "lio consumer error: an operation that was already polled cannot be \
+       run through Io"
+    );
+  };
+  state
+}
+
+/// What an [`Io`] can run: lio's own [operations](crate::api::ops) and
+/// built-in [models](crate::model). Sealed.
+///
+/// A single operation is registered with the driver as it is. A model that
+/// takes several steps is polled. For a model of your own, use
+/// [`model::spawn`] or [`model::run`].
 pub trait Runnable: sealed::Sealed + Sized {
   /// What the operation produces.
   type Item;
@@ -97,29 +130,6 @@ pub trait Runnable: sealed::Sealed + Sized {
 
   #[doc(hidden)]
   fn run_future(self, lio: Lio) -> Self::Future;
-}
-
-impl<T: OpModel> sealed::Sealed for T {}
-
-impl<T: OpModel> Runnable for T {
-  type Item = <T as OpModel>::Item;
-  type Future = IoStreamFuture<T>;
-
-  #[inline]
-  fn run_callback<F>(self, lio: Lio, f: F)
-  where
-    F: Fn(Self::Item) + 'static,
-  {
-    // Over capacity, the operation waits in a queue (see `Lio::is_full`).
-    lio.schedule_or_queue(move |arena| {
-      Registration::new_callback_in::<T, F>(arena, f, self)
-    });
-  }
-
-  #[inline]
-  fn run_future(self, lio: Lio) -> Self::Future {
-    IoStreamFuture { state: IoStreamFutureState::Pending(self), lio }
-  }
 }
 
 impl<T> Io<T>
@@ -463,40 +473,16 @@ impl<T> Io<T> {
   }
 }
 
-impl<T: crate::model::Model> Io<T> {
-  /// Extracts the model from this Io, to run it inside another model.
-  ///
-  /// ```
-  /// use lio::api::resource::Resource;
-  /// use lio::model::Join;
-  ///
-  /// let (a, b) = (Resource::stdin(), Resource::stdout());
-  /// let both = Join::new(
-  ///   lio::io::copy(&a, &b).into_inner(),
-  ///   lio::io::copy(&b, &a).into_inner(),
-  /// );
-  /// ```
+impl<T> Io<T> {
+  /// The operation itself, to poll from a model of your own.
   pub fn into_inner(self) -> T {
     self.op
   }
-}
 
-impl<T: crate::api::op::OneshotOpModel> Io<T> {
-  /// Turns this operation into a [`Model`](crate::model::Model), to run it
-  /// inside another model.
-  ///
-  /// ```
-  /// use lio::api::resource::Resource;
-  /// use lio::model::Join;
-  ///
-  /// let file = Resource::stdin();
-  /// let both = Join::new(
-  ///   lio::api::read(&file, Vec::<u8>::with_capacity(64)).into_model(),
-  ///   lio::api::fsync(&file).into_model(),
-  /// );
-  /// ```
-  pub fn into_model(self) -> crate::model::Op<T> {
-    crate::model::Op::new(self.op)
+  /// Wraps the public type of an operation around its memory.
+  #[inline]
+  pub(crate) fn leaf<R: Into<T>>(raw: R) -> Self {
+    Self::from_op(raw.into())
   }
 }
 
@@ -517,11 +503,9 @@ where
 /// A future representing a single-shot StreamOp operation.
 ///
 /// Owns the channel receiver to get typed results.
-pub struct IoStreamFuture<T>
-where
-  T: OpModel,
-{
-  state: IoStreamFutureState<T>,
+/// The future of a single operation run through [`Io`].
+pub struct OpFuture<T: Runnable> {
+  state: OpFutureState<T>,
   lio: Lio,
 }
 
@@ -530,21 +514,22 @@ struct LocalFutureSlot<T> {
   waker: Option<std::task::Waker>,
 }
 
-enum IoStreamFutureState<T>
-where
-  T: OpModel,
-{
-  /// Not yet submitted.
+enum OpFutureState<T: Runnable> {
   Pending(T),
-  /// Submitted and awaiting completion.
   Inflight { id: u64, slot: Rc<RefCell<LocalFutureSlot<T::Item>>> },
-  /// Done.
   Done,
 }
 
-impl<T> Future for IoStreamFuture<T>
+impl<T: Runnable> OpFuture<T> {
+  pub(crate) fn new(op: T, lio: Lio) -> Self {
+    Self { state: OpFutureState::Pending(op), lio }
+  }
+}
+
+impl<T> Future for OpFuture<T>
 where
-  T: OpModel + Unpin,
+  T: sealed::Direct + Unpin,
+  T::Item: 'static,
 {
   type Output = T::Item;
 
@@ -554,12 +539,12 @@ where
   ) -> Poll<Self::Output> {
     let this = &mut *self;
 
-    match std::mem::replace(&mut this.state, IoStreamFutureState::Done) {
-      IoStreamFutureState::Pending(stream_op) => {
+    match std::mem::replace(&mut this.state, OpFutureState::Done) {
+      OpFutureState::Pending(op) => {
         if this.lio.is_full() {
           // Wait for a slot; the driver wakes us when one frees up.
           this.lio.wait_for_capacity(cx.waker());
-          this.state = IoStreamFutureState::Pending(stream_op);
+          this.state = OpFutureState::Pending(op);
           return Poll::Pending;
         }
         let slot = Rc::new(RefCell::new(LocalFutureSlot {
@@ -568,36 +553,24 @@ where
         }));
         let callback_slot = Rc::clone(&slot);
 
-        let scheduled = this.lio.schedule_with(move |arena| {
-          Registration::new_callback_in(
-            arena,
-            move |item| {
-              let waker = {
-                let mut slot = callback_slot.borrow_mut();
-                slot.item = Some(item);
-                slot.waker.take()
-              };
-              // Wake with the slot released: the waker may poll or drop
-              // this future inline, and both borrow the slot.
-              if let Some(waker) = waker {
-                waker.wake();
-              }
-            },
-            stream_op,
-          )
-        });
-        let id = match scheduled {
-          Ok(id) => id,
-          Err(err) => {
-            unreachable!("lio rejected an operation it had capacity for: {err}")
+        let id = op.start(&this.lio, move |item| {
+          let waker = {
+            let mut slot = callback_slot.borrow_mut();
+            slot.item = Some(item);
+            slot.waker.take()
+          };
+          // Wake with the slot released: the waker may poll or drop this
+          // future inline, and both borrow the slot.
+          if let Some(waker) = waker {
+            waker.wake();
           }
-        };
+        });
 
-        this.state = IoStreamFutureState::Inflight { id, slot };
+        this.state = OpFutureState::Inflight { id, slot };
         Poll::Pending
       }
 
-      IoStreamFutureState::Inflight { id, slot } => {
+      OpFutureState::Inflight { id, slot } => {
         let mut slot_ref = slot.borrow_mut();
         if let Some(item) = slot_ref.item.take() {
           Poll::Ready(item)
@@ -607,24 +580,21 @@ where
             _ => slot_ref.waker = Some(cx.waker().clone()),
           }
           drop(slot_ref);
-          this.state = IoStreamFutureState::Inflight { id, slot };
+          this.state = OpFutureState::Inflight { id, slot };
           Poll::Pending
         }
       }
 
-      IoStreamFutureState::Done => {
-        panic!("IoStreamFuture polled after completion");
+      OpFutureState::Done => {
+        panic!("OpFuture polled after completion");
       }
     }
   }
 }
 
-impl<T> Drop for IoStreamFuture<T>
-where
-  T: OpModel,
-{
+impl<T: Runnable> Drop for OpFuture<T> {
   fn drop(&mut self) {
-    if let IoStreamFutureState::Inflight { id, slot } = &self.state {
+    if let OpFutureState::Inflight { id, slot } = &self.state {
       // The callback shares the slot. Once the registration (and with it the
       // callback) is gone, `id` is stale: a later operation may reuse it.
       if Rc::strong_count(slot) == 1 {
@@ -641,39 +611,12 @@ where
 // IoStream - Async Stream for multi-item operations
 // ============================================================================
 
-/// An async stream that yields multiple items from an operation.
+/// A model that produces several items, consumed one at a time.
 ///
-/// Unlike [`Io`] which produces a single result, `IoStream` can yield
-/// multiple items over time. This is useful for operations like accepting
-/// connections from a listening socket or watching for file changes.
-///
-/// # Async Iterator Pattern
-///
-/// `IoStream` provides an async iterator interface via the `next()` method:
-///
-/// ```ignore
-/// use lio::{Lio, api};
-///
-/// async fn accept_connections(lio: &Lio) -> std::io::Result<()> {
-///     # use lio::api::resource::Resource;
-///     # let listener = Resource::stdin(); // placeholder
-///     let mut stream = api::accept_stream(&listener).with_lio(lio);
-///
-///     while let Some(result) = stream.next().await {
-///         let conn = result?;
-///         println!("Accepted connection from {}", conn.peer_addr()?);
-///         // Handle client...
-///     }
-///     Ok(())
-/// }
-/// ```
-///
-/// # Platform Differences
-///
-/// - **io_uring (Linux)**: Uses multishot operations where possible. A single
-///   submission can yield multiple completions without resubmission.
-/// - **kqueue/epoll**: Each completion triggers automatic resubmission of the
-///   operation to continue the stream.
+/// The model runs from the first [`next`](Self::next). Every
+/// [`Step::Yield`](crate::model::Step::Yield) is one item, a
+/// [`Step::Done`](crate::model::Step::Done) is the last, and after it `next`
+/// returns `None`. Dropping the stream stops the model.
 pub struct IoStream<T>
 where
   T: OpModel,
@@ -686,27 +629,14 @@ enum IoStreamState<T>
 where
   T: OpModel,
 {
-  /// Not yet submitted - waiting for first `next()` call.
   Pending(T),
-  /// Submitted and awaiting completion, on the driver resolved at submission:
-  /// `id` only means something there, even if the global `Lio` changes.
-  ///
-  /// Items land in `slot`, the same kind of slot a oneshot future uses, so a
-  /// polled stream does not allocate a channel.
-  Inflight { id: u64, slot: Rc<RefCell<StreamSlot<T::Item>>>, lio: Lio },
-  /// Stream is done, no more items.
+  Inflight { task: Task, slot: Rc<RefCell<StreamSlot<T::Item>>> },
   Done,
 }
 
-/// Where a polled stream's items wait for `next`.
-///
-/// `slot` is the oneshot future's slot. `queued` holds items that arrived
-/// before the consumer took `slot.item`, so a run that completes more than
-/// once does not drop them.
 struct StreamSlot<T> {
   slot: LocalFutureSlot<T>,
   queued: VecDeque<T>,
-  /// The registration has been dropped, so no further item will arrive.
   ended: bool,
 }
 
@@ -728,8 +658,8 @@ impl<T> StreamSlot<T> {
   }
 }
 
-/// Dropped with the stream's registration. Marks the slot ended and wakes a
-/// consumer that polled, found no item, and is waiting to hear that.
+/// Marks the stream ended when the model's item sink is dropped, which is
+/// when the model is.
 struct StreamEnd<T> {
   slot: Rc<RefCell<StreamSlot<T>>>,
 }
@@ -740,7 +670,7 @@ impl<T> Drop for StreamEnd<T> {
       let mut wait = self.slot.borrow_mut();
       wait.ended = true;
       // Queued items sit behind `slot.item`, so one waiting item means the
-      // consumer will see it on the next poll. The callback already woke.
+      // consumer will see it on the next poll. The sink already woke.
       if wait.slot.item.is_some() {
         return;
       }
@@ -754,9 +684,8 @@ impl<T> Drop for StreamEnd<T> {
 
 impl<T> IoStream<T>
 where
-  T: OpModel + Unpin,
+  T: OpModel + 'static,
 {
-  /// Creates a new `IoStream` from a streaming operation.
   pub fn from_op(op: T) -> Self {
     Self {
       state: IoStreamState::Pending(op),
@@ -764,38 +693,15 @@ where
     }
   }
 
-  /// Binds a Lio instance to this stream.
   pub fn with_lio(mut self, lio: &Lio) -> Self {
     self.handle = LioHandle::Custom(lio.clone());
     self
   }
 
-  /// Returns the next item from the stream.
-  ///
-  /// Returns `Some(item)` if the stream has more items, or `None` if the
-  /// stream is exhausted.
-  ///
-  /// # Example
-  ///
-  /// ```ignore
-  /// # use lio::{Lio, api};
-  /// # use lio::api::resource::Resource;
-  /// # async fn example(lio: &Lio, listener: &Resource) -> std::io::Result<()> {
-  /// let mut stream = api::accept_stream(listener).with_lio(lio);
-  /// while let Some(result) = stream.next().await {
-  ///     let conn = result?;
-  ///     println!("New connection from {}", conn.peer_addr()?);
-  /// }
-  /// # Ok(())
-  /// # }
-  /// ```
   pub async fn next(&mut self) -> Option<T::Item> {
     IoStreamNextFuture { stream: self }.await
   }
 
-  /// Convert the stream into a channel receiver.
-  ///
-  /// Dropping the receiver stops the operation at its next item.
   pub fn send(self) -> StreamReceiver<T::Item>
   where
     T::Item: Send,
@@ -805,10 +711,8 @@ where
     StreamReceiver { recv: receiver }
   }
 
-  /// Sends each stream item through a provided channel sender.
-  ///
-  /// The operation stops at the first item that cannot be delivered because
-  /// every receiver was dropped.
+  /// Sends every item through `sender`. The model stops once every receiver
+  /// of `sender` is dropped.
   pub fn send_with(mut self, sender: std_mpsc::Sender<T::Item>)
   where
     T::Item: Send,
@@ -826,20 +730,18 @@ where
       }
     };
 
-    // Over capacity, the operation waits in a queue (see `Lio::is_full`).
-    // It stops once every receiver of `sender` is dropped.
-    lio.schedule_or_queue(move |arena| {
-      Registration::new_sender_in(arena, sender, op)
-    });
+    // The handle is dropped: the model runs until it is done or nobody
+    // receives.
+    let _task =
+      model::spawn_while(&lio, op, move |item| sender.send(item).is_ok());
   }
 }
 
-/// Future for a single `next()` call on an IoStream.
 struct IoStreamNextFuture<'a, T: OpModel> {
   stream: &'a mut IoStream<T>,
 }
 
-impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
+impl<T: OpModel + 'static> Future for IoStreamNextFuture<'_, T> {
   type Output = Option<T::Item>;
 
   fn poll(
@@ -849,100 +751,72 @@ impl<T: OpModel + Unpin> Future for IoStreamNextFuture<'_, T> {
     let this = &mut *self;
     let stream = &mut *this.stream;
 
-    match std::mem::replace(&mut stream.state, IoStreamState::Done) {
-      IoStreamState::Pending(stream_op) => {
-        let lio = stream.handle.lio();
-        if lio.is_full() {
-          // Wait for a slot; the driver wakes us when one frees up.
-          lio.wait_for_capacity(cx.waker());
-          stream.state = IoStreamState::Pending(stream_op);
-          return Poll::Pending;
-        }
-        let slot = Rc::new(RefCell::new(StreamSlot {
-          slot: LocalFutureSlot { item: None, waker: Some(cx.waker().clone()) },
-          queued: VecDeque::new(),
-          ended: false,
-        }));
-        let callback_slot = Rc::clone(&slot);
-        // Owns a clone of the slot so dropping the registration, not the
-        // stream, is what marks the stream ended.
-        let end = StreamEnd { slot: Rc::clone(&slot) };
-
-        let scheduled = lio.schedule_with(move |arena| {
-          Registration::new_callback_in(
-            arena,
-            move |item| {
-              let _end = &end;
-              let waker = {
-                let mut wait = callback_slot.borrow_mut();
-                wait.push_item(item);
-                wait.slot.waker.take()
-              };
-              // Wake with the slot released: the waker may poll this stream
-              // inline, and that poll borrows the slot.
-              if let Some(waker) = waker {
-                waker.wake();
-              }
-            },
-            stream_op,
-          )
-        });
-        let id = match scheduled {
-          Ok(id) => id,
-          Err(err) => {
-            unreachable!("lio rejected an operation it had capacity for: {err}")
+    let (task, slot) =
+      match std::mem::replace(&mut stream.state, IoStreamState::Done) {
+        IoStreamState::Pending(op) => {
+          let lio = stream.handle.lio();
+          if lio.is_full() {
+            // Wait for a slot; the driver wakes us when one frees up.
+            lio.wait_for_capacity(cx.waker());
+            stream.state = IoStreamState::Pending(op);
+            return Poll::Pending;
           }
-        };
-        stream.state = IoStreamState::Inflight { id, slot, lio };
-        Poll::Pending
-      }
-
-      IoStreamState::Inflight { id, slot, lio } => {
-        let mut wait = slot.borrow_mut();
-        if let Some(item) = wait.pop_item() {
-          drop(wait);
-          stream.state = IoStreamState::Inflight { id, slot, lio };
-          Poll::Ready(Some(item))
-        } else if wait.ended {
-          drop(wait);
-          stream.state = IoStreamState::Done;
-          Poll::Ready(None)
-        } else {
-          match &wait.slot.waker {
-            Some(waker) if waker.will_wake(cx.waker()) => {}
-            _ => wait.slot.waker = Some(cx.waker().clone()),
-          }
-          drop(wait);
-          stream.state = IoStreamState::Inflight { id, slot, lio };
-          Poll::Pending
+          let slot = Rc::new(RefCell::new(StreamSlot {
+            slot: LocalFutureSlot { item: None, waker: None },
+            queued: VecDeque::new(),
+            ended: false,
+          }));
+          let sink = Rc::clone(&slot);
+          let end = StreamEnd { slot: Rc::clone(&slot) };
+          let task = model::spawn(&lio, op, move |item| {
+            let _end = &end;
+            let waker = {
+              let mut wait = sink.borrow_mut();
+              wait.push_item(item);
+              wait.slot.waker.take()
+            };
+            // Wake with the slot released: the waker may poll this stream
+            // inline, and that poll borrows the slot.
+            if let Some(waker) = waker {
+              waker.wake();
+            }
+          });
+          // The model may have produced items, or finished, already.
+          (task, slot)
         }
-      }
+        IoStreamState::Inflight { task, slot } => (task, slot),
+        IoStreamState::Done => return Poll::Ready(None),
+      };
 
-      IoStreamState::Done => Poll::Ready(None),
+    let mut wait = slot.borrow_mut();
+    if let Some(item) = wait.pop_item() {
+      drop(wait);
+      stream.state = IoStreamState::Inflight { task, slot };
+      Poll::Ready(Some(item))
+    } else if wait.ended {
+      Poll::Ready(None)
+    } else {
+      match &wait.slot.waker {
+        Some(waker) if waker.will_wake(cx.waker()) => {}
+        _ => wait.slot.waker = Some(cx.waker().clone()),
+      }
+      drop(wait);
+      stream.state = IoStreamState::Inflight { task, slot };
+      Poll::Pending
     }
   }
 }
 
-/// Drop impl to cancel inflight multishot operations.
 impl<T: OpModel> Drop for IoStream<T> {
   fn drop(&mut self) {
-    // If the stream is inflight, cancel the operation
-    if let IoStreamState::Inflight { id, slot, lio } = &self.state {
-      // The callback shares the slot. Once the registration (and with it the
-      // callback) is gone, `id` is stale: a later operation may reuse it.
-      if Rc::strong_count(slot) == 1 {
-        return;
-      }
-      // The operation may still complete; nobody is left to wake then.
+    if let IoStreamState::Inflight { task, slot } = &self.state {
+      // Nobody is left to wake.
       slot.borrow_mut().slot.waker = None;
-      lio.cancel_stream(*id);
+      task.stop();
     }
   }
 }
 
-/// A receiver for streaming operation items.
-///
-/// Receives items from a streaming operation via a channel.
 pub struct StreamReceiver<T> {
   recv: std_mpsc::Receiver<T>,
 }
@@ -976,8 +850,9 @@ impl<T> StreamReceiver<T> {
 mod tests {
   use super::*;
   use crate::api;
-  use crate::api::op::{Action, Completion, OpResult, StreamOpModel};
+  use crate::api::ops;
   use crate::backend::testing::ScriptedBackend;
+  use crate::model::{Cx, Step};
   use std::sync::Arc;
   use std::sync::atomic::{AtomicUsize, Ordering};
   use std::task::{RawWaker, RawWakerVTable, Waker};
@@ -1035,7 +910,7 @@ mod tests {
   }
 
   #[test]
-  #[should_panic(expected = "IoStreamFuture polled after completion")]
+  #[should_panic(expected = "OpFuture polled after completion")]
   fn test_io_future_panics_when_polled_after_completion() {
     let lio = Lio::new(64).unwrap();
     let io = test_io(&lio);
@@ -1065,21 +940,21 @@ mod tests {
     let mut future = io.into_future();
 
     // Initial state is Pending
-    assert!(matches!(future.state, IoStreamFutureState::Pending(_)));
+    assert!(matches!(future.state, OpFutureState::Pending(_)));
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
     // After first poll, state is Inflight
     let _ = Pin::new(&mut future).poll(&mut cx);
-    assert!(matches!(future.state, IoStreamFutureState::Inflight { .. }));
+    assert!(matches!(future.state, OpFutureState::Inflight { .. }));
 
     // Complete the operation
     run_until_done(&lio);
 
     // After completion poll, state is Done
     let _ = Pin::new(&mut future).poll(&mut cx);
-    assert!(matches!(future.state, IoStreamFutureState::Done));
+    assert!(matches!(future.state, OpFutureState::Done));
   }
 
   #[test]
@@ -1100,7 +975,7 @@ mod tests {
     assert!(poll2.is_pending());
 
     // State should still be Inflight
-    assert!(matches!(future.state, IoStreamFutureState::Inflight { .. }));
+    assert!(matches!(future.state, OpFutureState::Inflight { .. }));
 
     // Now complete and verify
     run_until_done(&lio);
@@ -1268,28 +1143,34 @@ mod tests {
     assert!(result.is_some_and(|result| result.is_ok()));
   }
 
-  /// Yields 1 and 2, then finishes with 3.
-  struct Counter(u32);
+  /// Yields 1 and 2, then finishes with 3, one nop before each.
+  struct Counter(u32, ops::Nop);
+
+  impl Counter {
+    fn new() -> Self {
+      Self(0, api::nop().into_inner())
+    }
+  }
 
   impl OpModel for Counter {
     type Item = u32;
 
-    fn action(&mut self) -> Action<'_> {
-      action_io!(crate::backend::op::Op::Nop)
-    }
-
-    fn complete(&mut self, _: Completion) -> OpResult<u32> {
+    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<u32> {
+      let _ = crate::ready!(self.1.poll(cx));
       self.0 += 1;
-      if self.0 < 3 { OpResult::Yield(self.0) } else { OpResult::Done(self.0) }
+      if self.0 < 3 {
+        self.1 = api::nop().into_inner();
+        Step::Yield(self.0)
+      } else {
+        Step::Done(self.0)
+      }
     }
   }
-
-  impl StreamOpModel for Counter {}
 
   #[test]
   fn stream_receiver_iterates_every_item_until_the_stream_ends() {
     let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 1).unwrap();
-    let receiver = IoStream::from_op(Counter(0)).with_lio(&lio).send();
+    let receiver = IoStream::from_op(Counter::new()).with_lio(&lio).send();
     for _ in 0..3 {
       lio.try_run().unwrap();
     }
@@ -1299,7 +1180,7 @@ mod tests {
   #[test]
   fn a_stream_wakes_the_waker_it_was_last_polled_with() {
     let (backend, lio) = scripted(1);
-    let mut stream = IoStream::from_op(Counter(0)).with_lio(&lio);
+    let mut stream = IoStream::from_op(Counter::new()).with_lio(&lio);
     let mut next = Box::pin(stream.next());
     let (first, second) = (Arc::default(), Arc::default());
     let a = counting_waker(&first);
@@ -1318,7 +1199,7 @@ mod tests {
   #[test]
   fn a_stream_polled_again_with_the_same_waker_keeps_it() {
     let (_backend, lio) = scripted(1);
-    let mut stream = IoStream::from_op(Counter(0)).with_lio(&lio);
+    let mut stream = IoStream::from_op(Counter::new()).with_lio(&lio);
     let mut next = Box::pin(stream.next());
     let counts = Arc::default();
     let waker = counting_waker(&counts);
@@ -1333,31 +1214,35 @@ mod tests {
     );
   }
 
-  /// Takes a step without an item, then finishes with 7.
-  struct AgainThenDone(bool);
+  /// Takes a step without an item (unless that is already done), then
+  /// finishes with 7.
+  struct AgainThenDone(bool, ops::Nop);
+
+  impl AgainThenDone {
+    fn new(stepped: bool) -> Self {
+      Self(stepped, api::nop().into_inner())
+    }
+  }
 
   impl OpModel for AgainThenDone {
     type Item = u32;
 
-    fn action(&mut self) -> Action<'_> {
-      action_io!(crate::backend::op::Op::Nop)
-    }
-
-    fn complete(&mut self, _: Completion) -> OpResult<u32> {
-      if std::mem::replace(&mut self.0, true) {
-        OpResult::Done(7)
-      } else {
-        OpResult::Again
+    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<u32> {
+      loop {
+        let _ = crate::ready!(self.1.poll(cx));
+        if std::mem::replace(&mut self.0, true) {
+          return Step::Done(7);
+        }
+        self.1 = api::nop().into_inner();
       }
     }
   }
 
-  impl StreamOpModel for AgainThenDone {}
-
   #[test]
   fn a_stream_step_without_an_item_keeps_the_waker_for_the_next() {
     let (backend, lio) = scripted(1);
-    let mut stream = IoStream::from_op(AgainThenDone(false)).with_lio(&lio);
+    let mut stream =
+      IoStream::from_op(AgainThenDone::new(false)).with_lio(&lio);
     let mut next = Box::pin(stream.next());
     let counts = Arc::default();
     let waker = counting_waker(&counts);
@@ -1403,7 +1288,7 @@ mod tests {
     let (backend, lio) = scripted(1);
     let counts = Arc::default();
     let inline = Arc::new(InlineNext {
-      stream: IoStream::from_op(AgainThenDone(true)).with_lio(&lio).into(),
+      stream: IoStream::from_op(AgainThenDone::new(true)).with_lio(&lio).into(),
       items: Default::default(),
       next: counting_waker(&counts),
     });
@@ -1428,7 +1313,7 @@ mod tests {
   #[test]
   fn a_stream_keeps_items_that_arrive_before_they_are_polled() {
     let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 1).unwrap();
-    let mut stream = IoStream::from_op(Counter(0)).with_lio(&lio);
+    let mut stream = IoStream::from_op(Counter::new()).with_lio(&lio);
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     assert!(Box::pin(stream.next()).as_mut().poll(&mut cx).is_pending());

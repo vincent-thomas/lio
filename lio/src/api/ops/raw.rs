@@ -1,0 +1,2322 @@
+//! What each operation submits and how its result is read.
+//!
+//! Every type here owns the memory one operation uses. `action` builds the
+//! [`Op`] a backend executes from it, and `complete` turns what the backend
+//! reported into the operation's result. The driver calls the two, in that
+//! order, once each. The public operation types in [`super`] wrap these.
+
+use std::ffi::{CString, OsString};
+use std::io;
+use std::mem;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::ptr::{self, NonNull};
+use std::time::Duration;
+
+use crate::{
+  BufResult, IoBufMutVec, IoBufVec, IoSlicesMut,
+  api::{
+    op::{Action, Completion, CompletionFlags},
+    resource::Resource,
+  },
+  backend::op::{
+    FileMode, FileStat, MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, OpenFlags,
+    RawBuf, ReadDirBuf, ReadFlags, RecvFlags, SendFlags, ShutdownHow,
+    SockDomain, SockProto, SockType, SocketAddrBuf, SocketAddrFamily,
+    StatTarget, UnlinkKind, WriteFlags, is_valid_file_offset,
+    socket_addr_from_buf, socket_addr_into_buf,
+  },
+  buf::MAX_IOV_COUNT,
+};
+#[cfg(test)]
+use lio_test::{ContractKind, ContractStep, OpModelContract};
+
+/// Flags for contract tests: op models pass flags through untouched.
+#[cfg(test)]
+const TEST_RECV_FLAGS: RecvFlags = RecvFlags::PEEK;
+#[cfg(test)]
+const TEST_SEND_FLAGS: SendFlags = SendFlags::OOB;
+
+fn os_string_from_bytes(bytes: &[u8]) -> OsString {
+  #[cfg(unix)]
+  {
+    use std::os::unix::ffi::OsStringExt;
+    OsString::from_vec(bytes.to_vec())
+  }
+  #[cfg(not(unix))]
+  {
+    OsString::from(String::from_utf8_lossy(bytes).into_owned())
+  }
+}
+
+fn cstring_to_osstring(path: &CString) -> OsString {
+  #[cfg(unix)]
+  {
+    use std::os::unix::ffi::OsStringExt;
+    OsString::from_vec(path.as_bytes().to_vec())
+  }
+  #[cfg(not(unix))]
+  {
+    OsString::from(path.to_string_lossy().as_ref())
+  }
+}
+#[cfg(test)]
+macro_rules! impl_op_model_contract_runtime {
+  ($item:ty) => {
+    type Action = crate::api::op::Action<'static>;
+    type Completion = Completion;
+    type Result = $item;
+
+    fn action(&mut self) -> Self::Action {
+      let action = Self::action(self);
+      // SAFETY: the contract inspects this action while `self` is still
+      // borrowed and never submits it past that borrow.
+      unsafe { action.erase_lifetime() }
+    }
+
+    fn complete(&mut self, completion: Self::Completion) -> Self::Result {
+      Self::complete(self, completion)
+    }
+
+    // An operation is one step: its completion is its result.
+    fn is_again(_: &Self::Result) -> bool {
+      false
+    }
+
+    fn is_yield(_: &Self::Result) -> bool {
+      false
+    }
+
+    fn is_done(_: &Self::Result) -> bool {
+      true
+    }
+  };
+}
+
+pub use crate::backend::op::LinkKind;
+
+#[cfg(test)]
+type TwoVecBufResult = BufResult<usize, (Vec<u8>, Vec<u8>)>;
+// ============================================================================
+// Socket
+// ============================================================================
+
+pub struct Socket {
+  domain: SockDomain,
+  ty: SockType,
+  proto: SockProto,
+}
+
+impl Socket {
+  pub(crate) fn new(
+    domain: SockDomain,
+    ty: SockType,
+    proto: SockProto,
+  ) -> Self {
+    Self { domain, ty, proto }
+  }
+}
+
+impl Socket {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Socket {
+      domain: self.domain,
+      ty: self.ty,
+      proto: self.proto,
+    })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> io::Result<Resource> {
+    // SAFETY: a successful socket completion carries a new owned socket.
+    unsafe { Resource::from_completion(&completion) }
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Socket {
+  impl_op_model_contract_runtime!(io::Result<Resource>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(SockDomain::IPV4, SockType::STREAM, SockProto::TCP)
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| {
+        matches!(
+          action.as_op(),
+          Some(Op::Socket {
+            domain: SockDomain::IPV4,
+            ty: SockType::STREAM,
+            proto: SockProto::TCP,
+          })
+        )
+      },
+      #[cfg(unix)]
+      // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
+      Completion::new(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
+      #[cfg(windows)]
+      Completion::new({
+        use std::os::windows::io::IntoRawSocket;
+        // A fresh owned socket for the resulting `Resource` to take over.
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into_raw_socket()
+          as isize
+      }),
+      |result: &io::Result<Resource>| result.is_ok(),
+    )]
+  }
+}
+
+// ============================================================================
+// Accept
+// ============================================================================
+
+pub struct Accept {
+  res: Resource,
+  addr: SocketAddrBuf,
+}
+
+impl Accept {
+  pub(crate) fn new(res: Resource) -> Self {
+    Self { res, addr: SocketAddrBuf::unspecified() }
+  }
+
+  #[cfg(test)]
+  fn stage_peer_addr(&mut self, addr: SocketAddr) {
+    use crate::backend::op::socket_addr_into_buf;
+
+    self.addr = socket_addr_into_buf(addr);
+  }
+}
+
+impl Accept {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Accept {
+      fd: self.res.clone(),
+      addr: NonNull::from(&mut self.addr),
+    })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> io::Result<(Resource, SocketAddr)> {
+    let resource = self.complete_resource(completion)?;
+
+    let addr = match socket_addr_from_buf(&self.addr) {
+      Ok(addr) => addr,
+      Err(_) => {
+        return Err(io::Error::new(
+          io::ErrorKind::Unsupported,
+          "not an IP socket address; use `accept_unix` for UNIX listeners",
+        ));
+      }
+    };
+
+    Ok((resource, addr))
+  }
+}
+
+impl Accept {
+  /// Takes ownership of the accepted socket without decoding the peer address.
+  pub(crate) fn complete_resource(
+    &mut self,
+    completion: Completion,
+  ) -> io::Result<Resource> {
+    // SAFETY: a successful accept completion carries a new owned socket.
+    unsafe { Resource::from_completion(&completion) }
+  }
+}
+
+// ============================================================================
+// AcceptUnix
+// ============================================================================
+
+/// The address of a UNIX-domain socket: a filesystem path, or unnamed.
+///
+/// A client that connects without binding first is unnamed, so that is what
+/// [`accept_unix`](crate::api::accept_unix) usually reports for the peer.
+/// Linux abstract-namespace addresses are reported as unnamed too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnixAddr {
+  path: Option<PathBuf>,
+}
+
+impl UnixAddr {
+  /// The filesystem path, or `None` if the address is unnamed.
+  pub fn as_pathname(&self) -> Option<&Path> {
+    self.path.as_deref()
+  }
+
+  /// Whether the socket has no filesystem path.
+  pub fn is_unnamed(&self) -> bool {
+    self.path.is_none()
+  }
+
+  /// Decodes an address a backend reported. A backend that reported none is
+  /// treated as unnamed; an IP address is an error.
+  pub(crate) fn from_buf(buf: &SocketAddrBuf) -> io::Result<Self> {
+    match buf.family {
+      SocketAddrFamily::Unix => {
+        let len = (buf.unix_path_len as usize).min(buf.unix_path.len());
+        let bytes = &buf.unix_path[..len];
+        // The kernel may count the terminating NUL; an abstract address
+        // starts with one.
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let path =
+          (end > 0).then(|| PathBuf::from(os_string_from_bytes(&bytes[..end])));
+        Ok(Self { path })
+      }
+      SocketAddrFamily::Unspecified => Ok(Self { path: None }),
+      SocketAddrFamily::Ipv4 | SocketAddrFamily::Ipv6 => Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "not a UNIX socket address; use `accept` for IP listeners",
+      )),
+    }
+  }
+}
+
+/// [`Accept`] on a UNIX-domain listener, reporting the peer's [`UnixAddr`].
+pub struct AcceptUnix {
+  inner: Accept,
+}
+
+impl AcceptUnix {
+  pub(crate) fn new(res: Resource) -> Self {
+    Self { inner: Accept::new(res) }
+  }
+}
+
+impl AcceptUnix {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    self.inner.action()
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> io::Result<(Resource, UnixAddr)> {
+    let resource = self.inner.complete_resource(completion)?;
+    UnixAddr::from_buf(&self.inner.addr).map(|addr| (resource, addr))
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for AcceptUnix {
+  impl_op_model_contract_runtime!(io::Result<(Resource, UnixAddr)>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::stdin())
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Accept { .. }))
+      },
+      |model| {
+        model.inner.addr =
+          crate::backend::op::unix_socket_addr_buf(b"/tmp/peer.sock").unwrap();
+      },
+      #[cfg(unix)]
+      // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
+      Completion::new(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
+      #[cfg(windows)]
+      Completion::new({
+        use std::os::windows::io::IntoRawSocket;
+        // A fresh owned socket for the resulting `Resource` to take over.
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into_raw_socket()
+          as isize
+      }),
+      |result| {
+        matches!(
+          result,
+          Ok((_res, addr))
+            if addr.as_pathname() == Some(Path::new("/tmp/peer.sock"))
+        )
+      },
+    )]
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Accept {
+  impl_op_model_contract_runtime!(io::Result<(Resource, SocketAddr)>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::stdin())
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Accept { .. }))
+      },
+      |model| model.stage_peer_addr("127.0.0.1:8080".parse().unwrap()),
+      #[cfg(unix)]
+      // SAFETY: duplicating stdin in this test fixture yields a fresh owned fd.
+      Completion::new(unsafe { libc::dup(libc::STDIN_FILENO) as isize }),
+      #[cfg(windows)]
+      Completion::new({
+        use std::os::windows::io::IntoRawSocket;
+        // A fresh owned socket for the resulting `Resource` to take over.
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into_raw_socket()
+          as isize
+      }),
+      |result| {
+        matches!(
+          result,
+          Ok((_res, addr))
+            if *addr == "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
+        )
+      },
+    )]
+  }
+}
+//
+// ============================================================================
+// Connect
+// ============================================================================
+
+pub struct Connect {
+  res: Resource,
+  addr: SocketAddrBuf,
+}
+
+impl Connect {
+  pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {
+    Self::from_buf(res, socket_addr_into_buf(addr))
+  }
+
+  pub(crate) fn from_buf(res: Resource, addr: SocketAddrBuf) -> Self {
+    Self { res, addr }
+  }
+}
+
+impl Connect {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Connect { fd: self.res.clone(), addr: self.addr })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> std::io::Result<()> {
+    if completion.result() < 0 { Err(completion.os_error()) } else { Ok(()) }
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Connect {
+  impl_op_model_contract_runtime!(std::io::Result<()>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::stdin(), "127.0.0.1:8080".parse().unwrap())
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Connect { .. }))
+      },
+      Completion::new(0),
+      |result| matches!(result, Ok(())),
+    )]
+  }
+}
+
+// ============================================================================
+// Bind
+// ============================================================================
+
+pub struct Bind {
+  res: Resource,
+  addr: SocketAddrBuf,
+}
+
+impl Bind {
+  pub(crate) fn new(res: Resource, addr: SocketAddr) -> Self {
+    Self::from_buf(res, socket_addr_into_buf(addr))
+  }
+
+  pub(crate) fn from_buf(res: Resource, addr: SocketAddrBuf) -> Self {
+    Self { res, addr }
+  }
+}
+
+impl Bind {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Bind { fd: self.res.clone(), addr: self.addr })
+  }
+
+  pub(crate) fn complete(&mut self, completion: Completion) -> io::Result<()> {
+    if completion.result() < 0 { Err(completion.os_error()) } else { Ok(()) }
+  }
+}
+
+// ============================================================================
+// Listen
+// ============================================================================
+
+pub struct Listen {
+  res: Resource,
+  backlog: i32,
+}
+
+impl Listen {
+  pub(crate) fn new(res: Resource, backlog: i32) -> Self {
+    Self { res, backlog }
+  }
+}
+
+impl Listen {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Listen { fd: self.res.clone(), backlog: self.backlog })
+  }
+
+  pub(crate) fn complete(&mut self, completion: Completion) -> io::Result<()> {
+    if completion.result() < 0 { Err(completion.os_error()) } else { Ok(()) }
+  }
+}
+
+// ============================================================================
+// Shutdown
+// ============================================================================
+
+pub struct Shutdown {
+  res: Resource,
+  how: ShutdownHow,
+}
+
+impl Shutdown {
+  pub(crate) fn new(res: Resource, how: ShutdownHow) -> Self {
+    Self { res, how }
+  }
+}
+
+impl Shutdown {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Shutdown { fd: self.res.clone(), how: self.how })
+  }
+
+  pub(crate) fn complete(&mut self, completion: Completion) -> io::Result<()> {
+    if completion.result() < 0 { Err(completion.os_error()) } else { Ok(()) }
+  }
+}
+
+// ============================================================================
+// Fsync
+// ============================================================================
+
+pub struct Fsync {
+  res: Resource,
+}
+
+impl Fsync {
+  pub(crate) fn new(res: Resource) -> Self {
+    Self { res }
+  }
+}
+
+impl Fsync {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Fsync { fd: self.res.clone() })
+  }
+
+  pub(crate) fn complete(&mut self, completion: Completion) -> io::Result<()> {
+    if completion.result() < 0 { Err(completion.os_error()) } else { Ok(()) }
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Fsync {
+  impl_op_model_contract_runtime!(io::Result<()>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::stdout())
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Fsync { .. }))
+      },
+      Completion::new(0),
+      |result| matches!(result, Ok(())),
+    )]
+  }
+}
+
+// ============================================================================
+// Nop
+// ============================================================================
+
+pub struct Nop;
+
+impl Nop {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Nop)
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> std::io::Result<()> {
+    // A nop cancelled before it ran completes with an error (`-ECANCELED`).
+    if completion.result() < 0 { Err(completion.os_error()) } else { Ok(()) }
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Nop {
+  impl_op_model_contract_runtime!(std::io::Result<()>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| matches!(action.as_op(), Some(Op::Nop)),
+      Completion::new(0),
+      |result| matches!(result, Ok(())),
+    )]
+  }
+}
+
+/// Lowers the writable regions of `buf` into `out` with `to_raw`, returning
+/// how many there are.
+///
+/// The regions stay valid in place for as long as the caller leaves `buf`
+/// untouched.
+fn collect_regions<B: IoBufMutVec, T>(
+  buf: &mut B,
+  out: &mut [T; MAX_IOV_COUNT],
+  mut to_raw: impl FnMut(NonNull<u8>, usize) -> T,
+) -> usize {
+  let mut regions = IoSlicesMut::new();
+  buf.bufs_mut(&mut regions);
+  let count = regions.len();
+  for (slot, region) in out.iter_mut().zip(regions) {
+    let len = region.len();
+    *slot = to_raw(NonNull::from(region).cast(), len);
+  }
+  count
+}
+
+#[cfg(test)]
+fn stage_into<B: IoBufMutVec>(buf: &mut B, bytes: &[u8]) {
+  let mut regions = IoSlicesMut::new();
+  buf.bufs_mut(&mut regions);
+  let mut copied = 0usize;
+
+  for region in regions {
+    let n = (bytes.len() - copied).min(region.len());
+    for (dst, src) in region.iter_mut().zip(&bytes[copied..copied + n]) {
+      dst.write(*src);
+    }
+    copied += n;
+    if copied == bytes.len() {
+      break;
+    }
+  }
+
+  assert_eq!(copied, bytes.len(), "staged bytes exceed total buffer capacity");
+}
+
+/// The buffer an op holds from construction until `complete` hands it back.
+///
+/// The driver completes an op at most once and never asks it for an action
+/// afterwards, so the buffer is always there when this is called.
+fn held<T>(buf: Option<T>) -> T {
+  let Some(buf) = buf else {
+    unreachable!("buffer not available: the op was already completed");
+  };
+  buf
+}
+
+/// The error for a file offset past [`MAX_FILE_OFFSET`], which no kernel can
+/// address.
+///
+/// [`MAX_FILE_OFFSET`]: crate::backend::op::MAX_FILE_OFFSET
+fn offset_out_of_range_error() -> io::Error {
+  io::Error::new(
+    io::ErrorKind::InvalidInput,
+    "file offset exceeds the largest offset the OS supports (i64::MAX)",
+  )
+}
+
+// ============================================================================
+// Read
+// ============================================================================
+
+pub struct Read<B: IoBufMutVec> {
+  res: Resource,
+  buf: Option<B>,
+  raws: [crate::backend::op::RawBufMut<'static>; MAX_IOV_COUNT],
+  iov_count: usize,
+  offset: Option<u64>,
+}
+
+impl<B: IoBufMutVec> Read<B> {
+  /// Reads at `offset`, or from the current position when `None`.
+  ///
+  /// An offset past [`MAX_FILE_OFFSET`] submits no read and completes with
+  /// `InvalidInput`.
+  ///
+  /// [`MAX_FILE_OFFSET`]: crate::backend::op::MAX_FILE_OFFSET
+  pub(crate) fn new(res: Resource, buf: B, offset: Option<u64>) -> Self {
+    Self {
+      res,
+      buf: Some(buf),
+      // SAFETY: `RawBufMut` is a plain pointer/length pair and is immediately
+      // overwritten before submission.
+      raws: unsafe { mem::zeroed() },
+      iov_count: 0,
+      offset,
+    }
+  }
+
+  #[cfg(test)]
+  fn stage_read_data(&mut self, bytes: &[u8]) {
+    stage_into(held(self.buf.as_mut()), bytes);
+  }
+}
+
+impl<B: IoBufMutVec> Read<B> {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    if !is_valid_file_offset(self.offset) {
+      return action_io!(Op::Nop);
+    }
+    let buf = held(self.buf.as_mut());
+    self.iov_count = collect_regions(buf, &mut self.raws, |ptr, len| {
+      // SAFETY: the region is model-owned storage that stays valid in place
+      // until `complete()` consumes the buffer.
+      unsafe {
+        crate::backend::op::RawBufMut::from_raw_parts(ptr.as_ptr(), len)
+      }
+    });
+
+    action_io!(Op::Read {
+      fd: self.res.clone(),
+      iovecs: NonNull::from(&mut self.raws).cast(),
+      iov_count: self.iov_count,
+      offset: self.offset,
+      flags: ReadFlags::empty(),
+    })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> BufResult<usize, B> {
+    let mut buf = held(self.buf.take());
+
+    let result = if !is_valid_file_offset(self.offset) {
+      Err(offset_out_of_range_error())
+    } else if completion.result() < 0 {
+      Err(completion.os_error())
+    } else {
+      let mut remaining = completion.result() as usize;
+      for (i, raw) in self.raws.iter().take(self.iov_count).enumerate() {
+        let cap = raw.len;
+        let len = remaining.min(cap);
+        // The kernel filled the regions submitted in `action()` in order, so
+        // the first `len <= cap` bytes of region `i` are initialized.
+        buf.commit(i, crate::Initialized::new(raw.ptr, cap, len));
+        remaining = remaining.saturating_sub(cap);
+      }
+      Ok(completion.result() as usize)
+    };
+
+    (result, buf)
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Read<Vec<u8>> {
+  impl_op_model_contract_runtime!(BufResult<usize, Vec<u8>>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::stdin(), vec![0u8; 8], None)
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Read {
+            iov_count: 1,
+            offset: None,
+            flags,
+            ..
+          }) if flags.is_empty()
+        )
+      },
+      |model| model.stage_read_data(b"ping"),
+      Completion::new(4),
+      |result| {
+        matches!(
+          result,
+          (Ok(4), buf) if buf.as_slice() == b"ping"
+        )
+      },
+    )]
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Read<(Vec<u8>, Vec<u8>)> {
+  impl_op_model_contract_runtime!(BufResult<usize, (Vec<u8>, Vec<u8>)>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::stdin(), (vec![0u8; 3], vec![0u8; 5]), None)
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Read {
+            iov_count: 2,
+            offset: None,
+            flags,
+            ..
+          }) if flags.is_empty()
+        )
+      },
+      |model| model.stage_read_data(b"abcde"),
+      Completion::new(5),
+      |result: &TwoVecBufResult| match result {
+        (Ok(5), (a, b)) => a.as_slice() == b"abc" && b.as_slice() == b"de",
+        _ => false,
+      },
+    )]
+  }
+}
+
+// ============================================================================
+// Write
+// ============================================================================
+
+pub struct Write<B: IoBufVec + std::marker::Send + Sync> {
+  res: Resource,
+  buf: Option<B>,
+  raws: [RawBuf<'static>; MAX_IOV_COUNT],
+  offset: Option<u64>,
+}
+
+impl<B: IoBufVec + std::marker::Send + Sync> Write<B> {
+  /// Writes at `offset`, or at the current position when `None`.
+  ///
+  /// An offset past [`MAX_FILE_OFFSET`] submits no write and completes with
+  /// `InvalidInput`.
+  ///
+  /// [`MAX_FILE_OFFSET`]: crate::backend::op::MAX_FILE_OFFSET
+  pub(crate) fn new(res: Resource, buf: B, offset: Option<u64>) -> Self {
+    Self {
+      res,
+      buf: Some(buf),
+      // SAFETY: `RawBuf` is a plain pointer/length pair and is immediately
+      // overwritten before submission.
+      raws: unsafe { mem::zeroed() },
+      offset,
+    }
+  }
+}
+
+impl<B: IoBufVec + std::marker::Send + Sync + 'static> Write<B> {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    if !is_valid_file_offset(self.offset) {
+      return action_io!(Op::Nop);
+    }
+    let buf = held(self.buf.as_ref());
+    let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
+
+    for (raw, i) in self.raws.iter_mut().zip(0..buf_count) {
+      let bytes = buf.buf(i);
+      // SAFETY: `bytes` addresses model-owned storage that stays in place
+      // until `complete` consumes the buffer.
+      *raw = unsafe {
+        RawBuf::from_raw_parts(bytes.as_ptr().cast_mut(), bytes.len())
+      };
+    }
+
+    action_io!(Op::Write {
+      fd: self.res.clone(),
+      iovecs: NonNull::from(&mut self.raws).cast(),
+      iov_count: buf_count,
+      offset: self.offset,
+      flags: WriteFlags::empty(),
+    })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> BufResult<usize, B> {
+    let buf = held(self.buf.take());
+    let result = if !is_valid_file_offset(self.offset) {
+      Err(offset_out_of_range_error())
+    } else if completion.result() < 0 {
+      Err(completion.os_error())
+    } else {
+      Ok(completion.result() as usize)
+    };
+    (result, buf)
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Write<Vec<u8>> {
+  impl_op_model_contract_runtime!(BufResult<usize, Vec<u8>>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::stdin(), b"pong".to_vec(), None)
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Write {
+            iov_count: 1,
+            offset: None,
+            flags,
+            ..
+          }) if flags.is_empty()
+        )
+      },
+      Completion::new(4),
+      |result: &BufResult<usize, Vec<u8>>| match result {
+        (Ok(4), buf) => buf.as_slice() == b"pong",
+        _ => false,
+      },
+    )]
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Write<(Vec<u8>, Vec<u8>)> {
+  impl_op_model_contract_runtime!(BufResult<usize, (Vec<u8>, Vec<u8>)>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::stdin(), (b"ab".to_vec(), b"cde".to_vec()), None)
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Write {
+            iov_count: 2,
+            offset: None,
+            flags,
+            ..
+          }) if flags.is_empty()
+        )
+      },
+      Completion::new(5),
+      |result: &TwoVecBufResult| match result {
+        (Ok(5), (a, b)) => a.as_slice() == b"ab" && b.as_slice() == b"cde",
+        _ => false,
+      },
+    )]
+  }
+}
+
+// ============================================================================
+// Recv
+// ============================================================================
+
+struct RecvCore<B: IoBufMutVec + std::marker::Send + Sync> {
+  res: Resource,
+  buf: Option<B>,
+  bufs: [MsgBufMut; MAX_IOV_COUNT],
+  iov_count: usize,
+  flags: RecvFlags,
+  from: Option<SocketAddrBuf>,
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> RecvCore<B> {
+  fn new(
+    res: Resource,
+    buf: B,
+    flags: Option<RecvFlags>,
+    with_from: bool,
+  ) -> Self {
+    Self {
+      res,
+      buf: Some(buf),
+      // SAFETY: a dangling pointer with zero length is a placeholder until
+      // `action()` installs real buffer slices.
+      bufs: [unsafe { MsgBufMut::from_raw_parts(NonNull::dangling(), 0) };
+        MAX_IOV_COUNT],
+      iov_count: 0,
+      flags: flags.unwrap_or(RecvFlags::empty()),
+      from: with_from.then(SocketAddrBuf::unspecified),
+    }
+  }
+
+  fn action(&mut self) -> Action<'_> {
+    let buf = held(self.buf.as_mut());
+    let buf_count = collect_regions(buf, &mut self.bufs, |ptr, len| {
+      // SAFETY: the region is model-owned storage that stays valid in place
+      // until `complete_buf()` consumes the buffer.
+      unsafe { MsgBufMut::from_raw_parts(ptr, len) }
+    });
+    self.iov_count = buf_count;
+    // The contract takes at least one region: an empty collection receives
+    // into the zero-length placeholder, as `recvmsg` would with no iovecs.
+    let regions = &self.bufs[..buf_count.max(1)];
+
+    let msg = match self.from.as_mut() {
+      Some(addr) => MsgRecv::with_from(regions, NonNull::from(addr)),
+      None => MsgRecv::new(regions),
+    };
+
+    action_io!(Op::Recv { fd: self.res.clone(), msg, flags: self.flags })
+  }
+
+  fn complete_buf(
+    &mut self,
+    completion: Completion,
+  ) -> (std::io::Result<usize>, B) {
+    let mut buf = held(self.buf.take());
+
+    let result = if completion.result() < 0 {
+      Err(completion.os_error())
+    } else {
+      let mut remaining = completion.result() as usize;
+      for (i, region) in self.bufs.iter().take(self.iov_count).enumerate() {
+        let cap = region.len;
+        let len = remaining.min(cap);
+        // The kernel filled the regions submitted in `action()` in order, so
+        // the first `len <= cap` bytes of region `i` are initialized.
+        buf.commit(i, crate::Initialized::new(region.ptr.as_ptr(), cap, len));
+        remaining = remaining.saturating_sub(cap);
+      }
+      Ok(completion.result() as usize)
+    };
+
+    (result, buf)
+  }
+
+  #[cfg(test)]
+  fn stage_recv_data(&mut self, bytes: &[u8]) {
+    stage_into(held(self.buf.as_mut()), bytes);
+  }
+
+  #[cfg(test)]
+  fn stage_from_addr(&mut self, addr: SocketAddr) {
+    let Some(from) = self.from.as_mut() else {
+      panic!("from address capture not enabled");
+    };
+    *from = socket_addr_into_buf(addr);
+  }
+}
+
+pub struct Recv<B: IoBufMutVec + std::marker::Send + Sync> {
+  core: RecvCore<B>,
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> Recv<B> {
+  pub(crate) fn new(res: Resource, buf: B, flags: Option<RecvFlags>) -> Self {
+    Self { core: RecvCore::new(res, buf, flags, false) }
+  }
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> Recv<B> {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    self.core.action()
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> BufResult<usize, B> {
+    self.core.complete_buf(completion)
+  }
+}
+
+pub struct RecvFrom<B: IoBufMutVec + std::marker::Send + Sync> {
+  core: RecvCore<B>,
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> RecvFrom<B> {
+  pub(crate) fn new(res: Resource, buf: B, flags: Option<RecvFlags>) -> Self {
+    Self { core: RecvCore::new(res, buf, flags, true) }
+  }
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> RecvFrom<B> {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    self.core.action()
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> (std::io::Result<usize>, B, Option<SocketAddr>) {
+    let (result, buf) = self.core.complete_buf(completion);
+    let addr = result
+      .as_ref()
+      .ok()
+      .and(self.core.from.as_ref())
+      .and_then(|from| socket_addr_from_buf(from).ok());
+    (result, buf, addr)
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Recv<Vec<u8>> {
+  impl_op_model_contract_runtime!(BufResult<usize, Vec<u8>>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::stdin(), vec![0u8; 8], Some(TEST_RECV_FLAGS))
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action: &Action<'static>| match action {
+        Action::Io(op) => {
+          matches!(op.as_op(), Op::Recv { flags, .. } if *flags == TEST_RECV_FLAGS)
+        }
+        _ => false,
+      },
+      |model| model.core.stage_recv_data(b"recv"),
+      Completion::new(4),
+      |result: &BufResult<usize, Vec<u8>>| match result {
+        (Ok(4), buf) => buf.as_slice() == b"recv",
+        _ => false,
+      },
+    )]
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Recv<(Vec<u8>, Vec<u8>)> {
+  impl_op_model_contract_runtime!(BufResult<usize, (Vec<u8>, Vec<u8>)>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(
+      Resource::stdin(),
+      (vec![0u8; 2], vec![0u8; 4]),
+      Some(TEST_RECV_FLAGS),
+    )
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action: &Action<'static>| match action {
+        Action::Io(op) => {
+          matches!(op.as_op(), Op::Recv { flags, .. } if *flags == TEST_RECV_FLAGS)
+        }
+        _ => false,
+      },
+      |model| model.core.stage_recv_data(b"hello"),
+      Completion::new(5),
+      |result: &TwoVecBufResult| match result {
+        (Ok(5), (a, b)) => a.as_slice() == b"he" && b.as_slice() == b"llo",
+        _ => false,
+      },
+    )]
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for RecvFrom<Vec<u8>> {
+  impl_op_model_contract_runtime!((
+    std::io::Result<usize>,
+    Vec<u8>,
+    Option<SocketAddr>
+  ));
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::stdin(), vec![0u8; 8], Some(TEST_RECV_FLAGS))
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action: &Action<'static>| match action {
+        Action::Io(op) => {
+          matches!(op.as_op(), Op::Recv { flags, .. } if *flags == TEST_RECV_FLAGS)
+        }
+        _ => false,
+      },
+      |model| {
+        model.core.stage_recv_data(b"recv");
+        model
+          .core
+          .stage_from_addr("127.0.0.1:7000".parse().expect("socket addr"));
+      },
+      Completion::new(4),
+      |result| match result {
+        (Ok(4), buf, Some(addr)) => {
+          buf.as_slice() == b"recv"
+            && *addr == "127.0.0.1:7000".parse().unwrap()
+        }
+        _ => false,
+      },
+    )]
+  }
+}
+
+// ============================================================================
+// Send
+// ============================================================================
+
+pub struct Send<B: IoBufVec + std::marker::Send + Sync> {
+  res: Resource,
+  buf: Option<B>,
+  bufs: [MsgBuf; MAX_IOV_COUNT],
+  flags: SendFlags,
+  addr: Option<SocketAddr>,
+}
+
+// SAFETY: `Send` owns the buffer and the message slices only point into
+// that owned buffer and into fields of the same struct. The operation is driven
+// by a single owning thread.
+unsafe impl<B: IoBufVec + std::marker::Send + Sync> std::marker::Send
+  for Send<B>
+{
+}
+// SAFETY: shared references do not permit mutation of the pointed-to storage
+// outside the owning operation flow.
+unsafe impl<B: IoBufVec + std::marker::Send + Sync> std::marker::Sync
+  for Send<B>
+{
+}
+
+impl<B: IoBufVec + std::marker::Send + Sync> Send<B> {
+  pub(crate) fn new(
+    res: Resource,
+    buf: B,
+    addr: Option<SocketAddr>,
+    flags: Option<SendFlags>,
+  ) -> Self {
+    Self {
+      res,
+      buf: Some(buf),
+      // SAFETY: a dangling pointer with zero length is a placeholder until
+      // `action()` installs real buffer slices.
+      bufs: [unsafe { MsgBuf::from_raw_parts(NonNull::dangling(), 0) };
+        MAX_IOV_COUNT],
+      flags: flags.unwrap_or(SendFlags::empty()),
+      addr,
+    }
+  }
+
+  fn hydrate_msg(&mut self) -> MsgSend {
+    let buf = held(self.buf.as_ref());
+    let buf_count = buf.buf_count().min(MAX_IOV_COUNT);
+
+    for (region, i) in self.bufs.iter_mut().zip(0..buf_count) {
+      *region = MsgBuf::from_slice(buf.buf(i));
+    }
+
+    // The contract takes at least one region: an empty collection sends the
+    // zero-length placeholder, as `sendmsg` would with no iovecs.
+    MsgSend::new(&self.bufs[..buf_count.max(1)], self.addr)
+  }
+}
+
+impl<B: IoBufVec + std::marker::Send + Sync + 'static> Send<B> {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    let msg = self.hydrate_msg();
+    action_io!(Op::Send { fd: self.res.clone(), msg, flags: self.flags })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> BufResult<usize, B> {
+    let buf = held(self.buf.take());
+    let result = if completion.result() < 0 {
+      Err(completion.os_error())
+    } else {
+      Ok(completion.result() as usize)
+    };
+    (result, buf)
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Send<Vec<u8>> {
+  impl_op_model_contract_runtime!(BufResult<usize, Vec<u8>>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::stdin(), b"send".to_vec(), None, Some(TEST_SEND_FLAGS))
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| match action {
+        Action::Io(op) => {
+          matches!(op.as_op(), Op::Send { flags, .. } if *flags == TEST_SEND_FLAGS)
+        }
+        _ => false,
+      },
+      Completion::new(4),
+      |result: &BufResult<usize, Vec<u8>>| match result {
+        (Ok(4), buf) => buf.as_slice() == b"send",
+        _ => false,
+      },
+    )]
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Send<(Vec<u8>, Vec<u8>)> {
+  impl_op_model_contract_runtime!(BufResult<usize, (Vec<u8>, Vec<u8>)>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(
+      Resource::stdin(),
+      (b"he".to_vec(), b"llo".to_vec()),
+      None,
+      Some(TEST_SEND_FLAGS),
+    )
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| match action {
+        Action::Io(op) => {
+          matches!(op.as_op(), Op::Send { flags, .. } if *flags == TEST_SEND_FLAGS)
+        }
+        _ => false,
+      },
+      Completion::new(5),
+      |result: &TwoVecBufResult| match result {
+        (Ok(5), (a, b)) => a.as_slice() == b"he" && b.as_slice() == b"llo",
+        _ => false,
+      },
+    )]
+  }
+}
+
+// ============================================================================
+// Sleep
+// ============================================================================
+
+pub struct Sleep {
+  duration: Duration,
+}
+
+impl Sleep {
+  pub(crate) fn new(duration: Duration) -> Self {
+    Self { duration }
+  }
+
+  pub fn duration(&self) -> Duration {
+    self.duration
+  }
+}
+
+impl Sleep {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    Action::Sleep(self.duration)
+  }
+
+  pub(crate) fn complete(&mut self, completion: Completion) -> io::Result<()> {
+    assert!(completion.flags().contains(CompletionFlags::TIMER));
+
+    if completion.result() == 0 { Ok(()) } else { Err(completion.os_error()) }
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Sleep {
+  impl_op_model_contract_runtime!(io::Result<()>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Duration::from_millis(10))
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| matches!(action, Action::Sleep(duration) if *duration == Duration::from_millis(10)),
+      Completion::with_flags(0, CompletionFlags::TIMER),
+      |result| matches!(result, Ok(())),
+    )]
+  }
+}
+
+pub struct OpenAt {
+  dir_res: Resource,
+  pathname: CString,
+  flags: OpenFlags,
+  mode: FileMode,
+}
+
+impl OpenAt {
+  pub(crate) fn new(
+    dir_res: Resource,
+    pathname: CString,
+    flags: OpenFlags,
+    mode: FileMode,
+  ) -> Self {
+    Self { dir_res, pathname, flags, mode }
+  }
+}
+
+impl OpenAt {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::OpenAt {
+      dir_fd: self.dir_res.clone(),
+      path: cstring_to_osstring(&self.pathname),
+      flags: self.flags,
+      mode: self.mode,
+    })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> std::io::Result<Resource> {
+    // SAFETY: a successful open completion carries a new owned handle.
+    unsafe { Resource::from_completion(&completion) }
+  }
+}
+
+pub struct Stat {
+  target: StatModelTarget,
+  out: FileStat,
+}
+
+enum StatModelTarget {
+  Path {
+    dir_res: Resource,
+    pathname: CString,
+    follow_symlinks: bool,
+  },
+  Fd {
+    fd: Resource,
+  },
+  /// The path could not be represented; completes with `InvalidInput`.
+  // Only `lio::fs` (feature `high`) takes paths that can contain NUL bytes.
+  #[cfg_attr(not(feature = "high"), allow(dead_code))]
+  InvalidPath,
+}
+
+/// The error for a path that contains a NUL byte, as `std::fs` reports it.
+pub(crate) fn nul_path_error() -> std::io::Error {
+  std::io::Error::new(
+    std::io::ErrorKind::InvalidInput,
+    "path contains an interior NUL byte",
+  )
+}
+
+impl Stat {
+  pub(crate) fn new_at(
+    dir_res: Resource,
+    pathname: CString,
+    follow_symlinks: bool,
+  ) -> Self {
+    Self {
+      target: StatModelTarget::Path { dir_res, pathname, follow_symlinks },
+      out: FileStat::zeroed(),
+    }
+  }
+
+  pub(crate) fn new_fd(fd: Resource) -> Self {
+    Self { target: StatModelTarget::Fd { fd }, out: FileStat::zeroed() }
+  }
+
+  /// A stat that fails with `InvalidInput` without touching the file system.
+  #[cfg_attr(not(feature = "high"), allow(dead_code))]
+  pub(crate) fn invalid_path() -> Self {
+    Self { target: StatModelTarget::InvalidPath, out: FileStat::zeroed() }
+  }
+}
+
+impl Stat {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    let target = match &mut self.target {
+      StatModelTarget::Path { dir_res, pathname, follow_symlinks } => {
+        StatTarget::Path {
+          dir_fd: dir_res.clone(),
+          path: cstring_to_osstring(pathname),
+          follow_symlinks: *follow_symlinks,
+        }
+      }
+      StatModelTarget::Fd { fd } => StatTarget::Fd { fd: fd.clone() },
+      StatModelTarget::InvalidPath => return action_io!(Op::Nop),
+    };
+    action_io!(Op::Stat { target, out: NonNull::from(&mut self.out) })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> std::io::Result<FileStat> {
+    if matches!(self.target, StatModelTarget::InvalidPath) {
+      Err(nul_path_error())
+    } else if completion.result() < 0 {
+      Err(completion.os_error())
+    } else {
+      Ok(self.out)
+    }
+  }
+}
+
+pub struct ReadDir {
+  fd: Resource,
+  buf: ReadDirBuf,
+}
+
+impl ReadDir {
+  pub(crate) fn new(fd: Resource, buf: ReadDirBuf) -> Self {
+    Self { fd, buf }
+  }
+}
+
+impl ReadDir {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::ReadDir {
+      fd: self.fd.clone(),
+      raw_buf: NonNull::from(self.buf.raw.as_mut_slice()).cast(),
+      raw_cap: self.buf.raw.len(),
+      entries: NonNull::from(self.buf.entries.as_mut_slice()).cast(),
+      entries_cap: self.buf.entries.len(),
+      opaque: NonNull::from(&mut self.buf.opaque),
+      opaque_drop: NonNull::from(&mut self.buf.opaque_drop),
+      out: NonNull::from(&mut self.buf.result),
+    })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> std::io::Result<ReadDirBuf> {
+    if completion.result() < 0 {
+      Err(completion.os_error())
+    } else {
+      Ok(std::mem::take(&mut self.buf))
+    }
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for ReadDir {
+  impl_op_model_contract_runtime!(std::io::Result<ReadDirBuf>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(Resource::cwd(), ReadDirBuf::with_capacity(64, 4))
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::ReadDir { .. }))
+      },
+      |model| {
+        model.buf.raw[..5].copy_from_slice(b"child");
+        model.buf.entries[0] = crate::backend::op::DirEntryRef {
+          name_offset: 0,
+          name_len: 5,
+          file_type: Some(crate::backend::op::FileType::File),
+          ino: Some(1),
+        };
+        model.buf.result = crate::backend::op::ReadDirResult {
+          entries: 1,
+          raw_written: 5,
+          eof: true,
+        };
+      },
+      Completion::new(0),
+      |result| {
+        matches!(
+          result,
+          Ok(buf)
+            if buf.result.entries == 1
+              && buf.iter().next().map(|entry| entry.name) == Some(&b"child"[..])
+        )
+      },
+    )]
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Stat {
+  impl_op_model_contract_runtime!(std::io::Result<FileStat>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new_at(Resource::cwd(), CString::new("file").expect("cstring"), true)
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action: &Action<'static>| {
+        matches!(
+          action.as_op(),
+          Some(Op::Stat {
+            target: StatTarget::Path { follow_symlinks: true, .. },
+            ..
+          })
+        )
+      },
+      |model| {
+        // S_IFREG | 0o644
+        let mode = 0o100644;
+        model.out = FileStat {
+          file_type: crate::backend::op::FileType::File,
+          size: 7,
+          permissions: 0o644,
+          mode,
+          nlink: 1,
+          uid: 1000,
+          gid: 1000,
+        };
+      },
+      Completion::new(0),
+      |result| {
+        matches!(
+          result,
+          Ok(stat)
+            if stat.is_file() && stat.len() == 7 && stat.permissions == 0o644
+        )
+      },
+    )]
+  }
+}
+
+pub struct UnlinkAt {
+  dir_res: Resource,
+  pathname: CString,
+  kind: UnlinkKind,
+}
+
+impl UnlinkAt {
+  pub(crate) fn new(
+    dir_res: Resource,
+    pathname: CString,
+    kind: UnlinkKind,
+  ) -> Self {
+    Self { dir_res, pathname, kind }
+  }
+}
+
+impl UnlinkAt {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::UnlinkAt {
+      dir_fd: self.dir_res.clone(),
+      path: cstring_to_osstring(&self.pathname),
+      kind: self.kind,
+    })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> std::io::Result<()> {
+    if completion.result() < 0 { Err(completion.os_error()) } else { Ok(()) }
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for UnlinkAt {
+  impl_op_model_contract_runtime!(std::io::Result<()>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(
+      Resource::cwd(),
+      CString::new("tmp-file").expect("cstring"),
+      UnlinkKind::Directory,
+    )
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| {
+        matches!(
+          action.as_op(),
+          Some(Op::UnlinkAt { kind: UnlinkKind::Directory, .. })
+        )
+      },
+      Completion::new(0),
+      |result| matches!(result, Ok(())),
+    )]
+  }
+}
+
+pub struct RenameAt {
+  old_dir_res: Resource,
+  old_pathname: CString,
+  new_dir_res: Resource,
+  new_pathname: CString,
+}
+
+impl RenameAt {
+  pub(crate) fn new(
+    old_dir_res: Resource,
+    old_pathname: CString,
+    new_dir_res: Resource,
+    new_pathname: CString,
+  ) -> Self {
+    Self { old_dir_res, old_pathname, new_dir_res, new_pathname }
+  }
+}
+
+impl RenameAt {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::RenameAt {
+      old_dir_fd: self.old_dir_res.clone(),
+      old_path: cstring_to_osstring(&self.old_pathname),
+      new_dir_fd: self.new_dir_res.clone(),
+      new_path: cstring_to_osstring(&self.new_pathname),
+    })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> std::io::Result<()> {
+    if completion.result() < 0 { Err(completion.os_error()) } else { Ok(()) }
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for RenameAt {
+  impl_op_model_contract_runtime!(std::io::Result<()>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(
+      Resource::cwd(),
+      CString::new("old-name").expect("cstring"),
+      Resource::cwd(),
+      CString::new("new-name").expect("cstring"),
+    )
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::RenameAt { .. }))
+      },
+      Completion::new(0),
+      |result| matches!(result, Ok(())),
+    )]
+  }
+}
+
+pub struct MkdirAt {
+  dir_res: Resource,
+  pathname: CString,
+  mode: FileMode,
+}
+
+impl MkdirAt {
+  pub(crate) fn new(
+    dir_res: Resource,
+    pathname: CString,
+    mode: FileMode,
+  ) -> Self {
+    Self { dir_res, pathname, mode }
+  }
+}
+
+impl MkdirAt {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::MkdirAt {
+      dir_fd: self.dir_res.clone(),
+      path: cstring_to_osstring(&self.pathname),
+      mode: self.mode,
+    })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> std::io::Result<()> {
+    if completion.result() < 0 { Err(completion.os_error()) } else { Ok(()) }
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for MkdirAt {
+  impl_op_model_contract_runtime!(std::io::Result<()>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(
+      Resource::cwd(),
+      CString::new("new-dir").expect("cstring"),
+      FileMode::from_octal(0o755).unwrap(),
+    )
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| matches!(action.as_op(), Some(Op::MkdirAt { mode, .. }) if mode.octal() == 0o755),
+      Completion::new(0),
+      |result| matches!(result, Ok(())),
+    )]
+  }
+}
+
+pub struct LinkAt {
+  source_dir_res: Resource,
+  source_pathname: CString,
+  new_dir_res: Resource,
+  new_pathname: CString,
+  kind: LinkKind,
+}
+
+impl LinkAt {
+  pub(crate) fn new(
+    source_dir_res: Resource,
+    source_pathname: CString,
+    new_dir_res: Resource,
+    new_pathname: CString,
+    kind: LinkKind,
+  ) -> Self {
+    Self { source_dir_res, source_pathname, new_dir_res, new_pathname, kind }
+  }
+}
+
+impl LinkAt {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::LinkAt {
+      kind: self.kind,
+      source_dir_fd: self.source_dir_res.clone(),
+      source_path: cstring_to_osstring(&self.source_pathname),
+      new_dir_fd: self.new_dir_res.clone(),
+      new_path: cstring_to_osstring(&self.new_pathname),
+    })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> std::io::Result<()> {
+    if completion.result() < 0 { Err(completion.os_error()) } else { Ok(()) }
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for LinkAt {
+  impl_op_model_contract_runtime!(std::io::Result<()>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(
+      Resource::cwd(),
+      CString::new("old-name").expect("cstring"),
+      Resource::cwd(),
+      CString::new("new-name").expect("cstring"),
+      LinkKind::Hard,
+    )
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::LinkAt { kind: LinkKind::Hard, .. }))
+      },
+      Completion::new(0),
+      |result| matches!(result, Ok(())),
+    )]
+  }
+}
+
+pub struct ReadlinkAt<B: IoBufMutVec + std::marker::Send + Sync> {
+  dir_res: Resource,
+  pathname: CString,
+  buf: Option<B>,
+  raw: RawBuf<'static>,
+  raw_len: usize,
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> ReadlinkAt<B> {
+  pub(crate) fn new(dir_res: Resource, pathname: CString, buf: B) -> Self {
+    Self {
+      dir_res,
+      pathname,
+      buf: Some(buf),
+      // SAFETY: null with zero length is a placeholder until `action()`.
+      raw: unsafe { RawBuf::from_raw_parts(ptr::null_mut(), 0) },
+      raw_len: 0,
+    }
+  }
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> ReadlinkAt<B> {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    let buf = held(self.buf.as_mut());
+    let mut regions = IoSlicesMut::new();
+    buf.bufs_mut(&mut regions);
+    let Some(region) = regions.into_iter().next() else {
+      panic!("readlink needs a buffer with at least one region");
+    };
+    let len = region.len();
+    let ptr = NonNull::from(region).cast::<u8>();
+    // SAFETY: the region is model-owned storage that stays in place until
+    // `complete()` consumes the buffer.
+    self.raw = unsafe { RawBuf::from_raw_parts(ptr.as_ptr(), len) };
+    self.raw_len = len;
+
+    action_io!(Op::ReadlinkAt {
+      dir_fd: self.dir_res.clone(),
+      path: cstring_to_osstring(&self.pathname),
+      buf: ptr,
+      buf_len: self.raw_len,
+    })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> BufResult<usize, B> {
+    let mut buf = held(self.buf.take());
+    let result = if completion.result() < 0 {
+      Err(completion.os_error())
+    } else {
+      let len = (completion.result() as usize).min(self.raw_len);
+      // The kernel wrote `len <= raw_len` bytes into the region submitted
+      // in `action()`.
+      buf.commit(0, crate::Initialized::new(self.raw.ptr, self.raw_len, len));
+      Ok(completion.result() as usize)
+    };
+    (result, buf)
+  }
+}
+
+pub struct GetCwd<B: IoBufMutVec + std::marker::Send + Sync> {
+  buf: Option<B>,
+  out: std::ffi::OsString,
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> GetCwd<B> {
+  pub(crate) fn new(buf: B) -> Self {
+    Self { buf: Some(buf), out: std::ffi::OsString::new() }
+  }
+}
+
+impl<B: IoBufMutVec + std::marker::Send + Sync> GetCwd<B> {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::GetCwd { out: NonNull::from(&mut self.out) })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> BufResult<usize, B> {
+    let mut buf = held(self.buf.take());
+    let result = if completion.result() < 0 {
+      Err(completion.os_error())
+    } else {
+      let bytes = self.out.as_encoded_bytes();
+
+      let mut regions = IoSlicesMut::new();
+      buf.bufs_mut(&mut regions);
+      let first = regions.into_iter().next();
+      match first {
+        Some(region) if bytes.len() <= region.len() => {
+          let len = bytes.len();
+          let ptr = region.as_mut_ptr().cast::<u8>();
+          let region_len = region.len();
+          for (dst, src) in region.iter_mut().zip(bytes) {
+            dst.write(*src);
+          }
+          // The first `len` bytes of region 0 were just initialized above.
+          buf.commit(0, crate::Initialized::new(ptr, region_len, len));
+          Ok(bytes.len())
+        }
+        _ => Err(std::io::Error::from_raw_os_error(
+          crate::backend::native::BUFFER_TOO_SMALL,
+        )),
+      }
+    };
+    (result, buf)
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for GetCwd<Vec<u8>> {
+  impl_op_model_contract_runtime!(BufResult<usize, Vec<u8>>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(vec![0; 32])
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::GetCwd { .. }))
+      },
+      |model| {
+        #[cfg(unix)]
+        {
+          use std::os::unix::ffi::OsStringExt;
+          model.out = std::ffi::OsString::from_vec(b"/tmp".to_vec());
+        }
+        #[cfg(not(unix))]
+        {
+          model.out = std::ffi::OsString::from("/tmp");
+        }
+      },
+      Completion::new(0),
+      |result| match result {
+        (Ok(bytes), buf) => *bytes == 4 && &buf[..4] == b"/tmp",
+        _ => false,
+      },
+    )]
+  }
+}
+
+pub struct Spawn {
+  spec: crate::backend::op::SpawnSpec,
+}
+
+impl Spawn {
+  pub(crate) fn new(
+    path: CString,
+    argv: Vec<CString>,
+    envp: Option<Vec<CString>>,
+  ) -> Self {
+    Self {
+      spec: crate::backend::op::SpawnSpec {
+        program: cstring_to_osstring(&path),
+        args: argv.iter().map(cstring_to_osstring).collect(),
+        env: envp.map(|vars| vars.iter().map(cstring_to_osstring).collect()),
+      },
+    }
+  }
+}
+
+impl Spawn {
+  pub(crate) fn action(&mut self) -> Action<'_> {
+    action_io!(Op::Spawn { spec: self.spec.clone() })
+  }
+
+  pub(crate) fn complete(
+    &mut self,
+    completion: Completion,
+  ) -> std::io::Result<crate::api::Pid> {
+    if completion.result() < 0 {
+      Err(completion.os_error())
+    } else {
+      Ok(crate::api::Pid::from_raw(completion.result() as i64))
+    }
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for Spawn {
+  impl_op_model_contract_runtime!(std::io::Result<crate::api::Pid>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(
+      CString::new("/bin/echo").expect("cstring"),
+      vec![CString::new("echo").expect("cstring")],
+      None,
+    )
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::new(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::Spawn { .. }))
+      },
+      Completion::new(1234),
+      |result: &std::io::Result<crate::api::Pid>| matches!(result, Ok(pid) if pid.as_raw() == 1234),
+    )]
+  }
+}
+
+#[cfg(test)]
+impl OpModelContract for ReadlinkAt<Vec<u8>> {
+  impl_op_model_contract_runtime!(BufResult<usize, Vec<u8>>);
+  fn contract_kind() -> ContractKind {
+    ContractKind::Oneshot
+  }
+
+  fn contract_model() -> Self {
+    Self::new(
+      Resource::cwd(),
+      CString::new("link-name").expect("cstring"),
+      vec![0; 32],
+    )
+  }
+
+  fn contract_steps() -> Vec<ContractStep<Self>> {
+    vec![ContractStep::with_setup(
+      |action: &Action<'static>| {
+        matches!(action.as_op(), Some(Op::ReadlinkAt { .. }))
+      },
+      |model| {
+        model.buf.as_mut().expect("buffer available")[..4]
+          .copy_from_slice(b"dest");
+      },
+      Completion::new(4),
+      |result| match result {
+        (Ok(bytes), buf) => *bytes == 4 && &buf[..4] == b"dest",
+        _ => false,
+      },
+    )]
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  mod nop_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Nop);
+
+    #[test]
+    fn cancelled_nop_completes_with_its_error() {
+      let Err(err) = Nop.complete(Completion::new(-125)) else {
+        panic!("a failed nop must complete with an error");
+      };
+      assert_eq!(err.raw_os_error(), Some(125));
+    }
+  }
+
+  mod socket_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Socket);
+  }
+
+  mod getcwd_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(GetCwd<Vec<u8>>);
+  }
+
+  mod stat_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Stat);
+  }
+
+  mod recvfrom_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(RecvFrom<Vec<u8>>);
+  }
+
+  mod readdir_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(ReadDir);
+  }
+
+  mod spawn_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Spawn);
+  }
+
+  mod read_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Read<Vec<u8>>);
+  }
+
+  mod read_vectored_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Read<(Vec<u8>, Vec<u8>)>);
+  }
+
+  mod write_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Write<Vec<u8>>);
+  }
+
+  mod write_vectored_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Write<(Vec<u8>, Vec<u8>)>);
+  }
+
+  mod fsync_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Fsync);
+  }
+
+  mod unlinkat_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(UnlinkAt);
+  }
+
+  mod renameat_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(RenameAt);
+  }
+
+  mod mkdirat_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(MkdirAt);
+  }
+
+  mod linkat_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(LinkAt);
+  }
+
+  mod readlinkat_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(ReadlinkAt<Vec<u8>>);
+  }
+
+  mod accept_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Accept);
+  }
+
+  mod accept_unix_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(AcceptUnix);
+  }
+
+  mod connect_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Connect);
+  }
+
+  mod sleep_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Sleep);
+  }
+
+  mod recv_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Recv<Vec<u8>>);
+  }
+
+  mod recv_vectored_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Recv<(Vec<u8>, Vec<u8>)>);
+  }
+
+  mod send_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Send<Vec<u8>>);
+  }
+
+  mod send_vectored_contract {
+    use super::*;
+
+    lio_test::test_op_model_contract!(Send<(Vec<u8>, Vec<u8>)>);
+  }
+
+  #[test]
+  fn empty_buffer_collections_submit_one_empty_region() {
+    let mut send =
+      Send::new(Resource::stdin(), Vec::<Vec<u8>>::new(), None, None);
+    let Action::Io(op) = send.action() else {
+      panic!("send must submit a send");
+    };
+    let Op::Send { msg, .. } = op.as_op() else {
+      panic!("send must submit a send");
+    };
+    assert_eq!(msg.buf_count.get(), 1);
+    // SAFETY: `msg` points into `send`, which is still alive.
+    assert_eq!(unsafe { msg.bufs.as_ref() }.len, 0);
+
+    let mut recv = Recv::new(Resource::stdin(), Vec::<Vec<u8>>::new(), None);
+    let Action::Io(op) = recv.action() else {
+      panic!("recv must submit a recv");
+    };
+    let Op::Recv { msg, .. } = op.as_op() else {
+      panic!("recv must submit a recv");
+    };
+    assert_eq!(msg.buf_count.get(), 1);
+    // SAFETY: `msg` points into `recv`, which is still alive.
+    assert_eq!(unsafe { msg.bufs.as_ref() }.len, 0);
+    let (Ok(0), bufs) = recv.complete(Completion::new(0)) else {
+      panic!("an empty recv must complete with zero bytes");
+    };
+    assert!(bufs.is_empty());
+  }
+}

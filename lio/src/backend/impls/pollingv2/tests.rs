@@ -10,7 +10,7 @@ use std::time::Duration;
 mod immediate_sockets {
   use super::super::Poller;
   use crate::api::{
-    op::{Action, Completion, OpModel, OpResult},
+    op::{Action, Completion},
     ops,
     resource::Resource,
   };
@@ -39,8 +39,8 @@ mod immediate_sockets {
     backend
   }
 
-  fn queue<T: OpModel>(backend: &mut Poller, id: u64, model: &mut T) {
-    let Action::Io(op) = model.action() else {
+  fn queue(backend: &mut Poller, id: u64, action: Action<'_>) {
+    let Action::Io(op) = action else {
       panic!("expected I/O");
     };
     // Poller does not use the step arena. Models are boxed by the caller so
@@ -58,20 +58,17 @@ mod immediate_sockets {
   fn ready_receive_does_not_register_readiness() {
     let (socket, mut peer) = pair(true);
     peer.write_all(b"hello").unwrap();
-    let mut model = Box::new(ops::Recv::new(socket.clone(), vec![0; 5], None));
+    let mut model =
+      Box::new(ops::raw::Recv::new(socket.clone(), vec![0; 5], None));
     let mut backend = backend();
-    queue(&mut backend, 11, &mut *model);
+    queue(&mut backend, 11, model.action());
     backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 0);
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].registration_id(), 11);
-    let OpResult::Done((result, buf)) =
-      model.complete(Completion::new(completed[0].result()))
-    else {
-      panic!();
-    };
+    let (result, buf) = model.complete(Completion::new(completed[0].result()));
     assert_eq!(result.unwrap(), 5);
     assert_eq!(buf, b"hello");
   }
@@ -79,9 +76,10 @@ mod immediate_sockets {
   #[test]
   fn unavailable_receive_is_registered_and_completes_later() {
     let (socket, mut peer) = pair(true);
-    let mut model = Box::new(ops::Recv::new(socket.clone(), vec![0; 5], None));
+    let mut model =
+      Box::new(ops::raw::Recv::new(socket.clone(), vec![0; 5], None));
     let mut backend = backend();
-    queue(&mut backend, 12, &mut *model);
+    queue(&mut backend, 12, model.action());
     backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 1);
     let mut completed = Vec::new();
@@ -97,9 +95,10 @@ mod immediate_sockets {
   #[test]
   fn blocking_socket_keeps_readiness_first_behavior() {
     let (socket, mut peer) = pair(false);
-    let mut model = Box::new(ops::Recv::new(socket.clone(), vec![0; 5], None));
+    let mut model =
+      Box::new(ops::raw::Recv::new(socket.clone(), vec![0; 5], None));
     let mut backend = backend();
-    queue(&mut backend, 13, &mut *model);
+    queue(&mut backend, 13, model.action());
     backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 1);
     assert!(backend.queued_completed.is_empty());
@@ -113,10 +112,14 @@ mod immediate_sockets {
   #[test]
   fn ready_send_does_not_register_readiness() {
     let (socket, mut peer) = pair(true);
-    let mut model =
-      Box::new(ops::Send::new(socket.clone(), b"hello".to_vec(), None, None));
+    let mut model = Box::new(ops::raw::Send::new(
+      socket.clone(),
+      b"hello".to_vec(),
+      None,
+      None,
+    ));
     let mut backend = backend();
-    queue(&mut backend, 14, &mut *model);
+    queue(&mut backend, 14, model.action());
     backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 0);
     let mut completed = Vec::new();
@@ -131,9 +134,10 @@ mod immediate_sockets {
   #[test]
   fn immediate_completions_do_not_starve_registered_receives() {
     let (socket, mut peer) = pair(true);
-    let mut model = Box::new(ops::Recv::new(socket.clone(), vec![0; 5], None));
+    let mut model =
+      Box::new(ops::raw::Recv::new(socket.clone(), vec![0; 5], None));
     let mut backend = backend();
-    queue(&mut backend, 15, &mut *model);
+    queue(&mut backend, 15, model.action());
     backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 1);
     peer.write_all(b"hello").unwrap();
@@ -158,9 +162,10 @@ mod immediate_sockets {
   #[test]
   fn drain_drops_a_registered_receive() {
     let (socket, _peer) = pair(true);
-    let mut model = Box::new(ops::Recv::new(socket.clone(), vec![0; 5], None));
+    let mut model =
+      Box::new(ops::raw::Recv::new(socket.clone(), vec![0; 5], None));
     let mut backend = backend();
-    queue(&mut backend, 15, &mut *model);
+    queue(&mut backend, 15, model.action());
     backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 1);
     assert!(backend.drain());
@@ -188,10 +193,14 @@ mod immediate_sockets {
     let socket = Resource::from(unsafe {
       std::os::fd::OwnedFd::from_raw_fd(socket.into_raw_fd())
     });
-    let mut model =
-      Box::new(ops::Send::new(socket.clone(), b"hello".to_vec(), None, None));
+    let mut model = Box::new(ops::raw::Send::new(
+      socket.clone(),
+      b"hello".to_vec(),
+      None,
+      None,
+    ));
     let mut backend = backend();
-    queue(&mut backend, 17, &mut *model);
+    queue(&mut backend, 17, model.action());
     backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 1);
     assert!(backend.queued_completed.is_empty());

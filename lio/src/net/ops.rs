@@ -22,6 +22,7 @@
 use std::{io, marker::PhantomData, net::SocketAddr};
 
 #[allow(unused_imports)] // TcpListener used in doc links
+use crate::api::ops::raw;
 use crate::{
   api::{
     ops,
@@ -30,7 +31,7 @@ use crate::{
   backend::op::{
     SockDomain, SockProto, SockType, SocketAddrBuf, socket_addr_into_buf,
   },
-  model::{Cx, Model, Op, Step},
+  model::{Cx, OpModel, Step},
   net::{Socket, TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream},
   ready,
 };
@@ -46,16 +47,16 @@ fn ip_domain(addr: &SocketAddr) -> SockDomain {
 ///
 /// You typically won't create this directly; it's returned by [`Socket::accept()`](crate::net::Socket::accept).
 pub struct SocketAccept {
-  inner: Op<ops::Accept>,
+  inner: ops::Accept,
 }
 
 impl SocketAccept {
   pub(crate) fn new(res: Resource) -> Self {
-    Self { inner: Op::new(ops::Accept::new(res)) }
+    Self { inner: ops::Accept::from(raw::Accept::new(res)) }
   }
 }
 
-impl Model for SocketAccept {
+impl OpModel for SocketAccept {
   type Item = io::Result<(Socket, SocketAddr)>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -75,7 +76,7 @@ model_io!(SocketAccept);
 ///
 /// You typically won't create this directly; it's returned by [`Socket::new()`](crate::net::Socket::new).
 pub struct SocketNew {
-  inner: Op<ops::Socket>,
+  inner: ops::Socket,
 }
 
 impl SocketNew {
@@ -84,11 +85,11 @@ impl SocketNew {
     ty: SockType,
     proto: SockProto,
   ) -> Self {
-    Self { inner: Op::new(ops::Socket::new(domain, ty, proto)) }
+    Self { inner: ops::Socket::from(raw::Socket::new(domain, ty, proto)) }
   }
 }
 
-impl Model for SocketNew {
+impl OpModel for SocketNew {
   type Item = io::Result<Socket>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -99,16 +100,16 @@ impl Model for SocketNew {
 model_io!(SocketNew);
 
 pub struct TcpAccept {
-  inner: Op<ops::Accept>,
+  inner: ops::Accept,
 }
 
 impl TcpAccept {
   pub(crate) fn new(res: Resource) -> Self {
-    Self { inner: Op::new(ops::Accept::new(res)) }
+    Self { inner: ops::Accept::from(raw::Accept::new(res)) }
   }
 }
 
-impl Model for TcpAccept {
+impl OpModel for TcpAccept {
   type Item = io::Result<(TcpStream, SocketAddr)>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -132,9 +133,9 @@ pub struct BindListener<T> {
 pub type TcpBindListener = BindListener<TcpListener>;
 
 enum BindListenerState {
-  Socket(Op<ops::Socket>),
-  Bind { resource: Resource, bind: Op<ops::Bind> },
-  Listen { resource: Resource, listen: Op<ops::Listen> },
+  Socket(ops::Socket),
+  Bind { resource: Resource, bind: ops::Bind },
+  Listen { resource: Resource, listen: ops::Listen },
 }
 
 impl<T> BindListener<T> {
@@ -144,7 +145,7 @@ impl<T> BindListener<T> {
     addr: SocketAddrBuf,
   ) -> Self {
     Self {
-      state: BindListenerState::Socket(Op::new(ops::Socket::new(
+      state: BindListenerState::Socket(ops::Socket::from(raw::Socket::new(
         domain,
         SockType::STREAM,
         proto,
@@ -171,7 +172,7 @@ impl BindListener<UnixListener> {
   }
 }
 
-impl<T: FromResource + 'static> Model for BindListener<T> {
+impl<T: FromResource + 'static> OpModel for BindListener<T> {
   type Item = io::Result<T>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -179,7 +180,10 @@ impl<T: FromResource + 'static> Model for BindListener<T> {
       self.state = match &mut self.state {
         BindListenerState::Socket(socket) => match ready!(socket.poll(cx)) {
           Ok(resource) => BindListenerState::Bind {
-            bind: Op::new(ops::Bind::from_buf(resource.clone(), self.addr)),
+            bind: ops::Bind::from(raw::Bind::from_buf(
+              resource.clone(),
+              self.addr,
+            )),
             resource,
           },
           Err(err) => return Step::Done(Err(err)),
@@ -187,7 +191,10 @@ impl<T: FromResource + 'static> Model for BindListener<T> {
         BindListenerState::Bind { resource, bind } => {
           match ready!(bind.poll(cx)) {
             Ok(()) => BindListenerState::Listen {
-              listen: Op::new(ops::Listen::new(resource.clone(), 128)),
+              listen: ops::Listen::from(raw::Listen::new(
+                resource.clone(),
+                128,
+              )),
               resource: resource.clone(),
             },
             Err(err) => return Step::Done(Err(err)),
@@ -215,8 +222,8 @@ struct Connecting {
 }
 
 enum ConnectingState {
-  Socket(Op<ops::Socket>),
-  Connect { resource: Resource, connect: Op<ops::Connect> },
+  Socket(ops::Socket),
+  Connect { resource: Resource, connect: ops::Connect },
 }
 
 impl Connecting {
@@ -227,7 +234,7 @@ impl Connecting {
     addr: SocketAddrBuf,
   ) -> Self {
     Self {
-      state: ConnectingState::Socket(Op::new(ops::Socket::new(
+      state: ConnectingState::Socket(ops::Socket::from(raw::Socket::new(
         domain, ty, proto,
       ))),
       addr,
@@ -235,7 +242,7 @@ impl Connecting {
   }
 }
 
-impl Model for Connecting {
+impl OpModel for Connecting {
   type Item = io::Result<Resource>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -244,7 +251,7 @@ impl Model for Connecting {
         ConnectingState::Socket(socket) => match ready!(socket.poll(cx)) {
           Ok(resource) => {
             self.state = ConnectingState::Connect {
-              connect: Op::new(ops::Connect::from_buf(
+              connect: ops::Connect::from(raw::Connect::from_buf(
                 resource.clone(),
                 self.addr,
               )),
@@ -299,7 +306,7 @@ impl StreamConnect<UnixStream> {
   }
 }
 
-impl<T: FromResource + 'static> Model for StreamConnect<T> {
+impl<T: FromResource + 'static> OpModel for StreamConnect<T> {
   type Item = io::Result<T>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -313,16 +320,16 @@ model_io!(generic [T: FromResource + 'static] StreamConnect<T>);
 ///
 /// Unix peers are usually unnamed, so the peer address is not reported.
 pub struct UnixAccept {
-  inner: Op<ops::AcceptUnix>,
+  inner: ops::AcceptUnix,
 }
 
 impl UnixAccept {
   pub(crate) fn new(res: Resource) -> Self {
-    Self { inner: Op::new(ops::AcceptUnix::new(res)) }
+    Self { inner: ops::AcceptUnix::from(raw::AcceptUnix::new(res)) }
   }
 }
 
-impl Model for UnixAccept {
+impl OpModel for UnixAccept {
   type Item = io::Result<UnixStream>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -341,14 +348,14 @@ pub struct UdpBindSocket {
 }
 
 enum UdpBindState {
-  Socket(Op<ops::Socket>),
-  Bind { resource: Resource, bind: Op<ops::Bind> },
+  Socket(ops::Socket),
+  Bind { resource: Resource, bind: ops::Bind },
 }
 
 impl UdpBindSocket {
   pub(crate) fn new(addr: SocketAddr) -> Self {
     Self {
-      state: UdpBindState::Socket(Op::new(ops::Socket::new(
+      state: UdpBindState::Socket(ops::Socket::from(raw::Socket::new(
         ip_domain(&addr),
         SockType::DGRAM,
         SockProto::DEFAULT,
@@ -358,7 +365,7 @@ impl UdpBindSocket {
   }
 }
 
-impl Model for UdpBindSocket {
+impl OpModel for UdpBindSocket {
   type Item = io::Result<UdpSocket>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
@@ -367,7 +374,10 @@ impl Model for UdpBindSocket {
         UdpBindState::Socket(socket) => match ready!(socket.poll(cx)) {
           Ok(resource) => {
             self.state = UdpBindState::Bind {
-              bind: Op::new(ops::Bind::new(resource.clone(), self.addr)),
+              bind: ops::Bind::from(raw::Bind::new(
+                resource.clone(),
+                self.addr,
+              )),
               resource,
             };
           }
@@ -403,7 +413,7 @@ impl UdpConnectSocket {
   }
 }
 
-impl Model for UdpConnectSocket {
+impl OpModel for UdpConnectSocket {
   type Item = io::Result<UdpSocket>;
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {

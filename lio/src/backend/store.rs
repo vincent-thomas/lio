@@ -205,27 +205,6 @@ impl OpStore {
     Some(unsafe { slot.registration.assume_init_mut() })
   }
 
-  /// Borrows a registration and its per-step arena together.
-  ///
-  /// The driver uses this to read the model's next action and hand that
-  /// borrow to the backend in the same call.
-  #[inline]
-  pub fn with_slot<R>(
-    &mut self,
-    id: u64,
-    f: impl FnOnce(&mut Registration, &mut Bump) -> R,
-  ) -> Option<R> {
-    let key = SlabKey::from_u64(id);
-    let slot = self.slots.get_mut(key)?;
-    // SAFETY: an occupied slot's registration is initialized. `registration`
-    // and `step_bump` are different fields, so the two references do not alias.
-    let (registration, step_bump) = unsafe {
-      let slot = slot as *mut StoreSlot;
-      ((*slot).registration.assume_init_mut(), &mut (*slot).step_bump)
-    };
-    Some(f(registration, step_bump))
-  }
-
   /// Inserts an operation and submits it while its model is borrowed.
   ///
   /// `submit` returns whether the model produced an action. The slot stays
@@ -412,30 +391,29 @@ impl Drop for OpStore {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::api::ops::Nop;
+  use crate::api::ops::raw::Nop;
   use std::collections::HashSet;
   use std::sync::mpsc;
-  use std::task::{RawWaker, RawWakerVTable, Waker};
-
-  fn dummy_waker() -> Waker {
-    unsafe fn clone(_: *const ()) -> RawWaker {
-      RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    unsafe fn wake(_: *const ()) {}
-    unsafe fn wake_by_ref(_: *const ()) {}
-    unsafe fn drop(_: *const ()) {}
-
-    static VTABLE: RawWakerVTable =
-      RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-    let raw_waker = RawWaker::new(std::ptr::null(), &VTABLE);
-    // SAFETY: `raw_waker` is built from a static vtable whose functions never
-    // touch the null data pointer, so it is valid to materialize a `Waker`.
-    unsafe { Waker::from_raw(raw_waker) }
-  }
 
   fn dummy_stored_op(arena: &mut Bump) -> Registration {
-    let (tx, _rx) = mpsc::channel();
-    Registration::new_waker_in(arena, dummy_waker(), tx, Nop)
+    Registration::new_in(arena, Nop, Nop::action, Nop::complete, |_| {})
+  }
+
+  /// A registration that holds `tx`: the receiver disconnects when the
+  /// registration is dropped.
+  fn holding(
+    arena: &mut Bump,
+    tx: mpsc::Sender<std::io::Result<()>>,
+  ) -> Registration {
+    Registration::new_in(
+      arena,
+      Nop,
+      Nop::action,
+      Nop::complete,
+      move |result| {
+        let _ = tx.send(result);
+      },
+    )
   }
 
   #[test]
@@ -553,13 +531,9 @@ mod tests {
     let mut store = OpStore::with_capacity(1);
     let id = store.insert_with(|arena| {
       let bomb = PanicOnDrop;
-      Registration::new_callback_in(
-        arena,
-        move |_| {
-          let _ = &bomb;
-        },
-        Nop,
-      )
+      Registration::new_in(arena, Nop, Nop::action, Nop::complete, move |_| {
+        let _ = &bomb;
+      })
     });
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       store.remove(id)
@@ -596,9 +570,7 @@ mod tests {
   fn dropping_the_store_drops_its_registrations() {
     let (tx, rx) = mpsc::channel::<std::io::Result<()>>();
     let mut store = OpStore::new();
-    store.insert_with(|arena| {
-      Registration::new_waker_in(arena, dummy_waker(), tx, Nop)
-    });
+    store.insert_with(|arena| holding(arena, tx));
     drop(store);
     // `try_recv`: a store that leaked it would make `recv` block forever.
     assert!(
@@ -612,7 +584,7 @@ mod tests {
     let (tx, rx) = mpsc::channel::<std::io::Result<()>>();
     let mut store = OpStore::with_capacity(1);
     let id = store.insert_submitting(
-      |arena| Registration::new_waker_in(arena, dummy_waker(), tx, Nop),
+      |arena| holding(arena, tx),
       |_id, _reg, _bump, _insert| {},
     );
     assert!(id.is_none());
@@ -626,7 +598,7 @@ mod tests {
     let mut store = OpStore::with_capacity(1);
     let id = store
       .insert_submitting(
-        |arena| Registration::new_waker_in(arena, dummy_waker(), tx, Nop),
+        |arena| holding(arena, tx),
         |_id, _reg, _bump, insert| insert.keep_on_panic(),
       )
       .expect("the slot was claimed");
@@ -641,7 +613,7 @@ mod tests {
     let mut store = OpStore::with_capacity(1);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       store.insert_submitting(
-        |arena| Registration::new_waker_in(arena, dummy_waker(), tx, Nop),
+        |arena| holding(arena, tx),
         |_id, _reg, _bump, _insert| panic!("action failed"),
       );
     }));
@@ -660,7 +632,7 @@ mod tests {
     let id = std::cell::Cell::new(0);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       store.insert_submitting(
-        |arena| Registration::new_waker_in(arena, dummy_waker(), tx, Nop),
+        |arena| holding(arena, tx),
         |new_id, _reg, _bump, insert| {
           id.set(new_id);
           insert.keep_on_panic();

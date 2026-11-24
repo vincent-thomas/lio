@@ -27,8 +27,9 @@
 //! let mut backend = DefaultBackend::new();
 //! backend.init(1024).unwrap();
 //!
-//! // A nop borrows nothing. Real submissions come from a pinned op model:
-//! // `Lio` calls `InFlight::from_model` while that model is borrowed.
+//! // A nop borrows nothing. Real submissions borrow an operation's memory,
+//! // which the driver keeps in place: `Lio` calls `InFlight::from_model`
+//! // while that memory is borrowed.
 //! // SAFETY: this nop has no buffer for the backend to retain.
 //! let op = unsafe { InFlight::attest(BorrowedOp::nop()) };
 //! backend.push(1, op, &mut bumpalo::Bump::new());
@@ -175,7 +176,7 @@ impl OpCompleted {
   }
 }
 
-/// Unified I/O backend trait to drive `OpModel`'s to completion.
+/// Unified I/O backend trait: executes the operations the driver submits.
 ///
 /// Designed for single-thread ownership (`&mut self`), dyn-compatible for
 /// runtime backend selection via `Box<dyn IoBackend>`.
@@ -191,15 +192,15 @@ impl OpCompleted {
 ///
 /// # Usage
 ///
-/// [`Lio`](crate::Lio) is what submits. It owns the op model, and the model
-/// owns the buffers. While that model is borrowed, the driver builds an
+/// [`Lio`](crate::Lio) is what submits. It owns the operation's memory,
+/// buffers included. While that memory is borrowed, the driver builds an
 /// [`InFlight`] and passes it to [`push`](IoBackend::push). The borrow is
 /// what ties the operation to the memory the backend may keep using until
 /// the completion comes back.
 ///
 /// # Safety
 ///
-/// The driver frees an op model's buffers based on what the backend reports.
+/// The driver frees an operation's buffers based on what the backend reports.
 /// The compiler cannot check that, so the implementor must uphold it:
 ///
 /// - Store the [`Keep`] from [`push`](IoBackend::push) for as long as this
@@ -207,8 +208,8 @@ impl OpCompleted {
 ///   that [`Op`].
 /// - Report each pushed operation at most once from [`wait`](IoBackend::wait),
 ///   and only after nothing outside the backend can use its addresses.
-/// - Report only what happened. The driver hands each result to the op model
-///   as proof, without checking it: a non-negative result for an operation
+/// - Report only what happened. The driver reads each result into the
+///   operation's memory as proof, without checking it: a non-negative result for an operation
 ///   that fills memory means that many bytes of it were written, and for an
 ///   operation that creates a resource it is a new descriptor or handle that
 ///   nothing else owns, closed by [`resource_close`](IoBackend::resource_close).
@@ -235,9 +236,9 @@ pub unsafe trait IoBackend {
   ///
   /// Call `flush()` to submit queued operations.
   ///
-  /// `op` borrows the op model that owns its buffers. [`Lio`](crate::Lio)
+  /// `op` borrows the memory that owns its buffers. [`Lio`](crate::Lio)
   /// builds it with [`InFlight::from_model`](InFlight::from_model) while that
-  /// model is borrowed. Take [`InFlight::into_parts`] and store the [`Keep`]
+  /// memory is borrowed. Take [`InFlight::into_parts`] and store the [`Keep`]
   /// for as long as any address copied from the [`Op`] is used. The driver
   /// frees the model when it holds the last [`Keep`]. [`drain`](IoBackend::drain)
   /// still has to stop kernel and worker threads, which do not hold a
@@ -294,7 +295,7 @@ pub unsafe trait IoBackend {
   ) -> io::Result<()>;
 }
 
-/// One share of the op model's lifetime.
+/// One share of the lifetime of an operation's memory.
 ///
 /// The driver holds one. Each copy a backend stores holds another. The
 /// driver frees the model only when it holds the last one. Dropping a copy
@@ -316,7 +317,7 @@ impl Keep {
   }
 }
 
-/// One operation borrowed from the op model that owns its buffers.
+/// One operation borrowed from the memory that owns its buffers.
 ///
 /// [`Lio`](crate::Lio) builds this with [`from_model`](Self::from_model)
 /// while that model is borrowed, then passes it to [`IoBackend::push`]. The
@@ -332,10 +333,9 @@ pub struct InFlight<'a> {
 impl<'a> InFlight<'a> {
   /// Wraps an operation borrowed from a model the driver has pinned.
   ///
-  /// The driver calls this inside the borrow of [`OpModel::action`] and does
-  /// not move or drop that model until the backend is finished with it.
-  ///
-  /// [`OpModel::action`]: crate::api::op::OpModel::action
+  /// The driver calls this while it borrows the operation's memory to build
+  /// the action, and does not move or drop that memory until the backend is
+  /// finished with it.
   pub(crate) fn from_model(op: BorrowedOp<'a>, keep: Keep) -> Self {
     Self { op, keep }
   }

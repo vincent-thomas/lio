@@ -17,28 +17,26 @@ use proptest::prelude::*;
 
 use crate::Lio;
 use crate::api::Io;
-use crate::api::op::{Action, Completion, OneshotOpModel, OpModel, OpResult};
+use crate::api::op::{Action, Completion};
 use crate::api::resource::Resource;
 use crate::backend::op::Op;
 use crate::backend::testing::{Checked, ScriptedBackend};
 
-/// An operation whose submission carries its tag, so the test can tell
-/// which backend id belongs to which submission.
-struct Tagged(u32);
+/// The memory of an operation whose submission carries its tag, so the
+/// test can tell which backend id belongs to which submission.
+struct TaggedOp(u32);
 
-impl OpModel for Tagged {
-  type Item = (u32, isize);
-
+impl TaggedOp {
   fn action(&mut self) -> Action<'_> {
     action_io!(Op::Listen { fd: Resource::stdin(), backlog: self.0 as i32 })
   }
 
-  fn complete(&mut self, completion: Completion) -> OpResult<(u32, isize)> {
-    OpResult::Done((self.0, completion.result()))
+  fn complete(&mut self, completion: Completion) -> (u32, isize) {
+    (self.0, completion.result())
   }
 }
 
-impl OneshotOpModel for Tagged {}
+leaf!([] struct Tagged(TaggedOp) => (u32, isize));
 
 #[derive(Clone, Debug)]
 enum Step {
@@ -136,7 +134,7 @@ impl Harness {
       Step::Callback => {
         let tag = self.tag();
         let delivered = self.delivered.clone();
-        Io::from_op(Tagged(tag)).with_lio(&self.lio).when_done(
+        Io::<Tagged>::leaf(TaggedOp(tag)).with_lio(&self.lio).when_done(
           move |(tag, result)| {
             delivered.borrow_mut().push((tag, Delivered::Io(result)));
           },
@@ -144,7 +142,7 @@ impl Harness {
       }
       Step::Future => {
         let tag = self.tag();
-        let io = Io::from_op(Tagged(tag)).with_lio(&self.lio);
+        let io = Io::<Tagged>::leaf(TaggedOp(tag)).with_lio(&self.lio);
         let delivered = self.delivered.clone();
         self.push_future(tag, async move {
           let (tag, result) = io.await;
