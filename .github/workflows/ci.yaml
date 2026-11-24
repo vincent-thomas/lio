@@ -57,7 +57,7 @@ jobs:
           version: "2026.11.12"
           cache: false
 
-      # fmt, check, check-clean, clippy, lint, then test. Windows skips check-clean.
+      # fmt, check, check-clean, clippy, cargo deny, then test. Each runs once. Windows skips check-clean.
       - name: ci
         run: mise run ci
 
