@@ -73,17 +73,58 @@ use std::{
 /// # Examples
 /// See examples in each method's docs.
 #[must_use = "Io doesn't schedule any operation on itself."]
-pub struct Io<T>
-where
-  T: Send,
-{
+pub struct Io<T> {
   op: T,
   handle: LioHandle,
 }
 
+pub(crate) mod sealed {
+  pub trait Sealed {}
+}
+
+/// What an [`Io`] can run: one of lio's operations, or one of its built-in
+/// [models](crate::model). Sealed.
+pub trait Runnable: sealed::Sealed + Sized {
+  /// What the operation produces.
+  type Item;
+  /// The future an [`Io`] of this operation turns into.
+  type Future;
+
+  #[doc(hidden)]
+  fn run_callback<F>(self, lio: Lio, f: F)
+  where
+    F: Fn(Self::Item) + 'static;
+
+  #[doc(hidden)]
+  fn run_future(self, lio: Lio) -> Self::Future;
+}
+
+impl<T: OpModel> sealed::Sealed for T {}
+
+impl<T: OpModel> Runnable for T {
+  type Item = <T as OpModel>::Item;
+  type Future = IoStreamFuture<T>;
+
+  #[inline]
+  fn run_callback<F>(self, lio: Lio, f: F)
+  where
+    F: Fn(Self::Item) + 'static,
+  {
+    // Over capacity, the operation waits in a queue (see `Lio::is_full`).
+    lio.schedule_or_queue(move |arena| {
+      Registration::new_callback_in::<T, F>(arena, f, self)
+    });
+  }
+
+  #[inline]
+  fn run_future(self, lio: Lio) -> Self::Future {
+    IoStreamFuture { state: IoStreamFutureState::Pending(self), lio }
+  }
+}
+
 impl<T> Io<T>
 where
-  T: OpModel,
+  T: Runnable,
 {
   // /// Block the current thread until the operation completes and return the result.
   // ///
@@ -122,7 +163,7 @@ where
   #[inline]
   pub fn send(self) -> Receiver<T::Item>
   where
-    T::Item: Send,
+    T::Item: Send + 'static,
   {
     let (sender, receiver) = std_mpsc::channel();
 
@@ -159,7 +200,7 @@ where
   #[inline]
   pub fn send_with(self, sender: std_mpsc::Sender<T::Item>)
   where
-    T::Item: Send,
+    T::Item: Send + 'static,
   {
     self.when_done(move |res| {
       let _ = sender.send(res);
@@ -208,11 +249,8 @@ where
   where
     F: Fn(T::Item) + 'static,
   {
-    let (lio, stream_op) = self.into_lio();
-    // Over capacity, the operation waits in a queue (see `Lio::is_full`).
-    lio.schedule_or_queue(move |arena| {
-      Registration::new_callback_in::<T, F>(arena, f, stream_op)
-    });
+    let (lio, op) = self.into_lio();
+    op.run_callback(lio, f);
   }
 }
 
@@ -387,10 +425,7 @@ impl<T> Receiver<T> {
   }
 }
 
-impl<T> Io<T>
-where
-  T: Send,
-{
+impl<T> Io<T> {
   /// Creates a new Io from an operation.
   ///
   /// The returned Io has no Lio instance bound. You must call
@@ -426,25 +461,56 @@ where
     let lio = self.handle.into_lio();
     (lio, self.op)
   }
+}
 
-  /// Extracts the inner operation from this Io.
+impl<T: crate::model::Model> Io<T> {
+  /// Extracts the model from this Io, to run it inside another model.
   ///
-  /// This is useful for wrapping operations with combinators like `timeout`.
+  /// ```
+  /// use lio::api::resource::Resource;
+  /// use lio::model::Join;
+  ///
+  /// let (a, b) = (Resource::stdin(), Resource::stdout());
+  /// let both = Join::new(
+  ///   lio::io::copy(&a, &b).into_inner(),
+  ///   lio::io::copy(&b, &a).into_inner(),
+  /// );
+  /// ```
   pub fn into_inner(self) -> T {
     self.op
   }
 }
 
+impl<T: crate::api::op::OneshotOpModel> Io<T> {
+  /// Turns this operation into a [`Model`](crate::model::Model), to run it
+  /// inside another model.
+  ///
+  /// ```
+  /// use lio::api::resource::Resource;
+  /// use lio::model::Join;
+  ///
+  /// let file = Resource::stdin();
+  /// let both = Join::new(
+  ///   lio::api::read(&file, Vec::<u8>::with_capacity(64)).into_model(),
+  ///   lio::api::fsync(&file).into_model(),
+  /// );
+  /// ```
+  pub fn into_model(self) -> crate::model::Op<T> {
+    crate::model::Op::new(self.op)
+  }
+}
+
 impl<T> IntoFuture for Io<T>
 where
-  T: OpModel + Unpin + 'static,
+  T: Runnable,
+  T::Future: Future<Output = T::Item>,
 {
   type Output = T::Item;
-  type IntoFuture = IoStreamFuture<T>;
+  type IntoFuture = T::Future;
 
   fn into_future(self) -> Self::IntoFuture {
-    let (lio, stream_op) = self.into_lio();
-    IoStreamFuture { state: IoStreamFutureState::Pending(stream_op), lio }
+    let (lio, op) = self.into_lio();
+    op.run_future(lio)
   }
 }
 

@@ -12,10 +12,11 @@ use std::os::unix::ffi::OsStringExt;
 use crate::api::{
   FileMode, FileStat, FileType, OpenFlags, ReadDirBuf, UnlinkKind,
   io::Io,
-  op::{Action, Completion, OneshotOpModel, OpModel, OpResult},
   ops,
   resource::{AsResource, FromResource, IntoResource, Resource},
 };
+use crate::model::{Cx, Model, Op, Step};
+use crate::ready;
 
 const DEFAULT_READ_DIR_SCRATCH_BYTES: usize = 4096;
 const DEFAULT_READ_DIR_ENTRIES_CAP: usize = 32;
@@ -104,12 +105,7 @@ impl Directory {
   /// Opens a directory relative to the current working directory.
   pub fn open(path: std::ffi::CString) -> Io<OpenDirectory> {
     Io::from_op(OpenDirectory {
-      inner: ops::OpenAt::new(
-        Resource::cwd(),
-        path,
-        OpenFlags::READ | OpenFlags::DIRECTORY,
-        FileMode::empty(),
-      ),
+      inner: Op::new(open_dir(Resource::cwd(), path)),
     })
   }
 
@@ -261,10 +257,17 @@ impl OpenOptions {
   /// otherwise the open fails with [`io::ErrorKind::InvalidInput`] and
   /// touches nothing.
   pub fn open(self, path: std::ffi::CString) -> Io<OpenFile> {
-    let inner = self
-      .flags()
-      .map(|flags| ops::OpenAt::new(Resource::cwd(), path, flags, self.mode));
-    Io::from_op(OpenFile { inner })
+    Io::from_op(OpenFile {
+      state: match self.flags() {
+        Ok(flags) => OpenFileState::Opening(Op::new(ops::OpenAt::new(
+          Resource::cwd(),
+          path,
+          flags,
+          self.mode,
+        ))),
+        Err(msg) => OpenFileState::Invalid(msg, Op::new(ops::Nop)),
+      },
+    })
   }
 
   fn flags(&self) -> Result<OpenFlags, &'static str> {
@@ -300,146 +303,103 @@ impl OpenOptions {
   }
 }
 
+/// Opens a directory for reading.
+fn open_dir(parent: Resource, name: CString) -> ops::OpenAt {
+  ops::OpenAt::new(
+    parent,
+    name,
+    OpenFlags::READ | OpenFlags::DIRECTORY,
+    FileMode::empty(),
+  )
+}
+
 /// Open-file operation specialized to return a typed [`File`].
 pub struct OpenFile {
-  /// The options were invalid: completes with this `InvalidInput` message.
-  inner: Result<ops::OpenAt, &'static str>,
+  state: OpenFileState,
 }
 
-impl OpModel for OpenFile {
+enum OpenFileState {
+  Opening(Op<ops::OpenAt>),
+  /// The options were invalid: completes with this `InvalidInput` message,
+  /// from the driver like any other result.
+  Invalid(&'static str, Op<ops::Nop>),
+}
+
+impl Model for OpenFile {
   type Item = io::Result<File>;
 
-  fn action(&mut self) -> Action<'_> {
-    match &mut self.inner {
-      Ok(inner) => inner.action(),
-      Err(_) => action_io!(crate::backend::op::Op::Nop),
-    }
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    let inner = match &mut self.inner {
-      Ok(inner) => inner,
-      Err(msg) => {
-        return OpResult::Done(Err(io::Error::new(
-          io::ErrorKind::InvalidInput,
-          *msg,
-        )));
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    match &mut self.state {
+      OpenFileState::Opening(open) => {
+        Step::Done(ready!(open.poll(cx)).map(File::from_resource))
       }
-    };
-    match inner.complete(completion) {
-      OpResult::Done(Ok(resource)) => {
-        OpResult::Done(Ok(File::from_resource(resource)))
+      OpenFileState::Invalid(msg, nop) => {
+        let _ = ready!(nop.poll(cx));
+        Step::Done(Err(io::Error::new(io::ErrorKind::InvalidInput, *msg)))
       }
-      OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-      OpResult::Again => OpResult::Again,
-      OpResult::Yield(item) => OpResult::Yield(item.map(File::from_resource)),
     }
   }
 }
 
-impl OneshotOpModel for OpenFile {}
+model_io!(OpenFile);
 
 /// Open-directory operation specialized to return a typed [`Directory`].
 pub struct OpenDirectory {
-  inner: ops::OpenAt,
+  inner: Op<ops::OpenAt>,
 }
 
-impl OpModel for OpenDirectory {
+impl Model for OpenDirectory {
   type Item = io::Result<Directory>;
 
-  fn action(&mut self) -> Action<'_> {
-    self.inner.action()
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    match self.inner.complete(completion) {
-      OpResult::Done(Ok(resource)) => {
-        OpResult::Done(Ok(Directory::from_resource(resource)))
-      }
-      OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-      OpResult::Again => OpResult::Again,
-      OpResult::Yield(item) => {
-        OpResult::Yield(item.map(Directory::from_resource))
-      }
-    }
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    Step::Done(ready!(self.inner.poll(cx)).map(Directory::from_resource))
   }
 }
 
-impl OneshotOpModel for OpenDirectory {}
+model_io!(OpenDirectory);
 
 /// Open-directory operation specialized to return a high-level [`ReadDir`].
 pub struct OpenReadDir {
   state: OpenReadDirState,
   parent: PathBuf,
-  buf: Option<ReadDirBuf>,
   entries: Vec<io::Result<DirEntry>>,
 }
 
 enum OpenReadDirState {
   /// The path could not be represented; completes with `InvalidInput`.
-  InvalidPath,
-  Opening(ops::OpenAt),
+  InvalidPath(Op<ops::Nop>),
+  Opening(Op<ops::OpenAt>),
   Reading {
     fd: Resource,
-    op: ops::ReadDir,
+    read: Op<ops::ReadDir>,
   },
-  Done,
 }
 
-impl OpenReadDir {
-  fn new(state: OpenReadDirState, parent: PathBuf) -> Self {
-    Self {
-      state,
-      parent,
-      buf: Some(ReadDirBuf::with_capacity(
-        DEFAULT_READ_DIR_SCRATCH_BYTES,
-        DEFAULT_READ_DIR_ENTRIES_CAP,
-      )),
-      entries: Vec::new(),
-    }
-  }
-}
-
-impl OpModel for OpenReadDir {
+impl Model for OpenReadDir {
   type Item = io::Result<ReadDir>;
 
-  fn action(&mut self) -> Action<'_> {
-    match &mut self.state {
-      OpenReadDirState::InvalidPath => action_io!(crate::backend::op::Op::Nop),
-      OpenReadDirState::Opening(op) => op.action(),
-      OpenReadDirState::Reading { op, .. } => op.action(),
-      OpenReadDirState::Done => {
-        panic!("OpenReadDir action requested after completion")
-      }
-    }
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    match std::mem::replace(&mut self.state, OpenReadDirState::Done) {
-      OpenReadDirState::InvalidPath => {
-        OpResult::Done(Err(ops::nul_path_error()))
-      }
-      OpenReadDirState::Opening(mut op) => match op.complete(completion) {
-        OpResult::Done(Ok(fd)) => {
-          let Some(buf) = self.buf.take() else {
-            unreachable!("read_dir buffer missing");
-          };
-          self.state = OpenReadDirState::Reading {
-            fd: fd.clone(),
-            op: ops::ReadDir::new(fd, buf),
-          };
-          OpResult::Again
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    loop {
+      let (fd, buf) = match &mut self.state {
+        OpenReadDirState::InvalidPath(nop) => {
+          let _ = ready!(nop.poll(cx));
+          return Step::Done(Err(ops::nul_path_error()));
         }
-        OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-        OpResult::Again => {
-          self.state = OpenReadDirState::Opening(op);
-          OpResult::Again
-        }
-        OpResult::Yield(_) => unreachable!("OpenAt is a oneshot operation"),
-      },
-      OpenReadDirState::Reading { fd, mut op } => match op.complete(completion)
-      {
-        OpResult::Done(Ok(buf)) => {
+        OpenReadDirState::Opening(open) => match ready!(open.poll(cx)) {
+          Ok(fd) => {
+            let buf = ReadDirBuf::with_capacity(
+              DEFAULT_READ_DIR_SCRATCH_BYTES,
+              DEFAULT_READ_DIR_ENTRIES_CAP,
+            );
+            (fd, buf)
+          }
+          Err(err) => return Step::Done(Err(err)),
+        },
+        OpenReadDirState::Reading { fd, read } => {
+          let buf = match ready!(read.poll(cx)) {
+            Ok(buf) => buf,
+            Err(err) => return Step::Done(Err(err)),
+          };
           let eof = buf.result.eof;
           if !eof && buf.result.entries == 0 {
             panic!(
@@ -451,35 +411,22 @@ impl OpModel for OpenReadDir {
               .iter()
               .map(|entry| Ok(DirEntry::from_view(self.parent.clone(), entry))),
           );
-          self.buf = Some(buf);
           if eof {
-            OpResult::Done(Ok(ReadDir::new(std::mem::take(&mut self.entries))))
-          } else {
-            let Some(buf) = self.buf.take() else {
-              unreachable!("read_dir buffer missing");
-            };
-            self.state = OpenReadDirState::Reading {
-              fd: fd.clone(),
-              op: ops::ReadDir::new(fd, buf),
-            };
-            OpResult::Again
+            let entries = std::mem::take(&mut self.entries);
+            return Step::Done(Ok(ReadDir::new(entries)));
           }
+          (fd.clone(), buf)
         }
-        OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-        OpResult::Again => {
-          self.state = OpenReadDirState::Reading { fd, op };
-          OpResult::Again
-        }
-        OpResult::Yield(_) => unreachable!("readdir is a oneshot operation"),
-      },
-      OpenReadDirState::Done => {
-        panic!("OpenReadDir completed after reaching terminal state")
-      }
+      };
+      self.state = OpenReadDirState::Reading {
+        read: Op::new(ops::ReadDir::new(fd.clone(), buf)),
+        fd,
+      };
     }
   }
 }
 
-impl OneshotOpModel for OpenReadDir {}
+model_io!(OpenReadDir);
 
 #[derive(Clone)]
 struct PendingDirEntry {
@@ -511,11 +458,11 @@ impl RemoveDirFrame {
     }
   }
 
-  fn next_read(&mut self) -> ops::ReadDir {
+  fn next_read(&mut self) -> Op<ops::ReadDir> {
     let Some(buf) = self.buf.take() else {
       unreachable!("remove_dir_all buffer missing");
     };
-    ops::ReadDir::new(self.fd.clone(), buf)
+    Op::new(ops::ReadDir::new(self.fd.clone(), buf))
   }
 
   fn push_entries(&mut self, buf: ReadDirBuf) {
@@ -540,203 +487,147 @@ pub struct RemoveDirAll {
 }
 
 enum RemoveDirAllState {
-  Opening { parent: Resource, name: CString, op: ops::OpenAt },
-  Reading { op: ops::ReadDir },
-  Stating { parent: Resource, name: CString, op: ops::Stat },
-  RemovingEntry { op: ops::UnlinkAt },
-  RemovingDir { op: ops::UnlinkAt },
-  Done,
+  Opening {
+    parent: Resource,
+    name: CString,
+    open: Op<ops::OpenAt>,
+  },
+  Reading {
+    read: Op<ops::ReadDir>,
+  },
+  Stating {
+    parent: Resource,
+    name: CString,
+    stat: Op<ops::Stat>,
+  },
+  /// Removing a file, or a directory that has been emptied.
+  Removing {
+    unlink: Op<ops::UnlinkAt>,
+  },
+}
+
+impl RemoveDirAllState {
+  fn opening(parent: Resource, name: CString) -> Self {
+    Self::Opening {
+      open: Op::new(open_dir(parent.clone(), name.clone())),
+      parent,
+      name,
+    }
+  }
+
+  fn removing(parent: Resource, name: CString, kind: UnlinkKind) -> Self {
+    Self::Removing { unlink: Op::new(ops::UnlinkAt::new(parent, name, kind)) }
+  }
 }
 
 impl RemoveDirAll {
   fn new(path: CString) -> Self {
-    let parent = Resource::cwd();
     Self {
       stack: Vec::new(),
-      state: RemoveDirAllState::Opening {
-        op: ops::OpenAt::new(
-          parent.clone(),
-          path.clone(),
-          OpenFlags::READ | OpenFlags::DIRECTORY,
-          FileMode::empty(),
-        ),
-        parent,
-        name: path,
-      },
+      state: RemoveDirAllState::opening(Resource::cwd(), path),
     }
   }
 
-  fn advance(&mut self) -> OpResult<io::Result<()>> {
-    let Some(frame) = self.stack.last_mut() else {
-      self.state = RemoveDirAllState::Done;
-      return OpResult::Done(Ok(()));
-    };
+  /// The next step for the directory on top of the stack, or `None` when
+  /// every directory has been removed.
+  fn next_state(&mut self) -> Option<RemoveDirAllState> {
+    let frame = self.stack.last_mut()?;
 
     if let Some(entry) = frame.entries.pop() {
-      match entry.file_type {
+      let parent = frame.fd.clone();
+      return Some(match entry.file_type {
         Some(FileType::Directory) => {
-          self.state = RemoveDirAllState::Opening {
-            op: ops::OpenAt::new(
-              frame.fd.clone(),
-              entry.name.clone(),
-              OpenFlags::READ | OpenFlags::DIRECTORY,
-              FileMode::empty(),
-            ),
-            parent: frame.fd.clone(),
-            name: entry.name,
-          };
+          RemoveDirAllState::opening(parent, entry.name)
         }
         Some(_) => {
-          self.state = RemoveDirAllState::RemovingEntry {
-            op: ops::UnlinkAt::new(
-              frame.fd.clone(),
-              entry.name,
-              UnlinkKind::File,
-            ),
-          };
+          RemoveDirAllState::removing(parent, entry.name, UnlinkKind::File)
         }
-        None => {
-          self.state = RemoveDirAllState::Stating {
-            op: ops::Stat::new_at(frame.fd.clone(), entry.name.clone(), false),
-            parent: frame.fd.clone(),
-            name: entry.name,
-          };
-        }
-      }
-      return OpResult::Again;
+        None => RemoveDirAllState::Stating {
+          stat: Op::new(ops::Stat::new_at(
+            parent.clone(),
+            entry.name.clone(),
+            false,
+          )),
+          parent,
+          name: entry.name,
+        },
+      });
     }
 
     if !frame.eof {
-      self.state = RemoveDirAllState::Reading { op: frame.next_read() };
-      return OpResult::Again;
+      return Some(RemoveDirAllState::Reading { read: frame.next_read() });
     }
 
-    let Some(frame) = self.stack.pop() else {
-      unreachable!("remove_dir_all stack missing frame");
-    };
-    self.state = RemoveDirAllState::RemovingDir {
-      op: ops::UnlinkAt::new(frame.parent, frame.name, UnlinkKind::Directory),
-    };
-    OpResult::Again
+    let frame = self.stack.pop()?;
+    Some(RemoveDirAllState::removing(
+      frame.parent,
+      frame.name,
+      UnlinkKind::Directory,
+    ))
   }
 }
 
-impl OpModel for RemoveDirAll {
+impl Model for RemoveDirAll {
   type Item = io::Result<()>;
 
-  fn action(&mut self) -> Action<'_> {
-    match &mut self.state {
-      RemoveDirAllState::Opening { op, .. } => op.action(),
-      RemoveDirAllState::Reading { op } => op.action(),
-      RemoveDirAllState::Stating { op, .. } => op.action(),
-      RemoveDirAllState::RemovingEntry { op } => op.action(),
-      RemoveDirAllState::RemovingDir { op } => op.action(),
-      RemoveDirAllState::Done => {
-        panic!("RemoveDirAll action requested after completion")
-      }
-    }
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    match std::mem::replace(&mut self.state, RemoveDirAllState::Done) {
-      RemoveDirAllState::Opening { parent, name, mut op } => {
-        match op.complete(completion) {
-          OpResult::Done(Ok(fd)) => {
-            let mut frame = RemoveDirFrame::new(parent, name, fd);
-            let op = frame.next_read();
-            self.stack.push(frame);
-            self.state = RemoveDirAllState::Reading { op };
-            OpResult::Again
-          }
-          OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-          OpResult::Again => {
-            self.state = RemoveDirAllState::Opening { parent, name, op };
-            OpResult::Again
-          }
-          OpResult::Yield(_) => unreachable!("openat is a oneshot operation"),
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    loop {
+      let next = match &mut self.state {
+        RemoveDirAllState::Opening { parent, name, open } => {
+          let fd = match ready!(open.poll(cx)) {
+            Ok(fd) => fd,
+            Err(err) => return Step::Done(Err(err)),
+          };
+          let mut frame = RemoveDirFrame::new(parent.clone(), name.clone(), fd);
+          let read = frame.next_read();
+          self.stack.push(frame);
+          Some(RemoveDirAllState::Reading { read })
         }
-      }
-      RemoveDirAllState::Reading { mut op } => match op.complete(completion) {
-        OpResult::Done(Ok(buf)) => {
+        RemoveDirAllState::Reading { read } => {
+          let buf = match ready!(read.poll(cx)) {
+            Ok(buf) => buf,
+            Err(err) => return Step::Done(Err(err)),
+          };
           if !buf.result.eof && buf.result.entries == 0 {
             panic!(
               "lio::fs::remove_dir_all made no progress: low-level readdir returned zero entries before EOF; internal buffer is too small"
             );
           }
-
           let Some(frame) = self.stack.last_mut() else {
             unreachable!("remove_dir_all missing frame for directory read");
           };
           frame.eof = buf.result.eof;
           frame.push_entries(buf);
-          self.advance()
+          self.next_state()
         }
-        OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-        OpResult::Again => {
-          self.state = RemoveDirAllState::Reading { op };
-          OpResult::Again
+        RemoveDirAllState::Stating { parent, name, stat } => {
+          let stat = match ready!(stat.poll(cx)) {
+            Ok(stat) => stat,
+            Err(err) => return Step::Done(Err(err)),
+          };
+          let (parent, name) = (parent.clone(), name.clone());
+          Some(if stat.is_dir() {
+            RemoveDirAllState::opening(parent, name)
+          } else {
+            RemoveDirAllState::removing(parent, name, UnlinkKind::File)
+          })
         }
-        OpResult::Yield(_) => unreachable!("readdir is a oneshot operation"),
-      },
-      RemoveDirAllState::Stating { parent, name, mut op } => {
-        match op.complete(completion) {
-          OpResult::Done(Ok(stat)) => {
-            self.state = if stat.is_dir() {
-              RemoveDirAllState::Opening {
-                op: ops::OpenAt::new(
-                  parent.clone(),
-                  name.clone(),
-                  OpenFlags::READ | OpenFlags::DIRECTORY,
-                  FileMode::empty(),
-                ),
-                parent,
-                name,
-              }
-            } else {
-              RemoveDirAllState::RemovingEntry {
-                op: ops::UnlinkAt::new(parent, name, UnlinkKind::File),
-              }
-            };
-            OpResult::Again
+        RemoveDirAllState::Removing { unlink } => {
+          if let Err(err) = ready!(unlink.poll(cx)) {
+            return Step::Done(Err(err));
           }
-          OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-          OpResult::Again => {
-            self.state = RemoveDirAllState::Stating { parent, name, op };
-            OpResult::Again
-          }
-          OpResult::Yield(_) => unreachable!("stat is a oneshot operation"),
+          self.next_state()
         }
-      }
-      RemoveDirAllState::RemovingEntry { mut op } => {
-        match op.complete(completion) {
-          OpResult::Done(Ok(())) => self.advance(),
-          OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-          OpResult::Again => {
-            self.state = RemoveDirAllState::RemovingEntry { op };
-            OpResult::Again
-          }
-          OpResult::Yield(_) => unreachable!("unlinkat is a oneshot operation"),
-        }
-      }
-      RemoveDirAllState::RemovingDir { mut op } => {
-        match op.complete(completion) {
-          OpResult::Done(Ok(())) => self.advance(),
-          OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-          OpResult::Again => {
-            self.state = RemoveDirAllState::RemovingDir { op };
-            OpResult::Again
-          }
-          OpResult::Yield(_) => unreachable!("unlinkat is a oneshot operation"),
-        }
-      }
-      RemoveDirAllState::Done => {
-        panic!("RemoveDirAll completed after reaching terminal state")
+      };
+      match next {
+        Some(state) => self.state = state,
+        None => return Step::Done(Ok(())),
       }
     }
   }
 }
 
-impl OneshotOpModel for RemoveDirAll {}
+model_io!(RemoveDirAll);
 
 /// High-level symbolic-link target reader.
 pub struct ReadLink {
@@ -746,64 +637,54 @@ pub struct ReadLink {
 
 enum ReadLinkState {
   /// The path could not be represented; completes with `InvalidInput`.
-  InvalidPath,
-  Reading(ops::ReadlinkAt<Vec<u8>>),
-  Done,
+  InvalidPath(Op<ops::Nop>),
+  Reading(Op<ops::ReadlinkAt<Vec<u8>>>),
 }
 
 impl ReadLink {
   fn new(path: CString) -> Self {
-    Self {
-      path: path.clone(),
-      state: ReadLinkState::Reading(ops::ReadlinkAt::new(
-        Resource::cwd(),
-        path,
-        vec![0u8; DEFAULT_READ_LINK_BYTES],
-      )),
-    }
+    let state = ReadLinkState::reading(&path, DEFAULT_READ_LINK_BYTES);
+    Self { path, state }
   }
 }
 
-impl OpModel for ReadLink {
+impl ReadLinkState {
+  fn reading(path: &CString, len: usize) -> Self {
+    Self::Reading(Op::new(ops::ReadlinkAt::new(
+      Resource::cwd(),
+      path.clone(),
+      vec![0u8; len],
+    )))
+  }
+}
+
+impl Model for ReadLink {
   type Item = io::Result<PathBuf>;
 
-  fn action(&mut self) -> Action<'_> {
-    match &mut self.state {
-      ReadLinkState::InvalidPath => action_io!(crate::backend::op::Op::Nop),
-      ReadLinkState::Reading(op) => op.action(),
-      ReadLinkState::Done => panic!("ReadLink polled after completion"),
-    }
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    match std::mem::replace(&mut self.state, ReadLinkState::Done) {
-      ReadLinkState::InvalidPath => OpResult::Done(Err(ops::nul_path_error())),
-      ReadLinkState::Reading(mut op) => match op.complete(completion) {
-        OpResult::Done((Ok(n), buf)) if n == buf.capacity() => {
-          let next_len = buf.capacity().saturating_mul(2).max(1);
-          self.state = ReadLinkState::Reading(ops::ReadlinkAt::new(
-            Resource::cwd(),
-            self.path.clone(),
-            vec![0u8; next_len],
-          ));
-          OpResult::Again
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    loop {
+      match &mut self.state {
+        ReadLinkState::InvalidPath(nop) => {
+          let _ = ready!(nop.poll(cx));
+          return Step::Done(Err(ops::nul_path_error()));
         }
-        OpResult::Done((Ok(_), buf)) => {
-          OpResult::Done(Ok(PathBuf::from(os_string_from_bytes(&buf))))
-        }
-        OpResult::Done((Err(err), _)) => OpResult::Done(Err(err)),
-        OpResult::Again => {
-          self.state = ReadLinkState::Reading(op);
-          OpResult::Again
-        }
-        OpResult::Yield(_) => unreachable!("readlinkat is a oneshot operation"),
-      },
-      ReadLinkState::Done => panic!("ReadLink completed after terminal state"),
+        ReadLinkState::Reading(read) => match ready!(read.poll(cx)) {
+          // The target may have been cut off: try again with more room.
+          (Ok(n), buf) if n == buf.capacity() => {
+            let next_len = buf.capacity().saturating_mul(2).max(1);
+            self.state = ReadLinkState::reading(&self.path, next_len);
+          }
+          (Ok(_), buf) => {
+            return Step::Done(Ok(PathBuf::from(os_string_from_bytes(&buf))));
+          }
+          (Err(err), _) => return Step::Done(Err(err)),
+        },
+      }
     }
   }
 }
 
-impl OneshotOpModel for ReadLink {}
+model_io!(ReadLink);
 
 /// High-level UTF-8 file reader.
 pub struct ReadToString {
@@ -814,98 +695,67 @@ pub struct ReadToString {
 #[allow(clippy::large_enum_variant)]
 enum ReadToStringState {
   /// The path could not be represented; completes with `InvalidInput`.
-  InvalidPath,
-  Opening(ops::OpenAt),
+  InvalidPath(Op<ops::Nop>),
+  Opening(Op<ops::OpenAt>),
   Reading {
     fd: Resource,
-    op: ops::Read<Vec<u8>>,
+    read: Op<ops::Read<Vec<u8>>>,
   },
-  Done,
 }
 
 impl ReadToString {
   fn new(path: CString) -> Self {
     Self {
-      state: ReadToStringState::Opening(ops::OpenAt::new(
+      state: ReadToStringState::Opening(Op::new(ops::OpenAt::new(
         Resource::cwd(),
         path,
         OpenFlags::READ,
         FileMode::empty(),
-      )),
+      ))),
       bytes: Vec::new(),
     }
   }
 }
 
-impl OpModel for ReadToString {
+impl Model for ReadToString {
   type Item = io::Result<String>;
 
-  fn action(&mut self) -> Action<'_> {
-    match &mut self.state {
-      ReadToStringState::InvalidPath => action_io!(crate::backend::op::Op::Nop),
-      ReadToStringState::Opening(op) => op.action(),
-      ReadToStringState::Reading { op, .. } => op.action(),
-      ReadToStringState::Done => panic!("ReadToString polled after completion"),
-    }
-  }
-
-  fn complete(&mut self, completion: Completion) -> OpResult<Self::Item> {
-    match std::mem::replace(&mut self.state, ReadToStringState::Done) {
-      ReadToStringState::InvalidPath => {
-        OpResult::Done(Err(ops::nul_path_error()))
-      }
-      ReadToStringState::Opening(mut op) => match op.complete(completion) {
-        OpResult::Done(Ok(fd)) => {
-          self.state = ReadToStringState::Reading {
-            fd: fd.clone(),
-            op: ops::Read::new(
-              fd,
-              vec![0u8; DEFAULT_READ_TO_STRING_BYTES],
-              None,
-            ),
-          };
-          OpResult::Again
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    loop {
+      let (fd, buf) = match &mut self.state {
+        ReadToStringState::InvalidPath(nop) => {
+          let _ = ready!(nop.poll(cx));
+          return Step::Done(Err(ops::nul_path_error()));
         }
-        OpResult::Done(Err(err)) => OpResult::Done(Err(err)),
-        OpResult::Again => {
-          self.state = ReadToStringState::Opening(op);
-          OpResult::Again
+        ReadToStringState::Opening(open) => match ready!(open.poll(cx)) {
+          Ok(fd) => (fd, vec![0u8; DEFAULT_READ_TO_STRING_BYTES]),
+          Err(err) => return Step::Done(Err(err)),
+        },
+        ReadToStringState::Reading { fd, read } => {
+          match ready!(read.poll(cx)) {
+            (Ok(0), _) => {
+              let bytes = std::mem::take(&mut self.bytes);
+              return Step::Done(String::from_utf8(bytes).map_err(|err| {
+                io::Error::new(io::ErrorKind::InvalidData, err)
+              }));
+            }
+            (Ok(n), buf) => {
+              self.bytes.extend_from_slice(&buf[..n]);
+              (fd.clone(), buf)
+            }
+            (Err(err), _) => return Step::Done(Err(err)),
+          }
         }
-        OpResult::Yield(_) => unreachable!("openat is a oneshot operation"),
-      },
-      ReadToStringState::Reading { fd, mut op } => {
-        match op.complete(completion) {
-          OpResult::Done((Ok(0), _buf)) => {
-            let bytes = std::mem::take(&mut self.bytes);
-            OpResult::Done(
-              String::from_utf8(bytes)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err)),
-            )
-          }
-          OpResult::Done((Ok(n), buf)) => {
-            self.bytes.extend_from_slice(&buf[..n]);
-            self.state = ReadToStringState::Reading {
-              fd: fd.clone(),
-              op: ops::Read::new(fd, buf, None),
-            };
-            OpResult::Again
-          }
-          OpResult::Done((Err(err), _)) => OpResult::Done(Err(err)),
-          OpResult::Again => {
-            self.state = ReadToStringState::Reading { fd, op };
-            OpResult::Again
-          }
-          OpResult::Yield(_) => unreachable!("read is a oneshot operation"),
-        }
-      }
-      ReadToStringState::Done => {
-        panic!("ReadToString completed after terminal state")
-      }
+      };
+      self.state = ReadToStringState::Reading {
+        read: Op::new(ops::Read::new(fd.clone(), buf, None)),
+        fd,
+      };
     }
   }
 }
 
-impl OneshotOpModel for ReadToString {}
+model_io!(ReadToString);
 
 /// Opens a directory reader relative to the current working directory.
 ///
@@ -913,15 +763,12 @@ impl OneshotOpModel for ReadToString {}
 pub fn read_dir<P: AsRef<Path>>(path: P) -> Io<OpenReadDir> {
   let parent = path.as_ref().to_path_buf();
   let state = match path_to_cstring(path.as_ref()) {
-    Some(path) => OpenReadDirState::Opening(ops::OpenAt::new(
-      Resource::cwd(),
-      path,
-      OpenFlags::READ | OpenFlags::DIRECTORY,
-      FileMode::empty(),
-    )),
-    None => OpenReadDirState::InvalidPath,
+    Some(path) => {
+      OpenReadDirState::Opening(Op::new(open_dir(Resource::cwd(), path)))
+    }
+    None => OpenReadDirState::InvalidPath(Op::new(ops::Nop)),
   };
-  Io::from_op(OpenReadDir::new(state, parent))
+  Io::from_op(OpenReadDir { state, parent, entries: Vec::new() })
 }
 
 /// Reads metadata for a path relative to the current working directory, following symlinks.
@@ -958,9 +805,10 @@ pub fn metadata_cstring(
 pub fn read_link<P: AsRef<Path>>(path: P) -> Io<ReadLink> {
   Io::from_op(match path_to_cstring(path.as_ref()) {
     Some(path) => ReadLink::new(path),
-    None => {
-      ReadLink { path: CString::default(), state: ReadLinkState::InvalidPath }
-    }
+    None => ReadLink {
+      path: CString::default(),
+      state: ReadLinkState::InvalidPath(Op::new(ops::Nop)),
+    },
   })
 }
 
@@ -970,9 +818,10 @@ pub fn read_link<P: AsRef<Path>>(path: P) -> Io<ReadLink> {
 pub fn read_to_string<P: AsRef<Path>>(path: P) -> Io<ReadToString> {
   Io::from_op(match path_to_cstring(path.as_ref()) {
     Some(path) => ReadToString::new(path),
-    None => {
-      ReadToString { state: ReadToStringState::InvalidPath, bytes: Vec::new() }
-    }
+    None => ReadToString {
+      state: ReadToStringState::InvalidPath(Op::new(ops::Nop)),
+      bytes: Vec::new(),
+    },
   })
 }
 
@@ -1070,11 +919,32 @@ mod open_options_tests {
 
   #[test]
   fn invalid_options_complete_without_io() {
-    let mut op = OpenFile { inner: Err("bad options") };
-    assert!(op.action().is_nop());
-    let OpResult::Done(Err(err)) = op.complete(Completion::new(0)) else {
+    use crate::backend::op::Op as BackendOp;
+    use crate::backend::testing::ScriptedBackend;
+    use std::{cell::RefCell, rc::Rc};
+
+    let backend = ScriptedBackend::new();
+    let lio = crate::Lio::new_with_backend(backend.clone(), 1).unwrap();
+    let result = Rc::new(RefCell::new(None));
+    let out = Rc::clone(&result);
+    OpenOptions::new()
+      .truncate(true)
+      .open(c"file".to_owned())
+      .with_lio(&lio)
+      .when_done(move |res| *out.borrow_mut() = Some(res));
+
+    // The error arrives from the driver, after a nop, never inline.
+    assert!(result.borrow().is_none());
+    lio.try_run().unwrap();
+    let id = backend.in_flight()[0];
+    assert!(matches!(backend.op(id), Some(BackendOp::Nop)));
+    backend.complete(id, 0);
+    lio.try_run().unwrap();
+
+    let Some(Err(err)) = result.borrow_mut().take() else {
       panic!("invalid options must fail");
     };
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(backend.in_flight().is_empty());
   }
 }

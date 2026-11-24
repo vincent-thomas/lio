@@ -10,8 +10,8 @@ use std::time::Duration;
 mod immediate_sockets {
   use super::super::Poller;
   use crate::api::{
-    self,
     op::{Action, Completion, OpModel, OpResult},
+    ops,
     resource::Resource,
   };
   use crate::backend::{IoBackend, op::Op};
@@ -58,7 +58,7 @@ mod immediate_sockets {
   fn ready_receive_does_not_register_readiness() {
     let (socket, mut peer) = pair(true);
     peer.write_all(b"hello").unwrap();
-    let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
+    let mut model = Box::new(ops::Recv::new(socket.clone(), vec![0; 5], None));
     let mut backend = backend();
     queue(&mut backend, 11, &mut *model);
     backend.flush().unwrap();
@@ -79,7 +79,7 @@ mod immediate_sockets {
   #[test]
   fn unavailable_receive_is_registered_and_completes_later() {
     let (socket, mut peer) = pair(true);
-    let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
+    let mut model = Box::new(ops::Recv::new(socket.clone(), vec![0; 5], None));
     let mut backend = backend();
     queue(&mut backend, 12, &mut *model);
     backend.flush().unwrap();
@@ -97,7 +97,7 @@ mod immediate_sockets {
   #[test]
   fn blocking_socket_keeps_readiness_first_behavior() {
     let (socket, mut peer) = pair(false);
-    let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
+    let mut model = Box::new(ops::Recv::new(socket.clone(), vec![0; 5], None));
     let mut backend = backend();
     queue(&mut backend, 13, &mut *model);
     backend.flush().unwrap();
@@ -114,7 +114,7 @@ mod immediate_sockets {
   fn ready_send_does_not_register_readiness() {
     let (socket, mut peer) = pair(true);
     let mut model =
-      Box::new(api::send(&socket, b"hello".to_vec(), None).into_inner());
+      Box::new(ops::Send::new(socket.clone(), b"hello".to_vec(), None, None));
     let mut backend = backend();
     queue(&mut backend, 14, &mut *model);
     backend.flush().unwrap();
@@ -131,7 +131,7 @@ mod immediate_sockets {
   #[test]
   fn immediate_completions_do_not_starve_registered_receives() {
     let (socket, mut peer) = pair(true);
-    let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
+    let mut model = Box::new(ops::Recv::new(socket.clone(), vec![0; 5], None));
     let mut backend = backend();
     queue(&mut backend, 15, &mut *model);
     backend.flush().unwrap();
@@ -158,7 +158,7 @@ mod immediate_sockets {
   #[test]
   fn drain_drops_a_registered_receive() {
     let (socket, _peer) = pair(true);
-    let mut model = Box::new(api::recv(&socket, vec![0; 5], None).into_inner());
+    let mut model = Box::new(ops::Recv::new(socket.clone(), vec![0; 5], None));
     let mut backend = backend();
     queue(&mut backend, 15, &mut *model);
     backend.flush().unwrap();
@@ -189,7 +189,7 @@ mod immediate_sockets {
       std::os::fd::OwnedFd::from_raw_fd(socket.into_raw_fd())
     });
     let mut model =
-      Box::new(api::send(&socket, b"hello".to_vec(), None).into_inner());
+      Box::new(ops::Send::new(socket.clone(), b"hello".to_vec(), None, None));
     let mut backend = backend();
     queue(&mut backend, 17, &mut *model);
     backend.flush().unwrap();

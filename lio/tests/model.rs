@@ -12,7 +12,7 @@ use lio::api::{self, OpenFlags};
 use lio::backend::ds::{DSBackend, DSConfig};
 use lio::backend::op::Op;
 use lio::backend::testing::{Checked, POISON, ScriptedBackend};
-use lio::model::{self, Copy, Cx, Join, Model, Read, Step, Task, Write};
+use lio::model::{self, Cx, Join, Model, Read, Step, Task, Write};
 use lio::{BufResult, Lio};
 
 fn scripted(cap: usize) -> (ScriptedBackend, Lio) {
@@ -71,7 +71,8 @@ fn read_gives_back_the_buffer_with_what_was_written() {
 fn copy_alternates_reads_and_writes_until_the_source_ends() {
   let (backend, lio) = scripted(4);
   let (stdin, stdout) = (Resource::stdin(), Resource::stdout());
-  let (items, _task) = collect(&lio, Copy::new(&stdin, &stdout, 8));
+  let (items, _task) =
+    collect(&lio, lio::io::copy(&stdin, &stdout).into_inner());
 
   assert!(matches!(only_op(&backend, &lio), Op::Read { .. }));
   finish_only(&backend, &lio, 5);
@@ -92,7 +93,8 @@ fn copy_alternates_reads_and_writes_until_the_source_ends() {
 fn copy_stops_at_the_first_error() {
   let (backend, lio) = scripted(4);
   let (stdin, stdout) = (Resource::stdin(), Resource::stdout());
-  let (items, _task) = collect(&lio, Copy::new(&stdin, &stdout, 8));
+  let (items, _task) =
+    collect(&lio, lio::io::copy(&stdin, &stdout).into_inner());
 
   finish_only(&backend, &lio, 4);
   finish_only(&backend, &lio, -9);
@@ -134,7 +136,7 @@ fn composites_nest() {
   let (backend, lio) = scripted(4);
   let (stdin, stdout) = (Resource::stdin(), Resource::stdout());
   let model = Join::new(
-    Copy::new(&stdin, &stdout, 8),
+    lio::io::copy(&stdin, &stdout).into_inner(),
     Write::new(&stdout, b"hi".to_vec()),
   );
   let (items, _task) = collect(&lio, model);
@@ -344,7 +346,7 @@ fn copy_moves_a_file_through_a_simulated_backend() {
     | OpenFlags::WRITE
     | OpenFlags::CREATE
     | OpenFlags::TRUNCATE;
-  let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+  let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
 
   let src = open(&lio, "/tmp/lio_model_copy_src", create);
   let (written, _task) = collect(&lio, WriteAll::new(&src, data.clone()));
@@ -352,8 +354,8 @@ fn copy_moves_a_file_through_a_simulated_backend() {
 
   let src = open(&lio, "/tmp/lio_model_copy_src", OpenFlags::READ);
   let dst = open(&lio, "/tmp/lio_model_copy_dst", create);
-  // A buffer smaller than the file: several read/write rounds.
-  let (copied, _task) = collect(&lio, Copy::new(&src, &dst, 1024));
+  // The file is larger than the copy buffer: several read/write rounds.
+  let (copied, _task) = collect(&lio, lio::io::copy(&src, &dst).into_inner());
   assert_eq!(run_to_item(&lio, &copied).unwrap(), data.len() as u64);
 
   let dst = open(&lio, "/tmp/lio_model_copy_dst", OpenFlags::READ);
