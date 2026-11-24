@@ -1,61 +1,129 @@
-# Project notes for lio
+# lio — notes for coding agents
 
-## Design philosophy
+`lio` is a manually driven, syscall-shaped async I/O library with pluggable
+backends (io_uring on Linux, epoll/kqueue polling on Unix, IOCP on Windows).
+The bar is **production-ready**: correctness, memory safety and tested
+contracts come before features or speed.
 
-`lio` is **pure bookkeeping**. Its job is to track operations, manage buffers, route
-completions, and provide type-safe abstractions — nothing more.
+## Repository map
 
-- **All actual I/O** (syscalls, kernel submissions, polling) belongs in `IoBackend`
-  implementations (`backend/impls/`). The `IoBackend` trait and `Op` data types in
-  `backend/op.rs` define the contract surface; they hold data, not platform code.
-- **No `libc`**, no `windows-sys`, no `cfg(target_os)` conditional code shall appear
-  outside of a backend implementation crate. The main `lio` crate must be
-  platform-independent.
-- **Allocation** (future goal) should follow the same pattern — outsourced to a
-  pluggable allocator interface.
+| Path | What it is |
+| --- | --- |
+| `lio/` | The main crate. Default member; `cargo test` with no `-p` hits it. |
+| `lio/src/api/` | Public ops: constructors (`mod.rs`), op state machines (`ops.rs`), the `Io<T>` handle (`io.rs`), `OpModel` traits (`op.rs`), `Resource` (`resource.rs`). |
+| `lio/src/lio.rs` | The `Lio` driver (mounted as `mod driver`). |
+| `lio/src/{registration,slab,backend/store}.rs` | In-flight op bookkeeping: slots, generations, per-slot bump arenas. |
+| `lio/src/time/` | Hierarchical timer wheel (`clock.rs`). |
+| `lio/src/backend/op.rs` | `Op`: the backend contract, **pure data**. |
+| `lio/src/backend/impls/` | Real backends: `io_uring.rs`, `pollingv2/`, `iocp.rs`, plus shared OS helpers. |
+| `lio/src/backend/testing.rs` | `ScriptedBackend` and `Checked`: drive the core with no I/O. |
+| `lio/src/backend/ds.rs` | `DSBackend`: seeded deterministic simulation (synthetic fs/sockets). |
+| `lio/src/{fs,net}/` | Higher-level wrappers, behind the `high` feature. |
+| `lio/src/ffi.rs` | C API behind `unstable_ffi`; `build.rs` regenerates `lio/include/lio.h`. |
+| `lio-test/` | Contract macros: `test_io_backend!`, `test_op_model_contract!`. |
+| `lio-uring/` | Safe io_uring bindings (Linux only, bindgen over the `liburing` submodule). |
+| `lio-tls/` | rustls on top of `lio::net`. |
+| `examples/busybox/` | Large Unix coreutils clone used as a dogfooding app (not built on Windows). |
 
-### Remaining platform-specific code in the main crate
+## How an operation flows
 
-No `libc`/`windows-sys` calls remain outside `backend/` (the backend
-implementations plus `backend::native` and `backend::sockaddr`, the OS
-primitives they share) and the `unstable_ffi` C interface. What is left is
-inherent or confined:
+```
+api::read(..)            -> Io<ops::Read<B>>             (user handle)
+  .with_lio(&lio) / global, then .await | .when_done | .send
+OpModel::action()        -> Action::Io(Op::Read{..}) | Action::Sleep(d)
+Lio driver               -> OpStore slot + Registration, IoBackend::push/flush
+IoBackend::wait()        -> OpCompleted { registration_id, result: isize }
+OpModel::complete(Completion) -> OpResult::{Again, Yield(item), Done(item)}
+```
 
-- `Resource` implements the std raw descriptor/handle traits per platform
-  (`AsRawFd`/`FromRawFd`, `AsRawHandle`/`FromRawHandle`).
-- Lossless `OsString` <-> byte conversions use `std::os::unix::ffi` under
-  `cfg(unix)`.
-- Unit-test fixtures may create real descriptors with `libc`.
+Negative `result` is a raw negated OS error code. Buffers move into the op
+and come back with the result; nothing borrows across an in-flight op.
 
-New code must keep it that way: OS primitives belong in `backend/`, and the
-contract (`backend::op`) stays pure data.
+Backend contract (see the `IoBackend` docs in `lio/src/backend/mod.rs`):
+`push` only queues; `flush` submits; every pushed id yields **exactly one**
+completion, including after `cancel`; an `Op`'s memory must stay valid until
+that completion; `drain` returns `false` if anything may still touch it.
 
-## Panics
+## Hard rules
 
-- No `debug_assert!`: CI rejects it, since it is compiled out of release
-  builds. Use `assert!`.
-- Library code denies `clippy::unwrap_used` and `clippy::expect_used`
-  (`clippy.toml` exempts test code), so every panic is spelled as one and
-  reads as intentional. Return an error or restructure where you can. Where a
-  panic is deliberate, write it out with `let ... else`:
-  `unreachable!` for a broken internal invariant, `panic!` for caller misuse
-  (document it under `# Panics`). Don't silence the lints with `#[allow]` or
-  `#[expect]`.
+1. **The core is bookkeeping only.** Syscalls, kernel submission and
+   polling live in `backend/impls/`. No `libc`, `windows-sys` or
+   `cfg(target_os)` outside `backend/` and `ffi.rs`. The only accepted
+   exceptions: `Resource`'s std raw fd/handle trait impls, `OsString`
+   byte conversions under `cfg(unix)`, and `libc` in unit-test fixtures.
+   `backend/op.rs` stays platform-free data.
+2. **No `debug_assert!` / `debug_assert_eq!` / `debug_assert_ne!`.** CI greps
+   for them. Use `assert!`.
+3. **No `unwrap`/`expect` in library code** (denied; `clippy.toml` allows
+   them in tests). Return an error, or restructure. A deliberate panic is
+   spelled with `let ... else`: `unreachable!` for a broken internal
+   invariant, `panic!` for caller misuse, documented under `# Panics`.
+   Never silence these lints with `#[allow]`/`#[expect]`.
+4. **Every `unsafe` block gets a `// SAFETY:` comment** (denied by
+   `clippy::undocumented_unsafe_blocks`).
+5. **Platform gates go on individual tests, never on whole test crates or
+   modules** (`#![cfg(unix)]` on a test file is rejected). Port the test with
+   helpers in `lio/tests/common.rs`; gate only what is truly
+   platform-specific, with the reason in a comment.
+6. **Build scripts must not rerun when nothing changed.** CI fails if a
+   second `cargo check` compiles anything.
+7. CI sets `RUSTFLAGS=-Dwarnings`: warnings are errors.
+
+## Commands
+
+Toolchains and tools come from `mise.toml` (`mise install`; it also
+initialises the `liburing` submodule). Rust is pinned to 1.100.0; nightly is
+only for Miri.
+
+```bash
+mise run lint                                   # fmt --check, check, clippy, cargo deny
+cargo clippy --workspace --all-targets --all-features
+cargo nextest run -p lio --lib                  # core bookkeeping tests (fast)
+cargo nextest run -p lio --features high        # + integration tests
+cargo test --doc -p lio -p lio-test --all-features   # nextest does not run doctests
+cargo test -p lio --test backends poller        # one backend's contract suite
+scripts/test-miri.sh                            # core tests under Miri
+scripts/test-ffi.sh                             # C API (builds lib, runs tests/ffi)
+```
+
+CI itself runs `cargo test`; `cargo nextest run` is equivalent for unit and
+integration tests and is the local default. On macOS `lio-uring` is skipped
+(`--exclude lio-uring`); on Windows also `busybox`, with `--features lio/high`.
+
+Run each suite once per change. Don't loop test runs to probe flakiness on
+macOS (it triggers OS permission prompts); ask first.
 
 ## Testing contract
 
-- When changing `lio::backend::op::Op` fields or semantic wrapper types, update the
-  `lio-test` backend contract macro as well as `lio` unit/integration tests.
-  `cargo test -p lio --lib` is not sufficient; run `mise run test` to compile
-  integration tests and doctests that instantiate raw `Op` values.
-- Core bookkeeping is tested without I/O through `lio::backend::testing`
-  (`ScriptedBackend`, `Checked`). Tests that need a real backend are marked
-  `#[cfg_attr(miri, ignore = "needs a real backend")]`; `mise run miri`
-  (`scripts/test-miri.sh`) runs the rest under Miri. That run is nightly
-  (`.github/workflows/deep.yaml`).
-- Search sizes: `PROPTEST_CASES` (model tests) and `LIO_LIFECYCLE_DEPTH`
-  (lifecycle enumeration). CI runs them small on PRs (`mise run test`) and
-  large nightly (`mise run search` in `.github/workflows/deep.yaml`), along
-  with every cargo-mutants mutant of the files `.cargo/mutants.toml` lists
-  (`mise run mutants`). A surviving mutant in a PR's diff fails CI
-  (`mise run mutants-diff`): add a test that kills it.
+- **Core logic** (driver, store, slab, registration, timers, `Io`) is tested
+  without I/O through `ScriptedBackend` + `Checked`. Prefer this for any core
+  change. Tests that need a real backend carry
+  `#[cfg_attr(miri, ignore = "needs a real backend")]`.
+- **Model tests** (`lio/src/lio_model_tests.rs`, proptest, size via
+  `PROPTEST_CASES`) and **lifecycle enumeration**
+  (`lio/src/lio_lifecycle_tests.rs`, depth via `LIO_LIFECYCLE_DEPTH`,
+  default 6) cover driver orderings. PRs run them small; `deep.yaml` runs
+  them large nightly.
+- **Op models**: each one in `api/ops.rs` implements `OpModelContract` and
+  instantiates `lio_test::test_op_model_contract!`.
+- **Backends**: `lio_test::test_io_backend!` in `lio/tests/backends/*.rs`.
+  Its doc comment lists the exact per-op guarantees (results, errnos).
+- **Changing `Op` fields or semantic wrapper types** means updating the
+  `lio-test` contract macro, every backend, `DSBackend`, `ScriptedBackend`,
+  and running the full suite including doctests: `-p lio --lib` alone misses
+  integration tests and doctests that build raw `Op` values.
+- **Mutation testing**: CI mutates every changed line in the files listed in
+  `.cargo/mutants.toml`. A surviving mutant fails the PR; add a test that
+  kills it. Add to `exclude_re` only for a genuinely equivalent mutant, with
+  a comment proving why.
+
+## Conventions
+
+- `rustfmt.toml`: 2-space indent, 80 columns. Run `cargo fmt`.
+- Doc comments explain *why* and state contracts; keep them true when code
+  changes. Public ops use `doc_op!` (`lio/src/macros.rs`) to link the
+  equivalent syscall.
+- Building with `unstable_ffi` regenerates `lio/include/lio.h`; commit it
+  with the `ffi.rs` change.
+- Commit subjects: short, imperative, sentence case, ending with a period
+  (`Fail a Miri run that selects nothing.`).
