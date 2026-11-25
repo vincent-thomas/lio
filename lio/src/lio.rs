@@ -1029,10 +1029,13 @@ impl Lio {
     } else {
       self.run_with::<false>(inner, timeout)
     };
-    // Also after an error: what this run removed is dropped either way.
-    self.bury_and_wake();
-    self.poll_woken();
-    let (processed, waiters) = ran?;
+    // After an error, what this run removed is still dropped. After a run
+    // that left nothing behind, there is nothing to do.
+    if ran.as_ref().map_or(true, |ran| ran.2) {
+      self.bury_and_wake();
+      self.poll_woken();
+    }
+    let (processed, waiters, _) = ran?;
     for waker in waiters {
       waker.wake();
     }
@@ -1163,7 +1166,7 @@ impl Lio {
     &'a self,
     mut inner: RefMut<'a, LioInner>,
     timeout: Option<Duration>,
-  ) -> io::Result<(usize, Vec<Waker>)> {
+  ) -> io::Result<(usize, Vec<Waker>, bool)> {
     let mut stats = LioProfile::default();
     let inner_ref = &mut *inner;
 
@@ -1241,7 +1244,13 @@ impl Lio {
       stats.completions_returned = processed;
       profile.merge(&stats);
     }
-    Ok((processed, Self::release_capacity(&mut inner)))
+    let waiters = Self::release_capacity(&mut inner);
+    // Whether this run left something to drop or a model to poll, which
+    // happens with the driver not borrowed.
+    let unfinished = !inner.dying.is_empty()
+      || !inner.abandoned.is_empty()
+      || !inner.woken.is_empty();
+    Ok((processed, waiters, unfinished))
   }
 
   /// Routes one completion to its registration, releasing `inner` only while
