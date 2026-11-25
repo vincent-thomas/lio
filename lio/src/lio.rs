@@ -897,30 +897,27 @@ impl Lio {
     }
   }
 
-  /// Removes registration `id`, to be dropped by
-  /// [`bury_and_wake`](Self::bury_and_wake) once the driver is not borrowed.
+  /// Gives back slot `id`, which is spent.
   #[inline]
   fn retire(inner: &mut LioInner, id: u64) {
     assert!(
       !inner.time.contains(id),
       "driver: removed registration {id} with its timer still scheduled"
     );
-    // One copy, straight into `dying`. A held lease then leaves that list:
-    // the registration is leaked and the slot stays reserved, so the buffers
-    // the backend still uses stay valid.
-    inner.store.detach_known_into(id, &mut inner.dying);
-    let held = inner
-      .dying
-      .last()
-      .is_some_and(|detached| detached.registration.lease_held());
-    if held {
-      let Some(detached) = inner.dying.pop() else {
-        unreachable!(
-          "driver: retire moved registration {id} and dying is empty"
-        );
-      };
+    let Some(detached) = inner.store.detach(id) else {
+      unreachable!("driver: retired slot {id}, which is not taken");
+    };
+    if detached.registration.lease_held() {
+      // A backend may still use the operation's memory: the registration
+      // is leaked and the slot stays reserved, so that memory stays valid.
       inner.leaked += 1;
       std::mem::forget(detached);
+    } else {
+      // The slot is spent: its model and its consumer were dropped when the
+      // model finished, and its operation's result was taken. Nothing is
+      // left that would run user code, so it goes back right away.
+      inner.store.release(detached.slot);
+      drop(detached.registration);
     }
     Self::assert_retired_slots_tracked(inner);
   }
@@ -1058,6 +1055,12 @@ impl Lio {
       drop(abandoned);
       let mut inner = self.inner.borrow_mut();
       if inner.dying.is_empty() {
+        // Slots given back since the last time may be wanted.
+        let waiters = Self::release_capacity(&mut inner);
+        drop(inner);
+        for waker in waiters {
+          waker.wake();
+        }
         return;
       }
       if inner.dying.len() == 1 {
@@ -1938,23 +1941,16 @@ mod tests {
   }
 
   #[test]
-  fn a_batch_of_256_stays_full_until_every_registration_is_dropped() {
-    let full = full_while_burying(256);
-    assert_eq!(full.len(), 256);
-    assert!(
-      full.iter().all(|full| *full),
-      "a finishing model's slot is still taken while its consumer is dropped"
-    );
-  }
-
-  #[test]
-  fn a_batch_past_256_gives_every_slot_back() {
+  fn a_slot_goes_back_as_soon_as_its_model_is_done() {
     // What a model and its consumer hold is dropped when the model
-    // finishes, with its slot still taken. The slots go back afterwards,
-    // in chunks past 256.
+    // finishes, with its own slot still taken.
+    assert_eq!(full_while_burying(1), [true]);
+    // The slots of the models that finished before it are free by then.
     let full = full_while_burying(257);
     assert_eq!(full.len(), 257);
-    assert!(full.iter().all(|full| *full));
+    assert!(full[0], "nothing has finished before the first");
+    assert!(full[1..].iter().all(|full| !*full));
+
     let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 257).unwrap();
     for _ in 0..257 {
       crate::api::nop().with_lio(&lio).when_done(|_| {});

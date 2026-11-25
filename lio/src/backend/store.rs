@@ -156,33 +156,6 @@ impl OpStore {
     Some(Detached { registration, slot: key.slot() })
   }
 
-  /// [`detach`](Self::detach) for an ID already validated by `get_mut`
-  /// under the same exclusive store borrow, appended straight into `out`.
-  ///
-  /// Returning the registration and then pushing it copies the value twice
-  /// (it does not fit in registers). One copy, into the spare slot of `out`,
-  /// is enough.
-  #[inline]
-  pub fn detach_known_into(&mut self, id: u64, out: &mut Vec<Detached>) {
-    let key = SlabKey::from_u64(id);
-    out.reserve(1);
-    self.slots.retire_known_with(key, |slot| {
-      // SAFETY: `reserve` left a spare element, and this slot holds an
-      // initialized registration. The write moves it; the slot is marked
-      // retired only after this returns, and nothing else drops it.
-      unsafe {
-        let dst = out.as_mut_ptr().add(out.len());
-        std::ptr::copy_nonoverlapping(
-          slot.registration.as_ptr(),
-          std::ptr::addr_of_mut!((*dst).registration),
-          1,
-        );
-        std::ptr::addr_of_mut!((*dst).slot).write(key.slot());
-        out.set_len(out.len() + 1);
-      }
-    });
-  }
-
   /// Makes a slot whose registration was [`detach`](Self::detach)ed and
   /// dropped available again.
   /// Number of detached registrations whose slot is not released yet.
