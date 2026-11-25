@@ -11,6 +11,7 @@ use bumpalo::Bump;
 
 #[cfg(test)]
 use crate::api::op::Action;
+use crate::backend::Keep;
 use crate::registration::Registration;
 use crate::slab::{SlabKey, SlotPool};
 
@@ -18,6 +19,10 @@ struct StoreSlot {
   registration: MaybeUninit<Registration>,
   model_bump: Bump,
   step_bump: Bump,
+  /// The driver's share of the lease on the memory of the slot's operation.
+  /// A backend holds the other shares. It belongs to the slot, not to the
+  /// registration in it, so using a slot again allocates nothing.
+  lease: Keep,
 }
 
 /// Store for in-flight I/O operations using contiguous memory.
@@ -58,6 +63,7 @@ impl OpStore {
         registration: MaybeUninit::uninit(),
         model_bump: Bump::new(),
         step_bump: Bump::new(),
+        lease: Keep::new(),
       }),
     }
   }
@@ -186,17 +192,37 @@ impl OpStore {
   pub fn with_slot<R>(
     &mut self,
     id: u64,
-    f: impl FnOnce(&mut Registration, &mut Bump) -> R,
+    f: impl FnOnce(&mut Registration, &mut Bump, &Keep) -> R,
   ) -> Option<R> {
     let key = SlabKey::from_u64(id);
     let slot = self.slots.get_mut(key)?;
-    // SAFETY: an occupied slot's registration is initialized. `registration`
-    // and `step_bump` are different fields, so the two references do not alias.
-    let (registration, step_bump) = unsafe {
-      let slot = slot as *mut StoreSlot;
-      ((*slot).registration.assume_init_mut(), &mut (*slot).step_bump)
-    };
-    Some(f(registration, step_bump))
+    let lease = &slot.lease;
+    // SAFETY: an occupied slot's registration is initialized.
+    let registration = unsafe { slot.registration.assume_init_mut() };
+    Some(f(registration, &mut slot.step_bump, lease))
+  }
+
+  /// Whether a backend still holds a share of the lease of slot `id`: it
+  /// may still use the memory of an operation that slot held.
+  #[inline]
+  pub fn lease_held(&mut self, id: u64) -> bool {
+    let key = SlabKey::from_u64(id);
+    self.slots.get_mut(key).is_some_and(|slot| slot.lease.held_elsewhere())
+  }
+
+  /// Frees slot `id` and drops its registration where it is.
+  ///
+  /// For a registration whose drop runs no user code. Returns whether the
+  /// slot was taken.
+  #[inline]
+  pub fn remove_in_place(&mut self, id: u64) -> bool {
+    let key = SlabKey::from_u64(id);
+    let removed = self.slots.remove_with(key, |slot| {
+      // SAFETY: occupied slots always contain an initialized registration,
+      // and the slot no longer counts as initialized once this returns.
+      unsafe { slot.registration.assume_init_drop() }
+    });
+    removed.is_some()
   }
 
   /// Inserts an operation and submits it while its model is borrowed.
@@ -212,7 +238,7 @@ impl OpStore {
   pub fn insert_submitting(
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
-    submit: impl FnOnce(u64, &mut Registration, &mut Bump, &mut Insert),
+    submit: impl FnOnce(u64, &mut Registration, &mut Bump, &Keep, &mut Insert),
   ) -> Option<u64> {
     let Some(slot_idx) = self.slots.peek_free() else {
       panic!("insert on a full store: check is_full first");
@@ -240,7 +266,8 @@ impl OpStore {
       let slot = (*slots).state_mut(slot_idx);
       let registration = slot.registration.assume_init_mut();
       let step_bump = &mut slot.step_bump as *mut Bump;
-      submit(id, registration, &mut *step_bump, &mut guard.token());
+      let lease = &slot.lease as *const Keep;
+      submit(id, registration, &mut *step_bump, &*lease, &mut guard.token());
     }
     if !guard.keep {
       if guard.drop_registration {
@@ -568,7 +595,7 @@ mod tests {
     let mut store = OpStore::with_capacity(1);
     let id = store.insert_submitting(
       |arena| holding(arena, tx),
-      |_id, _reg, _bump, _insert| {},
+      |_id, _reg, _bump, _lease, _insert| {},
     );
     assert!(id.is_none());
     assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
@@ -582,7 +609,7 @@ mod tests {
     let id = store
       .insert_submitting(
         |arena| holding(arena, tx),
-        |_id, _reg, _bump, insert| insert.keep_on_panic(),
+        |_id, _reg, _bump, _lease, insert| insert.keep_on_panic(),
       )
       .expect("the slot was claimed");
     assert!(store.is_full());
@@ -597,7 +624,7 @@ mod tests {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       store.insert_submitting(
         |arena| holding(arena, tx),
-        |_id, _reg, _bump, _insert| panic!("action failed"),
+        |_id, _reg, _bump, _lease, _insert| panic!("action failed"),
       );
     }));
     assert!(result.is_err());
@@ -616,7 +643,7 @@ mod tests {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       store.insert_submitting(
         |arena| holding(arena, tx),
-        |new_id, _reg, _bump, insert| {
+        |new_id, _reg, _bump, _lease, insert| {
           id.set(new_id);
           insert.keep_on_panic();
           panic!("push failed");
