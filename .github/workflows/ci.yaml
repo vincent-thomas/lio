@@ -57,9 +57,38 @@ jobs:
           version: "2026.11.12"
           cache: false
 
-      # fmt, check, check-clean, clippy, then test. Windows skips check-clean.
+      # fmt, check, check-clean, clippy, cargo deny, then test. Each runs once. Windows skips check-clean.
       - name: ci
         run: mise run ci
+
+  # The C ABI, then the C and C++ tests that link it.
+  # Linux uses the mise conda g++. macOS uses the image clang++.
+  ffi:
+    name: ffi-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      # Checked downloads. The action does not restore an install tree.
+      # https://mise.jdx.dev/continuous-integration.html#trusted-cache
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.os == 'macOS' && '~/Library/Caches/mise/downloads-cas' || '~/.cache/mise/downloads-cas' }}
+          key: mise-downloads-${{ runner.os }}-${{ hashFiles('mise.lock') }}
+
+      - uses: jdx/mise-action@v5
+        with:
+          version: "2026.11.12"
+          cache: false
+
+      - name: ffi
+        run: mise run ffi
 
   # Slow, and still a merge gate: a mutant that survives in the diff fails CI.
   mutants:
