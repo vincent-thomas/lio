@@ -251,7 +251,7 @@ impl OpStore {
       (*slots).assert_free(slot_idx);
       let slot = (*slots).state_mut(slot_idx);
       slot.model_bump.reset();
-      slot.step_bump.reset();
+      // The step arena is reset by whoever starts an operation in the slot.
       slot.registration.write(init(&mut slot.model_bump));
     }
     // SAFETY: same pointer as above, still the only use of this pool.
