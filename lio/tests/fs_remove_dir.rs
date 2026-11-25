@@ -78,3 +78,46 @@ fn fs_remove_dir_all_does_not_follow_directory_symlinks() {
   std::fs::remove_file(target.join("target.txt")).ok();
   std::fs::remove_dir(&target).ok();
 }
+
+#[test]
+fn fs_remove_dir_all_removes_more_files_than_it_removes_at_once() {
+  let mut lio = Lio::new(64).unwrap();
+  let dir = temp_path("fs_remove_dir_all_wide");
+  std::fs::create_dir(&dir).unwrap();
+  // Wider than one concurrent batch, with subdirectories among the files.
+  for i in 0..100 {
+    std::fs::write(dir.join(format!("file-{i}")), b"x").unwrap();
+  }
+  for sub in ["a", "b", "c"] {
+    std::fs::create_dir(dir.join(sub)).unwrap();
+    for i in 0..40 {
+      std::fs::write(dir.join(sub).join(format!("file-{i}")), b"x").unwrap();
+    }
+    symlink(dir.join("file-0"), dir.join(sub).join("link")).unwrap();
+  }
+
+  let mut remove =
+    fs::remove_dir_all(path_to_cstring(&dir)).with_lio(&lio).send();
+  poll_recv(&mut lio, &mut remove).expect("remove_dir_all wide");
+
+  assert!(!dir.exists());
+}
+
+#[test]
+fn fs_remove_dir_all_fits_a_driver_smaller_than_one_batch() {
+  // Four slots: the directory handle and the removals share them, and the
+  // removals past that wait their turn.
+  let mut lio = Lio::new(4).unwrap();
+  let dir = temp_path("fs_remove_dir_all_small_driver");
+  std::fs::create_dir_all(dir.join("nested")).unwrap();
+  for i in 0..50 {
+    std::fs::write(dir.join(format!("file-{i}")), b"x").unwrap();
+    std::fs::write(dir.join("nested").join(format!("file-{i}")), b"x").unwrap();
+  }
+
+  let mut remove =
+    fs::remove_dir_all(path_to_cstring(&dir)).with_lio(&lio).send();
+  poll_recv(&mut lio, &mut remove).expect("remove_dir_all small driver");
+
+  assert!(!dir.exists());
+}

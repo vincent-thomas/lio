@@ -68,26 +68,91 @@ fn read_gives_back_the_buffer_with_what_was_written() {
   assert!(items.is_empty());
 }
 
+/// The in-flight operations `is` accepts.
+fn in_flight(backend: &ScriptedBackend, is: impl Fn(&Op) -> bool) -> Vec<u64> {
+  let mut ids = backend.in_flight();
+  ids.retain(|&id| backend.op(id).is_some_and(|op| is(&op)));
+  ids
+}
+
+fn reads(backend: &ScriptedBackend) -> Vec<u64> {
+  in_flight(backend, |op| matches!(op, Op::Read { .. }))
+}
+
+fn writes(backend: &ScriptedBackend) -> Vec<u64> {
+  in_flight(backend, |op| matches!(op, Op::Write { .. }))
+}
+
+/// Finishes `id` with `result`, and lets the driver route it and submit
+/// what that starts.
+fn finish(backend: &ScriptedBackend, lio: &Lio, id: u64, result: isize) {
+  backend.complete(id, result);
+  lio.try_run().unwrap();
+  lio.try_run().unwrap();
+}
+
 #[test]
-fn copy_alternates_reads_and_writes_until_the_source_ends() {
+fn copy_reads_the_next_chunk_while_it_writes_the_last() {
   let (backend, lio) = scripted(4);
   let (stdin, stdout) = (Resource::stdin(), Resource::stdout());
   let (items, _task) =
     collect(&lio, lio::io::copy(&stdin, &stdout).into_inner());
+  lio.try_run().unwrap();
+  assert_eq!((reads(&backend).len(), writes(&backend).len()), (1, 0));
 
-  assert!(matches!(only_op(&backend, &lio), Op::Read { .. }));
-  finish_only(&backend, &lio, 5);
-  // A short write: the rest of the buffer is written again.
-  assert!(matches!(only_op(&backend, &lio), Op::Write { .. }));
-  finish_only(&backend, &lio, 2);
-  assert!(matches!(only_op(&backend, &lio), Op::Write { .. }));
-  finish_only(&backend, &lio, 3);
-  assert!(matches!(only_op(&backend, &lio), Op::Read { .. }));
-  assert!(items.borrow().is_empty());
-  finish_only(&backend, &lio, 0);
+  // The first chunk is written while the second is read.
+  finish(&backend, &lio, reads(&backend)[0], 5);
+  assert_eq!((reads(&backend).len(), writes(&backend).len()), (1, 1));
 
-  assert_eq!(items.borrow_mut().pop().unwrap().unwrap(), 5);
+  // A short write: the rest of the chunk is written again.
+  finish(&backend, &lio, writes(&backend)[0], 2);
+  assert_eq!((reads(&backend).len(), writes(&backend).len()), (1, 1));
+
+  // The second chunk arrives while the first is still being written. It
+  // waits, and nothing more is read until it has been taken.
+  finish(&backend, &lio, reads(&backend)[0], 4);
+  assert_eq!((reads(&backend).len(), writes(&backend).len()), (0, 1));
+
+  // The first chunk is out: the second is written and a third is read.
+  finish(&backend, &lio, writes(&backend)[0], 3);
+  assert_eq!((reads(&backend).len(), writes(&backend).len()), (1, 1));
+
+  // The source ends while the second chunk is still being written.
+  finish(&backend, &lio, reads(&backend)[0], 0);
+  assert_eq!((reads(&backend).len(), writes(&backend).len()), (0, 1));
+  assert!(items.borrow().is_empty(), "the last chunk is not written yet");
+
+  finish(&backend, &lio, writes(&backend)[0], 4);
+  assert_eq!(items.borrow_mut().pop().unwrap().unwrap(), 9);
   assert!(backend.in_flight().is_empty());
+  assert_eq!(backend.pushed().len(), 6, "three reads and three writes");
+}
+
+#[test]
+fn copy_n_reads_no_further_than_its_limit() {
+  let (backend, lio) = scripted(4);
+  let (stdin, stdout) = (Resource::stdin(), Resource::stdout());
+  let (items, _task) =
+    collect(&lio, lio::io::copy_n(&stdin, &stdout, 6).into_inner());
+  lio.try_run().unwrap();
+
+  // Four of six: the read that runs beside the write asks for two more.
+  finish(&backend, &lio, reads(&backend)[0], 4);
+  let ahead = reads(&backend);
+  assert_eq!((ahead.len(), writes(&backend).len()), (1, 1));
+  finish(&backend, &lio, ahead[0], 2);
+  // The limit is reached: no third read, though the source has not ended.
+  finish(&backend, &lio, writes(&backend)[0], 4);
+  assert_eq!((reads(&backend).len(), writes(&backend).len()), (0, 1));
+  finish(&backend, &lio, writes(&backend)[0], 2);
+
+  assert_eq!(items.borrow_mut().pop().unwrap().unwrap(), 6);
+  assert_eq!(backend.pushed().len(), 4, "two reads and two writes");
+
+  let (items, _task) =
+    collect(&lio, lio::io::copy_n(&stdin, &stdout, 0).into_inner());
+  assert_eq!(items.borrow_mut().pop().unwrap().unwrap(), 0);
+  assert_eq!(backend.pushed().len(), 4, "a limit of zero submits nothing");
 }
 
 #[test]
@@ -98,11 +163,31 @@ fn copy_stops_at_the_first_error() {
     collect(&lio, lio::io::copy(&stdin, &stdout).into_inner());
 
   finish_only(&backend, &lio, 4);
-  finish_only(&backend, &lio, -9);
+  lio.try_run().unwrap();
+  let ahead = reads(&backend);
+  finish(&backend, &lio, writes(&backend)[0], -9);
 
   let err = items.borrow_mut().pop().unwrap().unwrap_err();
   assert_eq!(err.raw_os_error(), Some(9));
+  assert_eq!(backend.cancelled(), ahead, "the read beside it is cancelled");
+  backend.complete_all(-125);
+  lio.try_run().unwrap();
   assert!(backend.in_flight().is_empty());
+  assert!(!lio.is_full());
+
+  // An error from the read ends the copy too, and cancels the write.
+  let (items, _task) =
+    collect(&lio, lio::io::copy(&stdin, &stdout).into_inner());
+  finish_only(&backend, &lio, 4);
+  lio.try_run().unwrap();
+  let writing = writes(&backend);
+  finish(&backend, &lio, reads(&backend)[0], -5);
+  let err = items.borrow_mut().pop().unwrap().unwrap_err();
+  assert_eq!(err.raw_os_error(), Some(5));
+  assert!(backend.cancelled().ends_with(&writing));
+  backend.complete_all(-125);
+  lio.try_run().unwrap();
+  assert!(!lio.is_full());
 }
 
 #[test]

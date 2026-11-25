@@ -438,6 +438,9 @@ struct RemoveDirFrame {
   fd: Resource,
   buf: Option<ReadDirBuf>,
   entries: Vec<PendingDirEntry>,
+  /// Subdirectories found so far, removed one after another once the
+  /// entries read with them are gone.
+  dirs: Vec<CString>,
   eof: bool,
 }
 
@@ -452,6 +455,7 @@ impl RemoveDirFrame {
         DEFAULT_REMOVE_DIR_ALL_ENTRIES_CAP,
       )),
       entries: Vec::new(),
+      dirs: Vec::new(),
       eof: false,
     }
   }
@@ -478,7 +482,15 @@ impl RemoveDirFrame {
   }
 }
 
+/// How many entries of one directory are removed at the same time.
+const REMOVE_DIR_ALL_CONCURRENCY: usize = 16;
+
 /// Recursive directory-removal operation specialized to return `()`.
+///
+/// The files of a directory are removed concurrently, up to
+/// [`REMOVE_DIR_ALL_CONCURRENCY`] at a time. Its subdirectories are removed
+/// one after another, so the number of open directories stays the depth of
+/// the tree.
 pub struct RemoveDirAll {
   stack: Vec<RemoveDirFrame>,
   state: RemoveDirAllState,
@@ -493,24 +505,29 @@ enum RemoveDirAllState {
   Reading {
     read: ops::ReadDir,
   },
-  Stating {
-    parent: Resource,
-    name: CString,
-    stat: ops::Stat,
+  /// Removing the entries read so far that are not directories.
+  Clearing {
+    in_flight: Vec<Clearing>,
   },
-  /// Removing a file, or a directory that has been emptied.
+  /// Removing a directory that has been emptied.
   Removing {
     unlink: ops::UnlinkAt,
   },
 }
 
+/// One entry of the directory being cleared.
+enum Clearing {
+  /// An entry whose type the directory listing did not say.
+  Stat {
+    name: CString,
+    stat: ops::Stat,
+  },
+  Unlink(ops::UnlinkAt),
+}
+
 impl RemoveDirAllState {
   fn opening(parent: Resource, name: CString) -> Self {
     Self::Opening { open: open_dir(parent.clone(), name.clone()), parent, name }
-  }
-
-  fn removing(parent: Resource, name: CString, kind: UnlinkKind) -> Self {
-    Self::Removing { unlink: ops::UnlinkAt::new(parent, name, kind) }
   }
 }
 
@@ -527,37 +544,100 @@ impl RemoveDirAll {
   fn next_state(&mut self) -> Option<RemoveDirAllState> {
     let frame = self.stack.last_mut()?;
 
-    if let Some(entry) = frame.entries.pop() {
-      let parent = frame.fd.clone();
-      return Some(match entry.file_type {
-        Some(FileType::Directory) => {
-          RemoveDirAllState::opening(parent, entry.name)
-        }
-        Some(_) => {
-          RemoveDirAllState::removing(parent, entry.name, UnlinkKind::File)
-        }
-        None => RemoveDirAllState::Stating {
-          stat: ops::Stat::new(ops::StatOf::Path {
-            dir: parent.clone(),
-            path: entry.name.clone(),
-            follow_symlinks: false,
-          }),
-          parent,
-          name: entry.name,
-        },
-      });
+    if !frame.entries.is_empty() {
+      return Some(RemoveDirAllState::Clearing { in_flight: Vec::new() });
     }
-
+    if let Some(name) = frame.dirs.pop() {
+      return Some(RemoveDirAllState::opening(frame.fd.clone(), name));
+    }
     if !frame.eof {
       return Some(RemoveDirAllState::Reading { read: frame.next_read() });
     }
 
     let frame = self.stack.pop()?;
-    Some(RemoveDirAllState::removing(
-      frame.parent,
-      frame.name,
-      UnlinkKind::Directory,
-    ))
+    Some(RemoveDirAllState::Removing {
+      unlink: ops::UnlinkAt::new(
+        frame.parent,
+        frame.name,
+        UnlinkKind::Directory,
+      ),
+    })
+  }
+}
+
+impl RemoveDirFrame {
+  /// Starts removing entries until `in_flight` is full or none are left.
+  /// Directories are set aside.
+  fn start_clearing(&mut self, in_flight: &mut Vec<Clearing>) -> bool {
+    let mut started = false;
+    while in_flight.len() < REMOVE_DIR_ALL_CONCURRENCY
+      && let Some(entry) = self.entries.pop()
+    {
+      match entry.file_type {
+        Some(FileType::Directory) => self.dirs.push(entry.name),
+        Some(_) => {
+          in_flight.push(Clearing::Unlink(self.unlink_file(entry.name)));
+          started = true;
+        }
+        None => {
+          in_flight.push(Clearing::Stat {
+            stat: ops::Stat::new(ops::StatOf::Path {
+              dir: self.fd.clone(),
+              path: entry.name.clone(),
+              follow_symlinks: false,
+            }),
+            name: entry.name,
+          });
+          started = true;
+        }
+      }
+    }
+    started
+  }
+
+  fn unlink_file(&self, name: CString) -> ops::UnlinkAt {
+    ops::UnlinkAt::new(self.fd.clone(), name, UnlinkKind::File)
+  }
+
+  /// Polls every entry being cleared. Returns whether any of them moved on,
+  /// or the first error.
+  fn poll_clearing(
+    &mut self,
+    in_flight: &mut Vec<Clearing>,
+    cx: &mut Cx<'_>,
+  ) -> io::Result<bool> {
+    let mut progressed = false;
+    let mut i = 0;
+    while let Some(entry) = in_flight.get_mut(i) {
+      match entry {
+        Clearing::Stat { name, stat } => {
+          let (Step::Yield(stat) | Step::Done(stat)) = stat.poll(cx) else {
+            i += 1;
+            continue;
+          };
+          let name = std::mem::take(name);
+          if stat?.is_dir() {
+            self.dirs.push(name);
+            in_flight.swap_remove(i);
+          } else {
+            // Polled, and so submitted, on the next round.
+            *entry = Clearing::Unlink(self.unlink_file(name));
+            i += 1;
+          }
+          progressed = true;
+        }
+        Clearing::Unlink(unlink) => {
+          let (Step::Yield(done) | Step::Done(done)) = unlink.poll(cx) else {
+            i += 1;
+            continue;
+          };
+          done?;
+          in_flight.swap_remove(i);
+          progressed = true;
+        }
+      }
+    }
+    Ok(progressed)
   }
 }
 
@@ -594,17 +674,25 @@ impl OpModel for RemoveDirAll {
           frame.push_entries(buf);
           self.next_state()
         }
-        RemoveDirAllState::Stating { parent, name, stat } => {
-          let stat = match ready!(stat.poll(cx)) {
-            Ok(stat) => stat,
-            Err(err) => return Step::Done(Err(err)),
+        RemoveDirAllState::Clearing { in_flight } => {
+          let Some(frame) = self.stack.last_mut() else {
+            unreachable!("remove_dir_all missing frame for its entries");
           };
-          let (parent, name) = (parent.clone(), name.clone());
-          Some(if stat.is_dir() {
-            RemoveDirAllState::opening(parent, name)
-          } else {
-            RemoveDirAllState::removing(parent, name, UnlinkKind::File)
-          })
+          loop {
+            let started = frame.start_clearing(in_flight);
+            let progressed = match frame.poll_clearing(in_flight, cx) {
+              Ok(progressed) => progressed,
+              // Dropping the rest cancels what is still in flight.
+              Err(err) => return Step::Done(Err(err)),
+            };
+            if in_flight.is_empty() && frame.entries.is_empty() {
+              break;
+            }
+            if !started && !progressed {
+              return Step::Pending;
+            }
+          }
+          self.next_state()
         }
         RemoveDirAllState::Removing { unlink } => {
           if let Err(err) = ready!(unlink.poll(cx)) {
