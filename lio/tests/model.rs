@@ -605,7 +605,7 @@ fn io_runs_a_model_of_your_own_like_one_of_lio_s() {
   // With a callback.
   let done = Rc::new(RefCell::new(None));
   let sink = Rc::clone(&done);
-  lio::api::Io::from_op(TwoNops::new())
+  api::run(TwoNops::new())
     .with_lio(&lio)
     .when_done(move |item| *sink.borrow_mut() = Some(item));
   finish_only(&backend, &lio, 0);
@@ -665,4 +665,30 @@ fn a_model_takes_one_slot_however_many_steps_it_has() {
   assert_eq!(items.borrow_mut().pop().unwrap().unwrap(), 2);
   let ids = backend.pushed();
   assert_eq!(ids[0], ids[1], "both steps ran in the model's slot");
+}
+
+#[test]
+fn run_stream_gives_a_model_s_items_one_at_a_time() {
+  let (backend, lio) = scripted(4);
+  let from = Resource::stdin();
+  let read = api::read(&from, Vec::<u8>::with_capacity(4)).into_inner();
+  let mut stream = api::run_stream(Chunks { from, read }).with_lio(&lio);
+  let mut cx = Context::from_waker(Waker::noop());
+
+  let mut lens = Vec::new();
+  for result in [4, 2, 0] {
+    assert!(Box::pin(stream.next()).as_mut().poll(&mut cx).is_pending());
+    finish_only(&backend, &lio, result);
+    let Poll::Ready(Some((_, buf))) =
+      Box::pin(stream.next()).as_mut().poll(&mut cx)
+    else {
+      panic!("the chunk that was read is an item");
+    };
+    lens.push(buf.len());
+  }
+  assert_eq!(lens, [4, 2, 0]);
+  // The model is done: so is the stream.
+  let end = Box::pin(stream.next()).as_mut().poll(&mut cx);
+  assert!(matches!(end, Poll::Ready(None)));
+  assert!(!lio.is_full());
 }
