@@ -17,14 +17,61 @@ pub(crate) type CompleteFn<S, Out> = fn(&mut S, Completion) -> Out;
 /// action.
 type WithActionFn = fn(*mut (), &mut dyn for<'a> FnMut(Action<'a>));
 
+/// Where one operation's result goes: a callback placed in the operation's
+/// arena, with its type erased down to the result it takes.
+///
+/// The operation's memory and its callback are written by different code:
+/// the memory by the function that submits the operation, the callback by
+/// whoever runs it. This is how the two meet without either naming the
+/// other's type.
+pub(crate) struct Callback<Out> {
+  data: *mut (),
+  call: fn(*mut (), Out),
+  drop: fn(*mut ()),
+}
+
+impl<Out> Callback<Out> {
+  #[inline]
+  pub(crate) fn new_in<F>(arena: &mut Bump, f: F) -> Self
+  where
+    F: Fn(Out) + 'static,
+  {
+    Self {
+      data: BumpBox::into_raw(BumpBox::new_in(f, arena)) as *mut (),
+      call: |data, out| {
+        // SAFETY: `data` was created from an `F` in `new_in` and is valid
+        // until this `Callback` is dropped.
+        let f = unsafe { &*(data as *const F) };
+        f(out);
+      },
+      drop: |data| {
+        // SAFETY: `data` was allocated by `BumpBox::into_raw` in `new_in`,
+        // and `Callback::drop` runs this once.
+        unsafe { drop(BumpBox::from_raw(data as *mut F)) };
+      },
+    }
+  }
+
+  #[inline]
+  fn call(&self, out: Out) {
+    (self.call)(self.data, out);
+  }
+}
+
+impl<Out> Drop for Callback<Out> {
+  fn drop(&mut self) {
+    (self.drop)(self.data);
+  }
+}
+
 /// Everything one operation needs, in its slot's arena: the memory the
 /// backend uses, the two functions that speak for it, and where the result
 /// goes.
-struct Payload<S, Out, F> {
+struct Payload<S, Out> {
   state: S,
   action: ActionFn<S>,
   complete: CompleteFn<S, Out>,
-  callback: F,
+  callback: Callback<Out>,
 }
 
 /// A copy of a registration's completion handler that can run without access
@@ -69,60 +116,73 @@ pub struct Registration {
 impl Registration {
   /// Creates a registration whose payload lives in a bump arena.
   ///
-  /// `state` is the memory the operation uses. `action` and `complete` are
-  /// that operation's two halves, and `callback` receives its result.
+  /// `state` is the memory the operation uses. `action` builds what it
+  /// submits from that memory, `complete` reads its result out of it, and
+  /// `callback` receives that result.
   #[inline]
-  pub(crate) fn new_in<S, Out, F>(
+  pub(crate) fn new_in<S, Out>(
     arena: &mut Bump,
     state: S,
     action: ActionFn<S>,
     complete: CompleteFn<S, Out>,
-    callback: F,
+    callback: Callback<Out>,
   ) -> Self
   where
     S: 'static,
     Out: 'static,
-    F: Fn(Out) + 'static,
   {
     Self {
       payload: BumpBox::into_raw(BumpBox::new_in(
         Payload { state, action, complete, callback },
         arena,
       )) as *mut (),
-      on_completion_fn: Self::on_completion_impl::<S, Out, F>,
-      with_action_fn: Self::with_action_impl::<S, Out, F>,
-      drop_fn: Self::drop_impl::<S, Out, F>,
+      on_completion_fn: Self::on_completion_impl::<S, Out>,
+      with_action_fn: Self::with_action_impl::<S, Out>,
+      drop_fn: Self::drop_impl::<S, Out>,
       lease: crate::backend::Keep::new(),
     }
   }
 
+  /// A nop whose result goes to `f`: the smallest registration there is.
+  #[cfg(test)]
+  pub(crate) fn nop_in<F>(arena: &mut Bump, f: F) -> Self
+  where
+    F: Fn(std::io::Result<()>) + 'static,
+  {
+    let callback = Callback::new_in(arena, f);
+    Self::new_in(
+      arena,
+      (),
+      |_| Action::nop(),
+      |_, completion| completion.status(),
+      callback,
+    )
+  }
+
   #[inline]
-  fn with_action_impl<S, Out, F>(
+  fn with_action_impl<S, Out>(
     payload_ptr: *mut (),
     f: &mut dyn for<'a> FnMut(Action<'a>),
   ) {
-    // SAFETY: `payload_ptr` was created from a `Payload<S, Out, F>` in
-    // `new_in` and stays valid for the registration's lifetime.
-    let payload = unsafe { &mut *(payload_ptr as *mut Payload<S, Out, F>) };
+    // SAFETY: `payload_ptr` was created from a `Payload<S, Out>` in `new_in`
+    // and stays valid for the registration's lifetime.
+    let payload = unsafe { &mut *(payload_ptr as *mut Payload<S, Out>) };
     f((payload.action)(&mut payload.state));
   }
 
   #[inline]
-  fn on_completion_impl<S, Out, F>(payload_ptr: *mut (), completion: Completion)
-  where
-    F: Fn(Out),
-  {
-    // SAFETY: `payload_ptr` was created from a `Payload<S, Out, F>` in
-    // `new_in` and stays valid while completions are dispatched.
-    let payload = unsafe { &mut *(payload_ptr as *mut Payload<S, Out, F>) };
+  fn on_completion_impl<S, Out>(payload_ptr: *mut (), completion: Completion) {
+    // SAFETY: `payload_ptr` was created from a `Payload<S, Out>` in `new_in`
+    // and stays valid while completions are dispatched.
+    let payload = unsafe { &mut *(payload_ptr as *mut Payload<S, Out>) };
     let out = (payload.complete)(&mut payload.state, completion);
-    (payload.callback)(out);
+    payload.callback.call(out);
   }
 
-  fn drop_impl<S, Out, F>(payload_ptr: *mut ()) {
+  fn drop_impl<S, Out>(payload_ptr: *mut ()) {
     // SAFETY: `payload_ptr` was allocated by `BumpBox::into_raw` in `new_in`.
     unsafe {
-      drop(BumpBox::from_raw(payload_ptr as *mut Payload<S, Out, F>));
+      drop(BumpBox::from_raw(payload_ptr as *mut Payload<S, Out>));
     }
   }
 
@@ -179,23 +239,12 @@ impl Drop for Registration {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::api::ops::raw::Nop;
   use std::cell::{Cell, RefCell};
   use std::rc::Rc;
 
-  /// A nop that counts its drops and reports the raw result.
+  /// The memory of a nop that counts its drops.
   struct Counted {
     drops: Rc<Cell<usize>>,
-  }
-
-  impl Counted {
-    fn action(&mut self) -> Action<'_> {
-      Action::nop()
-    }
-
-    fn complete(&mut self, completion: Completion) -> isize {
-      completion.result()
-    }
   }
 
   impl Drop for Counted {
@@ -204,11 +253,26 @@ mod tests {
     }
   }
 
+  /// A registration over `Counted` that reports the raw result.
+  fn counted(
+    arena: &mut Bump,
+    drops: &Rc<Cell<usize>>,
+    f: impl Fn(isize) + 'static,
+  ) -> Registration {
+    let callback = Callback::new_in(arena, f);
+    Registration::new_in(
+      arena,
+      Counted { drops: Rc::clone(drops) },
+      |_| Action::nop(),
+      |_, completion| completion.result(),
+      callback,
+    )
+  }
+
   #[test]
   fn the_action_is_the_one_the_state_builds() {
     let mut arena = Bump::new();
-    let mut reg =
-      Registration::new_in(&mut arena, Nop, Nop::action, Nop::complete, |_| {});
+    let mut reg = Registration::nop_in(&mut arena, |_| {});
     let mut seen = 0;
     reg.with_action(&mut |action| {
       assert!(action.is_nop());
@@ -223,13 +287,8 @@ mod tests {
     let results = Rc::new(RefCell::new(Vec::new()));
     let sink = Rc::clone(&results);
     let mut arena = Bump::new();
-    let mut reg = Registration::new_in(
-      &mut arena,
-      Counted { drops: Rc::clone(&drops) },
-      Counted::action,
-      Counted::complete,
-      move |result| sink.borrow_mut().push(result),
-    );
+    let mut reg =
+      counted(&mut arena, &drops, move |result| sink.borrow_mut().push(result));
 
     let handler = reg.begin_completion();
     // SAFETY: `reg` is alive and this is its only completion.
@@ -247,15 +306,9 @@ mod tests {
     let held = Rc::new(());
     let in_callback = Rc::clone(&held);
     let mut arena = Bump::new();
-    let reg = Registration::new_in(
-      &mut arena,
-      Counted { drops: Rc::clone(&drops) },
-      Counted::action,
-      Counted::complete,
-      move |_| {
-        let _held = &in_callback;
-      },
-    );
+    let reg = counted(&mut arena, &drops, move |_| {
+      let _held = &in_callback;
+    });
     assert_eq!(Rc::strong_count(&held), 2);
 
     drop(reg);

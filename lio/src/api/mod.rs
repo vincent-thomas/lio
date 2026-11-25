@@ -47,8 +47,8 @@ pub use io::{Io, IoStream, Receiver, StreamReceiver};
 pub use ops::UnixAddr;
 pub use pid::Pid;
 
+use crate::backend::op::socket_addr_into_buf;
 use crate::{IoBufMutVec, IoBufVec};
-use ops::raw;
 use resource::AsResource;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -57,7 +57,7 @@ doc_op! {
     short: "A no-op operation useful for driving and testing the runtime.",
 
     pub fn nop() -> Io<ops::Nop> {
-        Io::leaf(raw::Nop)
+        Io::from_op(ops::Nop::new())
     }
 }
 
@@ -65,7 +65,7 @@ doc_op! {
     short: "Completes after the specified duration elapses.",
 
     pub fn sleep(duration: Duration) -> Io<ops::Sleep> {
-        Io::leaf(raw::Sleep::new(duration))
+        Io::from_op(ops::Sleep::new(duration))
     }
 }
 
@@ -84,7 +84,7 @@ doc_op! {
         ty: SockType,
         proto: SockProto,
     ) -> Io<ops::Socket> {
-        Io::leaf(raw::Socket::new(domain, ty, proto))
+        Io::from_op(ops::Socket::new(domain, ty, proto))
     }
 }
 
@@ -95,7 +95,7 @@ doc_op! {
     where
         B: IoBufMutVec + Send + Sync + 'static,
     {
-        Io::leaf(raw::Read::new(res.as_resource().clone(), buf, None))
+        Io::from_op(ops::Read::new(res.as_resource().clone(), buf, None))
     }
 }
 
@@ -110,7 +110,7 @@ doc_op! {
     where
         B: IoBufMutVec + Send + Sync + 'static,
     {
-        Io::leaf(raw::Read::new(res.as_resource().clone(), buf, Some(offset)))
+        Io::from_op(ops::Read::new(res.as_resource().clone(), buf, Some(offset)))
     }
 }
 
@@ -123,7 +123,7 @@ doc_op! {
     where
         B: IoBufVec + Send + Sync + 'static,
     {
-        Io::leaf(raw::Write::new(res.as_resource().clone(), buf, None))
+        Io::from_op(ops::Write::new(res.as_resource().clone(), buf, None))
     }
 }
 
@@ -140,7 +140,7 @@ doc_op! {
     where
         B: IoBufVec + Send + Sync + 'static,
     {
-        Io::leaf(raw::Write::new(
+        Io::from_op(ops::Write::new(
             res.as_resource().clone(),
             buf,
             Some(offset),
@@ -153,7 +153,7 @@ doc_op! {
     syscall: "fsync(2)",
 
     pub fn fsync(res: &impl AsResource) -> Io<ops::Fsync> {
-        Io::leaf(raw::Fsync::new(res.as_resource().clone()))
+        Io::from_op(ops::Fsync::new(res.as_resource().clone()))
     }
 }
 
@@ -168,7 +168,11 @@ doc_op! {
     where
         B: IoBufMutVec + Send + Sync + 'static,
     {
-        Io::leaf(raw::Recv::new(res.as_resource().clone(), buf, flags))
+        Io::from_op(ops::Recv::new(
+            res.as_resource().clone(),
+            buf,
+            flags.unwrap_or(RecvFlags::empty()),
+        ))
     }
 }
 
@@ -183,7 +187,12 @@ doc_op! {
     where
         B: IoBufVec + Send + Sync + 'static,
     {
-        Io::leaf(raw::Send::new(res.as_resource().clone(), buf, None, flags))
+        Io::from_op(ops::Send::new(
+            res.as_resource().clone(),
+            buf,
+            None,
+            flags.unwrap_or(SendFlags::empty()),
+        ))
     }
 }
 
@@ -200,7 +209,11 @@ doc_op! {
     where
         B: IoBufMutVec + Send + Sync + 'static,
     {
-        Io::leaf(raw::RecvFrom::new(res.as_resource().clone(), buf, flags))
+        Io::from_op(ops::RecvFrom::new(
+            res.as_resource().clone(),
+            buf,
+            flags.unwrap_or(RecvFlags::empty()),
+        ))
     }
 }
 
@@ -210,7 +223,7 @@ doc_op! {
     pub fn accept(
         res: &impl AsResource,
     ) -> Io<ops::Accept> {
-        Io::leaf(raw::Accept::new(res.as_resource().clone()))
+        Io::from_op(ops::Accept::new(res.as_resource().clone()))
     }
 }
 
@@ -220,7 +233,7 @@ doc_op! {
     pub fn accept_unix(
         res: &impl AsResource,
     ) -> Io<ops::AcceptUnix> {
-        Io::leaf(raw::AcceptUnix::new(res.as_resource().clone()))
+        Io::from_op(ops::AcceptUnix::new(res.as_resource().clone()))
     }
 }
 
@@ -231,7 +244,10 @@ doc_op! {
         res: &impl AsResource,
         addr: SocketAddr,
     ) -> Io<ops::Connect> {
-        Io::leaf(raw::Connect::new(res.as_resource().clone(), addr))
+        Io::from_op(ops::Connect::new(
+            res.as_resource().clone(),
+            socket_addr_into_buf(addr),
+        ))
     }
 }
 
@@ -242,7 +258,10 @@ doc_op! {
         res: &impl AsResource,
         addr: SocketAddr,
     ) -> Io<ops::Bind> {
-        Io::leaf(raw::Bind::new(res.as_resource().clone(), addr))
+        Io::from_op(ops::Bind::new(
+            res.as_resource().clone(),
+            socket_addr_into_buf(addr),
+        ))
     }
 }
 
@@ -253,7 +272,7 @@ doc_op! {
         res: &impl AsResource,
         backlog: i32,
     ) -> Io<ops::Listen> {
-        Io::leaf(raw::Listen::new(res.as_resource().clone(), backlog))
+        Io::from_op(ops::Listen::new(res.as_resource().clone(), backlog))
     }
 }
 
@@ -264,7 +283,7 @@ doc_op! {
         res: &impl AsResource,
         how: ShutdownHow,
     ) -> Io<ops::Shutdown> {
-        Io::leaf(raw::Shutdown::new(res.as_resource().clone(), how))
+        Io::from_op(ops::Shutdown::new(res.as_resource().clone(), how))
     }
 }
 
@@ -277,7 +296,7 @@ doc_op! {
         flags: OpenFlags,
         mode: FileMode,
     ) -> Io<ops::OpenAt> {
-        Io::leaf(raw::OpenAt::new(
+        Io::from_op(ops::OpenAt::new(
             dir_res.as_resource().clone(),
             path,
             flags,
@@ -294,11 +313,11 @@ doc_op! {
         path: std::ffi::CString,
         follow_symlinks: bool,
     ) -> Io<ops::Stat> {
-        Io::leaf(raw::Stat::new_at(
-            dir_res.as_resource().clone(),
+        Io::from_op(ops::Stat::new(ops::StatOf::Path {
+            dir: dir_res.as_resource().clone(),
             path,
             follow_symlinks,
-        ))
+        }))
     }
 }
 
@@ -308,7 +327,7 @@ doc_op! {
     pub fn fstat(
         fd: &impl AsResource,
     ) -> Io<ops::Stat> {
-        Io::leaf(raw::Stat::new_fd(fd.as_resource().clone()))
+        Io::from_op(ops::Stat::new(ops::StatOf::File(fd.as_resource().clone())))
     }
 }
 
@@ -322,7 +341,7 @@ doc_op! {
         fd: &impl AsResource,
         buf: ReadDirBuf,
     ) -> Io<ops::ReadDir> {
-        Io::leaf(raw::ReadDir::new(fd.as_resource().clone(), buf))
+        Io::from_op(ops::ReadDir::new(fd.as_resource().clone(), buf))
     }
 }
 
@@ -334,7 +353,7 @@ doc_op! {
         path: std::ffi::CString,
         kind: UnlinkKind,
     ) -> Io<ops::UnlinkAt> {
-        Io::leaf(raw::UnlinkAt::new(
+        Io::from_op(ops::UnlinkAt::new(
             dir_res.as_resource().clone(),
             path,
             kind,
@@ -351,7 +370,7 @@ doc_op! {
         new_dir_res: &impl AsResource,
         new_path: std::ffi::CString,
     ) -> Io<ops::RenameAt> {
-        Io::leaf(raw::RenameAt::new(
+        Io::from_op(ops::RenameAt::new(
             old_dir_res.as_resource().clone(),
             old_path,
             new_dir_res.as_resource().clone(),
@@ -368,7 +387,7 @@ doc_op! {
         path: std::ffi::CString,
         mode: FileMode,
     ) -> Io<ops::MkdirAt> {
-        Io::leaf(raw::MkdirAt::new(
+        Io::from_op(ops::MkdirAt::new(
             dir_res.as_resource().clone(),
             path,
             mode,
@@ -386,7 +405,7 @@ doc_op! {
         new_path: std::ffi::CString,
         kind: ops::LinkKind,
     ) -> Io<ops::LinkAt> {
-        Io::leaf(raw::LinkAt::new(
+        Io::from_op(ops::LinkAt::new(
             source_dir_res.as_resource().clone(),
             source_path,
             new_dir_res.as_resource().clone(),
@@ -404,7 +423,7 @@ doc_op! {
         path: std::ffi::CString,
         buf: Vec<u8>,
     ) -> Io<ops::ReadlinkAt<Vec<u8>>> {
-        Io::leaf(raw::ReadlinkAt::new(
+        Io::from_op(ops::ReadlinkAt::new(
             dir_res.as_resource().clone(),
             path,
             buf,
@@ -416,7 +435,7 @@ doc_op! {
     short: "Reads the current working directory into a caller-provided buffer.",
 
     pub fn getcwd(buf: Vec<u8>) -> Io<ops::GetCwd<Vec<u8>>> {
-        Io::leaf(raw::GetCwd::new(buf))
+        Io::from_op(ops::GetCwd::new(buf))
     }
 }
 
@@ -428,7 +447,7 @@ doc_op! {
         argv: Vec<std::ffi::CString>,
         envp: Option<Vec<std::ffi::CString>>,
     ) -> Io<ops::Spawn> {
-        Io::leaf(raw::Spawn::new(path, argv, envp))
+        Io::from_op(ops::Spawn::new(path, argv, envp))
     }
 }
 
@@ -460,11 +479,11 @@ doc_op! {
     where
         B: IoBufVec + Send + Sync + 'static,
     {
-        Io::leaf(raw::Send::new(
+        Io::from_op(ops::Send::new(
             res.as_resource().clone(),
             buf,
             Some(addr),
-            flags,
+            flags.unwrap_or(SendFlags::empty()),
         ))
     }
 }

@@ -391,12 +391,11 @@ impl Drop for OpStore {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::api::ops::raw::Nop;
   use std::collections::HashSet;
   use std::sync::mpsc;
 
   fn dummy_stored_op(arena: &mut Bump) -> Registration {
-    Registration::new_in(arena, Nop, Nop::action, Nop::complete, |_| {})
+    Registration::nop_in(arena, |_| {})
   }
 
   /// A registration that holds `tx`: the receiver disconnects when the
@@ -405,15 +404,9 @@ mod tests {
     arena: &mut Bump,
     tx: mpsc::Sender<std::io::Result<()>>,
   ) -> Registration {
-    Registration::new_in(
-      arena,
-      Nop,
-      Nop::action,
-      Nop::complete,
-      move |result| {
-        let _ = tx.send(result);
-      },
-    )
+    Registration::nop_in(arena, move |result| {
+      let _ = tx.send(result);
+    })
   }
 
   #[test]
@@ -531,7 +524,7 @@ mod tests {
     let mut store = OpStore::with_capacity(1);
     let id = store.insert_with(|arena| {
       let bomb = PanicOnDrop;
-      Registration::new_in(arena, Nop, Nop::action, Nop::complete, move |_| {
+      Registration::nop_in(arena, move |_| {
         let _ = &bomb;
       })
     });

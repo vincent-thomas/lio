@@ -211,27 +211,30 @@ macro_rules! model_io {
   };
 }
 
-/// Declares the public type of one operation around the memory it uses.
+/// Declares the type of one operation: what it was asked to do, held
+/// until it is polled, and the [`Cx`](crate::model::Cx) method that then
+/// starts it.
 ///
-/// The memory type has two functions, `action` and `complete`: what the
-/// operation submits, and how its result is read. The generated type is an
-/// [`OpModel`](crate::model::OpModel) that pairs them, and an
-/// [`Io`](crate::api::Io) of it is registered with the driver as it is.
+/// The generated type is an [`OpModel`](crate::model::OpModel) whose `poll`
+/// calls that method. An [`Io`](crate::api::Io) of it calls the same method
+/// with a `Cx` that delivers the result straight to the consumer, so a
+/// single operation is registered with the driver as it is.
 macro_rules! leaf {
   (
     $(#[$meta:meta])*
-    [$($generics:tt)*] $vis:vis struct $name:ident $(<$param:ident>)? ($raw:ty)
-      => $item:ty
+    [$($generics:tt)*] $vis:vis struct $name:ident $(<$param:ident>)? (
+      $($arg:ident : $ty:ty),* $(,)?
+    ) -> $item:ty = cx.$method:ident
   ) => {
     $(#[$meta])*
     $vis struct $name<$($generics)*> {
-      leaf: $crate::model::Leaf<$raw, $item>,
+      state: $crate::model::Leaf<($($ty,)*), $item>,
     }
 
-    impl<$($generics)*> From<$raw> for $name$(<$param>)? {
+    impl<$($generics)*> $name$(<$param>)? {
       #[inline]
-      fn from(raw: $raw) -> Self {
-        Self { leaf: $crate::model::Leaf::Idle(raw) }
+      pub(crate) fn new($($arg: $ty),*) -> Self {
+        Self { state: $crate::model::Leaf::Idle(($($arg,)*)) }
       }
     }
 
@@ -243,7 +246,7 @@ macro_rules! leaf {
         &mut self,
         cx: &mut $crate::model::Cx<'_>,
       ) -> $crate::model::Step<Self::Item> {
-        self.leaf.poll(cx, <$raw>::action, <$raw>::complete)
+        self.state.poll(cx, |cx, ($($arg,)*)| cx.$method($($arg),*))
       }
     }
 
@@ -258,16 +261,10 @@ macro_rules! leaf {
       where
         F: Fn(Self::Item) + 'static,
       {
-        let state = $crate::api::io::unsubmitted(self.leaf.into_idle());
+        let request = $crate::api::io::unsubmitted(self.state.into_idle());
         // Over capacity, the operation waits in a queue (see `Lio::is_full`).
-        lio.schedule_or_queue(move |arena| {
-          $crate::registration::Registration::new_in(
-            arena,
-            state,
-            <$raw>::action,
-            <$raw>::complete,
-            f,
-          )
+        $crate::model::run_direct(&lio, request, f, true, |cx, ($($arg,)*)| {
+          cx.$method($($arg),*)
         });
       }
 
@@ -283,22 +280,18 @@ macro_rules! leaf {
       where
         F: Fn(Self::Item) + 'static,
       {
-        let state = $crate::api::io::unsubmitted(self.leaf.into_idle());
-        let scheduled = lio.schedule_with(move |arena| {
-          $crate::registration::Registration::new_in(
-            arena,
-            state,
-            <$raw>::action,
-            <$raw>::complete,
-            f,
-          )
-        });
-        match scheduled {
-          Ok(id) => id,
-          Err(err) => {
-            unreachable!("lio rejected an operation it had capacity for: {err}")
-          }
-        }
+        let request = $crate::api::io::unsubmitted(self.state.into_idle());
+        let id = $crate::model::run_direct(
+          lio,
+          request,
+          f,
+          false,
+          |cx, ($($arg,)*)| cx.$method($($arg),*),
+        );
+        let Some(id) = id else {
+          unreachable!("an operation that may not queue was queued");
+        };
+        id
       }
     }
   };

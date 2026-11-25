@@ -72,15 +72,19 @@
 //! operation is one driver registration plus one small allocation that
 //! carries its result back to the model.
 
+use std::any::TypeId;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use bumpalo::Bump;
+
 use crate::Lio;
 use crate::driver::{QueueToken, WeakLio};
-use crate::registration::{ActionFn, CompleteFn, Registration};
+use crate::registration::{ActionFn, Callback, CompleteFn, Registration};
 
 /// A piece of I/O work the driver runs by polling it.
 pub trait OpModel {
@@ -135,54 +139,191 @@ macro_rules! ready {
 /// passes it on to the models it polls.
 pub struct Cx<'a> {
   lio: &'a Lio,
-  root: &'a Rc<dyn Wake>,
+  mode: Mode<'a>,
 }
 
-impl Cx<'_> {
+enum Mode<'a> {
+  /// Polling a root model: a result comes back through a [`Ticket`], and
+  /// the root is polled again when it has.
+  Root(&'a Rc<dyn Wake>),
+  /// Running one operation on its own: its result goes straight to a
+  /// callback, and there is no model to poll again.
+  Direct(Direct<'a>),
+}
+
+/// The callback of an operation run on its own, behind the type of the
+/// result it takes.
+struct Direct<'a> {
+  /// The `Out` of the `&mut dyn Deliver<Out>` that `deliver` points to.
+  out: TypeId,
+  deliver: *mut (),
+  /// Whether the operation may wait in the driver's queue.
+  queue: bool,
+  _deliver: PhantomData<&'a mut ()>,
+}
+
+/// Hands a callback to the registration of the operation it belongs to.
+trait Deliver<Out> {
+  /// Moves the callback into the operation's arena.
+  fn place(&mut self, arena: &mut Bump) -> Callback<Out>;
+
+  /// Moves the callback to the heap, for an operation that has to wait for
+  /// a slot.
+  fn boxed(&mut self) -> Box<dyn Fn(Out)>;
+}
+
+impl<Out, F: Fn(Out) + 'static> Deliver<Out> for Option<F> {
+  #[inline]
+  fn place(&mut self, arena: &mut Bump) -> Callback<Out> {
+    Callback::new_in(arena, self.taken())
+  }
+
+  fn boxed(&mut self) -> Box<dyn Fn(Out)> {
+    Box::new(self.taken())
+  }
+}
+
+trait Taken<F> {
+  fn taken(&mut self) -> F;
+}
+
+impl<F> Taken<F> for Option<F> {
+  fn taken(&mut self) -> F {
+    let Some(f) = self.take() else {
+      unreachable!("one operation run on its own submitted twice");
+    };
+    f
+  }
+}
+
+impl<'a> Cx<'a> {
   /// The result of the operation `ticket` stands for, once, when it has
   /// finished.
   fn take<T>(&mut self, ticket: &mut Ticket<T>) -> Option<T> {
-    ticket.slot.borrow_mut().take()
+    match &mut ticket.kind {
+      TicketKind::Rooted { slot, .. } => slot.borrow_mut().take(),
+      TicketKind::Direct { .. } => None,
+    }
   }
 
   /// Moves `state`, the memory one operation uses, into a driver
   /// registration, and submits the operation `action` builds from it.
   ///
-  /// `complete` reads the result out of that same memory. The pair is fixed
-  /// here, by lio's own operation types, so the result a ticket yields is
-  /// always the result of the operation that was submitted for it.
-  fn submit<S: 'static, Out: 'static>(
+  /// `complete` reads the result out of that same memory. The two are
+  /// written together, at one call site per operation (see
+  /// [`api::ops`](crate::api::ops)), so the result a ticket yields is always
+  /// the result of the operation that was submitted for it.
+  #[inline]
+  pub(crate) fn submit<S: 'static, Out: 'static>(
     &mut self,
     state: S,
     action: ActionFn<S>,
     complete: CompleteFn<S, Out>,
   ) -> Ticket<Out> {
-    let slot = Rc::new(RefCell::new(None));
-    let filled = Rc::clone(&slot);
-    let root = Rc::clone(self.root);
-    let on_done = move |out: Out| {
-      *filled.borrow_mut() = Some(out);
-      Rc::clone(&root).notify();
-    };
-
-    let id = if self.lio.is_full() {
-      // Over capacity the operation waits in the driver's queue.
-      TicketId::Queued(self.lio.queue_abandonable(move |arena| {
-        Registration::new_in(arena, state, action, complete, on_done)
-      }))
-    } else {
-      let scheduled = self.lio.schedule_with(move |arena| {
-        Registration::new_in(arena, state, action, complete, on_done)
-      });
-      match scheduled {
-        Ok(id) => TicketId::Scheduled(id),
-        Err(err) => {
-          unreachable!("lio rejected an operation it had capacity for: {err}")
+    let lio = self.lio;
+    let kind = match &mut self.mode {
+      Mode::Root(root) => {
+        let slot = Rc::new(RefCell::new(None));
+        let filled = Rc::clone(&slot);
+        let root = Rc::clone(root);
+        let on_done = move |out: Out| {
+          *filled.borrow_mut() = Some(out);
+          Rc::clone(&root).notify();
+        };
+        let init = move |arena: &mut Bump| {
+          let callback = Callback::new_in(arena, on_done);
+          Registration::new_in(arena, state, action, complete, callback)
+        };
+        let id = if lio.is_full() {
+          // Over capacity the operation waits in the driver's queue.
+          TicketId::Queued(lio.queue_abandonable(init))
+        } else {
+          TicketId::Scheduled(scheduled(lio.schedule_with(init)))
+        };
+        TicketKind::Rooted { slot, id, lio: lio.downgrade() }
+      }
+      Mode::Direct(direct) => {
+        let queue = direct.queue;
+        let deliver = direct.deliver::<Out>();
+        if queue && lio.is_full() {
+          // Over capacity the operation waits in the driver's queue, and
+          // its callback on the heap.
+          let on_done = deliver.boxed();
+          lio.schedule_or_queue(move |arena| {
+            let callback = Callback::new_in(arena, on_done);
+            Registration::new_in(arena, state, action, complete, callback)
+          });
+          TicketKind::Direct { id: None }
+        } else {
+          let id = scheduled(lio.schedule_with(|arena| {
+            let callback = deliver.place(arena);
+            Registration::new_in(arena, state, action, complete, callback)
+          }));
+          TicketKind::Direct { id: Some(id) }
         }
       }
     };
+    Ticket { kind }
+  }
+}
 
-    Ticket { slot, id, lio: self.lio.downgrade() }
+impl Direct<'_> {
+  /// The callback, as the one for an operation that produces `Out`.
+  #[inline]
+  fn deliver<Out: 'static>(&mut self) -> &mut dyn Deliver<Out> {
+    assert!(
+      self.out == TypeId::of::<Out>(),
+      "an operation run on its own submitted another operation's result type"
+    );
+    // SAFETY: `deliver` was made in `run_direct` from a
+    // `&mut &mut dyn Deliver<Out>` for the `Out` whose `TypeId` was just
+    // checked, and that reference is borrowed for as long as this `Direct`
+    // lives.
+    unsafe { &mut **(self.deliver as *mut &mut dyn Deliver<Out>) }
+  }
+}
+
+#[inline]
+fn scheduled(scheduled: std::io::Result<u64>) -> u64 {
+  match scheduled {
+    Ok(id) => id,
+    Err(err) => {
+      unreachable!("lio rejected an operation it had capacity for: {err}")
+    }
+  }
+}
+
+/// Runs one operation on its own: `submit` starts it through the [`Cx`] it
+/// is given, and `on_done` receives its result.
+///
+/// With `queue`, an operation over capacity waits in the driver's queue.
+/// Without it the driver must have a free slot. Returns the operation's id
+/// when it has a slot.
+#[inline]
+pub(crate) fn run_direct<Req, Out: 'static>(
+  lio: &Lio,
+  request: Req,
+  on_done: impl Fn(Out) + 'static,
+  queue: bool,
+  submit: impl FnOnce(&mut Cx<'_>, Req) -> Ticket<Out>,
+) -> Option<u64> {
+  let mut on_done = Some(on_done);
+  let mut deliver: &mut dyn Deliver<Out> = &mut on_done;
+  let mut cx = Cx {
+    lio,
+    mode: Mode::Direct(Direct {
+      out: TypeId::of::<Out>(),
+      deliver: (&raw mut deliver).cast(),
+      queue,
+      _deliver: PhantomData,
+    }),
+  };
+  let ticket = submit(&mut cx, request);
+  match ticket.kind {
+    TicketKind::Direct { id } => id,
+    TicketKind::Rooted { .. } => {
+      unreachable!("an operation run on its own was given a rooted ticket")
+    }
   }
 }
 
@@ -192,9 +333,15 @@ impl Cx<'_> {
 /// result is taken cancels the operation; the driver frees the buffer once
 /// the backend is done with it.
 pub(crate) struct Ticket<T> {
-  slot: Rc<RefCell<Option<T>>>,
-  id: TicketId,
-  lio: WeakLio,
+  kind: TicketKind<T>,
+}
+
+enum TicketKind<T> {
+  /// Submitted by a model: the result arrives in `slot`.
+  Rooted { slot: Rc<RefCell<Option<T>>>, id: TicketId, lio: WeakLio },
+  /// Run on its own: the result goes to a callback, and whoever holds that
+  /// callback's other end cancels by id.
+  Direct { id: Option<u64> },
 }
 
 enum TicketId {
@@ -206,12 +353,13 @@ enum TicketId {
 
 impl<T> Drop for Ticket<T> {
   fn drop(&mut self) {
+    let TicketKind::Rooted { slot, id, lio } = &self.kind else { return };
     // The registration's callback shares the slot. Once it is gone the
     // operation has finished and its id may belong to a later one.
-    if Rc::strong_count(&self.slot) == 1 || self.slot.borrow().is_some() {
+    if Rc::strong_count(slot) == 1 || slot.borrow().is_some() {
       return;
     }
-    let id = match &self.id {
+    let id = match id {
       TicketId::Scheduled(id) => Some(*id),
       TicketId::Queued(token) => {
         // Still queued: it never reaches the backend.
@@ -221,7 +369,7 @@ impl<T> Drop for Ticket<T> {
     };
     // Without a driver there is nothing left to cancel.
     if let Some(id) = id
-      && let Some(lio) = self.lio.upgrade()
+      && let Some(lio) = lio.upgrade()
     {
       lio.cancel_stream(id);
     }
@@ -292,7 +440,7 @@ where
       let step = {
         let mut model = self.model.borrow_mut();
         let Some(model) = model.as_mut() else { break };
-        model.poll(&mut Cx { lio: &lio, root: &root })
+        model.poll(&mut Cx { lio: &lio, mode: Mode::Root(&root) })
       };
       match step {
         Step::Pending if self.woken.get() => {}
@@ -494,22 +642,23 @@ impl<M: OpModel> Drop for Run<M> {
 /// One operation: not started, in flight, or finished.
 ///
 /// Every operation type in [`api::ops`](crate::api::ops) is one of these
-/// around the memory the operation uses.
-pub(crate) enum Leaf<S, Out> {
-  Idle(S),
+/// around what the operation was asked to do.
+pub(crate) enum Leaf<Req, Out> {
+  Idle(Req),
   InFlight(Ticket<Out>),
   Done,
 }
 
-impl<S: 'static, Out: 'static> Leaf<S, Out> {
+impl<Req, Out> Leaf<Req, Out> {
+  /// Starts the operation with `submit` on the first poll, then waits for
+  /// its result.
   pub(crate) fn poll(
     &mut self,
     cx: &mut Cx<'_>,
-    action: ActionFn<S>,
-    complete: CompleteFn<S, Out>,
+    submit: impl FnOnce(&mut Cx<'_>, Req) -> Ticket<Out>,
   ) -> Step<Out> {
     let mut ticket = match std::mem::replace(self, Leaf::Done) {
-      Leaf::Idle(state) => cx.submit(state, action, complete),
+      Leaf::Idle(request) => submit(cx, request),
       Leaf::InFlight(ticket) => ticket,
       Leaf::Done => panic!("operation polled after it was done"),
     };
@@ -522,10 +671,10 @@ impl<S: 'static, Out: 'static> Leaf<S, Out> {
     }
   }
 
-  /// The operation's memory, when it has not been submitted yet.
-  pub(crate) fn into_idle(self) -> Option<S> {
+  /// What the operation was asked to do, when it has not started yet.
+  pub(crate) fn into_idle(self) -> Option<Req> {
     match self {
-      Leaf::Idle(state) => Some(state),
+      Leaf::Idle(request) => Some(request),
       Leaf::InFlight(_) | Leaf::Done => None,
     }
   }

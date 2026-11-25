@@ -9,16 +9,16 @@ use std::time::Duration;
 
 mod immediate_sockets {
   use super::super::Poller;
-  use crate::api::{
-    op::{Action, Completion},
-    ops,
-    resource::Resource,
+  use crate::api::{op::Action, resource::Resource};
+  use crate::backend::IoBackend;
+  use crate::backend::op::{
+    MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, RecvFlags, SendFlags,
   };
-  use crate::backend::{IoBackend, op::Op};
   use bumpalo::Bump;
   use std::io::{Read, Write};
   use std::os::fd::{FromRawFd, IntoRawFd};
   use std::os::unix::net::UnixStream;
+  use std::ptr::NonNull;
   use std::time::Duration;
 
   fn pair(nonblocking: bool) -> (Resource, UnixStream) {
@@ -39,14 +39,62 @@ mod immediate_sockets {
     backend
   }
 
+  /// A five-byte receive. The test keeps it alive, boxed so the buffer and
+  /// its descriptor stay in place, until the backend is finished with it.
+  struct Receive {
+    socket: Resource,
+    bytes: [u8; 5],
+    region: Option<MsgBufMut>,
+  }
+
+  impl Receive {
+    fn new(socket: &Resource) -> Box<Self> {
+      Box::new(Self { socket: socket.clone(), bytes: [0; 5], region: None })
+    }
+
+    fn action(&mut self) -> Action<'_> {
+      let bytes = NonNull::from(&mut self.bytes).cast();
+      // SAFETY: the region is `self.bytes`, which the test keeps alive and
+      // in place until the backend is finished.
+      let region =
+        self.region.insert(unsafe { MsgBufMut::from_raw_parts(bytes, 5) });
+      action_io!(Op::Recv {
+        fd: self.socket.clone(),
+        msg: MsgRecv::new(std::slice::from_ref(region)),
+        flags: RecvFlags::empty(),
+      })
+    }
+  }
+
+  /// A send of `hello`, kept alive the same way.
+  struct Send {
+    socket: Resource,
+    bytes: [u8; 5],
+    region: Option<MsgBuf>,
+  }
+
+  impl Send {
+    fn new(socket: &Resource) -> Box<Self> {
+      Box::new(Self { socket: socket.clone(), bytes: *b"hello", region: None })
+    }
+
+    fn action(&mut self) -> Action<'_> {
+      let region = self.region.insert(MsgBuf::from_slice(&self.bytes));
+      action_io!(Op::Send {
+        fd: self.socket.clone(),
+        msg: MsgSend::new(std::slice::from_ref(region), None),
+        flags: SendFlags::empty(),
+      })
+    }
+  }
+
   fn queue(backend: &mut Poller, id: u64, action: Action<'_>) {
     let Action::Io(op) = action else {
       panic!("expected I/O");
     };
-    // Poller does not use the step arena. Models are boxed by the caller so
-    // the buffers and message descriptors stay stable until completion.
-    // `from_model` names that borrow: `model` stays alive until the backend
-    // finishes.
+    // Poller does not use the step arena. The caller keeps what `action`
+    // borrows boxed, so the buffers and message descriptors stay in place
+    // until the backend finishes. `from_model` names that borrow.
     backend.push(
       id,
       crate::backend::InFlight::from_model(op, crate::backend::Keep::new()),
@@ -58,8 +106,7 @@ mod immediate_sockets {
   fn ready_receive_does_not_register_readiness() {
     let (socket, mut peer) = pair(true);
     peer.write_all(b"hello").unwrap();
-    let mut model =
-      Box::new(ops::raw::Recv::new(socket.clone(), vec![0; 5], None));
+    let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 11, model.action());
     backend.flush().unwrap();
@@ -68,16 +115,14 @@ mod immediate_sockets {
     backend.wait(None, &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].registration_id(), 11);
-    let (result, buf) = model.complete(Completion::new(completed[0].result()));
-    assert_eq!(result.unwrap(), 5);
-    assert_eq!(buf, b"hello");
+    assert_eq!(completed[0].result(), 5);
+    assert_eq!(&model.bytes, b"hello");
   }
 
   #[test]
   fn unavailable_receive_is_registered_and_completes_later() {
     let (socket, mut peer) = pair(true);
-    let mut model =
-      Box::new(ops::raw::Recv::new(socket.clone(), vec![0; 5], None));
+    let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 12, model.action());
     backend.flush().unwrap();
@@ -95,8 +140,7 @@ mod immediate_sockets {
   #[test]
   fn blocking_socket_keeps_readiness_first_behavior() {
     let (socket, mut peer) = pair(false);
-    let mut model =
-      Box::new(ops::raw::Recv::new(socket.clone(), vec![0; 5], None));
+    let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 13, model.action());
     backend.flush().unwrap();
@@ -112,12 +156,7 @@ mod immediate_sockets {
   #[test]
   fn ready_send_does_not_register_readiness() {
     let (socket, mut peer) = pair(true);
-    let mut model = Box::new(ops::raw::Send::new(
-      socket.clone(),
-      b"hello".to_vec(),
-      None,
-      None,
-    ));
+    let mut model = Send::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 14, model.action());
     backend.flush().unwrap();
@@ -134,8 +173,7 @@ mod immediate_sockets {
   #[test]
   fn immediate_completions_do_not_starve_registered_receives() {
     let (socket, mut peer) = pair(true);
-    let mut model =
-      Box::new(ops::raw::Recv::new(socket.clone(), vec![0; 5], None));
+    let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 15, model.action());
     backend.flush().unwrap();
@@ -162,8 +200,7 @@ mod immediate_sockets {
   #[test]
   fn drain_drops_a_registered_receive() {
     let (socket, _peer) = pair(true);
-    let mut model =
-      Box::new(ops::raw::Recv::new(socket.clone(), vec![0; 5], None));
+    let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 15, model.action());
     backend.flush().unwrap();
@@ -193,12 +230,7 @@ mod immediate_sockets {
     let socket = Resource::from(unsafe {
       std::os::fd::OwnedFd::from_raw_fd(socket.into_raw_fd())
     });
-    let mut model = Box::new(ops::raw::Send::new(
-      socket.clone(),
-      b"hello".to_vec(),
-      None,
-      None,
-    ));
+    let mut model = Send::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 17, model.action());
     backend.flush().unwrap();

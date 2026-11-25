@@ -25,7 +25,6 @@
 use std::io;
 use std::mem::MaybeUninit;
 
-use crate::api::ops::raw;
 use crate::api::{
   io::Io,
   ops,
@@ -158,11 +157,7 @@ impl Copy {
     let initial = limit.min(DEFAULT_BUF_SIZE as u64) as usize;
     let buf = CappedBuf::new(Vec::with_capacity(initial), initial);
     Self {
-      state: CopyState::Reading(ops::Read::from(raw::Read::new(
-        reader.clone(),
-        buf,
-        None,
-      ))),
+      state: CopyState::Reading(ops::Read::new(reader.clone(), buf, None)),
       reader,
       writer,
       total: 0,
@@ -179,11 +174,7 @@ impl Copy {
   }
 
   fn writing(&self, buf: Vec<u8>) -> CopyState {
-    CopyState::Writing(ops::Write::from(raw::Write::new(
-      self.writer.clone(),
-      buf,
-      None,
-    )))
+    CopyState::Writing(ops::Write::new(self.writer.clone(), buf, None))
   }
 }
 
@@ -215,11 +206,7 @@ impl OpModel for Copy {
           (Ok(_), mut buf) => {
             buf.clear();
             let buf = CappedBuf::new(buf, self.next_read_len());
-            CopyState::Reading(ops::Read::from(raw::Read::new(
-              self.reader.clone(),
-              buf,
-              None,
-            )))
+            CopyState::Reading(ops::Read::new(self.reader.clone(), buf, None))
           }
           (Err(err), _buf) => return Step::Done(Err(err)),
         },
