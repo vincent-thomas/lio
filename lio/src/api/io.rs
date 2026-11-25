@@ -438,7 +438,7 @@ where
 
   fn into_future(self) -> Self::IntoFuture {
     let (lio, op) = self.into_lio();
-    model::run(&lio, op)
+    model::Run::new(lio, op)
   }
 }
 

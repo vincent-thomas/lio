@@ -18,8 +18,8 @@
 //!
 //! [`api::run`](crate::api::run) runs a model of yours the way lio's own
 //! are run, and [`api::run_stream`](crate::api::run_stream) runs one that
-//! yields. [`spawn`] and [`run`] here take the driver explicitly, and
-//! [`spawn`] gives you a handle to cancel by.
+//! yields. [`spawn`] here takes the driver and a callback, and gives you a
+//! handle to cancel by.
 //!
 //! ```
 //! use lio::Lio;
@@ -275,21 +275,19 @@ where
   Task { lio: lio.downgrade(), spawned: lio.spawn(model, on_item) }
 }
 
-/// Runs `model` on `lio` as a future that resolves to its first item.
+/// The future of a model: what an [`Io`](crate::api::Io) turns into. It
+/// resolves to the model's first item.
 ///
 /// The model starts on the first poll, or once the driver has a free slot.
 /// Dropping the future cancels it.
-pub fn run<M>(lio: &Lio, model: M) -> Run<M>
-where
-  M: OpModel + Unpin + 'static,
-{
-  Run { state: RunState::Idle(lio.clone(), model) }
-}
-
-/// The future of a model: what [`run`] returns and what an
-/// [`Io`](crate::api::Io) turns into.
 pub struct Run<M: OpModel> {
   state: RunState<M>,
+}
+
+impl<M: OpModel> Run<M> {
+  pub(crate) fn new(lio: Lio, model: M) -> Self {
+    Self { state: RunState::Idle(lio, model) }
+  }
 }
 
 enum RunState<M: OpModel> {
