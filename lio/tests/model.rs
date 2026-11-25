@@ -266,10 +266,8 @@ fn cancelling_a_task_cancels_what_it_has_in_flight() {
 fn a_dropped_future_cancels_its_model() {
   let (backend, lio) = scripted(4);
   let stdin = Resource::stdin();
-  let mut future = Box::pin(model::run(
-    &lio,
-    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
-  ));
+  let read = api::read(&stdin, Vec::<u8>::with_capacity(8)).with_lio(&lio);
+  let mut future = Box::pin(std::future::IntoFuture::into_future(read));
   let mut cx = Context::from_waker(Waker::noop());
   assert!(future.as_mut().poll(&mut cx).is_pending());
   lio.try_run().unwrap();
@@ -285,10 +283,8 @@ fn a_dropped_future_cancels_its_model() {
 fn a_future_resolves_to_the_item() {
   let (backend, lio) = scripted(4);
   let stdin = Resource::stdin();
-  let mut future = Box::pin(model::run(
-    &lio,
-    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
-  ));
+  let read = api::read(&stdin, Vec::<u8>::with_capacity(8)).with_lio(&lio);
+  let mut future = Box::pin(std::future::IntoFuture::into_future(read));
   let mut cx = Context::from_waker(Waker::noop());
   assert!(future.as_mut().poll(&mut cx).is_pending());
 
