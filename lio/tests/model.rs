@@ -546,9 +546,8 @@ impl OpModel for Leaks {
 }
 
 #[test]
-#[should_panic(expected = "already polled")]
-fn an_operation_in_flight_cannot_be_run_again_through_io() {
-  let (_backend, lio) = scripted(2);
+fn an_operation_in_flight_can_move_to_another_model() {
+  let (backend, lio) = scripted(2);
   let out = Rc::new(RefCell::new(None));
   let read = api::read(&Resource::stdin(), Vec::with_capacity(8)).into_inner();
   let _task = model::spawn(
@@ -556,6 +555,114 @@ fn an_operation_in_flight_cannot_be_run_again_through_io() {
     Leaks { read: Some(read), out: Rc::clone(&out) },
     |()| {},
   );
+  // The model that started the read is done. The read is still in flight,
+  // in that model's slot, and its ticket is here.
   let in_flight = out.borrow_mut().take().unwrap();
-  lio::api::Io::from_op(in_flight).with_lio(&lio).when_done(|_| {});
+  assert_eq!(backend.in_flight().len(), 1);
+
+  // Whoever polls it next is the one told when it finishes.
+  let (items, _task) = collect(&lio, in_flight);
+  assert_eq!(backend.pushed().len(), 1, "it is not submitted again");
+  finish_only(&backend, &lio, 3);
+  let (result, buf) = items.borrow_mut().pop().unwrap();
+  assert_eq!((result.unwrap(), buf.len()), (3, 3));
+  assert!(!lio.is_full(), "both slots are free again");
+}
+
+/// Two nops, one after the other.
+struct TwoNops {
+  left: u8,
+  nop: lio::api::ops::Nop,
+}
+
+impl TwoNops {
+  fn new() -> Self {
+    Self { left: 2, nop: api::nop().into_inner() }
+  }
+}
+
+impl OpModel for TwoNops {
+  type Item = std::io::Result<u8>;
+
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    loop {
+      if let Err(err) = lio::ready!(self.nop.poll(cx)) {
+        return Step::Done(Err(err));
+      }
+      self.left -= 1;
+      if self.left == 0 {
+        return Step::Done(Ok(2));
+      }
+      self.nop = api::nop().into_inner();
+    }
+  }
+}
+
+#[test]
+fn io_runs_a_model_of_your_own_like_one_of_lio_s() {
+  let (backend, lio) = scripted(1);
+
+  // With a callback.
+  let done = Rc::new(RefCell::new(None));
+  let sink = Rc::clone(&done);
+  lio::api::Io::from_op(TwoNops::new())
+    .with_lio(&lio)
+    .when_done(move |item| *sink.borrow_mut() = Some(item));
+  finish_only(&backend, &lio, 0);
+  finish_only(&backend, &lio, 0);
+  assert_eq!(done.borrow_mut().take().unwrap().unwrap(), 2);
+
+  // As a future.
+  let mut future = Box::pin(std::future::IntoFuture::into_future(
+    lio::api::Io::from_op(TwoNops::new()).with_lio(&lio),
+  ));
+  let mut cx = Context::from_waker(Waker::noop());
+  assert!(future.as_mut().poll(&mut cx).is_pending());
+  finish_only(&backend, &lio, 0);
+  assert!(future.as_mut().poll(&mut cx).is_pending());
+  finish_only(&backend, &lio, 0);
+  let Poll::Ready(item) = future.as_mut().poll(&mut cx) else {
+    panic!("the model is done");
+  };
+  assert_eq!(item.unwrap(), 2);
+
+  // One slot was enough throughout: each nop used the model's own.
+  assert_eq!(backend.pushed().len(), 4);
+  assert!(!lio.is_full());
+}
+
+#[test]
+fn a_model_doing_two_things_at_once_still_fits_one_slot() {
+  let (backend, lio) = scripted(1);
+  let stdin = Resource::stdin();
+  let join = Join::new(
+    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
+  );
+  let (items, _task) = collect(&lio, join);
+
+  // The second read has no slot of its own to go to. It runs in the
+  // model's slot once the first is out of it, not after the model is done.
+  finish_only(&backend, &lio, 3);
+  assert!(items.borrow().is_empty());
+  finish_only(&backend, &lio, 2);
+
+  let ((first, _), (second, _)) = items.borrow_mut().pop().unwrap();
+  assert_eq!((first.unwrap(), second.unwrap()), (3, 2));
+  assert_eq!(backend.pushed().len(), 2);
+  assert!(!lio.is_full());
+}
+
+#[test]
+fn a_model_takes_one_slot_however_many_steps_it_has() {
+  let (backend, lio) = scripted(2);
+  let (items, _task) = collect(&lio, TwoNops::new());
+  // The second slot stays free for somebody else the whole time.
+  assert!(!lio.is_full());
+  finish_only(&backend, &lio, 0);
+  assert!(!lio.is_full());
+  finish_only(&backend, &lio, 0);
+  assert_eq!(items.borrow_mut().pop().unwrap().unwrap(), 2);
+  let ids = backend.pushed();
+  assert_eq!(ids[0], ids[1], "both steps ran in the model's slot");
 }

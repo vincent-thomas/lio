@@ -66,8 +66,6 @@ impl OpModel for SocketAccept {
   }
 }
 
-model_io!(SocketAccept);
-
 /// Socket creation operation specialized for [`Socket`].
 ///
 /// This type wraps the low-level socket creation operation and adapts its result to
@@ -96,8 +94,6 @@ impl OpModel for SocketNew {
   }
 }
 
-model_io!(SocketNew);
-
 pub struct TcpAccept {
   inner: ops::Accept,
 }
@@ -118,8 +114,6 @@ impl OpModel for TcpAccept {
     )
   }
 }
-
-model_io!(TcpAccept);
 
 /// Socket-create/bind/listen operation that returns a listener of type `T`.
 pub struct BindListener<T> {
@@ -203,8 +197,6 @@ impl<T: FromResource + 'static> OpModel for BindListener<T> {
     }
   }
 }
-
-model_io!(generic [T: FromResource + 'static] BindListener<T>);
 
 /// A socket created and then connected to an address.
 ///
@@ -302,8 +294,6 @@ impl<T: FromResource + 'static> OpModel for StreamConnect<T> {
   }
 }
 
-model_io!(generic [T: FromResource + 'static] StreamConnect<T>);
-
 /// Accept operation specialized for [`UnixStream`].
 ///
 /// Unix peers are usually unnamed, so the peer address is not reported.
@@ -327,8 +317,6 @@ impl OpModel for UnixAccept {
     )
   }
 }
-
-model_io!(UnixAccept);
 
 pub struct UdpBindSocket {
   state: UdpBindState,
@@ -382,8 +370,6 @@ impl OpModel for UdpBindSocket {
   }
 }
 
-model_io!(UdpBindSocket);
-
 pub struct UdpConnectSocket {
   inner: Connecting,
 }
@@ -408,5 +394,3 @@ impl OpModel for UdpConnectSocket {
     Step::Done(ready!(self.inner.poll(cx)).map(UdpSocket::from_resource))
   }
 }
-
-model_io!(UdpConnectSocket);

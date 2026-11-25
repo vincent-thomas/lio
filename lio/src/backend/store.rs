@@ -205,6 +205,27 @@ impl OpStore {
     Some(unsafe { slot.registration.assume_init_mut() })
   }
 
+  /// Borrows a registration and its step arena together.
+  ///
+  /// The driver uses this to start another operation in a slot that is
+  /// already taken, and hand it to the backend in the same call.
+  #[inline]
+  pub fn with_slot<R>(
+    &mut self,
+    id: u64,
+    f: impl FnOnce(&mut Registration, &mut Bump) -> R,
+  ) -> Option<R> {
+    let key = SlabKey::from_u64(id);
+    let slot = self.slots.get_mut(key)?;
+    // SAFETY: an occupied slot's registration is initialized. `registration`
+    // and `step_bump` are different fields, so the two references do not alias.
+    let (registration, step_bump) = unsafe {
+      let slot = slot as *mut StoreSlot;
+      ((*slot).registration.assume_init_mut(), &mut (*slot).step_bump)
+    };
+    Some(f(registration, step_bump))
+  }
+
   /// Inserts an operation and submits it while its model is borrowed.
   ///
   /// `submit` returns whether the model produced an action. The slot stays
@@ -395,7 +416,7 @@ mod tests {
   use std::sync::mpsc;
 
   fn dummy_stored_op(arena: &mut Bump) -> Registration {
-    Registration::nop_in(arena, |_| {})
+    Registration::nop_in(arena, ())
   }
 
   /// A registration that holds `tx`: the receiver disconnects when the
@@ -404,9 +425,7 @@ mod tests {
     arena: &mut Bump,
     tx: mpsc::Sender<std::io::Result<()>>,
   ) -> Registration {
-    Registration::nop_in(arena, move |result| {
-      let _ = tx.send(result);
-    })
+    Registration::nop_in(arena, tx)
   }
 
   #[test]
@@ -524,9 +543,7 @@ mod tests {
     let mut store = OpStore::with_capacity(1);
     let id = store.insert_with(|arena| {
       let bomb = PanicOnDrop;
-      Registration::nop_in(arena, move |_| {
-        let _ = &bomb;
-      })
+      Registration::nop_in(arena, bomb)
     });
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       store.remove(id)
