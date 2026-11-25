@@ -16,8 +16,10 @@
 //! is to poll one of lio's leaves, and a leaf only produces the result of
 //! the operation it started.
 //!
-//! [`Io`](crate::api::Io) runs any model, lio's or yours. [`spawn`] and
-//! [`run`] are the same thing with a handle to cancel it by.
+//! [`api::run`](crate::api::run) runs a model of yours the way lio's own
+//! are run, and [`api::run_stream`](crate::api::run_stream) runs one that
+//! yields. [`spawn`] and [`run`] here take the driver explicitly, and
+//! [`spawn`] gives you a handle to cancel by.
 //!
 //! ```
 //! use lio::Lio;

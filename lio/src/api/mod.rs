@@ -53,6 +53,57 @@ use resource::AsResource;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+/// Runs a model of your own, the way lio's operations are run.
+///
+/// Nothing happens until the returned [`Io`] is consumed: `.await` it, or
+/// use [`when_done`](Io::when_done) or [`send`](Io::send). A future takes
+/// the model's first item; a callback or channel gets every item.
+///
+/// ```
+/// use lio::api::{self, ops};
+/// use lio::backend::testing::ScriptedBackend;
+/// use lio::model::{Cx, OpModel, Step};
+///
+/// /// Two nops, one after the other.
+/// struct TwoNops(u8, ops::Nop);
+///
+/// impl OpModel for TwoNops {
+///   type Item = std::io::Result<()>;
+///
+///   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+///     loop {
+///       if let Err(err) = lio::ready!(self.1.poll(cx)) {
+///         return Step::Done(Err(err));
+///       }
+///       self.0 += 1;
+///       if self.0 == 2 {
+///         return Step::Done(Ok(()));
+///       }
+///       self.1 = api::nop().into_inner();
+///     }
+///   }
+/// }
+///
+/// let lio = lio::Lio::new_with_backend(ScriptedBackend::auto(0), 4).unwrap();
+/// api::run(TwoNops(0, api::nop().into_inner()))
+///   .with_lio(&lio)
+///   .when_done(|result| result.unwrap());
+/// while lio.try_run().unwrap() > 0 {}
+/// ```
+pub fn run<M: crate::model::OpModel>(model: M) -> Io<M> {
+  Io::from_op(model)
+}
+
+/// Runs a model of your own that produces several items, as a stream.
+///
+/// Every [`Step::Yield`](crate::model::Step::Yield) is one item of the
+/// stream and a [`Step::Done`](crate::model::Step::Done) is its last. The
+/// model starts on the first [`next`](IoStream::next), and stops when the
+/// stream is dropped.
+pub fn run_stream<M: crate::model::OpModel + 'static>(model: M) -> IoStream<M> {
+  IoStream::from_op(model)
+}
+
 doc_op! {
     short: "A no-op operation useful for driving and testing the runtime.",
 
