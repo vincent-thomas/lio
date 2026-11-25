@@ -83,8 +83,12 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use crate::Lio;
-use crate::driver::{OpRef, Spawned, WeakLio};
-use crate::registration::{ActionFn, CompleteFn};
+use bumpalo::Bump;
+
+use crate::driver::{OpRef, PlaceOp, Spawned, WeakLio};
+use crate::registration::{
+  ActionFn, CompleteFn, LendFn, Registration, ReturnFn,
+};
 
 /// A piece of I/O work the driver runs by polling it.
 pub trait OpModel {
@@ -182,8 +186,33 @@ impl<'a> Cx<'a> {
     action: ActionFn<S>,
     complete: CompleteFn<S, Out>,
   ) -> Ticket<Out> {
+    self.ticket(move |reg: &mut Registration, arena: &mut Bump, waiter| {
+      reg.start_op(arena, state, action, complete, waiter)
+    })
+  }
+
+  /// [`submit`](Self::submit) for an operation that lends a buffer.
+  ///
+  /// `action` describes the buffer to the backend in the regions it is
+  /// given, and `complete` gets those regions back to tell how much of each
+  /// was used. They are part of the operation's memory but not of `state`:
+  /// they are made in the driver, where they stay.
+  #[inline]
+  pub(crate) fn submit_lending<S: 'static, R: 'static, Out: 'static>(
+    &mut self,
+    state: S,
+    action: LendFn<S, R>,
+    complete: ReturnFn<S, R, Out>,
+  ) -> Ticket<Out> {
+    self.ticket(move |reg: &mut Registration, arena: &mut Bump, waiter| {
+      reg.start_lending_op(arena, state, action, complete, waiter)
+    })
+  }
+
+  #[inline]
+  fn ticket<Out>(&mut self, place: impl PlaceOp) -> Ticket<Out> {
     Ticket {
-      op: self.lio.submit_op(self.task, state, action, complete),
+      op: self.lio.submit_op(self.task, place),
       lio: self.lio.downgrade(),
       taken: false,
       _out: PhantomData,
