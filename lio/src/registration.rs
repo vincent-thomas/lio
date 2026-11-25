@@ -1,7 +1,21 @@
+//! What one driver slot holds: a model being run, an operation, or both.
+//!
+//! A model that is run moves into a slot's arena and stays there until it is
+//! done. The operations it starts need memory the backend can point into,
+//! which must stay put until the backend reports them finished, whatever the
+//! model does meanwhile. So that memory is the slot's too, not the model's:
+//!
+//! - the first operation a model has in flight uses the model's own slot,
+//!   so a model that does one thing at a time takes one slot;
+//! - an operation started while that one is busy takes a slot of its own.
+//!
+//! A slot is free again when its model is done and its operation's result
+//! has been taken or dropped.
+
 use bumpalo::Bump;
-use bumpalo::boxed::Box as BumpBox;
 
 use crate::api::op::{Action, Completion};
+use crate::model::{Cx, OpModel, Step};
 
 /// Builds the action an operation submits from the memory it owns.
 ///
@@ -13,186 +27,458 @@ pub(crate) type ActionFn<S> = for<'a> fn(&'a mut S) -> Action<'a>;
 /// reported for the action [`ActionFn`] built from that same memory.
 pub(crate) type CompleteFn<S, Out> = fn(&mut S, Completion) -> Out;
 
-/// Calls the closure with the operation's action, for any lifetime of that
+/// Calls the closure with an operation's action, for any lifetime of that
 /// action.
 type WithActionFn = fn(*mut (), &mut dyn for<'a> FnMut(Action<'a>));
 
-/// Where one operation's result goes: a callback placed in the operation's
-/// arena, with its type erased down to the result it takes.
-///
-/// The operation's memory and its callback are written by different code:
-/// the memory by the function that submits the operation, the callback by
-/// whoever runs it. This is how the two meet without either naming the
-/// other's type.
-pub(crate) struct Callback<Out> {
-  data: *mut (),
-  call: fn(*mut (), Out),
-  drop: fn(*mut ()),
+// ============================================================================
+// The model a slot runs
+// ============================================================================
+
+/// A model and where its items go, in the slot's arena.
+struct TaskPayload<M, F> {
+  model: Option<M>,
+  sink: Option<F>,
 }
 
-impl<Out> Callback<Out> {
-  #[inline]
-  pub(crate) fn new_in<F>(arena: &mut Bump, f: F) -> Self
-  where
-    F: Fn(Out) + 'static,
-  {
-    Self {
-      data: BumpBox::into_raw(BumpBox::new_in(f, arena)) as *mut (),
-      call: |data, out| {
-        // SAFETY: `data` was created from an `F` in `new_in` and is valid
-        // until this `Callback` is dropped.
-        let f = unsafe { &*(data as *const F) };
-        f(out);
-      },
-      drop: |data| {
-        // SAFETY: `data` was allocated by `BumpBox::into_raw` in `new_in`,
-        // and `Callback::drop` runs this once.
-        unsafe { drop(BumpBox::from_raw(data as *mut F)) };
-      },
-    }
-  }
-
-  #[inline]
-  fn call(&self, out: Out) {
-    (self.call)(self.data, out);
-  }
-}
-
-impl<Out> Drop for Callback<Out> {
-  fn drop(&mut self) {
-    (self.drop)(self.data);
-  }
-}
-
-/// Everything one operation needs, in its slot's arena: the memory the
-/// backend uses, the two functions that speak for it, and where the result
-/// goes.
-struct Payload<S, Out> {
-  state: S,
-  action: ActionFn<S>,
-  complete: CompleteFn<S, Out>,
-  callback: Callback<Out>,
-}
-
-/// A copy of a registration's completion handler that can run without access
-/// to the registration itself.
-///
-/// The handler's payload lives in the registration's arena, whose memory
-/// never moves. The driver copies the handler out, releases its own borrow,
-/// and only then runs it, because the handler runs user code (a callback, or
-/// a model's `poll`) that may schedule, drop or drive operations on the same
-/// `Lio`.
-#[derive(Clone, Copy)]
-pub(crate) struct RawHandler {
+struct Task {
   payload: *mut (),
-  on_completion_fn: fn(*mut (), Completion),
+  poll_fn: fn(*mut (), &mut Cx<'_>) -> bool,
+  drop_fn: fn(*mut ()),
+  /// The model is being polled, or dropped, further up the stack.
+  busy: bool,
+  /// An operation finished while the model was busy: poll once more.
+  woken: bool,
+  /// Already in the driver's queue of models to poll.
+  notified: bool,
+  /// Its consumer is gone: drop the model at the next chance.
+  cancelled: bool,
+  /// The model and its sink have been dropped.
+  finished: bool,
 }
 
-impl RawHandler {
-  /// Reads the operation's result and delivers it.
+/// A copy of what is needed to poll or drop a slot's model without holding
+/// the slot: both run user code, which may use the driver.
+#[derive(Clone, Copy)]
+pub(crate) struct RawTask {
+  payload: *mut (),
+  poll_fn: fn(*mut (), &mut Cx<'_>) -> bool,
+  drop_fn: fn(*mut ()),
+}
+
+impl RawTask {
+  /// Polls the model until it has nothing more to do right now. Returns
+  /// whether it is finished, and dropped with its sink.
   ///
   /// # Safety
   ///
-  /// The registration this handler was copied from must be alive, must not
-  /// be processed concurrently, and must not have been completed before.
-  #[inline]
-  pub(crate) unsafe fn complete(self, completion: Completion) {
-    (self.on_completion_fn)(self.payload, completion);
+  /// The registration this was copied from must be alive and marked busy by
+  /// [`Registration::begin_poll`], so that nothing else touches its model.
+  pub(crate) unsafe fn poll(self, cx: &mut Cx<'_>) -> bool {
+    (self.poll_fn)(self.payload, cx)
+  }
+
+  /// Drops the model and its sink.
+  ///
+  /// # Safety
+  ///
+  /// The registration this was copied from must be alive and marked busy,
+  /// so that nothing else touches its model.
+  pub(crate) unsafe fn drop_model(self) {
+    (self.drop_fn)(self.payload);
   }
 }
 
-/// One operation in flight: submitted once, completed once.
+// ============================================================================
+// The operation a slot holds
+// ============================================================================
+
+/// The memory of one operation and, once it is finished, its result.
+///
+/// `result` comes first so that a ticket, which knows `Out` but not `S`, can
+/// reach it through a pointer to this.
+#[repr(C)]
+struct OpPayload<S, Out> {
+  result: Option<Out>,
+  state: Option<S>,
+  action: ActionFn<S>,
+  complete: CompleteFn<S, Out>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stage {
+  /// No operation: one may start.
+  Free,
+  /// Submitted, and not reported finished yet.
+  InFlight,
+  /// Finished: the result waits to be taken.
+  Ready,
+  /// Being read or dropped further up the stack.
+  Busy,
+}
+
+struct OpCell {
+  stage: Stage,
+  /// Nobody will take the result: drop it when it arrives.
+  abandoned: bool,
+  /// Counts the operations this slot has held, so a receipt for an earlier
+  /// one does not match a later one.
+  seq: u64,
+  /// The slot of the model to poll when the result is in.
+  waiter: u64,
+  payload: *mut (),
+  with_action_fn: WithActionFn,
+  complete_fn: fn(*mut (), Completion, bool),
+  drop_fn: fn(*mut ()),
+}
+
+/// A copy of what is needed to finish a slot's operation without holding
+/// the slot: reading a result may run user code.
+#[derive(Clone, Copy)]
+pub(crate) struct RawOp {
+  payload: *mut (),
+  complete_fn: fn(*mut (), Completion, bool),
+  drop_fn: fn(*mut ()),
+  keep: bool,
+}
+
+impl RawOp {
+  /// Reads the operation's result out of its memory and drops that memory.
+  /// The result is kept for its ticket, unless the operation was abandoned.
+  ///
+  /// # Safety
+  ///
+  /// The registration this was copied from must be alive, with its
+  /// operation marked busy by [`Registration::begin_completion`].
+  pub(crate) unsafe fn complete(self, completion: Completion) {
+    (self.complete_fn)(self.payload, completion, self.keep);
+  }
+
+  /// Whether the result is kept for a ticket.
+  pub(crate) fn kept(self) -> bool {
+    self.keep
+  }
+
+  /// Drops the operation's memory, or its untaken result.
+  ///
+  /// # Safety
+  ///
+  /// The registration this was copied from must be alive, with its
+  /// operation marked busy by [`Registration::begin_drop`].
+  pub(crate) unsafe fn drop_payload(self) {
+    (self.drop_fn)(self.payload);
+  }
+}
+
+/// What dropping a ticket asks of the driver.
+pub(crate) enum Abandon {
+  /// The ticket is for an operation this slot no longer holds.
+  Stale,
+  /// The operation is in flight: finish it early, and drop its result.
+  InFlight,
+  /// Its result is waiting: drop it.
+  Ready,
+}
+
+/// What the driver does after polling a slot's model.
+pub(crate) enum AfterPoll {
+  /// Waiting on its operations.
+  Pending,
+  /// Woken while it was polled: poll again.
+  Again,
+  /// Its consumer went away while it was polled: drop the model.
+  Cancelled,
+  /// Done, and dropped.
+  Finished,
+}
+
+// ============================================================================
+// Registration
+// ============================================================================
+
+/// One driver slot.
 // NOTE: Registration should **NEVER** impl Sync.
 pub struct Registration {
-  payload: *mut (),
-  on_completion_fn: fn(*mut (), Completion),
-  with_action_fn: WithActionFn,
-  drop_fn: fn(*mut ()),
-  /// The driver's share of the operation's lease. A backend holds the other
-  /// shares.
+  task: Option<Task>,
+  cell: OpCell,
+  /// The driver's share of the lease on the operation's memory. A backend
+  /// holds the other shares.
   lease: crate::backend::Keep,
 }
 
+fn no_action(_: *mut (), _: &mut dyn for<'a> FnMut(Action<'a>)) {}
+fn no_completion(_: *mut (), _: Completion, _: bool) {}
+fn no_drop(_: *mut ()) {}
+
 impl Registration {
-  /// Creates a registration whose payload lives in a bump arena.
-  ///
-  /// `state` is the memory the operation uses. `action` builds what it
-  /// submits from that memory, `complete` reads its result out of it, and
-  /// `callback` receives that result.
-  #[inline]
-  pub(crate) fn new_in<S, Out>(
-    arena: &mut Bump,
-    state: S,
-    action: ActionFn<S>,
-    complete: CompleteFn<S, Out>,
-    callback: Callback<Out>,
-  ) -> Self
-  where
-    S: 'static,
-    Out: 'static,
-  {
+  /// A slot with no model: it holds an operation started by a model whose
+  /// own slot was busy.
+  pub(crate) fn vacant() -> Self {
     Self {
-      payload: BumpBox::into_raw(BumpBox::new_in(
-        Payload { state, action, complete, callback },
-        arena,
-      )) as *mut (),
-      on_completion_fn: Self::on_completion_impl::<S, Out>,
-      with_action_fn: Self::with_action_impl::<S, Out>,
-      drop_fn: Self::drop_impl::<S, Out>,
+      task: None,
+      cell: OpCell {
+        stage: Stage::Free,
+        abandoned: false,
+        seq: 0,
+        waiter: 0,
+        payload: std::ptr::null_mut(),
+        with_action_fn: no_action,
+        complete_fn: no_completion,
+        drop_fn: no_drop,
+      },
       lease: crate::backend::Keep::new(),
     }
   }
 
-  /// A nop whose result goes to `f`: the smallest registration there is.
-  #[cfg(test)]
-  pub(crate) fn nop_in<F>(arena: &mut Bump, f: F) -> Self
+  /// A slot that runs `model`, passing every item it produces to `sink`
+  /// until the model is done or `sink` returns `false`.
+  pub(crate) fn running<M, F>(arena: &mut Bump, model: M, sink: F) -> Self
   where
-    F: Fn(std::io::Result<()>) + 'static,
+    M: OpModel + 'static,
+    F: FnMut(M::Item) -> bool + 'static,
   {
-    let callback = Callback::new_in(arena, f);
-    Self::new_in(
-      arena,
-      (),
-      |_| Action::nop(),
-      |_, completion| completion.status(),
-      callback,
-    )
+    let payload: &mut TaskPayload<M, F> =
+      arena.alloc(TaskPayload { model: Some(model), sink: Some(sink) });
+    let mut registration = Self::vacant();
+    registration.task = Some(Task {
+      payload: (payload as *mut TaskPayload<M, F>).cast(),
+      poll_fn: Self::poll_impl::<M, F>,
+      drop_fn: Self::drop_task_impl::<M, F>,
+      busy: false,
+      woken: false,
+      notified: false,
+      cancelled: false,
+      finished: false,
+    });
+    registration
   }
 
-  #[inline]
-  fn with_action_impl<S, Out>(
-    payload_ptr: *mut (),
-    f: &mut dyn for<'a> FnMut(Action<'a>),
-  ) {
-    // SAFETY: `payload_ptr` was created from a `Payload<S, Out>` in `new_in`
-    // and stays valid for the registration's lifetime.
-    let payload = unsafe { &mut *(payload_ptr as *mut Payload<S, Out>) };
-    f((payload.action)(&mut payload.state));
-  }
-
-  #[inline]
-  fn on_completion_impl<S, Out>(payload_ptr: *mut (), completion: Completion) {
-    // SAFETY: `payload_ptr` was created from a `Payload<S, Out>` in `new_in`
-    // and stays valid while completions are dispatched.
-    let payload = unsafe { &mut *(payload_ptr as *mut Payload<S, Out>) };
-    let out = (payload.complete)(&mut payload.state, completion);
-    payload.callback.call(out);
-  }
-
-  fn drop_impl<S, Out>(payload_ptr: *mut ()) {
-    // SAFETY: `payload_ptr` was allocated by `BumpBox::into_raw` in `new_in`.
-    unsafe {
-      drop(BumpBox::from_raw(payload_ptr as *mut Payload<S, Out>));
+  fn poll_impl<M, F>(payload: *mut (), cx: &mut Cx<'_>) -> bool
+  where
+    M: OpModel,
+    F: FnMut(M::Item) -> bool,
+  {
+    // SAFETY: `payload` was created from a `TaskPayload<M, F>` in `running`
+    // and lives in the slot's arena. The task is marked busy, so this is the
+    // only reference to it.
+    let payload = unsafe { &mut *payload.cast::<TaskPayload<M, F>>() };
+    loop {
+      let Some(model) = payload.model.as_mut() else { return true };
+      match model.poll(cx) {
+        Step::Pending => return false,
+        Step::Yield(item) => {
+          let wanted = match payload.sink.as_mut() {
+            Some(sink) => sink(item),
+            None => false,
+          };
+          // The sink may also have dropped the consumer, which asks for
+          // the model to stop: it must not take another step.
+          if !wanted || cx.stopped() {
+            payload.model = None;
+            payload.sink = None;
+            return true;
+          }
+        }
+        Step::Done(item) => {
+          payload.model = None;
+          // Dropped once it has run: a stream's consumer learns from that
+          // drop that no further item is coming.
+          if let Some(mut sink) = payload.sink.take() {
+            sink(item);
+          }
+          return true;
+        }
+      }
     }
   }
 
-  /// A copy of the lease the driver holds for this operation.
+  fn drop_task_impl<M, F>(payload: *mut ()) {
+    // SAFETY: as in `poll_impl`. Taking both leaves nothing to drop twice.
+    let payload = unsafe { &mut *payload.cast::<TaskPayload<M, F>>() };
+    payload.model = None;
+    payload.sink = None;
+  }
+
+  // --- the model ------------------------------------------------------------
+
+  /// Marks the model busy and returns what polls it. `None` when there is
+  /// no model left to poll, or it is busy already: then it is polled again
+  /// when whoever has it is done.
+  pub(crate) fn begin_poll(&mut self) -> Option<RawTask> {
+    let task = self.task.as_mut()?;
+    task.notified = false;
+    if task.finished {
+      return None;
+    }
+    if task.busy {
+      task.woken = true;
+      return None;
+    }
+    task.busy = true;
+    task.woken = false;
+    Some(RawTask {
+      payload: task.payload,
+      poll_fn: task.poll_fn,
+      drop_fn: task.drop_fn,
+    })
+  }
+
+  /// Ends a poll. Returns what to do next.
+  pub(crate) fn end_poll(&mut self, finished: bool) -> AfterPoll {
+    let Some(task) = self.task.as_mut() else {
+      unreachable!("a poll ended in a slot that runs no model");
+    };
+    if finished {
+      task.busy = false;
+      task.finished = true;
+      AfterPoll::Finished
+    } else if task.cancelled {
+      // Still busy: the caller drops the model, and then ends the poll
+      // again with it finished.
+      AfterPoll::Cancelled
+    } else if task.woken {
+      task.woken = false;
+      AfterPoll::Again
+    } else {
+      task.busy = false;
+      AfterPoll::Pending
+    }
+  }
+
+  /// Asks for the model to be dropped. Returns what drops it now, or `None`
+  /// when there is nothing to drop or whoever has the model will do it.
+  pub(crate) fn cancel_task(&mut self) -> Option<RawTask> {
+    let task = self.task.as_mut()?;
+    if task.finished {
+      return None;
+    }
+    task.cancelled = true;
+    if task.busy {
+      return None;
+    }
+    task.busy = true;
+    Some(RawTask {
+      payload: task.payload,
+      poll_fn: task.poll_fn,
+      drop_fn: task.drop_fn,
+    })
+  }
+
+  /// A poll unwound. The model is in an unknown state: it is dropped, not
+  /// polled again.
+  pub(crate) fn poll_panicked(&mut self) {
+    if let Some(task) = self.task.as_mut() {
+      task.busy = false;
+      task.cancelled = true;
+    }
+  }
+
+  /// Whether this slot's model should be queued to be polled: it has one,
+  /// that is not done and not queued yet.
+  pub(crate) fn notify(&mut self) -> bool {
+    match self.task.as_mut() {
+      Some(task) if !task.finished && !task.notified => {
+        task.notified = true;
+        true
+      }
+      _ => false,
+    }
+  }
+
+  /// Whether this slot's model was asked to stop and nobody has dropped it
+  /// yet.
+  pub(crate) fn is_cancelled(&self) -> bool {
+    self.task.as_ref().is_some_and(|task| task.cancelled && !task.finished)
+  }
+
+  // --- the operation --------------------------------------------------------
+
+  /// Whether a new operation may use this slot.
+  pub(crate) fn can_start_op(&self) -> bool {
+    self.cell.stage == Stage::Free && !self.lease.held_elsewhere()
+  }
+
+  /// Moves the memory of one operation into `arena` and records it as this
+  /// slot's operation. Returns its sequence number.
+  ///
+  /// `arena` must be the slot's step arena, just reset: the memory lives
+  /// until the next operation in this slot.
+  pub(crate) fn start_op<S: 'static, Out: 'static>(
+    &mut self,
+    arena: &mut Bump,
+    state: S,
+    action: ActionFn<S>,
+    complete: CompleteFn<S, Out>,
+    waiter: u64,
+  ) -> u64 {
+    assert!(
+      self.cell.stage == Stage::Free,
+      "driver: started an operation in a slot that holds one"
+    );
+    let payload: &mut OpPayload<S, Out> = arena.alloc(OpPayload {
+      result: None,
+      state: Some(state),
+      action,
+      complete,
+    });
+    self.cell.seq += 1;
+    self.cell.stage = Stage::InFlight;
+    self.cell.abandoned = false;
+    self.cell.waiter = waiter;
+    self.cell.payload = (payload as *mut OpPayload<S, Out>).cast();
+    self.cell.with_action_fn = Self::with_action_impl::<S, Out>;
+    self.cell.complete_fn = Self::complete_impl::<S, Out>;
+    self.cell.drop_fn = Self::drop_op_impl::<S, Out>;
+    self.cell.seq
+  }
+
+  fn with_action_impl<S, Out>(
+    payload: *mut (),
+    f: &mut dyn for<'a> FnMut(Action<'a>),
+  ) {
+    // SAFETY: `payload` was created from an `OpPayload<S, Out>` in
+    // `start_op` and stays valid until the slot's next operation.
+    let payload = unsafe { &mut *payload.cast::<OpPayload<S, Out>>() };
+    let Some(state) = payload.state.as_mut() else {
+      unreachable!("an operation was submitted after it was completed");
+    };
+    f((payload.action)(state));
+  }
+
+  fn complete_impl<S, Out>(
+    payload: *mut (),
+    completion: Completion,
+    keep: bool,
+  ) {
+    // SAFETY: as in `with_action_impl`. The operation is marked busy, so
+    // this is the only reference to its memory.
+    let payload = unsafe { &mut *payload.cast::<OpPayload<S, Out>>() };
+    let Some(state) = payload.state.as_mut() else {
+      unreachable!("an operation was completed twice");
+    };
+    let out = (payload.complete)(state, completion);
+    // The backend is done with this memory.
+    payload.state = None;
+    if keep {
+      payload.result = Some(out);
+    }
+  }
+
+  fn drop_op_impl<S, Out>(payload: *mut ()) {
+    // SAFETY: as in `with_action_impl`. Taking both leaves nothing to drop
+    // twice.
+    let payload = unsafe { &mut *payload.cast::<OpPayload<S, Out>>() };
+    payload.state = None;
+    payload.result = None;
+  }
+
+  /// A copy of the lease the driver holds on the operation's memory.
   #[inline]
   pub(crate) fn lease(&self) -> crate::backend::Keep {
     self.lease.clone()
   }
 
-  /// A backend still holds a copy of this operation's lease.
+  /// A backend still holds a copy of that lease.
   #[inline]
   pub(crate) fn lease_held(&self) -> bool {
     self.lease.held_elsewhere()
@@ -203,7 +489,131 @@ impl Registration {
   /// The driver calls this once, when it submits the operation.
   #[inline]
   pub(crate) fn with_action(&mut self, f: &mut dyn for<'a> FnMut(Action<'a>)) {
-    (self.with_action_fn)(self.payload, f);
+    (self.cell.with_action_fn)(self.cell.payload, f);
+  }
+
+  /// The operation could not be submitted: drops its memory and frees the
+  /// slot's operation.
+  pub(crate) fn abort_op(&mut self) {
+    if self.cell.stage == Stage::InFlight {
+      self.cell.stage = Stage::Free;
+      (self.cell.drop_fn)(self.cell.payload);
+    }
+  }
+
+  /// Marks the operation busy and returns what reads its result. `None`
+  /// when no operation is in flight here.
+  pub(crate) fn begin_completion(&mut self) -> Option<RawOp> {
+    if self.cell.stage != Stage::InFlight {
+      return None;
+    }
+    self.cell.stage = Stage::Busy;
+    Some(self.raw_op())
+  }
+
+  /// The result was read. Returns the slot of the model to poll, when the
+  /// result is kept for a ticket.
+  pub(crate) fn end_completion(&mut self, kept: bool) -> Option<u64> {
+    if kept && !self.cell.abandoned {
+      self.cell.stage = Stage::Ready;
+      Some(self.cell.waiter)
+    } else if kept {
+      // The ticket was dropped while the result was being read.
+      self.cell.stage = Stage::Free;
+      (self.cell.drop_fn)(self.cell.payload);
+      None
+    } else {
+      self.cell.stage = Stage::Free;
+      None
+    }
+  }
+
+  /// Reading the result unwound. The operation's memory is in an unknown
+  /// state and is not dropped.
+  pub(crate) fn completion_panicked(&mut self) {
+    self.cell.stage = Stage::Free;
+  }
+
+  /// The result of operation `seq`, once, when it is in. Until then, the
+  /// model in slot `waiter` is the one polled when it arrives.
+  ///
+  /// # Safety
+  ///
+  /// `Out` must be the result type operation `seq` of this slot was started
+  /// with.
+  pub(crate) unsafe fn take<Out>(
+    &mut self,
+    seq: u64,
+    waiter: u64,
+  ) -> Option<Out> {
+    if self.cell.seq != seq {
+      return None;
+    }
+    match self.cell.stage {
+      Stage::Ready => {
+        self.cell.stage = Stage::Free;
+        // SAFETY: the payload is an `OpPayload<S, Out>` for the caller's
+        // `Out`, which is `repr(C)` with `result: Option<Out>` first.
+        unsafe { (*self.cell.payload.cast::<Option<Out>>()).take() }
+      }
+      Stage::InFlight => {
+        self.cell.waiter = waiter;
+        None
+      }
+      Stage::Free | Stage::Busy => None,
+    }
+  }
+
+  /// What dropping the ticket for operation `seq` asks for.
+  pub(crate) fn abandon(&mut self, seq: u64) -> Abandon {
+    if self.cell.seq != seq {
+      return Abandon::Stale;
+    }
+    match self.cell.stage {
+      Stage::InFlight => Abandon::InFlight,
+      Stage::Ready => Abandon::Ready,
+      // Its result is being read right now, for a ticket that is gone by
+      // the time it is in: dropped then.
+      Stage::Busy => {
+        self.cell.abandoned = true;
+        Abandon::Stale
+      }
+      Stage::Free => Abandon::Stale,
+    }
+  }
+
+  /// The operation stays in the backend until it reports: its result is
+  /// dropped when it does.
+  pub(crate) fn abandon_in_flight(&mut self) {
+    self.cell.abandoned = true;
+  }
+
+  /// Marks the operation busy and returns what drops its memory or its
+  /// untaken result.
+  pub(crate) fn begin_drop(&mut self) -> RawOp {
+    self.cell.stage = Stage::Busy;
+    self.raw_op()
+  }
+
+  /// The caller of [`begin_drop`](Self::begin_drop) is done.
+  pub(crate) fn end_drop(&mut self) {
+    self.cell.stage = Stage::Free;
+  }
+
+  fn raw_op(&self) -> RawOp {
+    RawOp {
+      payload: self.cell.payload,
+      complete_fn: self.cell.complete_fn,
+      drop_fn: self.cell.drop_fn,
+      keep: !self.cell.abandoned,
+    }
+  }
+
+  /// Nothing is left here: no model that is still running, and no
+  /// operation. The slot can be given back.
+  pub(crate) fn is_spent(&self) -> bool {
+    self.cell.stage == Stage::Free
+      && self.task.as_ref().is_none_or(|task| task.finished && !task.busy)
   }
 
   /// The operation's action, with its borrow of the operation's memory
@@ -219,101 +629,185 @@ impl Registration {
     erased
   }
 
-  /// The handler to run, outside any driver borrow, for this operation's
-  /// completion.
-  #[inline]
-  pub(crate) fn begin_completion(&mut self) -> RawHandler {
-    RawHandler {
-      payload: self.payload,
-      on_completion_fn: self.on_completion_fn,
-    }
+  /// A slot holding one nop, in flight, whose memory holds `guard`.
+  #[cfg(test)]
+  pub(crate) fn nop_in<G: 'static>(arena: &mut Bump, guard: G) -> Self {
+    let mut registration = Self::vacant();
+    registration.start_op(
+      arena,
+      guard,
+      |_| Action::nop(),
+      |_, completion| completion.status(),
+      0,
+    );
+    registration
   }
 }
 
 impl Drop for Registration {
   fn drop(&mut self) {
-    (self.drop_fn)(self.payload);
+    // The operation first: its ticket, if the model still holds it, then
+    // finds nothing to cancel.
+    if self.cell.stage != Stage::Free {
+      self.cell.stage = Stage::Free;
+      (self.cell.drop_fn)(self.cell.payload);
+    }
+    if let Some(task) = self.task.take()
+      && !task.finished
+    {
+      (task.drop_fn)(task.payload);
+    }
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::cell::{Cell, RefCell};
+  use std::cell::Cell;
   use std::rc::Rc;
 
-  /// The memory of a nop that counts its drops.
-  struct Counted {
-    drops: Rc<Cell<usize>>,
-  }
+  /// Counts its drops.
+  struct Counted(Rc<Cell<usize>>);
 
   impl Drop for Counted {
     fn drop(&mut self) {
-      self.drops.set(self.drops.get() + 1);
+      self.0.set(self.0.get() + 1);
     }
   }
 
-  /// A registration over `Counted` that reports the raw result.
-  fn counted(
-    arena: &mut Bump,
-    drops: &Rc<Cell<usize>>,
-    f: impl Fn(isize) + 'static,
-  ) -> Registration {
-    let callback = Callback::new_in(arena, f);
-    Registration::new_in(
+  /// A slot holding one in-flight nop that reports the raw result and whose
+  /// memory holds a `Counted`.
+  fn counted(arena: &mut Bump, drops: &Rc<Cell<usize>>) -> (Registration, u64) {
+    let mut registration = Registration::vacant();
+    let seq = registration.start_op(
       arena,
-      Counted { drops: Rc::clone(drops) },
+      Counted(Rc::clone(drops)),
       |_| Action::nop(),
       |_, completion| completion.result(),
-      callback,
-    )
+      7,
+    );
+    (registration, seq)
+  }
+
+  fn complete(reg: &mut Registration, result: isize) -> Option<u64> {
+    let raw = reg.begin_completion().unwrap();
+    assert!(reg.begin_completion().is_none(), "one completion at a time");
+    // SAFETY: `reg` is alive and its operation was just marked busy.
+    unsafe { raw.complete(Completion::new(result)) };
+    reg.end_completion(raw.keep)
   }
 
   #[test]
-  fn the_action_is_the_one_the_state_builds() {
+  fn the_action_is_the_one_the_memory_builds() {
     let mut arena = Bump::new();
-    let mut reg = Registration::nop_in(&mut arena, |_| {});
+    let mut reg = Registration::nop_in(&mut arena, ());
     let mut seen = 0;
     reg.with_action(&mut |action| {
       assert!(action.is_nop());
       seen += 1;
     });
     assert_eq!(seen, 1);
+    assert!(reg.action().is_some_and(|action| action.is_nop()));
   }
 
   #[test]
-  fn a_completion_reaches_the_callback_as_the_operation_s_result() {
+  fn a_result_waits_for_its_ticket_and_frees_the_slot_when_taken() {
     let drops = Rc::new(Cell::new(0));
-    let results = Rc::new(RefCell::new(Vec::new()));
-    let sink = Rc::clone(&results);
     let mut arena = Bump::new();
-    let mut reg =
-      counted(&mut arena, &drops, move |result| sink.borrow_mut().push(result));
+    let (mut reg, seq) = counted(&mut arena, &drops);
+    assert!(!reg.can_start_op());
+    assert!(!reg.is_spent());
+    // SAFETY: the operation was started with `isize` results.
+    assert_eq!(unsafe { reg.take::<isize>(seq, 9) }, None, "not finished");
 
-    let handler = reg.begin_completion();
-    // SAFETY: `reg` is alive and this is its only completion.
-    unsafe { handler.complete(Completion::new(7)) };
+    assert_eq!(complete(&mut reg, 42), Some(9), "the last asker is polled");
+    assert_eq!(drops.get(), 1, "the memory is dropped once the result is read");
+    assert!(!reg.is_spent(), "the result is still here");
 
-    assert_eq!(*results.borrow(), [7]);
-    assert_eq!(drops.get(), 0, "the state lives until the registration drops");
-    drop(reg);
+    // SAFETY: as above.
+    assert_eq!(unsafe { reg.take::<isize>(seq + 1, 9) }, None, "another op");
+    // SAFETY: as above.
+    assert_eq!(unsafe { reg.take::<isize>(seq, 9) }, Some(42));
+    // SAFETY: as above.
+    assert_eq!(unsafe { reg.take::<isize>(seq, 9) }, None, "taken once");
+    assert!(reg.can_start_op());
+    assert!(reg.is_spent());
     assert_eq!(drops.get(), 1);
   }
 
   #[test]
-  fn dropping_an_uncompleted_registration_drops_state_and_callback() {
+  fn an_abandoned_operation_s_result_is_dropped_when_it_arrives() {
     let drops = Rc::new(Cell::new(0));
-    let held = Rc::new(());
-    let in_callback = Rc::clone(&held);
     let mut arena = Bump::new();
-    let reg = counted(&mut arena, &drops, move |_| {
-      let _held = &in_callback;
-    });
-    assert_eq!(Rc::strong_count(&held), 2);
+    let (mut reg, seq) = counted(&mut arena, &drops);
+    assert!(matches!(reg.abandon(seq + 1), Abandon::Stale));
+    assert!(matches!(reg.abandon(seq), Abandon::InFlight));
+    reg.abandon_in_flight();
+    assert!(!reg.is_spent(), "the backend still has it");
 
-    drop(reg);
-
+    assert_eq!(complete(&mut reg, 1), None, "nobody to poll");
+    assert!(reg.is_spent());
     assert_eq!(drops.get(), 1);
-    assert_eq!(Rc::strong_count(&held), 1);
+  }
+
+  #[test]
+  fn an_untaken_result_can_be_dropped() {
+    fn held(guard: &mut Option<Counted>, _: Completion) -> Option<Counted> {
+      guard.take()
+    }
+    let drops = Rc::new(Cell::new(0));
+    let mut arena = Bump::new();
+    let mut reg = Registration::vacant();
+    let seq = reg.start_op(
+      &mut arena,
+      Some(Counted(Rc::clone(&drops))),
+      |_| Action::nop(),
+      held,
+      0,
+    );
+    assert_eq!(complete(&mut reg, 0), Some(0));
+    assert_eq!(drops.get(), 0, "the result holds the guard now");
+
+    assert!(matches!(reg.abandon(seq), Abandon::Ready));
+    let raw = reg.begin_drop();
+    assert!(!reg.can_start_op(), "busy while it is dropped");
+    // SAFETY: `reg` is alive and its operation was just marked busy.
+    unsafe { raw.drop_payload() };
+    reg.end_drop();
+    assert!(reg.is_spent());
+    assert_eq!(drops.get(), 1);
+  }
+
+  #[test]
+  fn dropping_a_slot_drops_what_its_operation_holds() {
+    let drops = Rc::new(Cell::new(0));
+    let mut arena = Bump::new();
+    let (reg, _) = counted(&mut arena, &drops);
+    drop(reg);
+    assert_eq!(drops.get(), 1);
+
+    let mut reg = Registration::nop_in(&mut arena, Counted(Rc::clone(&drops)));
+    reg.abort_op();
+    assert_eq!(drops.get(), 2, "an operation that was not submitted");
+    assert!(reg.is_spent());
+    drop(reg);
+    assert_eq!(drops.get(), 2);
+  }
+
+  #[test]
+  fn a_slot_s_operations_are_told_apart_by_sequence() {
+    let mut arena = Bump::new();
+    let mut reg = Registration::vacant();
+    let first =
+      reg.start_op(&mut arena, (), |_| Action::nop(), |_, c| c.result(), 0);
+    assert_eq!(complete(&mut reg, 1), Some(0));
+    // SAFETY: the operation was started with `isize` results.
+    assert_eq!(unsafe { reg.take::<isize>(first, 0) }, Some(1));
+
+    let second =
+      reg.start_op(&mut arena, (), |_| Action::nop(), |_, c| c.result(), 0);
+    assert_ne!(first, second);
+    assert!(matches!(reg.abandon(first), Abandon::Stale));
+    assert!(matches!(reg.abandon(second), Abandon::InFlight));
   }
 }

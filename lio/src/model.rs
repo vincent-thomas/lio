@@ -16,8 +16,8 @@
 //! is to poll one of lio's leaves, and a leaf only produces the result of
 //! the operation it started.
 //!
-//! [`Io`](crate::api::Io) runs lio's own models. [`spawn`] and [`run`] run
-//! any model, including yours.
+//! [`Io`](crate::api::Io) runs any model, lio's or yours. [`spawn`] and
+//! [`run`] are the same thing with a handle to cancel it by.
 //!
 //! ```
 //! use lio::Lio;
@@ -65,26 +65,24 @@
 //! while lio.try_run().unwrap() > 0 {}
 //! ```
 //!
-//! # Cost
+//! # Where a running model lives
 //!
-//! An operation run on its own through [`Io`](crate::api::Io) is registered
-//! with the driver directly and allocates nothing. Inside a composite, each
-//! operation is one driver registration plus one small allocation that
-//! carries its result back to the model.
+//! Running a model moves it into one of the driver's slots, where it stays
+//! until it is done. The first operation it has in flight uses that same
+//! slot, so a single operation, or a model that does one thing at a time,
+//! takes one slot and allocates nothing. An operation started while that
+//! one is still busy takes a slot of its own.
 
-use std::any::TypeId;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-use bumpalo::Bump;
-
 use crate::Lio;
-use crate::driver::{QueueToken, WeakLio};
-use crate::registration::{ActionFn, Callback, CompleteFn, Registration};
+use crate::driver::{OpRef, Spawned, WeakLio};
+use crate::registration::{ActionFn, CompleteFn};
 
 /// A piece of I/O work the driver runs by polling it.
 pub trait OpModel {
@@ -139,75 +137,37 @@ macro_rules! ready {
 /// passes it on to the models it polls.
 pub struct Cx<'a> {
   lio: &'a Lio,
-  mode: Mode<'a>,
-}
-
-enum Mode<'a> {
-  /// Polling a root model: a result comes back through a [`Ticket`], and
-  /// the root is polled again when it has.
-  Root(&'a Rc<dyn Wake>),
-  /// Running one operation on its own: its result goes straight to a
-  /// callback, and there is no model to poll again.
-  Direct(Direct<'a>),
-}
-
-/// The callback of an operation run on its own, behind the type of the
-/// result it takes.
-struct Direct<'a> {
-  /// The `Out` of the `&mut dyn Deliver<Out>` that `deliver` points to.
-  out: TypeId,
-  deliver: *mut (),
-  /// Whether the operation may wait in the driver's queue.
-  queue: bool,
-  _deliver: PhantomData<&'a mut ()>,
-}
-
-/// Hands a callback to the registration of the operation it belongs to.
-trait Deliver<Out> {
-  /// Moves the callback into the operation's arena.
-  fn place(&mut self, arena: &mut Bump) -> Callback<Out>;
-
-  /// Moves the callback to the heap, for an operation that has to wait for
-  /// a slot.
-  fn boxed(&mut self) -> Box<dyn Fn(Out)>;
-}
-
-impl<Out, F: Fn(Out) + 'static> Deliver<Out> for Option<F> {
-  #[inline]
-  fn place(&mut self, arena: &mut Bump) -> Callback<Out> {
-    Callback::new_in(arena, self.taken())
-  }
-
-  fn boxed(&mut self) -> Box<dyn Fn(Out)> {
-    Box::new(self.taken())
-  }
-}
-
-trait Taken<F> {
-  fn taken(&mut self) -> F;
-}
-
-impl<F> Taken<F> for Option<F> {
-  fn taken(&mut self) -> F {
-    let Some(f) = self.take() else {
-      unreachable!("one operation run on its own submitted twice");
-    };
-    f
-  }
+  /// The slot of the model being polled.
+  task: u64,
 }
 
 impl<'a> Cx<'a> {
-  /// The result of the operation `ticket` stands for, once, when it has
-  /// finished.
-  fn take<T>(&mut self, ticket: &mut Ticket<T>) -> Option<T> {
-    match &mut ticket.kind {
-      TicketKind::Rooted { slot, .. } => slot.borrow_mut().take(),
-      TicketKind::Direct { .. } => None,
-    }
+  pub(crate) fn new(lio: &'a Lio, task: u64) -> Self {
+    Self { lio, task }
   }
 
-  /// Moves `state`, the memory one operation uses, into a driver
-  /// registration, and submits the operation `action` builds from it.
+  /// Whether the model being polled was asked to stop.
+  pub(crate) fn stopped(&self) -> bool {
+    self.lio.is_stopped(self.task)
+  }
+
+  /// The result of the operation `ticket` stands for, once, when it has
+  /// finished. Until then, the model being polled is the one polled again
+  /// when it has.
+  fn take<T>(&mut self, ticket: &mut Ticket<T>) -> Option<T> {
+    // A ticket names a slot of the driver it came from.
+    if ticket.taken || !ticket.lio.is(self.lio) {
+      return None;
+    }
+    // SAFETY: only `submit` makes a ticket, from the `OpRef` of an
+    // operation whose result is `T`, and it was made on this driver.
+    let out = unsafe { self.lio.take_op::<T>(&ticket.op, self.task) }?;
+    ticket.taken = true;
+    Some(out)
+  }
+
+  /// Moves `state`, the memory one operation uses, into the driver, and
+  /// submits the operation `action` builds from it.
   ///
   /// `complete` reads the result out of that same memory. The two are
   /// written together, at one call site per operation (see
@@ -220,299 +180,73 @@ impl<'a> Cx<'a> {
     action: ActionFn<S>,
     complete: CompleteFn<S, Out>,
   ) -> Ticket<Out> {
-    let lio = self.lio;
-    let kind = match &mut self.mode {
-      Mode::Root(root) => {
-        let slot = Rc::new(RefCell::new(None));
-        let filled = Rc::clone(&slot);
-        let root = Rc::clone(root);
-        let on_done = move |out: Out| {
-          *filled.borrow_mut() = Some(out);
-          Rc::clone(&root).notify();
-        };
-        let init = move |arena: &mut Bump| {
-          let callback = Callback::new_in(arena, on_done);
-          Registration::new_in(arena, state, action, complete, callback)
-        };
-        let id = if lio.is_full() {
-          // Over capacity the operation waits in the driver's queue.
-          TicketId::Queued(lio.queue_abandonable(init))
-        } else {
-          TicketId::Scheduled(scheduled(lio.schedule_with(init)))
-        };
-        TicketKind::Rooted { slot, id, lio: lio.downgrade() }
-      }
-      Mode::Direct(direct) => {
-        let queue = direct.queue;
-        let deliver = direct.deliver::<Out>();
-        if queue && lio.is_full() {
-          // Over capacity the operation waits in the driver's queue, and
-          // its callback on the heap.
-          let on_done = deliver.boxed();
-          lio.schedule_or_queue(move |arena| {
-            let callback = Callback::new_in(arena, on_done);
-            Registration::new_in(arena, state, action, complete, callback)
-          });
-          TicketKind::Direct { id: None }
-        } else {
-          let id = scheduled(lio.schedule_with(|arena| {
-            let callback = deliver.place(arena);
-            Registration::new_in(arena, state, action, complete, callback)
-          }));
-          TicketKind::Direct { id: Some(id) }
-        }
-      }
-    };
-    Ticket { kind }
-  }
-}
-
-impl Direct<'_> {
-  /// The callback, as the one for an operation that produces `Out`.
-  #[inline]
-  fn deliver<Out: 'static>(&mut self) -> &mut dyn Deliver<Out> {
-    assert!(
-      self.out == TypeId::of::<Out>(),
-      "an operation run on its own submitted another operation's result type"
-    );
-    // SAFETY: `deliver` was made in `run_direct` from a
-    // `&mut &mut dyn Deliver<Out>` for the `Out` whose `TypeId` was just
-    // checked, and that reference is borrowed for as long as this `Direct`
-    // lives.
-    unsafe { &mut **(self.deliver as *mut &mut dyn Deliver<Out>) }
-  }
-}
-
-#[inline]
-fn scheduled(scheduled: std::io::Result<u64>) -> u64 {
-  match scheduled {
-    Ok(id) => id,
-    Err(err) => {
-      unreachable!("lio rejected an operation it had capacity for: {err}")
-    }
-  }
-}
-
-/// Runs one operation on its own: `submit` starts it through the [`Cx`] it
-/// is given, and `on_done` receives its result.
-///
-/// With `queue`, an operation over capacity waits in the driver's queue.
-/// Without it the driver must have a free slot. Returns the operation's id
-/// when it has a slot.
-#[inline]
-pub(crate) fn run_direct<Req, Out: 'static>(
-  lio: &Lio,
-  request: Req,
-  on_done: impl Fn(Out) + 'static,
-  queue: bool,
-  submit: impl FnOnce(&mut Cx<'_>, Req) -> Ticket<Out>,
-) -> Option<u64> {
-  let mut on_done = Some(on_done);
-  let mut deliver: &mut dyn Deliver<Out> = &mut on_done;
-  let mut cx = Cx {
-    lio,
-    mode: Mode::Direct(Direct {
-      out: TypeId::of::<Out>(),
-      deliver: (&raw mut deliver).cast(),
-      queue,
-      _deliver: PhantomData,
-    }),
-  };
-  let ticket = submit(&mut cx, request);
-  match ticket.kind {
-    TicketKind::Direct { id } => id,
-    TicketKind::Rooted { .. } => {
-      unreachable!("an operation run on its own was given a rooted ticket")
+    Ticket {
+      op: self.lio.submit_op(self.task, state, action, complete),
+      lio: self.lio.downgrade(),
+      taken: false,
+      _out: PhantomData,
     }
   }
 }
 
 /// A receipt for one submitted operation.
 ///
-/// Its type is the result that operation produces. Dropping it before the
-/// result is taken cancels the operation; the driver frees the buffer once
-/// the backend is done with it.
+/// Its type is the result that operation produces. It names the driver slot
+/// that holds the operation's memory and, later, its result. Dropping it
+/// before the result is taken cancels the operation; the driver frees the
+/// memory once the backend is done with it.
 pub(crate) struct Ticket<T> {
-  kind: TicketKind<T>,
-}
-
-enum TicketKind<T> {
-  /// Submitted by a model: the result arrives in `slot`.
-  Rooted { slot: Rc<RefCell<Option<T>>>, id: TicketId, lio: WeakLio },
-  /// Run on its own: the result goes to a callback, and whoever holds that
-  /// callback's other end cancels by id.
-  Direct { id: Option<u64> },
-}
-
-enum TicketId {
-  /// In a driver slot.
-  Scheduled(u64),
-  /// Waiting for a slot, or in one since.
-  Queued(Rc<QueueToken>),
+  op: OpRef,
+  lio: WeakLio,
+  taken: bool,
+  _out: PhantomData<fn() -> T>,
 }
 
 impl<T> Drop for Ticket<T> {
   fn drop(&mut self) {
-    let TicketKind::Rooted { slot, id, lio } = &self.kind else { return };
-    // The registration's callback shares the slot. Once it is gone the
-    // operation has finished and its id may belong to a later one.
-    if Rc::strong_count(slot) == 1 || slot.borrow().is_some() {
+    if self.taken {
       return;
     }
-    let id = match id {
-      TicketId::Scheduled(id) => Some(*id),
-      TicketId::Queued(token) => {
-        // Still queued: it never reaches the backend.
-        token.abandon();
-        token.id()
-      }
-    };
     // Without a driver there is nothing left to cancel.
-    if let Some(id) = id
-      && let Some(lio) = lio.upgrade()
-    {
-      lio.cancel_stream(id);
+    if let Some(lio) = self.lio.upgrade() {
+      lio.drop_op(&self.op);
     }
   }
 }
 
 // ============================================================================
-// Running a root model
+// Running a model
 // ============================================================================
 
-pub(crate) trait Wake {
-  /// One of the root model's operations finished: have the driver poll it
-  /// once the run that routed the completion has released its slot.
-  fn notify(self: Rc<Self>);
-
-  /// Polls the root model.
-  fn wake(self: Rc<Self>);
-
-  /// Drops the root model, cancelling what it has in flight.
-  fn cancel(&self);
-}
-
-struct Root<M: OpModel, F> {
-  /// Weak: the driver's registrations hold this root through their
-  /// callbacks.
-  lio: WeakLio,
-  model: RefCell<Option<M>>,
-  /// Receives the items. Dropped as soon as the model is: a stream's
-  /// consumer learns from that drop that no further item is coming.
-  on_item: RefCell<Option<F>>,
-  /// Already waiting for the driver to poll it.
-  notified: Cell<bool>,
-  /// A poll is running further up the stack.
-  polling: Cell<bool>,
-  /// An operation finished while a poll was running: poll once more.
-  woken: Cell<bool>,
-  cancelled: Cell<bool>,
-}
-
-impl<M, F> Wake for Root<M, F>
-where
-  M: OpModel + 'static,
-  F: FnMut(M::Item) -> bool + 'static,
-{
-  fn notify(self: Rc<Self>) {
-    if !self.notified.replace(true)
-      && let Some(lio) = self.lio.upgrade()
-    {
-      lio.wake_later(self);
-    }
-  }
-
-  fn wake(self: Rc<Self>) {
-    self.notified.set(false);
-    if self.polling.replace(true) {
-      self.woken.set(true);
-      return;
-    }
-    let root: Rc<dyn Wake> = self.clone();
-    loop {
-      self.woken.set(false);
-      // A model cannot outlive its driver: nothing would ever finish.
-      let lio = self.lio.upgrade();
-      let (false, Some(lio)) = (self.cancelled.get(), lio) else {
-        self.finish();
-        break;
-      };
-      let step = {
-        let mut model = self.model.borrow_mut();
-        let Some(model) = model.as_mut() else { break };
-        model.poll(&mut Cx { lio: &lio, mode: Mode::Root(&root) })
-      };
-      match step {
-        Step::Pending if self.woken.get() => {}
-        Step::Pending => break,
-        Step::Yield(item) => {
-          let wanted = match self.on_item.borrow_mut().as_mut() {
-            Some(on_item) => on_item(item),
-            None => false,
-          };
-          if !wanted {
-            self.cancelled.set(true);
-          }
-        }
-        Step::Done(item) => {
-          let model = self.model.borrow_mut().take();
-          drop(model);
-          let on_item = self.on_item.borrow_mut().take();
-          if let Some(mut on_item) = on_item {
-            on_item(item);
-          }
-          break;
-        }
-      }
-    }
-    self.polling.set(false);
-  }
-
-  fn cancel(&self) {
-    self.cancelled.set(true);
-    // A running poll sees the flag when it returns.
-    if !self.polling.get() {
-      self.finish();
-    }
-  }
-}
-
-impl<M: OpModel, F> Root<M, F> {
-  /// Drops the model and the item sink, each with its cell released:
-  /// dropping tickets calls back into the driver, and dropping the sink may
-  /// wake a consumer that polls inline.
-  fn finish(&self) {
-    let model = self.model.borrow_mut().take();
-    drop(model);
-    let on_item = self.on_item.borrow_mut().take();
-    drop(on_item);
-  }
-}
-
-/// A running root model.
+/// A running model.
 ///
 /// Dropping the handle leaves the model running. [`cancel`](Self::cancel)
 /// stops it.
 pub struct Task {
-  root: Rc<dyn Wake>,
+  lio: WeakLio,
+  spawned: Spawned,
 }
 
 impl Task {
   /// Drops the model. Operations it has in flight are cancelled, and no
   /// further item is delivered.
   pub fn cancel(self) {
-    self.root.cancel();
+    self.stop();
   }
 
   /// [`cancel`](Self::cancel) for a handle that cannot be consumed.
   pub(crate) fn stop(&self) {
-    self.root.cancel();
+    if let Some(lio) = self.lio.upgrade() {
+      lio.cancel(&self.spawned);
+    }
   }
 }
 
 /// Runs `model` on `lio`, calling `on_item` with every item it produces.
 ///
-/// The first poll happens here. The rest happen while `lio` runs.
+/// The model moves into the driver, which polls it for the first time here
+/// and then whenever one of its operations finishes, while `lio` runs.
+/// Over the driver's capacity it starts once a slot is free.
 pub fn spawn<M>(
   lio: &Lio,
   model: M,
@@ -536,22 +270,13 @@ pub(crate) fn spawn_while<M>(
 where
   M: OpModel + 'static,
 {
-  let root: Rc<dyn Wake> = Rc::new(Root {
-    lio: lio.downgrade(),
-    model: RefCell::new(Some(model)),
-    on_item: RefCell::new(Some(on_item)),
-    notified: Cell::new(false),
-    polling: Cell::new(false),
-    woken: Cell::new(false),
-    cancelled: Cell::new(false),
-  });
-  Rc::clone(&root).wake();
-  Task { root }
+  Task { lio: lio.downgrade(), spawned: lio.spawn(model, on_item) }
 }
 
 /// Runs `model` on `lio` as a future that resolves to its first item.
 ///
-/// The model starts on the first poll. Dropping the future cancels it.
+/// The model starts on the first poll, or once the driver has a free slot.
+/// Dropping the future cancels it.
 pub fn run<M>(lio: &Lio, model: M) -> Run<M>
 where
   M: OpModel + Unpin + 'static,
@@ -559,7 +284,8 @@ where
   Run { state: RunState::Idle(lio.clone(), model) }
 }
 
-/// The future [`run`] returns.
+/// The future of a model: what [`run`] returns and what an
+/// [`Io`](crate::api::Io) turns into.
 pub struct Run<M: OpModel> {
   state: RunState<M>,
 }
@@ -585,40 +311,47 @@ where
     let this = &mut *self;
     match std::mem::replace(&mut this.state, RunState::Done) {
       RunState::Idle(lio, model) => {
+        if lio.is_full() {
+          // Wait for a slot; the driver wakes us when one frees up.
+          lio.wait_for_capacity(cx.waker());
+          this.state = RunState::Idle(lio, model);
+          return Poll::Pending;
+        }
         let shared = Rc::new(RefCell::new(Shared {
           item: None,
           waker: Some(cx.waker().clone()),
         }));
         let sink = Rc::clone(&shared);
-        let task = spawn(&lio, model, move |item| {
+        let task = spawn_while(&lio, model, move |item| {
           let waker = {
             let mut shared = sink.borrow_mut();
-            if shared.item.is_none() {
-              shared.item = Some(item);
-            }
+            shared.item = Some(item);
             shared.waker.take()
           };
+          // Wake with the cell released: the waker may poll or drop this
+          // future inline, and both borrow it.
           if let Some(waker) = waker {
             waker.wake();
           }
+          // One item is all a future takes.
+          false
         });
         this.state = RunState::Running { shared, task };
         // The model may have finished inside `spawn`.
         Pin::new(this).poll(cx)
       }
       RunState::Running { shared, task } => {
-        let item = shared.borrow_mut().item.take();
-        match item {
-          Some(item) => {
-            task.cancel();
-            Poll::Ready(item)
-          }
-          None => {
-            shared.borrow_mut().waker = Some(cx.waker().clone());
-            this.state = RunState::Running { shared, task };
-            Poll::Pending
-          }
+        let mut waiting = shared.borrow_mut();
+        if let Some(item) = waiting.item.take() {
+          return Poll::Ready(item);
         }
+        match &waiting.waker {
+          Some(waker) if waker.will_wake(cx.waker()) => {}
+          _ => waiting.waker = Some(cx.waker().clone()),
+        }
+        drop(waiting);
+        this.state = RunState::Running { shared, task };
+        Poll::Pending
       }
       RunState::Done => panic!("model future polled after completion"),
     }
@@ -627,10 +360,10 @@ where
 
 impl<M: OpModel> Drop for Run<M> {
   fn drop(&mut self) {
-    if let RunState::Running { task, .. } =
-      std::mem::replace(&mut self.state, RunState::Done)
-    {
-      task.cancel();
+    if let RunState::Running { shared, task } = &self.state {
+      // The operation may still complete; nobody is left to wake then.
+      shared.borrow_mut().waker = None;
+      task.stop();
     }
   }
 }
@@ -668,14 +401,6 @@ impl<Req, Out> Leaf<Req, Out> {
         *self = Leaf::InFlight(ticket);
         Step::Pending
       }
-    }
-  }
-
-  /// What the operation was asked to do, when it has not started yet.
-  pub(crate) fn into_idle(self) -> Option<Req> {
-    match self {
-      Leaf::Idle(request) => Some(request),
-      Leaf::InFlight(_) | Leaf::Done => None,
     }
   }
 }

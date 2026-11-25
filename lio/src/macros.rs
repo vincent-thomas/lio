@@ -179,46 +179,12 @@ macro_rules! action_io {
   }};
 }
 
-/// Lets an [`Io`](crate::api::Io) run a built-in poll-shaped model.
-///
-/// `model_io!(Type)`, or `model_io!(generic [T: Bound] Type<T>)`.
-macro_rules! model_io {
-  (generic [$($generics:tt)*] $ty:ty) => {
-    model_io!(@impl [$($generics)*] $ty);
-  };
-  ($ty:ty) => {
-    model_io!(@impl [] $ty);
-  };
-  (@impl [$($generics:tt)*] $ty:ty) => {
-    impl<$($generics)*> $crate::api::io::sealed::Sealed for $ty {}
-
-    impl<$($generics)*> $crate::api::io::Runnable for $ty {
-      type Item = <$ty as $crate::model::OpModel>::Item;
-      type Future = $crate::model::Run<$ty>;
-
-      fn run_callback<F>(self, lio: $crate::Lio, f: F)
-      where
-        F: Fn(Self::Item) + 'static,
-      {
-        // The task is left running: its operations keep it alive.
-        let _task = $crate::model::spawn(&lio, self, f);
-      }
-
-      fn run_future(self, lio: $crate::Lio) -> Self::Future {
-        $crate::model::run(&lio, self)
-      }
-    }
-  };
-}
-
 /// Declares the type of one operation: what it was asked to do, held
 /// until it is polled, and the [`Cx`](crate::model::Cx) method that then
 /// starts it.
 ///
 /// The generated type is an [`OpModel`](crate::model::OpModel) whose `poll`
-/// calls that method. An [`Io`](crate::api::Io) of it calls the same method
-/// with a `Cx` that delivers the result straight to the consumer, so a
-/// single operation is registered with the driver as it is.
+/// calls that method.
 macro_rules! leaf {
   (
     $(#[$meta:meta])*
@@ -247,51 +213,6 @@ macro_rules! leaf {
         cx: &mut $crate::model::Cx<'_>,
       ) -> $crate::model::Step<Self::Item> {
         self.state.poll(cx, |cx, ($($arg,)*)| cx.$method($($arg),*))
-      }
-    }
-
-    impl<$($generics)*> $crate::api::io::sealed::Sealed for $name$(<$param>)? {}
-
-    impl<$($generics)*> $crate::api::io::Runnable for $name$(<$param>)? {
-      type Item = $item;
-      type Future = $crate::api::io::OpFuture<Self>;
-
-      #[inline]
-      fn run_callback<F>(self, lio: $crate::Lio, f: F)
-      where
-        F: Fn(Self::Item) + 'static,
-      {
-        let request = $crate::api::io::unsubmitted(self.state.into_idle());
-        // Over capacity, the operation waits in a queue (see `Lio::is_full`).
-        $crate::model::run_direct(&lio, request, f, true, |cx, ($($arg,)*)| {
-          cx.$method($($arg),*)
-        });
-      }
-
-      #[inline]
-      fn run_future(self, lio: $crate::Lio) -> Self::Future {
-        $crate::api::io::OpFuture::new(self, lio)
-      }
-    }
-
-    impl<$($generics)*> $crate::api::io::sealed::Direct for $name$(<$param>)? {
-      #[inline]
-      fn start<F>(self, lio: &$crate::Lio, f: F) -> u64
-      where
-        F: Fn(Self::Item) + 'static,
-      {
-        let request = $crate::api::io::unsubmitted(self.state.into_idle());
-        let id = $crate::model::run_direct(
-          lio,
-          request,
-          f,
-          false,
-          |cx, ($($arg,)*)| cx.$method($($arg),*),
-        );
-        let Some(id) = id else {
-          unreachable!("an operation that may not queue was queued");
-        };
-        id
       }
     }
   };

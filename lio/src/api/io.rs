@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! Io<T>
-//!   ├─> IntoFuture ──> T::Future   (async/await)
+//!   ├─> IntoFuture ──> Run<T>      (async/await)
 //!   ├─> when_done(F)  (callback)
 //!   ├─> send()    ──> Receiver<T>        (channel-based blocking)
 //!   └─> send_with(Sender<T>)             (custom channel)
@@ -80,61 +80,9 @@ pub struct Io<T> {
   handle: LioHandle,
 }
 
-pub(crate) mod sealed {
-  use crate::driver::Lio;
-
-  pub trait Sealed {}
-
-  /// A single operation, which the driver registers as it is.
-  pub trait Direct: super::Runnable {
-    /// Submits the operation now and returns its id. The driver must have a
-    /// free slot.
-    fn start<F>(self, lio: &Lio, f: F) -> u64
-    where
-      F: Fn(Self::Item) + 'static;
-  }
-}
-
-/// The memory of an operation that has not been submitted.
-///
-/// # Panics
-///
-/// Panics for an operation that was already polled: its memory is in the
-/// driver, so it cannot be submitted again.
-pub(crate) fn unsubmitted<S>(state: Option<S>) -> S {
-  let Some(state) = state else {
-    panic!(
-      "lio consumer error: an operation that was already polled cannot be \
-       run through Io"
-    );
-  };
-  state
-}
-
-/// What an [`Io`] can run: lio's own [operations](crate::api::ops) and
-/// built-in [models](crate::model). Sealed.
-///
-/// A single operation is registered with the driver as it is. A model that
-/// takes several steps is polled. For a model of your own, use
-/// [`model::spawn`] or [`model::run`].
-pub trait Runnable: sealed::Sealed + Sized {
-  /// What the operation produces.
-  type Item;
-  /// The future an [`Io`] of this operation turns into.
-  type Future;
-
-  #[doc(hidden)]
-  fn run_callback<F>(self, lio: Lio, f: F)
-  where
-    F: Fn(Self::Item) + 'static;
-
-  #[doc(hidden)]
-  fn run_future(self, lio: Lio) -> Self::Future;
-}
-
 impl<T> Io<T>
 where
-  T: Runnable,
+  T: OpModel + 'static,
 {
   // /// Block the current thread until the operation completes and return the result.
   // ///
@@ -260,7 +208,8 @@ where
     F: Fn(T::Item) + 'static,
   {
     let (lio, op) = self.into_lio();
-    op.run_callback(lio, f);
+    // The handle is dropped: the model runs until it is done.
+    let _task = model::spawn(&lio, op, f);
   }
 }
 
@@ -482,123 +431,20 @@ impl<T> Io<T> {
 
 impl<T> IntoFuture for Io<T>
 where
-  T: Runnable,
-  T::Future: Future<Output = T::Item>,
+  T: OpModel + Unpin + 'static,
 {
   type Output = T::Item;
-  type IntoFuture = T::Future;
+  type IntoFuture = model::Run<T>;
 
   fn into_future(self) -> Self::IntoFuture {
     let (lio, op) = self.into_lio();
-    op.run_future(lio)
+    model::run(&lio, op)
   }
-}
-
-/// A future representing a single-shot StreamOp operation.
-///
-/// Owns the channel receiver to get typed results.
-/// The future of a single operation run through [`Io`].
-pub struct OpFuture<T: Runnable> {
-  state: OpFutureState<T>,
-  lio: Lio,
 }
 
 struct LocalFutureSlot<T> {
   item: Option<T>,
   waker: Option<std::task::Waker>,
-}
-
-enum OpFutureState<T: Runnable> {
-  Pending(T),
-  Inflight { id: u64, slot: Rc<RefCell<LocalFutureSlot<T::Item>>> },
-  Done,
-}
-
-impl<T: Runnable> OpFuture<T> {
-  pub(crate) fn new(op: T, lio: Lio) -> Self {
-    Self { state: OpFutureState::Pending(op), lio }
-  }
-}
-
-impl<T> Future for OpFuture<T>
-where
-  T: sealed::Direct + Unpin,
-  T::Item: 'static,
-{
-  type Output = T::Item;
-
-  fn poll(
-    mut self: Pin<&mut Self>,
-    cx: &mut Context<'_>,
-  ) -> Poll<Self::Output> {
-    let this = &mut *self;
-
-    match std::mem::replace(&mut this.state, OpFutureState::Done) {
-      OpFutureState::Pending(op) => {
-        if this.lio.is_full() {
-          // Wait for a slot; the driver wakes us when one frees up.
-          this.lio.wait_for_capacity(cx.waker());
-          this.state = OpFutureState::Pending(op);
-          return Poll::Pending;
-        }
-        let slot = Rc::new(RefCell::new(LocalFutureSlot {
-          item: None,
-          waker: Some(cx.waker().clone()),
-        }));
-        let callback_slot = Rc::clone(&slot);
-
-        let id = op.start(&this.lio, move |item| {
-          let waker = {
-            let mut slot = callback_slot.borrow_mut();
-            slot.item = Some(item);
-            slot.waker.take()
-          };
-          // Wake with the slot released: the waker may poll or drop this
-          // future inline, and both borrow the slot.
-          if let Some(waker) = waker {
-            waker.wake();
-          }
-        });
-
-        this.state = OpFutureState::Inflight { id, slot };
-        Poll::Pending
-      }
-
-      OpFutureState::Inflight { id, slot } => {
-        let mut slot_ref = slot.borrow_mut();
-        if let Some(item) = slot_ref.item.take() {
-          Poll::Ready(item)
-        } else {
-          match &slot_ref.waker {
-            Some(waker) if waker.will_wake(cx.waker()) => {}
-            _ => slot_ref.waker = Some(cx.waker().clone()),
-          }
-          drop(slot_ref);
-          this.state = OpFutureState::Inflight { id, slot };
-          Poll::Pending
-        }
-      }
-
-      OpFutureState::Done => {
-        panic!("OpFuture polled after completion");
-      }
-    }
-  }
-}
-
-impl<T: Runnable> Drop for OpFuture<T> {
-  fn drop(&mut self) {
-    if let OpFutureState::Inflight { id, slot } = &self.state {
-      // The callback shares the slot. Once the registration (and with it the
-      // callback) is gone, `id` is stale: a later operation may reuse it.
-      if Rc::strong_count(slot) == 1 {
-        return;
-      }
-      // The operation may still complete; nobody is left to wake then.
-      slot.borrow_mut().waker = None;
-      self.lio.cancel_stream(*id);
-    }
-  }
 }
 
 // ============================================================================
@@ -904,7 +750,7 @@ mod tests {
   }
 
   #[test]
-  #[should_panic(expected = "OpFuture polled after completion")]
+  #[should_panic(expected = "model future polled after completion")]
   fn test_io_future_panics_when_polled_after_completion() {
     let lio = Lio::new(64).unwrap();
     let io = test_io(&lio);
@@ -933,22 +779,17 @@ mod tests {
     let io = test_io(&lio);
     let mut future = io.into_future();
 
-    // Initial state is Pending
-    assert!(matches!(future.state, OpFutureState::Pending(_)));
-
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
     // After first poll, state is Inflight
     let _ = Pin::new(&mut future).poll(&mut cx);
-    assert!(matches!(future.state, OpFutureState::Inflight { .. }));
 
     // Complete the operation
     run_until_done(&lio);
 
     // After completion poll, state is Done
     let _ = Pin::new(&mut future).poll(&mut cx);
-    assert!(matches!(future.state, OpFutureState::Done));
   }
 
   #[test]
@@ -967,9 +808,6 @@ mod tests {
     // Polling again before completion should still be pending
     let poll2 = Pin::new(&mut future).poll(&mut cx);
     assert!(poll2.is_pending());
-
-    // State should still be Inflight
-    assert!(matches!(future.state, OpFutureState::Inflight { .. }));
 
     // Now complete and verify
     run_until_done(&lio);

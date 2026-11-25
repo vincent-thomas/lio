@@ -269,8 +269,6 @@ impl OpModel for Copy {
   }
 }
 
-model_io!(Copy);
-
 /// A read buffer whose writable region is capped below the `Vec`'s capacity.
 ///
 /// A `Vec<u8>` lends reads its whole capacity, so reusing one allocation for

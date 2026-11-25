@@ -339,8 +339,6 @@ impl OpModel for OpenFile {
   }
 }
 
-model_io!(OpenFile);
-
 /// Open-directory operation specialized to return a typed [`Directory`].
 pub struct OpenDirectory {
   inner: ops::OpenAt,
@@ -353,8 +351,6 @@ impl OpModel for OpenDirectory {
     Step::Done(ready!(self.inner.poll(cx)).map(Directory::from_resource))
   }
 }
-
-model_io!(OpenDirectory);
 
 /// Open-directory operation specialized to return a high-level [`ReadDir`].
 pub struct OpenReadDir {
@@ -423,8 +419,6 @@ impl OpModel for OpenReadDir {
     }
   }
 }
-
-model_io!(OpenReadDir);
 
 #[derive(Clone)]
 struct PendingDirEntry {
@@ -709,8 +703,6 @@ impl OpModel for RemoveDirAll {
   }
 }
 
-model_io!(RemoveDirAll);
-
 /// High-level symbolic-link target reader.
 pub struct ReadLink {
   path: CString,
@@ -765,8 +757,6 @@ impl OpModel for ReadLink {
     }
   }
 }
-
-model_io!(ReadLink);
 
 /// High-level UTF-8 file reader.
 pub struct ReadToString {
@@ -836,8 +826,6 @@ impl OpModel for ReadToString {
     }
   }
 }
-
-model_io!(ReadToString);
 
 /// Opens a directory reader relative to the current working directory.
 ///

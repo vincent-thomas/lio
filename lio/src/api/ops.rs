@@ -1015,7 +1015,7 @@ impl Cx<'_> {
 mod tests {
   use super::*;
   use crate::Lio;
-  use crate::api::io::{Io, Runnable};
+  use crate::api::io::Io;
   use crate::backend::op::socket_addr_into_buf;
   use crate::backend::testing::{Checked, POISON, ScriptedBackend};
   use crate::model;
@@ -1031,7 +1031,7 @@ mod tests {
   /// run submitted and produced, which must not depend on how it ran.
   fn run<M>(make: impl Fn() -> M, result: isize) -> Vec<(Op, Item<M>)>
   where
-    M: OpModel + Runnable<Item = Item<M>> + 'static,
+    M: OpModel + 'static,
     Item<M>: 'static,
   {
     let backend = ScriptedBackend::new();
@@ -1077,9 +1077,7 @@ mod tests {
   /// `submits` accepts, and turn a result into `Ok(())` or its OS error.
   fn reports_status<M>(make: impl Fn() -> M, submits: impl Fn(&Op) -> bool)
   where
-    M: OpModel<Item = io::Result<()>>
-      + Runnable<Item = io::Result<()>>
-      + 'static,
+    M: OpModel<Item = io::Result<()>> + 'static,
   {
     for (op, item) in run(&make, 0) {
       assert!(submits(&op), "unexpected submission: {op:?}");
