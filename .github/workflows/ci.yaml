@@ -62,7 +62,7 @@ jobs:
         run: mise run ci
 
   # The C ABI, then the C and C++ tests that link it.
-  # Ubuntu's g++ provides libstdc++. macOS uses the image clang++.
+  # Linux uses the mise conda g++. macOS uses the image clang++.
   ffi:
     name: ffi-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
