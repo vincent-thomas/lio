@@ -522,7 +522,7 @@ impl Lio {
   {
     let inserted = inner.store.insert_submitting(
       |arena| Registration::running(arena, model, sink),
-      |_id, _reg, _step_bump, insert| insert.keep_on_panic(),
+      |_id, _reg, _step_bump, _lease, insert| insert.keep_on_panic(),
     );
     let Some(id) = inserted else {
       unreachable!("driver: a slot that was kept was not claimed");
@@ -695,8 +695,10 @@ impl Lio {
   ) -> Result<u64, S> {
     let LioInner { io, store, time, .. } = inner;
     let mut state = Some(state);
-    let started = store.with_slot(id, |reg, step_bump| {
-      if !reg.can_start_op() {
+    let started = store.with_slot(id, |reg, step_bump, lease| {
+      // A backend that still holds the lease may still use the memory of
+      // the operation before this one.
+      if !reg.can_start_op() || lease.held_elsewhere() {
         return None;
       }
       let state = state.take()?;
@@ -704,7 +706,7 @@ impl Lio {
       // nothing points into the arena any more.
       step_bump.reset();
       let seq = reg.start_op(step_bump, state, action, complete, id);
-      let keep = reg.lease();
+      let keep = lease.clone();
       let mut abort = AbortOp { reg, armed: true };
       let AbortOp { reg, armed } = &mut abort;
       reg.with_action(&mut |action| {
@@ -744,9 +746,9 @@ impl Lio {
     let LioInner { io, store, time, .. } = inner;
     let inserted = store.insert_submitting(
       |_arena| Registration::vacant(),
-      |id, reg, step_bump, insert| {
+      |id, reg, step_bump, lease, insert| {
         reg.start_op(step_bump, state, action, complete, waiter);
-        let keep = reg.lease();
+        let keep = lease.clone();
         reg.with_action(&mut |action| {
           // After this, a panic must not free the operation's memory:
           // `push` may have copied its addresses. A panic while building
@@ -877,6 +879,7 @@ impl Lio {
   fn start_waiting_at_home(inner: &mut LioInner, home: u64) {
     while !inner.overflow.is_empty()
       && inner.store.get_mut(home).is_some_and(|reg| reg.can_start_op())
+      && !inner.store.lease_held(home)
     {
       let waiting =
         inner.overflow.iter().position(|queued| queued.home == Some(home));
@@ -904,20 +907,21 @@ impl Lio {
       !inner.time.contains(id),
       "driver: removed registration {id} with its timer still scheduled"
     );
-    let Some(detached) = inner.store.detach(id) else {
-      unreachable!("driver: retired slot {id}, which is not taken");
-    };
-    if detached.registration.lease_held() {
+    if inner.store.lease_held(id) {
       // A backend may still use the operation's memory: the registration
       // is leaked and the slot stays reserved, so that memory stays valid.
+      let Some(detached) = inner.store.detach(id) else {
+        unreachable!("driver: retired slot {id}, which is not taken");
+      };
       inner.leaked += 1;
       std::mem::forget(detached);
     } else {
       // The slot is spent: its model and its consumer were dropped when the
       // model finished, and its operation's result was taken. Nothing is
-      // left that would run user code, so it goes back right away.
-      inner.store.release(detached.slot);
-      drop(detached.registration);
+      // left that would run user code, so it is dropped where it is and the
+      // slot goes back right away.
+      let removed = inner.store.remove_in_place(id);
+      assert!(removed, "driver: retired slot {id}, which is not taken");
     }
     Self::assert_retired_slots_tracked(inner);
   }

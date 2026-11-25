@@ -201,9 +201,6 @@ pub(crate) enum AfterPoll {
 pub struct Registration {
   task: Option<Task>,
   cell: OpCell,
-  /// The driver's share of the lease on the operation's memory. A backend
-  /// holds the other shares.
-  lease: crate::backend::Keep,
 }
 
 fn no_action(_: *mut (), _: &mut dyn for<'a> FnMut(Action<'a>)) {}
@@ -226,7 +223,6 @@ impl Registration {
         complete_fn: no_completion,
         drop_fn: no_drop,
       },
-      lease: crate::backend::Keep::new(),
     }
   }
 
@@ -393,9 +389,10 @@ impl Registration {
 
   // --- the operation --------------------------------------------------------
 
-  /// Whether a new operation may use this slot.
+  /// Whether this slot holds no operation, so that one may start. The
+  /// caller also checks that no backend still holds the slot's lease.
   pub(crate) fn can_start_op(&self) -> bool {
-    self.cell.stage == Stage::Free && !self.lease.held_elsewhere()
+    self.cell.stage == Stage::Free
   }
 
   /// Moves the memory of one operation into `arena` and records it as this
@@ -470,18 +467,6 @@ impl Registration {
     let payload = unsafe { &mut *payload.cast::<OpPayload<S, Out>>() };
     payload.state = None;
     payload.result = None;
-  }
-
-  /// A copy of the lease the driver holds on the operation's memory.
-  #[inline]
-  pub(crate) fn lease(&self) -> crate::backend::Keep {
-    self.lease.clone()
-  }
-
-  /// A backend still holds a copy of that lease.
-  #[inline]
-  pub(crate) fn lease_held(&self) -> bool {
-    self.lease.held_elsewhere()
   }
 
   /// Runs `f` on the operation's action while its memory is borrowed.
