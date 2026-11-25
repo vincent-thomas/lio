@@ -8,6 +8,9 @@ rust = [
 cmake = "3.28.3"
 jq = "1.7.1"
 "conda:libclang" = { version = "18.1.3", os = ["linux"] }
+# C++ compiler for the FFI tests. conda clang 18 has no clang++.
+# This g++ ships libstdc++ and links it. macOS uses the image clang++.
+"conda:gxx" = { version = "16.2.0", os = ["linux"] }
 
 # The conda package ships ar as `<target>-ar` only. build.rs calls `ar`.
 [tools.clang]
@@ -108,7 +111,7 @@ description = "Every core mutant from .cargo/mutants.toml. Set SHARD=k/n for one
 run = "scripts/mutants.sh"
 
 [tasks.ffi]
-description = "Build the C ABI, then compile and run the C and C++ tests. Needs clang++ or g++ on PATH."
+description = "Build the C ABI, then compile and run the C and C++ tests. Linux uses the mise g++. macOS uses clang++."
 run = "scripts/test-ffi.sh"
 
 [tasks.ci]
