@@ -31,7 +31,6 @@ use crate::api::{
   resource::{AsResource, Resource},
 };
 use crate::model::{Cx, OpModel, Step};
-use crate::ready;
 use crate::{IoBuf, IoBufMut, IoBufVec};
 
 /// Default buffer size for I/O operations (64 KB).
@@ -136,32 +135,44 @@ pub fn copy_n(
   ))
 }
 
+/// Copies from one resource to another, reading the next chunk while the
+/// one before it is being written.
+///
+/// At most one read and one write are in flight, so bytes arrive in order.
+/// A chunk that has been read waits until the write before it is done, and
+/// no further read starts while one is waiting: the copy holds two buffers.
 pub struct Copy {
   reader: Resource,
   writer: Resource,
-  total: u64,
+  /// Bytes read so far. Never past `limit`.
+  read: u64,
   limit: u64,
-  state: CopyState,
-}
-
-enum CopyState {
-  Reading(ops::Read<CappedBuf>),
-  Writing(ops::Write<Vec<u8>>),
+  /// The reader reported its end.
+  eof: bool,
+  reading: Option<ops::Read<CappedBuf>>,
+  writing: Option<ops::Write<Vec<u8>>>,
+  /// A chunk read while the one before it was still being written.
+  ready: Option<Vec<u8>>,
+  /// An empty buffer for the next read.
+  spare: Option<Vec<u8>>,
 }
 
 impl Copy {
   fn new_without_limit(reader: Resource, writer: Resource) -> Self {
     Self::new_with_limit(reader, writer, u64::MAX)
   }
+
   fn new_with_limit(reader: Resource, writer: Resource, limit: u64) -> Self {
-    let initial = limit.min(DEFAULT_BUF_SIZE as u64) as usize;
-    let buf = CappedBuf::new(Vec::with_capacity(initial), initial);
     Self {
-      state: CopyState::Reading(ops::Read::new(reader.clone(), buf, None)),
       reader,
       writer,
-      total: 0,
+      read: 0,
       limit,
+      eof: false,
+      reading: None,
+      writing: None,
+      ready: None,
+      spare: None,
     }
   }
 
@@ -169,12 +180,18 @@ impl Copy {
     io::Error::new(io::ErrorKind::WriteZero, "write returned 0")
   }
 
-  fn next_read_len(&self) -> usize {
-    (self.limit - self.total).min(DEFAULT_BUF_SIZE as u64) as usize
+  /// A read of the next chunk, no longer than what is left of the limit.
+  fn next_read(&mut self) -> ops::Read<CappedBuf> {
+    let len = (self.limit - self.read).min(DEFAULT_BUF_SIZE as u64) as usize;
+    let buf = match self.spare.take() {
+      Some(buf) => buf,
+      None => Vec::with_capacity(len),
+    };
+    ops::Read::new(self.reader.clone(), CappedBuf::new(buf, len), None)
   }
 
-  fn writing(&self, buf: Vec<u8>) -> CopyState {
-    CopyState::Writing(ops::Write::new(self.writer.clone(), buf, None))
+  fn write(&self, chunk: Vec<u8>) -> ops::Write<Vec<u8>> {
+    ops::Write::new(self.writer.clone(), chunk, None)
   }
 }
 
@@ -183,34 +200,71 @@ impl OpModel for Copy {
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     loop {
-      self.state = match &mut self.state {
-        CopyState::Reading(read) => match ready!(read.poll(cx)) {
-          (Ok(0), _buf) => return Step::Done(Ok(self.total)),
+      // Something finished or started: go around again, so that what
+      // started is submitted and what it unblocked can start.
+      let mut progressed = false;
+
+      // The write goes first: on a driver with one free slot, what was
+      // read is written before more is read.
+      if let Some(write) = &mut self.writing
+        && let Step::Yield(done) | Step::Done(done) = write.poll(cx)
+      {
+        self.writing = None;
+        progressed = true;
+        match done {
+          (Ok(0), _chunk) => return Step::Done(Err(Self::write_zero())),
+          (Ok(written), mut chunk) if written < chunk.len() => {
+            let remaining = chunk.len() - written;
+            chunk.copy_within(written.., 0);
+            chunk.truncate(remaining);
+            self.writing = Some(self.write(chunk));
+          }
+          (Ok(_), mut chunk) => {
+            chunk.clear();
+            // The other buffer is with the reader, or waiting in `ready`.
+            self.spare.get_or_insert(chunk);
+          }
+          (Err(err), _chunk) => return Step::Done(Err(err)),
+        }
+      }
+
+      if let Some(read) = &mut self.reading
+        && let Step::Yield(done) | Step::Done(done) = read.poll(cx)
+      {
+        self.reading = None;
+        progressed = true;
+        match done {
+          (Ok(0), buf) => {
+            self.eof = true;
+            self.spare = Some(buf.into_inner());
+          }
           (Ok(n), buf) => {
-            self.total += n as u64;
-            self.writing(buf.into_inner())
+            self.read += n as u64;
+            self.ready = Some(buf.into_inner());
           }
           (Err(err), _buf) => return Step::Done(Err(err)),
-        },
-        CopyState::Writing(write) => match ready!(write.poll(cx)) {
-          (Ok(0), _buf) => return Step::Done(Err(Self::write_zero())),
-          (Ok(written), mut buf) if written < buf.len() => {
-            let remaining = buf.len() - written;
-            buf.copy_within(written.., 0);
-            buf.truncate(remaining);
-            self.writing(buf)
-          }
-          (Ok(_), _buf) if self.total >= self.limit => {
-            return Step::Done(Ok(self.total));
-          }
-          (Ok(_), mut buf) => {
-            buf.clear();
-            let buf = CappedBuf::new(buf, self.next_read_len());
-            CopyState::Reading(ops::Read::new(self.reader.clone(), buf, None))
-          }
-          (Err(err), _buf) => return Step::Done(Err(err)),
-        },
-      };
+        }
+      }
+
+      if self.writing.is_none()
+        && let Some(chunk) = self.ready.take()
+      {
+        self.writing = Some(self.write(chunk));
+        progressed = true;
+      }
+
+      let more = !self.eof && self.read < self.limit;
+      if more && self.reading.is_none() && self.ready.is_none() {
+        self.reading = Some(self.next_read());
+        progressed = true;
+      }
+
+      if self.reading.is_none() && self.writing.is_none() && !more {
+        return Step::Done(Ok(self.read));
+      }
+      if !progressed {
+        return Step::Pending;
+      }
     }
   }
 }
