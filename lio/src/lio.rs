@@ -694,13 +694,11 @@ impl Lio {
   /// dropped first, then their slots are released together.
   fn bury_and_wake(&self) {
     loop {
+      // Queued submissions nobody waits for any more hold user values:
+      // dropped here, with the driver not borrowed.
+      let abandoned = std::mem::take(&mut self.inner.borrow_mut().abandoned);
+      drop(abandoned);
       let mut inner = self.inner.borrow_mut();
-      if !inner.abandoned.is_empty() {
-        let abandoned = std::mem::take(&mut inner.abandoned);
-        drop(inner);
-        drop(abandoned);
-        continue;
-      }
       if inner.dying.is_empty() {
         return;
       }

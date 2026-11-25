@@ -33,14 +33,17 @@ exclude_re = [
   # level's granularity: when the next level up would hand it down too.
   "replace < with <= in Clock::insert_timer",
   "replace < with <= in Clock::insert_higher_timer",
-  # `CompletionFlags::MORE` is `1 << 0`, and `1 >> 0` is the same value.
-  "lio/src/api/op\\.rs:61:33: replace << with >>",
 ]
 # Each mutant builds and runs these only: the core suites, which drive the
-# scripted backend. The real-backend integration suites barely touch the
+# scripted backend (`model` also runs one copy on the simulated one). The real-backend integration suites barely touch the
 # core and would make up most of every mutant's build and run. (Cargo args
 # reach both the build and the test step; test args only the test step.)
-additional_cargo_args = ["--lib", "--test", "cancellation", "--test", "capacity"]
+additional_cargo_args = [
+  "--lib",
+  "--test", "cancellation",
+  "--test", "capacity",
+  "--test", "model",
+]
 # A mutant can turn a loop infinite. cargo test has no per-test limit, so
 # this process timeout is what stops it. It follows the baseline copy
 # (timeout_multiplier). The floor is 20s, the old per-test hang limit, so a
