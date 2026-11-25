@@ -574,7 +574,12 @@ impl Lio {
   /// Marks the model in slot `id` busy and returns what polls it, or what
   /// drops it if it was asked to stop while it could not be dropped.
   fn begin(inner: &mut LioInner, id: u64) -> Option<Begun> {
-    let reg = inner.store.get_mut(id)?;
+    Self::begin_in(inner.store.get_mut(id)?)
+  }
+
+  /// [`begin`](Self::begin) for a slot that is in hand.
+  #[inline]
+  fn begin_in(reg: &mut Registration) -> Option<Begun> {
     if reg.is_cancelled() {
       return reg.cancel_task().map(Begun::Drop);
     }
@@ -705,7 +710,6 @@ impl Lio {
       // nothing points into the arena any more.
       step_bump.reset();
       let seq = place(reg, step_bump, id);
-      let keep = lease.clone();
       let mut abort = AbortOp { reg, armed: true };
       let AbortOp { reg, armed } = &mut abort;
       reg.with_action(&mut |action| {
@@ -716,7 +720,7 @@ impl Lio {
         match action {
           Action::Io(op) => io.push(
             id,
-            crate::backend::InFlight::from_model(op, keep.clone()),
+            crate::backend::InFlight::from_model(op, lease.clone()),
             step_bump,
           ),
           Action::Sleep(duration) => time.schedule(id, duration),
@@ -737,8 +741,10 @@ impl Lio {
     let inserted = store.insert_submitting(
       |_arena| Registration::vacant(),
       |id, reg, step_bump, lease, insert| {
+        // The slot's last operation is long gone: nothing points into the
+        // arena any more.
+        step_bump.reset();
         place(reg, step_bump, waiter);
-        let keep = lease.clone();
         reg.with_action(&mut |action| {
           // After this, a panic must not free the operation's memory:
           // `push` may have copied its addresses. A panic while building
@@ -747,7 +753,7 @@ impl Lio {
           match action {
             Action::Io(op) => io.push(
               id,
-              crate::backend::InFlight::from_model(op, keep.clone()),
+              crate::backend::InFlight::from_model(op, lease.clone()),
               step_bump,
             ),
             Action::Sleep(duration) => time.schedule(id, duration),
@@ -866,7 +872,18 @@ impl Lio {
 
   /// Slot `home` can hold an operation again: starts there the first
   /// operation its model has waiting for a slot, if any.
+  #[inline]
   fn start_waiting_at_home(inner: &mut LioInner, home: u64) {
+    // Nearly always: nothing is waiting for a slot.
+    if inner.overflow.is_empty() {
+      return;
+    }
+    Self::start_queued_at_home(inner, home);
+  }
+
+  #[cold]
+  #[inline(never)]
+  fn start_queued_at_home(inner: &mut LioInner, home: u64) {
     while !inner.overflow.is_empty()
       && inner.store.get_mut(home).is_some_and(|reg| reg.can_start_op())
       && !inner.store.lease_held(home)
@@ -1297,7 +1314,13 @@ impl Lio {
       // The model that was waiting for it takes it now. A model that is
       // busy further up the stack is polled again when it is not.
       Some(waiter) => {
-        if let Some(begun) = Self::begin(inner_ref, waiter) {
+        // Usually its own slot's model, which is in hand already.
+        let begun = if waiter == id {
+          Self::begin_in(reg)
+        } else {
+          Self::begin(inner_ref, waiter)
+        };
+        if let Some(begun) = begun {
           // A slot this empties is given back when the run is over.
           (inner, _) = self.poll_begun(inner, waiter, begun);
         }
