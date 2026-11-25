@@ -23,12 +23,11 @@ use std::task::{Context, Waker};
 use std::time::Duration;
 
 use crate::Lio;
-use crate::api::op::{Action, Completion};
 use crate::api::resource::Resource;
 use crate::api::{Io, IoStream};
 use crate::backend::op::Op;
 use crate::backend::testing::{Checked, ScriptedBackend};
-use crate::model::{Cx, OpModel, Step};
+use crate::model::{Cx, OpModel, Step, Ticket};
 
 /// A stream ends after this many items, or at its first error.
 const STREAM_ITEMS: u32 = 3;
@@ -46,26 +45,24 @@ impl Drop for DropLog {
   }
 }
 
-/// The memory of an op whose submission carries its tag.
-struct TaggedOp {
-  tag: u32,
-  /// Present on an op run on its own. A stream logs its own drop.
-  _log: Option<DropLog>,
-}
-
-impl TaggedOp {
-  fn action(&mut self) -> Action<'_> {
-    action_io!(Op::Listen { fd: Resource::stdin(), backlog: self.tag as i32 })
-  }
-
-  fn complete(&mut self, completion: Completion) -> (u32, isize) {
-    (self.tag, completion.result())
+impl Cx<'_> {
+  /// An op whose submission carries its tag. `log`, when present, is
+  /// dropped with the op's memory.
+  fn tagged(&mut self, tag: u32, log: Option<DropLog>) -> Ticket<(u32, isize)> {
+    self.submit(
+      (tag, log),
+      |(tag, _)| {
+        action_io!(Op::Listen { fd: Resource::stdin(), backlog: *tag as i32 })
+      },
+      |(tag, _), completion| (*tag, completion.result()),
+    )
   }
 }
 
 leaf!(
-  /// An op whose submissions carry its tag, and which logs being dropped.
-  [] struct Tagged(TaggedOp) => (u32, isize)
+  /// An op whose submissions carry its tag, and which logs being dropped
+  /// when run on its own. A stream logs its own drop.
+  [] struct Tagged(tag: u32, log: Option<DropLog>) -> (u32, isize) = cx.tagged
 );
 
 /// One tagged op after another: every result is an item.
@@ -83,7 +80,7 @@ impl OpModel for TaggedStream {
     let item = crate::ready!(self.step.poll(cx));
     self.completions += 1;
     if item.1 >= 0 && self.completions < STREAM_ITEMS {
-      self.step = TaggedOp { tag: self.tag, _log: None }.into();
+      self.step = Tagged::new(self.tag, None);
       Step::Yield(item)
     } else {
       Step::Done(item)
@@ -197,14 +194,14 @@ impl Harness {
   }
 
   fn tagged(&self, index: usize) -> Tagged {
-    TaggedOp { tag: index as u32, _log: Some(self.log(index)) }.into()
+    Tagged::new(index as u32, Some(self.log(index)))
   }
 
   fn tagged_stream(&self, index: usize) -> TaggedStream {
     TaggedStream {
       tag: index as u32,
       completions: 0,
-      step: TaggedOp { tag: index as u32, _log: None }.into(),
+      step: Tagged::new(index as u32, None),
       _log: self.log(index),
     }
   }

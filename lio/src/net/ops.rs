@@ -22,7 +22,6 @@
 use std::{io, marker::PhantomData, net::SocketAddr};
 
 #[allow(unused_imports)] // TcpListener used in doc links
-use crate::api::ops::raw;
 use crate::{
   api::{
     ops,
@@ -52,7 +51,7 @@ pub struct SocketAccept {
 
 impl SocketAccept {
   pub(crate) fn new(res: Resource) -> Self {
-    Self { inner: ops::Accept::from(raw::Accept::new(res)) }
+    Self { inner: ops::Accept::new(res) }
   }
 }
 
@@ -85,7 +84,7 @@ impl SocketNew {
     ty: SockType,
     proto: SockProto,
   ) -> Self {
-    Self { inner: ops::Socket::from(raw::Socket::new(domain, ty, proto)) }
+    Self { inner: ops::Socket::new(domain, ty, proto) }
   }
 }
 
@@ -105,7 +104,7 @@ pub struct TcpAccept {
 
 impl TcpAccept {
   pub(crate) fn new(res: Resource) -> Self {
-    Self { inner: ops::Accept::from(raw::Accept::new(res)) }
+    Self { inner: ops::Accept::new(res) }
   }
 }
 
@@ -145,11 +144,11 @@ impl<T> BindListener<T> {
     addr: SocketAddrBuf,
   ) -> Self {
     Self {
-      state: BindListenerState::Socket(ops::Socket::from(raw::Socket::new(
+      state: BindListenerState::Socket(ops::Socket::new(
         domain,
         SockType::STREAM,
         proto,
-      ))),
+      )),
       addr,
       _listener: PhantomData,
     }
@@ -180,10 +179,7 @@ impl<T: FromResource + 'static> OpModel for BindListener<T> {
       self.state = match &mut self.state {
         BindListenerState::Socket(socket) => match ready!(socket.poll(cx)) {
           Ok(resource) => BindListenerState::Bind {
-            bind: ops::Bind::from(raw::Bind::from_buf(
-              resource.clone(),
-              self.addr,
-            )),
+            bind: ops::Bind::new(resource.clone(), self.addr),
             resource,
           },
           Err(err) => return Step::Done(Err(err)),
@@ -191,10 +187,7 @@ impl<T: FromResource + 'static> OpModel for BindListener<T> {
         BindListenerState::Bind { resource, bind } => {
           match ready!(bind.poll(cx)) {
             Ok(()) => BindListenerState::Listen {
-              listen: ops::Listen::from(raw::Listen::new(
-                resource.clone(),
-                128,
-              )),
+              listen: ops::Listen::new(resource.clone(), 128),
               resource: resource.clone(),
             },
             Err(err) => return Step::Done(Err(err)),
@@ -234,9 +227,7 @@ impl Connecting {
     addr: SocketAddrBuf,
   ) -> Self {
     Self {
-      state: ConnectingState::Socket(ops::Socket::from(raw::Socket::new(
-        domain, ty, proto,
-      ))),
+      state: ConnectingState::Socket(ops::Socket::new(domain, ty, proto)),
       addr,
     }
   }
@@ -251,10 +242,7 @@ impl OpModel for Connecting {
         ConnectingState::Socket(socket) => match ready!(socket.poll(cx)) {
           Ok(resource) => {
             self.state = ConnectingState::Connect {
-              connect: ops::Connect::from(raw::Connect::from_buf(
-                resource.clone(),
-                self.addr,
-              )),
+              connect: ops::Connect::new(resource.clone(), self.addr),
               resource,
             };
           }
@@ -325,7 +313,7 @@ pub struct UnixAccept {
 
 impl UnixAccept {
   pub(crate) fn new(res: Resource) -> Self {
-    Self { inner: ops::AcceptUnix::from(raw::AcceptUnix::new(res)) }
+    Self { inner: ops::AcceptUnix::new(res) }
   }
 }
 
@@ -355,11 +343,11 @@ enum UdpBindState {
 impl UdpBindSocket {
   pub(crate) fn new(addr: SocketAddr) -> Self {
     Self {
-      state: UdpBindState::Socket(ops::Socket::from(raw::Socket::new(
+      state: UdpBindState::Socket(ops::Socket::new(
         ip_domain(&addr),
         SockType::DGRAM,
         SockProto::DEFAULT,
-      ))),
+      )),
       addr,
     }
   }
@@ -374,10 +362,10 @@ impl OpModel for UdpBindSocket {
         UdpBindState::Socket(socket) => match ready!(socket.poll(cx)) {
           Ok(resource) => {
             self.state = UdpBindState::Bind {
-              bind: ops::Bind::from(raw::Bind::new(
+              bind: ops::Bind::new(
                 resource.clone(),
-                self.addr,
-              )),
+                crate::backend::op::socket_addr_into_buf(self.addr),
+              ),
               resource,
             };
           }

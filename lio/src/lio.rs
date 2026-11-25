@@ -1254,32 +1254,30 @@ mod tests {
     lio.wait_for_capacity(Waker::noop());
   }
 
-  /// The memory of an op that panics when asked for its action, and records
-  /// being dropped.
-  struct PanicsOnAction(Rc<Cell<bool>>);
+  /// Records being dropped.
+  struct DropFlag(Rc<Cell<bool>>);
 
-  impl PanicsOnAction {
-    fn action(&mut self) -> Action<'_> {
-      panic!("no action for you");
-    }
-
-    fn complete(&mut self, _: Completion) {}
-  }
-
-  impl Drop for PanicsOnAction {
+  impl Drop for DropFlag {
     fn drop(&mut self) {
       self.0.set(true);
     }
   }
 
-  leaf!([] struct Panicking(PanicsOnAction) => ());
+  impl crate::model::Cx<'_> {
+    /// An operation that panics when the driver asks what to submit.
+    fn panicking(&mut self, memory: DropFlag) -> crate::model::Ticket<()> {
+      self.submit(memory, |_| panic!("no action for you"), |_, _| ())
+    }
+  }
+
+  leaf!([] struct Panicking(memory: DropFlag) -> () = cx.panicking);
 
   #[test]
   fn a_panic_while_building_the_action_does_not_keep_its_slot() {
     // Capacity 1: if the panicking op kept its slot, nothing more would run.
     let (backend, lio) = lio(1);
     let dropped = Rc::new(Cell::new(false));
-    let op: Panicking = PanicsOnAction(dropped.clone()).into();
+    let op = Panicking::new(DropFlag(dropped.clone()));
 
     let submit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       crate::api::Io::from_op(op).with_lio(&lio).when_done(|_| {});
@@ -1300,10 +1298,8 @@ mod tests {
   fn scheduling_on_a_full_driver_is_refused() {
     let (_, lio) = lio(1);
     crate::api::nop().with_lio(&lio).when_done(|_| {});
-    let refused = lio.schedule_with(|arena| {
-      use crate::api::ops::raw::Nop;
-      Registration::new_in(arena, Nop, Nop::action, Nop::complete, |_| {})
-    });
+    let refused =
+      lio.schedule_with(|arena| Registration::nop_in(arena, |_| {}));
     assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::WouldBlock);
   }
 

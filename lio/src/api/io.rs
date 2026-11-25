@@ -478,12 +478,6 @@ impl<T> Io<T> {
   pub fn into_inner(self) -> T {
     self.op
   }
-
-  /// Wraps the public type of an operation around its memory.
-  #[inline]
-  pub(crate) fn leaf<R: Into<T>>(raw: R) -> Self {
-    Self::from_op(raw.into())
-  }
 }
 
 impl<T> IntoFuture for Io<T>

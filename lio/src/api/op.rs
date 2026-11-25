@@ -59,6 +59,16 @@ impl Completion {
   pub(crate) const fn resource_close(&self) -> ResourceClose {
     self.resource_close
   }
+  /// `Ok` for a non-negative result, the OS error otherwise.
+  pub(crate) fn status(&self) -> std::io::Result<()> {
+    self.count().map(|_| ())
+  }
+
+  /// A non-negative result as a count, the OS error otherwise.
+  pub(crate) fn count(&self) -> std::io::Result<usize> {
+    usize::try_from(self.result).map_err(|_| self.os_error())
+  }
+
   /// The error a failed completion (a negative `result`) reports.
   ///
   /// A result that is no OS error code, because negating it overflows or it
