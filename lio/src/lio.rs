@@ -5,9 +5,7 @@ use crate::{
     store::{Detached, OpStore},
   },
   model::{Cx, OpModel},
-  registration::{
-    Abandon, ActionFn, AfterPoll, CompleteFn, RawTask, Registration,
-  },
+  registration::{Abandon, AfterPoll, RawTask, Registration},
   time::TimeManager,
 };
 
@@ -21,7 +19,6 @@ use std::{
   time::{Duration, Instant},
 };
 
-#[cfg(test)]
 use bumpalo::Bump;
 
 thread_local! {
@@ -175,6 +172,19 @@ pub(crate) enum Spawned {
   Now(u64),
   /// Waiting for a slot.
   Queued(Rc<QueueToken>),
+}
+
+/// Moves the memory of one operation into a slot's step arena and records
+/// it as that slot's operation, for the model in the given slot. Returns
+/// the operation's sequence number there.
+pub(crate) trait PlaceOp:
+  FnOnce(&mut Registration, &mut Bump, u64) -> u64 + 'static
+{
+}
+
+impl<F> PlaceOp for F where
+  F: FnOnce(&mut Registration, &mut Bump, u64) -> u64 + 'static
+{
 }
 
 /// What to do with a model that was marked busy.
@@ -650,27 +660,20 @@ impl Lio {
   ///
   /// The operation goes into the model's own slot when that holds none, and
   /// otherwise into a slot of its own, waiting for one over capacity.
-  pub(crate) fn submit_op<S: 'static, Out: 'static>(
-    &self,
-    task: u64,
-    state: S,
-    action: ActionFn<S>,
-    complete: CompleteFn<S, Out>,
-  ) -> OpRef {
+  pub(crate) fn submit_op(&self, task: u64, place: impl PlaceOp) -> OpRef {
     let mut inner = self.inner.borrow_mut();
-    let state =
-      match Self::start_in_slot(&mut inner, task, state, action, complete) {
-        Ok(seq) => return OpRef::At { id: task, seq },
-        Err(state) => state,
-      };
+    let place = match Self::start_in_slot(&mut inner, task, place) {
+      Ok(seq) => return OpRef::At { id: task, seq },
+      Err(place) => place,
+    };
     if !inner.overflow.is_empty() || inner.store.is_full() {
       let token = Rc::new(QueueToken::default());
       let start = move |inner: &mut LioInner, home: Option<u64>| {
         let Some(home) = home else {
-          let id = Self::insert_op(inner, task, state, action, complete);
+          let id = Self::insert_op(inner, task, place);
           return (id, FIRST_OP);
         };
-        match Self::start_in_slot(inner, home, state, action, complete) {
+        match Self::start_in_slot(inner, home, place) {
           Ok(seq) => (home, seq),
           Err(_) => unreachable!(
             "driver: a queued operation was sent to a slot that holds one"
@@ -680,32 +683,28 @@ impl Lio {
       Self::enqueue(&mut inner, start, Some(Rc::clone(&token)), Some(task));
       return OpRef::Queued(token);
     }
-    let id = Self::insert_op(&mut inner, task, state, action, complete);
+    let id = Self::insert_op(&mut inner, task, place);
     OpRef::At { id, seq: FIRST_OP }
   }
 
   /// Starts an operation in slot `id`, which is taken already. Gives
   /// `state` back when that slot cannot hold another operation right now.
-  fn start_in_slot<S: 'static, Out: 'static>(
+  fn start_in_slot<P: PlaceOp>(
     inner: &mut LioInner,
     id: u64,
-    state: S,
-    action: ActionFn<S>,
-    complete: CompleteFn<S, Out>,
-  ) -> Result<u64, S> {
+    place: P,
+  ) -> Result<u64, P> {
     let LioInner { io, store, time, .. } = inner;
-    let mut state = Some(state);
-    let started = store.with_slot(id, |reg, step_bump, lease| {
+    let started = store.with_slot(id, move |reg, step_bump, lease| {
       // A backend that still holds the lease may still use the memory of
       // the operation before this one.
       if !reg.can_start_op() || lease.held_elsewhere() {
-        return None;
+        return Err(place);
       }
-      let state = state.take()?;
       // The operation before this one is finished and its result taken:
       // nothing points into the arena any more.
       step_bump.reset();
-      let seq = reg.start_op(step_bump, state, action, complete, id);
+      let seq = place(reg, step_bump, id);
       let keep = lease.clone();
       let mut abort = AbortOp { reg, armed: true };
       let AbortOp { reg, armed } = &mut abort;
@@ -723,31 +722,22 @@ impl Lio {
           Action::Sleep(duration) => time.schedule(id, duration),
         }
       });
-      Some(seq)
+      Ok(seq)
     });
-    match (started.flatten(), state) {
-      (Some(seq), _) => Ok(seq),
-      (None, Some(state)) => Err(state),
-      (None, None) => {
-        unreachable!("driver: an operation's memory was taken and not used")
-      }
-    }
+    let Some(started) = started else {
+      unreachable!("driver: slot {id} is gone while its model starts work");
+    };
+    started
   }
 
   /// Starts an operation in a slot of its own, for the model in slot
   /// `waiter`. The store must have a free slot.
-  fn insert_op<S: 'static, Out: 'static>(
-    inner: &mut LioInner,
-    waiter: u64,
-    state: S,
-    action: ActionFn<S>,
-    complete: CompleteFn<S, Out>,
-  ) -> u64 {
+  fn insert_op(inner: &mut LioInner, waiter: u64, place: impl PlaceOp) -> u64 {
     let LioInner { io, store, time, .. } = inner;
     let inserted = store.insert_submitting(
       |_arena| Registration::vacant(),
       |id, reg, step_bump, lease, insert| {
-        reg.start_op(step_bump, state, action, complete, waiter);
+        place(reg, step_bump, waiter);
         let keep = lease.clone();
         reg.with_action(&mut |action| {
           // After this, a panic must not free the operation's memory:

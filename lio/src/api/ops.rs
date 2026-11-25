@@ -38,8 +38,8 @@ use crate::backend::op::{
   StatTarget, UnlinkKind, WriteFlags, is_valid_file_offset,
   socket_addr_from_buf,
 };
-use crate::buf::MAX_IOV_COUNT;
 use crate::model::{Cx, OpModel, Step, Ticket};
+use crate::registration::Regions;
 use crate::{
   BufResult, Initialized, IoBufMutVec, IoBufVec, IoSlicesMut, ready,
 };
@@ -143,54 +143,41 @@ impl Cx<'_> {
   }
 }
 
-/// A buffer the backend fills, with the regions it was lent.
-struct Filled<B, R> {
-  buf: Option<B>,
-  regions: [R; MAX_IOV_COUNT],
-  count: usize,
+/// Lends the writable regions of `buf` to the backend, as its `R`.
+#[inline]
+fn lend_writable<B: IoBufMutVec, R>(
+  buf: &mut B,
+  regions: &mut Regions<R>,
+  mut region: impl FnMut(NonNull<u8>, usize) -> R,
+) {
+  let mut writable = IoSlicesMut::new();
+  buf.bufs_mut(&mut writable);
+  regions.lend(writable.into_iter().map(|lent| {
+    let len = lent.len();
+    region(NonNull::from(lent).cast(), len)
+  }));
 }
 
-impl<B: IoBufMutVec, R> Filled<B, R> {
-  /// `empty` makes a region that lends nothing.
-  #[inline]
-  fn new(buf: B, empty: impl FnMut() -> R) -> Self {
-    let mut empty = empty;
-    Self { buf: Some(buf), regions: std::array::from_fn(|_| empty()), count: 0 }
-  }
-
-  /// Records the buffer's writable regions, as the backend's `R`.
-  #[inline]
-  fn lend(&mut self, mut region: impl FnMut(NonNull<u8>, usize) -> R) {
-    let mut regions = IoSlicesMut::new();
-    held(self.buf.as_mut()).bufs_mut(&mut regions);
-    self.count = regions.len();
-    for (slot, lent) in self.regions.iter_mut().zip(regions) {
-      let len = lent.len();
-      *slot = region(NonNull::from(lent).cast(), len);
+/// Gives `buf` back with the bytes the backend wrote marked initialized.
+/// `parts` is a lent region's pointer and length.
+#[inline]
+fn filled<B: IoBufMutVec, R>(
+  mut buf: B,
+  regions: &Regions<R>,
+  done: &Completion,
+  parts: impl Fn(&R) -> (*mut u8, usize),
+) -> BufResult<usize, B> {
+  let result = done.count().inspect(|&written| {
+    let mut remaining = written;
+    for (i, region) in regions.lent().iter().enumerate() {
+      let (ptr, cap) = parts(region);
+      // The backend filled the lent regions in order, so the first
+      // `min(remaining, cap)` bytes of region `i` are initialized.
+      buf.commit(i, Initialized::new(ptr, cap, remaining.min(cap)));
+      remaining = remaining.saturating_sub(cap);
     }
-  }
-
-  /// Gives the buffer back with the bytes the backend wrote marked
-  /// initialized. `parts` is a lent region's pointer and length.
-  #[inline]
-  fn finish(
-    &mut self,
-    done: &Completion,
-    parts: impl Fn(&R) -> (*mut u8, usize),
-  ) -> BufResult<usize, B> {
-    let mut buf = held(self.buf.take());
-    let result = done.count().inspect(|&written| {
-      let mut remaining = written;
-      for (i, region) in self.regions.iter().take(self.count).enumerate() {
-        let (ptr, cap) = parts(region);
-        // The backend filled the lent regions in order, so the first
-        // `min(remaining, cap)` bytes of region `i` are initialized.
-        buf.commit(i, Initialized::new(ptr, cap, remaining.min(cap)));
-        remaining = remaining.saturating_sub(cap);
-      }
-    });
-    (result, buf)
-  }
+  });
+  (result, buf)
 }
 
 // ============================================================================
@@ -457,35 +444,35 @@ leaf!(
   ) -> (io::Result<usize>, B, Option<SocketAddr>) = cx.recv_from
 );
 
-/// The memory of a receive: the buffer, and where the sender's address goes.
+/// The memory of a receive, besides the regions it lends: the buffer, and
+/// where the sender's address goes.
 struct Receiving<B> {
   socket: Resource,
-  into: Filled<B, MsgBufMut>,
+  buf: Option<B>,
   flags: RecvFlags,
   from: Option<SocketAddrBuf>,
 }
 
 impl<B: IoBufMutVec> Receiving<B> {
   fn new(socket: Resource, buf: B, flags: RecvFlags, with_from: bool) -> Self {
-    let empty = || {
-      // SAFETY: a zero-length region is never read or written.
-      unsafe { MsgBufMut::from_raw_parts(NonNull::dangling(), 0) }
-    };
     Self {
       socket,
-      into: Filled::new(buf, empty),
+      buf: Some(buf),
       flags,
       from: with_from.then(SocketAddrBuf::unspecified),
     }
   }
 
-  fn recv(&mut self) -> Action<'_> {
-    self.into.lend(|ptr, len| {
+  fn recv<'a>(&'a mut self, regions: &'a mut Regions<MsgBufMut>) -> Action<'a> {
+    lend_writable(held(self.buf.as_mut()), regions, |ptr, len| {
       // SAFETY: the region is this operation's buffer, which stays valid in
       // place until the result is read.
       unsafe { MsgBufMut::from_raw_parts(ptr, len) }
     });
-    let regions = &self.into.regions[..self.into.count.max(1)];
+    let regions = regions.lent_or(|| {
+      // SAFETY: a zero-length region is never read or written.
+      unsafe { MsgBufMut::from_raw_parts(NonNull::dangling(), 0) }
+    });
     let msg = match self.from.as_mut() {
       Some(from) => MsgRecv::with_from(regions, NonNull::from(from)),
       None => MsgRecv::new(regions),
@@ -493,8 +480,14 @@ impl<B: IoBufMutVec> Receiving<B> {
     action_io!(Op::Recv { fd: self.socket.clone(), msg, flags: self.flags })
   }
 
-  fn received(&mut self, done: &Completion) -> BufResult<usize, B> {
-    self.into.finish(done, |region| (region.ptr.as_ptr(), region.len))
+  fn received(
+    &mut self,
+    regions: &Regions<MsgBufMut>,
+    done: &Completion,
+  ) -> BufResult<usize, B> {
+    filled(held(self.buf.take()), regions, done, |region| {
+      (region.ptr.as_ptr(), region.len)
+    })
   }
 }
 
@@ -506,10 +499,10 @@ impl Cx<'_> {
     buf: B,
     flags: RecvFlags,
   ) -> Ticket<BufResult<usize, B>> {
-    self.submit(
+    self.submit_lending(
       Receiving::new(socket, buf, flags, false),
       Receiving::recv,
-      |recv, done| recv.received(&done),
+      |recv, regions, done| recv.received(regions, &done),
     )
   }
 
@@ -520,11 +513,11 @@ impl Cx<'_> {
     buf: B,
     flags: RecvFlags,
   ) -> Ticket<(io::Result<usize>, B, Option<SocketAddr>)> {
-    self.submit(
+    self.submit_lending(
       Receiving::new(socket, buf, flags, true),
       Receiving::recv,
-      |recv, done| {
-        let (result, buf) = recv.received(&done);
+      |recv, regions, done| {
+        let (result, buf) = recv.received(regions, &done);
         let from = result
           .as_ref()
           .ok()
@@ -555,20 +548,20 @@ impl Cx<'_> {
     to: Option<SocketAddr>,
     flags: SendFlags,
   ) -> Ticket<BufResult<usize, B>> {
-    // SAFETY: a zero-length region is never read.
-    let empty = unsafe { MsgBuf::from_raw_parts(NonNull::dangling(), 0) };
-    self.submit(
-      (socket, Some(buf), [empty; MAX_IOV_COUNT], to, flags),
-      |(socket, buf, regions, to, flags)| {
+    self.submit_lending(
+      (socket, Some(buf), to, flags),
+      |(socket, buf, to, flags), regions: &mut Regions<MsgBuf>| {
         let buf = held(buf.as_ref());
-        let count = buf.buf_count().min(MAX_IOV_COUNT);
-        for (region, i) in regions.iter_mut().zip(0..count) {
-          *region = MsgBuf::from_slice(buf.buf(i));
-        }
-        let msg = MsgSend::new(&regions[..count.max(1)], *to);
+        regions
+          .lend((0..buf.buf_count()).map(|i| MsgBuf::from_slice(buf.buf(i))));
+        let regions = regions.lent_or(|| {
+          // SAFETY: a zero-length region is never read.
+          unsafe { MsgBuf::from_raw_parts(NonNull::dangling(), 0) }
+        });
+        let msg = MsgSend::new(regions, *to);
         action_io!(Op::Send { fd: socket.clone(), msg, flags: *flags })
       },
-      |(_, buf, ..), done| (done.count(), held(buf.take())),
+      |(_, buf, ..), _, done| (done.count(), held(buf.take())),
     )
   }
 }
@@ -603,28 +596,26 @@ impl Cx<'_> {
     if !is_valid_file_offset(offset) {
       return self.refused(move || (Err(offset_out_of_range_error()), buf));
     }
-    let empty = || {
-      // SAFETY: a zero-length region is never written.
-      unsafe { RawBufMut::from_raw_parts(NonNull::dangling().as_ptr(), 0) }
-    };
-    self.submit(
-      (file, Filled::new(buf, empty), offset),
-      |(file, into, offset)| {
-        into.lend(|ptr, len| {
+    self.submit_lending(
+      (file, Some(buf), offset),
+      |(file, buf, offset), regions: &mut Regions<RawBufMut<'static>>| {
+        lend_writable(held(buf.as_mut()), regions, |ptr, len| {
           // SAFETY: the region is this operation's buffer, which stays
           // valid in place until the result is read.
           unsafe { RawBufMut::from_raw_parts(ptr.as_ptr(), len) }
         });
         action_io!(Op::Read {
           fd: file.clone(),
-          iovecs: NonNull::from(&mut into.regions).cast(),
-          iov_count: into.count,
+          iovecs: regions.as_ptr().cast(),
+          iov_count: regions.count(),
           offset: *offset,
           flags: ReadFlags::empty(),
         })
       },
-      |(_, into, _), done| {
-        into.finish(&done, |region| (region.ptr, region.len))
+      |(_, buf, _), regions, done| {
+        filled(held(buf.take()), regions, &done, |region| {
+          (region.ptr, region.len)
+        })
       },
     )
   }
@@ -656,31 +647,27 @@ impl Cx<'_> {
     if !is_valid_file_offset(offset) {
       return self.refused(move || (Err(offset_out_of_range_error()), buf));
     }
-    // SAFETY: a zero-length region is never read.
-    let empty =
-      unsafe { RawBuf::from_raw_parts(NonNull::dangling().as_ptr(), 0) };
-    self.submit(
-      (file, Some(buf), [empty; MAX_IOV_COUNT], offset),
-      |(file, buf, regions, offset)| {
+    self.submit_lending(
+      (file, Some(buf), offset),
+      |(file, buf, offset), regions: &mut Regions<RawBuf<'static>>| {
         let buf = held(buf.as_ref());
-        let count = buf.buf_count().min(MAX_IOV_COUNT);
-        for (region, i) in regions.iter_mut().zip(0..count) {
+        regions.lend((0..buf.buf_count()).map(|i| {
           let bytes = buf.buf(i);
           // SAFETY: the bytes are this operation's buffer, which stays
           // valid in place until the result is read.
-          *region = unsafe {
+          unsafe {
             RawBuf::from_raw_parts(bytes.as_ptr().cast_mut(), bytes.len())
-          };
-        }
+          }
+        }));
         action_io!(Op::Write {
           fd: file.clone(),
-          iovecs: NonNull::from(regions).cast(),
-          iov_count: count,
+          iovecs: regions.as_ptr().cast(),
+          iov_count: regions.count(),
           offset: *offset,
           flags: WriteFlags::empty(),
         })
       },
-      |(_, buf, ..), done| (done.count(), held(buf.take())),
+      |(_, buf, _), _, done| (done.count(), held(buf.take())),
     )
   }
 }

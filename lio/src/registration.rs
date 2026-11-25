@@ -12,9 +12,14 @@
 //! A slot is free again when its model is done and its operation's result
 //! has been taken or dropped.
 
+use std::alloc::Layout;
+use std::mem::MaybeUninit;
+use std::ptr::NonNull;
+
 use bumpalo::Bump;
 
 use crate::api::op::{Action, Completion};
+use crate::buf::MAX_IOV_COUNT;
 use crate::model::{Cx, OpModel, Step};
 
 /// Builds the action an operation submits from the memory it owns.
@@ -26,6 +31,87 @@ pub(crate) type ActionFn<S> = for<'a> fn(&'a mut S) -> Action<'a>;
 /// Reads an operation's result out of its memory, given what the backend
 /// reported for the action [`ActionFn`] built from that same memory.
 pub(crate) type CompleteFn<S, Out> = fn(&mut S, Completion) -> Out;
+
+/// Builds the action of an operation that lends a buffer: `regions` is
+/// where it describes the buffer to the backend. It is part of the
+/// operation's memory, and is not moved once the operation has a slot.
+pub(crate) type LendFn<S, R> =
+  for<'a> fn(&'a mut S, &'a mut Regions<R>) -> Action<'a>;
+
+/// Reads the result of an operation that lent a buffer, given the regions
+/// its [`LendFn`] lent.
+pub(crate) type ReturnFn<S, R, Out> =
+  fn(&mut S, &Regions<R>, Completion) -> Out;
+
+/// The regions of a buffer that are lent to the backend, in the form `R`
+/// the backend takes them in.
+///
+/// It has room for [`MAX_IOV_COUNT`], but only the ones in use are ever
+/// written, and it is made where it stays: a single buffer, the common
+/// case, does not pay for the rest.
+pub(crate) struct Regions<R> {
+  slots: [MaybeUninit<R>; MAX_IOV_COUNT],
+  count: usize,
+}
+
+impl<R> Regions<R> {
+  /// Makes `this` hold no regions.
+  ///
+  /// # Safety
+  ///
+  /// `this` must be valid for writes of a `Regions<R>`.
+  unsafe fn init(this: *mut Self) {
+    // SAFETY: the caller's promise. The slots are `MaybeUninit`, so
+    // writing the count initializes the whole value.
+    unsafe { (&raw mut (*this).count).write(0) };
+  }
+
+  /// Lends `regions`, in place of what was lent before. Regions past
+  /// [`MAX_IOV_COUNT`] are left out.
+  #[inline]
+  pub(crate) fn lend(&mut self, regions: impl Iterator<Item = R>) {
+    let mut count = 0;
+    for (slot, region) in self.slots.iter_mut().zip(regions) {
+      slot.write(region);
+      count += 1;
+    }
+    self.count = count;
+  }
+
+  /// What is lent.
+  #[inline]
+  pub(crate) fn lent(&self) -> &[R] {
+    // SAFETY: `lend` wrote the first `count` slots, and `MaybeUninit<R>`
+    // has the layout of `R`.
+    unsafe {
+      std::slice::from_raw_parts(self.slots.as_ptr().cast(), self.count)
+    }
+  }
+
+  /// What is lent, or one region from `empty` when nothing is: a message
+  /// needs at least one.
+  #[inline]
+  pub(crate) fn lent_or(&mut self, empty: impl FnOnce() -> R) -> &[R] {
+    if self.count == 0 {
+      let [first, ..] = &mut self.slots;
+      return std::slice::from_ref(first.write(empty()));
+    }
+    self.lent()
+  }
+
+  /// Where the first region is, for an operation that takes them as a
+  /// pointer and a count.
+  #[inline]
+  pub(crate) fn as_ptr(&mut self) -> NonNull<R> {
+    NonNull::from(&mut self.slots).cast()
+  }
+
+  /// How many regions are lent.
+  #[inline]
+  pub(crate) fn count(&self) -> usize {
+    self.count
+  }
+}
 
 /// Calls the closure with an operation's action, for any lifetime of that
 /// action.
@@ -103,6 +189,17 @@ struct OpPayload<S, Out> {
   state: Option<S>,
   action: ActionFn<S>,
   complete: CompleteFn<S, Out>,
+}
+
+/// The memory of an operation that lends a buffer: as [`OpPayload`], with
+/// the regions it lends.
+#[repr(C)]
+struct LendingPayload<S, R, Out> {
+  result: Option<Out>,
+  state: Option<S>,
+  regions: Regions<R>,
+  action: LendFn<S, R>,
+  complete: ReturnFn<S, R, Out>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -408,25 +505,118 @@ impl Registration {
     complete: CompleteFn<S, Out>,
     waiter: u64,
   ) -> u64 {
-    assert!(
-      self.cell.stage == Stage::Free,
-      "driver: started an operation in a slot that holds one"
-    );
-    let payload: &mut OpPayload<S, Out> = arena.alloc(OpPayload {
+    let payload: &mut OpPayload<S, Out> = arena.alloc_with(|| OpPayload {
       result: None,
       state: Some(state),
       action,
       complete,
     });
+    self.occupy(
+      (payload as *mut OpPayload<S, Out>).cast(),
+      waiter,
+      Self::with_action_impl::<S, Out>,
+      Self::complete_impl::<S, Out>,
+      Self::drop_op_impl::<S, Out>,
+    )
+  }
+
+  /// [`start_op`](Self::start_op) for an operation that lends a buffer.
+  ///
+  /// The regions are made in `arena`, where they stay: they are a few
+  /// hundred bytes, which would otherwise be copied in with `state`.
+  pub(crate) fn start_lending_op<S: 'static, R: 'static, Out: 'static>(
+    &mut self,
+    arena: &mut Bump,
+    state: S,
+    action: LendFn<S, R>,
+    complete: ReturnFn<S, R, Out>,
+    waiter: u64,
+  ) -> u64 {
+    let payload = arena
+      .alloc_layout(Layout::new::<LendingPayload<S, R, Out>>())
+      .cast::<LendingPayload<S, R, Out>>()
+      .as_ptr();
+    // SAFETY: `payload` is a fresh allocation with the layout of a
+    // `LendingPayload<S, R, Out>`. Every field is written here before
+    // anything reads it.
+    unsafe {
+      (&raw mut (*payload).result).write(None);
+      (&raw mut (*payload).state).write(Some(state));
+      Regions::init(&raw mut (*payload).regions);
+      (&raw mut (*payload).action).write(action);
+      (&raw mut (*payload).complete).write(complete);
+    }
+    self.occupy(
+      payload.cast(),
+      waiter,
+      Self::lend_impl::<S, R, Out>,
+      Self::return_impl::<S, R, Out>,
+      Self::drop_lending_impl::<S, R, Out>,
+    )
+  }
+
+  /// Records `payload` as this slot's operation, in flight.
+  fn occupy(
+    &mut self,
+    payload: *mut (),
+    waiter: u64,
+    with_action_fn: WithActionFn,
+    complete_fn: fn(*mut (), Completion, bool),
+    drop_fn: fn(*mut ()),
+  ) -> u64 {
+    assert!(
+      self.cell.stage == Stage::Free,
+      "driver: started an operation in a slot that holds one"
+    );
     self.cell.seq += 1;
     self.cell.stage = Stage::InFlight;
     self.cell.abandoned = false;
     self.cell.waiter = waiter;
-    self.cell.payload = (payload as *mut OpPayload<S, Out>).cast();
-    self.cell.with_action_fn = Self::with_action_impl::<S, Out>;
-    self.cell.complete_fn = Self::complete_impl::<S, Out>;
-    self.cell.drop_fn = Self::drop_op_impl::<S, Out>;
+    self.cell.payload = payload;
+    self.cell.with_action_fn = with_action_fn;
+    self.cell.complete_fn = complete_fn;
+    self.cell.drop_fn = drop_fn;
     self.cell.seq
+  }
+
+  fn lend_impl<S, R, Out>(
+    payload: *mut (),
+    f: &mut dyn for<'a> FnMut(Action<'a>),
+  ) {
+    // SAFETY: `payload` was created from a `LendingPayload<S, R, Out>` in
+    // `start_lending_op` and stays valid until the slot's next operation.
+    let payload = unsafe { &mut *payload.cast::<LendingPayload<S, R, Out>>() };
+    let Some(state) = payload.state.as_mut() else {
+      unreachable!("an operation was submitted after it was completed");
+    };
+    f((payload.action)(state, &mut payload.regions));
+  }
+
+  fn return_impl<S, R, Out>(
+    payload: *mut (),
+    completion: Completion,
+    keep: bool,
+  ) {
+    // SAFETY: as in `lend_impl`. The operation is marked busy, so this is
+    // the only reference to its memory.
+    let payload = unsafe { &mut *payload.cast::<LendingPayload<S, R, Out>>() };
+    let Some(state) = payload.state.as_mut() else {
+      unreachable!("an operation was completed twice");
+    };
+    let out = (payload.complete)(state, &payload.regions, completion);
+    // The backend is done with this memory.
+    payload.state = None;
+    if keep {
+      payload.result = Some(out);
+    }
+  }
+
+  fn drop_lending_impl<S, R, Out>(payload: *mut ()) {
+    // SAFETY: as in `lend_impl`. Taking both leaves nothing to drop twice.
+    // The regions are plain descriptions of memory and own nothing.
+    let payload = unsafe { &mut *payload.cast::<LendingPayload<S, R, Out>>() };
+    payload.state = None;
+    payload.result = None;
   }
 
   fn with_action_impl<S, Out>(

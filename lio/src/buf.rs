@@ -215,20 +215,22 @@ pub unsafe trait IoBufVec {
 ///
 /// Holds at most [`MAX_IOV_COUNT`] regions; further pushes are ignored.
 pub struct IoSlicesMut<'a> {
-  slices: [&'a mut [MaybeUninit<u8>]; MAX_IOV_COUNT],
+  /// Only the first `len` are written: a single buffer, the common case,
+  /// should not pay for the other fifteen.
+  slices: [MaybeUninit<&'a mut [MaybeUninit<u8>]>; MAX_IOV_COUNT],
   len: usize,
 }
 
 impl<'a> IoSlicesMut<'a> {
   /// Creates an empty set of regions.
   pub fn new() -> Self {
-    Self { slices: std::array::from_fn(|_| <&mut [_]>::default()), len: 0 }
+    Self { slices: [const { MaybeUninit::uninit() }; MAX_IOV_COUNT], len: 0 }
   }
 
   /// Appends a region. Ignored once [`MAX_IOV_COUNT`] regions are held.
   pub fn push(&mut self, region: &'a mut [MaybeUninit<u8>]) {
     if let Some(slot) = self.slices.get_mut(self.len) {
-      *slot = region;
+      slot.write(region);
       self.len += 1;
     }
   }
@@ -252,11 +254,36 @@ impl Default for IoSlicesMut<'_> {
 
 impl<'a> IntoIterator for IoSlicesMut<'a> {
   type Item = &'a mut [MaybeUninit<u8>];
-  type IntoIter =
-    std::iter::Take<std::array::IntoIter<Self::Item, MAX_IOV_COUNT>>;
+  type IntoIter = IoSlicesMutIter<'a>;
 
   fn into_iter(self) -> Self::IntoIter {
-    self.slices.into_iter().take(self.len)
+    IoSlicesMutIter { regions: self, next: 0 }
+  }
+}
+
+/// The regions of an [`IoSlicesMut`], in the order they were pushed.
+pub struct IoSlicesMutIter<'a> {
+  regions: IoSlicesMut<'a>,
+  next: usize,
+}
+
+impl<'a> Iterator for IoSlicesMutIter<'a> {
+  type Item = &'a mut [MaybeUninit<u8>];
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.next >= self.regions.len {
+      return None;
+    }
+    let slot = self.regions.slices.get(self.next)?;
+    self.next += 1;
+    // SAFETY: `push` wrote the first `len` slots, and `next` only moves
+    // forward, so each of them is read out once.
+    Some(unsafe { slot.assume_init_read() })
+  }
+
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    let left = self.regions.len - self.next;
+    (left, Some(left))
   }
 }
 
