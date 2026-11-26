@@ -646,8 +646,13 @@ impl IoUring {
       self.pending.remove_value(SlabKey::from_u64(user_data))
     {
       pending.lowered.finalize(result);
-      completed
-        .push(OpCompleted::new(pending.registration_id, result as isize));
+      let id = pending.registration_id;
+      // The kernel reports a request it stopped this way, and nothing else.
+      completed.push(if result == -libc::ECANCELED {
+        OpCompleted::cancelled(id, result as isize)
+      } else {
+        OpCompleted::new(id, result as isize)
+      });
     }
   }
 
@@ -1474,7 +1479,7 @@ unsafe impl IoBackend for IoUring {
       self.backlog.swap_remove(index);
       self
         .queued_completed
-        .push(OpCompleted::new(id, -(libc::ECANCELED as isize)));
+        .push(OpCompleted::cancelled(id, -(libc::ECANCELED as isize)));
       return;
     }
     let Some(key) =
@@ -1546,5 +1551,9 @@ unsafe impl IoBackend for IoUring {
     }
 
     Ok(())
+  }
+
+  fn resource_close(&self) -> crate::api::resource::ResourceClose {
+    crate::api::resource::ResourceClose::native()
   }
 }

@@ -121,6 +121,18 @@ fn trace_read_batches() {
       stats.chunks[completed.len()] += 1;
       result
     }
+
+    fn resource_close(&self) -> crate::api::resource::ResourceClose {
+      self.inner.resource_close()
+    }
+
+    fn cancel(&mut self, id: u64) {
+      self.inner.cancel(id)
+    }
+
+    fn drain(&mut self) -> bool {
+      self.inner.drain()
+    }
   }
   let depth: usize =
     std::env::var("LIO_DIAG_DEPTH").unwrap_or("32".into()).parse().unwrap();

@@ -670,6 +670,18 @@ mod tests {
         completed.extend(self.0.map(|id| OpCompleted::new(id, 0)));
         Ok(())
       }
+
+      fn resource_close(&self) -> crate::api::resource::ResourceClose {
+        crate::api::resource::ResourceClose::native()
+      }
+
+      // Its operations finish on their own: there is nothing to stop.
+      fn cancel(&mut self, _id: u64) {}
+
+      // Nothing outside this type ever holds an address.
+      fn drain(&mut self) -> bool {
+        true
+      }
     }
 
     let mut checked = Checked::new(Twice(None));

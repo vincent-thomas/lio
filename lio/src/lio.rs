@@ -1646,6 +1646,18 @@ mod tests {
       completed.extend(self.0.drain(..).map(|id| OpCompleted::new(id, 0)));
       Ok(())
     }
+
+    fn resource_close(&self) -> crate::api::resource::ResourceClose {
+      crate::api::resource::ResourceClose::native()
+    }
+
+    // Its operations finish on their own: there is nothing to stop.
+    fn cancel(&mut self, _id: u64) {}
+
+    // Nothing outside this type ever holds an address.
+    fn drain(&mut self) -> bool {
+      true
+    }
   }
 
   #[test]
@@ -1810,6 +1822,14 @@ mod tests {
     ) -> io::Result<()> {
       self.inner.wait(timeout, completed)
     }
+
+    fn resource_close(&self) -> crate::api::resource::ResourceClose {
+      self.inner.resource_close()
+    }
+
+    fn cancel(&mut self, id: u64) {
+      self.inner.cancel(id)
+    }
   }
 
   #[test]
@@ -1931,6 +1951,14 @@ mod tests {
     ) -> io::Result<()> {
       self.timeouts.borrow_mut().push(timeout);
       self.inner.wait(timeout, completed)
+    }
+
+    fn cancel(&mut self, id: u64) {
+      self.inner.cancel(id)
+    }
+
+    fn drain(&mut self) -> bool {
+      self.inner.drain()
     }
   }
 
@@ -2184,6 +2212,18 @@ mod tests {
       completed
         .extend(self.pending.drain(..).map(|id| OpCompleted::new(id, 0)));
       Ok(())
+    }
+
+    fn resource_close(&self) -> crate::api::resource::ResourceClose {
+      crate::api::resource::ResourceClose::native()
+    }
+
+    // Its operations finish on their own: there is nothing to stop.
+    fn cancel(&mut self, _id: u64) {}
+
+    // Nothing outside this type ever holds an address.
+    fn drain(&mut self) -> bool {
+      true
     }
   }
 

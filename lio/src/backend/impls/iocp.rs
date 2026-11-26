@@ -979,7 +979,15 @@ impl Iocp {
         }
         continue;
       }
-      completed.push(OpCompleted::new(id, self.finish(state)));
+      let asked_to_stop = state.cancelled;
+      let result = self.finish(state);
+      completed.push(
+        if asked_to_stop && result == neg(ERROR_OPERATION_ABORTED) {
+          OpCompleted::cancelled(id, result)
+        } else {
+          OpCompleted::new(id, result)
+        },
+      );
     }
     self.entries = Vec::with_capacity(MAX_ENTRIES);
     Ok(true)
@@ -1101,7 +1109,7 @@ unsafe impl IoBackend for Iocp {
     if let Some(index) = self.backlog.iter().position(|queued| queued.id == id)
     {
       self.backlog.swap_remove(index);
-      self.ready.push(OpCompleted::new(id, neg(ERROR_OPERATION_ABORTED)));
+      self.ready.push(OpCompleted::cancelled(id, neg(ERROR_OPERATION_ABORTED)));
       return;
     }
     // SAFETY: every pointer in `in_flight` is a live boxed `Overlapped`.
@@ -1162,6 +1170,10 @@ unsafe impl IoBackend for Iocp {
         return Ok(());
       }
     }
+  }
+
+  fn resource_close(&self) -> crate::api::resource::ResourceClose {
+    crate::api::resource::ResourceClose::native()
   }
 }
 
