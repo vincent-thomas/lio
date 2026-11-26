@@ -315,7 +315,7 @@ fn buffer(criterion: &mut Criterion) {
 struct SteppedNop {
   steps: usize,
   left: usize,
-  nop: api::ops::Nop,
+  nop: api::Io<api::ops::Nop>,
 }
 
 impl SteppedNop {

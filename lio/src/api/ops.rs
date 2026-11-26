@@ -4,8 +4,9 @@
 //! operation and produces its result. They are made by the functions in
 //! [`api`](crate::api), and are opaque.
 //!
-//! Run one directly (`.await`, `when_done`, `send`, `send_with`, or
-//! `with_lio` to name the driver), or poll it from a model of your own.
+//! The functions in [`api`](crate::api) return each one in an
+//! [`Io`](crate::api::Io), which is what runs it and is itself a model to
+//! compose with.
 //!
 //! # How an operation is written
 //!
@@ -240,8 +241,6 @@ impl OpStream for Interval {
     Next::Item(tick)
   }
 }
-
-streamable!([] Interval);
 
 // ============================================================================
 // Sockets

@@ -117,7 +117,7 @@ fn cancelling_a_future_frees_its_slot_for_a_waiter() {
 /// Yields 1, then 2, with one nop before each.
 struct OneShotStream {
   sent: u32,
-  nop: lio::api::ops::Nop,
+  nop: lio::api::Io<lio::api::ops::Nop>,
 }
 
 impl OneShotStream {

@@ -3,6 +3,7 @@ use std::{io, net::SocketAddr};
 use crate::{
   api::{
     ShutdownHow,
+    io::Io,
     ops::{self, Recv, Shutdown},
     resource::{AsResource, FromResource, IntoResource, Resource},
   },
@@ -82,8 +83,8 @@ impl TcpListener {
   ///     Ok(())
   /// }
   /// ```
-  pub fn bind(addr: SocketAddr) -> TcpBindListener {
-    TcpBindListener::new(addr)
+  pub fn bind(addr: SocketAddr) -> Io<TcpBindListener> {
+    Io::from_op(TcpBindListener::new(addr))
   }
 
   /// Accepts a new incoming connection from this listener.
@@ -116,8 +117,8 @@ impl TcpListener {
   ///     }
   /// }
   /// ```
-  pub fn accept(&self) -> TcpAccept {
-    TcpAccept::new(self.0.as_resource().clone())
+  pub fn accept(&self) -> Io<TcpAccept> {
+    Io::from_op(TcpAccept::new(self.0.as_resource().clone()))
   }
 
   /// Returns the local address this listener is bound to.
@@ -225,8 +226,8 @@ impl TcpStream {
   ///     Ok(())
   /// }
   /// ```
-  pub fn connect(addr: SocketAddr) -> TcpStreamConnect {
-    TcpStreamConnect::new(addr)
+  pub fn connect(addr: SocketAddr) -> Io<TcpStreamConnect> {
+    Io::from_op(TcpStreamConnect::new(addr))
   }
 
   /// Receives data from the socket into the provided buffer.
@@ -261,7 +262,7 @@ impl TcpStream {
   ///     Ok(())
   /// }
   /// ```
-  pub fn recv<V>(&self, vec: V) -> Recv<V>
+  pub fn recv<V>(&self, vec: V) -> Io<Recv<V>>
   where
     V: buf::IoBufMutVec + std::marker::Send + Sync + 'static,
   {
@@ -299,7 +300,7 @@ impl TcpStream {
   ///     Ok(())
   /// }
   /// ```
-  pub fn send<V>(&self, vec: V) -> ops::Send<V>
+  pub fn send<V>(&self, vec: V) -> Io<ops::Send<V>>
   where
     V: buf::IoBufVec + std::marker::Send + Sync + 'static,
   {
@@ -345,7 +346,7 @@ impl TcpStream {
   ///     Ok(())
   /// }
   /// ```
-  pub fn shutdown(&self, how: ShutdownHow) -> Shutdown {
+  pub fn shutdown(&self, how: ShutdownHow) -> Io<Shutdown> {
     self.0.shutdown(how)
   }
 }

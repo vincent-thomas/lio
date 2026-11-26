@@ -34,7 +34,7 @@
 //! struct ReadTwice {
 //!   from: Resource,
 //!   first: Option<usize>,
-//!   read: ops::Read<Vec<u8>>,
+//!   read: api::Io<ops::Read<Vec<u8>>>,
 //! }
 //!
 //! impl OpModel for ReadTwice {
@@ -602,8 +602,6 @@ impl<A: OpModel, B: OpModel> Join<A, B> {
     Self { a: Side::Running(a), b: Side::Running(b) }
   }
 }
-
-runnable!([A: OpModel, B: OpModel] Join<A, B>);
 
 impl<A: OpModel, B: OpModel> OpModel for Join<A, B> {
   type Item = (A::Item, B::Item);
