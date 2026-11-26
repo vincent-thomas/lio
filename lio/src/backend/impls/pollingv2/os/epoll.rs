@@ -207,6 +207,16 @@ impl Drop for OsPoller {
 impl ReadinessPoll for OsPoller {
   type NativeEvent = libc::epoll_event;
 
+  fn open() -> io::Result<Self> {
+    Self::new()
+  }
+
+  fn blank_event() -> Self::NativeEvent {
+    // SAFETY: the event record is plain old data, and all-zero is a value
+    // of it.
+    unsafe { std::mem::zeroed() }
+  }
+
   fn add(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()> {
     self.add_inner(fd, key, interest, true)
   }

@@ -33,7 +33,6 @@ use bumpalo::Bump;
 
 use crate::backend::{
   IoBackend, OpCompleted,
-  impls::pollingv2::interest::Interest,
   impls::unix_stat::{file_stat_from_raw, file_type_from_dirent_dtype},
   op::{
     DirEntryRef, MsgRecv, MsgSend, Op, ReadDirResult, WriteFlags,
@@ -42,25 +41,42 @@ use crate::backend::{
 };
 use crate::slab::{Slab, SlabKey};
 mod interest;
+pub use interest::Interest;
 
-/// Trait for OS-specific readiness polling implementations
+/// What a [`Poller`] needs from the operating system: watch descriptors,
+/// and say which became ready.
 ///
-/// This abstraction makes it easy to add new platforms (epoll, IOCP, etc.)
+/// Implement this for a readiness API (as lio does for `epoll` and
+/// `kqueue`) and [`Poller::with_poller`] is an [`IoBackend`] over it. The
+/// poller supplies the rest: performing the operations, queueing several on
+/// one descriptor, cancelling, and keeping to its capacity.
 ///
-/// ## Design for cross-platform compatibility
+/// # What the poller relies on
 ///
-/// - **epoll**: Registers both read/write interest on a single fd
-/// - **kqueue**: Registers read and write separately as different filters
-/// - This trait accommodates both by accepting Interest flags
+/// - A descriptor has at most one registration. [`add`](Self::add) for one
+///   that is registered fails, with `EEXIST`, and leaves the registration
+///   as it was.
+/// - A registration is one-shot: once [`wait`](Self::wait) has reported an
+///   event for it, it reports nothing more until it is deleted and added
+///   again.
+/// - An event carries the key its registration was added with.
 ///
 /// ## Thread Safety
 ///
-/// Implementations of this trait are intentionally `!Send` to ensure they are
-/// used only from a single thread. This allows for more efficient interior
-/// mutability without synchronization overhead.
-pub(crate) trait ReadinessPoll {
-  /// The native event type used by this implementation
-  type NativeEvent;
+/// Implementations are used from a single thread, and need not be `Send`.
+pub trait ReadinessPoll {
+  /// The event record [`wait`](Self::wait) fills in.
+  type NativeEvent: Copy;
+
+  /// Opens a poller. A [`Poller`] made with [`Poller::new`] calls this when
+  /// the driver starts it.
+  fn open() -> io::Result<Self>
+  where
+    Self: Sized;
+
+  /// An event record that stands for nothing, to fill the buffer
+  /// [`wait`](Self::wait) writes into.
+  fn blank_event() -> Self::NativeEvent;
 
   /// Add interest for a file descriptor (one-shot mode).
   /// This is not idempotent.
@@ -70,8 +86,10 @@ pub(crate) trait ReadinessPoll {
   /// This fails if 'fd' hasn't previously been added.
   fn delete(&self, fd: RawFd) -> io::Result<()>;
 
-  /// Wait for events, filling the provided buffer
-  /// Returns the number of events received
+  /// Waits for events and writes them to the front of `events`.
+  ///
+  /// Returns how many were written. A count past `events.len()` is read as
+  /// `events.len()`.
   fn wait(
     &self,
     events: &mut [Self::NativeEvent],
@@ -92,57 +110,40 @@ type LoweredMsg = (
   Option<(libc::sockaddr_storage, libc::socklen_t)>,
 );
 
-/// A collection of events returned from polling
-pub(crate) struct Events {
-  events: Vec<<sys::OsPoller as ReadinessPoll>::NativeEvent>,
+/// The buffer a poller's `wait` writes events into, and the events of the
+/// last wait that are still to be handled.
+struct Events<P: ReadinessPoll> {
+  /// Every entry holds an event record: blank, or one a wait wrote.
+  events: Vec<P::NativeEvent>,
+  /// How many at the front are still to be handled.
+  ready: usize,
 }
 
-impl Default for Events {
-  fn default() -> Self {
-    Self::with_capacity(512)
-  }
-}
-
-impl Events {
-  /// Create a new empty events collection with specified capacity
-  pub(crate) fn with_capacity(capacity: usize) -> Self {
-    Self { events: Vec::with_capacity(capacity) }
+impl<P: ReadinessPoll> Events<P> {
+  /// Room for `capacity` events per wait.
+  fn with_capacity(capacity: usize) -> Self {
+    Self { events: vec![P::blank_event(); capacity], ready: 0 }
   }
 
-  /// Returns the vec of maybe-initialised values. Meant for OS to fill and
-  /// then we set correct length.
-  fn as_buf(&mut self) -> &mut [<sys::OsPoller as ReadinessPoll>::NativeEvent] {
+  /// The whole buffer, for a wait to write into.
+  fn as_buf(&mut self) -> &mut [P::NativeEvent] {
     assert!(
-      self.events.is_empty(),
+      self.ready == 0,
       "lio logic error: Left over items during Events::as_buf call."
     );
-    let spare = self.events.spare_capacity_mut();
-    // SAFETY: The OS wait syscall will initialize up to `spare.len()` entries.
-    // `set_len()` is called afterward with the actual initialized count.
-    unsafe {
-      std::slice::from_raw_parts_mut(
-        spare
-          .as_mut_ptr()
-          .cast::<<sys::OsPoller as ReadinessPoll>::NativeEvent>(),
-        spare.len(),
-      )
-    }
+    &mut self.events
   }
 
-  unsafe fn set_len(&mut self, len: usize) {
-    assert!(len <= self.events.capacity(), "set_len: len must be <= capacity");
-    // SAFETY: The caller guarantees that the first `len` elements have been initialized
-    // by the OS's wait() call. We've verified len <= capacity above.
-    unsafe { self.events.set_len(len) }
+  /// A wait wrote `count` events to the front of the buffer.
+  fn set_ready(&mut self, count: usize) {
+    self.ready = count.min(self.events.len());
   }
 
   /// The next event: its key, and what the kernel says is ready.
   fn pop_event(&mut self) -> Option<(u64, Interest)> {
-    let native_event = self.events.pop()?;
-    Some((
-      sys::OsPoller::event_key(&native_event),
-      sys::OsPoller::event_interest(&native_event),
-    ))
+    self.ready = self.ready.checked_sub(1)?;
+    let native_event = self.events.get(self.ready)?;
+    Some((P::event_key(native_event), P::event_interest(native_event)))
   }
 }
 
@@ -177,10 +178,14 @@ impl Waiters {
   }
 }
 
-/// Polling-based I/O backend for epoll (Linux) and kqueue (BSD/macOS).
-pub struct Poller {
-  sys: Option<sys::OsPoller>,
-  events: Events,
+/// Polling-based I/O backend: performs each operation itself once the
+/// operating system says its descriptor is ready.
+///
+/// [`Poller::new`] uses epoll (Linux) or kqueue (BSD/macOS).
+/// [`Poller::with_poller`] takes any [`ReadinessPoll`].
+pub struct Poller<P: ReadinessPoll = sys::OsPoller> {
+  sys: Option<P>,
+  events: Events<P>,
   capacity: usize,
   backlog: Vec<PendingOp>,
   /// Operations that are waiting for their descriptor to become ready.
@@ -195,9 +200,28 @@ pub struct Poller {
 
 impl Default for Poller {
   fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl Poller {
+  /// A poller on epoll (Linux) or kqueue (BSD/macOS), opened when the
+  /// driver starts it.
+  pub fn new() -> Self {
+    Self::unstarted(None)
+  }
+}
+
+impl<P: ReadinessPoll> Poller<P> {
+  /// A poller over `poller`.
+  pub fn with_poller(poller: P) -> Self {
+    Self::unstarted(Some(poller))
+  }
+
+  fn unstarted(sys: Option<P>) -> Self {
     Self {
-      sys: None,
-      events: Events::default(),
+      sys,
+      events: Events::with_capacity(0),
       capacity: 0,
       backlog: Vec::new(),
       pending: Slab::new(0),
@@ -253,7 +277,7 @@ fn raw_error(err: &io::Error) -> isize {
   err.raw_os_error().map_or(-(libc::EIO as isize), |code| -(code as isize))
 }
 
-impl Poller {
+impl<P: ReadinessPoll> Poller<P> {
   /// Registers `fd` for what its waiters wait for, in place of what was
   /// registered. With no waiter left, the descriptor is forgotten.
   ///
@@ -261,7 +285,7 @@ impl Poller {
   /// direction at once, so this runs after an event and whenever a
   /// direction gains its first waiter or loses its last.
   fn rearm(
-    sys: &sys::OsPoller,
+    sys: &P,
     waiters: &mut HashMap<RawFd, Waiters>,
     fd: RawFd,
   ) -> io::Result<()> {
@@ -312,7 +336,7 @@ impl Poller {
         queue.pop_front();
         continue;
       };
-      let result = Poller::exec_op(&entry.op);
+      let result = Self::exec_op(&entry.op);
       if result == EAGAIN_NEG || result == EWOULDBLOCK_NEG {
         return;
       }
@@ -616,10 +640,6 @@ impl Poller {
       msg_flags: 0,
     };
     Some((iovecs, hdr, addr))
-  }
-
-  pub fn new() -> Self {
-    Self::default()
   }
 
   #[cfg(unix)]
@@ -1248,9 +1268,11 @@ impl Poller {
   }
 }
 
-impl IoBackend for Poller {
+impl<P: ReadinessPoll> IoBackend for Poller<P> {
   fn init(&mut self, cap: usize) -> io::Result<()> {
-    self.sys = Some(sys::OsPoller::new()?);
+    if self.sys.is_none() {
+      self.sys = Some(P::open()?);
+    }
     self.events = Events::with_capacity(cap.min(4096));
     self.capacity = cap;
     self.backlog.clear();
@@ -1431,8 +1453,7 @@ impl IoBackend for Poller {
           return Err(err);
         }
       };
-      // SAFETY: `wait()` initialized exactly `event_count` events in the buffer.
-      unsafe { self.events.set_len(event_count) };
+      self.events.set_ready(event_count);
     }
 
     while let Some((key, ready)) = self.events.pop_event() {
