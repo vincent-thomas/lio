@@ -565,6 +565,83 @@ fn an_operation_in_flight_can_move_to_another_model() {
   assert!(!lio.is_full(), "both slots are free again");
 }
 
+/// Starts two reads, and hands the second out before it is done.
+struct HandsOut {
+  reads: Option<[Read<Vec<u8>>; 2]>,
+  out: Rc<RefCell<Option<Read<Vec<u8>>>>>,
+}
+
+impl OpModel for HandsOut {
+  type Item = ();
+
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
+    let [mut first, mut second] = self.reads.take().unwrap();
+    assert!(matches!(first.poll(cx), Step::Pending));
+    assert!(matches!(second.poll(cx), Step::Pending));
+    *self.out.borrow_mut() = Some(second);
+    Step::Done(())
+  }
+}
+
+/// Waits for a nop, then for the read it finds in `from`.
+struct PicksUp {
+  nop: Option<lio::api::ops::Nop>,
+  from: Rc<RefCell<Option<Read<Vec<u8>>>>>,
+  read: Option<Read<Vec<u8>>>,
+}
+
+impl OpModel for PicksUp {
+  type Item = BufResult<usize, Vec<u8>>;
+
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    if let Some(nop) = self.nop.as_mut() {
+      lio::ready!(nop.poll(cx)).unwrap();
+      self.nop = None;
+      self.read = self.from.borrow_mut().take();
+    }
+    Step::Done(lio::ready!(self.read.as_mut().unwrap().poll(cx)))
+  }
+}
+
+#[test]
+fn an_operation_waiting_for_a_slot_can_move_to_another_model() {
+  let (backend, lio) = scripted(2);
+  let out = Rc::new(RefCell::new(None));
+  let picks_up = PicksUp {
+    nop: Some(api::nop().into_inner()),
+    from: Rc::clone(&out),
+    read: None,
+  };
+  let (items, _task) = collect(&lio, picks_up);
+  let nop = backend.in_flight()[0];
+
+  // The first read fills the driver: the second waits for a slot.
+  let read =
+    || api::read(&Resource::stdin(), Vec::with_capacity(8)).into_inner();
+  let _task = model::spawn(
+    &lio,
+    HandsOut { reads: Some([read(), read()]), out: Rc::clone(&out) },
+    |()| {},
+  );
+  assert_eq!(backend.pushed().len(), 2);
+
+  // The other model takes the waiting read over, and asks for its result
+  // before it has a slot.
+  finish(&backend, &lio, nop, 0);
+  assert!(out.borrow().is_none());
+  assert_eq!(backend.pushed().len(), 2, "still waiting");
+
+  // The read its first model gave up on finishes, which frees a slot.
+  finish(&backend, &lio, reads(&backend)[0], 0);
+  assert_eq!(backend.pushed().len(), 3);
+
+  // The model that has the ticket now is the one told.
+  finish(&backend, &lio, reads(&backend)[0], 3);
+  let (result, buf) = items.borrow_mut().pop().unwrap();
+  assert_eq!((result.unwrap(), buf.len()), (3, 3));
+  assert!(!lio.is_full());
+}
+
 /// Two nops, one after the other.
 struct TwoNops {
   left: u8,
