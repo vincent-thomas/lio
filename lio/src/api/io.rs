@@ -542,6 +542,22 @@ where
     IoStreamNextFuture { stream: self }.await
   }
 
+  /// The model itself, to poll from a model of your own or to hand to
+  /// [`model::spawn`] or [`Join`](crate::model::Join).
+  ///
+  /// `None` once the stream has started: the model is in the driver by
+  /// then, and stops with the stream.
+  pub fn into_inner(mut self) -> Option<T> {
+    match std::mem::replace(&mut self.state, IoStreamState::Done) {
+      IoStreamState::Pending(op) => Some(op),
+      started => {
+        // Dropped with the stream, which stops the model.
+        self.state = started;
+        None
+      }
+    }
+  }
+
   pub fn send(self) -> StreamReceiver<T::Item>
   where
     T::Item: Send,

@@ -307,7 +307,7 @@ fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
       .open(c_path(&dir.join(name)))
   };
 
-  let copy = block_on(lio, async {
+  block_on(lio, async {
     let (source, copy) = (open("source.txt").await?, open("copy.txt").await?);
     // The operations in `lio::api` take any resource: here, the files'.
     let (source, copy) = (source.into_resource(), copy.into_resource());
@@ -334,16 +334,18 @@ fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
       text.extend(chunk);
     }
     assert_eq!(text, b"0123456789");
-    io::Result::Ok(copy)
+    io::Result::Ok(())
   })?;
 
   // Without an `Io`: `spawn` hands every item to a callback, and gives back
-  // a handle that can stop the model.
-  let task = model::spawn(lio, Chunks::new(&copy), |(result, chunk)| {
-    println!("chunk: {result:?} {:?}", String::from_utf8_lossy(&chunk));
-  });
-  // One chunk per run. Dropping the handle would leave the model running
-  // to the end of the file: cancelling stops it here.
+  // a handle that can stop the model. `into_inner` gives the model inside a
+  // stream that has not started yet.
+  let ticks = api::interval(Duration::from_millis(1))
+    .into_inner()
+    .expect("the stream has not started");
+  let task = model::spawn(lio, ticks, |tick| println!("tick: {tick:?}"));
+  // One tick per run. Dropping the handle would leave the model running:
+  // cancelling stops it here.
   lio.run()?;
   lio.run()?;
   task.cancel();

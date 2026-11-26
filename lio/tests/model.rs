@@ -642,6 +642,31 @@ fn an_operation_waiting_for_a_slot_can_move_to_another_model() {
   assert!(!lio.is_full());
 }
 
+#[test]
+fn a_stream_gives_its_model_back_until_it_has_started() {
+  let (backend, lio) = scripted(2);
+  let from = Resource::stdin();
+  let chunks = || Chunks {
+    from: from.clone(),
+    read: api::read(&from, Vec::<u8>::with_capacity(4)).into_inner(),
+  };
+
+  // Not started: the model comes back, and runs like any other.
+  let model = api::run_stream(chunks()).with_lio(&lio).into_inner().unwrap();
+  let (items, _task) = collect(&lio, model);
+  finish_only(&backend, &lio, 0);
+  assert_eq!(items.borrow().len(), 1);
+
+  // Started: the model is in the driver, and stops with the stream.
+  let mut stream = api::run_stream(chunks()).with_lio(&lio);
+  let mut cx = Context::from_waker(Waker::noop());
+  assert!(Box::pin(stream.next()).as_mut().poll(&mut cx).is_pending());
+  let started = backend.in_flight();
+  assert_eq!(started.len(), 1);
+  assert!(stream.into_inner().is_none());
+  assert_eq!(backend.cancelled(), started);
+}
+
 /// Two nops, one after the other.
 struct TwoNops {
   left: u8,
