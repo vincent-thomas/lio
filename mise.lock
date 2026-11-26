@@ -1625,6 +1625,7 @@ specifiers = ["1.100.0"]
 [tools.rust.options]
 components = "clippy,rust-src,rustfmt"
 profile = "minimal"
+targets = "wasm32-wasip3"
 
 [[tools.rust]]
 version = "nightly-2026-11-22"
