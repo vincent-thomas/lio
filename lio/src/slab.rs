@@ -409,10 +409,14 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
   }
 
   /// Calls `f` on every slot that still owns its state: occupied, or
-  /// retired and not yet released.
+  /// retired and not yet released. A slot at its last generation is
+  /// `Exhausted` until `release`, and it still owns that state.
   pub(crate) fn for_each_leased(&mut self, f: impl FnMut(&mut T)) {
     self.for_each_where(
-      |slot| slot.occupied() || slot.status == Status::Retired,
+      |slot| {
+        slot.occupied()
+          || matches!(slot.status, Status::Retired | Status::Exhausted)
+      },
       f,
     );
   }

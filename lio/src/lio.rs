@@ -121,7 +121,11 @@ struct LioInner {
   ready_timers: VecDeque<u64>,
   /// Registrations removed while the driver was borrowed, to be dropped
   /// once it is not (see [`Lio::bury`]). Their slots stay reserved until then.
-  dying: Vec<Detached>,
+  ///
+  /// Dropped by hand after a drain that holds nothing. A plain `Vec` would
+  /// still drop them when this struct drops, which frees models the backend
+  /// may still address.
+  dying: ManuallyDrop<Vec<Detached>>,
   /// Slot indices reused across [`Lio::bury_and_wake`] so releasing a batch
   /// does not allocate.
   released_slots: Vec<u32>,
@@ -332,7 +336,7 @@ impl Drop for LioInner {
       if self.leaked == 0 && !self.store.any_lease_held() {
         // The detached models point into the store's arenas, so they go
         // before it, and only after drain said the backend holds nothing.
-        drop(std::mem::take(&mut self.dying));
+        drop(std::mem::take(&mut *self.dying));
         // SAFETY: this field is not used again.
         unsafe { ManuallyDrop::drop(&mut self.io) };
         #[cfg(test)]
@@ -474,7 +478,7 @@ impl Lio {
       completed: Vec::with_capacity(cap),
       ready_io: VecDeque::with_capacity(cap),
       ready_timers: VecDeque::new(),
-      dying: Vec::with_capacity(cap),
+      dying: ManuallyDrop::new(Vec::with_capacity(cap)),
       released_slots: Vec::with_capacity(cap),
       burying: 0,
       leaked: 0,
@@ -1129,7 +1133,7 @@ impl Lio {
         // One borrow drains every registration removed so far. Drops happen
         // below, with the driver not borrowed. Slots are released after
         // those drops, in one borrow, unless a drop panics.
-        let pending = std::mem::take(&mut inner.dying);
+        let pending = std::mem::take(&mut *inner.dying);
         let slots = std::mem::take(&mut inner.released_slots);
         inner.burying += pending.len();
         drop(inner);
@@ -1149,7 +1153,7 @@ impl Lio {
           // something into the fresh `dying` queue; keep those.
           let spare_dying = std::mem::take(&mut batch.pending);
           if inner.dying.is_empty() {
-            inner.dying = spare_dying;
+            *inner.dying = spare_dying;
           }
           inner.released_slots = std::mem::take(&mut batch.slots);
           Self::release_capacity(&mut inner)
@@ -1470,7 +1474,7 @@ impl Drop for BuryBatch<'_> {
     let n = self.pending.len();
     inner.burying -= n;
     if inner.dying.is_empty() {
-      inner.dying = std::mem::take(&mut self.pending);
+      *inner.dying = std::mem::take(&mut self.pending);
     } else {
       inner.dying.append(&mut self.pending);
     }
@@ -1664,6 +1668,7 @@ mod tests {
   /// Copies one caller buffer address and says `drain` succeeded.
   struct KeepsBuffer {
     addr: Rc<Cell<Option<usize>>>,
+    id: Rc<Cell<Option<u64>>>,
     ticket: Option<crate::backend::Ticket>,
   }
 
@@ -1681,6 +1686,7 @@ mod tests {
         let ptr = unsafe { iovecs.as_ref().ptr };
         self.addr.set(Some(ptr as usize));
       }
+      self.id.set(Some(ticket.id()));
       self.ticket = Some(ticket);
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -1711,7 +1717,11 @@ mod tests {
   #[cfg_attr(miri, ignore = "leaks the registration on purpose")]
   fn a_drained_backend_that_keeps_a_buffer_address_does_not_free_the_model() {
     let addr = Rc::new(Cell::new(None));
-    let backend = KeepsBuffer { addr: addr.clone(), ticket: None };
+    let backend = KeepsBuffer {
+      addr: addr.clone(),
+      id: Rc::new(Cell::new(None)),
+      ticket: None,
+    };
     let lio = Lio::new_with_backend(backend, 1).unwrap();
     let dropped = Rc::new(Cell::new(false));
     let flag = dropped.clone();
@@ -1738,6 +1748,50 @@ mod tests {
       !dropped.get() && !STORE_DROPPED.with(|dropped| dropped.get()),
       "the model was freed while the backend still stores a caller buffer address"
     );
+  }
+
+  /// The registration is detached into `dying` while the backend still holds
+  /// its ticket. Dropping the driver must not free that model.
+  fn detach_while_a_ticket_is_held(last_generation: bool) -> bool {
+    let addr = Rc::new(Cell::new(None));
+    let id = Rc::new(Cell::new(None));
+    let backend =
+      KeepsBuffer { addr: addr.clone(), id: id.clone(), ticket: None };
+    let lio = Lio::new_with_backend(backend, 1).unwrap();
+    if last_generation {
+      lio.inner.borrow_mut().store.set_generation(0, u32::MAX);
+    }
+    let dropped = Rc::new(Cell::new(false));
+    let flag = dropped.clone();
+    struct Note(Rc<Cell<bool>>);
+    impl Drop for Note {
+      fn drop(&mut self) {
+        self.0.set(true);
+      }
+    }
+    let note = Note(flag);
+    crate::api::read(&crate::api::resource::Resource::stdout(), vec![0u8; 1])
+      .with_lio(&lio)
+      .when_done(move |_| {
+        let _ = &note;
+      });
+    let id = id.get().unwrap();
+    let detached = lio.inner.borrow_mut().store.detach(id).unwrap();
+    lio.inner.borrow_mut().dying.push(detached);
+    drop(lio);
+    !dropped.get() && addr.get().is_some()
+  }
+
+  #[test]
+  #[cfg_attr(miri, ignore = "leaks the registration on purpose")]
+  fn a_detached_model_stays_while_its_ticket_is_held() {
+    assert!(detach_while_a_ticket_is_held(false));
+  }
+
+  #[test]
+  #[cfg_attr(miri, ignore = "leaks the registration on purpose")]
+  fn an_exhausted_slot_keeps_a_detached_model_while_its_ticket_is_held() {
+    assert!(detach_while_a_ticket_is_held(true));
   }
 
   /// Reports a completion for every pushed op, twice.

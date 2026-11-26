@@ -260,13 +260,12 @@ impl IoBackend for ScriptedBackend {
 }
 
 /// Whether `op` stores an address of a buffer the caller owns.
+///
+/// A read is the operation the drain promise is checked with. A count of
+/// zero names no buffer.
 fn holds_caller_buffer(op: &Op) -> bool {
   match op {
-    Op::Read { iov_count, .. } | Op::Write { iov_count, .. } => *iov_count > 0,
-    Op::Recv { msg, .. } => msg.buf_count.get() > 0,
-    Op::Send { msg, .. } => msg.buf_count.get() > 0,
-    Op::ReadlinkAt { buf_len, .. } => *buf_len > 0,
-    Op::ReadDir { .. } | Op::Stat { .. } | Op::Accept { .. } => true,
+    Op::Read { iov_count, .. } => *iov_count > 0,
     _ => false,
   }
 }
@@ -654,6 +653,22 @@ mod tests {
     let (mut into, mut iovec) = (0u8, crate::backend::op::RawBufMut::empty());
     push_op(&mut backend.clone(), 1, read_into(&mut into, &mut iovec));
     let _ = backend.drain();
+  }
+
+  #[test]
+  fn drain_allows_a_read_that_names_no_buffer() {
+    let mut backend = ScriptedBackend::new();
+    backend.drain_while_holding();
+    backend.init(1).unwrap();
+    let read = Op::Read {
+      fd: crate::api::resource::Resource::stdout(),
+      iovecs: ptr::NonNull::dangling(),
+      iov_count: 0,
+      offset: None,
+      flags: Default::default(),
+    };
+    push_op(&mut backend, 1, read);
+    assert!(backend.drain());
   }
 
   #[test]
