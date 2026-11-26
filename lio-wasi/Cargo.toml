@@ -1,0 +1,17 @@
+[package]
+name = "lio-wasi"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Completion-queue interface to WASI 0.3 (component-model async), without an executor"
+repository = "https://github.com/vincent-thomas/lio"
+documentation = "https://docs.rs/lio-wasi"
+keywords = ["wasi", "async", "io", "wasm", "component-model"]
+categories = ["asynchronous", "wasm", "network-programming"]
+
+[package.metadata.docs.rs]
+default-target = "wasm32-wasip3"
+targets = ["wasm32-wasip3"]
+
+[dependencies]
+wasip3 = "0.10.0"
