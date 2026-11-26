@@ -92,6 +92,12 @@ pub mod impls {
   #[cfg(windows)]
   pub use iocp::*;
 
+  #[cfg(target_os = "wasi")]
+  pub(crate) mod wasi;
+  #[cfg(target_os = "wasi")]
+  pub use wasi::Wasi;
+
+  #[cfg(any(unix, windows))]
   pub(crate) use super::sockaddr;
   #[cfg(unix)]
   pub(crate) mod iovec;
@@ -118,6 +124,10 @@ pub mod impls {
   /// The backend [`Lio::new`](crate::Lio::new) uses on this platform.
   #[cfg(windows)]
   pub type DefaultBackend = Iocp;
+
+  /// The backend [`Lio::new`](crate::Lio::new) uses on this platform.
+  #[cfg(target_os = "wasi")]
+  pub type DefaultBackend = Wasi;
 }
 
 pub(crate) mod store;
@@ -128,9 +138,26 @@ pub(crate) mod native;
 
 /// OS socket-address conversions. Lives with the backend implementations but
 /// is also needed by `net` when no backend implementations are compiled in.
+#[cfg(any(unix, windows))]
 #[path = "impls/sockaddr.rs"]
 #[cfg_attr(not(feature = "backend_impls"), allow(dead_code))]
 pub(crate) mod sockaddr;
+
+/// Socket-address queries on WASI, where a socket is a typed handle held by
+/// the WASI backend instead of a descriptor the OS can be asked about.
+#[cfg(target_os = "wasi")]
+pub(crate) mod sockaddr {
+  /// Looks up the local (`peer == false`) or remote address of a socket.
+  #[cfg(feature = "high")]
+  pub(crate) fn socket_name(
+    socket: &crate::api::resource::Resource,
+    peer: bool,
+  ) -> std::io::Result<std::net::SocketAddr> {
+    // The WASI backend does not create sockets yet.
+    let _ = (socket, peer);
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+  }
+}
 
 use std::io;
 use std::time::Duration;
