@@ -13,6 +13,7 @@
 //! thousands of times slower, so the test only runs there when the depth
 //! is set explicitly (the deep workflow does).
 
+use core::task::{Poll, ready};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
@@ -20,7 +21,6 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
-use std::task::{Poll, ready};
 use std::time::Duration;
 
 use crate::Lio;

@@ -2065,7 +2065,7 @@ mod tests {
 
   use crate::api::ops::{Nop, Sleep};
   use crate::model::{Cx, Join, OpModel};
-  use std::task::{Poll, ready};
+  use core::task::{Poll, ready};
 
   /// Counts the models that finished.
   fn counting(count: &Rc<Cell<usize>>) -> impl FnMut(()) -> bool + 'static {

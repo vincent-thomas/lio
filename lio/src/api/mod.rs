@@ -74,7 +74,7 @@ use std::time::Duration;
 /// use lio::api::{self, ops};
 /// use lio::backend::testing::ScriptedBackend;
 /// use lio::model::{Cx, OpModel};
-/// use std::task::{Poll, ready};
+/// use core::task::{Poll, ready};
 ///
 /// /// Two nops, one after the other.
 /// struct TwoNops(u8, ops::Nop);

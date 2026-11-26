@@ -20,12 +20,12 @@
 //! private to lio, so the result an operation produces is always the result
 //! of what it submitted.
 
+use core::task::{Poll, ready};
 use std::ffi::{CString, OsString};
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::task::{Poll, ready};
 use std::time::Duration;
 
 use crate::api::Pid;

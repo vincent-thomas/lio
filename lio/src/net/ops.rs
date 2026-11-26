@@ -19,7 +19,7 @@
 //!   create/connect operations, also used for Unix domain sockets
 //! - [`UnixAccept`]: Accept operation that returns a [`UnixStream`]
 
-use std::task::{Poll, ready};
+use core::task::{Poll, ready};
 use std::{io, marker::PhantomData, net::SocketAddr};
 
 #[allow(unused_imports)] // TcpListener used in doc links
