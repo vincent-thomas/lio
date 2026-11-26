@@ -22,9 +22,9 @@
 //! }
 //! ```
 
+use core::task::Poll;
 use std::io;
 use std::mem::MaybeUninit;
-use std::task::Poll;
 
 use crate::api::{
   ops,

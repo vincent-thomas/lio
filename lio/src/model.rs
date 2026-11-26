@@ -3,7 +3,7 @@
 //! An [`OpModel`] is a state machine that describes a piece of I/O work with
 //! one result. The driver asks it one question, [`poll`](OpModel::poll):
 //! given what has finished so far, can you make progress? It answers with
-//! std's [`Poll`], as a future does. An [`OpStream`] is the same for work
+//! [`core::task::Poll`], as a future does. An [`OpStream`] is the same for work
 //! that produces several items.
 //!
 //! - Every single operation in [`api`](crate::api) is a model (a *leaf*).
@@ -29,7 +29,7 @@
 //! use lio::api::{self, ops, resource::Resource};
 //! use lio::backend::testing::ScriptedBackend;
 //! use lio::model::{self, Cx, OpModel};
-//! use std::task::{Poll, ready};
+//! use core::task::{Poll, ready};
 //!
 //! /// Reads twice from the same resource, one read after the other.
 //! struct ReadTwice {
@@ -79,12 +79,12 @@
 //! takes one slot and allocates nothing. An operation started while that
 //! one is still busy takes a slot of its own.
 
+use core::task::{Context, Poll, Waker};
 use std::cell::RefCell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
 
 use crate::Lio;
 use bumpalo::Bump;
@@ -98,7 +98,7 @@ use crate::registration::{
 ///
 /// It is to the driver what a [`Future`] is to an executor, and `poll`
 /// reports the same way: [`Poll::Pending`], or [`Poll::Ready`] with the
-/// result. [`std::task::ready!`] works on it.
+/// result. [`core::task::ready!`] works on it.
 pub trait OpModel {
   /// What the model produces.
   type Item;

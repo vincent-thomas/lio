@@ -1,6 +1,6 @@
 //! Filesystem resource types.
 
-use std::task::{Poll, ready};
+use core::task::{Poll, ready};
 use std::{
   ffi::{CString, OsStr, OsString},
   io,

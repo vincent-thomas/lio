@@ -844,9 +844,9 @@ impl Drop for Registration {
 mod tests {
   use super::*;
   use crate::model::OpModel;
+  use core::task::Poll;
   use std::cell::Cell;
   use std::rc::Rc;
-  use std::task::Poll;
 
   /// Counts its drops.
   struct Counted(Rc<Cell<usize>>);

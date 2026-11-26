@@ -189,7 +189,7 @@ macro_rules! action_io {
 /// use lio::api;
 /// use lio::backend::testing::ScriptedBackend;
 /// use lio::model::{Cx, OpModel};
-/// use std::task::{Poll, ready};
+/// use core::task::{Poll, ready};
 ///
 /// struct Twice(api::ops::Nop, bool);
 ///
@@ -407,7 +407,7 @@ macro_rules! leaf {
       fn poll(
         &mut self,
         cx: &mut $crate::model::Cx<'_>,
-      ) -> ::std::task::Poll<Self::Item> {
+      ) -> ::core::task::Poll<Self::Item> {
         self.state.poll(cx, |cx, ($($arg,)*)| cx.$method($($arg),*))
       }
     }
