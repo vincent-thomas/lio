@@ -850,6 +850,9 @@ struct Transfer {
   /// Reads the file's size after an append at the cursor, which leaves the
   /// cursor at the new end of the file.
   position: Option<fs::Stat<'static>>,
+  /// The error to report once the cursor is placed. The append landed
+  /// before the sync that failed, so the cursor still has to move.
+  failed: Option<isize>,
   phase: Phase,
   /// The buffer being filled or drained, and how far into it.
   index: usize,
@@ -872,6 +875,7 @@ impl Transfer {
       sync: None,
       sync_data: None,
       position: None,
+      failed: None,
       phase: Phase::Data,
       index: 0,
       within: 0,
@@ -1818,6 +1822,10 @@ impl Wasi {
               };
               match synced {
                 Some(Ok(())) => return self.after_sync(id, pending),
+                Some(Err(error)) if transfer.position.is_some() => {
+                  transfer.failed = Some(fail(errno(&error)));
+                  return self.after_sync(id, pending);
+                }
                 Some(Err(error)) => fail(errno(&error)),
                 None => unreachable!("a returned call has a result"),
               }
@@ -1829,8 +1837,9 @@ impl Wasi {
           Some(result)
         }
         Phase::Position => {
-          // The data is written either way. A size that could not be read
-          // leaves the cursor where it was.
+          // The data is written either way. If the size could not be read,
+          // nothing says where the end is, and the cursor stays where it
+          // was.
           let size = match (outcome, transfer.position.as_mut()) {
             (Outcome::Returned, Some(stat)) => match stat.result() {
               Some(Ok(stat)) => Some(stat.size),
@@ -1838,7 +1847,8 @@ impl Wasi {
             },
             _ => None,
           };
-          let (raw, total) = (transfer.raw, transfer.total);
+          let raw = transfer.raw;
+          let result = transfer.failed.unwrap_or(transfer.total as isize);
           if let Some(size) = size {
             with_table(|table| {
               if let Ok(file) = table.file(raw) {
@@ -1847,7 +1857,7 @@ impl Wasi {
             });
           }
           self.release(pending);
-          Some(total as isize)
+          Some(result)
         }
       },
     }
@@ -2303,11 +2313,21 @@ unsafe impl IoBackend for Wasi {
         self.ops.remove(&id);
       }
     }
-    let ids: Vec<u64> = self.ops.keys().copied().collect();
-    for id in ids {
-      self.queue.cancel(id);
+    // A cancel only finds a step that is still in flight. If the step had
+    // already completed, the pump moves its operation on to the next step,
+    // which the host then holds. So cancel and pump until no operation is
+    // left: each pass ends a step, and an operation has finitely many.
+    while !self.ops.is_empty() {
+      let ids: Vec<u64> = self.ops.keys().copied().collect();
+      for id in ids {
+        self.queue.cancel(id);
+      }
+      self.pump();
+      if self.queue.outstanding() == 0 {
+        // Nothing can complete any more, so nothing is held by the host.
+        break;
+      }
     }
-    self.pump();
     self.ops.clear();
     self.ready.clear();
     self.close_deferred();
