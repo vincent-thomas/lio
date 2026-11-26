@@ -319,7 +319,7 @@ struct SteppedNop {
 
 impl SteppedNop {
   fn new(steps: usize) -> Self {
-    Self { steps, left: steps, nop: api::nop().into_inner() }
+    Self { steps, left: steps, nop: api::nop() }
   }
 }
 
@@ -329,7 +329,7 @@ impl OpModel for SteppedNop {
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
     loop {
       let _ = lio::ready!(self.nop.poll(cx));
-      self.nop = api::nop().into_inner();
+      self.nop = api::nop();
       if self.left == 0 {
         self.left = self.steps;
         return Step::Yield(());

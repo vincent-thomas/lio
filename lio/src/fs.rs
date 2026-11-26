@@ -10,9 +10,7 @@ use std::{
 use std::os::unix::ffi::OsStringExt;
 
 use crate::api::{
-  FileMode, FileStat, FileType, OpenFlags, ReadDirBuf, UnlinkKind,
-  io::Io,
-  ops,
+  FileMode, FileStat, FileType, OpenFlags, ReadDirBuf, UnlinkKind, ops,
   resource::{AsResource, FromResource, IntoResource, Resource},
 };
 use crate::model::{Cx, OpModel, Step};
@@ -57,7 +55,7 @@ impl File {
   ///
   /// An `offset` above `i64::MAX` completes with
   /// [`InvalidInput`](io::ErrorKind::InvalidInput); see [`crate::api::read_at`].
-  pub fn read_at(&self, buf: Vec<u8>, offset: u64) -> Io<ops::Read<Vec<u8>>> {
+  pub fn read_at(&self, buf: Vec<u8>, offset: u64) -> ops::Read<Vec<u8>> {
     crate::api::read_at(self, buf, offset)
   }
 
@@ -65,17 +63,17 @@ impl File {
   ///
   /// An `offset` above `i64::MAX` completes with
   /// [`InvalidInput`](io::ErrorKind::InvalidInput); see [`crate::api::write_at`].
-  pub fn write_at(&self, buf: Vec<u8>, offset: u64) -> Io<ops::Write<Vec<u8>>> {
+  pub fn write_at(&self, buf: Vec<u8>, offset: u64) -> ops::Write<Vec<u8>> {
     crate::api::write_at(self, buf, offset)
   }
 
   /// Synchronizes file contents and metadata to stable storage.
-  pub fn sync_all(&self) -> Io<ops::Fsync> {
+  pub fn sync_all(&self) -> ops::Fsync {
     crate::api::fsync(self)
   }
 
   /// Reads metadata for this open file.
-  pub fn metadata(&self) -> Io<ops::Stat> {
+  pub fn metadata(&self) -> ops::Stat {
     crate::api::fstat(self)
   }
 }
@@ -103,17 +101,17 @@ impl FromResource for Directory {
 
 impl Directory {
   /// Opens a directory relative to the current working directory.
-  pub fn open(path: std::ffi::CString) -> Io<OpenDirectory> {
-    Io::from_op(OpenDirectory { inner: open_dir(Resource::cwd(), path) })
+  pub fn open(path: std::ffi::CString) -> OpenDirectory {
+    OpenDirectory { inner: open_dir(Resource::cwd(), path) }
   }
 
   /// Reads one batch of entries from the directory.
-  pub fn readdir(&self, buf: ReadDirBuf) -> Io<ops::ReadDir> {
+  pub fn readdir(&self, buf: ReadDirBuf) -> ops::ReadDir {
     crate::api::readdir(self, buf)
   }
 
   /// Synchronizes directory metadata to stable storage.
-  pub fn sync_all(&self) -> Io<ops::Fsync> {
+  pub fn sync_all(&self) -> ops::Fsync {
     crate::api::fsync(self)
   }
 }
@@ -254,8 +252,8 @@ impl OpenOptions {
   /// need write access, and `truncate` with `append` needs `create_new`;
   /// otherwise the open fails with [`io::ErrorKind::InvalidInput`] and
   /// touches nothing.
-  pub fn open(self, path: std::ffi::CString) -> Io<OpenFile> {
-    Io::from_op(OpenFile {
+  pub fn open(self, path: std::ffi::CString) -> OpenFile {
+    OpenFile {
       state: match self.flags() {
         Ok(flags) => OpenFileState::Opening(ops::OpenAt::new(
           Resource::cwd(),
@@ -265,7 +263,7 @@ impl OpenOptions {
         )),
         Err(msg) => OpenFileState::Invalid(msg, ops::Nop::new()),
       },
-    })
+    }
   }
 
   fn flags(&self) -> Result<OpenFlags, &'static str> {
@@ -312,6 +310,7 @@ fn open_dir(parent: Resource, name: CString) -> ops::OpenAt {
 }
 
 /// Open-file operation specialized to return a typed [`File`].
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct OpenFile {
   state: OpenFileState,
 }
@@ -322,6 +321,8 @@ enum OpenFileState {
   /// from the driver like any other result.
   Invalid(&'static str, ops::Nop),
 }
+
+runnable!([] OpenFile);
 
 impl OpModel for OpenFile {
   type Item = io::Result<File>;
@@ -340,9 +341,12 @@ impl OpModel for OpenFile {
 }
 
 /// Open-directory operation specialized to return a typed [`Directory`].
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct OpenDirectory {
   inner: ops::OpenAt,
 }
+
+runnable!([] OpenDirectory);
 
 impl OpModel for OpenDirectory {
   type Item = io::Result<Directory>;
@@ -353,6 +357,7 @@ impl OpModel for OpenDirectory {
 }
 
 /// Open-directory operation specialized to return a high-level [`ReadDir`].
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct OpenReadDir {
   state: OpenReadDirState,
   parent: PathBuf,
@@ -368,6 +373,8 @@ enum OpenReadDirState {
     read: ops::ReadDir,
   },
 }
+
+runnable!([] OpenReadDir);
 
 impl OpModel for OpenReadDir {
   type Item = io::Result<ReadDir>;
@@ -485,6 +492,7 @@ const REMOVE_DIR_ALL_CONCURRENCY: usize = 16;
 /// [`REMOVE_DIR_ALL_CONCURRENCY`] at a time. Its subdirectories are removed
 /// one after another, so the number of open directories stays the depth of
 /// the tree.
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct RemoveDirAll {
   stack: Vec<RemoveDirFrame>,
   state: RemoveDirAllState,
@@ -635,6 +643,8 @@ impl RemoveDirFrame {
   }
 }
 
+runnable!([] RemoveDirAll);
+
 impl OpModel for RemoveDirAll {
   type Item = io::Result<()>;
 
@@ -704,6 +714,7 @@ impl OpModel for RemoveDirAll {
 }
 
 /// High-level symbolic-link target reader.
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct ReadLink {
   path: CString,
   state: ReadLinkState,
@@ -732,6 +743,8 @@ impl ReadLinkState {
   }
 }
 
+runnable!([] ReadLink);
+
 impl OpModel for ReadLink {
   type Item = io::Result<PathBuf>;
 
@@ -759,6 +772,7 @@ impl OpModel for ReadLink {
 }
 
 /// High-level UTF-8 file reader.
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct ReadToString {
   state: ReadToStringState,
   bytes: Vec<u8>,
@@ -788,6 +802,8 @@ impl ReadToString {
     }
   }
 }
+
+runnable!([] ReadToString);
 
 impl OpModel for ReadToString {
   type Item = io::Result<String>;
@@ -830,32 +846,32 @@ impl OpModel for ReadToString {
 /// Opens a directory reader relative to the current working directory.
 ///
 /// A path containing a NUL byte fails with [`io::ErrorKind::InvalidInput`].
-pub fn read_dir<P: AsRef<Path>>(path: P) -> Io<OpenReadDir> {
+pub fn read_dir<P: AsRef<Path>>(path: P) -> OpenReadDir {
   let parent = path.as_ref().to_path_buf();
   let state = match path_to_cstring(path.as_ref()) {
     Some(path) => OpenReadDirState::Opening(open_dir(Resource::cwd(), path)),
     None => OpenReadDirState::InvalidPath(ops::Nop::new()),
   };
-  Io::from_op(OpenReadDir { state, parent, entries: Vec::new() })
+  OpenReadDir { state, parent, entries: Vec::new() }
 }
 
 /// Reads metadata for a path relative to the current working directory, following symlinks.
 ///
 /// A path containing a NUL byte fails with [`io::ErrorKind::InvalidInput`].
-pub fn metadata<P: AsRef<Path>>(path: P) -> Io<ops::Stat> {
+pub fn metadata<P: AsRef<Path>>(path: P) -> ops::Stat {
   match path_to_cstring(path.as_ref()) {
     Some(path) => metadata_cstring(path, true),
-    None => Io::from_op(ops::Stat::new(ops::StatOf::InvalidPath)),
+    None => ops::Stat::new(ops::StatOf::InvalidPath),
   }
 }
 
 /// Reads metadata for a path relative to the current working directory, without following symlinks.
 ///
 /// A path containing a NUL byte fails with [`io::ErrorKind::InvalidInput`].
-pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> Io<ops::Stat> {
+pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> ops::Stat {
   match path_to_cstring(path.as_ref()) {
     Some(path) => metadata_cstring(path, false),
-    None => Io::from_op(ops::Stat::new(ops::StatOf::InvalidPath)),
+    None => ops::Stat::new(ops::StatOf::InvalidPath),
   }
 }
 
@@ -863,38 +879,38 @@ pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> Io<ops::Stat> {
 pub fn metadata_cstring(
   path: std::ffi::CString,
   follow_symlinks: bool,
-) -> Io<ops::Stat> {
+) -> ops::Stat {
   crate::api::statat(&Resource::cwd(), path, follow_symlinks)
 }
 
 /// Reads the target of a symbolic link relative to the current working directory.
 ///
 /// A path containing a NUL byte fails with [`io::ErrorKind::InvalidInput`].
-pub fn read_link<P: AsRef<Path>>(path: P) -> Io<ReadLink> {
-  Io::from_op(match path_to_cstring(path.as_ref()) {
+pub fn read_link<P: AsRef<Path>>(path: P) -> ReadLink {
+  match path_to_cstring(path.as_ref()) {
     Some(path) => ReadLink::new(path),
     None => ReadLink {
       path: CString::default(),
       state: ReadLinkState::InvalidPath(ops::Nop::new()),
     },
-  })
+  }
 }
 
 /// Reads a UTF-8 file into a string relative to the current working directory.
 ///
 /// A path containing a NUL byte fails with [`io::ErrorKind::InvalidInput`].
-pub fn read_to_string<P: AsRef<Path>>(path: P) -> Io<ReadToString> {
-  Io::from_op(match path_to_cstring(path.as_ref()) {
+pub fn read_to_string<P: AsRef<Path>>(path: P) -> ReadToString {
+  match path_to_cstring(path.as_ref()) {
     Some(path) => ReadToString::new(path),
     None => ReadToString {
       state: ReadToStringState::InvalidPath(ops::Nop::new()),
       bytes: Vec::new(),
     },
-  })
+  }
 }
 
 /// Creates a directory relative to the current working directory.
-pub fn create_dir(path: std::ffi::CString, mode: FileMode) -> Io<ops::MkdirAt> {
+pub fn create_dir(path: std::ffi::CString, mode: FileMode) -> ops::MkdirAt {
   crate::api::mkdirat(&Resource::cwd(), path, mode)
 }
 
@@ -902,23 +918,23 @@ pub fn create_dir(path: std::ffi::CString, mode: FileMode) -> Io<ops::MkdirAt> {
 pub fn rename(
   old_path: std::ffi::CString,
   new_path: std::ffi::CString,
-) -> Io<ops::RenameAt> {
+) -> ops::RenameAt {
   crate::api::renameat(&Resource::cwd(), old_path, &Resource::cwd(), new_path)
 }
 
 /// Removes a file relative to the current working directory.
-pub fn remove_file(path: std::ffi::CString) -> Io<ops::UnlinkAt> {
+pub fn remove_file(path: std::ffi::CString) -> ops::UnlinkAt {
   crate::api::unlinkat(&Resource::cwd(), path, UnlinkKind::File)
 }
 
 /// Removes an empty directory relative to the current working directory.
-pub fn remove_dir(path: std::ffi::CString) -> Io<ops::UnlinkAt> {
+pub fn remove_dir(path: std::ffi::CString) -> ops::UnlinkAt {
   crate::api::unlinkat(&Resource::cwd(), path, UnlinkKind::Directory)
 }
 
 /// Recursively removes a directory relative to the current working directory.
-pub fn remove_dir_all(path: std::ffi::CString) -> Io<RemoveDirAll> {
-  Io::from_op(RemoveDirAll::new(path))
+pub fn remove_dir_all(path: std::ffi::CString) -> RemoveDirAll {
+  RemoveDirAll::new(path)
 }
 
 #[allow(dead_code)]

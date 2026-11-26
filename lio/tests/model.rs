@@ -56,7 +56,7 @@ fn read_gives_back_the_buffer_with_what_was_written() {
   let stdin = Resource::stdin();
   // Uninitialized capacity: only the bytes the backend wrote come back.
   let (items, _task) =
-    collect(&lio, api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner());
+    collect(&lio, api::read(&stdin, Vec::<u8>::with_capacity(8)));
 
   assert!(items.borrow().is_empty());
   finish_only(&backend, &lio, 3);
@@ -95,8 +95,7 @@ fn finish(backend: &ScriptedBackend, lio: &Lio, id: u64, result: isize) {
 fn copy_reads_the_next_chunk_while_it_writes_the_last() {
   let (backend, lio) = scripted(4);
   let (stdin, stdout) = (Resource::stdin(), Resource::stdout());
-  let (items, _task) =
-    collect(&lio, lio::io::copy(&stdin, &stdout).into_inner());
+  let (items, _task) = collect(&lio, lio::io::copy(&stdin, &stdout));
   lio.try_run().unwrap();
   assert_eq!((reads(&backend).len(), writes(&backend).len()), (1, 0));
 
@@ -132,8 +131,7 @@ fn copy_reads_the_next_chunk_while_it_writes_the_last() {
 fn copy_n_reads_no_further_than_its_limit() {
   let (backend, lio) = scripted(4);
   let (stdin, stdout) = (Resource::stdin(), Resource::stdout());
-  let (items, _task) =
-    collect(&lio, lio::io::copy_n(&stdin, &stdout, 6).into_inner());
+  let (items, _task) = collect(&lio, lio::io::copy_n(&stdin, &stdout, 6));
   lio.try_run().unwrap();
 
   // Four of six: the read that runs beside the write asks for two more.
@@ -149,8 +147,7 @@ fn copy_n_reads_no_further_than_its_limit() {
   assert_eq!(items.borrow_mut().pop().unwrap().unwrap(), 6);
   assert_eq!(backend.pushed().len(), 4, "two reads and two writes");
 
-  let (items, _task) =
-    collect(&lio, lio::io::copy_n(&stdin, &stdout, 0).into_inner());
+  let (items, _task) = collect(&lio, lio::io::copy_n(&stdin, &stdout, 0));
   assert_eq!(items.borrow_mut().pop().unwrap().unwrap(), 0);
   assert_eq!(backend.pushed().len(), 4, "a limit of zero submits nothing");
 }
@@ -159,8 +156,7 @@ fn copy_n_reads_no_further_than_its_limit() {
 fn copy_stops_at_the_first_error() {
   let (backend, lio) = scripted(4);
   let (stdin, stdout) = (Resource::stdin(), Resource::stdout());
-  let (items, _task) =
-    collect(&lio, lio::io::copy(&stdin, &stdout).into_inner());
+  let (items, _task) = collect(&lio, lio::io::copy(&stdin, &stdout));
 
   finish_only(&backend, &lio, 4);
   lio.try_run().unwrap();
@@ -176,8 +172,7 @@ fn copy_stops_at_the_first_error() {
   assert!(!lio.is_full());
 
   // An error from the read ends the copy too, and cancels the write.
-  let (items, _task) =
-    collect(&lio, lio::io::copy(&stdin, &stdout).into_inner());
+  let (items, _task) = collect(&lio, lio::io::copy(&stdin, &stdout));
   finish_only(&backend, &lio, 4);
   lio.try_run().unwrap();
   let writing = writes(&backend);
@@ -195,8 +190,8 @@ fn join_has_both_operations_in_flight_and_waits_for_both() {
   let (backend, lio) = scripted(4);
   let stdin = Resource::stdin();
   let join = Join::new(
-    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
-    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)),
   );
   let (items, _task) = collect(&lio, join);
   lio.try_run().unwrap();
@@ -222,8 +217,8 @@ fn composites_nest() {
   let (backend, lio) = scripted(4);
   let (stdin, stdout) = (Resource::stdin(), Resource::stdout());
   let model = Join::new(
-    lio::io::copy(&stdin, &stdout).into_inner(),
-    api::write(&stdout, b"hi".to_vec()).into_inner(),
+    lio::io::copy(&stdin, &stdout),
+    api::write(&stdout, b"hi".to_vec()),
   );
   let (items, _task) = collect(&lio, model);
   lio.try_run().unwrap();
@@ -244,8 +239,8 @@ fn cancelling_a_task_cancels_what_it_has_in_flight() {
   let (backend, lio) = scripted(4);
   let stdin = Resource::stdin();
   let join = Join::new(
-    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
-    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)),
   );
   let (items, task) = collect(&lio, join);
   lio.try_run().unwrap();
@@ -310,8 +305,7 @@ impl OpModel for Chunks {
     let (result, buf) = lio::ready!(self.read.poll(cx));
     match result {
       Ok(n) if n > 0 => {
-        self.read =
-          api::read(&self.from, Vec::<u8>::with_capacity(4)).into_inner();
+        self.read = api::read(&self.from, Vec::<u8>::with_capacity(4));
         Step::Yield((Ok(n), buf))
       }
       other => Step::Done((other, buf)),
@@ -323,7 +317,7 @@ impl OpModel for Chunks {
 fn a_stream_yields_until_it_is_done() {
   let (backend, lio) = scripted(4);
   let from = Resource::stdin();
-  let read = api::read(&from, Vec::<u8>::with_capacity(4)).into_inner();
+  let read = api::read(&from, Vec::<u8>::with_capacity(4));
   let (items, _task) = collect(&lio, Chunks { from, read });
 
   finish_only(&backend, &lio, 4);
@@ -369,11 +363,7 @@ struct WriteAll {
 
 impl WriteAll {
   fn new(to: &Resource, data: Vec<u8>) -> Self {
-    Self {
-      to: to.clone(),
-      offset: 0,
-      write: api::write_at(to, data, 0).into_inner(),
-    }
+    Self { to: to.clone(), offset: 0, write: api::write_at(to, data, 0) }
   }
 }
 
@@ -392,7 +382,7 @@ impl OpModel for WriteAll {
       if buf.is_empty() {
         return Step::Done(Ok(self.offset));
       }
-      self.write = api::write_at(&self.to, buf, self.offset).into_inner();
+      self.write = api::write_at(&self.to, buf, self.offset);
     }
   }
 }
@@ -406,7 +396,7 @@ struct ReadToEnd {
 
 impl ReadToEnd {
   fn new(from: &Resource) -> Self {
-    let read = api::read_at(from, Vec::with_capacity(512), 0).into_inner();
+    let read = api::read_at(from, Vec::with_capacity(512), 0);
     Self { from: from.clone(), bytes: Vec::new(), read }
   }
 }
@@ -423,8 +413,7 @@ impl OpModel for ReadToEnd {
         Err(err) => return Step::Done(Err(err)),
       }
       buf.clear();
-      self.read =
-        api::read_at(&self.from, buf, self.bytes.len() as u64).into_inner();
+      self.read = api::read_at(&self.from, buf, self.bytes.len() as u64);
     }
   }
 }
@@ -447,7 +436,7 @@ fn copy_moves_a_file_through_a_simulated_backend() {
   let src = open(&lio, "/tmp/lio_model_copy_src", OpenFlags::READ);
   let dst = open(&lio, "/tmp/lio_model_copy_dst", create);
   // The file is larger than the copy buffer: several read/write rounds.
-  let (copied, _task) = collect(&lio, lio::io::copy(&src, &dst).into_inner());
+  let (copied, _task) = collect(&lio, lio::io::copy(&src, &dst));
   assert_eq!(run_to_item(&lio, &copied).unwrap(), data.len() as u64);
 
   let dst = open(&lio, "/tmp/lio_model_copy_dst", OpenFlags::READ);
@@ -461,8 +450,8 @@ fn a_step_waiting_for_a_slot_is_never_submitted_once_its_model_is_dropped() {
   let stdin = Resource::stdin();
   // One slot: the second read waits in the driver's queue.
   let join = Join::new(
-    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
-    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)),
   );
   let (items, task) = collect(&lio, join);
   lio.try_run().unwrap();
@@ -489,7 +478,7 @@ fn a_step_that_left_the_queue_is_cancelled_when_its_model_is_dropped() {
   lio.try_run().unwrap();
   let blocker = backend.in_flight();
   let (items, task) =
-    collect(&lio, api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner());
+    collect(&lio, api::read(&stdin, Vec::<u8>::with_capacity(8)));
   assert_eq!(backend.pushed(), blocker, "the read is waiting for a slot");
 
   backend.complete_all(0);
@@ -513,8 +502,7 @@ fn a_model_s_next_step_reuses_the_slot_its_last_one_freed() {
   let stdout = Resource::stdout();
   // Read, then write, then read: with one slot, each step needs the slot
   // the step before it held.
-  let (items, _task) =
-    collect(&lio, lio::io::copy(&stdin, &stdout).into_inner());
+  let (items, _task) = collect(&lio, lio::io::copy(&stdin, &stdout));
   finish_only(&backend, &lio, 3);
   assert!(matches!(only_op(&backend, &lio), Op::Write { .. }));
   finish_only(&backend, &lio, 3);
@@ -545,7 +533,7 @@ impl OpModel for Leaks {
 fn an_operation_in_flight_can_move_to_another_model() {
   let (backend, lio) = scripted(2);
   let out = Rc::new(RefCell::new(None));
-  let read = api::read(&Resource::stdin(), Vec::with_capacity(8)).into_inner();
+  let read = api::read(&Resource::stdin(), Vec::with_capacity(8));
   let _task = model::spawn(
     &lio,
     Leaks { read: Some(read), out: Rc::clone(&out) },
@@ -607,17 +595,13 @@ impl OpModel for PicksUp {
 fn an_operation_waiting_for_a_slot_can_move_to_another_model() {
   let (backend, lio) = scripted(2);
   let out = Rc::new(RefCell::new(None));
-  let picks_up = PicksUp {
-    nop: Some(api::nop().into_inner()),
-    from: Rc::clone(&out),
-    read: None,
-  };
+  let picks_up =
+    PicksUp { nop: Some(api::nop()), from: Rc::clone(&out), read: None };
   let (items, _task) = collect(&lio, picks_up);
   let nop = backend.in_flight()[0];
 
   // The first read fills the driver: the second waits for a slot.
-  let read =
-    || api::read(&Resource::stdin(), Vec::with_capacity(8)).into_inner();
+  let read = || api::read(&Resource::stdin(), Vec::with_capacity(8));
   let _task = model::spawn(
     &lio,
     HandsOut { reads: Some([read(), read()]), out: Rc::clone(&out) },
@@ -650,7 +634,7 @@ struct TwoNops {
 
 impl TwoNops {
   fn new() -> Self {
-    Self { left: 2, nop: api::nop().into_inner() }
+    Self { left: 2, nop: api::nop() }
   }
 }
 
@@ -666,7 +650,7 @@ impl OpModel for TwoNops {
       if self.left == 0 {
         return Step::Done(Ok(2));
       }
-      self.nop = api::nop().into_inner();
+      self.nop = api::nop();
     }
   }
 }
@@ -709,8 +693,8 @@ fn a_model_doing_two_things_at_once_still_fits_one_slot() {
   let (backend, lio) = scripted(1);
   let stdin = Resource::stdin();
   let join = Join::new(
-    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
-    api::read(&stdin, Vec::<u8>::with_capacity(8)).into_inner(),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)),
+    api::read(&stdin, Vec::<u8>::with_capacity(8)),
   );
   let (items, _task) = collect(&lio, join);
 
@@ -744,7 +728,7 @@ fn a_model_takes_one_slot_however_many_steps_it_has() {
 fn run_stream_gives_a_model_s_items_one_at_a_time() {
   let (backend, lio) = scripted(4);
   let from = Resource::stdin();
-  let read = api::read(&from, Vec::<u8>::with_capacity(4)).into_inner();
+  let read = api::read(&from, Vec::<u8>::with_capacity(4));
   let mut stream = api::run_stream(Chunks { from, read }).with_lio(&lio);
   let mut cx = Context::from_waker(Waker::noop());
 

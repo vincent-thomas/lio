@@ -18,7 +18,7 @@
 //!
 //! # Async Design
 //!
-//! All I/O operations return [`Io<T>`](crate::api::io::Io) which can be awaited.
+//! All I/O operations return [`T`](crate::api::io::Io) which can be awaited.
 //! For example:
 //!
 //! ```rust,ignore

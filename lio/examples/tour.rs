@@ -184,7 +184,7 @@ fn time(lio: &Lio) -> io::Result<()> {
 
     // A stream gives its items one at a time, and stops its model when it
     // is dropped.
-    let mut ticks = api::interval(Duration::from_millis(2));
+    let mut ticks = api::interval(Duration::from_millis(2)).stream();
     for _ in 0..3 {
       ticks.next().await.expect("an interval never ends")?;
     }
@@ -199,14 +199,10 @@ fn sockets(lio: &Lio) -> io::Result<()> {
     let listener = TcpListener::bind(([127, 0, 0, 1], 0).into()).await?;
     let addr = listener.local_addr()?;
 
-    // Accepting and connecting at the same time: `Join` runs two models
-    // together and is done when both are. `into_inner` gives the model
-    // inside an `Io`, and `api::run` runs any model.
-    let both = Join::new(
-      listener.accept().into_inner(),
-      TcpStream::connect(addr).into_inner(),
-    );
-    let (accepted, client) = api::run(both).await;
+    // Accepting and connecting at the same time: every operation is a
+    // model, and `Join` runs two models together until both are done.
+    let (accepted, client) =
+      Join::new(listener.accept(), TcpStream::connect(addr)).await;
     let ((server, peer), client) = (accepted?, client?);
     println!("accepted a connection from {peer}");
 
@@ -237,7 +233,7 @@ struct WriteAll {
 
 impl WriteAll {
   fn new(to: &Resource, data: Vec<u8>) -> Self {
-    let write = api::write_at(to, data, 0).into_inner();
+    let write = api::write_at(to, data, 0);
     Self { to: to.clone(), offset: 0, write }
   }
 }
@@ -258,7 +254,7 @@ impl OpModel for WriteAll {
       if buf.is_empty() {
         return Step::Done(Ok(self.offset));
       }
-      self.write = api::write_at(&self.to, buf, self.offset).into_inner();
+      self.write = api::write_at(&self.to, buf, self.offset);
     }
   }
 }
@@ -275,7 +271,7 @@ impl Chunks {
 
   fn new(from: &Resource) -> Self {
     let read = api::read_at(from, Vec::<u8>::with_capacity(Self::SIZE), 0);
-    Self { from: from.clone(), offset: 0, read: read.into_inner() }
+    Self { from: from.clone(), offset: 0, read }
   }
 }
 
@@ -288,7 +284,7 @@ impl OpModel for Chunks {
       Ok(n) if n > 0 => {
         self.offset += n as u64;
         let next = Vec::<u8>::with_capacity(Self::SIZE);
-        self.read = api::read_at(&self.from, next, self.offset).into_inner();
+        self.read = api::read_at(&self.from, next, self.offset);
         // More is coming.
         Step::Yield((Ok(n), buf))
       }
@@ -307,7 +303,7 @@ fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
       .open(c_path(&dir.join(name)))
   };
 
-  let copy = block_on(lio, async {
+  block_on(lio, async {
     let (source, copy) = (open("source.txt").await?, open("copy.txt").await?);
     // The operations in `lio::api` take any resource: here, the files'.
     let (source, copy) = (source.into_resource(), copy.into_resource());
@@ -319,11 +315,8 @@ fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
     assert_eq!(written, 10);
 
     // Models nest: lio's own `copy` is one, and so is a `Join` of two.
-    let (copied, stat) = api::run(Join::new(
-      lio::io::copy(&source, &copy).into_inner(),
-      api::fstat(&source).into_inner(),
-    ))
-    .await;
+    let (copied, stat) =
+      Join::new(lio::io::copy(&source, &copy), api::fstat(&source)).await;
     assert_eq!((copied?, stat?.size), (10, 10));
 
     // A model that yields is a stream.
@@ -334,16 +327,15 @@ fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
       text.extend(chunk);
     }
     assert_eq!(text, b"0123456789");
-    io::Result::Ok(copy)
+    io::Result::Ok(())
   })?;
 
-  // Without an `Io`: `spawn` hands every item to a callback, and gives back
-  // a handle that can stop the model.
-  let task = model::spawn(lio, Chunks::new(&copy), |(result, chunk)| {
-    println!("chunk: {result:?} {:?}", String::from_utf8_lossy(&chunk));
-  });
-  // One chunk per run. Dropping the handle would leave the model running
-  // to the end of the file: cancelling stops it here.
+  // `spawn` hands every item to a callback, and gives back a handle that
+  // can stop the model.
+  let ticks = api::interval(Duration::from_millis(1));
+  let task = model::spawn(lio, ticks, |tick| println!("tick: {tick:?}"));
+  // One tick per run. Dropping the handle would leave the model running:
+  // cancelling stops it here.
   lio.run()?;
   lio.run()?;
   task.cancel();

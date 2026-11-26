@@ -121,7 +121,7 @@ struct OneShotStream {
 
 impl OneShotStream {
   fn new() -> Self {
-    Self { done: false, nop: api::nop().into_inner() }
+    Self { done: false, nop: api::nop() }
   }
 }
 
@@ -134,7 +134,7 @@ impl OpModel for OneShotStream {
       Step::Done(2)
     } else {
       self.done = true;
-      self.nop = api::nop().into_inner();
+      self.nop = api::nop();
       Step::Yield(1)
     }
   }

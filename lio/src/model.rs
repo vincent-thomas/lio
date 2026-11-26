@@ -48,7 +48,7 @@
 //!         Some(first) => return Step::Done(Ok(first + n)),
 //!         None => {
 //!           self.first = Some(n);
-//!           self.read = api::read(&self.from, buf).into_inner();
+//!           self.read = api::read(&self.from, buf);
 //!         }
 //!       }
 //!     }
@@ -59,7 +59,7 @@
 //! let lio = Lio::new_with_backend(backend, 4).unwrap();
 //! let from = Resource::stdin();
 //! let model = ReadTwice {
-//!   read: api::read(&from, Vec::with_capacity(8)).into_inner(),
+//!   read: api::read(&from, Vec::with_capacity(8)),
 //!   from,
 //!   first: None,
 //! };
@@ -442,6 +442,7 @@ impl<Req, Out> Leaf<Req, Out> {
 ///
 /// Both are polled in the same call, so their operations are in flight
 /// together.
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct Join<A: OpModel, B: OpModel> {
   a: Side<A>,
   b: Side<B>,
@@ -468,6 +469,8 @@ impl<A: OpModel, B: OpModel> Join<A, B> {
     Self { a: Side::Running(a), b: Side::Running(b) }
   }
 }
+
+runnable!([A: OpModel, B: OpModel] Join<A, B>);
 
 impl<A: OpModel, B: OpModel> OpModel for Join<A, B> {
   type Item = (A::Item, B::Item);

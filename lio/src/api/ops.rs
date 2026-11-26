@@ -4,9 +4,8 @@
 //! operation and produces its result. They are made by the functions in
 //! [`api`](crate::api), and are opaque.
 //!
-//! Run one with [`Io`](crate::api::Io), or take it out with
-//! [`Io::into_inner`](crate::api::Io::into_inner) and poll it from a model
-//! of your own.
+//! Run one directly (`.await`, `when_done`, `send`, `send_with`, or
+//! `with_lio` to name the driver), or poll it from a model of your own.
 //!
 //! # How an operation is written
 //!
@@ -28,9 +27,9 @@ use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::time::Duration;
 
-use crate::api::Pid;
 use crate::api::op::{Action, Completion, CompletionFlags};
 use crate::api::resource::Resource;
+use crate::api::{IoStream, Pid};
 use crate::backend::op::{
   FileMode, FileStat, MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, OpenFlags,
   RawBuf, RawBufMut, ReadDirBuf, ReadFlags, RecvFlags, SendFlags, ShutdownHow,
@@ -216,6 +215,7 @@ impl Cx<'_> {
 }
 
 /// Yields every time a period has passed, until it is dropped.
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct Interval {
   period: Duration,
   sleep: Sleep,
@@ -228,6 +228,12 @@ impl Interval {
 
   pub fn period(&self) -> Duration {
     self.period
+  }
+
+  /// The ticks as a stream, one per [`next`](IoStream::next). It stops
+  /// when the stream is dropped.
+  pub fn stream(self) -> IoStream<Self> {
+    IoStream::from_op(self)
   }
 }
 

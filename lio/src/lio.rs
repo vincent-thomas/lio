@@ -1745,7 +1745,7 @@ mod tests {
     crate::api::nop().with_lio(&lio).when_done(|_| {});
     let ran = Rc::new(Cell::new(false));
     let set = ran.clone();
-    let queued = lio.spawn(crate::api::nop().into_inner(), move |_| {
+    let queued = lio.spawn(crate::api::nop(), move |_| {
       set.set(true);
       true
     });
@@ -1765,7 +1765,7 @@ mod tests {
   fn a_model_cancelled_while_it_waits_for_a_slot_never_starts() {
     let (backend, lio) = lio(1);
     crate::api::nop().with_lio(&lio).when_done(|_| {});
-    let queued = lio.spawn(crate::api::nop().into_inner(), |_| true);
+    let queued = lio.spawn(crate::api::nop(), |_| true);
     lio.cancel(&queued);
 
     backend.complete_all(0);
