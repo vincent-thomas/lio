@@ -213,6 +213,9 @@ pub(crate) struct QueueToken {
   /// Set by the driver once the submission has a slot: the slot, and its
   /// sequence number there.
   at: Cell<Option<(u64, u64)>>,
+  /// Set by a model that asked for the result while the submission was
+  /// still queued: the slot of that model, which is the one to poll.
+  waiter: Cell<Option<u64>>,
 }
 
 impl OpRef {
@@ -781,7 +784,14 @@ impl Lio {
     op: &OpRef,
     waiter: u64,
   ) -> Option<Out> {
-    let (id, seq) = op.resolved()?;
+    let Some((id, seq)) = op.resolved() else {
+      // Still waiting for a slot, and maybe handed to another model since
+      // it was submitted: the one asking now is the one to poll.
+      if let OpRef::Queued(token) = op {
+        token.waiter.set(Some(waiter));
+      }
+      return None;
+    };
     let mut inner = self.inner.borrow_mut();
     let inner_ref = &mut *inner;
     let reg = inner_ref.store.get_mut(id)?;
@@ -871,6 +881,22 @@ impl Lio {
     inner.overflow.push_back(Queued { init: Box::new(init), token, home });
   }
 
+  /// A queued submission now has a slot: tells its consumer where, and the
+  /// slot which model asked for the result meanwhile.
+  fn left_the_queue(
+    inner: &mut LioInner,
+    token: Option<Rc<QueueToken>>,
+    at: (u64, u64),
+  ) {
+    let Some(token) = token else { return };
+    token.at.set(Some(at));
+    if let Some(waiter) = token.waiter.take()
+      && let Some(reg) = inner.store.get_mut(at.0)
+    {
+      reg.set_waiter(waiter);
+    }
+  }
+
   /// Slot `home` can hold an operation again: starts there the first
   /// operation its model has waiting for a slot, if any.
   #[inline]
@@ -903,9 +929,7 @@ impl Lio {
       }
       let Queued { init, token, .. } = queued;
       let at = init(inner, Some(home));
-      if let Some(token) = token {
-        token.at.set(Some(at));
-      }
+      Self::left_the_queue(inner, token, at);
       return;
     }
   }
@@ -997,9 +1021,7 @@ impl Lio {
       }
       let Queued { init, token, .. } = queued;
       let at = init(inner, None);
-      if let Some(token) = token {
-        token.at.set(Some(at));
-      }
+      Self::left_the_queue(inner, token, at);
     }
     if inner.store.is_full() {
       Vec::new()

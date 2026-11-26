@@ -732,6 +732,12 @@ impl Registration {
     }
   }
 
+  /// Names the model to poll when the operation just started here is
+  /// finished: the one that asked for its result while it was queued.
+  pub(crate) fn set_waiter(&mut self, waiter: u64) {
+    self.cell.waiter = waiter;
+  }
+
   /// What dropping the ticket for operation `seq` asks for.
   pub(crate) fn abandon(&mut self, seq: u64) -> Abandon {
     if self.cell.seq != seq {
