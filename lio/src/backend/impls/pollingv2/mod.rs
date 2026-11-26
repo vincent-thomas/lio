@@ -47,7 +47,7 @@ pub use interest::Interest;
 /// and say which became ready.
 ///
 /// lio implements it for `epoll` and `kqueue`, and for `poll(2)` in its
-/// tests. A [`Poller`] over an implementation is an [`IoBackend`]: the
+/// tests. An [`Engine`] over an implementation is an [`IoBackend`]: the
 /// poller supplies the rest, performing the operations, queueing several on
 /// one descriptor, cancelling, and keeping to its capacity.
 ///
@@ -71,7 +71,7 @@ pub trait ReadinessPoll {
   /// The event record [`wait`](Self::wait) fills in.
   type NativeEvent: Copy;
 
-  /// Opens a poller. A [`Poller`] made with [`Poller::new`] calls this when
+  /// Opens a poller. A [`Poller`] calls this when
   /// the driver starts it.
   fn open() -> io::Result<Self>
   where
@@ -184,8 +184,60 @@ impl Waiters {
 /// Polling-based I/O backend: performs each operation itself once the
 /// operating system says its descriptor is ready.
 ///
-/// [`Poller::new`] uses epoll (Linux) or kqueue (BSD/macOS).
-pub struct Poller<P: ReadinessPoll = sys::OsPoller> {
+/// Uses epoll (Linux) or kqueue (BSD/macOS).
+pub struct Poller(Engine<sys::OsPoller>);
+
+impl Default for Poller {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl Poller {
+  /// A poller on epoll (Linux) or kqueue (BSD/macOS), opened when the
+  /// driver starts it.
+  pub fn new() -> Self {
+    Self(Engine::unstarted(None))
+  }
+}
+
+impl IoBackend for Poller {
+  fn init(&mut self, cap: usize) -> io::Result<()> {
+    self.0.init(cap)
+  }
+
+  fn resource_close(&self) -> crate::api::resource::ResourceClose {
+    self.0.resource_close()
+  }
+
+  fn push(&mut self, op: crate::backend::InFlight<'_>, step_bump: &mut Bump) {
+    self.0.push(op, step_bump)
+  }
+
+  fn flush(&mut self) -> io::Result<()> {
+    self.0.flush()
+  }
+
+  fn cancel(&mut self, id: u64) {
+    self.0.cancel(id)
+  }
+
+  fn drain(&mut self) -> bool {
+    self.0.drain()
+  }
+
+  fn wait(
+    &mut self,
+    timeout: Option<Duration>,
+    completed: &mut Vec<OpCompleted>,
+  ) -> io::Result<()> {
+    self.0.wait(timeout, completed)
+  }
+}
+
+/// The poller itself, over whichever readiness API `P` is. [`Poller`] is
+/// this over the platform's own.
+struct Engine<P: ReadinessPoll> {
   sys: Option<P>,
   events: Events<P>,
   capacity: usize,
@@ -200,21 +252,7 @@ pub struct Poller<P: ReadinessPoll = sys::OsPoller> {
   completed: Vec<OpCompleted>,
 }
 
-impl Default for Poller {
-  fn default() -> Self {
-    Self::new()
-  }
-}
-
-impl Poller {
-  /// A poller on epoll (Linux) or kqueue (BSD/macOS), opened when the
-  /// driver starts it.
-  pub fn new() -> Self {
-    Self::unstarted(None)
-  }
-}
-
-impl<P: ReadinessPoll> Poller<P> {
+impl<P: ReadinessPoll> Engine<P> {
   /// A poller over `poller`.
   #[cfg(test)]
   pub(crate) fn with_poller(poller: P) -> Self {
@@ -237,7 +275,7 @@ impl<P: ReadinessPoll> Poller<P> {
 
 /// One operation the poller holds, queued or waiting for its descriptor.
 ///
-/// The poller performs the I/O itself, in [`Poller::exec_op`]: no address
+/// The poller performs the I/O itself, in [`Engine::exec_op`]: no address
 /// from `op` is ever left with the kernel or another thread between calls.
 /// That is what lets every method here give the ticket up.
 pub struct PendingOp {
@@ -250,7 +288,7 @@ impl PendingOp {
     self.ticket.id()
   }
 
-  /// Reports the operation. `result` is what [`Poller::exec_op`] returned
+  /// Reports the operation. `result` is what [`Engine::exec_op`] returned
   /// for it, or a negative code for an operation that was not performed.
   fn report(self, result: isize) -> OpCompleted {
     // SAFETY: nothing but this thread ever uses the operation's addresses,
@@ -280,7 +318,7 @@ fn raw_error(err: &io::Error) -> isize {
   err.raw_os_error().map_or(-(libc::EIO as isize), |code| -(code as isize))
 }
 
-impl<P: ReadinessPoll> Poller<P> {
+impl<P: ReadinessPoll> Engine<P> {
   /// Registers `fd` for what its waiters wait for, in place of what was
   /// registered. With no waiter left, the descriptor is forgotten.
   ///
@@ -1271,7 +1309,7 @@ impl<P: ReadinessPoll> Poller<P> {
   }
 }
 
-impl<P: ReadinessPoll> IoBackend for Poller<P> {
+impl<P: ReadinessPoll> IoBackend for Engine<P> {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     if self.sys.is_none() {
       self.sys = Some(P::open()?);

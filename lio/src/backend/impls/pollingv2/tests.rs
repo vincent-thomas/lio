@@ -9,7 +9,7 @@ use std::time::Duration;
 mod on_poll {
   lio_test::test_io_backend!(
     lio,
-    lio::backend::impls::pollingv2::Poller::with_poller(
+    lio::backend::impls::pollingv2::Engine::with_poller(
       lio::backend::impls::pollingv2::os::poll::PollPoller::default()
     )
   );
@@ -18,7 +18,8 @@ mod on_poll {
 // Helper utilities
 
 mod immediate_sockets {
-  use super::super::Poller;
+  // These tests look inside the poller, so they build the engine itself.
+  type Poller = super::super::Engine<super::super::sys::OsPoller>;
   use crate::api::{op::Action, resource::Resource};
   use crate::backend::IoBackend;
   use crate::backend::op::{
@@ -44,7 +45,7 @@ mod immediate_sockets {
   }
 
   fn backend() -> Poller {
-    let mut backend = Poller::new();
+    let mut backend = Poller::unstarted(None);
     backend.init(4).unwrap();
     backend
   }
