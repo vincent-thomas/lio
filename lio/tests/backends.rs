@@ -16,17 +16,5 @@ mod backends {
     target_os = "openbsd",
     target_os = "netbsd"
   ))]
-  mod poll;
-  #[cfg(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "watchos",
-    target_os = "freebsd",
-    target_os = "dragonfly",
-    target_os = "openbsd",
-    target_os = "netbsd"
-  ))]
   mod poller;
 }

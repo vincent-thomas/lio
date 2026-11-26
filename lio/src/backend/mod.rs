@@ -85,7 +85,7 @@ pub mod impls {
     target_os = "openbsd",
     target_os = "netbsd"
   ))]
-  pub use pollingv2::{Interest, Poller, ReadinessPoll};
+  pub use pollingv2::Poller;
 
   #[cfg(windows)]
   mod iocp;

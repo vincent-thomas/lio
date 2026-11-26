@@ -11,6 +11,8 @@ pub mod epoll;
   target_os = "netbsd"
 ))]
 pub mod kqueue;
+#[cfg(test)]
+pub mod poll;
 
 const NOTIFY_KEY: u64 = u64::MAX;
 /// Reserved key for the timing wheel's kernel timer.

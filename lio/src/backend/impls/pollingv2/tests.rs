@@ -5,6 +5,16 @@ use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
+/// The backend contract against the poller on `poll(2)`.
+mod on_poll {
+  lio_test::test_io_backend!(
+    lio,
+    lio::backend::impls::pollingv2::Poller::with_poller(
+      lio::backend::impls::pollingv2::os::poll::PollPoller::default()
+    )
+  );
+}
+
 // Helper utilities
 
 mod immediate_sockets {

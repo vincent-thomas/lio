@@ -46,10 +46,13 @@ pub use interest::Interest;
 /// What a [`Poller`] needs from the operating system: watch descriptors,
 /// and say which became ready.
 ///
-/// Implement this for a readiness API (as lio does for `epoll` and
-/// `kqueue`) and [`Poller::with_poller`] is an [`IoBackend`] over it. The
-/// poller supplies the rest: performing the operations, queueing several on
+/// lio implements it for `epoll` and `kqueue`, and for `poll(2)` in its
+/// tests. A [`Poller`] over an implementation is an [`IoBackend`]: the
+/// poller supplies the rest, performing the operations, queueing several on
 /// one descriptor, cancelling, and keeping to its capacity.
+///
+/// The trait cannot be named outside this crate. A backend from elsewhere
+/// implements [`IoBackend`].
 ///
 /// # What the poller relies on
 ///
@@ -182,7 +185,6 @@ impl Waiters {
 /// operating system says its descriptor is ready.
 ///
 /// [`Poller::new`] uses epoll (Linux) or kqueue (BSD/macOS).
-/// [`Poller::with_poller`] takes any [`ReadinessPoll`].
 pub struct Poller<P: ReadinessPoll = sys::OsPoller> {
   sys: Option<P>,
   events: Events<P>,
@@ -214,7 +216,8 @@ impl Poller {
 
 impl<P: ReadinessPoll> Poller<P> {
   /// A poller over `poller`.
-  pub fn with_poller(poller: P) -> Self {
+  #[cfg(test)]
+  pub(crate) fn with_poller(poller: P) -> Self {
     Self::unstarted(Some(poller))
   }
 
