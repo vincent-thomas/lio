@@ -653,6 +653,40 @@ fn dropping_the_backend_stops_what_is_in_flight() {
   assert!(ORPHANS.with(|orphans| orphans.borrow().is_empty()));
 }
 
+#[test]
+fn drain_follows_operations_through_their_later_steps() {
+  let mut backend = backend();
+  let root = scratch("drain-steps");
+  let path = format!("{root}/log");
+  std::fs::write(&path, b"abc").unwrap();
+  let flags = OpenFlags::READ | OpenFlags::WRITE;
+  let raw = open(&mut backend, &path, flags);
+  let file = own(&backend, raw);
+
+  // Each of these has steps after its first: a status, a sync, the size.
+  let parts = [RawBuf::new(b"de")];
+  let synced_append = WriteFlags::APPEND | WriteFlags::SYNC;
+  let (mut first, mut second) = ([0u8; 2], [0u8; 2]);
+  let bufs =
+    [RawBufMut::from_mut(&mut first), RawBufMut::from_mut(&mut second)];
+  push(
+    &mut backend,
+    1,
+    BorrowedOp::write(file.clone(), &parts, None, synced_append),
+  );
+  push(
+    &mut backend,
+    2,
+    BorrowedOp::read(file.clone(), &bufs, Some(0), ReadFlags::empty()),
+  );
+  backend.flush().unwrap();
+
+  assert!(backend.drain());
+  assert!(backend.ops.is_empty());
+  assert_eq!(backend.queue.outstanding(), 0, "the host still holds a step");
+  assert!(poll(&mut backend).is_empty());
+}
+
 // ─────────────────────────────── resources ──────────────────────────────────
 
 #[test]
