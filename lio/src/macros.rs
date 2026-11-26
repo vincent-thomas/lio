@@ -179,49 +179,14 @@ macro_rules! action_io {
   }};
 }
 
-/// Gives a model type the ways to run it: `.await`, `when_done`, `send`,
-/// `send_with`, and `with_lio` to name the driver.
+/// Gives one of lio's own model types the ways to run it, callable without
+/// importing anything: `.await`, and the methods of
+/// [`ModelExt`](crate::model::ModelExt).
 ///
-/// Every operation and model lio provides has these. Use this for a model
-/// of your own, so it is run the same way:
-///
-/// ```
-/// use lio::api;
-/// use lio::backend::testing::ScriptedBackend;
-/// use lio::model::{Cx, OpModel, Step};
-/// use lio::ready;
-///
-/// struct Twice(api::ops::Nop, bool);
-///
-/// impl OpModel for Twice {
-///   type Item = std::io::Result<()>;
-///
-///   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-///     loop {
-///       if let Err(err) = ready!(self.0.poll(cx)) {
-///         return Step::Done(Err(err));
-///       }
-///       if std::mem::replace(&mut self.1, true) {
-///         return Step::Done(Ok(()));
-///       }
-///       self.0 = api::nop();
-///     }
-///   }
-/// }
-///
-/// lio::runnable!(Twice);
-///
-/// let lio = lio::Lio::new_with_backend(ScriptedBackend::auto(0), 4).unwrap();
-/// Twice(api::nop(), false).with_lio(&lio).when_done(|result| result.unwrap());
-/// while lio.try_run().unwrap() > 0 {}
-/// ```
-///
-/// A type with parameters lists them first:
-/// `lio::runnable!([B: IoBuf] WriteAll<B>)`.
-///
-/// It is a macro because Rust cannot implement `.await` for every
-/// [`OpModel`](crate::model::OpModel) at once.
-#[macro_export]
+/// A model written outside lio has those methods through `ModelExt`
+/// already. `.await` is the one thing Rust cannot give every
+/// [`OpModel`](crate::model::OpModel) at once, so it is implemented here,
+/// per type.
 macro_rules! runnable {
   ([$($generics:tt)*] $ty:ty) => {
     impl<$($generics)*> $ty
@@ -285,18 +250,12 @@ macro_rules! runnable {
     }
   };
   ($ty:ty) => {
-    $crate::runnable!([] $ty);
+    runnable!([] $ty);
   };
 }
 
-/// Gives a stream type the ways to run it: `start` for a handle to take
-/// items from, `send` and `send_with` for a channel, and `with_lio` to name
-/// the driver.
-///
-/// Every stream lio provides has these. Use this for an
-/// [`OpStream`](crate::model::OpStream) of your own:
-/// `lio::streamable!(Chunks)`, or `lio::streamable!([B: IoBuf] Chunks<B>)`.
-#[macro_export]
+/// Gives one of lio's own stream types the methods of
+/// [`StreamExt`](crate::model::StreamExt), callable without importing it.
 macro_rules! streamable {
   ([$($generics:tt)*] $ty:ty) => {
     impl<$($generics)*> $ty
@@ -344,7 +303,7 @@ macro_rules! streamable {
     }
   };
   ($ty:ty) => {
-    $crate::streamable!([] $ty);
+    streamable!([] $ty);
   };
 }
 
