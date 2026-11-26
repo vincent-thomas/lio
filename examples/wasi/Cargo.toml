@@ -1,0 +1,10 @@
+[package]
+name = "lio-wasi-example"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "lio's WASI 0.3 backend driven through lio's own API, as a runnable check"
+
+[dependencies]
+lio = { path = "../../lio", features = ["high"] }

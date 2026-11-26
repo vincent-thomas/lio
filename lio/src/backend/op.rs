@@ -780,6 +780,8 @@ impl OpaqueDrop {
   ///
   /// `call(ptr)` drops the allocation `ptr` owns, and it is the only drop of
   /// that allocation.
+  // The WASI backend keeps a listing with its directory, not in this slot.
+  #[cfg_attr(target_os = "wasi", allow(dead_code))]
   pub(crate) const unsafe fn new(call: unsafe fn(*mut ())) -> Self {
     Self { call }
   }

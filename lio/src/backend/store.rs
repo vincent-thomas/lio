@@ -210,6 +210,19 @@ impl OpStore {
     self.slots.get_mut(key).is_some_and(|slot| slot.lease.held_elsewhere())
   }
 
+  /// Whether a share of the lease of any stored operation is still held
+  /// outside the store: by a ticket that was never given up, or by a
+  /// completion that is still alive.
+  pub fn any_lease_held(&mut self) -> bool {
+    let mut held = false;
+    self.slots.for_each_occupied(|slot| {
+      if slot.lease.held_elsewhere() {
+        held = true;
+      }
+    });
+    held
+  }
+
   /// Frees slot `id` and drops its registration where it is.
   ///
   /// For a registration whose drop runs no user code. Returns whether the
@@ -506,6 +519,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn test_capacity_limit() {
     let mut store = OpStore::with_capacity(4);
     let _ids: Vec<_> =
@@ -518,6 +532,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn panicking_init_leaves_the_slot_free() {
     let mut store = OpStore::with_capacity(1);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -539,6 +554,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn panicking_drop_on_remove_still_releases_the_slot() {
     let mut store = OpStore::with_capacity(1);
     let id = store.insert_with(|arena| {
@@ -618,6 +634,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn panic_before_keep_drops_the_registration_and_frees_the_slot() {
     let (tx, rx) = mpsc::channel::<std::io::Result<()>>();
     let mut store = OpStore::with_capacity(1);
@@ -636,6 +653,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn panic_after_keep_leaves_the_registration_stored() {
     let (tx, rx) = mpsc::channel::<std::io::Result<()>>();
     let mut store = OpStore::with_capacity(1);

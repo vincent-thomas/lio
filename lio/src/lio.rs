@@ -317,12 +317,19 @@ impl Drop for LioInner {
     // They point into the store's arenas, so they go before it.
     drop(std::mem::take(&mut self.dying));
     if self.io.drain() {
-      // SAFETY: the backend is dropped first, so it drops the leases it
-      // stored. A model whose lease is still held stays leaked with the store.
+      // Completions the driver never routed hold a share of their
+      // operations' leases. Nothing reads them any more.
+      self.completed.clear();
+      self.ready_io.clear();
+      // SAFETY: this field is not used again.
       unsafe { ManuallyDrop::drop(&mut self.io) };
       // `leaked` counts registrations forgotten while a backend still held
       // their lease. Their arenas live in the store, so the store stays too.
-      if self.leaked == 0 {
+      //
+      // A lease still held now belongs to a ticket the backend never gave
+      // up, whatever its `drain` said: something may still use that
+      // operation's memory, so the store stays as well.
+      if self.leaked == 0 && !self.store.any_lease_held() {
         #[cfg(test)]
         STORE_DROPPED.with(|dropped| dropped.set(true));
         // SAFETY: every registration was dropped, and this field is not
@@ -1595,6 +1602,36 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(miri, ignore = "leaks the registration on purpose")]
+  fn a_ticket_never_given_up_keeps_the_store_after_the_driver_drops() {
+    // `Hoarding` says it drained, and still holds its tickets.
+    let lio = Lio::new_with_backend(Hoarding::default(), 1).unwrap();
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    assert_eq!(lio.inner.borrow().leaked, 0);
+    STORE_DROPPED.with(|dropped| dropped.set(false));
+    drop(lio);
+    assert!(
+      !STORE_DROPPED.with(|dropped| dropped.get()),
+      "the store was freed under an operation the backend never gave up"
+    );
+  }
+
+  #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
+  fn a_completion_never_routed_does_not_keep_the_store() {
+    let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 2).unwrap();
+    crate::api::nop().with_lio(&lio).when_done(|_| panic!("handler failure"));
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let run =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lio.try_run()));
+    assert!(run.is_err(), "the first handler panics");
+    assert_eq!(lio.inner.borrow().ready_io.len(), 1, "one is left queued");
+    STORE_DROPPED.with(|dropped| dropped.set(false));
+    drop(lio);
+    assert!(STORE_DROPPED.with(|dropped| dropped.get()));
+  }
+
+  #[test]
   fn completing_one_op_drops_only_its_lease() {
     let (backend, lio) = lio(2);
     crate::api::nop().with_lio(&lio).when_done(|_| {});
@@ -1731,6 +1768,7 @@ mod tests {
   leaf!([] struct Panicking(memory: DropFlag) -> () = cx.panicking);
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_panic_while_building_the_action_does_not_keep_its_slot() {
     // Capacity 1: if the panicking op kept its slot, nothing more would run.
     let (backend, lio) = lio(1);
@@ -1847,6 +1885,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_run_routes_only_what_was_queued_when_it_started() {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1954,6 +1993,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn queued_completions_do_not_wait_on_the_backend() {
     let timeouts = Rc::new(RefCell::new(Vec::new()));
     let backend =
@@ -1973,6 +2013,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_panicking_handler_still_frees_its_slot() {
     let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 1).unwrap();
     crate::api::nop().with_lio(&lio).when_done(|_| panic!("handler failure"));
@@ -2041,6 +2082,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_panic_while_burying_a_batch_releases_the_slots_already_dropped() {
     let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 3).unwrap();
     crate::api::nop().with_lio(&lio).when_done(|_| {});
@@ -2315,6 +2357,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_queued_completion_alone_keeps_a_run_from_blocking() {
     let timeout = timeout_after_a_failed_run(|lio| {
       crate::api::nop().with_lio(lio).when_done(|_| {});
@@ -2323,6 +2366,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_fired_timer_alone_keeps_a_run_from_blocking() {
     let timeout = timeout_after_a_failed_run(|lio| {
       crate::api::sleep(Duration::from_millis(1))
@@ -2333,6 +2377,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_slot_whose_result_could_not_be_read_goes_back_on_the_next_run() {
     let (backend, lio) = lio(2);
     // The nop takes the model's slot, and the failing one a slot of its own.

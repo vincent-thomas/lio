@@ -22,7 +22,8 @@ primitives they share) and the `unstable_ffi` C interface. What is left is
 inherent or confined:
 
 - `Resource` implements the std raw descriptor/handle traits per platform
-  (`AsRawFd`/`FromRawFd`, `AsRawHandle`/`FromRawHandle`).
+  (`AsRawFd`/`FromRawFd`, `AsRawHandle`/`FromRawHandle`). On WASI the raw
+  value is an id in the WASI backend's resource table, not a descriptor.
 - Lossless `OsString` <-> byte conversions use `std::os::unix::ffi` under
   `cfg(unix)`.
 - Unit-test fixtures may create real descriptors with `libc`.
@@ -53,6 +54,14 @@ contract (`backend::op`) stays pure data.
   `#[cfg_attr(miri, ignore = "needs a real backend")]`; `mise run miri`
   (`scripts/test-miri.sh`) runs the rest under Miri. That run is nightly
   (`.github/workflows/deep.yaml`).
+- WASI: `mise run wasi` runs what builds for `wasm32-wasip3` under wasmtime
+  (`scripts/test-wasi.sh`): the library tests, the integration tests that do
+  not build fixtures from std descriptors, and the WASI examples. The WASI
+  backend's own tests are in `backend/impls/wasi/tests.rs`; the shared
+  contract macro cannot run there, because a WASI resource is not a
+  descriptor std can make or inspect. That target does not unwind, so a test
+  that catches a panic carries
+  `#[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]`.
 - Search sizes: `PROPTEST_CASES` (model tests) and `LIO_LIFECYCLE_DEPTH`
   (lifecycle enumeration). CI runs them small on PRs (`mise run test`) and
   large nightly (`mise run search` in `.github/workflows/deep.yaml`), along
