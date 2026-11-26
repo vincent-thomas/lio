@@ -72,7 +72,7 @@
 //! use std::fs::File;
 //! use lio::api::resource::Resource;
 //!
-//! #[cfg(unix)]
+//! #[cfg(any(unix, target_os = "wasi"))]
 //! fn from_file(file: File) -> Resource {
 //!     use std::os::fd::OwnedFd;
 //!     Resource::from(OwnedFd::from(file))
@@ -90,7 +90,7 @@ use std::sync::Arc;
 
 macro_rules! impl_native_convervions {
   ($nice:ident) => {
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "wasi"))]
     impl std::os::fd::AsFd for $nice {
       fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         // SAFETY: Owned guarrantees it's valid.
@@ -105,7 +105,7 @@ macro_rules! impl_native_convervions {
       }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "wasi"))]
     impl std::os::fd::AsRawFd for $nice {
       fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.0.inner
@@ -138,7 +138,7 @@ macro_rules! impl_native_convervions {
 
 /// The native value behind a [`Resource`]: a file descriptor on Unix, a
 /// handle (or socket) on Windows.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 pub type RawResource = std::os::fd::RawFd;
 
 /// The native value behind a [`Resource`]: a file descriptor on Unix, a
@@ -153,7 +153,7 @@ type Inner = RawResource;
 
 /// Converts a successful completion result into the descriptor it carries,
 /// rejecting values that are negative or out of range.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 fn raw_from_result(result: isize) -> Option<RawResource> {
   RawResource::try_from(result).ok().filter(|fd| *fd >= 0)
 }
@@ -202,6 +202,13 @@ impl ResourceClose {
   /// Closes native OS descriptors/handles.
   pub const fn native() -> Self {
     Self { close: close_owned }
+  }
+
+  /// Closes resources with `close`, for a backend whose resources are not
+  /// native descriptors.
+  #[cfg_attr(not(target_os = "wasi"), allow(dead_code))]
+  pub(crate) const fn with(close: fn(RawResource)) -> Self {
+    Self { close }
   }
 
   pub(crate) fn call(self, raw: RawResource) {
@@ -363,7 +370,7 @@ pub trait FromResource {
 
 impl_native_convervions!(Resource);
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 impl From<std::os::fd::OwnedFd> for Resource {
   fn from(fd: std::os::fd::OwnedFd) -> Self {
     use std::os::fd::IntoRawFd;
@@ -455,7 +462,7 @@ impl Resource {
   ///
   /// The descriptor cannot be duplicated, including sentinels from
   /// [`cwd`](Self::cwd) and [`invalid`](Self::invalid).
-  #[cfg(unix)]
+  #[cfg(any(unix, target_os = "wasi"))]
   pub fn try_duplicate(&self) -> io::Result<Self> {
     crate::backend::native::duplicate(self.0.inner).map(Self::from_owned)
   }
@@ -477,7 +484,7 @@ impl Resource {
   /// # Errors
   ///
   /// As [`try_duplicate`](Self::try_duplicate).
-  #[cfg(unix)]
+  #[cfg(any(unix, target_os = "wasi"))]
   pub fn duplicate_of(fd: impl std::os::fd::AsFd) -> io::Result<Self> {
     use std::os::fd::AsRawFd;
     crate::backend::native::duplicate(fd.as_fd().as_raw_fd())
@@ -711,13 +718,13 @@ mod tests {
   #[test]
   fn invalid_resource_is_not_a_borrowable_descriptor() {
     let invalid = Resource::invalid();
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "wasi"))]
     {
       use std::os::fd::AsRawFd;
       assert_eq!(invalid.as_raw_fd(), -1);
     }
     let panicked = std::panic::catch_unwind(|| {
-      #[cfg(unix)]
+      #[cfg(any(unix, target_os = "wasi"))]
       {
         use std::os::fd::AsFd;
         let _ = invalid.as_fd();

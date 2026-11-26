@@ -1,6 +1,6 @@
 [tools]
 rust = [
-  { version = "1.100.0", profile = "minimal", components = "clippy,rust-src,rustfmt" },
+  { version = "1.100.0", profile = "minimal", components = "clippy,rust-src,rustfmt", targets = "wasm32-wasip3" },
   { version = "nightly", profile = "minimal", components = "miri,rust-src" },
 ]
 # The cargo: tools below install prebuilt binaries through this.
@@ -14,6 +14,7 @@ jq = "1.7.1"
 # C++ compiler for the FFI tests. conda clang 18 has no clang++.
 # This g++ ships libstdc++ and links it. macOS uses the image clang++.
 "conda:gxx" = { version = "16.2.0", os = ["linux"] }
+# Runs lio-wasi's examples, which are its runtime tests (mise run wasi).
 wasmtime = "latest"
 
 # The conda package ships ar as `<target>-ar` only. build.rs calls `ar`.
@@ -117,6 +118,10 @@ run = "scripts/mutants.sh"
 [tasks.ffi]
 description = "Build the C ABI, then compile and run the C and C++ tests. Linux uses the mise g++. macOS uses clang++."
 run = "scripts/test-ffi.sh"
+
+[tasks.wasi]
+description = "Build the lio-wasi examples and the lio WASI example for wasm32-wasip3 and run each under wasmtime. They assert what every operation did."
+run = "scripts/test-wasi.sh"
 
 [tasks.ci]
 description = "Pull-request checks for this OS. fmt, check, clippy, and cargo deny run once through lint. check-clean and test run once too."

@@ -639,6 +639,7 @@ dependencies = [
  "libc",
  "lio-test",
  "lio-uring",
+ "lio-wasi",
  "pastey 0.1.1",
  "proptest",
  "windows-sys 0.59.0",
@@ -671,6 +672,13 @@ name = "lio-wasi"
 version = "0.1.0"
 dependencies = [
  "wasip3 0.10.0+wasi-0.3.2",
+]
+
+[[package]]
+name = "lio-wasi-example"
+version = "0.0.0"
+dependencies = [
+ "lio",
 ]
 
 [[package]]

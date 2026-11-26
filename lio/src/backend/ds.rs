@@ -63,7 +63,7 @@ const WINDOWS_CWD_KEY: i32 = -100;
 /// to the equivalent Win32/Winsock code, so simulated errors decode to the
 /// same `io::ErrorKind` as real ones there.
 pub mod errno {
-  #[cfg(unix)]
+  #[cfg(any(unix, target_os = "wasi"))]
   pub use libc::{
     EACCES, EADDRINUSE, EAGAIN, EBADF, ECANCELED, ECONNABORTED, ECONNREFUSED,
     ECONNRESET, EDESTADDRREQ, EEXIST, EFBIG, EHOSTUNREACH, EINVAL, EIO,
@@ -165,16 +165,16 @@ pub mod errno {
 /// File-type mode bits the simulation reports; Linux values where the
 /// platform has none (Windows' CRT).
 mod sim {
-  #[cfg(unix)]
+  #[cfg(any(unix, target_os = "wasi"))]
   pub(super) use libc::{S_IFLNK, S_IFSOCK};
 
-  #[cfg(not(unix))]
+  #[cfg(not(any(unix, target_os = "wasi")))]
   pub(super) const S_IFLNK: u32 = 0o120000;
-  #[cfg(not(unix))]
+  #[cfg(not(any(unix, target_os = "wasi")))]
   pub(super) const S_IFSOCK: u32 = 0o140000;
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
@@ -1540,7 +1540,7 @@ impl DSBackend {
       .map_err(|_| -(errno::EINVAL as isize))
   }
 
-  #[cfg(unix)]
+  #[cfg(any(unix, target_os = "wasi"))]
   fn resource_key(resource: &Resource) -> i32 {
     resource.as_raw_fd()
   }
@@ -1577,12 +1577,12 @@ impl DSBackend {
     raw == 1 || raw == 2
   }
 
-  #[cfg(unix)]
+  #[cfg(any(unix, target_os = "wasi"))]
   fn is_builtin_cwd(raw: i32) -> bool {
     raw == libc::AT_FDCWD
   }
 
-  #[cfg(not(unix))]
+  #[cfg(not(any(unix, target_os = "wasi")))]
   fn is_builtin_cwd(raw: i32) -> bool {
     raw == WINDOWS_CWD_KEY
   }
@@ -4234,7 +4234,7 @@ mod tests {
     // unrelated real fd owned by a concurrently running test.
     // SAFETY: `fd` is a simulated descriptor number owned by the DS world.
     // It is never an OS descriptor, and the closer is `close_simulated`.
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "wasi"))]
     return unsafe { Resource::borrow_raw(fd) };
     #[cfg(windows)]
     return unsafe {

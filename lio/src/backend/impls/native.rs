@@ -19,12 +19,12 @@ use crate::backend::op::{FileMode, OpenFlags, RecvFlags, SendFlags};
 pub(crate) const CWD: RawResource = -100isize as RawResource;
 
 /// Value meaning "the current working directory" for `*at` operations.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 pub(crate) const CWD: RawResource = libc::AT_FDCWD;
 
 /// Error code for "the caller's buffer is too small" (as `getcwd(3)`
 /// reports it).
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 pub(crate) const BUFFER_TOO_SMALL: i32 = libc::ERANGE;
 
 /// Error code for "the caller's buffer is too small".
@@ -34,7 +34,7 @@ pub(crate) const BUFFER_TOO_SMALL: i32 =
 
 /// A descriptor/handle that is never open. Borrowing it does not close
 /// anything; submitting I/O on it fails with a bad-handle error.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 pub(crate) const INVALID: RawResource = -1;
 
 /// A descriptor/handle that is never open. Borrowing it does not close
@@ -44,7 +44,7 @@ pub(crate) const INVALID: RawResource = std::ptr::null_mut();
 
 /// Whether `raw` can be a real OS descriptor/handle rather than a sentinel
 /// (`AT_FDCWD`, the invalid placeholder, or a Windows pseudo-handle stand-in).
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 pub(crate) const fn is_os_descriptor(raw: RawResource) -> bool {
   raw >= 0
 }
@@ -63,6 +63,12 @@ pub(crate) fn duplicate(raw: RawResource) -> std::io::Result<RawResource> {
     // `EBADF` and does not touch other descriptors.
     let fd = unsafe { libc::dup(raw) };
     if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(fd) }
+  }
+  // WASI has no `dup`: a handle names one resource and cannot be copied.
+  #[cfg(target_os = "wasi")]
+  {
+    let _ = raw;
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
   }
   #[cfg(windows)]
   {
@@ -97,7 +103,7 @@ pub(crate) fn duplicate(raw: RawResource) -> std::io::Result<RawResource> {
 pub(crate) unsafe fn close(raw: RawResource) {
   // `OwnedFd` follows std's I/O-safety rules: debug builds abort on a double
   // close (EBADF) instead of silently closing someone else's descriptor.
-  #[cfg(unix)]
+  #[cfg(any(unix, target_os = "wasi"))]
   // SAFETY: guaranteed by the caller.
   drop(unsafe {
     <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw)
@@ -122,7 +128,7 @@ pub(crate) unsafe fn close(raw: RawResource) {
 
 /// The process's standard input.
 pub(crate) fn stdin() -> RawResource {
-  #[cfg(unix)]
+  #[cfg(any(unix, target_os = "wasi"))]
   return libc::STDIN_FILENO;
   #[cfg(windows)]
   return std_handle(windows_sys::Win32::System::Console::STD_INPUT_HANDLE);
@@ -130,7 +136,7 @@ pub(crate) fn stdin() -> RawResource {
 
 /// The process's standard output.
 pub(crate) fn stdout() -> RawResource {
-  #[cfg(unix)]
+  #[cfg(any(unix, target_os = "wasi"))]
   return libc::STDOUT_FILENO;
   #[cfg(windows)]
   return std_handle(windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE);
@@ -138,7 +144,7 @@ pub(crate) fn stdout() -> RawResource {
 
 /// The process's standard error.
 pub(crate) fn stderr() -> RawResource {
-  #[cfg(unix)]
+  #[cfg(any(unix, target_os = "wasi"))]
   return libc::STDERR_FILENO;
   #[cfg(windows)]
   return std_handle(windows_sys::Win32::System::Console::STD_ERROR_HANDLE);
