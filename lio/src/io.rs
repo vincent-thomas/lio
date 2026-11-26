@@ -26,6 +26,7 @@ use std::io;
 use std::mem::MaybeUninit;
 
 use crate::api::{
+  io::Io,
   ops,
   resource::{AsResource, Resource},
 };
@@ -98,11 +99,11 @@ unsafe impl<B: IoBufVec> IoBufVec for WriteCursor<B> {
 ///     Ok(())
 /// }
 /// ```
-pub fn copy(reader: &impl AsResource, writer: &impl AsResource) -> Copy {
-  Copy::new_without_limit(
+pub fn copy(reader: &impl AsResource, writer: &impl AsResource) -> Io<Copy> {
+  Io::from_op(Copy::new_without_limit(
     reader.as_resource().clone(),
     writer.as_resource().clone(),
-  )
+  ))
 }
 
 /// Copies up to `limit` bytes from reader to writer.
@@ -126,12 +127,12 @@ pub fn copy_n(
   reader: &impl AsResource,
   writer: &impl AsResource,
   limit: u64,
-) -> Copy {
-  Copy::new_with_limit(
+) -> Io<Copy> {
+  Io::from_op(Copy::new_with_limit(
     reader.as_resource().clone(),
     writer.as_resource().clone(),
     limit,
-  )
+  ))
 }
 
 /// Copies from one resource to another, reading the next chunk while the
@@ -140,7 +141,6 @@ pub fn copy_n(
 /// At most one read and one write are in flight, so bytes arrive in order.
 /// A chunk that has been read waits until the write before it is done, and
 /// no further read starts while one is waiting: the copy holds two buffers.
-#[must_use = "an operation does nothing until it is run or polled"]
 pub struct Copy {
   reader: Resource,
   writer: Resource,
@@ -194,8 +194,6 @@ impl Copy {
     ops::Write::new(self.writer.clone(), chunk, None)
   }
 }
-
-runnable!([] Copy);
 
 impl OpModel for Copy {
   type Item = io::Result<u64>;

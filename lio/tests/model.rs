@@ -10,12 +10,15 @@ use std::task::{Context, Poll, Waker};
 
 use lio::api::ops::{Read, Write};
 use lio::api::resource::Resource;
-use lio::api::{self, OpenFlags};
+use lio::api::{self, Io, OpenFlags};
 use lio::backend::ds::{DSBackend, DSConfig};
 use lio::backend::op::Op;
 use lio::backend::testing::{Checked, POISON, ScriptedBackend};
 use lio::model::{self, Cx, Join, Next, OpModel, OpStream, Step, Task};
 use lio::{BufResult, Lio};
+
+/// A read into a `Vec`, as `api::read` returns it.
+type ReadOp = Io<Read<Vec<u8>>>;
 
 fn scripted(cap: usize) -> (ScriptedBackend, Lio) {
   let backend = ScriptedBackend::new();
@@ -296,7 +299,7 @@ fn a_future_resolves_to_the_item() {
 /// per read, until the source ends.
 struct Chunks {
   from: Resource,
-  read: Read<Vec<u8>>,
+  read: ReadOp,
   ended: bool,
 }
 
@@ -370,7 +373,7 @@ fn run_to_item<T>(lio: &Lio, items: &Rc<RefCell<Vec<T>>>) -> T {
 struct WriteAll {
   to: Resource,
   offset: u64,
-  write: Write<Vec<u8>>,
+  write: Io<Write<Vec<u8>>>,
 }
 
 impl WriteAll {
@@ -403,7 +406,7 @@ impl OpModel for WriteAll {
 struct ReadToEnd {
   from: Resource,
   bytes: Vec<u8>,
-  read: Read<Vec<u8>>,
+  read: ReadOp,
 }
 
 impl ReadToEnd {
@@ -526,8 +529,8 @@ fn a_model_s_next_step_reuses_the_slot_its_last_one_freed() {
 
 /// Polls its read once, then hands it out while it is in flight.
 struct Leaks {
-  read: Option<Read<Vec<u8>>>,
-  out: Rc<RefCell<Option<Read<Vec<u8>>>>>,
+  read: Option<ReadOp>,
+  out: Rc<RefCell<Option<ReadOp>>>,
 }
 
 impl OpModel for Leaks {
@@ -567,8 +570,8 @@ fn an_operation_in_flight_can_move_to_another_model() {
 
 /// Starts two reads, and hands the second out before it is done.
 struct HandsOut {
-  reads: Option<[Read<Vec<u8>>; 2]>,
-  out: Rc<RefCell<Option<Read<Vec<u8>>>>>,
+  reads: Option<[ReadOp; 2]>,
+  out: Rc<RefCell<Option<ReadOp>>>,
 }
 
 impl OpModel for HandsOut {
@@ -585,9 +588,9 @@ impl OpModel for HandsOut {
 
 /// Waits for a nop, then for the read it finds in `from`.
 struct PicksUp {
-  nop: Option<lio::api::ops::Nop>,
-  from: Rc<RefCell<Option<Read<Vec<u8>>>>>,
-  read: Option<Read<Vec<u8>>>,
+  nop: Option<Io<lio::api::ops::Nop>>,
+  from: Rc<RefCell<Option<ReadOp>>>,
+  read: Option<ReadOp>,
 }
 
 impl OpModel for PicksUp {
@@ -641,7 +644,7 @@ fn an_operation_waiting_for_a_slot_can_move_to_another_model() {
 /// Two nops, one after the other.
 struct TwoNops {
   left: u8,
-  nop: lio::api::ops::Nop,
+  nop: Io<lio::api::ops::Nop>,
 }
 
 impl TwoNops {

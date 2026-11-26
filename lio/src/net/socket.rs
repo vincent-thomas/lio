@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use crate::{
   api::{
     self, ShutdownHow, SockDomain, SockProto, SockType,
+    io::Io,
     ops::{Bind, Connect, Listen, Recv, RecvFrom, Send, Shutdown},
     resource::{AsResource, FromResource, IntoResource, Resource},
   },
@@ -120,8 +121,13 @@ impl Socket {
   /// }
   /// ```
   #[allow(clippy::new_ret_no_self)]
-  pub fn new(domain: SockDomain, ty: SockType, proto: SockProto) -> SocketNew {
-    SocketNew::new(domain, ty, proto)
+  pub fn new(
+    domain: SockDomain,
+    ty: SockType,
+    proto: SockProto,
+  ) -> Io<SocketNew> {
+    let socket_accept_op = SocketNew::new(domain, ty, proto);
+    Io::from_op(socket_accept_op)
   }
 
   /// Binds the socket to the specified address.
@@ -144,7 +150,7 @@ impl Socket {
   ///     Ok(())
   /// }
   /// ```
-  pub fn bind(&self, addr: SocketAddr) -> Bind {
+  pub fn bind(&self, addr: SocketAddr) -> Io<Bind> {
     api::bind(&self.0, addr)
   }
 
@@ -169,7 +175,7 @@ impl Socket {
   ///     Ok(())
   /// }
   /// ```
-  pub fn listen(&self) -> Listen {
+  pub fn listen(&self) -> Io<Listen> {
     api::listen(&self.0, 128)
   }
 
@@ -204,8 +210,9 @@ impl Socket {
   ///     Ok(())
   /// }
   /// ```
-  pub fn accept(&self) -> SocketAccept {
-    SocketAccept::new(self.0.clone())
+  pub fn accept(&self) -> Io<SocketAccept> {
+    let socket_accept_op = SocketAccept::new(self.0.clone());
+    Io::from_op(socket_accept_op)
   }
 
   /// Initiates a connection to a remote socket at the specified address.
@@ -230,7 +237,7 @@ impl Socket {
   ///     Ok(())
   /// }
   /// ```
-  pub fn connect(&self, addr: SocketAddr) -> Connect {
+  pub fn connect(&self, addr: SocketAddr) -> Io<Connect> {
     api::connect(&self.0, addr)
   }
 
@@ -262,7 +269,7 @@ impl Socket {
   ///     Ok(())
   /// }
   /// ```
-  pub fn recv<V>(&self, vec: V) -> Recv<V>
+  pub fn recv<V>(&self, vec: V) -> Io<Recv<V>>
   where
     V: buf::IoBufMutVec + std::marker::Send + Sync + 'static,
   {
@@ -270,7 +277,7 @@ impl Socket {
   }
 
   /// Receives data together with the sender's address.
-  pub fn recvfrom<V>(&self, vec: V) -> RecvFrom<V>
+  pub fn recvfrom<V>(&self, vec: V) -> Io<RecvFrom<V>>
   where
     V: buf::IoBufMutVec + std::marker::Send + Sync + 'static,
   {
@@ -304,7 +311,7 @@ impl Socket {
   ///     Ok(())
   /// }
   /// ```
-  pub fn send<V>(&self, vec: V) -> Send<V>
+  pub fn send<V>(&self, vec: V) -> Io<Send<V>>
   where
     V: buf::IoBufVec + std::marker::Send + Sync + 'static,
   {
@@ -312,7 +319,7 @@ impl Socket {
   }
 
   /// Sends data to a specific destination address.
-  pub fn sendto<V>(&self, vec: V, addr: SocketAddr) -> Send<V>
+  pub fn sendto<V>(&self, vec: V, addr: SocketAddr) -> Io<Send<V>>
   where
     V: buf::IoBufVec + std::marker::Send + Sync + 'static,
   {
@@ -346,7 +353,7 @@ impl Socket {
   ///     Ok(())
   /// }
   /// ```
-  pub fn shutdown(&self, how: ShutdownHow) -> Shutdown {
+  pub fn shutdown(&self, how: ShutdownHow) -> Io<Shutdown> {
     api::shutdown(&self.0, how)
   }
 

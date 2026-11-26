@@ -6,10 +6,9 @@
 //!
 //! # Overview
 //!
-//! [`Io<T>`] is a model together with the driver it will run on. lio's own
-//! operations are run directly and only become an `Io` through `with_lio`;
-//! a model of your own becomes one through [`api::run`](crate::api::run).
-//! Either way the result is consumed in one of these ways:
+//! [`Io<T>`] is a model with the ways to run it. Every function in
+//! [`api`](crate::api) returns one, and [`api::run`](crate::api::run) makes
+//! one of a model of your own. The result is consumed in one of these ways:
 //!
 //! - **Async/await**: Implements `IntoFuture`, allowing direct `.await` syntax
 //! - **Callbacks**: [`when_done()`](Io::when_done) executes a closure on completion
@@ -68,24 +67,88 @@ use std::{
   time::Duration,
 };
 
-/// A model and the driver it will run on, with the ways to get its result.
+/// A model, with the ways to run it and get its result.
 ///
-/// lio's operations can be run without one: `api::read(..).await` uses the
-/// driver installed for the thread. An `Io` is what `with_lio` on an
-/// operation returns, and what [`api::run`](crate::api::run) makes of a
-/// model of your own.
+/// Every function in [`api`](crate::api) returns one, and
+/// [`api::run`](crate::api::run) makes one of a model of your own. It runs
+/// on the driver installed for the thread, or on the one
+/// [`with_lio`](Self::with_lio) names.
+///
+/// It is also a model itself, so it composes: see the
+/// [`OpModel`] implementation below.
 ///
 /// # Examples
 /// See examples in each method's docs.
 #[must_use = "Io doesn't schedule any operation on itself."]
-pub struct Io<T> {
+pub struct Io<T, D = Installed> {
   op: T,
-  handle: LioHandle,
+  driver: D,
 }
 
-impl<T> Io<T>
+/// Which driver an [`Io`] or [`IoStream`] runs on: [`Installed`], or a
+/// [`Lio`] named with `with_lio`.
+pub trait Driver: sealed::Sealed {
+  #[doc(hidden)]
+  fn into_lio(self) -> Lio;
+}
+
+/// The driver installed for the thread, by
+/// [`install_global`](crate::install_global).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Installed;
+
+mod sealed {
+  pub trait Sealed {}
+  impl Sealed for super::Installed {}
+  impl Sealed for crate::Lio {}
+}
+
+impl Driver for Installed {
+  #[inline]
+  fn into_lio(self) -> Lio {
+    match driver::get_global() {
+      Some(lio) => lio,
+      None => panic!(
+        "No Lio instance available. Either call install_global(lio) or use .with_lio(&lio) before consuming the operation."
+      ),
+    }
+  }
+}
+
+impl Driver for Lio {
+  #[inline]
+  fn into_lio(self) -> Lio {
+    self
+  }
+}
+
+/// An `Io` that has not been given a driver is a model like any other: it
+/// goes into a [`Join`](crate::model::Join), [`model::spawn`], or a model
+/// of your own, which polls it.
+///
+/// One that names its driver is not, so a driver chosen for a part of a
+/// model, which could not be honoured, does not compile:
+///
+/// ```compile_fail
+/// use lio::api;
+/// use lio::model::Join;
+///
+/// let lio = lio::Lio::new(8).unwrap();
+/// let _ = Join::new(api::nop().with_lio(&lio), api::nop());
+/// ```
+impl<T: OpModel> OpModel for Io<T, Installed> {
+  type Item = T::Item;
+
+  #[inline]
+  fn poll(&mut self, cx: &mut model::Cx<'_>) -> model::Step<Self::Item> {
+    self.op.poll(cx)
+  }
+}
+
+impl<T, D> Io<T, D>
 where
   T: OpModel + 'static,
+  D: Driver,
 {
   // /// Block the current thread until the operation completes and return the result.
   // ///
@@ -213,34 +276,6 @@ where
     let (lio, op) = self.into_lio();
     // The handle is dropped: the model runs until it is done.
     let _task = model::spawn(&lio, op, f);
-  }
-}
-
-/// Internal handle for accessing the Lio instance.
-#[derive(Clone)]
-enum LioHandle {
-  /// No Lio bound - will panic if used. This is the default from `from_op()`.
-  GloballyInstalled,
-  /// User-provided Lio instance via `.with_lio()`.
-  Custom(Lio),
-}
-
-impl LioHandle {
-  #[inline]
-  fn into_lio(self) -> Lio {
-    match self {
-      LioHandle::GloballyInstalled => match driver::get_global() {
-        Some(lio) => lio,
-        None => panic!(
-          "No Lio instance available. Either call install_global(lio) or use .with_lio(&lio) before consuming the operation."
-        ),
-      },
-      LioHandle::Custom(lio) => lio,
-    }
-  }
-
-  fn lio(&self) -> Lio {
-    self.clone().into_lio()
   }
 }
 
@@ -394,9 +429,11 @@ impl<T> Io<T> {
   /// `.with_lio()` before consuming the operation.
   #[inline]
   pub fn from_op(op: T) -> Self {
-    Self { op, handle: LioHandle::GloballyInstalled }
+    Self { op, driver: Installed }
   }
+}
 
+impl<T, D> Io<T, D> {
   /// Binds a Lio instance to this operation.
   ///
   /// This must be called before consuming the operation via `.await`, `.wait()`,
@@ -414,20 +451,22 @@ impl<T> Io<T> {
   ///     .send();
   /// ```
   #[inline]
-  pub fn with_lio(self, lio: &Lio) -> Self {
-    Io { op: self.op, handle: LioHandle::Custom(lio.clone()) }
-  }
-
-  #[inline]
-  fn into_lio(self) -> (Lio, T) {
-    let lio = self.handle.into_lio();
-    (lio, self.op)
+  pub fn with_lio(self, lio: &Lio) -> Io<T, Lio> {
+    Io { op: self.op, driver: lio.clone() }
   }
 }
 
-impl<T> IntoFuture for Io<T>
+impl<T, D: Driver> Io<T, D> {
+  #[inline]
+  fn into_lio(self) -> (Lio, T) {
+    (self.driver.into_lio(), self.op)
+  }
+}
+
+impl<T, D> IntoFuture for Io<T, D>
 where
   T: OpModel + Unpin + 'static,
+  D: Driver,
 {
   type Output = T::Item;
   type IntoFuture = model::Run<T>;
@@ -447,18 +486,29 @@ struct LocalFutureSlot<T> {
 // IoStream - Async Stream for multi-item operations
 // ============================================================================
 
-/// A stream and the driver it will run on, with the ways to get its items.
+/// A stream, with the ways to get its items: [`start`](Self::start) for a
+/// handle to take them from, or [`send`](Self::send) and
+/// [`send_with`](Self::send_with) for a channel.
 ///
-/// lio's streams can be run without one: `api::interval(d).start()` uses
-/// the driver installed for the thread. An `IoStream` is what `with_lio` on
-/// a stream returns, and what [`api::run_stream`](crate::api::run_stream)
-/// makes of a stream of your own.
-///
-/// Every method consumes it, so a stream cannot be started twice.
+/// It runs on the driver installed for the thread, or on the one
+/// [`with_lio`](Self::with_lio) names. Every method consumes it, so a
+/// stream cannot be started twice.
 #[must_use = "a stream does nothing until it is started"]
-pub struct IoStream<T> {
+pub struct IoStream<T, D = Installed> {
   op: T,
-  handle: LioHandle,
+  driver: D,
+}
+
+/// An `IoStream` that has not been given a driver is a stream like any
+/// other, to poll from a stream of your own or hand to
+/// [`model::spawn_stream`].
+impl<T: OpStream> OpStream for IoStream<T, Installed> {
+  type Item = T::Item;
+
+  #[inline]
+  fn poll_next(&mut self, cx: &mut model::Cx<'_>) -> model::Next<Self::Item> {
+    self.op.poll_next(cx)
+  }
 }
 
 /// The items of a running stream, taken one at a time with
@@ -471,7 +521,7 @@ where
   T: OpStream,
 {
   state: ItemsState<T>,
-  handle: LioHandle,
+  lio: Lio,
 }
 
 enum ItemsState<T>
@@ -531,25 +581,29 @@ impl<T> Drop for StreamEnd<T> {
   }
 }
 
-impl<T> IoStream<T>
-where
-  T: OpStream + 'static,
-{
+impl<T> IoStream<T> {
   pub fn from_op(op: T) -> Self {
-    Self { op, handle: LioHandle::GloballyInstalled }
+    Self { op, driver: Installed }
   }
+}
 
+impl<T, D> IoStream<T, D> {
   /// Runs the stream on `lio` instead of the driver installed for the
   /// thread.
-  pub fn with_lio(mut self, lio: &Lio) -> Self {
-    self.handle = LioHandle::Custom(lio.clone());
-    self
+  pub fn with_lio(self, lio: &Lio) -> IoStream<T, Lio> {
+    IoStream { op: self.op, driver: lio.clone() }
   }
+}
 
+impl<T, D> IoStream<T, D>
+where
+  T: OpStream + 'static,
+  D: Driver,
+{
   /// Gives the handle the stream's items are taken from, one
   /// [`next`](Items::next) at a time.
   pub fn start(self) -> Items<T> {
-    Items { state: ItemsState::Pending(self.op), handle: self.handle }
+    Items { state: ItemsState::Pending(self.op), lio: self.driver.into_lio() }
   }
 
   /// Runs the stream and gives a receiver for its items.
@@ -568,7 +622,7 @@ where
   where
     T::Item: Send,
   {
-    let lio = self.handle.into_lio();
+    let lio = self.driver.into_lio();
     // The handle is dropped: the stream runs until it ends or nobody
     // receives.
     let _task = model::spawn_while(&lio, model::Many(self.op), move |item| {
@@ -604,7 +658,7 @@ impl<T: OpStream + 'static> Future for ItemsNextFuture<'_, T> {
     let (task, slot) =
       match std::mem::replace(&mut stream.state, ItemsState::Done) {
         ItemsState::Pending(op) => {
-          let lio = stream.handle.lio();
+          let lio = stream.lio.clone();
           if lio.is_full() {
             // Wait for a slot; the driver wakes us when one frees up.
             lio.wait_for_capacity(cx.waker());
@@ -735,7 +789,7 @@ mod tests {
     lio.run_timeout(Duration::from_millis(10)).unwrap();
   }
 
-  fn test_io(lio: &Lio) -> Io<crate::api::ops::Sleep> {
+  fn test_io(lio: &Lio) -> Io<crate::api::ops::Sleep, Lio> {
     api::sleep(Duration::from_millis(1)).with_lio(lio)
   }
 
@@ -987,7 +1041,7 @@ mod tests {
   }
 
   /// Yields 1, 2 and 3, one nop before each.
-  struct Counter(u32, ops::Nop);
+  struct Counter(u32, Io<ops::Nop>);
 
   impl Counter {
     fn new() -> Self {
@@ -1060,7 +1114,7 @@ mod tests {
 
   /// Takes a step without an item (unless that is already done), then
   /// finishes with 7.
-  struct AgainThenDone(bool, ops::Nop, bool);
+  struct AgainThenDone(bool, Io<ops::Nop>, bool);
 
   impl AgainThenDone {
     fn new(stepped: bool) -> Self {

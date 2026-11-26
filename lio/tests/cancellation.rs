@@ -152,7 +152,7 @@ fn dropped_sleep_is_removed_at_once() {
 }
 
 /// Yields a value for every nop that completes, forever.
-struct Endless(api::ops::Nop);
+struct Endless(api::Io<api::ops::Nop>);
 
 impl Endless {
   fn new() -> Self {

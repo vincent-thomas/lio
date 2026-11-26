@@ -179,135 +179,6 @@ macro_rules! action_io {
   }};
 }
 
-/// Gives one of lio's own model types the ways to run it: `.await`,
-/// `when_done`, `send`, `send_with`, and `with_lio` to name the driver.
-///
-/// A model written outside lio is run through
-/// [`api::run`](crate::api::run), which gives an [`Io`](crate::api::Io)
-/// with the same five.
-macro_rules! runnable {
-  ([$($generics:tt)*] $ty:ty) => {
-    impl<$($generics)*> $ty
-    where
-      Self: $crate::model::OpModel + 'static,
-    {
-      /// Runs this on `lio` instead of the driver installed for the thread.
-      #[inline]
-      pub fn with_lio(self, lio: &$crate::Lio) -> $crate::api::Io<Self> {
-        $crate::api::Io::from_op(self).with_lio(lio)
-      }
-
-      /// Runs this and calls `f` with the result. See
-      /// [`Io::when_done`]($crate::api::Io::when_done).
-      #[inline]
-      pub fn when_done<F>(self, f: F)
-      where
-        F: Fn(<Self as $crate::model::OpModel>::Item) + 'static,
-      {
-        $crate::api::Io::from_op(self).when_done(f)
-      }
-
-      /// Runs this and sends the result through a channel. See
-      /// [`Io::send`]($crate::api::Io::send).
-      #[inline]
-      pub fn send(
-        self,
-      ) -> $crate::api::Receiver<<Self as $crate::model::OpModel>::Item>
-      where
-        <Self as $crate::model::OpModel>::Item: ::std::marker::Send + 'static,
-      {
-        $crate::api::Io::from_op(self).send()
-      }
-
-      /// Runs this and sends the result through `sender`. See
-      /// [`Io::send_with`]($crate::api::Io::send_with).
-      #[inline]
-      pub fn send_with(
-        self,
-        sender: ::std::sync::mpsc::Sender<
-          <Self as $crate::model::OpModel>::Item,
-        >,
-      ) where
-        <Self as $crate::model::OpModel>::Item: ::std::marker::Send + 'static,
-      {
-        $crate::api::Io::from_op(self).send_with(sender)
-      }
-    }
-
-    impl<$($generics)*> ::std::future::IntoFuture for $ty
-    where
-      Self: $crate::model::OpModel + ::std::marker::Unpin + 'static,
-    {
-      type Output = <Self as $crate::model::OpModel>::Item;
-      type IntoFuture = $crate::model::Run<Self>;
-
-      #[inline]
-      fn into_future(self) -> Self::IntoFuture {
-        $crate::api::Io::from_op(self).into_future()
-      }
-    }
-  };
-  ($ty:ty) => {
-    runnable!([] $ty);
-  };
-}
-
-/// Gives one of lio's own stream types the ways to run it: `start`,
-/// `send`, `send_with`, and `with_lio` to name the driver.
-///
-/// A stream written outside lio is run through
-/// [`api::run_stream`](crate::api::run_stream).
-macro_rules! streamable {
-  ([$($generics:tt)*] $ty:ty) => {
-    impl<$($generics)*> $ty
-    where
-      Self: $crate::model::OpStream + 'static,
-    {
-      /// Runs this on `lio` instead of the driver installed for the thread.
-      #[inline]
-      pub fn with_lio(self, lio: &$crate::Lio) -> $crate::api::IoStream<Self> {
-        $crate::api::IoStream::from_op(self).with_lio(lio)
-      }
-
-      /// Starts this, and gives the handle its items are taken from. See
-      /// [`IoStream::start`]($crate::api::IoStream::start).
-      #[inline]
-      pub fn start(self) -> $crate::api::Items<Self> {
-        $crate::api::IoStream::from_op(self).start()
-      }
-
-      /// Runs this and sends every item through a channel. See
-      /// [`IoStream::send`]($crate::api::IoStream::send).
-      #[inline]
-      pub fn send(
-        self,
-      ) -> $crate::api::StreamReceiver<<Self as $crate::model::OpStream>::Item>
-      where
-        <Self as $crate::model::OpStream>::Item: ::std::marker::Send,
-      {
-        $crate::api::IoStream::from_op(self).send()
-      }
-
-      /// Runs this and sends every item through `sender`. See
-      /// [`IoStream::send_with`]($crate::api::IoStream::send_with).
-      #[inline]
-      pub fn send_with(
-        self,
-        sender: ::std::sync::mpsc::Sender<
-          <Self as $crate::model::OpStream>::Item,
-        >,
-      ) where
-        <Self as $crate::model::OpStream>::Item: ::std::marker::Send,
-      {
-        $crate::api::IoStream::from_op(self).send_with(sender)
-      }
-    }
-  };
-  ($ty:ty) => {
-    streamable!([] $ty);
-  };
-}
-
 /// Declares the type of one operation: what it was asked to do, held
 /// until it is polled, and the [`Cx`](crate::model::Cx) method that then
 /// starts it.
@@ -317,39 +188,12 @@ macro_rules! streamable {
 macro_rules! leaf {
   (
     $(#[$meta:meta])*
-    [$($generics:tt)*] pub struct $name:ident $(<$param:ident>)? (
-      $($args:tt)*
-    ) -> $item:ty = cx.$method:ident
-  ) => {
-    leaf!(
-      @model $(#[$meta])*
-      [$($generics)*] (pub) struct $name $(<$param>)? ($($args)*)
-        -> $item = cx.$method
-    );
-    // Only lio's public operations are run by users.
-    runnable!([$($generics)*] $name$(<$param>)?);
-  };
-  (
-    $(#[$meta:meta])*
-    [$($generics:tt)*] struct $name:ident $(<$param:ident>)? (
-      $($args:tt)*
-    ) -> $item:ty = cx.$method:ident
-  ) => {
-    leaf!(
-      @model $(#[$meta])*
-      [$($generics)*] () struct $name $(<$param>)? ($($args)*)
-        -> $item = cx.$method
-    );
-  };
-  (
-    @model $(#[$meta:meta])*
-    [$($generics:tt)*] ($($vis:tt)*) struct $name:ident $(<$param:ident>)? (
+    [$($generics:tt)*] $vis:vis struct $name:ident $(<$param:ident>)? (
       $($arg:ident : $ty:ty),* $(,)?
     ) -> $item:ty = cx.$method:ident
   ) => {
     $(#[$meta])*
-    #[must_use = "an operation does nothing until it is run or polled"]
-    $($vis)* struct $name<$($generics)*> {
+    $vis struct $name<$($generics)*> {
       state: $crate::model::Leaf<($($ty,)*), $item>,
     }
 

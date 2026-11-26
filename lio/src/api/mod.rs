@@ -1,9 +1,8 @@
 //! lio's low-level I/O API.
 //!
 //! This module contains all the syscall-oriented I/O operations provided by lio.
-//! Each function maps directly to a system call and returns the operation as
-//! a value, one of the types in [`ops`]. Nothing happens until it is run, or
-//! polled by a model it was put in.
+//! Each function maps directly to a system call and returns an [`Io`]: the
+//! operation, not yet started.
 //!
 //! # Design Philosophy
 //!
@@ -13,23 +12,24 @@
 //! - **Flexible**: Multiple completion modes (async, blocking, channels, callbacks).
 //! - **Type-safe**: Resources are reference-counted and automatically cleaned up.
 //!
-//! ## Synchronisation
+//! ## Running
 //!
-//! Every operation can be run in any of these ways:
+//! An [`Io`] is run in any of these ways:
 //! - Async/await: `.await` it (runtime-independent).
-//! - A callback: `when_done`.
-//! - Channels: `send` for a receiver, *or* `send_with` for a sender of your
-//!   own.
+//! - [A callback](io::Io::when_done).
+//! - Channels: [get a receiver](io::Io::send) *or*
+//!   [send with your own](io::Io::send_with).
 //!
-//! They use the driver installed for the thread. `with_lio` names another,
-//! and gives an [`Io`] with the same four ways.
+//! It uses the driver installed for the thread, or the one
+//! [`with_lio`](io::Io::with_lio) names.
 //!
-//! # Composing
+//! ## Composing
 //!
-//! An operation is an [`OpModel`](crate::model::OpModel), so it goes
+//! An [`Io`] is also an [`OpModel`](crate::model::OpModel): it goes
 //! straight into a [`Join`](crate::model::Join),
-//! [`model::spawn`](crate::model::spawn), or a model of your own. [`run`]
-//! and [`run_stream`] run a model or stream of your own the way lio's are.
+//! [`model::spawn`](crate::model::spawn), or a model of your own, which
+//! polls it. [`run`] makes an `Io` of a model of your own, so it is run the
+//! same way, and [`run_stream`] does that for a stream.
 //!
 //! # Buffer Ownership
 //!
@@ -39,7 +39,7 @@
 //!
 //! # See Also
 //!
-//! - [`Io`] - A model and the driver it runs on
+//! - [`Io`] - An operation or model, and the ways to run it
 //! - [`Resource`](crate::api::resource::Resource) - Reference-counted file descriptor wrapper
 //! - [`crate::buf`] - Buffer types and pooling
 
@@ -54,7 +54,9 @@ pub use crate::backend::op::{
   ReadDirBuf, ReadDirResult, ReadFlags, RecvFlags, SendFlags, ShutdownHow,
   SockDomain, SockProto, SockType, UnlinkKind, WriteFlags,
 };
-pub use io::{Io, IoStream, Items, Receiver, StreamReceiver};
+pub use io::{
+  Driver, Installed, Io, IoStream, Items, Receiver, StreamReceiver,
+};
 pub use ops::UnixAddr;
 pub use pid::Pid;
 
@@ -68,23 +70,21 @@ use std::time::Duration;
 ///
 /// Nothing happens until the returned [`Io`] is consumed: `.await` it, or
 /// use [`when_done`](Io::when_done) or [`send`](Io::send).
-/// [`with_lio`](Io::with_lio) names the driver, as on lio's own operations.
 ///
 /// ```
 /// use lio::api::{self, ops};
 /// use lio::backend::testing::ScriptedBackend;
 /// use lio::model::{Cx, OpModel, Step};
-/// use lio::ready;
 ///
 /// /// Two nops, one after the other.
-/// struct TwoNops(u8, ops::Nop);
+/// struct TwoNops(u8, api::Io<ops::Nop>);
 ///
 /// impl OpModel for TwoNops {
 ///   type Item = std::io::Result<()>;
 ///
 ///   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
 ///     loop {
-///       if let Err(err) = ready!(self.1.poll(cx)) {
+///       if let Err(err) = lio::ready!(self.1.poll(cx)) {
 ///         return Step::Done(Err(err));
 ///       }
 ///       self.0 += 1;
@@ -111,33 +111,41 @@ pub fn run<M: crate::model::OpModel>(model: M) -> Io<M> {
 /// Nothing happens until the returned [`IoStream`] is consumed:
 /// [`start`](IoStream::start) it for a handle to take items from, or use
 /// [`send`](IoStream::send) or [`send_with`](IoStream::send_with).
-/// [`with_lio`](IoStream::with_lio) names the driver.
-pub fn run_stream<S: crate::model::OpStream + 'static>(
-  stream: S,
-) -> IoStream<S> {
+pub fn run_stream<S: crate::model::OpStream>(stream: S) -> IoStream<S> {
   IoStream::from_op(stream)
+}
+
+/// Runs two models at the same time and produces both results.
+///
+/// [`Join`](crate::model::Join), ready to run.
+pub fn join<A, B>(a: A, b: B) -> Io<crate::model::Join<A, B>>
+where
+  A: crate::model::OpModel,
+  B: crate::model::OpModel,
+{
+  Io::from_op(crate::model::Join::new(a, b))
 }
 
 doc_op! {
     short: "A no-op operation useful for driving and testing the runtime.",
 
-    pub fn nop() -> ops::Nop {
-        ops::Nop::new()
+    pub fn nop() -> Io<ops::Nop> {
+        Io::from_op(ops::Nop::new())
     }
 }
 
 doc_op! {
     short: "Completes after the specified duration elapses.",
 
-    pub fn sleep(duration: Duration) -> ops::Sleep {
-        ops::Sleep::new(duration)
+    pub fn sleep(duration: Duration) -> Io<ops::Sleep> {
+        Io::from_op(ops::Sleep::new(duration))
     }
 }
 
 doc_op! {
     short: "Runs an interval of said duration.",
-    pub fn interval(duration: Duration) -> ops::Interval {
-      ops::Interval::new(duration)
+    pub fn interval(duration: Duration) -> IoStream<ops::Interval> {
+      IoStream::from_op(ops::Interval::new(duration))
     }
 }
 
@@ -148,19 +156,19 @@ doc_op! {
         domain: SockDomain,
         ty: SockType,
         proto: SockProto,
-    ) -> ops::Socket {
-        ops::Socket::new(domain, ty, proto)
+    ) -> Io<ops::Socket> {
+        Io::from_op(ops::Socket::new(domain, ty, proto))
     }
 }
 
 doc_op! {
     short: "Reads into one or more owned buffers.",
 
-    pub fn read<B>(res: &impl AsResource, buf: B) -> ops::Read<B>
+    pub fn read<B>(res: &impl AsResource, buf: B) -> Io<ops::Read<B>>
     where
         B: IoBufMutVec + Send + Sync + 'static,
     {
-        ops::Read::new(res.as_resource().clone(), buf, None)
+        Io::from_op(ops::Read::new(res.as_resource().clone(), buf, None))
     }
 }
 
@@ -171,11 +179,11 @@ doc_op! {
     /// Operating systems address files with signed 64-bit offsets, so an
     /// `offset` above `i64::MAX` completes with
     /// [`InvalidInput`](std::io::ErrorKind::InvalidInput) without reading.
-    pub fn read_at<B>(res: &impl AsResource, buf: B, offset: u64) -> ops::Read<B>
+    pub fn read_at<B>(res: &impl AsResource, buf: B, offset: u64) -> Io<ops::Read<B>>
     where
         B: IoBufMutVec + Send + Sync + 'static,
     {
-        ops::Read::new(res.as_resource().clone(), buf, Some(offset))
+        Io::from_op(ops::Read::new(res.as_resource().clone(), buf, Some(offset)))
     }
 }
 
@@ -184,11 +192,11 @@ doc_op! {
     syscall: "write(2)",
     doc_link: "https://man7.org/linux/man-pages/man2/write.2.html",
 
-    pub fn write<B>(res: &impl AsResource, buf: B) -> ops::Write<B>
+    pub fn write<B>(res: &impl AsResource, buf: B) -> Io<ops::Write<B>>
     where
         B: IoBufVec + Send + Sync + 'static,
     {
-        ops::Write::new(res.as_resource().clone(), buf, None)
+        Io::from_op(ops::Write::new(res.as_resource().clone(), buf, None))
     }
 }
 
@@ -201,15 +209,15 @@ doc_op! {
     /// Operating systems address files with signed 64-bit offsets, so an
     /// `offset` above `i64::MAX` completes with
     /// [`InvalidInput`](std::io::ErrorKind::InvalidInput) without writing.
-    pub fn write_at<B>(res: &impl AsResource, buf: B, offset: u64) -> ops::Write<B>
+    pub fn write_at<B>(res: &impl AsResource, buf: B, offset: u64) -> Io<ops::Write<B>>
     where
         B: IoBufVec + Send + Sync + 'static,
     {
-        ops::Write::new(
+        Io::from_op(ops::Write::new(
             res.as_resource().clone(),
             buf,
             Some(offset),
-        )
+        ))
     }
 }
 
@@ -217,8 +225,8 @@ doc_op! {
     short: "Synchronizes a resource to stable storage.",
     syscall: "fsync(2)",
 
-    pub fn fsync(res: &impl AsResource) -> ops::Fsync {
-        ops::Fsync::new(res.as_resource().clone())
+    pub fn fsync(res: &impl AsResource) -> Io<ops::Fsync> {
+        Io::from_op(ops::Fsync::new(res.as_resource().clone()))
     }
 }
 
@@ -229,15 +237,15 @@ doc_op! {
         res: &impl AsResource,
         buf: B,
         flags: Option<RecvFlags>,
-    ) -> ops::Recv<B>
+    ) -> Io<ops::Recv<B>>
     where
         B: IoBufMutVec + Send + Sync + 'static,
     {
-        ops::Recv::new(
+        Io::from_op(ops::Recv::new(
             res.as_resource().clone(),
             buf,
             flags.unwrap_or(RecvFlags::empty()),
-        )
+        ))
     }
 }
 
@@ -248,16 +256,16 @@ doc_op! {
         res: &impl AsResource,
         buf: B,
         flags: Option<SendFlags>,
-    ) -> ops::Send<B>
+    ) -> Io<ops::Send<B>>
     where
         B: IoBufVec + Send + Sync + 'static,
     {
-        ops::Send::new(
+        Io::from_op(ops::Send::new(
             res.as_resource().clone(),
             buf,
             None,
             flags.unwrap_or(SendFlags::empty()),
-        )
+        ))
     }
 }
 
@@ -270,15 +278,15 @@ doc_op! {
         res: &impl AsResource,
         buf: B,
         flags: Option<RecvFlags>,
-    ) -> ops::RecvFrom<B>
+    ) -> Io<ops::RecvFrom<B>>
     where
         B: IoBufMutVec + Send + Sync + 'static,
     {
-        ops::RecvFrom::new(
+        Io::from_op(ops::RecvFrom::new(
             res.as_resource().clone(),
             buf,
             flags.unwrap_or(RecvFlags::empty()),
-        )
+        ))
     }
 }
 
@@ -287,8 +295,8 @@ doc_op! {
 
     pub fn accept(
         res: &impl AsResource,
-    ) -> ops::Accept {
-        ops::Accept::new(res.as_resource().clone())
+    ) -> Io<ops::Accept> {
+        Io::from_op(ops::Accept::new(res.as_resource().clone()))
     }
 }
 
@@ -297,8 +305,8 @@ doc_op! {
 
     pub fn accept_unix(
         res: &impl AsResource,
-    ) -> ops::AcceptUnix {
-        ops::AcceptUnix::new(res.as_resource().clone())
+    ) -> Io<ops::AcceptUnix> {
+        Io::from_op(ops::AcceptUnix::new(res.as_resource().clone()))
     }
 }
 
@@ -308,11 +316,11 @@ doc_op! {
     pub fn connect(
         res: &impl AsResource,
         addr: SocketAddr,
-    ) -> ops::Connect {
-        ops::Connect::new(
+    ) -> Io<ops::Connect> {
+        Io::from_op(ops::Connect::new(
             res.as_resource().clone(),
             socket_addr_into_buf(addr),
-        )
+        ))
     }
 }
 
@@ -322,11 +330,11 @@ doc_op! {
     pub fn bind(
         res: &impl AsResource,
         addr: SocketAddr,
-    ) -> ops::Bind {
-        ops::Bind::new(
+    ) -> Io<ops::Bind> {
+        Io::from_op(ops::Bind::new(
             res.as_resource().clone(),
             socket_addr_into_buf(addr),
-        )
+        ))
     }
 }
 
@@ -336,8 +344,8 @@ doc_op! {
     pub fn listen(
         res: &impl AsResource,
         backlog: i32,
-    ) -> ops::Listen {
-        ops::Listen::new(res.as_resource().clone(), backlog)
+    ) -> Io<ops::Listen> {
+        Io::from_op(ops::Listen::new(res.as_resource().clone(), backlog))
     }
 }
 
@@ -347,8 +355,8 @@ doc_op! {
     pub fn shutdown(
         res: &impl AsResource,
         how: ShutdownHow,
-    ) -> ops::Shutdown {
-        ops::Shutdown::new(res.as_resource().clone(), how)
+    ) -> Io<ops::Shutdown> {
+        Io::from_op(ops::Shutdown::new(res.as_resource().clone(), how))
     }
 }
 
@@ -360,13 +368,13 @@ doc_op! {
         path: std::ffi::CString,
         flags: OpenFlags,
         mode: FileMode,
-    ) -> ops::OpenAt {
-        ops::OpenAt::new(
+    ) -> Io<ops::OpenAt> {
+        Io::from_op(ops::OpenAt::new(
             dir_res.as_resource().clone(),
             path,
             flags,
             mode,
-        )
+        ))
     }
 }
 
@@ -377,12 +385,12 @@ doc_op! {
         dir_res: &impl AsResource,
         path: std::ffi::CString,
         follow_symlinks: bool,
-    ) -> ops::Stat {
-        ops::Stat::new(ops::StatOf::Path {
+    ) -> Io<ops::Stat> {
+        Io::from_op(ops::Stat::new(ops::StatOf::Path {
             dir: dir_res.as_resource().clone(),
             path,
             follow_symlinks,
-        })
+        }))
     }
 }
 
@@ -391,8 +399,8 @@ doc_op! {
 
     pub fn fstat(
         fd: &impl AsResource,
-    ) -> ops::Stat {
-        ops::Stat::new(ops::StatOf::File(fd.as_resource().clone()))
+    ) -> Io<ops::Stat> {
+        Io::from_op(ops::Stat::new(ops::StatOf::File(fd.as_resource().clone())))
     }
 }
 
@@ -405,8 +413,8 @@ doc_op! {
     pub fn readdir(
         fd: &impl AsResource,
         buf: ReadDirBuf,
-    ) -> ops::ReadDir {
-        ops::ReadDir::new(fd.as_resource().clone(), buf)
+    ) -> Io<ops::ReadDir> {
+        Io::from_op(ops::ReadDir::new(fd.as_resource().clone(), buf))
     }
 }
 
@@ -417,12 +425,12 @@ doc_op! {
         dir_res: &impl AsResource,
         path: std::ffi::CString,
         kind: UnlinkKind,
-    ) -> ops::UnlinkAt {
-        ops::UnlinkAt::new(
+    ) -> Io<ops::UnlinkAt> {
+        Io::from_op(ops::UnlinkAt::new(
             dir_res.as_resource().clone(),
             path,
             kind,
-        )
+        ))
     }
 }
 
@@ -434,13 +442,13 @@ doc_op! {
         old_path: std::ffi::CString,
         new_dir_res: &impl AsResource,
         new_path: std::ffi::CString,
-    ) -> ops::RenameAt {
-        ops::RenameAt::new(
+    ) -> Io<ops::RenameAt> {
+        Io::from_op(ops::RenameAt::new(
             old_dir_res.as_resource().clone(),
             old_path,
             new_dir_res.as_resource().clone(),
             new_path,
-        )
+        ))
     }
 }
 
@@ -451,12 +459,12 @@ doc_op! {
         dir_res: &impl AsResource,
         path: std::ffi::CString,
         mode: FileMode,
-    ) -> ops::MkdirAt {
-        ops::MkdirAt::new(
+    ) -> Io<ops::MkdirAt> {
+        Io::from_op(ops::MkdirAt::new(
             dir_res.as_resource().clone(),
             path,
             mode,
-        )
+        ))
     }
 }
 
@@ -469,14 +477,14 @@ doc_op! {
         new_dir_res: &impl AsResource,
         new_path: std::ffi::CString,
         kind: ops::LinkKind,
-    ) -> ops::LinkAt {
-        ops::LinkAt::new(
+    ) -> Io<ops::LinkAt> {
+        Io::from_op(ops::LinkAt::new(
             source_dir_res.as_resource().clone(),
             source_path,
             new_dir_res.as_resource().clone(),
             new_path,
             kind,
-        )
+        ))
     }
 }
 
@@ -487,20 +495,20 @@ doc_op! {
         dir_res: &impl AsResource,
         path: std::ffi::CString,
         buf: Vec<u8>,
-    ) -> ops::ReadlinkAt<Vec<u8>> {
-        ops::ReadlinkAt::new(
+    ) -> Io<ops::ReadlinkAt<Vec<u8>>> {
+        Io::from_op(ops::ReadlinkAt::new(
             dir_res.as_resource().clone(),
             path,
             buf,
-        )
+        ))
     }
 }
 
 doc_op! {
     short: "Reads the current working directory into a caller-provided buffer.",
 
-    pub fn getcwd(buf: Vec<u8>) -> ops::GetCwd<Vec<u8>> {
-        ops::GetCwd::new(buf)
+    pub fn getcwd(buf: Vec<u8>) -> Io<ops::GetCwd<Vec<u8>>> {
+        Io::from_op(ops::GetCwd::new(buf))
     }
 }
 
@@ -511,8 +519,8 @@ doc_op! {
         path: std::ffi::CString,
         argv: Vec<std::ffi::CString>,
         envp: Option<Vec<std::ffi::CString>>,
-    ) -> ops::Spawn {
-        ops::Spawn::new(path, argv, envp)
+    ) -> Io<ops::Spawn> {
+        Io::from_op(ops::Spawn::new(path, argv, envp))
     }
 }
 
@@ -540,15 +548,15 @@ doc_op! {
     ///     Ok(())
     /// }
     /// ```
-    pub fn sendto<B>(res: &impl AsResource, buf: B, addr: SocketAddr, flags: Option<SendFlags>) -> ops::Send<B>
+    pub fn sendto<B>(res: &impl AsResource, buf: B, addr: SocketAddr, flags: Option<SendFlags>) -> Io<ops::Send<B>>
     where
         B: IoBufVec + Send + Sync + 'static,
     {
-        ops::Send::new(
+        Io::from_op(ops::Send::new(
             res.as_resource().clone(),
             buf,
             Some(addr),
             flags.unwrap_or(SendFlags::empty()),
-        )
+        ))
     }
 }

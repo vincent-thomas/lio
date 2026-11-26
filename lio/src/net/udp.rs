@@ -3,6 +3,7 @@ use std::{io, net::SocketAddr};
 use crate::{
   api::{
     ShutdownHow,
+    io::Io,
     ops::{Recv, RecvFrom, Send, Shutdown},
     resource::{AsResource, FromResource, IntoResource, Resource},
   },
@@ -48,8 +49,8 @@ impl UdpSocket {
   ///
   /// The returned socket is ready for datagram receive and for explicit-address
   /// sends via [`sendto`](Self::sendto).
-  pub fn bind(addr: SocketAddr) -> UdpBindSocket {
-    UdpBindSocket::new(addr)
+  pub fn bind(addr: SocketAddr) -> Io<UdpBindSocket> {
+    Io::from_op(UdpBindSocket::new(addr))
   }
 
   /// Creates a UDP socket and connects it to the specified remote address.
@@ -57,15 +58,15 @@ impl UdpSocket {
   /// A connected UDP socket keeps datagram semantics, but gains a default peer
   /// so callers can use [`send`](Self::send) and [`recv`](Self::recv) without
   /// specifying an address on each send.
-  pub fn connect(addr: SocketAddr) -> UdpConnectSocket {
-    UdpConnectSocket::new(addr)
+  pub fn connect(addr: SocketAddr) -> Io<UdpConnectSocket> {
+    Io::from_op(UdpConnectSocket::new(addr))
   }
 
   /// Receives one datagram into the provided buffer.
   ///
   /// This is most useful on a connected UDP socket where the peer is already
   /// fixed. If the sender address matters, use [`recvfrom`](Self::recvfrom).
-  pub fn recv<V>(&self, vec: V) -> Recv<V>
+  pub fn recv<V>(&self, vec: V) -> Io<Recv<V>>
   where
     V: buf::IoBufMutVec + std::marker::Send + Sync + 'static,
   {
@@ -73,7 +74,7 @@ impl UdpSocket {
   }
 
   /// Receives one datagram together with the sender's address.
-  pub fn recvfrom<V>(&self, vec: V) -> RecvFrom<V>
+  pub fn recvfrom<V>(&self, vec: V) -> Io<RecvFrom<V>>
   where
     V: buf::IoBufMutVec + std::marker::Send + Sync + 'static,
   {
@@ -84,7 +85,7 @@ impl UdpSocket {
   ///
   /// This is most useful on a connected UDP socket with a default peer. For
   /// unconnected use, prefer [`sendto`](Self::sendto).
-  pub fn send<V>(&self, vec: V) -> Send<V>
+  pub fn send<V>(&self, vec: V) -> Io<Send<V>>
   where
     V: buf::IoBufVec + std::marker::Send + Sync + 'static,
   {
@@ -92,7 +93,7 @@ impl UdpSocket {
   }
 
   /// Sends one datagram to a specific destination address.
-  pub fn sendto<V>(&self, vec: V, addr: SocketAddr) -> Send<V>
+  pub fn sendto<V>(&self, vec: V, addr: SocketAddr) -> Io<Send<V>>
   where
     V: buf::IoBufVec + std::marker::Send + Sync + 'static,
   {
@@ -100,7 +101,7 @@ impl UdpSocket {
   }
 
   /// Shuts down part or all of the socket.
-  pub fn shutdown(&self, how: ShutdownHow) -> Shutdown {
+  pub fn shutdown(&self, how: ShutdownHow) -> Io<Shutdown> {
     self.0.shutdown(how)
   }
 

@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use lio::api::ops::{Read, Write};
 use lio::api::resource::{IntoResource, Resource};
-use lio::api::{self, FileMode, OpenFlags, ShutdownHow};
-use lio::model::{self, Cx, Join, Next, OpModel, OpStream, Step};
+use lio::api::{self, FileMode, Io, OpenFlags, ShutdownHow};
+use lio::model::{self, Cx, Next, OpModel, OpStream, Step};
 use lio::net::{TcpListener, TcpStream};
 use lio::{Lio, fs};
 
@@ -200,10 +200,10 @@ fn sockets(lio: &Lio) -> io::Result<()> {
     let listener = TcpListener::bind(([127, 0, 0, 1], 0).into()).await?;
     let addr = listener.local_addr()?;
 
-    // Accepting and connecting at the same time: every operation is a
-    // model, and `Join` runs two models together until both are done.
+    // Accepting and connecting at the same time: every `Io` is a model,
+    // and `api::join` runs two models together until both are done.
     let (accepted, client) =
-      Join::new(listener.accept(), TcpStream::connect(addr)).await;
+      api::join(listener.accept(), TcpStream::connect(addr)).await;
     let ((server, peer), client) = (accepted?, client?);
     println!("accepted a connection from {peer}");
 
@@ -229,7 +229,7 @@ fn sockets(lio: &Lio) -> io::Result<()> {
 struct WriteAll {
   to: Resource,
   offset: u64,
-  write: Write<Vec<u8>>,
+  write: Io<Write<Vec<u8>>>,
 }
 
 impl WriteAll {
@@ -264,7 +264,7 @@ impl OpModel for WriteAll {
 struct Chunks {
   from: Resource,
   offset: u64,
-  read: Read<Vec<u8>>,
+  read: Io<Read<Vec<u8>>>,
   failed: bool,
 }
 
@@ -323,9 +323,9 @@ fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
       api::run(WriteAll::new(&source, b"0123456789".to_vec())).await?;
     assert_eq!(written, 10);
 
-    // Models nest: lio's own `copy` is one, and so is a `Join` of two.
+    // Models nest: lio's own `copy` is one, and so is a join of two.
     let (copied, stat) =
-      Join::new(lio::io::copy(&source, &copy), api::fstat(&source)).await;
+      api::join(lio::io::copy(&source, &copy), api::fstat(&source)).await;
     assert_eq!((copied?, stat?.size), (10, 10));
 
     // Work that produces several items is an `OpStream`. Starting it
