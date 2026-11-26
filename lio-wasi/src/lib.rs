@@ -63,6 +63,7 @@ use std::fmt;
 use wasip3::wit_bindgen::{StreamReader, StreamWriter};
 use wasip3::wit_stream::StreamPayload;
 
+use fs::{DirEntryBuf, DirStream, DirectoryEntry};
 use sockets::{Accepted, Listener, TcpSocket};
 
 /// The `wasip3` bindings this crate is built on. Use them for the WASI
@@ -126,7 +127,7 @@ impl sealed::Sealed for Nop {
 }
 
 /// How an operation ended. For a stream operation, also how many items it
-/// moved first: bytes, or accepted sockets.
+/// moved first: bytes, accepted sockets, or directory entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
   /// The operation moved this many items and the stream is still open.
@@ -239,13 +240,15 @@ enum End {
   Writable,
   /// The readable end of a listener's `stream<tcp-socket>`.
   Accepting,
+  /// The readable end of a directory's `stream<directory-entry>`.
+  Listing,
 }
 
 impl End {
   /// The waitable-set event that ends a blocked operation on this end.
   fn event(self) -> u32 {
     match self {
-      End::Readable | End::Accepting => sys::EVENT_STREAM_READ,
+      End::Readable | End::Accepting | End::Listing => sys::EVENT_STREAM_READ,
       End::Writable => sys::EVENT_STREAM_WRITE,
     }
   }
@@ -435,6 +438,56 @@ impl Queue {
   /// A cancelled accept still produces its completion.
   pub fn close_listener(&mut self, listener: Listener) -> Result<(), Error> {
     self.close(listener.0, End::Accepting)
+  }
+
+  /// Takes ownership of a directory's stream of entries, as returned by
+  /// `Descriptor::read_directory`.
+  pub fn add_dir_reader(
+    &mut self,
+    entries: StreamReader<DirectoryEntry>,
+  ) -> DirStream {
+    let handle = entries.take_handle();
+    let ops = <DirectoryEntry as StreamPayload>::VTABLE;
+    self.adopt(handle, End::Listing, ops.cancel_read, ops.drop_readable);
+    DirStream(handle)
+  }
+
+  /// Starts reading directory entries into `buf`, up to its capacity.
+  ///
+  /// The read's [`Completion`] carries `user_data` and reports how many
+  /// entries arrived; take them with [`DirEntryBuf::drain`].
+  /// [`Outcome::Closed`] means the listing is over, after the entries it
+  /// counts.
+  ///
+  /// # Safety
+  ///
+  /// `buf` stays allocated and unmoved, and nothing else reads or writes
+  /// it, until this read's completion has been returned.
+  pub unsafe fn push_read_dir(
+    &mut self,
+    stream: DirStream,
+    buf: &mut DirEntryBuf,
+    user_data: u64,
+  ) -> Result<(), Error> {
+    if !self.begin(stream.0, End::Listing, user_data)? {
+      return Ok(());
+    }
+    let (slots, capacity) = buf.arm();
+    let capacity = capacity.min(sys::MAX_LENGTH);
+    let ops = <DirectoryEntry as StreamPayload>::VTABLE;
+    // SAFETY: the handle is an open directory stream with no read in
+    // flight, and the caller vouches for `buf`, which holds `capacity`
+    // entries.
+    let code = unsafe { (ops.start_read)(stream.0, slots, capacity) };
+    self.started(stream.0, user_data, code);
+    Ok(())
+  }
+
+  /// Stops listing, cancelling the read in flight if there is one.
+  ///
+  /// A cancelled read still produces its completion.
+  pub fn close_dir_reader(&mut self, stream: DirStream) -> Result<(), Error> {
+    self.close(stream.0, End::Listing)
   }
 
   /// Starts a WASI call.
@@ -851,6 +904,7 @@ mod tests {
   fn each_end_expects_its_own_event() {
     assert_eq!(End::Readable.event(), sys::EVENT_STREAM_READ);
     assert_eq!(End::Accepting.event(), sys::EVENT_STREAM_READ);
+    assert_eq!(End::Listing.event(), sys::EVENT_STREAM_READ);
     assert_eq!(End::Writable.event(), sys::EVENT_STREAM_WRITE);
   }
 

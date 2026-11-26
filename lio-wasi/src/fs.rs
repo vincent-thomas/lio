@@ -9,8 +9,10 @@
 //! with its `result` method.
 //!
 //! Calls that do not wait are not here: use `wasip3` directly for
-//! `read_via_stream`, `write_via_stream`, `append_via_stream` and
-//! `filesystem::preopens`, and drop a [`Descriptor`] to close it.
+//! `read_via_stream`, `write_via_stream`, `append_via_stream`,
+//! `read_directory` and `filesystem::preopens`, and drop a [`Descriptor`] to
+//! close it. A directory is listed through the stream `read_directory`
+//! returns: see [`DirEntryBuf`].
 //!
 //! The layouts are written by hand to match what `wit-bindgen` generates for
 //! the same functions. The assertions next to each one pin them for
@@ -21,7 +23,7 @@ use core::marker::PhantomData;
 use wasip3::clocks::system_clock::Instant;
 pub use wasip3::filesystem::types::{
   Advice, Descriptor, DescriptorFlags, DescriptorStat, DescriptorType,
-  ErrorCode, NewTimestamp, OpenFlags, PathFlags,
+  DirectoryEntry, ErrorCode, NewTimestamp, OpenFlags, PathFlags,
 };
 use wasip3::wit_bindgen::FutureReader;
 use wasip3::wit_future::FuturePayload;
@@ -870,6 +872,115 @@ call!(StatAt => DescriptorStat, |op, reply| {
   )
 });
 
+// ───────────────────────────── directory listing ────────────────────────────
+
+/// The stream of a directory's entries, owned by a [`Queue`](crate::Queue).
+///
+/// Returned by [`Queue::add_dir_reader`](crate::Queue::add_dir_reader). It
+/// stays valid until
+/// [`Queue::close_dir_reader`](crate::Queue::close_dir_reader) or until the
+/// queue is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DirStream(pub(crate) u32);
+
+/// Stored in a slot's type tag while the host has not written an entry
+/// there. A real `descriptor-type` case is below it.
+const NO_ENTRY: usize = 0xff;
+
+/// `directory-entry` as the host writes it: the entry's type, then its
+/// name.
+#[repr(C)]
+struct RawDirEntry {
+  kind: Words,
+  name: *mut u8,
+  name_len: usize,
+}
+
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+  assert!(size_of::<RawDirEntry>() == 24);
+  assert!(align_of::<RawDirEntry>() == 4);
+  assert!(core::mem::offset_of!(RawDirEntry, name) == 16);
+  assert!(core::mem::offset_of!(RawDirEntry, name_len) == 20);
+};
+
+impl RawDirEntry {
+  const fn empty() -> Self {
+    Self {
+      kind: Words { a: NO_ENTRY, ..Words::zeroed() },
+      name: core::ptr::null_mut(),
+      name_len: 0,
+    }
+  }
+
+  /// Takes the entry out, leaving the slot empty.
+  fn take(&mut self) -> Option<DirectoryEntry> {
+    if self.kind.case() as usize == NO_ENTRY {
+      return None;
+    }
+    let raw = core::mem::replace(self, Self::empty());
+    Some(DirectoryEntry {
+      // SAFETY: the host wrote a descriptor type here, and the slot was
+      // emptied, so it is lifted once.
+      type_: unsafe { DescriptorType::lift(&raw.kind) },
+      // SAFETY: the host allocated the name in this component and handed
+      // it over; as above, it is adopted once.
+      name: unsafe { crate::reply::adopt_string(raw.name, raw.name_len) },
+    })
+  }
+}
+
+/// Where directory entries land.
+///
+/// Pass it to [`Queue::push_read_dir`](crate::Queue::push_read_dir). The
+/// read's completion reports how many entries arrived, and
+/// [`drain`](Self::drain) hands them over. Entries for `.` and `..` are not
+/// among them.
+///
+/// The host allocates each name in this component. Entries left in the
+/// buffer are freed when it is dropped or read into again.
+pub struct DirEntryBuf {
+  /// The host writes entries through a pointer into this.
+  slots: core::cell::UnsafeCell<Box<[RawDirEntry]>>,
+}
+
+impl DirEntryBuf {
+  /// A buffer for up to `capacity` entries per read.
+  pub fn with_capacity(capacity: usize) -> Self {
+    let slots = (0..capacity).map(|_| RawDirEntry::empty()).collect();
+    Self { slots: core::cell::UnsafeCell::new(slots) }
+  }
+
+  /// How many entries one read can deliver.
+  pub fn capacity(&mut self) -> usize {
+    self.slots.get_mut().len()
+  }
+
+  /// Takes the entries the last read delivered, in order.
+  pub fn drain(&mut self) -> impl Iterator<Item = DirectoryEntry> + '_ {
+    // The host fills slots from the front, so the first empty one ends
+    // them.
+    self.slots.get_mut().iter_mut().map_while(RawDirEntry::take)
+  }
+
+  /// Frees what the last read left and returns where the host writes the
+  /// next entries, and how many fit.
+  pub(crate) fn arm(&mut self) -> (*mut u8, usize) {
+    let slots = self.slots.get_mut();
+    for slot in slots.iter_mut() {
+      drop(slot.take());
+    }
+    (slots.as_mut_ptr().cast(), slots.len())
+  }
+}
+
+impl Drop for DirEntryBuf {
+  fn drop(&mut self) {
+    // Untaken entries own their names. Release them.
+    self.arm();
+  }
+}
+
 // ────────────────────────────── stream status ───────────────────────────────
 
 /// How a file stream ended: `Ok` at the end of the data, or the error that
@@ -949,6 +1060,54 @@ mod tests {
         DescriptorType::Other(None)
       ));
     }
+  }
+
+  /// Writes an entry as the host would: an exact allocation for the name.
+  fn host_entry(slot: &mut RawDirEntry, kind: usize, name: &str) {
+    let name = String::from(name).into_boxed_str();
+    slot.name_len = name.len();
+    slot.name = Box::into_raw(name).cast();
+    slot.kind = words(kind);
+  }
+
+  #[test]
+  fn a_new_entry_buffer_is_empty() {
+    let mut buf = DirEntryBuf::with_capacity(4);
+    assert_eq!(buf.capacity(), 4);
+    assert_eq!(buf.drain().count(), 0);
+  }
+
+  #[test]
+  fn entries_drain_in_order_and_only_once() {
+    let mut buf = DirEntryBuf::with_capacity(4);
+    {
+      let slots = buf.slots.get_mut();
+      host_entry(&mut slots[0], 5, "file.txt");
+      host_entry(&mut slots[1], 2, "sub");
+    }
+    let entries: Vec<DirectoryEntry> = buf.drain().collect();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].name, "file.txt");
+    assert!(matches!(entries[0].type_, DescriptorType::RegularFile));
+    assert_eq!(entries[1].name, "sub");
+    assert!(matches!(entries[1].type_, DescriptorType::Directory));
+    assert_eq!(buf.drain().count(), 0);
+  }
+
+  #[test]
+  fn arming_frees_entries_that_were_not_taken() {
+    let mut buf = DirEntryBuf::with_capacity(2);
+    host_entry(&mut buf.slots.get_mut()[0], 5, "left behind");
+    let (_, capacity) = buf.arm();
+    assert_eq!(capacity, 2);
+    assert_eq!(buf.drain().count(), 0);
+  }
+
+  #[test]
+  fn dropping_frees_entries_that_were_not_taken() {
+    let mut buf = DirEntryBuf::with_capacity(2);
+    host_entry(&mut buf.slots.get_mut()[0], 5, "left behind");
+    drop(buf);
   }
 
   #[test]
