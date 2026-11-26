@@ -2,13 +2,14 @@
 //!
 //! Everything here asserts what it did, so the run doubles as a test of the
 //! backend. It is its own crate because `lio`'s dev-dependencies do not
-//! build for `wasm32-wasip3`. Nothing in it is specific to WASI: built for
-//! the host, it runs against the native backend from inside an empty
-//! directory.
+//! build for `wasm32-wasip3`.
+//!
+//! It expects an empty directory preopened as `/`, and network access for
+//! the loopback sockets:
 //!
 //! ```text
 //! cargo build -p lio-wasi-example --target wasm32-wasip3
-//! wasmtime run -S p3 --dir <empty directory>::/ \
+//! wasmtime run -S p3 -S inherit-network --dir <empty directory>::/ \
 //!   target/wasm32-wasip3/debug/lio-wasi-example.wasm
 //! ```
 
@@ -21,7 +22,8 @@ use std::time::{Duration, Instant};
 
 use lio::api::ops::LinkKind;
 use lio::api::resource::Resource;
-use lio::api::{self, FileMode, OpenFlags, UnlinkKind};
+use lio::api::{self, FileMode, OpenFlags, ShutdownHow, UnlinkKind};
+use lio::net::{TcpListener, TcpStream, UdpSocket};
 use lio::{Lio, fs};
 
 fn block_on<F: IntoFuture>(lio: &Lio, future: F) -> F::Output {
@@ -170,6 +172,8 @@ fn main() -> io::Result<()> {
     let ((a, _), (b, _)) = join(first, second).await;
     assert_eq!((a?, b?), (7, 7));
 
+    sockets().await?;
+
     // Time.
     let start = Instant::now();
     api::sleep(Duration::from_millis(50)).await?;
@@ -183,6 +187,96 @@ fn main() -> io::Result<()> {
   let start = Instant::now();
   lio.run_timeout(Duration::from_millis(30))?;
   println!("run_timeout: back after {:?}", start.elapsed());
+  Ok(())
+}
+
+/// TCP and UDP over loopback, with both ends in this program.
+async fn sockets() -> io::Result<()> {
+  let listener = TcpListener::bind(([127, 0, 0, 1], 0).into()).await?;
+  let addr = listener.local_addr()?;
+  assert_ne!(addr.port(), 0, "the listener was given a port");
+
+  // Accepting and connecting at the same time.
+  let (accepted, client) =
+    api::join(listener.accept(), TcpStream::connect(addr)).await;
+  let ((server, peer), client) = (accepted?, client?);
+  assert!(peer.ip().is_loopback());
+  assert_ne!(peer.port(), addr.port(), "the peer is the client's end");
+  println!("tcp accept, connect: ok");
+
+  let (sent, _) = client.send(b"ping".to_vec()).await;
+  assert_eq!(sent?, 4);
+  let (received, buf) = server.recv(Vec::<u8>::with_capacity(16)).await;
+  assert_eq!((received?, buf.as_slice()), (4, &b"ping"[..]));
+  let (sent, _) = server.send(b"pong".to_vec()).await;
+  assert_eq!(sent?, 4);
+  let (received, buf) = client.recv(Vec::<u8>::with_capacity(16)).await;
+  assert_eq!((received?, buf.as_slice()), (4, &b"pong"[..]));
+
+  // More than one receive holds, and several buffers in one send.
+  let big: Vec<u8> = (0..20_000u32).map(|n| (n % 251) as u8).collect();
+  let halves = (big[..10_000].to_vec(), big[10_000..].to_vec());
+  let (sent, _) = client.send(halves).await;
+  assert_eq!(sent?, big.len());
+  let mut got = Vec::new();
+  while got.len() < big.len() {
+    let (received, buf) = server.recv(Vec::<u8>::with_capacity(4096)).await;
+    assert_ne!(received?, 0, "the stream ended early");
+    got.extend_from_slice(&buf);
+  }
+  assert_eq!(got, big);
+  println!("tcp send, recv: ok");
+
+  // Two receives on one socket wait their turn, and each gets data.
+  let first = server.recv(Vec::<u8>::with_capacity(1)).into_future();
+  let second = server.recv(Vec::<u8>::with_capacity(1)).into_future();
+  let (sent, _) = client.send(b"ab".to_vec()).await;
+  assert_eq!(sent?, 2);
+  let ((a, a_buf), (b, b_buf)) = join(pin!(first), pin!(second)).await;
+  assert_eq!((a?, b?), (1, 1));
+  let mut both = [a_buf[0], b_buf[0]];
+  both.sort_unstable();
+  assert_eq!(&both, b"ab");
+  println!("tcp queued receives: ok");
+
+  // Shutting down the write side ends the peer's stream.
+  client.shutdown(ShutdownHow::Write).await?;
+  let (received, _) = server.recv(Vec::<u8>::with_capacity(16)).await;
+  assert_eq!(received?, 0, "the client is done sending");
+  let (sent, _) = client.send(b"late".to_vec()).await;
+  assert_eq!(sent.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+  // The other direction still works.
+  let (sent, _) = server.send(b"bye".to_vec()).await;
+  assert_eq!(sent?, 3);
+  let (received, buf) = client.recv(Vec::<u8>::with_capacity(16)).await;
+  assert_eq!((received?, buf.as_slice()), (3, &b"bye"[..]));
+  println!("tcp shutdown: ok");
+
+  // Nobody listens on a closed listener's port.
+  drop((server, client, listener));
+  let refused = TcpStream::connect(addr).await;
+  assert_eq!(
+    refused.err().map(|error| error.kind()),
+    Some(io::ErrorKind::ConnectionRefused)
+  );
+  println!("tcp connect to a closed port: refused");
+
+  // UDP, addressed and connected.
+  let a = UdpSocket::bind(([127, 0, 0, 1], 0).into()).await?;
+  let b = UdpSocket::bind(([127, 0, 0, 1], 0).into()).await?;
+  let (a_addr, b_addr) = (a.local_addr()?, b.local_addr()?);
+  let (sent, _) = a.sendto(b"datagram".to_vec(), b_addr).await;
+  assert_eq!(sent?, 8);
+  let (received, buf, from) = b.recvfrom(Vec::<u8>::with_capacity(64)).await;
+  assert_eq!((received?, buf.as_slice()), (8, &b"datagram"[..]));
+  assert_eq!(from, Some(a_addr));
+  assert!(a.peer_addr().is_err(), "an unconnected socket has no peer");
+  // A datagram longer than the buffer is cut to fit.
+  let (sent, _) = a.sendto(b"too long".to_vec(), b_addr).await;
+  assert_eq!(sent?, 8);
+  let (received, buf) = b.recv(Vec::<u8>::with_capacity(3)).await;
+  assert_eq!((received?, buf.as_slice()), (3, &b"too"[..]));
+  println!("udp sendto, recvfrom: ok");
   Ok(())
 }
 
