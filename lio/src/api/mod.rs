@@ -54,7 +54,7 @@ pub use crate::backend::op::{
   ReadDirBuf, ReadDirResult, ReadFlags, RecvFlags, SendFlags, ShutdownHow,
   SockDomain, SockProto, SockType, UnlinkKind, WriteFlags,
 };
-pub use io::{Io, IoStream, Receiver, StreamReceiver};
+pub use io::{Io, IoStream, Items, Receiver, StreamReceiver};
 pub use ops::UnixAddr;
 pub use pid::Pid;
 
@@ -67,13 +67,14 @@ use std::time::Duration;
 /// Runs a model of your own, the way lio's operations are run.
 ///
 /// Nothing happens until the returned [`Io`] is consumed: `.await` it, or
-/// use [`when_done`](Io::when_done) or [`send`](Io::send). A future takes
-/// the model's first item; a callback or channel gets every item.
+/// use [`when_done`](Io::when_done) or [`send`](Io::send).
+/// [`runnable!`](crate::runnable) gives a model type those methods directly.
 ///
 /// ```
 /// use lio::api::{self, ops};
 /// use lio::backend::testing::ScriptedBackend;
-/// use lio::model::{Cx, OpModel, Step};
+/// use lio::model::{Cx, OpModel};
+/// use std::task::{Poll, ready};
 ///
 /// /// Two nops, one after the other.
 /// struct TwoNops(u8, ops::Nop);
@@ -81,14 +82,14 @@ use std::time::Duration;
 /// impl OpModel for TwoNops {
 ///   type Item = std::io::Result<()>;
 ///
-///   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+///   fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
 ///     loop {
-///       if let Err(err) = lio::ready!(self.1.poll(cx)) {
-///         return Step::Done(Err(err));
+///       if let Err(err) = ready!(self.1.poll(cx)) {
+///         return Poll::Ready(Err(err));
 ///       }
 ///       self.0 += 1;
 ///       if self.0 == 2 {
-///         return Step::Done(Ok(()));
+///         return Poll::Ready(Ok(()));
 ///       }
 ///       self.1 = api::nop();
 ///     }
@@ -105,13 +106,15 @@ pub fn run<M: crate::model::OpModel>(model: M) -> Io<M> {
   Io::from_op(model)
 }
 
-/// Runs a model of your own that produces several items, as a stream.
+/// Runs a stream of your own, the way lio's streams are run.
 ///
-/// Every [`Step::Yield`](crate::model::Step::Yield) is one item of the
-/// stream and a [`Step::Done`](crate::model::Step::Done) is its last. The
-/// model starts on the first [`next`](IoStream::next), and stops when the
-/// stream is dropped.
-pub fn run_stream<M: crate::model::OpModel + 'static>(model: M) -> IoStream<M> {
+/// Nothing happens until the returned [`IoStream`] is consumed:
+/// [`start`](IoStream::start) it for a handle to take items from, or use
+/// [`send`](IoStream::send). [`streamable!`](crate::streamable) gives a
+/// stream type those methods directly.
+pub fn run_stream<S: crate::model::OpStream + 'static>(
+  model: S,
+) -> IoStream<S> {
   IoStream::from_op(model)
 }
 

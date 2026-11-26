@@ -25,11 +25,12 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::task::{Poll, ready};
 use std::time::Duration;
 
+use crate::api::Pid;
 use crate::api::op::{Action, Completion, CompletionFlags};
 use crate::api::resource::Resource;
-use crate::api::{IoStream, Pid};
 use crate::backend::op::{
   FileMode, FileStat, MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, OpenFlags,
   RawBuf, RawBufMut, ReadDirBuf, ReadFlags, RecvFlags, SendFlags, ShutdownHow,
@@ -37,11 +38,9 @@ use crate::backend::op::{
   StatTarget, UnlinkKind, WriteFlags, is_valid_file_offset,
   socket_addr_from_buf,
 };
-use crate::model::{Cx, OpModel, Step, Ticket};
+use crate::model::{Cx, OpModel, OpStream, Ticket};
 use crate::registration::Regions;
-use crate::{
-  BufResult, Initialized, IoBufMutVec, IoBufVec, IoSlicesMut, ready,
-};
+use crate::{BufResult, Initialized, IoBufMutVec, IoBufVec, IoSlicesMut};
 
 pub use crate::backend::op::LinkKind;
 
@@ -229,24 +228,20 @@ impl Interval {
   pub fn period(&self) -> Duration {
     self.period
   }
-
-  /// The ticks as a stream, one per [`next`](IoStream::next). It stops
-  /// when the stream is dropped.
-  pub fn stream(self) -> IoStream<Self> {
-    IoStream::from_op(self)
-  }
 }
 
-impl OpModel for Interval {
+impl OpStream for Interval {
   type Item = io::Result<()>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<Self::Item>> {
     let tick = ready!(self.sleep.poll(cx));
     // The next period starts when this item has been delivered.
     self.sleep = Sleep::new(self.period);
-    Step::Yield(tick)
+    Poll::Ready(Some(tick))
   }
 }
+
+streamable!([] Interval);
 
 // ============================================================================
 // Sockets
@@ -1429,8 +1424,9 @@ mod tests {
     let sink = Rc::clone(&ticks);
     let interval = Interval::new(Duration::from_millis(5));
     assert_eq!(interval.period(), Duration::from_millis(5));
-    let task =
-      model::spawn(&lio, interval, move |tick| sink.borrow_mut().push(tick));
+    let task = model::spawn_stream(&lio, interval, move |tick| {
+      sink.borrow_mut().push(tick)
+    });
     for _ in 0..3 {
       lio.advance_time_by_ticks(10);
       lio.try_run().unwrap();

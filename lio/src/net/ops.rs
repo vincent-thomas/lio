@@ -19,6 +19,7 @@
 //!   create/connect operations, also used for Unix domain sockets
 //! - [`UnixAccept`]: Accept operation that returns a [`UnixStream`]
 
+use std::task::{Poll, ready};
 use std::{io, marker::PhantomData, net::SocketAddr};
 
 #[allow(unused_imports)] // TcpListener used in doc links
@@ -30,9 +31,8 @@ use crate::{
   backend::op::{
     SockDomain, SockProto, SockType, SocketAddrBuf, socket_addr_into_buf,
   },
-  model::{Cx, OpModel, Step},
+  model::{Cx, OpModel},
   net::{Socket, TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream},
-  ready,
 };
 
 fn ip_domain(addr: &SocketAddr) -> SockDomain {
@@ -61,8 +61,8 @@ runnable!([] SocketAccept);
 impl OpModel for SocketAccept {
   type Item = io::Result<(Socket, SocketAddr)>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-    Step::Done(
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+    Poll::Ready(
       ready!(self.inner.poll(cx))
         .map(|(resource, addr)| (Socket::from_resource(resource), addr)),
     )
@@ -95,8 +95,8 @@ runnable!([] SocketNew);
 impl OpModel for SocketNew {
   type Item = io::Result<Socket>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-    Step::Done(ready!(self.inner.poll(cx)).map(Socket::from_resource))
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+    Poll::Ready(ready!(self.inner.poll(cx)).map(Socket::from_resource))
   }
 }
 
@@ -116,8 +116,8 @@ runnable!([] TcpAccept);
 impl OpModel for TcpAccept {
   type Item = io::Result<(TcpStream, SocketAddr)>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-    Step::Done(
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+    Poll::Ready(
       ready!(self.inner.poll(cx))
         .map(|(resource, addr)| (TcpStream::from_resource(resource), addr)),
     )
@@ -180,7 +180,7 @@ runnable!([T: FromResource + 'static] BindListener<T>);
 impl<T: FromResource + 'static> OpModel for BindListener<T> {
   type Item = io::Result<T>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
     loop {
       self.state = match &mut self.state {
         BindListenerState::Socket(socket) => match ready!(socket.poll(cx)) {
@@ -188,7 +188,7 @@ impl<T: FromResource + 'static> OpModel for BindListener<T> {
             bind: ops::Bind::new(resource.clone(), self.addr),
             resource,
           },
-          Err(err) => return Step::Done(Err(err)),
+          Err(err) => return Poll::Ready(Err(err)),
         },
         BindListenerState::Bind { resource, bind } => {
           match ready!(bind.poll(cx)) {
@@ -196,12 +196,12 @@ impl<T: FromResource + 'static> OpModel for BindListener<T> {
               listen: ops::Listen::new(resource.clone(), 128),
               resource: resource.clone(),
             },
-            Err(err) => return Step::Done(Err(err)),
+            Err(err) => return Poll::Ready(Err(err)),
           }
         }
         BindListenerState::Listen { resource, listen } => {
           let listening = ready!(listen.poll(cx));
-          return Step::Done(
+          return Poll::Ready(
             listening.map(|()| T::from_resource(resource.clone())),
           );
         }
@@ -240,7 +240,7 @@ impl Connecting {
 impl OpModel for Connecting {
   type Item = io::Result<Resource>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
     loop {
       match &mut self.state {
         ConnectingState::Socket(socket) => match ready!(socket.poll(cx)) {
@@ -250,11 +250,11 @@ impl OpModel for Connecting {
               resource,
             };
           }
-          Err(err) => return Step::Done(Err(err)),
+          Err(err) => return Poll::Ready(Err(err)),
         },
         ConnectingState::Connect { resource, connect } => {
           let connected = ready!(connect.poll(cx));
-          return Step::Done(connected.map(|()| resource.clone()));
+          return Poll::Ready(connected.map(|()| resource.clone()));
         }
       }
     }
@@ -304,8 +304,8 @@ runnable!([T: FromResource + 'static] StreamConnect<T>);
 impl<T: FromResource + 'static> OpModel for StreamConnect<T> {
   type Item = io::Result<T>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-    Step::Done(ready!(self.inner.poll(cx)).map(T::from_resource))
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+    Poll::Ready(ready!(self.inner.poll(cx)).map(T::from_resource))
   }
 }
 
@@ -328,8 +328,8 @@ runnable!([] UnixAccept);
 impl OpModel for UnixAccept {
   type Item = io::Result<UnixStream>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-    Step::Done(
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+    Poll::Ready(
       ready!(self.inner.poll(cx))
         .map(|(resource, _peer)| UnixStream::from_resource(resource)),
     )
@@ -365,7 +365,7 @@ runnable!([] UdpBindSocket);
 impl OpModel for UdpBindSocket {
   type Item = io::Result<UdpSocket>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
     loop {
       match &mut self.state {
         UdpBindState::Socket(socket) => match ready!(socket.poll(cx)) {
@@ -378,11 +378,11 @@ impl OpModel for UdpBindSocket {
               resource,
             };
           }
-          Err(err) => return Step::Done(Err(err)),
+          Err(err) => return Poll::Ready(Err(err)),
         },
         UdpBindState::Bind { resource, bind } => {
           let bound = ready!(bind.poll(cx));
-          return Step::Done(
+          return Poll::Ready(
             bound.map(|()| UdpSocket::from_resource(resource.clone())),
           );
         }
@@ -414,7 +414,7 @@ runnable!([] UdpConnectSocket);
 impl OpModel for UdpConnectSocket {
   type Item = io::Result<UdpSocket>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-    Step::Done(ready!(self.inner.poll(cx)).map(UdpSocket::from_resource))
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+    Poll::Ready(ready!(self.inner.poll(cx)).map(UdpSocket::from_resource))
   }
 }

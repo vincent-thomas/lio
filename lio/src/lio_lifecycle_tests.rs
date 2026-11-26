@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
+use std::task::{Poll, ready};
 use std::time::Duration;
 
 use crate::Lio;
@@ -27,7 +28,7 @@ use crate::api::resource::Resource;
 use crate::api::{Io, IoStream};
 use crate::backend::op::Op;
 use crate::backend::testing::{Checked, ScriptedBackend};
-use crate::model::{Cx, OpModel, Step, Ticket};
+use crate::model::{Cx, OpModel, OpStream, Ticket};
 
 /// A stream ends after this many items, or at its first error.
 const STREAM_ITEMS: u32 = 3;
@@ -70,21 +71,25 @@ struct TaggedStream {
   tag: u32,
   completions: u32,
   step: Tagged,
+  ended: bool,
   _log: DropLog,
 }
 
-impl OpModel for TaggedStream {
+impl OpStream for TaggedStream {
   type Item = (u32, isize);
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-    let item = crate::ready!(self.step.poll(cx));
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<Self::Item>> {
+    if self.ended {
+      return Poll::Ready(None);
+    }
+    let item = ready!(self.step.poll(cx));
     self.completions += 1;
     if item.1 >= 0 && self.completions < STREAM_ITEMS {
       self.step = Tagged::new(self.tag, None);
-      Step::Yield(item)
     } else {
-      Step::Done(item)
+      self.ended = true;
     }
+    Poll::Ready(Some(item))
   }
 }
 
@@ -202,6 +207,7 @@ impl Harness {
       tag: index as u32,
       completions: 0,
       step: Tagged::new(index as u32, None),
+      ended: false,
       _log: self.log(index),
     }
   }
@@ -298,7 +304,7 @@ impl Harness {
       }
       Kind::Stream => {
         let mut stream =
-          IoStream::from_op(self.tagged_stream(index)).with_lio(&lio);
+          IoStream::from_op(self.tagged_stream(index)).with_lio(&lio).start();
         Some(Box::pin(async move {
           while let Some((_, result)) = stream.next().await {
             delivered.borrow_mut().push(Delivered::Io(result));

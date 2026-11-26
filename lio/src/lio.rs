@@ -4,7 +4,7 @@ use crate::{
     IoBackend, OpCompleted,
     store::{Detached, OpStore},
   },
-  model::{Cx, OpModel},
+  model::{Cx, Drive},
   registration::{Abandon, AfterPoll, RawTask, Registration},
   time::TimeManager,
 };
@@ -482,7 +482,7 @@ impl Lio {
   /// Over capacity it waits in a queue (see [`Lio::is_full`]).
   pub(crate) fn spawn<M, F>(&self, model: M, sink: F) -> Spawned
   where
-    M: OpModel + 'static,
+    M: Drive + 'static,
     F: FnMut(M::Item) -> bool + 'static,
   {
     let mut inner = self.inner.borrow_mut();
@@ -530,7 +530,7 @@ impl Lio {
   /// Moves a model into a free slot. The store must have one.
   fn insert_task<M, F>(inner: &mut LioInner, model: M, sink: F) -> u64
   where
-    M: OpModel + 'static,
+    M: Drive + 'static,
     F: FnMut(M::Item) -> bool + 'static,
   {
     let inserted = inner.store.insert_submitting(
@@ -2064,7 +2064,8 @@ mod tests {
   }
 
   use crate::api::ops::{Nop, Sleep};
-  use crate::model::{Cx, Join, Step};
+  use crate::model::{Cx, Join, OpModel};
+  use std::task::{Poll, ready};
 
   /// Counts the models that finished.
   fn counting(count: &Rc<Cell<usize>>) -> impl FnMut(()) -> bool + 'static {
@@ -2081,8 +2082,8 @@ mod tests {
   impl OpModel for Now {
     type Item = ();
 
-    fn poll(&mut self, _: &mut Cx<'_>) -> Step<()> {
-      Step::Done(())
+    fn poll(&mut self, _: &mut Cx<'_>) -> Poll<()> {
+      Poll::Ready(())
     }
   }
 
@@ -2137,13 +2138,13 @@ mod tests {
   impl OpModel for NopTwice {
     type Item = ();
 
-    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
+    fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<()> {
       if let Some(first) = self.first.as_mut() {
-        let _ = crate::ready!(first.poll(cx));
+        let _ = ready!(first.poll(cx));
         self.first = None;
       }
-      let _ = crate::ready!(self.second.poll(cx));
-      Step::Done(())
+      let _ = ready!(self.second.poll(cx));
+      Poll::Ready(())
     }
   }
 
@@ -2214,12 +2215,12 @@ mod tests {
   impl OpModel for Fickle {
     type Item = ();
 
-    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
+    fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<()> {
       if let Some(mut nop) = self.given_up.take() {
-        assert!(matches!(nop.poll(cx), Step::Pending));
+        assert!(matches!(nop.poll(cx), Poll::Pending));
       }
-      let _ = crate::ready!(self.kept.poll(cx));
-      Step::Done(())
+      let _ = ready!(self.kept.poll(cx));
+      Poll::Ready(())
     }
   }
 

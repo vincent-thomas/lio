@@ -9,13 +9,13 @@ use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Wake, Waker, ready};
 use std::time::Duration;
 
-use lio::api::IoStream;
 use lio::api::resource::Resource;
+use lio::api::{IoStream, Items};
 use lio::backend::testing::{Checked, POISON, ScriptedBackend};
-use lio::model::{Cx, OpModel, Step};
+use lio::model::{Cx, OpModel, OpStream};
 use lio::{IoBuf, Lio, api};
 
 /// A write buffer that reports being dropped. A write owns its buffer, so
@@ -159,18 +159,18 @@ impl Endless {
   }
 }
 
-impl OpModel for Endless {
+impl OpStream for Endless {
   type Item = ();
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
-    let _ = lio::ready!(self.0.poll(cx));
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<()>> {
+    let _ = ready!(self.0.poll(cx));
     self.0 = api::nop();
-    Step::Yield(())
+    Poll::Ready(Some(()))
   }
 }
 
 /// Drops the stream it holds when woken.
-struct DropOnWake(RefCell<Option<IoStream<Endless>>>);
+struct DropOnWake(RefCell<Option<Items<Endless>>>);
 
 // SAFETY: the test drives everything on one thread.
 unsafe impl Send for DropOnWake {}
@@ -191,7 +191,7 @@ fn stream_dropped_by_its_wake_up_is_not_resubmitted() {
   let holder = Arc::new(DropOnWake(RefCell::new(None)));
   let waker = Waker::from(holder.clone());
   let mut cx = Context::from_waker(&waker);
-  let mut stream = IoStream::from_op(Endless::new()).with_lio(&lio);
+  let mut stream = IoStream::from_op(Endless::new()).with_lio(&lio).start();
   {
     let mut next = Box::pin(stream.next());
     assert!(next.as_mut().poll(&mut cx).is_pending());
@@ -240,7 +240,7 @@ fn stream_on_the_global_lio_cancels_on_the_driver_it_ran_on() {
   let first = Lio::new(1).unwrap();
   let guard = lio::install_global(first.clone());
   // Submitted through the global, so on `first`.
-  let mut stream = api::interval(Duration::from_secs(3600)).stream();
+  let mut stream = api::interval(Duration::from_secs(3600)).start();
   let mut next = Box::pin(stream.next());
   let mut cx = Context::from_waker(Waker::noop());
   assert!(next.as_mut().poll(&mut cx).is_pending());

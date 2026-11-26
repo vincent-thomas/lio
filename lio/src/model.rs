@@ -1,8 +1,10 @@
 //! Operation models: I/O work the driver runs by polling it.
 //!
-//! An [`OpModel`] is a state machine that describes a piece of I/O work. The
-//! driver asks it one question, [`poll`](OpModel::poll): given what has
-//! finished so far, can you make progress?
+//! An [`OpModel`] is a state machine that describes a piece of I/O work with
+//! one result. The driver asks it one question, [`poll`](OpModel::poll):
+//! given what has finished so far, can you make progress? It answers with
+//! std's [`Poll`], as a future does. An [`OpStream`] is the same for work
+//! that produces several items.
 //!
 //! - Every single operation in [`api`](crate::api) is a model (a *leaf*).
 //!   Polling it submits the operation, with the buffer it owns, to the
@@ -16,16 +18,18 @@
 //! is to poll one of lio's leaves, and a leaf only produces the result of
 //! the operation it started.
 //!
-//! [`api::run`](crate::api::run) runs a model of yours the way lio's own
-//! are run, and [`api::run_stream`](crate::api::run_stream) runs one that
-//! yields. [`spawn`] here takes the driver and a callback, and gives you a
+//! [`runnable!`](crate::runnable) gives a model of yours the ways lio's own
+//! are run (`.await`, `when_done`, `send`, `send_with`, `with_lio`), and
+//! [`streamable!`](crate::streamable) does the same for a stream. [`spawn`]
+//! and [`spawn_stream`] here take the driver and a callback, and give you a
 //! handle to cancel by.
 //!
 //! ```
 //! use lio::Lio;
 //! use lio::api::{self, ops, resource::Resource};
 //! use lio::backend::testing::ScriptedBackend;
-//! use lio::model::{self, Cx, OpModel, Step};
+//! use lio::model::{self, Cx, OpModel};
+//! use std::task::{Poll, ready};
 //!
 //! /// Reads twice from the same resource, one read after the other.
 //! struct ReadTwice {
@@ -37,15 +41,15 @@
 //! impl OpModel for ReadTwice {
 //!   type Item = std::io::Result<usize>;
 //!
-//!   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+//!   fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
 //!     loop {
-//!       let (result, buf) = lio::ready!(self.read.poll(cx));
+//!       let (result, buf) = ready!(self.read.poll(cx));
 //!       let n = match result {
 //!         Ok(n) => n,
-//!         Err(err) => return Step::Done(Err(err)),
+//!         Err(err) => return Poll::Ready(Err(err)),
 //!       };
 //!       match self.first {
-//!         Some(first) => return Step::Done(Ok(first + n)),
+//!         Some(first) => return Poll::Ready(Ok(first + n)),
 //!         None => {
 //!           self.first = Some(n);
 //!           self.read = api::read(&self.from, buf);
@@ -90,7 +94,11 @@ use crate::registration::{
   ActionFn, CompleteFn, LendFn, Registration, ReturnFn,
 };
 
-/// A piece of I/O work the driver runs by polling it.
+/// A piece of I/O work that produces one result, run by polling it.
+///
+/// It is to the driver what a [`Future`] is to an executor, and `poll`
+/// reports the same way: [`Poll::Pending`], or [`Poll::Ready`] with the
+/// result. [`std::task::ready!`] works on it.
 pub trait OpModel {
   /// What the model produces.
   type Item;
@@ -103,37 +111,91 @@ pub trait OpModel {
   ///
   /// # Panics
   ///
-  /// A model may panic when polled after it returned [`Step::Done`].
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item>;
+  /// A model may panic when polled after it returned [`Poll::Ready`].
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item>;
 }
 
-/// What one [`OpModel::poll`] call reports.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Step<T> {
-  /// Nothing to report. The model is polled again when something it
-  /// submitted finishes.
-  Pending,
-  /// One item, with more to come. The model is polled again right away.
-  Yield(T),
-  /// The last item. The model is dropped.
-  Done(T),
-}
-
-/// Takes the item out of a [`Step`], or returns [`Step::Pending`] from the
-/// surrounding [`OpModel::poll`].
+/// A piece of I/O work that produces several items, one after another.
 ///
-/// For a child that produces one item. A [`Step::Yield`] is unwrapped the
-/// same way as a [`Step::Done`].
-#[macro_export]
-macro_rules! ready {
-  ($step:expr) => {
-    match $step {
-      $crate::model::Step::Pending => return $crate::model::Step::Pending,
-      $crate::model::Step::Yield(item) | $crate::model::Step::Done(item) => {
-        item
-      }
+/// It is to [`OpModel`] what a stream is to a future. The two are separate
+/// traits so that the compiler rejects a stream where one result is
+/// expected, in a [`Join`] say, and a single result where a stream is.
+///
+/// ```compile_fail
+/// use lio::api;
+/// use lio::model::Join;
+/// use std::time::Duration;
+///
+/// // An interval never has "a result" for the join to wait for.
+/// let _ = Join::new(api::interval(Duration::from_secs(1)), api::nop());
+/// ```
+///
+/// Starting a stream consumes it, so a running one cannot be started again
+/// or handed on as if it had not run:
+///
+/// ```compile_fail
+/// use lio::api;
+/// use std::time::Duration;
+///
+/// let ticks = api::interval(Duration::from_secs(1)).start();
+/// let _ = ticks.send();
+/// ```
+pub trait OpStream {
+  /// What the stream produces, each time.
+  type Item;
+
+  /// Makes as much progress as possible without waiting.
+  ///
+  /// `Ready(Some(item))` is one item, and the stream is polled again right
+  /// away. `Ready(None)` ends it: it is dropped, and not polled again.
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<Self::Item>>;
+}
+
+/// What the driver is told when it polls what runs in a slot.
+pub(crate) enum Step<T> {
+  /// Nothing to report.
+  Pending,
+  /// One item, with more to come: poll again right away.
+  Yield(T),
+  /// The last item.
+  Done(T),
+  /// No further item.
+  End,
+}
+
+/// What a slot can run: an [`OpModel`], or an [`OpStream`] in a [`Many`].
+pub(crate) trait Drive {
+  type Item;
+
+  fn drive(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item>;
+}
+
+impl<M: OpModel> Drive for M {
+  type Item = M::Item;
+
+  #[inline]
+  fn drive(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    match self.poll(cx) {
+      Poll::Ready(item) => Step::Done(item),
+      Poll::Pending => Step::Pending,
     }
-  };
+  }
+}
+
+/// A stream, for a slot to run.
+pub(crate) struct Many<S>(pub(crate) S);
+
+impl<S: OpStream> Drive for Many<S> {
+  type Item = S::Item;
+
+  #[inline]
+  fn drive(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    match self.0.poll_next(cx) {
+      Poll::Ready(Some(item)) => Step::Yield(item),
+      Poll::Ready(None) => Step::End,
+      Poll::Pending => Step::Pending,
+    }
+  }
 }
 
 /// The driver's side of one [`OpModel::poll`] call.
@@ -273,7 +335,7 @@ impl Task {
   }
 }
 
-/// Runs `model` on `lio`, calling `on_item` with every item it produces.
+/// Runs `model` on `lio`, calling `on_done` with its result.
 ///
 /// The model moves into the driver, which polls it for the first time here
 /// and then whenever one of its operations finishes, while `lio` runs.
@@ -281,25 +343,43 @@ impl Task {
 pub fn spawn<M>(
   lio: &Lio,
   model: M,
-  mut on_item: impl FnMut(M::Item) + 'static,
+  mut on_done: impl FnMut(M::Item) + 'static,
 ) -> Task
 where
   M: OpModel + 'static,
 {
   spawn_while(lio, model, move |item| {
+    on_done(item);
+    true
+  })
+}
+
+/// Runs `stream` on `lio`, calling `on_item` with every item it produces.
+///
+/// As [`spawn`], for work that produces several items. It runs until it
+/// ends or the handle cancels it.
+pub fn spawn_stream<S>(
+  lio: &Lio,
+  stream: S,
+  mut on_item: impl FnMut(S::Item) + 'static,
+) -> Task
+where
+  S: OpStream + 'static,
+{
+  spawn_while(lio, Many(stream), move |item| {
     on_item(item);
     true
   })
 }
 
-/// [`spawn`] that stops the model once `on_item` returns `false`.
+/// Runs what a slot can run, until it is done or `on_item` returns `false`.
 pub(crate) fn spawn_while<M>(
   lio: &Lio,
   model: M,
   on_item: impl FnMut(M::Item) -> bool + 'static,
 ) -> Task
 where
-  M: OpModel + 'static,
+  M: Drive + 'static,
 {
   Task { lio: lio.downgrade(), spawned: lio.spawn(model, on_item) }
 }
@@ -418,17 +498,17 @@ impl<Req, Out> Leaf<Req, Out> {
     &mut self,
     cx: &mut Cx<'_>,
     submit: impl FnOnce(&mut Cx<'_>, Req) -> Ticket<Out>,
-  ) -> Step<Out> {
+  ) -> Poll<Out> {
     let mut ticket = match std::mem::replace(self, Leaf::Done) {
       Leaf::Idle(request) => submit(cx, request),
       Leaf::InFlight(ticket) => ticket,
       Leaf::Done => panic!("operation polled after it was done"),
     };
     match cx.take(&mut ticket) {
-      Some(out) => Step::Done(out),
+      Some(out) => Poll::Ready(out),
       None => {
         *self = Leaf::InFlight(ticket);
-        Step::Pending
+        Poll::Pending
       }
     }
   }
@@ -457,7 +537,7 @@ enum Side<M: OpModel> {
 impl<M: OpModel> Side<M> {
   fn poll(&mut self, cx: &mut Cx<'_>) {
     if let Side::Running(model) = self
-      && let Step::Yield(item) | Step::Done(item) = model.poll(cx)
+      && let Poll::Ready(item) = model.poll(cx)
     {
       *self = Side::Finished(item);
     }
@@ -475,17 +555,17 @@ runnable!([A: OpModel, B: OpModel] Join<A, B>);
 impl<A: OpModel, B: OpModel> OpModel for Join<A, B> {
   type Item = (A::Item, B::Item);
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
     self.a.poll(cx);
     self.b.poll(cx);
     if !matches!((&self.a, &self.b), (Side::Finished(_), Side::Finished(_))) {
-      return Step::Pending;
+      return Poll::Pending;
     }
     let a = std::mem::replace(&mut self.a, Side::Taken);
     let b = std::mem::replace(&mut self.b, Side::Taken);
     let (Side::Finished(a), Side::Finished(b)) = (a, b) else {
       unreachable!("both sides were finished above");
     };
-    Step::Done((a, b))
+    Poll::Ready((a, b))
   }
 }

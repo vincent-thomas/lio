@@ -40,7 +40,7 @@ use std::sync::{
   Arc,
   atomic::{AtomicBool, Ordering},
 };
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Wake, Waker, ready};
 use std::time::Duration;
 
 use bumpalo::Bump;
@@ -50,7 +50,7 @@ use criterion::{
 use lio::api::resource::Resource;
 use lio::backend::op::{BorrowedOp, Op};
 use lio::backend::{IoBackend, OpCompleted};
-use lio::model::{Cx, OpModel, Step};
+use lio::model::{Cx, OpModel, OpStream};
 use lio::time::Clock;
 use lio::{Lio, api};
 
@@ -323,16 +323,16 @@ impl SteppedNop {
   }
 }
 
-impl OpModel for SteppedNop {
+impl OpStream for SteppedNop {
   type Item = ();
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<()>> {
     loop {
-      let _ = lio::ready!(self.nop.poll(cx));
+      let _ = ready!(self.nop.poll(cx));
       self.nop = api::nop();
       if self.left == 0 {
         self.left = self.steps;
-        return Step::Yield(());
+        return Poll::Ready(Some(()));
       }
       self.left -= 1;
     }
@@ -357,7 +357,7 @@ fn resubmit(criterion: &mut Criterion) {
   for steps in [0usize, 1, 8] {
     let lio = Lio::new_with_backend(BenchBackend::default(), 1).unwrap();
     let mut stream =
-      api::io::IoStream::from_op(SteppedNop::new(steps)).with_lio(&lio);
+      api::io::IoStream::from_op(SteppedNop::new(steps)).with_lio(&lio).start();
     let ready = Arc::new(NopWaker::default());
     let waker = Waker::from(Arc::clone(&ready));
     let mut cx = Context::from_waker(&waker);

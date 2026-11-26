@@ -1140,7 +1140,6 @@ pub unsafe extern "C" fn lio_interval(
   callback: extern "C" fn(libc::c_int),
 ) {
   let receiver = api::interval(Duration::from_millis(millis as u64))
-    .stream()
     .with_lio(&unsafe { handle(lio) }.inner)
     .send();
   std::thread::spawn(move || {

@@ -20,7 +20,7 @@ use bumpalo::Bump;
 
 use crate::api::op::{Action, Completion};
 use crate::buf::MAX_IOV_COUNT;
-use crate::model::{Cx, OpModel, Step};
+use crate::model::{Cx, Drive, Step};
 
 /// Builds the action an operation submits from the memory it owns.
 ///
@@ -322,7 +322,7 @@ impl Registration {
   /// until the model is done or `sink` returns `false`.
   pub(crate) fn running<M, F>(arena: &mut Bump, model: M, sink: F) -> Self
   where
-    M: OpModel + 'static,
+    M: Drive + 'static,
     F: FnMut(M::Item) -> bool + 'static,
   {
     let payload: &mut TaskPayload<M, F> =
@@ -343,7 +343,7 @@ impl Registration {
 
   fn poll_impl<M, F>(payload: *mut (), cx: &mut Cx<'_>) -> bool
   where
-    M: OpModel,
+    M: Drive,
     F: FnMut(M::Item) -> bool,
   {
     // SAFETY: `payload` was created from a `TaskPayload<M, F>` in `running`
@@ -352,7 +352,7 @@ impl Registration {
     let payload = unsafe { &mut *payload.cast::<TaskPayload<M, F>>() };
     loop {
       let Some(model) = payload.model.as_mut() else { return true };
-      match model.poll(cx) {
+      match model.drive(cx) {
         Step::Pending => return false,
         Step::Yield(item) => {
           let wanted = match payload.sink.as_mut() {
@@ -366,6 +366,11 @@ impl Registration {
             payload.sink = None;
             return true;
           }
+        }
+        Step::End => {
+          payload.model = None;
+          payload.sink = None;
+          return true;
         }
         Step::Done(item) => {
           payload.model = None;
@@ -838,8 +843,10 @@ impl Drop for Registration {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::model::OpModel;
   use std::cell::Cell;
   use std::rc::Rc;
+  use std::task::Poll;
 
   /// Counts its drops.
   struct Counted(Rc<Cell<usize>>);
@@ -878,8 +885,8 @@ mod tests {
   impl OpModel for Now {
     type Item = ();
 
-    fn poll(&mut self, _: &mut Cx<'_>) -> Step<()> {
-      Step::Done(())
+    fn poll(&mut self, _: &mut Cx<'_>) -> Poll<()> {
+      Poll::Ready(())
     }
   }
 
