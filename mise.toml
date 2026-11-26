@@ -3,6 +3,9 @@ rust = [
   { version = "1.100.0", profile = "minimal", components = "clippy,rust-src,rustfmt" },
   { version = "nightly", profile = "minimal", components = "miri,rust-src" },
 ]
+# The cargo: tools below install prebuilt binaries through this.
+# Without it they compile from source.
+cargo-binstall = "latest"
 "cargo:cargo-deny" = "latest"
 "cargo:cargo-mutants" = "latest"
 cmake = "3.28.3"
