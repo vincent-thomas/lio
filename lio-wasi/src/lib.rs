@@ -51,9 +51,9 @@
 //!
 //! ## Status
 //!
-//! `stream<u8>` reads and writes are bound, and two calls: [`fs::OpenAt`]
-//! and [`clock::WaitFor`]. Futures and the other async calls (`stat`,
-//! `connect`, ...) are not yet.
+//! Bound: byte-stream reads and writes, their completion status, timers,
+//! and the `wasi:filesystem` and `wasi:sockets` calls that correspond to an
+//! io_uring operation. See the crate README for the full table.
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
@@ -61,9 +61,18 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use wasip3::wit_bindgen::{StreamReader, StreamWriter};
+use wasip3::wit_stream::StreamPayload;
+
+use sockets::{Accepted, Listener, TcpSocket};
+
+/// The `wasip3` bindings this crate is built on. Use them for the WASI
+/// functions that do not wait and so have no operation here.
+pub use wasip3;
 
 pub mod clock;
 pub mod fs;
+mod reply;
+pub mod sockets;
 mod sys;
 
 use sys::{Event, WaitableSet};
@@ -75,28 +84,57 @@ use sys::{Event, WaitableSet};
 pub trait Call: sealed::Sealed {}
 
 mod sealed {
+  /// What the host answered when an operation started.
+  pub enum Started {
+    /// An async import was called. This is its packed state and subtask
+    /// handle.
+    Subtask(u32),
+    /// A `future` is being read. `code` is the read's result code.
+    Future {
+      handle: u32,
+      code: u32,
+      /// The future type's `cancel-read` built-in.
+      cancel: unsafe extern "C" fn(u32) -> u32,
+    },
+    /// Nothing reached the host; the operation is already done.
+    Done,
+  }
+
   pub trait Sealed {
-    /// Calls the async-lowered import with this operation's argument and
-    /// result storage. Returns the packed state and subtask handle.
+    /// Starts the operation with this value's argument and result storage.
     ///
     /// # Safety
     ///
     /// The operation is not in flight. It stays allocated, unmoved and
-    /// untouched until the call returns or is cancelled.
-    unsafe fn start(&mut self) -> u32;
+    /// untouched until it completes or is cancelled.
+    unsafe fn start(&mut self) -> Started;
   }
 }
 
-/// How an operation ended. For a stream operation, also how many bytes it
-/// moved first.
+use sealed::Started;
+
+/// An operation that does nothing and completes at once.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Nop;
+
+impl Call for Nop {}
+
+impl sealed::Sealed for Nop {
+  unsafe fn start(&mut self) -> Started {
+    Started::Done
+  }
+}
+
+/// How an operation ended. For a stream operation, also how many items it
+/// moved first: bytes, or accepted sockets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
-  /// The operation moved this many bytes and the stream is still open.
+  /// The operation moved this many items and the stream is still open.
   Transferred(usize),
-  /// The other end closed the stream. This many bytes were moved first.
+  /// The other end closed the stream. This many items were moved first.
   /// Later operations on it complete at once with `Closed(0)`.
   Closed(usize),
-  /// The operation was cancelled. This many bytes were moved first. A
+  /// The operation was cancelled. This many items were moved first. A
   /// cancelled call has no result.
   Cancelled(usize),
   /// The call returned. Its result is in the operation value.
@@ -104,7 +142,7 @@ pub enum Outcome {
 }
 
 impl Outcome {
-  /// Bytes moved before the operation ended.
+  /// Items moved before the operation ended.
   pub fn count(&self) -> usize {
     match *self {
       Outcome::Transferred(n) | Outcome::Closed(n) | Outcome::Cancelled(n) => n,
@@ -124,6 +162,16 @@ impl Outcome {
       sys::DROPPED => Outcome::Closed(count),
       sys::CANCELLED => Outcome::Cancelled(count),
       other => unreachable!("unknown stream result code {other:#x}"),
+    })
+  }
+
+  /// Decodes the result code of a `future` read, which moves one value or
+  /// none. `BLOCKED` is not a result.
+  fn decode_future(code: u32) -> Option<Outcome> {
+    Some(match Outcome::decode(code)? {
+      Outcome::Transferred(_) => Outcome::Returned,
+      Outcome::Closed(_) => Outcome::Closed(0),
+      other => other,
     })
   }
 }
@@ -182,18 +230,22 @@ pub struct ReadStream(u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WriteStream(u32);
 
-/// Which end of a stream a handle is.
+/// Which end of a stream a handle is, and of what.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum End {
+  /// The readable end of a `stream<u8>`.
   Readable,
+  /// The writable end of a `stream<u8>`.
   Writable,
+  /// The readable end of a listener's `stream<tcp-socket>`.
+  Accepting,
 }
 
 impl End {
   /// The waitable-set event that ends a blocked operation on this end.
   fn event(self) -> u32 {
     match self {
-      End::Readable => sys::EVENT_STREAM_READ,
+      End::Readable | End::Accepting => sys::EVENT_STREAM_READ,
       End::Writable => sys::EVENT_STREAM_WRITE,
     }
   }
@@ -208,6 +260,17 @@ struct Slot {
   /// The other end closed. The component model traps on another operation
   /// after that, so the queue answers `Closed(0)` itself.
   closed: bool,
+  /// The built-in that cancels this end's operation.
+  cancel: unsafe extern "C" fn(u32) -> u32,
+  /// The built-in that drops this end.
+  drop: unsafe extern "C" fn(u32),
+}
+
+/// A `future` read in flight.
+#[derive(Clone, Copy, Debug)]
+struct FutureRead {
+  user_data: u64,
+  cancel: unsafe extern "C" fn(u32) -> u32,
 }
 
 /// A completion queue for WASI 0.3 operations.
@@ -215,17 +278,20 @@ struct Slot {
 /// The queue owns the stream ends added to it and one `waitable-set`. It is
 /// not `Send`: handles belong to the component instance's single thread.
 pub struct Queue {
-  /// Indexed by stream handle. Both ends share one handle table, and handles
-  /// are small indices into it.
+  /// Indexed by stream handle. Handles are small indices into a table.
   streams: Vec<Option<Slot>>,
-  /// `user_data` of each call in flight, indexed by subtask handle. Kept
-  /// apart from `streams` so the two never rely on sharing a handle table.
+  /// `user_data` of each call in flight, indexed by subtask handle.
+  ///
+  /// Calls, futures and streams are kept in separate tables and told apart
+  /// by the kind of event, so nothing relies on them sharing a handle table.
   calls: Vec<Option<u64>>,
+  /// Future reads in flight, indexed by future handle.
+  futures: Vec<Option<FutureRead>>,
   /// Operations whose result arrives through the waitable set.
   in_flight: usize,
   /// Results that were known without waiting.
   ready: VecDeque<Completion>,
-  /// Declared last: every stream must leave the set before it is dropped.
+  /// Declared last: every waitable must leave the set before it is dropped.
   set: WaitableSet,
 }
 
@@ -240,6 +306,7 @@ impl Queue {
     Self {
       streams: Vec::new(),
       calls: Vec::new(),
+      futures: Vec::new(),
       in_flight: 0,
       ready: VecDeque::with_capacity(cap),
       set: WaitableSet::new(),
@@ -249,7 +316,8 @@ impl Queue {
   /// Takes ownership of the readable end of a byte stream.
   pub fn add_reader(&mut self, reader: StreamReader<u8>) -> ReadStream {
     let handle = reader.take_handle();
-    self.adopt(handle, End::Readable);
+    let ops = sys::byte_stream();
+    self.adopt(handle, End::Readable, ops.cancel_read, ops.drop_readable);
     ReadStream(handle)
   }
 
@@ -259,7 +327,8 @@ impl Queue {
     // The writer has no way to give up its handle. Forgetting it skips the
     // destructor that would drop the handle; it owns no heap memory.
     std::mem::forget(writer);
-    self.adopt(handle, End::Writable);
+    let ops = sys::byte_stream();
+    self.adopt(handle, End::Writable, ops.cancel_write, ops.drop_writable);
     WriteStream(handle)
   }
 
@@ -322,6 +391,52 @@ impl Queue {
     Ok(())
   }
 
+  /// Takes ownership of a listening socket's stream of connections, as
+  /// returned by `TcpSocket::listen`.
+  pub fn add_listener(
+    &mut self,
+    connections: StreamReader<TcpSocket>,
+  ) -> Listener {
+    let handle = connections.take_handle();
+    let ops = <TcpSocket as StreamPayload>::VTABLE;
+    self.adopt(handle, End::Accepting, ops.cancel_read, ops.drop_readable);
+    Listener(handle)
+  }
+
+  /// Starts accepting one connection into `slot`, like `accept`.
+  ///
+  /// The accept's [`Completion`] carries `user_data`. It reports
+  /// [`Outcome::Transferred(1)`](Outcome::Transferred) when a connection
+  /// arrived; take it with [`Accepted::socket`].
+  ///
+  /// # Safety
+  ///
+  /// `slot` stays allocated and unmoved, and nothing else reads or writes
+  /// it, until this accept's completion has been returned.
+  pub unsafe fn push_accept(
+    &mut self,
+    listener: Listener,
+    slot: &mut Accepted,
+    user_data: u64,
+  ) -> Result<(), Error> {
+    if !self.begin(listener.0, End::Accepting, user_data)? {
+      return Ok(());
+    }
+    let ops = <TcpSocket as StreamPayload>::VTABLE;
+    // SAFETY: the handle is an open listener with no accept in flight, and
+    // the caller vouches for `slot`, which holds one socket handle.
+    let code = unsafe { (ops.start_read)(listener.0, slot.arm(), 1) };
+    self.started(listener.0, user_data, code);
+    Ok(())
+  }
+
+  /// Stops listening, cancelling the accept in flight if there is one.
+  ///
+  /// A cancelled accept still produces its completion.
+  pub fn close_listener(&mut self, listener: Listener) -> Result<(), Error> {
+    self.close(listener.0, End::Accepting)
+  }
+
   /// Starts a WASI call.
   ///
   /// The call's [`Completion`] carries `user_data` and comes from a later
@@ -336,26 +451,20 @@ impl Queue {
   /// returned. What it borrows (a path, a descriptor) outlives that too.
   pub unsafe fn push_call<C: Call>(&mut self, call: &mut C, user_data: u64) {
     // SAFETY: the caller vouches for `call`.
-    let packed = unsafe { sealed::Sealed::start(call) };
-    let subtask = packed >> 4;
-    match packed & 0xf {
-      sys::STATUS_RETURNED => {
-        if subtask != 0 {
-          sys::subtask_drop(subtask);
+    match unsafe { sealed::Sealed::start(call) } {
+      Started::Done => self.complete(user_data, Outcome::Returned),
+      Started::Subtask(packed) => self.started_call(packed, user_data),
+      Started::Future { handle, code, cancel } => {
+        match Outcome::decode_future(code) {
+          Some(outcome) => self.complete(user_data, outcome),
+          None => {
+            let read = FutureRead { user_data, cancel };
+            set_slot(&mut self.futures, handle, read);
+            self.set.join(handle);
+            self.in_flight += 1;
+          }
         }
-        let outcome = Outcome::Returned;
-        self.ready.push_back(Completion { user_data, outcome });
       }
-      sys::STATUS_STARTING | sys::STATUS_STARTED => {
-        let index = subtask as usize;
-        if self.calls.len() <= index {
-          self.calls.resize(index + 1, None);
-        }
-        self.calls[index] = Some(user_data);
-        self.set.join(subtask);
-        self.in_flight += 1;
-      }
-      other => unreachable!("a call started in unknown state {other:#x}"),
     }
   }
 
@@ -363,21 +472,27 @@ impl Queue {
   ///
   /// Returns whether one was found. Its completion is queued before this
   /// returns: [`Outcome::Cancelled`], or the operation's own outcome if it
-  /// finished first. The host no longer uses the operation's buffer.
+  /// finished first. The host no longer uses the operation's memory.
   ///
   /// An operation that already finished is not found; its completion is
   /// already queued or returned.
   pub fn cancel(&mut self, user_data: u64) -> bool {
-    let found = self.streams.iter().position(|slot| {
+    // Each index below came from a `u32` handle.
+    let stream = self.streams.iter().position(|slot| {
       slot.is_some_and(|slot| slot.pending == Some(user_data))
     });
-    // The index came from a `u32` handle when the stream was added.
-    if let Some(index) = found {
-      return self.cancel_handle(index as u32);
+    if let Some(index) = stream {
+      return self.cancel_stream(index as u32);
     }
-    let found = self.calls.iter().position(|call| *call == Some(user_data));
-    // The index came from a `u32` handle when the call started.
-    found.is_some_and(|index| self.cancel_call(index as u32))
+    let call = self.calls.iter().position(|call| *call == Some(user_data));
+    if let Some(index) = call {
+      return self.cancel_call(index as u32);
+    }
+    let future = self
+      .futures
+      .iter()
+      .position(|read| read.is_some_and(|read| read.user_data == user_data));
+    future.is_some_and(|index| self.cancel_future(index as u32))
   }
 
   /// Closes the readable end, cancelling its read first if one is in flight.
@@ -439,12 +554,15 @@ impl Queue {
     }
   }
 
-  fn adopt(&mut self, handle: u32, end: End) {
-    let index = handle as usize;
-    if self.streams.len() <= index {
-      self.streams.resize(index + 1, None);
-    }
-    self.streams[index] = Some(Slot { end, pending: None, closed: false });
+  fn adopt(
+    &mut self,
+    handle: u32,
+    end: End,
+    cancel: unsafe extern "C" fn(u32) -> u32,
+    drop: unsafe extern "C" fn(u32),
+  ) {
+    let slot = Slot { end, pending: None, closed: false, cancel, drop };
+    set_slot(&mut self.streams, handle, slot);
   }
 
   /// The slot for `handle`, if the queue owns it as an `end`.
@@ -455,6 +573,11 @@ impl Queue {
       .and_then(Option::as_mut)
       .filter(|slot| slot.end == end)
       .ok_or(Error::UnknownStream)
+  }
+
+  /// Queues a completion that needs no waiting.
+  fn complete(&mut self, user_data: u64, outcome: Outcome) {
+    self.ready.push_back(Completion { user_data, outcome });
   }
 
   /// Checks that an operation may start on `handle`.
@@ -472,14 +595,13 @@ impl Queue {
       return Err(Error::Busy);
     }
     if slot.closed {
-      let outcome = Outcome::Closed(0);
-      self.ready.push_back(Completion { user_data, outcome });
+      self.complete(user_data, Outcome::Closed(0));
       return Ok(false);
     }
     Ok(true)
   }
 
-  /// Records what the host answered when an operation started.
+  /// Records what the host answered when a stream operation started.
   fn started(&mut self, handle: u32, user_data: u64, code: u32) {
     let Some(Some(slot)) = self.streams.get_mut(handle as usize) else {
       unreachable!("an operation started on a stream with no slot")
@@ -487,7 +609,7 @@ impl Queue {
     match Outcome::decode(code) {
       Some(outcome) => {
         slot.closed |= matches!(outcome, Outcome::Closed(_));
-        self.ready.push_back(Completion { user_data, outcome });
+        self.complete(user_data, outcome);
       }
       None => {
         slot.pending = Some(user_data);
@@ -497,9 +619,28 @@ impl Queue {
     }
   }
 
-  /// Cancels the operation in flight on `handle`. Returns whether there was
+  /// Records what the host answered when an async import was called.
+  fn started_call(&mut self, packed: u32, user_data: u64) {
+    let subtask = packed >> 4;
+    match packed & 0xf {
+      sys::STATUS_RETURNED => {
+        if subtask != 0 {
+          sys::subtask_drop(subtask);
+        }
+        self.complete(user_data, Outcome::Returned);
+      }
+      sys::STATUS_STARTING | sys::STATUS_STARTED => {
+        set_slot(&mut self.calls, subtask, user_data);
+        self.set.join(subtask);
+        self.in_flight += 1;
+      }
+      other => unreachable!("a call started in unknown state {other:#x}"),
+    }
+  }
+
+  /// Cancels the operation in flight on a stream. Returns whether there was
   /// one.
-  fn cancel_handle(&mut self, handle: u32) -> bool {
+  fn cancel_stream(&mut self, handle: u32) -> bool {
     let Some(Some(slot)) = self.streams.get_mut(handle as usize) else {
       return false;
     };
@@ -510,38 +651,16 @@ impl Queue {
     // host traps. Leaving first is safe, because the cancel below returns
     // the operation's result itself and no event follows.
     WaitableSet::leave(handle);
-    let ops = sys::byte_stream();
     // SAFETY: the handle is an open end of this kind with an operation in
     // flight.
-    let code = unsafe {
-      match slot.end {
-        End::Readable => (ops.cancel_read)(handle),
-        End::Writable => (ops.cancel_write)(handle),
-      }
-    };
+    let code = unsafe { (slot.cancel)(handle) };
     let Some(outcome) = Outcome::decode(code) else {
       unreachable!("a synchronous stream cancel returned BLOCKED")
     };
     slot.closed |= matches!(outcome, Outcome::Closed(_));
     self.in_flight -= 1;
-    self.ready.push_back(Completion { user_data, outcome });
+    self.complete(user_data, outcome);
     true
-  }
-
-  fn close(&mut self, handle: u32, end: End) -> Result<(), Error> {
-    self.slot_mut(handle, end)?;
-    self.cancel_handle(handle);
-    self.streams[handle as usize] = None;
-    let ops = sys::byte_stream();
-    // SAFETY: the handle is an open end of this kind with nothing in flight,
-    // and its slot is gone, so it is dropped once.
-    unsafe {
-      match end {
-        End::Readable => (ops.drop_readable)(handle),
-        End::Writable => (ops.drop_writable)(handle),
-      }
-    }
-    Ok(())
   }
 
   /// Cancels the call in flight on `subtask`. Returns whether there was
@@ -563,17 +682,47 @@ impl Queue {
     };
     sys::subtask_drop(subtask);
     self.in_flight -= 1;
-    self.ready.push_back(Completion { user_data, outcome });
+    self.complete(user_data, outcome);
     true
+  }
+
+  /// Cancels the read in flight on a future. Returns whether there was one.
+  fn cancel_future(&mut self, handle: u32) -> bool {
+    let Some(read) =
+      self.futures.get_mut(handle as usize).and_then(Option::take)
+    else {
+      return false;
+    };
+    // As for streams: leave the set before cancelling synchronously.
+    WaitableSet::leave(handle);
+    // SAFETY: the handle is a future's readable end with a read in flight.
+    let code = unsafe { (read.cancel)(handle) };
+    let Some(outcome) = Outcome::decode_future(code) else {
+      unreachable!("a synchronous future cancel returned BLOCKED")
+    };
+    self.in_flight -= 1;
+    self.complete(read.user_data, outcome);
+    true
+  }
+
+  fn close(&mut self, handle: u32, end: End) -> Result<(), Error> {
+    let drop = self.slot_mut(handle, end)?.drop;
+    self.cancel_stream(handle);
+    self.streams[handle as usize] = None;
+    // SAFETY: the handle is an open end of this kind with nothing in flight,
+    // and its slot is gone, so it is dropped once.
+    unsafe { drop(handle) };
+    Ok(())
   }
 
   /// Handles one waitable-set event. Returns the completion of the
   /// operation it ends, or `None` when the operation is still in flight.
   fn finish(&mut self, event: Event) -> Option<Completion> {
-    if event.kind == sys::EVENT_SUBTASK {
-      return self.finish_call(event);
+    match event.kind {
+      sys::EVENT_SUBTASK => self.finish_call(event),
+      sys::EVENT_FUTURE_READ => Some(self.finish_future(event)),
+      _ => Some(self.finish_stream(event)),
     }
-    Some(self.finish_stream(event))
   }
 
   /// Handles a state change of a call.
@@ -594,6 +743,21 @@ impl Queue {
       }
       other => unreachable!("a call moved to unexpected state {other:#x}"),
     }
+  }
+
+  /// Turns a future event into the completion of its read.
+  fn finish_future(&mut self, event: Event) -> Completion {
+    let Some(read) =
+      self.futures.get_mut(event.waitable as usize).and_then(Option::take)
+    else {
+      unreachable!("event for a future with no read in flight: {event:?}")
+    };
+    let Some(outcome) = Outcome::decode_future(event.code) else {
+      unreachable!("a future event carried BLOCKED")
+    };
+    WaitableSet::leave(event.waitable);
+    self.in_flight -= 1;
+    Completion { user_data: read.user_data, outcome }
   }
 
   /// Turns a stream event into the completion of the operation it ends.
@@ -617,6 +781,15 @@ impl Queue {
   }
 }
 
+/// Stores `value` at `handle`, growing the table to reach it.
+fn set_slot<T: Clone>(table: &mut Vec<Option<T>>, handle: u32, value: T) {
+  let index = handle as usize;
+  if table.len() <= index {
+    table.resize(index + 1, None);
+  }
+  table[index] = Some(value);
+}
+
 impl Default for Queue {
   fn default() -> Self {
     Self::new()
@@ -626,14 +799,16 @@ impl Default for Queue {
 impl Drop for Queue {
   fn drop(&mut self) {
     // Stop every operation so the host stops using caller memory, then drop
-    // the stream ends. The set drops after this, once it is empty.
+    // the stream ends. The set drops after this, once it is empty. Each
+    // index came from a `u32` handle.
     for index in 0..self.calls.len() {
-      // The index came from a `u32` handle when the call started.
       self.cancel_call(index as u32);
+    }
+    for index in 0..self.futures.len() {
+      self.cancel_future(index as u32);
     }
     for index in 0..self.streams.len() {
       if let Some(slot) = self.streams[index] {
-        // The index came from a `u32` handle when the stream was added.
         let _ = self.close(index as u32, slot.end);
       }
     }
@@ -654,10 +829,18 @@ mod tests {
   #[test]
   fn blocked_is_not_an_outcome() {
     assert_eq!(Outcome::decode(sys::BLOCKED), None);
+    assert_eq!(Outcome::decode_future(sys::BLOCKED), None);
   }
 
   #[test]
-  fn count_reports_bytes_for_every_outcome() {
+  fn a_future_that_delivers_has_returned() {
+    assert_eq!(Outcome::decode_future(0), Some(Outcome::Returned));
+    assert_eq!(Outcome::decode_future(2), Some(Outcome::Cancelled(0)));
+    assert_eq!(Outcome::decode_future(1), Some(Outcome::Closed(0)));
+  }
+
+  #[test]
+  fn count_reports_items_for_every_outcome() {
     assert_eq!(Outcome::Transferred(7).count(), 7);
     assert_eq!(Outcome::Closed(2).count(), 2);
     assert_eq!(Outcome::Cancelled(1).count(), 1);
@@ -667,6 +850,16 @@ mod tests {
   #[test]
   fn each_end_expects_its_own_event() {
     assert_eq!(End::Readable.event(), sys::EVENT_STREAM_READ);
+    assert_eq!(End::Accepting.event(), sys::EVENT_STREAM_READ);
     assert_eq!(End::Writable.event(), sys::EVENT_STREAM_WRITE);
+  }
+
+  #[test]
+  fn set_slot_grows_the_table_to_the_handle() {
+    let mut table: Vec<Option<u64>> = Vec::new();
+    set_slot(&mut table, 3, 9);
+    assert_eq!(table, [None, None, None, Some(9)]);
+    set_slot(&mut table, 1, 4);
+    assert_eq!(table, [None, Some(4), None, Some(9)]);
   }
 }

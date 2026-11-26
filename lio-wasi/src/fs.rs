@@ -1,80 +1,80 @@
 //! Calls on `wasi:filesystem/types@0.3.2`.
 //!
-//! Each operation value holds the call's arguments and result in the
+//! Each operation value holds a call's arguments and its result in the
 //! canonical-ABI layout the host reads and writes. Nothing is allocated to
-//! make a call: a path is passed by pointer, and the result lands in the
-//! operation value.
+//! make a call: paths are passed by pointer, and the result lands in the
+//! operation value. Push one with
+//! [`Queue::push_call`](crate::Queue::push_call); after its completion
+//! reports [`Outcome::Returned`](crate::Outcome::Returned), take the result
+//! with its `result` method.
 //!
-//! The layouts here are written by hand to match what `wit-bindgen`
-//! generates for the same functions. The assertions next to each one pin
-//! them for `wasm32`.
+//! Calls that do not wait are not here: use `wasip3` directly for
+//! `read_via_stream`, `write_via_stream`, `append_via_stream` and
+//! `filesystem::preopens`, and drop a [`Descriptor`] to close it.
+//!
+//! The layouts are written by hand to match what `wit-bindgen` generates for
+//! the same functions. The assertions next to each one pin them for
+//! `wasm32`.
 
-use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 
+use wasip3::clocks::system_clock::Instant;
 pub use wasip3::filesystem::types::{
-  Descriptor, DescriptorFlags, ErrorCode, OpenFlags, PathFlags,
+  Advice, Descriptor, DescriptorFlags, DescriptorStat, DescriptorType,
+  ErrorCode, NewTimestamp, OpenFlags, PathFlags,
 };
+use wasip3::wit_bindgen::FutureReader;
+use wasip3::wit_future::FuturePayload;
 
-use crate::{Call, sealed};
-
-/// Stored in a result's tag while the call has not returned, or after the
-/// result was taken. The host only ever writes `0` (ok) or `1` (error).
-const NO_RESULT: u8 = 0xff;
-
-/// `result<own<descriptor>, error-code>` as the host writes it.
-#[repr(C)]
-struct DescriptorResult {
-  /// `0` for ok, `1` for error, [`NO_RESULT`] before the call returns.
-  tag: u8,
-  /// Ok: the new descriptor's handle. Error: the `error-code` case, in the
-  /// first byte. A `u32` so the field sits at offset 4 as the ABI has it.
-  word: u32,
-  /// For `error-code::other`: whether a message follows.
-  other_tag: u8,
-  /// The message, allocated by the host through this component's allocator.
-  other_ptr: *mut u8,
-  other_len: usize,
-}
-
-#[cfg(target_pointer_width = "32")]
-const _: () = {
-  assert!(size_of::<DescriptorResult>() == 20);
-  assert!(core::mem::offset_of!(DescriptorResult, word) == 4);
-  assert!(core::mem::offset_of!(DescriptorResult, other_tag) == 8);
-  assert!(core::mem::offset_of!(DescriptorResult, other_ptr) == 12);
-  assert!(core::mem::offset_of!(DescriptorResult, other_len) == 16);
+use crate::Call;
+use crate::reply::{
+  LiftError, LiftOk, NO_RESULT, ResultFuture, Slot, Words, call,
 };
+use crate::sealed::{self, Started};
+use crate::sys::wasm_imports;
 
-impl DescriptorResult {
-  const fn empty() -> Self {
-    Self {
-      tag: NO_RESULT,
-      word: 0,
-      other_tag: 0,
-      other_ptr: core::ptr::null_mut(),
-      other_len: 0,
-    }
-  }
+wasm_imports!("wasi:filesystem/types@0.3.2" {
+  "[async-lower][method]descriptor.sync"
+    fn sync(file: i32, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.sync-data"
+    fn sync_data(file: i32, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.get-flags"
+    fn get_flags(file: i32, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.get-type"
+    fn get_type(file: i32, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.set-size"
+    fn set_size(file: i32, size: i64, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.advise"
+    fn advise(file: i32, offset: i64, length: i64, advice: i32, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.stat"
+    fn stat(file: i32, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.stat-at"
+    fn stat_at(dir: i32, path_flags: i32, path: *const u8, len: usize, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.create-directory-at"
+    fn create_directory_at(dir: i32, path: *const u8, len: usize, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.remove-directory-at"
+    fn remove_directory_at(dir: i32, path: *const u8, len: usize, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.unlink-file-at"
+    fn unlink_file_at(dir: i32, path: *const u8, len: usize, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.readlink-at"
+    fn readlink_at(dir: i32, path: *const u8, len: usize, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.open-at"
+    fn open_at(params: *const u8, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.rename-at"
+    fn rename_at(params: *const u8, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.link-at"
+    fn link_at(params: *const u8, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.symlink-at"
+    fn symlink_at(params: *const u8, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.set-times"
+    fn set_times(params: *const u8, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.set-times-at"
+    fn set_times_at(params: *const u8, reply: *mut u8) -> i32;
+});
 
-  /// Takes the result out, leaving [`NO_RESULT`] behind.
-  fn take(&mut self) -> Option<Result<Descriptor, ErrorCode>> {
-    match core::mem::replace(&mut self.tag, NO_RESULT) {
-      NO_RESULT => None,
-      0 => {
-        let handle = self.word;
-        // SAFETY: the host returned this handle as an owned descriptor, and
-        // the tag was cleared, so it is adopted once.
-        Some(Ok(unsafe { Descriptor::from_handle(handle) }))
-      }
-      1 => Some(Err(self.take_error())),
-      other => unreachable!("unknown result tag {other:#x}"),
-    }
-  }
-
-  /// Lifts the `error-code` of an error result.
-  fn take_error(&mut self) -> ErrorCode {
-    match self.word.to_le_bytes()[0] {
+impl LiftError for ErrorCode {
+  fn plain(case: u8) -> Option<Self> {
+    Some(match case {
       0 => ErrorCode::Access,
       1 => ErrorCode::Already,
       2 => ErrorCode::BadDescriptor,
@@ -111,65 +111,279 @@ impl DescriptorResult {
       33 => ErrorCode::InvalidSeek,
       34 => ErrorCode::TextFileBusy,
       35 => ErrorCode::CrossDevice,
-      36 => ErrorCode::Other(self.take_message()),
+      36 => return None,
       other => unreachable!("unknown error-code case {other}"),
-    }
+    })
   }
 
-  /// Takes the message of `error-code::other`, if the host sent one.
-  fn take_message(&mut self) -> Option<String> {
-    match self.other_tag {
-      0 => None,
-      1 if self.other_len == 0 => Some(String::new()),
-      1 => {
-        // SAFETY: the host allocated exactly `other_len` bytes with
-        // alignment 1 through this component's allocator and handed them
-        // over. The result tag was cleared, so they are adopted once.
-        let bytes = unsafe {
-          Vec::from_raw_parts(self.other_ptr, self.other_len, self.other_len)
-        };
-        Some(match String::from_utf8(bytes) {
-          Ok(message) => message,
-          Err(invalid) => {
-            String::from_utf8_lossy(invalid.as_bytes()).into_owned()
-          }
-        })
-      }
-      other => unreachable!("unknown option tag {other:#x}"),
+  fn other(message: Option<String>) -> Self {
+    ErrorCode::Other(message)
+  }
+}
+
+impl LiftOk for Descriptor {
+  unsafe fn lift(words: &Words) -> Self {
+    // SAFETY: the host returned an owned descriptor handle in the first
+    // word, and it is adopted once. A handle is 32 bits.
+    unsafe { Descriptor::from_handle(words.a as u32) }
+  }
+}
+
+impl LiftOk for DescriptorFlags {
+  unsafe fn lift(words: &Words) -> Self {
+    DescriptorFlags::from_bits_retain(words.case())
+  }
+}
+
+impl LiftOk for DescriptorType {
+  unsafe fn lift(words: &Words) -> Self {
+    match words.case() {
+      0 => DescriptorType::BlockDevice,
+      1 => DescriptorType::CharacterDevice,
+      2 => DescriptorType::Directory,
+      3 => DescriptorType::Fifo,
+      4 => DescriptorType::SymbolicLink,
+      5 => DescriptorType::RegularFile,
+      6 => DescriptorType::Socket,
+      // SAFETY: the case with a payload carries an optional name.
+      7 => DescriptorType::Other(unsafe { words.message() }),
+      other => unreachable!("unknown descriptor-type case {other}"),
     }
   }
 }
 
-/// Arguments and result of `descriptor.open-at`, in one block: the import
-/// takes a pointer to the arguments and a pointer to the result.
+/// A descriptor argument: its handle, as the ABI passes it.
+fn handle(descriptor: &Descriptor) -> i32 {
+  descriptor.handle().cast_signed()
+}
+
+// ───────────────────────────── whole-file calls ─────────────────────────────
+
+/// Flushes a file's data and metadata to storage, like `fsync`.
+pub struct Sync<'a> {
+  file: i32,
+  reply: Slot<(), ErrorCode>,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> Sync<'a> {
+  pub fn new(file: &'a Descriptor) -> Self {
+    Self { file: handle(file), reply: Slot::new(), borrows: PhantomData }
+  }
+}
+
+call!(Sync => (), |op, reply| imports::sync(op.file, reply));
+
+/// Flushes a file's data to storage, like `fdatasync`.
+pub struct SyncData<'a> {
+  file: i32,
+  reply: Slot<(), ErrorCode>,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> SyncData<'a> {
+  pub fn new(file: &'a Descriptor) -> Self {
+    Self { file: handle(file), reply: Slot::new(), borrows: PhantomData }
+  }
+}
+
+call!(SyncData => (), |op, reply| imports::sync_data(op.file, reply));
+
+/// Reads the flags a descriptor was opened with.
+pub struct GetFlags<'a> {
+  file: i32,
+  reply: Slot<DescriptorFlags, ErrorCode>,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> GetFlags<'a> {
+  pub fn new(file: &'a Descriptor) -> Self {
+    Self { file: handle(file), reply: Slot::new(), borrows: PhantomData }
+  }
+}
+
+call!(GetFlags => DescriptorFlags, |op, reply| {
+  imports::get_flags(op.file, reply)
+});
+
+/// Reads what kind of object a descriptor refers to.
+pub struct GetType<'a> {
+  file: i32,
+  reply: Slot<DescriptorType, ErrorCode>,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> GetType<'a> {
+  pub fn new(file: &'a Descriptor) -> Self {
+    Self { file: handle(file), reply: Slot::new(), borrows: PhantomData }
+  }
+}
+
+call!(GetType => DescriptorType, |op, reply| {
+  imports::get_type(op.file, reply)
+});
+
+/// Sets a file's size, truncating it or extending it with zeros, like
+/// `ftruncate`.
+pub struct SetSize<'a> {
+  file: i32,
+  size: u64,
+  reply: Slot<(), ErrorCode>,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> SetSize<'a> {
+  pub fn new(file: &'a Descriptor, size: u64) -> Self {
+    Self { file: handle(file), size, reply: Slot::new(), borrows: PhantomData }
+  }
+}
+
+call!(SetSize => (), |op, reply| {
+  imports::set_size(op.file, op.size.cast_signed(), reply)
+});
+
+/// Tells the host how a range of a file will be accessed, like
+/// `posix_fadvise`.
+pub struct Advise<'a> {
+  file: i32,
+  offset: u64,
+  length: u64,
+  advice: Advice,
+  reply: Slot<(), ErrorCode>,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> Advise<'a> {
+  pub fn new(
+    file: &'a Descriptor,
+    offset: u64,
+    length: u64,
+    advice: Advice,
+  ) -> Self {
+    Self {
+      file: handle(file),
+      offset,
+      length,
+      advice,
+      reply: Slot::new(),
+      borrows: PhantomData,
+    }
+  }
+}
+
+call!(Advise => (), |op, reply| {
+  imports::advise(
+    op.file,
+    op.offset.cast_signed(),
+    op.length.cast_signed(),
+    op.advice as i32,
+    reply,
+  )
+});
+
+// ──────────────────────────── one-path calls ────────────────────────────────
+
+/// Creates a directory, like `mkdirat`.
+pub struct CreateDirectoryAt<'a> {
+  dir: i32,
+  path: &'a str,
+  reply: Slot<(), ErrorCode>,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> CreateDirectoryAt<'a> {
+  pub fn new(dir: &'a Descriptor, path: &'a str) -> Self {
+    Self { dir: handle(dir), path, reply: Slot::new(), borrows: PhantomData }
+  }
+}
+
+call!(CreateDirectoryAt => (), |op, reply| {
+  imports::create_directory_at(op.dir, op.path.as_ptr(), op.path.len(), reply)
+});
+
+/// Removes an empty directory, like `unlinkat` with `AT_REMOVEDIR`.
+pub struct RemoveDirectoryAt<'a> {
+  dir: i32,
+  path: &'a str,
+  reply: Slot<(), ErrorCode>,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> RemoveDirectoryAt<'a> {
+  pub fn new(dir: &'a Descriptor, path: &'a str) -> Self {
+    Self { dir: handle(dir), path, reply: Slot::new(), borrows: PhantomData }
+  }
+}
+
+call!(RemoveDirectoryAt => (), |op, reply| {
+  imports::remove_directory_at(op.dir, op.path.as_ptr(), op.path.len(), reply)
+});
+
+/// Removes a file or symbolic link, like `unlinkat`.
+pub struct UnlinkFileAt<'a> {
+  dir: i32,
+  path: &'a str,
+  reply: Slot<(), ErrorCode>,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> UnlinkFileAt<'a> {
+  pub fn new(dir: &'a Descriptor, path: &'a str) -> Self {
+    Self { dir: handle(dir), path, reply: Slot::new(), borrows: PhantomData }
+  }
+}
+
+call!(UnlinkFileAt => (), |op, reply| {
+  imports::unlink_file_at(op.dir, op.path.as_ptr(), op.path.len(), reply)
+});
+
+/// Reads the target of a symbolic link, like `readlinkat`.
+///
+/// The host allocates the target string in this component.
+pub struct ReadlinkAt<'a> {
+  dir: i32,
+  path: &'a str,
+  reply: Slot<String, ErrorCode>,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> ReadlinkAt<'a> {
+  pub fn new(dir: &'a Descriptor, path: &'a str) -> Self {
+    Self { dir: handle(dir), path, reply: Slot::new(), borrows: PhantomData }
+  }
+}
+
+call!(ReadlinkAt => String, |op, reply| {
+  imports::readlink_at(op.dir, op.path.as_ptr(), op.path.len(), reply)
+});
+
+// ───────────────────────── calls with argument blocks ───────────────────────
+//
+// A call with more than four flat arguments passes a pointer to a block
+// holding all of them.
+
+/// Arguments of `descriptor.open-at`.
 #[repr(C)]
-struct OpenAtAbi {
-  dir: u32,
+struct OpenAtArgs {
+  dir: i32,
   path_flags: u8,
-  path_ptr: *const u8,
+  path: *const u8,
   path_len: usize,
   open_flags: u8,
   flags: u8,
-  result: DescriptorResult,
 }
 
 #[cfg(target_pointer_width = "32")]
 const _: () = {
-  assert!(size_of::<OpenAtAbi>() == 40);
-  assert!(align_of::<OpenAtAbi>() == 4);
-  assert!(core::mem::offset_of!(OpenAtAbi, path_flags) == 4);
-  assert!(core::mem::offset_of!(OpenAtAbi, path_ptr) == 8);
-  assert!(core::mem::offset_of!(OpenAtAbi, path_len) == 12);
-  assert!(core::mem::offset_of!(OpenAtAbi, open_flags) == 16);
-  assert!(core::mem::offset_of!(OpenAtAbi, flags) == 17);
-  assert!(core::mem::offset_of!(OpenAtAbi, result) == 20);
+  assert!(size_of::<OpenAtArgs>() == 20);
+  assert!(core::mem::offset_of!(OpenAtArgs, path_flags) == 4);
+  assert!(core::mem::offset_of!(OpenAtArgs, path) == 8);
+  assert!(core::mem::offset_of!(OpenAtArgs, path_len) == 12);
+  assert!(core::mem::offset_of!(OpenAtArgs, open_flags) == 16);
+  assert!(core::mem::offset_of!(OpenAtArgs, flags) == 17);
 };
 
 /// Opens a path relative to a directory, like `openat`.
-///
-/// Push it with [`Queue::push_call`](crate::Queue::push_call). After its
-/// completion reports [`Outcome::Returned`](crate::Outcome::Returned), take
-/// the new descriptor or the error with [`result`](Self::result).
 ///
 /// ```rust,ignore
 /// let mut open = OpenAt::new(
@@ -185,14 +399,12 @@ const _: () = {
 /// let file = open.result();
 /// ```
 pub struct OpenAt<'a> {
-  /// The host writes the result through a pointer into this.
-  abi: UnsafeCell<OpenAtAbi>,
-  /// The directory and the path are read by the host while in flight.
+  args: OpenAtArgs,
+  reply: Slot<Descriptor, ErrorCode>,
   borrows: PhantomData<(&'a Descriptor, &'a str)>,
 }
 
 impl<'a> OpenAt<'a> {
-  /// Describes opening `path` relative to `dir`.
   pub fn new(
     dir: &'a Descriptor,
     path_flags: PathFlags,
@@ -201,67 +413,502 @@ impl<'a> OpenAt<'a> {
     flags: DescriptorFlags,
   ) -> Self {
     Self {
-      abi: UnsafeCell::new(OpenAtAbi {
-        dir: dir.handle(),
+      args: OpenAtArgs {
+        dir: handle(dir),
         path_flags: path_flags.bits(),
-        path_ptr: path.as_ptr(),
+        path: path.as_ptr(),
         path_len: path.len(),
         open_flags: open_flags.bits(),
         flags: flags.bits(),
-        result: DescriptorResult::empty(),
-      }),
+      },
+      reply: Slot::new(),
       borrows: PhantomData,
     }
   }
-
-  /// Takes the call's result.
-  ///
-  /// Returns `None` if the call has not returned, was cancelled, or its
-  /// result was already taken.
-  pub fn result(&mut self) -> Option<Result<Descriptor, ErrorCode>> {
-    self.abi.get_mut().result.take()
-  }
 }
 
-impl Drop for OpenAt<'_> {
-  fn drop(&mut self) {
-    // An untaken result owns a descriptor or a message. Release it.
-    drop(self.result());
-  }
+call!(OpenAt => Descriptor, |op, reply| {
+  imports::open_at((&raw const op.args).cast(), reply)
+});
+
+/// Arguments of `descriptor.rename-at`.
+#[repr(C)]
+struct RenameAtArgs {
+  old_dir: i32,
+  old_path: *const u8,
+  old_len: usize,
+  new_dir: i32,
+  new_path: *const u8,
+  new_len: usize,
 }
 
-impl Call for OpenAt<'_> {}
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+  assert!(size_of::<RenameAtArgs>() == 24);
+  assert!(core::mem::offset_of!(RenameAtArgs, old_path) == 4);
+  assert!(core::mem::offset_of!(RenameAtArgs, new_dir) == 12);
+  assert!(core::mem::offset_of!(RenameAtArgs, new_path) == 16);
+};
 
-impl sealed::Sealed for OpenAt<'_> {
-  unsafe fn start(&mut self) -> u32 {
-    // A result left from an earlier use is released before it is
-    // overwritten.
-    drop(self.result());
-    let abi = self.abi.get();
-    // SAFETY: `abi` points into `self`. The caller keeps `self` in place
-    // until the call returns, and the path and directory it names outlive
-    // that.
-    unsafe {
-      let results = &raw mut (*abi).result;
-      imports::open_at(abi.cast(), results.cast()) as u32
+/// Renames a file or directory, like `renameat`.
+pub struct RenameAt<'a> {
+  args: RenameAtArgs,
+  reply: Slot<(), ErrorCode>,
+  borrows: PhantomData<(&'a Descriptor, &'a str)>,
+}
+
+impl<'a> RenameAt<'a> {
+  pub fn new(
+    old_dir: &'a Descriptor,
+    old_path: &'a str,
+    new_dir: &'a Descriptor,
+    new_path: &'a str,
+  ) -> Self {
+    Self {
+      args: RenameAtArgs {
+        old_dir: handle(old_dir),
+        old_path: old_path.as_ptr(),
+        old_len: old_path.len(),
+        new_dir: handle(new_dir),
+        new_path: new_path.as_ptr(),
+        new_len: new_path.len(),
+      },
+      reply: Slot::new(),
+      borrows: PhantomData,
     }
   }
 }
 
-#[cfg(target_arch = "wasm32")]
-mod imports {
-  #[link(wasm_import_module = "wasi:filesystem/types@0.3.2")]
-  unsafe extern "C" {
-    #[link_name = "[async-lower][method]descriptor.open-at"]
-    pub(super) fn open_at(params: *mut u8, results: *mut u8) -> i32;
+call!(RenameAt => (), |op, reply| {
+  imports::rename_at((&raw const op.args).cast(), reply)
+});
+
+/// Arguments of `descriptor.link-at`.
+#[repr(C)]
+struct LinkAtArgs {
+  old_dir: i32,
+  old_path_flags: u8,
+  old_path: *const u8,
+  old_len: usize,
+  new_dir: i32,
+  new_path: *const u8,
+  new_len: usize,
+}
+
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+  assert!(size_of::<LinkAtArgs>() == 28);
+  assert!(core::mem::offset_of!(LinkAtArgs, old_path_flags) == 4);
+  assert!(core::mem::offset_of!(LinkAtArgs, old_path) == 8);
+  assert!(core::mem::offset_of!(LinkAtArgs, new_dir) == 16);
+  assert!(core::mem::offset_of!(LinkAtArgs, new_path) == 20);
+};
+
+/// Creates a hard link, like `linkat`.
+pub struct LinkAt<'a> {
+  args: LinkAtArgs,
+  reply: Slot<(), ErrorCode>,
+  borrows: PhantomData<(&'a Descriptor, &'a str)>,
+}
+
+impl<'a> LinkAt<'a> {
+  pub fn new(
+    old_dir: &'a Descriptor,
+    old_path_flags: PathFlags,
+    old_path: &'a str,
+    new_dir: &'a Descriptor,
+    new_path: &'a str,
+  ) -> Self {
+    Self {
+      args: LinkAtArgs {
+        old_dir: handle(old_dir),
+        old_path_flags: old_path_flags.bits(),
+        old_path: old_path.as_ptr(),
+        old_len: old_path.len(),
+        new_dir: handle(new_dir),
+        new_path: new_path.as_ptr(),
+        new_len: new_path.len(),
+      },
+      reply: Slot::new(),
+      borrows: PhantomData,
+    }
   }
 }
 
-/// See `sys::imports`: there is no host to call off wasm.
-#[cfg(not(target_arch = "wasm32"))]
-mod imports {
-  pub(super) unsafe fn open_at(_params: *mut u8, _results: *mut u8) -> i32 {
-    panic!("lio-wasi runs only inside a WebAssembly component")
+call!(LinkAt => (), |op, reply| {
+  imports::link_at((&raw const op.args).cast(), reply)
+});
+
+/// Arguments of `descriptor.symlink-at`.
+#[repr(C)]
+struct SymlinkAtArgs {
+  dir: i32,
+  target: *const u8,
+  target_len: usize,
+  path: *const u8,
+  path_len: usize,
+}
+
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+  assert!(size_of::<SymlinkAtArgs>() == 20);
+  assert!(core::mem::offset_of!(SymlinkAtArgs, target) == 4);
+  assert!(core::mem::offset_of!(SymlinkAtArgs, path) == 12);
+};
+
+/// Creates a symbolic link at `path` whose contents are `target`, like
+/// `symlinkat`.
+pub struct SymlinkAt<'a> {
+  args: SymlinkAtArgs,
+  reply: Slot<(), ErrorCode>,
+  borrows: PhantomData<(&'a Descriptor, &'a str)>,
+}
+
+impl<'a> SymlinkAt<'a> {
+  pub fn new(dir: &'a Descriptor, target: &'a str, path: &'a str) -> Self {
+    Self {
+      args: SymlinkAtArgs {
+        dir: handle(dir),
+        target: target.as_ptr(),
+        target_len: target.len(),
+        path: path.as_ptr(),
+        path_len: path.len(),
+      },
+      reply: Slot::new(),
+      borrows: PhantomData,
+    }
+  }
+}
+
+call!(SymlinkAt => (), |op, reply| {
+  imports::symlink_at((&raw const op.args).cast(), reply)
+});
+
+/// `new-timestamp` as an argument.
+#[repr(C)]
+struct TimestampArg {
+  /// `0` leaves the time alone, `1` sets it to now, `2` sets it to the
+  /// instant that follows.
+  tag: u8,
+  seconds: i64,
+  nanoseconds: u32,
+}
+
+const _: () = {
+  assert!(size_of::<TimestampArg>() == 24);
+  assert!(core::mem::offset_of!(TimestampArg, seconds) == 8);
+  assert!(core::mem::offset_of!(TimestampArg, nanoseconds) == 16);
+};
+
+impl From<NewTimestamp> for TimestampArg {
+  fn from(time: NewTimestamp) -> Self {
+    match time {
+      NewTimestamp::NoChange => Self { tag: 0, seconds: 0, nanoseconds: 0 },
+      NewTimestamp::Now => Self { tag: 1, seconds: 0, nanoseconds: 0 },
+      NewTimestamp::Timestamp(Instant { seconds, nanoseconds }) => {
+        Self { tag: 2, seconds, nanoseconds }
+      }
+    }
+  }
+}
+
+/// Arguments of `descriptor.set-times`.
+#[repr(C)]
+struct SetTimesArgs {
+  file: i32,
+  accessed: TimestampArg,
+  modified: TimestampArg,
+}
+
+const _: () = {
+  assert!(size_of::<SetTimesArgs>() == 56);
+  assert!(core::mem::offset_of!(SetTimesArgs, accessed) == 8);
+  assert!(core::mem::offset_of!(SetTimesArgs, modified) == 32);
+};
+
+/// Sets a file's access and modification times, like `futimens`.
+pub struct SetTimes<'a> {
+  args: SetTimesArgs,
+  reply: Slot<(), ErrorCode>,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> SetTimes<'a> {
+  pub fn new(
+    file: &'a Descriptor,
+    accessed: NewTimestamp,
+    modified: NewTimestamp,
+  ) -> Self {
+    Self {
+      args: SetTimesArgs {
+        file: handle(file),
+        accessed: accessed.into(),
+        modified: modified.into(),
+      },
+      reply: Slot::new(),
+      borrows: PhantomData,
+    }
+  }
+}
+
+call!(SetTimes => (), |op, reply| {
+  imports::set_times((&raw const op.args).cast(), reply)
+});
+
+/// Arguments of `descriptor.set-times-at`.
+#[repr(C)]
+struct SetTimesAtArgs {
+  dir: i32,
+  path_flags: u8,
+  path: *const u8,
+  path_len: usize,
+  accessed: TimestampArg,
+  modified: TimestampArg,
+}
+
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+  assert!(size_of::<SetTimesAtArgs>() == 64);
+  assert!(core::mem::offset_of!(SetTimesAtArgs, path_flags) == 4);
+  assert!(core::mem::offset_of!(SetTimesAtArgs, path) == 8);
+  assert!(core::mem::offset_of!(SetTimesAtArgs, accessed) == 16);
+  assert!(core::mem::offset_of!(SetTimesAtArgs, modified) == 40);
+};
+
+/// Sets the access and modification times of a path, like `utimensat`.
+pub struct SetTimesAt<'a> {
+  args: SetTimesAtArgs,
+  reply: Slot<(), ErrorCode>,
+  borrows: PhantomData<(&'a Descriptor, &'a str)>,
+}
+
+impl<'a> SetTimesAt<'a> {
+  pub fn new(
+    dir: &'a Descriptor,
+    path_flags: PathFlags,
+    path: &'a str,
+    accessed: NewTimestamp,
+    modified: NewTimestamp,
+  ) -> Self {
+    Self {
+      args: SetTimesAtArgs {
+        dir: handle(dir),
+        path_flags: path_flags.bits(),
+        path: path.as_ptr(),
+        path_len: path.len(),
+        accessed: accessed.into(),
+        modified: modified.into(),
+      },
+      reply: Slot::new(),
+      borrows: PhantomData,
+    }
+  }
+}
+
+call!(SetTimesAt => (), |op, reply| {
+  imports::set_times_at((&raw const op.args).cast(), reply)
+});
+
+// ─────────────────────────────────── stat ───────────────────────────────────
+
+/// `option<instant>` in a stat result.
+#[repr(C)]
+struct OptionalInstant {
+  tag: u8,
+  seconds: i64,
+  nanoseconds: u32,
+}
+
+impl OptionalInstant {
+  const fn none() -> Self {
+    Self { tag: 0, seconds: 0, nanoseconds: 0 }
+  }
+
+  fn lift(&self) -> Option<Instant> {
+    match self.tag {
+      0 => None,
+      1 => {
+        Some(Instant { seconds: self.seconds, nanoseconds: self.nanoseconds })
+      }
+      other => unreachable!("unknown option tag {other:#x}"),
+    }
+  }
+}
+
+/// `result<descriptor-stat, error-code>` as the host writes it. It holds
+/// 64-bit fields, so its payload starts at offset 8.
+#[repr(C)]
+struct StatReply {
+  /// `0` for ok, `1` for error, [`NO_RESULT`] otherwise.
+  tag: u8,
+  pad: [u8; 7],
+  /// Ok: the descriptor type. Error: the error code.
+  words: Words,
+  link_count: u64,
+  size: u64,
+  accessed: OptionalInstant,
+  modified: OptionalInstant,
+  changed: OptionalInstant,
+}
+
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+  assert!(size_of::<StatReply>() == 112);
+  assert!(align_of::<StatReply>() == 8);
+  assert!(core::mem::offset_of!(StatReply, words) == 8);
+  assert!(core::mem::offset_of!(StatReply, link_count) == 24);
+  assert!(core::mem::offset_of!(StatReply, size) == 32);
+  assert!(core::mem::offset_of!(StatReply, accessed) == 40);
+  assert!(core::mem::offset_of!(StatReply, modified) == 64);
+  assert!(core::mem::offset_of!(StatReply, changed) == 88);
+};
+
+/// Storage for one stat result.
+struct StatSlot {
+  /// The host writes through a pointer into this.
+  reply: core::cell::UnsafeCell<StatReply>,
+}
+
+impl StatSlot {
+  const fn new() -> Self {
+    Self {
+      reply: core::cell::UnsafeCell::new(StatReply {
+        tag: NO_RESULT,
+        pad: [0; 7],
+        words: Words::zeroed(),
+        link_count: 0,
+        size: 0,
+        accessed: OptionalInstant::none(),
+        modified: OptionalInstant::none(),
+        changed: OptionalInstant::none(),
+      }),
+    }
+  }
+
+  /// Releases any result still here and returns where the host writes the
+  /// next one.
+  fn arm(&mut self) -> *mut u8 {
+    drop(self.take());
+    self.reply.get().cast()
+  }
+
+  fn take(&mut self) -> Option<Result<DescriptorStat, ErrorCode>> {
+    let reply = self.reply.get_mut();
+    match core::mem::replace(&mut reply.tag, NO_RESULT) {
+      NO_RESULT => None,
+      0 => Some(Ok(DescriptorStat {
+        // SAFETY: the host wrote a descriptor type, and the tag was
+        // cleared, so it is lifted once.
+        type_: unsafe { DescriptorType::lift(&reply.words) },
+        link_count: reply.link_count,
+        size: reply.size,
+        data_access_timestamp: reply.accessed.lift(),
+        data_modification_timestamp: reply.modified.lift(),
+        status_change_timestamp: reply.changed.lift(),
+      })),
+      // SAFETY: as above, for the error.
+      1 => Some(Err(unsafe { reply.words.error() })),
+      other => unreachable!("unknown result tag {other:#x}"),
+    }
+  }
+}
+
+impl Drop for StatSlot {
+  fn drop(&mut self) {
+    // An untaken result may own a string. Release it.
+    drop(self.take());
+  }
+}
+
+/// Reads a file's metadata, like `fstat`.
+pub struct Stat<'a> {
+  file: i32,
+  reply: StatSlot,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> Stat<'a> {
+  pub fn new(file: &'a Descriptor) -> Self {
+    Self { file: handle(file), reply: StatSlot::new(), borrows: PhantomData }
+  }
+}
+
+call!(Stat => DescriptorStat, |op, reply| imports::stat(op.file, reply));
+
+/// Reads the metadata of a path, like `fstatat`.
+pub struct StatAt<'a> {
+  dir: i32,
+  path_flags: PathFlags,
+  path: &'a str,
+  reply: StatSlot,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> StatAt<'a> {
+  pub fn new(
+    dir: &'a Descriptor,
+    path_flags: PathFlags,
+    path: &'a str,
+  ) -> Self {
+    Self {
+      dir: handle(dir),
+      path_flags,
+      path,
+      reply: StatSlot::new(),
+      borrows: PhantomData,
+    }
+  }
+}
+
+call!(StatAt => DescriptorStat, |op, reply| {
+  imports::stat_at(
+    op.dir,
+    i32::from(op.path_flags.bits()),
+    op.path.as_ptr(),
+    op.path.len(),
+    reply,
+  )
+});
+
+// ────────────────────────────── stream status ───────────────────────────────
+
+/// How a file stream ended: `Ok` at the end of the data, or the error that
+/// cut it short.
+///
+/// `read_via_stream`, `write_via_stream` and `append_via_stream` return it
+/// next to the stream as a future. A stream alone only reports
+/// [`Outcome::Closed`](crate::Outcome::Closed), for an error as for the end
+/// of the file. Push this to learn which it was. It completes once the
+/// stream has ended.
+///
+/// # Panics
+///
+/// Pushing it again after it returned panics: a status is delivered once.
+pub struct StreamStatus {
+  future: ResultFuture<ErrorCode>,
+}
+
+impl StreamStatus {
+  pub fn new(result: FutureReader<Result<(), ErrorCode>>) -> Self {
+    let vtable = <Result<(), ErrorCode> as FuturePayload>::VTABLE;
+    Self { future: ResultFuture::new(result, vtable) }
+  }
+
+  /// Takes the status.
+  ///
+  /// Returns `None` if it has not arrived, was cancelled, or was already
+  /// taken.
+  pub fn result(&mut self) -> Option<Result<(), ErrorCode>> {
+    self.future.take()
+  }
+}
+
+impl Call for StreamStatus {}
+
+impl sealed::Sealed for StreamStatus {
+  unsafe fn start(&mut self) -> Started {
+    // SAFETY: the caller keeps `self` in place until the read completes.
+    unsafe { self.future.start() }
   }
 }
 
@@ -269,57 +916,91 @@ mod imports {
 mod tests {
   use super::*;
 
-  fn error(case: u8) -> DescriptorResult {
-    let mut result = DescriptorResult::empty();
-    result.tag = 1;
-    result.word = u32::from(case);
-    result
+  fn words(a: usize) -> Words {
+    Words { a, ..Words::zeroed() }
   }
 
   #[test]
-  fn an_empty_result_has_nothing_to_take() {
-    assert!(DescriptorResult::empty().take().is_none());
+  fn error_cases_are_in_wit_order() {
+    assert!(matches!(ErrorCode::plain(0), Some(ErrorCode::Access)));
+    assert!(matches!(ErrorCode::plain(19), Some(ErrorCode::NoEntry)));
+    assert!(matches!(ErrorCode::plain(35), Some(ErrorCode::CrossDevice)));
+    assert!(ErrorCode::plain(36).is_none());
   }
 
   #[test]
-  fn an_error_is_lifted_by_case_and_taken_once() {
-    let mut result = error(19);
-    assert!(matches!(result.take(), Some(Err(ErrorCode::NoEntry))));
-    assert!(result.take().is_none());
+  fn descriptor_types_are_in_wit_order() {
+    // SAFETY: plain cases read nothing but the case byte.
+    unsafe {
+      assert!(matches!(
+        DescriptorType::lift(&words(0)),
+        DescriptorType::BlockDevice
+      ));
+      assert!(matches!(
+        DescriptorType::lift(&words(2)),
+        DescriptorType::Directory
+      ));
+      assert!(matches!(
+        DescriptorType::lift(&words(5)),
+        DescriptorType::RegularFile
+      ));
+      assert!(matches!(
+        DescriptorType::lift(&words(7)),
+        DescriptorType::Other(None)
+      ));
+    }
   }
 
   #[test]
-  fn the_first_and_last_plain_cases_are_in_order() {
-    assert!(matches!(error(0).take(), Some(Err(ErrorCode::Access))));
-    assert!(matches!(error(35).take(), Some(Err(ErrorCode::CrossDevice))));
+  fn flags_come_from_the_low_byte() {
+    // SAFETY: flags read nothing but the case byte.
+    let flags = unsafe { DescriptorFlags::lift(&words(0xff00 | 0b11)) };
+    assert_eq!(flags, DescriptorFlags::READ | DescriptorFlags::WRITE);
   }
 
   #[test]
-  fn other_without_a_message_is_none() {
-    let mut result = error(36);
-    assert!(matches!(result.take(), Some(Err(ErrorCode::Other(None)))));
+  fn a_timestamp_argument_carries_its_case() {
+    let now: TimestampArg = NewTimestamp::Now.into();
+    assert_eq!(now.tag, 1);
+    let at: TimestampArg =
+      NewTimestamp::Timestamp(Instant { seconds: 5, nanoseconds: 9 }).into();
+    assert_eq!((at.tag, at.seconds, at.nanoseconds), (2, 5, 9));
+    let keep: TimestampArg = NewTimestamp::NoChange.into();
+    assert_eq!(keep.tag, 0);
   }
 
   #[test]
-  fn other_adopts_the_message_the_host_allocated() {
-    let message = String::from("disk on fire").into_boxed_str();
-    let mut result = error(36);
-    result.other_tag = 1;
-    result.other_len = message.len();
-    result.other_ptr = Box::into_raw(message).cast();
-    let Some(Err(ErrorCode::Other(Some(text)))) = result.take() else {
-      panic!("expected the message");
+  fn a_stat_result_is_lifted_field_by_field() {
+    let mut slot = StatSlot::new();
+    {
+      let reply = slot.reply.get_mut();
+      reply.tag = 0;
+      reply.words = words(5);
+      reply.link_count = 2;
+      reply.size = 4096;
+      reply.modified = OptionalInstant { tag: 1, seconds: 7, nanoseconds: 3 };
+    }
+    let Some(Ok(stat)) = slot.take() else {
+      panic!("expected a stat");
     };
-    assert_eq!(text, "disk on fire");
+    assert!(matches!(stat.type_, DescriptorType::RegularFile));
+    assert_eq!((stat.link_count, stat.size), (2, 4096));
+    assert!(stat.data_access_timestamp.is_none());
+    let Some(modified) = stat.data_modification_timestamp else {
+      panic!("expected a modification time");
+    };
+    assert_eq!((modified.seconds, modified.nanoseconds), (7, 3));
+    assert!(slot.take().is_none());
   }
 
   #[test]
-  fn other_with_an_empty_message_reads_no_pointer() {
-    let mut result = error(36);
-    result.other_tag = 1;
-    let Some(Err(ErrorCode::Other(Some(text)))) = result.take() else {
-      panic!("expected an empty message");
-    };
-    assert!(text.is_empty());
+  fn a_stat_error_is_lifted() {
+    let mut slot = StatSlot::new();
+    {
+      let reply = slot.reply.get_mut();
+      reply.tag = 1;
+      reply.words = words(19);
+    }
+    assert!(matches!(slot.take(), Some(Err(ErrorCode::NoEntry))));
   }
 }
