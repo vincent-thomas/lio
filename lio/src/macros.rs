@@ -179,14 +179,12 @@ macro_rules! action_io {
   }};
 }
 
-/// Gives one of lio's own model types the ways to run it, callable without
-/// importing anything: `.await`, and the methods of
-/// [`ModelExt`](crate::model::ModelExt).
+/// Gives one of lio's own model types the ways to run it: `.await`,
+/// `when_done`, `send`, `send_with`, and `with_lio` to name the driver.
 ///
-/// A model written outside lio has those methods through `ModelExt`
-/// already. `.await` is the one thing Rust cannot give every
-/// [`OpModel`](crate::model::OpModel) at once, so it is implemented here,
-/// per type.
+/// A model written outside lio is run through
+/// [`api::run`](crate::api::run), which gives an [`Io`](crate::api::Io)
+/// with the same five.
 macro_rules! runnable {
   ([$($generics:tt)*] $ty:ty) => {
     impl<$($generics)*> $ty
@@ -254,8 +252,11 @@ macro_rules! runnable {
   };
 }
 
-/// Gives one of lio's own stream types the methods of
-/// [`StreamExt`](crate::model::StreamExt), callable without importing it.
+/// Gives one of lio's own stream types the ways to run it: `start`,
+/// `send`, `send_with`, and `with_lio` to name the driver.
+///
+/// A stream written outside lio is run through
+/// [`api::run_stream`](crate::api::run_stream).
 macro_rules! streamable {
   ([$($generics:tt)*] $ty:ty) => {
     impl<$($generics)*> $ty
