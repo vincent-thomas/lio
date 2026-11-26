@@ -251,11 +251,6 @@ impl RawOp {
     (self.complete_fn)(self.payload, completion, self.keep);
   }
 
-  /// Whether the result is kept for a ticket.
-  pub(crate) fn kept(self) -> bool {
-    self.keep
-  }
-
   /// Drops the operation's memory, or its untaken result.
   ///
   /// # Safety
@@ -686,20 +681,18 @@ impl Registration {
     Some(self.raw_op())
   }
 
-  /// The result was read. Returns the slot of the model to poll, when the
-  /// result is kept for a ticket.
-  pub(crate) fn end_completion(&mut self, kept: bool) -> Option<u64> {
-    if kept && !self.cell.abandoned {
-      self.cell.stage = Stage::Ready;
-      Some(self.cell.waiter)
-    } else if kept {
-      // The ticket was dropped while the result was being read.
+  /// The result was read. Returns the slot of the model to poll, when
+  /// there is still a ticket to take the result.
+  pub(crate) fn end_completion(&mut self) -> Option<u64> {
+    if self.cell.abandoned {
+      // Nothing is left to drop, unless the ticket was dropped while the
+      // result was being read: then the result was kept for it.
       self.cell.stage = Stage::Free;
       (self.cell.drop_fn)(self.cell.payload);
       None
     } else {
-      self.cell.stage = Stage::Free;
-      None
+      self.cell.stage = Stage::Ready;
+      Some(self.cell.waiter)
     }
   }
 
@@ -787,8 +780,9 @@ impl Registration {
   /// Nothing is left here: no model that is still running, and no
   /// operation. The slot can be given back.
   pub(crate) fn is_spent(&self) -> bool {
+    // A model is marked finished only once whoever had it busy is done.
     self.cell.stage == Stage::Free
-      && self.task.as_ref().is_none_or(|task| task.finished && !task.busy)
+      && self.task.as_ref().is_none_or(|task| task.finished)
   }
 
   /// The operation's action, with its borrow of the operation's memory
@@ -869,7 +863,76 @@ mod tests {
     assert!(reg.begin_completion().is_none(), "one completion at a time");
     // SAFETY: `reg` is alive and its operation was just marked busy.
     unsafe { raw.complete(Completion::new(result)) };
-    reg.end_completion(raw.keep)
+    reg.end_completion()
+  }
+
+  /// Done as soon as it is polled.
+  struct Now;
+
+  impl OpModel for Now {
+    type Item = ();
+
+    fn poll(&mut self, _: &mut Cx<'_>) -> Step<()> {
+      Step::Done(())
+    }
+  }
+
+  #[test]
+  fn a_model_is_queued_once_until_it_is_polled_and_never_once_done() {
+    assert!(!Registration::vacant().notify(), "no model to poll");
+
+    let mut arena = Bump::new();
+    let mut reg = Registration::running(&mut arena, Now, |()| true);
+    assert!(!reg.is_spent(), "its model has not run");
+    assert!(reg.notify());
+    assert!(!reg.notify(), "queued already");
+
+    assert!(reg.begin_poll().is_some());
+    assert!(reg.notify(), "polled since: it can be queued again");
+    assert!(matches!(reg.end_poll(true), AfterPoll::Finished));
+    assert!(reg.is_spent());
+    assert!(reg.begin_poll().is_none());
+    assert!(!reg.notify(), "done");
+  }
+
+  #[test]
+  fn a_result_whose_ticket_went_while_it_was_read_is_dropped() {
+    fn held(guard: &mut Option<Counted>, _: Completion) -> Option<Counted> {
+      guard.take()
+    }
+    let drops = Rc::new(Cell::new(0));
+    let mut arena = Bump::new();
+    let mut reg = Registration::vacant();
+    let seq = reg.start_op(
+      &mut arena,
+      Some(Counted(Rc::clone(&drops))),
+      |_| Action::nop(),
+      held,
+      0,
+    );
+    let raw = reg.begin_completion().unwrap();
+    // SAFETY: `reg` is alive and its operation was just marked busy.
+    unsafe { raw.complete(Completion::new(0)) };
+    assert_eq!(drops.get(), 0, "the result holds the guard");
+
+    assert!(matches!(reg.abandon(seq), Abandon::Stale), "nothing to cancel");
+    assert_eq!(reg.end_completion(), None, "nobody to poll");
+    assert_eq!(drops.get(), 1);
+    assert!(reg.is_spent());
+  }
+
+  #[test]
+  fn an_operation_whose_result_could_not_be_read_frees_its_slot() {
+    let drops = Rc::new(Cell::new(0));
+    let mut arena = Bump::new();
+    let (mut reg, seq) = counted(&mut arena, &drops);
+    assert!(reg.begin_completion().is_some());
+    reg.completion_panicked();
+    assert!(reg.can_start_op());
+    assert!(reg.is_spent());
+    // SAFETY: the operation was started with `isize` results.
+    assert_eq!(unsafe { reg.take::<isize>(seq, 0) }, None);
+    assert_eq!(drops.get(), 0, "memory in an unknown state is not dropped");
   }
 
   #[test]
