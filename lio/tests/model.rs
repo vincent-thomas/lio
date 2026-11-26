@@ -638,6 +638,8 @@ impl TwoNops {
   }
 }
 
+lio::runnable!(TwoNops);
+
 impl OpModel for TwoNops {
   type Item = std::io::Result<u8>;
 
@@ -669,9 +671,10 @@ fn io_runs_a_model_of_your_own_like_one_of_lio_s() {
   finish_only(&backend, &lio, 0);
   assert_eq!(done.borrow_mut().take().unwrap().unwrap(), 2);
 
-  // As a future.
+  // As a future, run like one of lio's own: `runnable!` gave it the
+  // methods.
   let mut future = Box::pin(std::future::IntoFuture::into_future(
-    lio::api::Io::from_op(TwoNops::new()).with_lio(&lio),
+    TwoNops::new().with_lio(&lio),
   ));
   let mut cx = Context::from_waker(Waker::noop());
   assert!(future.as_mut().poll(&mut cx).is_pending());
