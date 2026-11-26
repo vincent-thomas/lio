@@ -71,6 +71,13 @@ fn get_c_compiler() -> &'static str {
 }
 
 fn get_cpp_compiler() -> &'static str {
+  // conda g++ from mise.toml ships libstdc++. conda clang 18 has no
+  // clang++, and a system clang++ does not search that library.
+  // macOS keeps the platform clang++.
+  #[cfg(target_os = "linux")]
+  if Command::new("g++").arg("--version").output().is_ok() {
+    return "g++";
+  }
   if Command::new("clang++").arg("--version").output().is_ok() {
     "clang++"
   } else {
