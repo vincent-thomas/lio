@@ -292,6 +292,18 @@ unsafe impl lio::backend::IoBackend for InOrderBackend {
     );
     Ok(())
   }
+
+  fn resource_close(&self) -> lio::api::resource::ResourceClose {
+    lio::api::resource::ResourceClose::native()
+  }
+
+  // Its operations finish on their own: there is nothing to stop.
+  fn cancel(&mut self, _id: u64) {}
+
+  // Nothing outside this type ever holds an address.
+  fn drain(&mut self) -> bool {
+    true
+  }
 }
 
 #[test]

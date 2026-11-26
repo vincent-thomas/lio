@@ -785,10 +785,7 @@ macro_rules! test_io_backend {
         let completed =
           wait_completions(backend, Some(Duration::from_millis(10)));
         if let Some(first) = completed.first() {
-          return __lio_test_lio::backend::OpCompleted::new(
-            first.registration_id(),
-            first.result(),
-          );
+          return *first;
         }
       }
 
@@ -902,9 +899,8 @@ macro_rules! test_io_backend {
           let completed = wait_for_single_completion(&mut backend);
           assert_eq!(completed.registration_id(), 97);
           assert!(
-            completed.result() < 0,
-            "a cancelled recv reports an error, got {}",
-            completed.result()
+            completed.is_cancelled() && completed.result() < 0,
+            "a cancelled recv says so, and reports an error: {completed:?}"
           );
 
           // Data arriving afterwards belongs to no operation.
@@ -932,7 +928,10 @@ macro_rules! test_io_backend {
 
         let completed = wait_for_single_completion(&mut backend);
         assert_eq!(completed.registration_id(), 98);
-        assert!(completed.result() < 0, "got {}", completed.result());
+        assert!(
+          completed.is_cancelled() && completed.result() < 0,
+          "got {completed:?}"
+        );
         let extra = drain_for(&mut backend, Duration::from_millis(50));
         assert!(extra.is_empty(), "cancelled op completed again: {extra:?}");
       }

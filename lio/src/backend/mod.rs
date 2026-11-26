@@ -148,6 +148,7 @@ use crate::backend::op::{BorrowedOp, Op};
 pub struct OpCompleted {
   registration_id: u64,
   result: isize,
+  cancelled: bool,
 }
 
 impl OpCompleted {
@@ -162,7 +163,27 @@ impl OpCompleted {
   /// safety contract of [`IoBackend`].
   #[inline]
   pub fn new(op_id: u64, result: isize) -> Self {
-    Self { registration_id: op_id, result }
+    Self { registration_id: op_id, result, cancelled: false }
+  }
+
+  /// An operation that was stopped by [`IoBackend::cancel`] before it
+  /// finished.
+  ///
+  /// `result` is the error the platform reports for that, which differs
+  /// between platforms. [`is_cancelled`](Self::is_cancelled) is what says
+  /// so on all of them.
+  #[inline]
+  pub fn cancelled(op_id: u64, result: isize) -> Self {
+    Self { registration_id: op_id, result, cancelled: true }
+  }
+
+  /// Whether the operation was stopped by [`IoBackend::cancel`].
+  ///
+  /// `false` for one that finished first, even after a cancel was asked
+  /// for: it reports its own result.
+  #[inline]
+  pub fn is_cancelled(&self) -> bool {
+    self.cancelled
   }
 
   #[inline]
@@ -224,13 +245,11 @@ pub unsafe trait IoBackend {
 
   /// How resources produced by this backend's completions are closed.
   ///
-  /// The default closes them as native OS descriptors/handles. A backend
-  /// whose completions do not carry real OS resources (such as a simulation)
-  /// must override this, or dropping those resources would close unrelated
-  /// descriptors of the process.
-  fn resource_close(&self) -> ResourceClose {
-    ResourceClose::native()
-  }
+  /// [`ResourceClose::native`] closes them as OS descriptors or handles. A
+  /// backend whose completions do not carry real OS resources (such as a
+  /// simulation) must not return that, or dropping those resources would
+  /// close unrelated descriptors of the process.
+  fn resource_close(&self) -> ResourceClose;
 
   /// Queue an operation for submission.
   ///
@@ -251,20 +270,17 @@ pub unsafe trait IoBackend {
   /// Asks the backend to finish operation `id` early: its consumer is gone.
   ///
   /// The operation must still produce exactly one completion, from a later
-  /// `wait()`: a cancellation error, or its own result if it finished
-  /// first. Until then the memory its [`Op`] points to stays valid, so the
+  /// `wait()`: an [`OpCompleted::cancelled`], or its own result if it
+  /// finished first. Until then the memory its [`Op`] points to stays valid, so the
   /// backend must not consider the operation gone before it reports it.
   ///
   /// `id` may be unknown to the backend (already completed, or not an I/O
   /// operation); that is not an error.
   ///
-  /// The default does nothing: the operation runs to completion, and its
-  /// slot is freed then. Override it so operations that may never complete
-  /// on their own (an accept, a read from an idle socket) do not keep their
-  /// slot forever.
-  fn cancel(&mut self, id: u64) {
-    let _ = id;
-  }
+  /// A backend may do nothing here only if every operation it accepts
+  /// finishes on its own. One that may never complete (an accept, a read
+  /// from an idle socket) would otherwise keep its slot forever.
+  fn cancel(&mut self, id: u64);
 
   /// Drops every stored [`Keep`] and waits, for a bounded time, until nothing
   /// outside this call can dereference the operations.
@@ -275,11 +291,9 @@ pub unsafe trait IoBackend {
   /// backend and the models when this returns `false`, because a thread may
   /// still be writing. Completions for the drained operations are discarded.
   ///
-  /// The default returns `true` immediately. A backend that leaves work in
-  /// the kernel or on other threads between calls must override this.
-  fn drain(&mut self) -> bool {
-    true
-  }
+  /// Returning `true` at once is right only for a backend that leaves no
+  /// work in the kernel or on other threads between calls.
+  fn drain(&mut self) -> bool;
 
   /// Wait for completions with optional timeout.
   ///

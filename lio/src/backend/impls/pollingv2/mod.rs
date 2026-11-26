@@ -1334,7 +1334,7 @@ unsafe impl IoBackend for Poller {
       self.backlog.iter().position(|entry| entry.registration_id == id)
     {
       self.backlog.swap_remove(index);
-      self.queued_completed.push(OpCompleted::new(id, CANCELED));
+      self.queued_completed.push(OpCompleted::cancelled(id, CANCELED));
       return;
     }
     // This backend performs the I/O itself once the descriptor is ready, so
@@ -1347,7 +1347,7 @@ unsafe impl IoBackend for Poller {
     let Some(entry) = self.pending.remove_value(key) else {
       return;
     };
-    self.queued_completed.push(OpCompleted::new(id, CANCELED));
+    self.queued_completed.push(OpCompleted::cancelled(id, CANCELED));
 
     // The others waiting on its descriptor go on waiting.
     let (fd, interest) = self.extract_fd_interest(&entry.op);
@@ -1472,5 +1472,9 @@ unsafe impl IoBackend for Poller {
     completed.append(&mut self.completed);
 
     Ok(())
+  }
+
+  fn resource_close(&self) -> crate::api::resource::ResourceClose {
+    crate::api::resource::ResourceClose::native()
   }
 }

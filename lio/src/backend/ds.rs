@@ -2808,6 +2808,12 @@ unsafe impl IoBackend for DSBackend {
     }
 
     completed.append(&mut self.ready);
+    // A stopped operation is scheduled like any other result.
+    for done in completed.iter_mut() {
+      if done.result() == -(errno::ECANCELED as isize) {
+        *done = OpCompleted::cancelled(done.registration_id(), done.result());
+      }
+    }
     Ok(())
   }
 }
