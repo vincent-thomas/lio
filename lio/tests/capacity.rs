@@ -7,12 +7,12 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Wake, Waker, ready};
 use std::time::Duration;
 
 use lio::api::IoStream;
 use lio::backend::testing::{Checked, ScriptedBackend};
-use lio::model::{Cx, OpModel, Step};
+use lio::model::{Cx, OpModel, OpStream};
 use lio::{Lio, api};
 
 fn lio(cap: usize) -> Lio {
@@ -113,30 +113,31 @@ fn cancelling_a_future_frees_its_slot_for_a_waiter() {
   panic!("the waiting future never completed");
 }
 
-/// Yields one item, then finishes, with one nop before each.
+/// Yields 1, then 2, with one nop before each.
 struct OneShotStream {
-  done: bool,
+  sent: u32,
   nop: lio::api::ops::Nop,
 }
 
 impl OneShotStream {
   fn new() -> Self {
-    Self { done: false, nop: api::nop() }
+    Self { sent: 0, nop: api::nop() }
   }
 }
 
-impl OpModel for OneShotStream {
+impl OpStream for OneShotStream {
   type Item = u32;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<u32> {
-    let _ = lio::ready!(self.nop.poll(cx));
-    if self.done {
-      Step::Done(2)
-    } else {
-      self.done = true;
-      self.nop = api::nop();
-      Step::Yield(1)
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<u32>> {
+    if self.sent == 2 {
+      return Poll::Ready(None);
     }
+    let _ = ready!(self.nop.poll(cx));
+    self.sent += 1;
+    if self.sent < 2 {
+      self.nop = api::nop();
+    }
+    Poll::Ready(Some(self.sent))
   }
 }
 
@@ -152,7 +153,8 @@ fn stream_over_capacity_waits_instead_of_ending() {
     Box::pin(api::nop().with_lio(&lio).into_future());
   assert!(blocker.as_mut().poll(&mut cx).is_pending());
 
-  let mut stream = IoStream::from_op(OneShotStream::new()).with_lio(&lio);
+  let mut stream =
+    IoStream::from_op(OneShotStream::new()).with_lio(&lio).start();
   let mut next = Box::pin(stream.next());
   // Previously this reported `None`, ending the stream early.
   assert!(next.as_mut().poll(&mut cx).is_pending());

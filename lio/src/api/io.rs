@@ -54,7 +54,7 @@
 use crate::{
   driver,
   driver::Lio,
-  model::{self, OpModel, Task},
+  model::{self, OpModel, OpStream, Task},
 };
 
 use std::{
@@ -447,23 +447,36 @@ struct LocalFutureSlot<T> {
 // IoStream - Async Stream for multi-item operations
 // ============================================================================
 
-/// A model that produces several items, consumed one at a time.
+/// A stream and the driver it will run on, with the ways to get its items.
 ///
-/// The model runs from the first [`next`](Self::next). Every
-/// [`Step::Yield`](crate::model::Step::Yield) is one item, a
-/// [`Step::Done`](crate::model::Step::Done) is the last, and after it `next`
-/// returns `None`. Dropping the stream stops the model.
-pub struct IoStream<T>
-where
-  T: OpModel,
-{
-  state: IoStreamState<T>,
+/// lio's streams can be run without one: `api::interval(d).start()` uses
+/// the driver installed for the thread. An `IoStream` is what `with_lio` on
+/// a stream returns, and what [`api::run_stream`](crate::api::run_stream)
+/// makes of a stream of your own.
+///
+/// Every method consumes it, so a stream cannot be started twice.
+#[must_use = "a stream does nothing until it is started"]
+pub struct IoStream<T> {
+  op: T,
   handle: LioHandle,
 }
 
-enum IoStreamState<T>
+/// The items of a running stream, taken one at a time with
+/// [`next`](Self::next).
+///
+/// The stream runs from the first `next`. After its last item `next` returns
+/// `None`. Dropping this stops the stream.
+pub struct Items<T>
 where
-  T: OpModel,
+  T: OpStream,
+{
+  state: ItemsState<T>,
+  handle: LioHandle,
+}
+
+enum ItemsState<T>
+where
+  T: OpStream,
 {
   Pending(T),
   Inflight { task: Task, slot: Rc<RefCell<StreamSlot<T::Item>>> },
@@ -520,24 +533,26 @@ impl<T> Drop for StreamEnd<T> {
 
 impl<T> IoStream<T>
 where
-  T: OpModel + 'static,
+  T: OpStream + 'static,
 {
   pub fn from_op(op: T) -> Self {
-    Self {
-      state: IoStreamState::Pending(op),
-      handle: LioHandle::GloballyInstalled,
-    }
+    Self { op, handle: LioHandle::GloballyInstalled }
   }
 
+  /// Runs the stream on `lio` instead of the driver installed for the
+  /// thread.
   pub fn with_lio(mut self, lio: &Lio) -> Self {
     self.handle = LioHandle::Custom(lio.clone());
     self
   }
 
-  pub async fn next(&mut self) -> Option<T::Item> {
-    IoStreamNextFuture { stream: self }.await
+  /// Gives the handle the stream's items are taken from, one
+  /// [`next`](Items::next) at a time.
+  pub fn start(self) -> Items<T> {
+    Items { state: ItemsState::Pending(self.op), handle: self.handle }
   }
 
+  /// Runs the stream and gives a receiver for its items.
   pub fn send(self) -> StreamReceiver<T::Item>
   where
     T::Item: Send,
@@ -547,37 +562,36 @@ where
     StreamReceiver { recv: receiver }
   }
 
-  /// Sends every item through `sender`. The model stops once every receiver
-  /// of `sender` is dropped.
-  pub fn send_with(mut self, sender: std_mpsc::Sender<T::Item>)
+  /// Sends every item through `sender`. The stream stops once every
+  /// receiver of `sender` is dropped.
+  pub fn send_with(self, sender: std_mpsc::Sender<T::Item>)
   where
     T::Item: Send,
   {
-    let lio = self.handle.lio();
-    let op = match std::mem::replace(&mut self.state, IoStreamState::Done) {
-      IoStreamState::Pending(op) => op,
-      IoStreamState::Inflight { .. } => {
-        panic!("lio consumer error: stream already started before send_with()")
-      }
-      IoStreamState::Done => {
-        panic!(
-          "lio consumer error: stream already completed before send_with()"
-        )
-      }
-    };
-
-    // The handle is dropped: the model runs until it is done or nobody
+    let lio = self.handle.into_lio();
+    // The handle is dropped: the stream runs until it ends or nobody
     // receives.
-    let _task =
-      model::spawn_while(&lio, op, move |item| sender.send(item).is_ok());
+    let _task = model::spawn_while(&lio, model::Many(self.op), move |item| {
+      sender.send(item).is_ok()
+    });
   }
 }
 
-struct IoStreamNextFuture<'a, T: OpModel> {
-  stream: &'a mut IoStream<T>,
+impl<T> Items<T>
+where
+  T: OpStream + 'static,
+{
+  /// The next item, or `None` once the stream has ended.
+  pub async fn next(&mut self) -> Option<T::Item> {
+    ItemsNextFuture { stream: self }.await
+  }
 }
 
-impl<T: OpModel + 'static> Future for IoStreamNextFuture<'_, T> {
+struct ItemsNextFuture<'a, T: OpStream> {
+  stream: &'a mut Items<T>,
+}
+
+impl<T: OpStream + 'static> Future for ItemsNextFuture<'_, T> {
   type Output = Option<T::Item>;
 
   fn poll(
@@ -588,13 +602,13 @@ impl<T: OpModel + 'static> Future for IoStreamNextFuture<'_, T> {
     let stream = &mut *this.stream;
 
     let (task, slot) =
-      match std::mem::replace(&mut stream.state, IoStreamState::Done) {
-        IoStreamState::Pending(op) => {
+      match std::mem::replace(&mut stream.state, ItemsState::Done) {
+        ItemsState::Pending(op) => {
           let lio = stream.handle.lio();
           if lio.is_full() {
             // Wait for a slot; the driver wakes us when one frees up.
             lio.wait_for_capacity(cx.waker());
-            stream.state = IoStreamState::Pending(op);
+            stream.state = ItemsState::Pending(op);
             return Poll::Pending;
           }
           let slot = Rc::new(RefCell::new(StreamSlot {
@@ -604,7 +618,7 @@ impl<T: OpModel + 'static> Future for IoStreamNextFuture<'_, T> {
           }));
           let sink = Rc::clone(&slot);
           let end = StreamEnd { slot: Rc::clone(&slot) };
-          let task = model::spawn(&lio, op, move |item| {
+          let task = model::spawn_stream(&lio, op, move |item| {
             let _end = &end;
             let waker = {
               let mut wait = sink.borrow_mut();
@@ -620,14 +634,14 @@ impl<T: OpModel + 'static> Future for IoStreamNextFuture<'_, T> {
           // The model may have produced items, or finished, already.
           (task, slot)
         }
-        IoStreamState::Inflight { task, slot } => (task, slot),
-        IoStreamState::Done => return Poll::Ready(None),
+        ItemsState::Inflight { task, slot } => (task, slot),
+        ItemsState::Done => return Poll::Ready(None),
       };
 
     let mut wait = slot.borrow_mut();
     if let Some(item) = wait.pop_item() {
       drop(wait);
-      stream.state = IoStreamState::Inflight { task, slot };
+      stream.state = ItemsState::Inflight { task, slot };
       Poll::Ready(Some(item))
     } else if wait.ended {
       Poll::Ready(None)
@@ -637,15 +651,15 @@ impl<T: OpModel + 'static> Future for IoStreamNextFuture<'_, T> {
         _ => wait.slot.waker = Some(cx.waker().clone()),
       }
       drop(wait);
-      stream.state = IoStreamState::Inflight { task, slot };
+      stream.state = ItemsState::Inflight { task, slot };
       Poll::Pending
     }
   }
 }
 
-impl<T: OpModel> Drop for IoStream<T> {
+impl<T: OpStream> Drop for Items<T> {
   fn drop(&mut self) {
-    if let IoStreamState::Inflight { task, slot } = &self.state {
+    if let ItemsState::Inflight { task, slot } = &self.state {
       // Nobody is left to wake.
       slot.borrow_mut().slot.waker = None;
       task.stop();
@@ -688,10 +702,10 @@ mod tests {
   use crate::api;
   use crate::api::ops;
   use crate::backend::testing::ScriptedBackend;
-  use crate::model::{Cx, Step};
+  use crate::model::Cx;
   use std::sync::Arc;
   use std::sync::atomic::{AtomicUsize, Ordering};
-  use std::task::{RawWaker, RawWakerVTable, Waker};
+  use std::task::{RawWaker, RawWakerVTable, Waker, ready};
 
   #[test]
   fn test_blocking_receiver_is_send() {
@@ -971,7 +985,7 @@ mod tests {
     assert!(result.is_some_and(|result| result.is_ok()));
   }
 
-  /// Yields 1 and 2, then finishes with 3, one nop before each.
+  /// Yields 1, 2 and 3, one nop before each.
   struct Counter(u32, ops::Nop);
 
   impl Counter {
@@ -980,18 +994,19 @@ mod tests {
     }
   }
 
-  impl OpModel for Counter {
+  impl OpStream for Counter {
     type Item = u32;
 
-    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<u32> {
-      let _ = crate::ready!(self.1.poll(cx));
+    fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<u32>> {
+      if self.0 == 3 {
+        return Poll::Ready(None);
+      }
+      let _ = ready!(self.1.poll(cx));
       self.0 += 1;
       if self.0 < 3 {
         self.1 = api::nop();
-        Step::Yield(self.0)
-      } else {
-        Step::Done(self.0)
       }
+      Poll::Ready(Some(self.0))
     }
   }
 
@@ -1008,7 +1023,7 @@ mod tests {
   #[test]
   fn a_stream_wakes_the_waker_it_was_last_polled_with() {
     let (backend, lio) = scripted(1);
-    let mut stream = IoStream::from_op(Counter::new()).with_lio(&lio);
+    let mut stream = IoStream::from_op(Counter::new()).with_lio(&lio).start();
     let mut next = Box::pin(stream.next());
     let (first, second) = (Arc::default(), Arc::default());
     let a = counting_waker(&first);
@@ -1027,7 +1042,7 @@ mod tests {
   #[test]
   fn a_stream_polled_again_with_the_same_waker_keeps_it() {
     let (_backend, lio) = scripted(1);
-    let mut stream = IoStream::from_op(Counter::new()).with_lio(&lio);
+    let mut stream = IoStream::from_op(Counter::new()).with_lio(&lio).start();
     let mut next = Box::pin(stream.next());
     let counts = Arc::default();
     let waker = counting_waker(&counts);
@@ -1044,22 +1059,26 @@ mod tests {
 
   /// Takes a step without an item (unless that is already done), then
   /// finishes with 7.
-  struct AgainThenDone(bool, ops::Nop);
+  struct AgainThenDone(bool, ops::Nop, bool);
 
   impl AgainThenDone {
     fn new(stepped: bool) -> Self {
-      Self(stepped, api::nop())
+      Self(stepped, api::nop(), false)
     }
   }
 
-  impl OpModel for AgainThenDone {
+  impl OpStream for AgainThenDone {
     type Item = u32;
 
-    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<u32> {
+    fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<u32>> {
+      if self.2 {
+        return Poll::Ready(None);
+      }
       loop {
-        let _ = crate::ready!(self.1.poll(cx));
+        let _ = ready!(self.1.poll(cx));
         if std::mem::replace(&mut self.0, true) {
-          return Step::Done(7);
+          self.2 = true;
+          return Poll::Ready(Some(7));
         }
         self.1 = api::nop();
       }
@@ -1070,7 +1089,7 @@ mod tests {
   fn a_stream_step_without_an_item_keeps_the_waker_for_the_next() {
     let (backend, lio) = scripted(1);
     let mut stream =
-      IoStream::from_op(AgainThenDone::new(false)).with_lio(&lio);
+      IoStream::from_op(AgainThenDone::new(false)).with_lio(&lio).start();
     let mut next = Box::pin(stream.next());
     let counts = Arc::default();
     let waker = counting_waker(&counts);
@@ -1087,7 +1106,7 @@ mod tests {
   /// Polls its stream inline when woken, as an executor that runs tasks from
   /// `wake` would: takes the item, then polls for the next one with `next`.
   struct InlineNext {
-    stream: std::cell::RefCell<IoStream<AgainThenDone>>,
+    stream: std::cell::RefCell<Items<AgainThenDone>>,
     items: std::cell::RefCell<Vec<Option<u32>>>,
     next: Waker,
   }
@@ -1116,7 +1135,10 @@ mod tests {
     let (backend, lio) = scripted(1);
     let counts = Arc::default();
     let inline = Arc::new(InlineNext {
-      stream: IoStream::from_op(AgainThenDone::new(true)).with_lio(&lio).into(),
+      stream: IoStream::from_op(AgainThenDone::new(true))
+        .with_lio(&lio)
+        .start()
+        .into(),
       items: Default::default(),
       next: counting_waker(&counts),
     });
@@ -1141,7 +1163,7 @@ mod tests {
   #[test]
   fn a_stream_keeps_items_that_arrive_before_they_are_polled() {
     let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 1).unwrap();
-    let mut stream = IoStream::from_op(Counter::new()).with_lio(&lio);
+    let mut stream = IoStream::from_op(Counter::new()).with_lio(&lio).start();
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     assert!(Box::pin(stream.next()).as_mut().poll(&mut cx).is_pending());
@@ -1164,7 +1186,7 @@ mod tests {
     let lio = Lio::new(64).unwrap();
 
     let receiver =
-      api::interval(Duration::from_millis(1)).stream().with_lio(&lio).send();
+      api::interval(Duration::from_millis(1)).with_lio(&lio).send();
 
     run_until_done(&lio);
 

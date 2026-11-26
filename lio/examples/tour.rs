@@ -18,15 +18,15 @@ use std::io;
 use std::path::Path;
 use std::pin::pin;
 use std::sync::mpsc;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, Waker, ready};
 use std::time::Duration;
 
 use lio::api::ops::{Read, Write};
 use lio::api::resource::{IntoResource, Resource};
 use lio::api::{self, FileMode, OpenFlags, ShutdownHow};
-use lio::model::{self, Cx, Join, OpModel, Step};
+use lio::model::{self, Cx, Join, OpModel, OpStream};
 use lio::net::{TcpListener, TcpStream};
-use lio::{BufResult, Lio, fs, ready};
+use lio::{Lio, fs};
 
 fn main() -> io::Result<()> {
   // ---- 1. The driver -------------------------------------------------------
@@ -184,7 +184,7 @@ fn time(lio: &Lio) -> io::Result<()> {
 
     // A stream gives its items one at a time, and stops its model when it
     // is dropped.
-    let mut ticks = api::interval(Duration::from_millis(2)).stream();
+    let mut ticks = api::interval(Duration::from_millis(2)).start();
     for _ in 0..3 {
       ticks.next().await.expect("an interval never ends")?;
     }
@@ -238,21 +238,25 @@ impl WriteAll {
   }
 }
 
+// The ways to run it, as lio's own operations have them: `.await`,
+// `when_done`, `send`, `send_with` and `with_lio`.
+lio::runnable!(WriteAll);
+
 impl OpModel for WriteAll {
   type Item = io::Result<u64>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
     loop {
-      // `ready!` returns `Step::Pending` until the write has finished.
+      // `ready!` returns `Poll::Pending` until the write has finished.
       let (result, mut buf) = ready!(self.write.poll(cx));
       let written = match result {
         Ok(written) => written,
-        Err(err) => return Step::Done(Err(err)),
+        Err(err) => return Poll::Ready(Err(err)),
       };
       self.offset += written as u64;
       buf.drain(..written);
       if buf.is_empty() {
-        return Step::Done(Ok(self.offset));
+        return Poll::Ready(Ok(self.offset));
       }
       self.write = api::write_at(&self.to, buf, self.offset);
     }
@@ -264,6 +268,7 @@ struct Chunks {
   from: Resource,
   offset: u64,
   read: Read<Vec<u8>>,
+  failed: bool,
 }
 
 impl Chunks {
@@ -271,28 +276,38 @@ impl Chunks {
 
   fn new(from: &Resource) -> Self {
     let read = api::read_at(from, Vec::<u8>::with_capacity(Self::SIZE), 0);
-    Self { from: from.clone(), offset: 0, read }
+    Self { from: from.clone(), offset: 0, read, failed: false }
   }
 }
 
-impl OpModel for Chunks {
-  type Item = BufResult<usize, Vec<u8>>;
+impl OpStream for Chunks {
+  type Item = io::Result<Vec<u8>>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
-    let (result, buf) = ready!(self.read.poll(cx));
-    match result {
-      Ok(n) if n > 0 => {
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<Self::Item>> {
+    if self.failed {
+      return Poll::Ready(None);
+    }
+    let (result, chunk) = ready!(self.read.poll(cx));
+    Poll::Ready(match result {
+      // The end of the file ends the stream.
+      Ok(0) => None,
+      Ok(n) => {
         self.offset += n as u64;
         let next = Vec::<u8>::with_capacity(Self::SIZE);
         self.read = api::read_at(&self.from, next, self.offset);
-        // More is coming.
-        Step::Yield((Ok(n), buf))
+        Some(Ok(chunk))
       }
-      // The end, or an error: the last item.
-      last => Step::Done((last, buf)),
-    }
+      // An error is the last item.
+      Err(err) => {
+        self.failed = true;
+        Some(Err(err))
+      }
+    })
   }
 }
+
+// The ways to run it, as lio's own streams have them.
+lio::streamable!(Chunks);
 
 fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
   let open = |name: &str| {
@@ -308,10 +323,8 @@ fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
     // The operations in `lio::api` take any resource: here, the files'.
     let (source, copy) = (source.into_resource(), copy.into_resource());
 
-    // A model of your own runs like one of lio's: `api::run` makes it an
-    // `Io`, with the same four ways to get its result.
-    let written =
-      api::run(WriteAll::new(&source, b"0123456789".to_vec())).await?;
+    // A model of your own runs like one of lio's.
+    let written = WriteAll::new(&source, b"0123456789".to_vec()).await?;
     assert_eq!(written, 10);
 
     // Models nest: lio's own `copy` is one, and so is a `Join` of two.
@@ -319,21 +332,21 @@ fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
       Join::new(lio::io::copy(&source, &copy), api::fstat(&source)).await;
     assert_eq!((copied?, stat?.size), (10, 10));
 
-    // A model that yields is a stream.
-    let mut chunks = api::run_stream(Chunks::new(&copy));
+    // Work that produces several items is an `OpStream`. Starting it
+    // gives the handle its items are taken from.
+    let mut chunks = Chunks::new(&copy).start();
     let mut text = Vec::new();
-    while let Some((result, chunk)) = chunks.next().await {
-      result?;
-      text.extend(chunk);
+    while let Some(chunk) = chunks.next().await {
+      text.extend(chunk?);
     }
     assert_eq!(text, b"0123456789");
     io::Result::Ok(())
   })?;
 
-  // `spawn` hands every item to a callback, and gives back a handle that
+  // `spawn_stream` hands every item to a callback, and gives back a handle that
   // can stop the model.
   let ticks = api::interval(Duration::from_millis(1));
-  let task = model::spawn(lio, ticks, |tick| println!("tick: {tick:?}"));
+  let task = model::spawn_stream(lio, ticks, |tick| println!("tick: {tick:?}"));
   // One tick per run. Dropping the handle would leave the model running:
   // cancelling stops it here.
   lio.run()?;

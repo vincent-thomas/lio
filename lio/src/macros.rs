@@ -188,20 +188,21 @@ macro_rules! action_io {
 /// ```
 /// use lio::api;
 /// use lio::backend::testing::ScriptedBackend;
-/// use lio::model::{Cx, OpModel, Step};
+/// use lio::model::{Cx, OpModel};
+/// use std::task::{Poll, ready};
 ///
 /// struct Twice(api::ops::Nop, bool);
 ///
 /// impl OpModel for Twice {
 ///   type Item = std::io::Result<()>;
 ///
-///   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+///   fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
 ///     loop {
-///       if let Err(err) = lio::ready!(self.0.poll(cx)) {
-///         return Step::Done(Err(err));
+///       if let Err(err) = ready!(self.0.poll(cx)) {
+///         return Poll::Ready(Err(err));
 ///       }
 ///       if std::mem::replace(&mut self.1, true) {
-///         return Step::Done(Ok(()));
+///         return Poll::Ready(Ok(()));
 ///       }
 ///       self.0 = api::nop();
 ///     }
@@ -288,6 +289,65 @@ macro_rules! runnable {
   };
 }
 
+/// Gives a stream type the ways to run it: `start` for a handle to take
+/// items from, `send` and `send_with` for a channel, and `with_lio` to name
+/// the driver.
+///
+/// Every stream lio provides has these. Use this for an
+/// [`OpStream`](crate::model::OpStream) of your own:
+/// `lio::streamable!(Chunks)`, or `lio::streamable!([B: IoBuf] Chunks<B>)`.
+#[macro_export]
+macro_rules! streamable {
+  ([$($generics:tt)*] $ty:ty) => {
+    impl<$($generics)*> $ty
+    where
+      Self: $crate::model::OpStream + 'static,
+    {
+      /// Runs this on `lio` instead of the driver installed for the thread.
+      #[inline]
+      pub fn with_lio(self, lio: &$crate::Lio) -> $crate::api::IoStream<Self> {
+        $crate::api::IoStream::from_op(self).with_lio(lio)
+      }
+
+      /// Starts this, and gives the handle its items are taken from. See
+      /// [`IoStream::start`]($crate::api::IoStream::start).
+      #[inline]
+      pub fn start(self) -> $crate::api::Items<Self> {
+        $crate::api::IoStream::from_op(self).start()
+      }
+
+      /// Runs this and sends every item through a channel. See
+      /// [`IoStream::send`]($crate::api::IoStream::send).
+      #[inline]
+      pub fn send(
+        self,
+      ) -> $crate::api::StreamReceiver<<Self as $crate::model::OpStream>::Item>
+      where
+        <Self as $crate::model::OpStream>::Item: ::std::marker::Send,
+      {
+        $crate::api::IoStream::from_op(self).send()
+      }
+
+      /// Runs this and sends every item through `sender`. See
+      /// [`IoStream::send_with`]($crate::api::IoStream::send_with).
+      #[inline]
+      pub fn send_with(
+        self,
+        sender: ::std::sync::mpsc::Sender<
+          <Self as $crate::model::OpStream>::Item,
+        >,
+      ) where
+        <Self as $crate::model::OpStream>::Item: ::std::marker::Send,
+      {
+        $crate::api::IoStream::from_op(self).send_with(sender)
+      }
+    }
+  };
+  ($ty:ty) => {
+    $crate::streamable!([] $ty);
+  };
+}
+
 /// Declares the type of one operation: what it was asked to do, held
 /// until it is polled, and the [`Cx`](crate::model::Cx) method that then
 /// starts it.
@@ -347,7 +407,7 @@ macro_rules! leaf {
       fn poll(
         &mut self,
         cx: &mut $crate::model::Cx<'_>,
-      ) -> $crate::model::Step<Self::Item> {
+      ) -> ::std::task::Poll<Self::Item> {
         self.state.poll(cx, |cx, ($($arg,)*)| cx.$method($($arg),*))
       }
     }
