@@ -308,15 +308,22 @@ pub trait IoBackend {
   /// outside this call can dereference the operations. Each one that is
   /// finished is given up with [`Ticket::release`].
   ///
-  /// Returns whether the kernel and any worker threads are finished with
-  /// everything. The driver drops the backend after `true`, and leaks it
-  /// after `false`. Tickets still held either way are dropped unreported,
-  /// which leaks their operations' memory instead of freeing it under a
-  /// thread that may still be writing. Completions for the drained
-  /// operations are discarded.
+  /// Returns whether this backend holds nothing: no caller buffer address
+  /// remains stored here, and the kernel and any worker threads are
+  /// finished with every operation. That `true` is a checked promise. The
+  /// type system does not prove the kernel released the address. A test
+  /// fails when a backend reports drained while it still stores one.
+  ///
+  /// The driver keeps the operation model until this returns `true`, and
+  /// still keeps it when a ticket was not given up. It drops the backend
+  /// after a `true` that left no ticket held, and leaks both after `false`.
+  /// Tickets still held are dropped unreported, which leaks their
+  /// operations' memory instead of freeing it under a thread that may still
+  /// be writing. Completions for the drained operations are discarded.
   ///
   /// Returning `true` at once is right only for a backend that leaves no
-  /// work in the kernel or on other threads between calls.
+  /// work in the kernel or on other threads between calls, and that has
+  /// forgotten every caller buffer address it copied.
   fn drain(&mut self) -> bool;
 
   /// Wait for completions with optional timeout.

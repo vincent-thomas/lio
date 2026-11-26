@@ -38,6 +38,14 @@ Two ideas shape most of the API:
 
 That ownership model is how `lio` keeps in-flight I/O memory-safe without hiding lifecycle details behind background tasks or borrowed buffers.
 
+## Supported surface
+
+Callers depend on [`Lio`], [`Io`](api::io::Io), and [`api`]. That is the supported surface: the driver, the operation handle, and the syscall-shaped operations.
+
+[`backend`] is for people who implement a backend. It can change between releases. Do not build application code on it.
+
+`IoBackend::drain` is a checked promise that the backend no longer stores a caller buffer address. The type system does not prove that the kernel has released that address. The driver keeps the operation model until drain says the backend holds nothing.
+
 ## API reference versus explanation
 
 Rustdoc is the API reference.

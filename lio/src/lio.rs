@@ -314,22 +314,27 @@ macro_rules! timed {
 
 impl Drop for LioInner {
   fn drop(&mut self) {
-    // They point into the store's arenas, so they go before it.
-    drop(std::mem::take(&mut self.dying));
-    if self.io.drain() {
+    // `drain` runs before any operation model is dropped. `dying` points
+    // into the store, and the backend may still hold those addresses.
+    let drained = self.io.drain();
+    if drained {
       // Completions the driver never routed hold a share of their
       // operations' leases. Nothing reads them any more.
       self.completed.clear();
       self.ready_io.clear();
-      // SAFETY: this field is not used again.
-      unsafe { ManuallyDrop::drop(&mut self.io) };
       // `leaked` counts registrations forgotten while a backend still held
       // their lease. Their arenas live in the store, so the store stays too.
       //
       // A lease still held now belongs to a ticket the backend never gave
-      // up, whatever its `drain` said: something may still use that
-      // operation's memory, so the store stays as well.
+      // up. `drain` returning true is only a promise that no caller buffer
+      // address remains; a held ticket means that promise is not enough, so
+      // the model stays.
       if self.leaked == 0 && !self.store.any_lease_held() {
+        // The detached models point into the store's arenas, so they go
+        // before it, and only after drain said the backend holds nothing.
+        drop(std::mem::take(&mut self.dying));
+        // SAFETY: this field is not used again.
+        unsafe { ManuallyDrop::drop(&mut self.io) };
         #[cfg(test)]
         STORE_DROPPED.with(|dropped| dropped.set(true));
         // SAFETY: every registration was dropped, and this field is not
@@ -338,9 +343,9 @@ impl Drop for LioInner {
       }
     }
     // Otherwise an operation may still be running in the kernel or on a
-    // backend thread, writing into buffers and lowered state owned by the
-    // store. Leaking both keeps that memory valid, and keeps the backend
-    // from waiting again in its own `Drop`.
+    // backend thread, or the backend may still store a caller buffer
+    // address. Leaking the model and the backend keeps that memory valid,
+    // and keeps the backend from waiting again in its own `Drop`.
 
     let Some(profile) = &self.profile else {
       return;
@@ -1654,6 +1659,85 @@ mod tests {
     STORE_DROPPED.with(|dropped| dropped.set(false));
     drop(lio);
     assert!(STORE_DROPPED.with(|dropped| dropped.get()));
+  }
+
+  /// Copies one caller buffer address and says `drain` succeeded.
+  struct KeepsBuffer {
+    addr: Rc<Cell<Option<usize>>>,
+    ticket: Option<crate::backend::Ticket>,
+  }
+
+  impl IoBackend for KeepsBuffer {
+    fn init(&mut self, _: usize) -> io::Result<()> {
+      Ok(())
+    }
+    fn push(&mut self, op: crate::backend::InFlight<'_>, _: &mut Bump) {
+      let (op, ticket) = op.into_parts();
+      if let crate::backend::op::Op::Read { iovecs, iov_count, .. } = op
+        && iov_count > 0
+      {
+        // SAFETY: the driver keeps this descriptor until the ticket is given
+        // up. Only the address is copied. The bytes are not read.
+        let ptr = unsafe { iovecs.as_ref().ptr };
+        self.addr.set(Some(ptr as usize));
+      }
+      self.ticket = Some(ticket);
+    }
+    fn flush(&mut self) -> io::Result<()> {
+      Ok(())
+    }
+    fn wait(
+      &mut self,
+      _: Option<Duration>,
+      completed: &mut Vec<OpCompleted>,
+    ) -> io::Result<()> {
+      completed.clear();
+      Ok(())
+    }
+    fn resource_close(&self) -> crate::api::resource::ResourceClose {
+      crate::api::resource::ResourceClose::noop()
+    }
+    fn cancel(&mut self, _id: u64) {}
+    fn drain(&mut self) -> bool {
+      // The address copied above is still stored. True would be a lie if
+      // the driver treated it as proof the model can be freed. The held
+      // ticket keeps the model anyway: drain is a promise, and a held
+      // ticket fails that promise closed.
+      true
+    }
+  }
+
+  #[test]
+  #[cfg_attr(miri, ignore = "leaks the registration on purpose")]
+  fn a_drained_backend_that_keeps_a_buffer_address_does_not_free_the_model() {
+    let addr = Rc::new(Cell::new(None));
+    let backend = KeepsBuffer { addr: addr.clone(), ticket: None };
+    let lio = Lio::new_with_backend(backend, 1).unwrap();
+    let dropped = Rc::new(Cell::new(false));
+    let flag = dropped.clone();
+    struct Note(Rc<Cell<bool>>);
+    impl Drop for Note {
+      fn drop(&mut self) {
+        self.0.set(true);
+      }
+    }
+    let note = Note(flag);
+    crate::api::read(&crate::api::resource::Resource::stdout(), vec![0u8; 1])
+      .with_lio(&lio)
+      .when_done(move |_| {
+        let _ = &note;
+      });
+    assert!(addr.get().is_some(), "the backend stored the caller buffer");
+    STORE_DROPPED.with(|dropped| dropped.set(false));
+    drop(lio);
+    assert!(
+      addr.get().is_some(),
+      "backend reports drained while it still stores a caller buffer address"
+    );
+    assert!(
+      !dropped.get() && !STORE_DROPPED.with(|dropped| dropped.get()),
+      "the model was freed while the backend still stores a caller buffer address"
+    );
   }
 
   /// Reports a completion for every pushed op, twice.

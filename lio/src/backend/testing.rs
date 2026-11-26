@@ -56,6 +56,8 @@ struct Script {
   auto: Option<isize>,
   stuck: bool,
   no_poison: bool,
+  /// `drain` claims success without forgetting stored operations.
+  drain_while_holding: bool,
 }
 
 impl Drop for Script {
@@ -114,6 +116,15 @@ impl ScriptedBackend {
   /// the driver has to leak their memory.
   pub fn set_stuck(&self, stuck: bool) {
     self.0.borrow_mut().stuck = stuck;
+  }
+
+  /// Makes [`drain`](IoBackend::drain) report success while it still stores
+  /// every in-flight operation, caller buffer addresses included.
+  ///
+  /// That report is rejected. `drain` returning true is a checked promise,
+  /// not a proof the type system can make.
+  pub fn drain_while_holding(&self) {
+    self.0.borrow_mut().drain_while_holding = true;
   }
 
   /// The capacity the backend was initialized with.
@@ -214,18 +225,26 @@ impl IoBackend for ScriptedBackend {
     if script.stuck {
       return false;
     }
-    for (_, op) in std::mem::take(&mut script.in_flight) {
-      if !script.no_poison {
-        // SAFETY: a drained operation may still be finishing, so the driver
-        // keeps its memory valid until its ticket is given up.
-        unsafe { touch(&op) };
+    if !script.drain_while_holding {
+      for (_, op) in std::mem::take(&mut script.in_flight) {
+        if !script.no_poison {
+          // SAFETY: a drained operation may still be finishing, so the driver
+          // keeps its memory valid until its ticket is given up.
+          unsafe { touch(&op) };
+        }
       }
+      for (_, ticket) in script.tickets.drain() {
+        // SAFETY: no kernel or thread ever sees the addresses.
+        unsafe { ticket.release() };
+      }
+      script.ready.clear();
     }
-    for (_, ticket) in script.tickets.drain() {
-      // SAFETY: no kernel or thread ever sees the addresses.
-      unsafe { ticket.release() };
-    }
-    script.ready.clear();
+    // True means this backend no longer stores a caller buffer address.
+    // The flag above skips that forgetting, so the promise fails closed.
+    assert!(
+      !script.in_flight.iter().any(|(_, op)| holds_caller_buffer(op)),
+      "backend reports drained while it still stores a caller buffer address"
+    );
     true
   }
 
@@ -237,6 +256,18 @@ impl IoBackend for ScriptedBackend {
     completed.clear();
     completed.extend(self.0.borrow_mut().ready.drain(..));
     Ok(())
+  }
+}
+
+/// Whether `op` stores an address of a buffer the caller owns.
+fn holds_caller_buffer(op: &Op) -> bool {
+  match op {
+    Op::Read { iov_count, .. } | Op::Write { iov_count, .. } => *iov_count > 0,
+    Op::Recv { msg, .. } => msg.buf_count.get() > 0,
+    Op::Send { msg, .. } => msg.buf_count.get() > 0,
+    Op::ReadlinkAt { buf_len, .. } => *buf_len > 0,
+    Op::ReadDir { .. } | Op::Stat { .. } | Op::Accept { .. } => true,
+    _ => false,
   }
 }
 
@@ -612,6 +643,17 @@ mod tests {
     backend.complete(1, 1);
     assert_eq!(into, 0);
     assert_eq!(wait(&mut driver), vec![1]);
+  }
+
+  #[test]
+  #[should_panic(expected = "still stores a caller buffer address")]
+  fn drain_fails_if_it_reports_drained_while_a_caller_buffer_is_stored() {
+    let mut backend = ScriptedBackend::new();
+    backend.drain_while_holding();
+    backend.init(1).unwrap();
+    let (mut into, mut iovec) = (0u8, crate::backend::op::RawBufMut::empty());
+    push_op(&mut backend.clone(), 1, read_into(&mut into, &mut iovec));
+    let _ = backend.drain();
   }
 
   #[test]

@@ -17,6 +17,11 @@ The project is still evolving, but the direction is stable: stay low-level,
 preserve explicit ownership and control, and keep the abstraction close to the
 operating system.
 
+Callers depend on `Lio`, `Io`, and `api`. That is the supported surface.
+`backend` is for people who implement a backend, and it can change. `drain`
+is a checked promise that a backend holds no caller buffer address. The type
+system does not prove that the kernel released that address.
+
 ## Benchmarks
 
 ```sh

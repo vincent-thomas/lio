@@ -404,10 +404,27 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
   }
 
   /// Calls `f` on the state of every occupied slot.
-  pub(crate) fn for_each_occupied(&mut self, mut f: impl FnMut(&mut T)) {
+  pub(crate) fn for_each_occupied(&mut self, f: impl FnMut(&mut T)) {
+    self.for_each_where(|slot| slot.occupied(), f);
+  }
+
+  /// Calls `f` on every slot that still owns its state: occupied, or
+  /// retired and not yet released.
+  pub(crate) fn for_each_leased(&mut self, f: impl FnMut(&mut T)) {
+    self.for_each_where(
+      |slot| slot.occupied() || slot.status == Status::Retired,
+      f,
+    );
+  }
+
+  fn for_each_where(
+    &mut self,
+    mut keep: impl FnMut(&Slot<T>) -> bool,
+    mut f: impl FnMut(&mut T),
+  ) {
     let spares = self.spares.iter_mut().map(|spare| &mut **spare);
     for slot in self.slots[..self.next_slot as usize].iter_mut().chain(spares) {
-      if slot.occupied() {
+      if keep(slot) {
         f(&mut slot.state);
       }
     }

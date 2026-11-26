@@ -213,9 +213,13 @@ impl OpStore {
   /// Whether a share of the lease of any stored operation is still held
   /// outside the store: by a ticket that was never given up, or by a
   /// completion that is still alive.
+  ///
+  /// A detached registration leaves its slot retired, not occupied. Its
+  /// lease still belongs to that slot, so a ticket held for it counts here
+  /// too. The driver must not free that registration on that account.
   pub fn any_lease_held(&mut self) -> bool {
     let mut held = false;
-    self.slots.for_each_occupied(|slot| {
+    self.slots.for_each_leased(|slot| {
       if slot.lease.held_elsewhere() {
         held = true;
       }
