@@ -1,6 +1,6 @@
 //! Filesystem resource types.
 
-use core::task::{Poll, ready};
+use crate::ready;
 use std::{
   ffi::{CString, OsStr, OsString},
   io,
@@ -14,7 +14,7 @@ use crate::api::{
   FileMode, FileStat, FileType, OpenFlags, ReadDirBuf, UnlinkKind, ops,
   resource::{AsResource, FromResource, IntoResource, Resource},
 };
-use crate::model::{Cx, OpModel};
+use crate::model::{Cx, OpModel, Step};
 
 const DEFAULT_READ_DIR_SCRATCH_BYTES: usize = 4096;
 const DEFAULT_READ_DIR_ENTRIES_CAP: usize = 32;
@@ -327,14 +327,14 @@ runnable!([] OpenFile);
 impl OpModel for OpenFile {
   type Item = io::Result<File>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     match &mut self.state {
       OpenFileState::Opening(open) => {
-        Poll::Ready(ready!(open.poll(cx)).map(File::from_resource))
+        Step::Done(ready!(open.poll(cx)).map(File::from_resource))
       }
       OpenFileState::Invalid(msg, nop) => {
         let _ = ready!(nop.poll(cx));
-        Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidInput, *msg)))
+        Step::Done(Err(io::Error::new(io::ErrorKind::InvalidInput, *msg)))
       }
     }
   }
@@ -351,8 +351,8 @@ runnable!([] OpenDirectory);
 impl OpModel for OpenDirectory {
   type Item = io::Result<Directory>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
-    Poll::Ready(ready!(self.inner.poll(cx)).map(Directory::from_resource))
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+    Step::Done(ready!(self.inner.poll(cx)).map(Directory::from_resource))
   }
 }
 
@@ -379,12 +379,12 @@ runnable!([] OpenReadDir);
 impl OpModel for OpenReadDir {
   type Item = io::Result<ReadDir>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     loop {
       let (fd, buf) = match &mut self.state {
         OpenReadDirState::InvalidPath(nop) => {
           let _ = ready!(nop.poll(cx));
-          return Poll::Ready(Err(ops::nul_path_error()));
+          return Step::Done(Err(ops::nul_path_error()));
         }
         OpenReadDirState::Opening(open) => match ready!(open.poll(cx)) {
           Ok(fd) => {
@@ -394,12 +394,12 @@ impl OpModel for OpenReadDir {
             );
             (fd, buf)
           }
-          Err(err) => return Poll::Ready(Err(err)),
+          Err(err) => return Step::Done(Err(err)),
         },
         OpenReadDirState::Reading { fd, read } => {
           let buf = match ready!(read.poll(cx)) {
             Ok(buf) => buf,
-            Err(err) => return Poll::Ready(Err(err)),
+            Err(err) => return Step::Done(Err(err)),
           };
           let eof = buf.result.eof;
           if !eof && buf.result.entries == 0 {
@@ -414,7 +414,7 @@ impl OpModel for OpenReadDir {
           );
           if eof {
             let entries = std::mem::take(&mut self.entries);
-            return Poll::Ready(Ok(ReadDir::new(entries)));
+            return Step::Done(Ok(ReadDir::new(entries)));
           }
           (fd.clone(), buf)
         }
@@ -613,7 +613,7 @@ impl RemoveDirFrame {
     while let Some(entry) = in_flight.get_mut(i) {
       match entry {
         Clearing::Stat { name, stat } => {
-          let Poll::Ready(stat) = stat.poll(cx) else {
+          let Step::Done(stat) = stat.poll(cx) else {
             i += 1;
             continue;
           };
@@ -629,7 +629,7 @@ impl RemoveDirFrame {
           progressed = true;
         }
         Clearing::Unlink(unlink) => {
-          let Poll::Ready(done) = unlink.poll(cx) else {
+          let Step::Done(done) = unlink.poll(cx) else {
             i += 1;
             continue;
           };
@@ -648,13 +648,13 @@ runnable!([] RemoveDirAll);
 impl OpModel for RemoveDirAll {
   type Item = io::Result<()>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     loop {
       let next = match &mut self.state {
         RemoveDirAllState::Opening { parent, name, open } => {
           let fd = match ready!(open.poll(cx)) {
             Ok(fd) => fd,
-            Err(err) => return Poll::Ready(Err(err)),
+            Err(err) => return Step::Done(Err(err)),
           };
           let mut frame = RemoveDirFrame::new(parent.clone(), name.clone(), fd);
           let read = frame.next_read();
@@ -664,7 +664,7 @@ impl OpModel for RemoveDirAll {
         RemoveDirAllState::Reading { read } => {
           let buf = match ready!(read.poll(cx)) {
             Ok(buf) => buf,
-            Err(err) => return Poll::Ready(Err(err)),
+            Err(err) => return Step::Done(Err(err)),
           };
           if !buf.result.eof && buf.result.entries == 0 {
             panic!(
@@ -687,27 +687,27 @@ impl OpModel for RemoveDirAll {
             let progressed = match frame.poll_clearing(in_flight, cx) {
               Ok(progressed) => progressed,
               // Dropping the rest cancels what is still in flight.
-              Err(err) => return Poll::Ready(Err(err)),
+              Err(err) => return Step::Done(Err(err)),
             };
             if in_flight.is_empty() && frame.entries.is_empty() {
               break;
             }
             if !started && !progressed {
-              return Poll::Pending;
+              return Step::Pending;
             }
           }
           self.next_state()
         }
         RemoveDirAllState::Removing { unlink } => {
           if let Err(err) = ready!(unlink.poll(cx)) {
-            return Poll::Ready(Err(err));
+            return Step::Done(Err(err));
           }
           self.next_state()
         }
       };
       match next {
         Some(state) => self.state = state,
-        None => return Poll::Ready(Ok(())),
+        None => return Step::Done(Ok(())),
       }
     }
   }
@@ -748,12 +748,12 @@ runnable!([] ReadLink);
 impl OpModel for ReadLink {
   type Item = io::Result<PathBuf>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     loop {
       match &mut self.state {
         ReadLinkState::InvalidPath(nop) => {
           let _ = ready!(nop.poll(cx));
-          return Poll::Ready(Err(ops::nul_path_error()));
+          return Step::Done(Err(ops::nul_path_error()));
         }
         ReadLinkState::Reading(read) => match ready!(read.poll(cx)) {
           // The target may have been cut off: try again with more room.
@@ -762,9 +762,9 @@ impl OpModel for ReadLink {
             self.state = ReadLinkState::reading(&self.path, next_len);
           }
           (Ok(_), buf) => {
-            return Poll::Ready(Ok(PathBuf::from(os_string_from_bytes(&buf))));
+            return Step::Done(Ok(PathBuf::from(os_string_from_bytes(&buf))));
           }
-          (Err(err), _) => return Poll::Ready(Err(err)),
+          (Err(err), _) => return Step::Done(Err(err)),
         },
       }
     }
@@ -808,22 +808,22 @@ runnable!([] ReadToString);
 impl OpModel for ReadToString {
   type Item = io::Result<String>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     loop {
       let (fd, buf) = match &mut self.state {
         ReadToStringState::InvalidPath(nop) => {
           let _ = ready!(nop.poll(cx));
-          return Poll::Ready(Err(ops::nul_path_error()));
+          return Step::Done(Err(ops::nul_path_error()));
         }
         ReadToStringState::Opening(open) => match ready!(open.poll(cx)) {
           Ok(fd) => (fd, vec![0u8; DEFAULT_READ_TO_STRING_BYTES]),
-          Err(err) => return Poll::Ready(Err(err)),
+          Err(err) => return Step::Done(Err(err)),
         },
         ReadToStringState::Reading { fd, read } => {
           match ready!(read.poll(cx)) {
             (Ok(0), _) => {
               let bytes = std::mem::take(&mut self.bytes);
-              return Poll::Ready(String::from_utf8(bytes).map_err(|err| {
+              return Step::Done(String::from_utf8(bytes).map_err(|err| {
                 io::Error::new(io::ErrorKind::InvalidData, err)
               }));
             }
@@ -831,7 +831,7 @@ impl OpModel for ReadToString {
               self.bytes.extend_from_slice(&buf[..n]);
               (fd.clone(), buf)
             }
-            (Err(err), _) => return Poll::Ready(Err(err)),
+            (Err(err), _) => return Step::Done(Err(err)),
           }
         }
       };

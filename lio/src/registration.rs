@@ -20,7 +20,7 @@ use bumpalo::Bump;
 
 use crate::api::op::{Action, Completion};
 use crate::buf::MAX_IOV_COUNT;
-use crate::model::{Cx, Drive, Step};
+use crate::model::{Cx, Drive, Turn};
 
 /// Builds the action an operation submits from the memory it owns.
 ///
@@ -353,8 +353,8 @@ impl Registration {
     loop {
       let Some(model) = payload.model.as_mut() else { return true };
       match model.drive(cx) {
-        Step::Pending => return false,
-        Step::Yield(item) => {
+        Turn::Pending => return false,
+        Turn::Yield(item) => {
           let wanted = match payload.sink.as_mut() {
             Some(sink) => sink(item),
             None => false,
@@ -367,12 +367,12 @@ impl Registration {
             return true;
           }
         }
-        Step::End => {
+        Turn::End => {
           payload.model = None;
           payload.sink = None;
           return true;
         }
-        Step::Done(item) => {
+        Turn::Done(item) => {
           payload.model = None;
           // Dropped once it has run: a stream's consumer learns from that
           // drop that no further item is coming.
@@ -843,8 +843,7 @@ impl Drop for Registration {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::model::OpModel;
-  use core::task::Poll;
+  use crate::model::{OpModel, Step};
   use std::cell::Cell;
   use std::rc::Rc;
 
@@ -885,8 +884,8 @@ mod tests {
   impl OpModel for Now {
     type Item = ();
 
-    fn poll(&mut self, _: &mut Cx<'_>) -> Poll<()> {
-      Poll::Ready(())
+    fn poll(&mut self, _: &mut Cx<'_>) -> Step<()> {
+      Step::Done(())
     }
   }
 

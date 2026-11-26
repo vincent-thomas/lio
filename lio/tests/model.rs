@@ -1,11 +1,12 @@
 //! Operation models: single operations, composites, parallel I/O
 //! and cancellation, without real I/O where the order of completions matters.
 
+use lio::ready;
 use std::cell::RefCell;
 use std::ffi::CString;
 use std::future::Future;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker, ready};
+use std::task::{Context, Poll, Waker};
 
 use lio::api::ops::{Read, Write};
 use lio::api::resource::Resource;
@@ -13,7 +14,7 @@ use lio::api::{self, OpenFlags};
 use lio::backend::ds::{DSBackend, DSConfig};
 use lio::backend::op::Op;
 use lio::backend::testing::{Checked, POISON, ScriptedBackend};
-use lio::model::{self, Cx, Join, OpModel, OpStream, Task};
+use lio::model::{self, Cx, Join, Next, OpModel, OpStream, Step, Task};
 use lio::{BufResult, Lio};
 
 fn scripted(cap: usize) -> (ScriptedBackend, Lio) {
@@ -302,9 +303,9 @@ struct Chunks {
 impl OpStream for Chunks {
   type Item = BufResult<usize, Vec<u8>>;
 
-  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<Self::Item>> {
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Next<Self::Item> {
     if self.ended {
-      return Poll::Ready(None);
+      return Next::End;
     }
     let (result, buf) = ready!(self.read.poll(cx));
     match result {
@@ -314,7 +315,7 @@ impl OpStream for Chunks {
       // The end of the source, or an error: the last item.
       _ => self.ended = true,
     }
-    Poll::Ready(Some((result, buf)))
+    Next::Item((result, buf))
   }
 }
 
@@ -381,17 +382,17 @@ impl WriteAll {
 impl OpModel for WriteAll {
   type Item = std::io::Result<u64>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     loop {
       let (result, mut buf) = ready!(self.write.poll(cx));
       let written = match result {
         Ok(written) => written,
-        Err(err) => return Poll::Ready(Err(err)),
+        Err(err) => return Step::Done(Err(err)),
       };
       self.offset += written as u64;
       buf.drain(..written);
       if buf.is_empty() {
-        return Poll::Ready(Ok(self.offset));
+        return Step::Done(Ok(self.offset));
       }
       self.write = api::write_at(&self.to, buf, self.offset);
     }
@@ -415,13 +416,13 @@ impl ReadToEnd {
 impl OpModel for ReadToEnd {
   type Item = std::io::Result<Vec<u8>>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     loop {
       let (result, mut buf) = ready!(self.read.poll(cx));
       match result {
-        Ok(0) => return Poll::Ready(Ok(std::mem::take(&mut self.bytes))),
+        Ok(0) => return Step::Done(Ok(std::mem::take(&mut self.bytes))),
         Ok(_) => self.bytes.extend_from_slice(&buf),
-        Err(err) => return Poll::Ready(Err(err)),
+        Err(err) => return Step::Done(Err(err)),
       }
       buf.clear();
       self.read = api::read_at(&self.from, buf, self.bytes.len() as u64);
@@ -532,11 +533,11 @@ struct Leaks {
 impl OpModel for Leaks {
   type Item = ();
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<()> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
     let mut read = self.read.take().unwrap();
-    assert!(matches!(read.poll(cx), Poll::Pending));
+    assert!(matches!(read.poll(cx), Step::Pending));
     *self.out.borrow_mut() = Some(read);
-    Poll::Ready(())
+    Step::Done(())
   }
 }
 
@@ -573,12 +574,12 @@ struct HandsOut {
 impl OpModel for HandsOut {
   type Item = ();
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<()> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
     let [mut first, mut second] = self.reads.take().unwrap();
-    assert!(matches!(first.poll(cx), Poll::Pending));
-    assert!(matches!(second.poll(cx), Poll::Pending));
+    assert!(matches!(first.poll(cx), Step::Pending));
+    assert!(matches!(second.poll(cx), Step::Pending));
     *self.out.borrow_mut() = Some(second);
-    Poll::Ready(())
+    Step::Done(())
   }
 }
 
@@ -592,13 +593,13 @@ struct PicksUp {
 impl OpModel for PicksUp {
   type Item = BufResult<usize, Vec<u8>>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     if let Some(nop) = self.nop.as_mut() {
       ready!(nop.poll(cx)).unwrap();
       self.nop = None;
       self.read = self.from.borrow_mut().take();
     }
-    Poll::Ready(ready!(self.read.as_mut().unwrap().poll(cx)))
+    Step::Done(ready!(self.read.as_mut().unwrap().poll(cx)))
   }
 }
 
@@ -654,14 +655,14 @@ lio::runnable!(TwoNops);
 impl OpModel for TwoNops {
   type Item = std::io::Result<u8>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     loop {
       if let Err(err) = ready!(self.nop.poll(cx)) {
-        return Poll::Ready(Err(err));
+        return Step::Done(Err(err));
       }
       self.left -= 1;
       if self.left == 0 {
-        return Poll::Ready(Ok(2));
+        return Step::Done(Ok(2));
       }
       self.nop = api::nop();
     }

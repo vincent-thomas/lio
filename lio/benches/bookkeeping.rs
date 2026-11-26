@@ -30,6 +30,7 @@
 //! `cargo bench -p lio --bench bookkeeping`. `mise run bench` runs it and
 //! then the backend bench. Criterion flags go after `--`.
 
+use lio::ready;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::hint::black_box;
@@ -40,7 +41,7 @@ use std::sync::{
   Arc,
   atomic::{AtomicBool, Ordering},
 };
-use std::task::{Context, Poll, Wake, Waker, ready};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use bumpalo::Bump;
@@ -50,7 +51,7 @@ use criterion::{
 use lio::api::resource::Resource;
 use lio::backend::op::{BorrowedOp, Op};
 use lio::backend::{IoBackend, OpCompleted};
-use lio::model::{Cx, OpModel, OpStream};
+use lio::model::{Cx, Next, OpModel, OpStream};
 use lio::time::Clock;
 use lio::{Lio, api};
 
@@ -326,13 +327,13 @@ impl SteppedNop {
 impl OpStream for SteppedNop {
   type Item = ();
 
-  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<()>> {
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Next<()> {
     loop {
       let _ = ready!(self.nop.poll(cx));
       self.nop = api::nop();
       if self.left == 0 {
         self.left = self.steps;
-        return Poll::Ready(Some(()));
+        return Next::Item(());
       }
       self.left -= 1;
     }

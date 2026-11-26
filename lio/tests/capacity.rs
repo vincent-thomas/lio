@@ -1,18 +1,19 @@
 //! Going over `Lio::new(cap)` must not panic: futures wait for a free slot,
 //! and `when_done` / `send` / `send_with` queue the operation.
 
+use lio::ready;
 use std::cell::RefCell;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, Wake, Waker, ready};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use lio::api::IoStream;
 use lio::backend::testing::{Checked, ScriptedBackend};
-use lio::model::{Cx, OpModel, OpStream};
+use lio::model::{Cx, Next, OpModel, OpStream};
 use lio::{Lio, api};
 
 fn lio(cap: usize) -> Lio {
@@ -128,16 +129,16 @@ impl OneShotStream {
 impl OpStream for OneShotStream {
   type Item = u32;
 
-  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<u32>> {
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Next<u32> {
     if self.sent == 2 {
-      return Poll::Ready(None);
+      return Next::End;
     }
     let _ = ready!(self.nop.poll(cx));
     self.sent += 1;
     if self.sent < 2 {
       self.nop = api::nop();
     }
-    Poll::Ready(Some(self.sent))
+    Next::Item(self.sent)
   }
 }
 

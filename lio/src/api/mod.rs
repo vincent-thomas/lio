@@ -73,8 +73,8 @@ use std::time::Duration;
 /// ```
 /// use lio::api::{self, ops};
 /// use lio::backend::testing::ScriptedBackend;
-/// use lio::model::{Cx, OpModel};
-/// use core::task::{Poll, ready};
+/// use lio::model::{Cx, OpModel, Step};
+/// use lio::ready;
 ///
 /// /// Two nops, one after the other.
 /// struct TwoNops(u8, ops::Nop);
@@ -82,14 +82,14 @@ use std::time::Duration;
 /// impl OpModel for TwoNops {
 ///   type Item = std::io::Result<()>;
 ///
-///   fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+///   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
 ///     loop {
 ///       if let Err(err) = ready!(self.1.poll(cx)) {
-///         return Poll::Ready(Err(err));
+///         return Step::Done(Err(err));
 ///       }
 ///       self.0 += 1;
 ///       if self.0 == 2 {
-///         return Poll::Ready(Ok(()));
+///         return Step::Done(Ok(()));
 ///       }
 ///       self.1 = api::nop();
 ///     }

@@ -22,7 +22,6 @@
 //! }
 //! ```
 
-use core::task::Poll;
 use std::io;
 use std::mem::MaybeUninit;
 
@@ -30,7 +29,7 @@ use crate::api::{
   ops,
   resource::{AsResource, Resource},
 };
-use crate::model::{Cx, OpModel};
+use crate::model::{Cx, OpModel, Step};
 use crate::{IoBuf, IoBufMut, IoBufVec};
 
 /// Default buffer size for I/O operations (64 KB).
@@ -201,7 +200,7 @@ runnable!([] Copy);
 impl OpModel for Copy {
   type Item = io::Result<u64>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     loop {
       // Something finished or started: go around again, so that what
       // started is submitted and what it unblocked can start.
@@ -210,12 +209,12 @@ impl OpModel for Copy {
       // The write goes first: on a driver with one free slot, what was
       // read is written before more is read.
       if let Some(write) = &mut self.writing
-        && let Poll::Ready(done) = write.poll(cx)
+        && let Step::Done(done) = write.poll(cx)
       {
         self.writing = None;
         progressed = true;
         match done {
-          (Ok(0), _chunk) => return Poll::Ready(Err(Self::write_zero())),
+          (Ok(0), _chunk) => return Step::Done(Err(Self::write_zero())),
           (Ok(written), mut chunk) if written < chunk.len() => {
             let remaining = chunk.len() - written;
             chunk.copy_within(written.., 0);
@@ -227,12 +226,12 @@ impl OpModel for Copy {
             // The other buffer is with the reader, or waiting in `ready`.
             self.spare.get_or_insert(chunk);
           }
-          (Err(err), _chunk) => return Poll::Ready(Err(err)),
+          (Err(err), _chunk) => return Step::Done(Err(err)),
         }
       }
 
       if let Some(read) = &mut self.reading
-        && let Poll::Ready(done) = read.poll(cx)
+        && let Step::Done(done) = read.poll(cx)
       {
         self.reading = None;
         progressed = true;
@@ -245,7 +244,7 @@ impl OpModel for Copy {
             self.read += n as u64;
             self.ready = Some(buf.into_inner());
           }
-          (Err(err), _buf) => return Poll::Ready(Err(err)),
+          (Err(err), _buf) => return Step::Done(Err(err)),
         }
       }
 
@@ -263,10 +262,10 @@ impl OpModel for Copy {
       }
 
       if self.reading.is_none() && self.writing.is_none() && !more {
-        return Poll::Ready(Ok(self.read));
+        return Step::Done(Ok(self.read));
       }
       if !progressed {
-        return Poll::Pending;
+        return Step::Pending;
       }
     }
   }

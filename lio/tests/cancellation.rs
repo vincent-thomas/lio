@@ -4,18 +4,19 @@
 
 mod common;
 
+use lio::ready;
 use std::cell::RefCell;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, Wake, Waker, ready};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use lio::api::resource::Resource;
 use lio::api::{IoStream, Items};
 use lio::backend::testing::{Checked, POISON, ScriptedBackend};
-use lio::model::{Cx, OpModel, OpStream};
+use lio::model::{Cx, Next, OpModel, OpStream};
 use lio::{IoBuf, Lio, api};
 
 /// A write buffer that reports being dropped. A write owns its buffer, so
@@ -162,10 +163,10 @@ impl Endless {
 impl OpStream for Endless {
   type Item = ();
 
-  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<()>> {
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Next<()> {
     let _ = ready!(self.0.poll(cx));
     self.0 = api::nop();
-    Poll::Ready(Some(()))
+    Next::Item(())
   }
 }
 

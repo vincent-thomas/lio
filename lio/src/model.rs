@@ -3,8 +3,8 @@
 //! An [`OpModel`] is a state machine that describes a piece of I/O work with
 //! one result. The driver asks it one question, [`poll`](OpModel::poll):
 //! given what has finished so far, can you make progress? It answers with
-//! [`core::task::Poll`], as a future does. An [`OpStream`] is the same for work
-//! that produces several items.
+//! a [`Step`]. An [`OpStream`] is the same for work that produces several
+//! items, and answers with a [`Next`].
 //!
 //! - Every single operation in [`api`](crate::api) is a model (a *leaf*).
 //!   Polling it submits the operation, with the buffer it owns, to the
@@ -28,8 +28,8 @@
 //! use lio::Lio;
 //! use lio::api::{self, ops, resource::Resource};
 //! use lio::backend::testing::ScriptedBackend;
-//! use lio::model::{self, Cx, OpModel};
-//! use core::task::{Poll, ready};
+//! use lio::model::{self, Cx, OpModel, Step};
+//! use lio::ready;
 //!
 //! /// Reads twice from the same resource, one read after the other.
 //! struct ReadTwice {
@@ -41,15 +41,15 @@
 //! impl OpModel for ReadTwice {
 //!   type Item = std::io::Result<usize>;
 //!
-//!   fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+//!   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
 //!     loop {
 //!       let (result, buf) = ready!(self.read.poll(cx));
 //!       let n = match result {
 //!         Ok(n) => n,
-//!         Err(err) => return Poll::Ready(Err(err)),
+//!         Err(err) => return Step::Done(Err(err)),
 //!       };
 //!       match self.first {
-//!         Some(first) => return Poll::Ready(Ok(first + n)),
+//!         Some(first) => return Step::Done(Ok(first + n)),
 //!         None => {
 //!           self.first = Some(n);
 //!           self.read = api::read(&self.from, buf);
@@ -79,12 +79,12 @@
 //! takes one slot and allocates nothing. An operation started while that
 //! one is still busy takes a slot of its own.
 
-use core::task::{Context, Poll, Waker};
 use std::cell::RefCell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
 use crate::Lio;
 use bumpalo::Bump;
@@ -96,9 +96,8 @@ use crate::registration::{
 
 /// A piece of I/O work that produces one result, run by polling it.
 ///
-/// It is to the driver what a [`Future`] is to an executor, and `poll`
-/// reports the same way: [`Poll::Pending`], or [`Poll::Ready`] with the
-/// result. [`core::task::ready!`] works on it.
+/// It is to the driver what a future is to an executor. `poll` reports
+/// with [`Step`]: still waiting, or done with the result.
 pub trait OpModel {
   /// What the model produces.
   type Item;
@@ -111,8 +110,19 @@ pub trait OpModel {
   ///
   /// # Panics
   ///
-  /// A model may panic when polled after it returned [`Poll::Ready`].
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item>;
+  /// A model may panic when polled after it returned [`Step::Done`].
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item>;
+}
+
+/// What one [`OpModel::poll`] call reports.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a model that is pending has to be polled again"]
+pub enum Step<T> {
+  /// Nothing to report. The model is polled again when something it
+  /// submitted finishes.
+  Pending,
+  /// The result. The model is dropped.
+  Done(T),
 }
 
 /// A piece of I/O work that produces several items, one after another.
@@ -146,13 +156,57 @@ pub trait OpStream {
 
   /// Makes as much progress as possible without waiting.
   ///
-  /// `Ready(Some(item))` is one item, and the stream is polled again right
-  /// away. `Ready(None)` ends it: it is dropped, and not polled again.
-  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<Self::Item>>;
+  /// After a [`Next::Item`] the stream is polled again right away. A
+  /// [`Next::End`] ends it: it is dropped, and not polled again.
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Next<Self::Item>;
+}
+
+/// What one [`OpStream::poll_next`] call reports.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a stream that is pending has to be polled again"]
+pub enum Next<T> {
+  /// Nothing to report. The stream is polled again when something it
+  /// submitted finishes.
+  Pending,
+  /// One item, with more to come.
+  Item(T),
+  /// No further item. The stream is dropped.
+  End,
+}
+
+/// "Still waiting", for either trait: what [`ready!`](crate::ready) returns
+/// from the surrounding function, as a [`Step`] or a [`Next`].
+#[doc(hidden)]
+pub struct Waiting;
+
+impl<T> From<Waiting> for Step<T> {
+  fn from(_: Waiting) -> Self {
+    Step::Pending
+  }
+}
+
+impl<T> From<Waiting> for Next<T> {
+  fn from(_: Waiting) -> Self {
+    Next::Pending
+  }
+}
+
+/// Takes the result out of a [`Step`], or returns "pending" from the
+/// surrounding [`OpModel::poll`] or [`OpStream::poll_next`].
+#[macro_export]
+macro_rules! ready {
+  ($step:expr) => {
+    match $step {
+      $crate::model::Step::Done(item) => item,
+      $crate::model::Step::Pending => {
+        return ::core::convert::From::from($crate::model::Waiting);
+      }
+    }
+  };
 }
 
 /// What the driver is told when it polls what runs in a slot.
-pub(crate) enum Step<T> {
+pub(crate) enum Turn<T> {
   /// Nothing to report.
   Pending,
   /// One item, with more to come: poll again right away.
@@ -167,17 +221,17 @@ pub(crate) enum Step<T> {
 pub(crate) trait Drive {
   type Item;
 
-  fn drive(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item>;
+  fn drive(&mut self, cx: &mut Cx<'_>) -> Turn<Self::Item>;
 }
 
 impl<M: OpModel> Drive for M {
   type Item = M::Item;
 
   #[inline]
-  fn drive(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+  fn drive(&mut self, cx: &mut Cx<'_>) -> Turn<Self::Item> {
     match self.poll(cx) {
-      Poll::Ready(item) => Step::Done(item),
-      Poll::Pending => Step::Pending,
+      Step::Done(item) => Turn::Done(item),
+      Step::Pending => Turn::Pending,
     }
   }
 }
@@ -189,11 +243,11 @@ impl<S: OpStream> Drive for Many<S> {
   type Item = S::Item;
 
   #[inline]
-  fn drive(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+  fn drive(&mut self, cx: &mut Cx<'_>) -> Turn<Self::Item> {
     match self.0.poll_next(cx) {
-      Poll::Ready(Some(item)) => Step::Yield(item),
-      Poll::Ready(None) => Step::End,
-      Poll::Pending => Step::Pending,
+      Next::Item(item) => Turn::Yield(item),
+      Next::End => Turn::End,
+      Next::Pending => Turn::Pending,
     }
   }
 }
@@ -498,17 +552,17 @@ impl<Req, Out> Leaf<Req, Out> {
     &mut self,
     cx: &mut Cx<'_>,
     submit: impl FnOnce(&mut Cx<'_>, Req) -> Ticket<Out>,
-  ) -> Poll<Out> {
+  ) -> Step<Out> {
     let mut ticket = match std::mem::replace(self, Leaf::Done) {
       Leaf::Idle(request) => submit(cx, request),
       Leaf::InFlight(ticket) => ticket,
       Leaf::Done => panic!("operation polled after it was done"),
     };
     match cx.take(&mut ticket) {
-      Some(out) => Poll::Ready(out),
+      Some(out) => Step::Done(out),
       None => {
         *self = Leaf::InFlight(ticket);
-        Poll::Pending
+        Step::Pending
       }
     }
   }
@@ -537,7 +591,7 @@ enum Side<M: OpModel> {
 impl<M: OpModel> Side<M> {
   fn poll(&mut self, cx: &mut Cx<'_>) {
     if let Side::Running(model) = self
-      && let Poll::Ready(item) = model.poll(cx)
+      && let Step::Done(item) = model.poll(cx)
     {
       *self = Side::Finished(item);
     }
@@ -555,17 +609,17 @@ runnable!([A: OpModel, B: OpModel] Join<A, B>);
 impl<A: OpModel, B: OpModel> OpModel for Join<A, B> {
   type Item = (A::Item, B::Item);
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     self.a.poll(cx);
     self.b.poll(cx);
     if !matches!((&self.a, &self.b), (Side::Finished(_), Side::Finished(_))) {
-      return Poll::Pending;
+      return Step::Pending;
     }
     let a = std::mem::replace(&mut self.a, Side::Taken);
     let b = std::mem::replace(&mut self.b, Side::Taken);
     let (Side::Finished(a), Side::Finished(b)) = (a, b) else {
       unreachable!("both sides were finished above");
     };
-    Poll::Ready((a, b))
+    Step::Done((a, b))
   }
 }

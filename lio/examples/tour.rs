@@ -12,19 +12,20 @@
 //! 7. Models: operations combined into bigger ones, with [`OpModel`].
 //! 8. Capacity: what happens when the driver is full.
 
+use lio::ready;
 use std::ffi::CString;
 use std::future::{Future, IntoFuture};
 use std::io;
 use std::path::Path;
 use std::pin::pin;
 use std::sync::mpsc;
-use std::task::{Context, Poll, Waker, ready};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use lio::api::ops::{Read, Write};
 use lio::api::resource::{IntoResource, Resource};
 use lio::api::{self, FileMode, OpenFlags, ShutdownHow};
-use lio::model::{self, Cx, Join, OpModel, OpStream};
+use lio::model::{self, Cx, Join, Next, OpModel, OpStream, Step};
 use lio::net::{TcpListener, TcpStream};
 use lio::{Lio, fs};
 
@@ -245,18 +246,18 @@ lio::runnable!(WriteAll);
 impl OpModel for WriteAll {
   type Item = io::Result<u64>;
 
-  fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+  fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
     loop {
-      // `ready!` returns `Poll::Pending` until the write has finished.
+      // `ready!` returns `Step::Pending` until the write has finished.
       let (result, mut buf) = ready!(self.write.poll(cx));
       let written = match result {
         Ok(written) => written,
-        Err(err) => return Poll::Ready(Err(err)),
+        Err(err) => return Step::Done(Err(err)),
       };
       self.offset += written as u64;
       buf.drain(..written);
       if buf.is_empty() {
-        return Poll::Ready(Ok(self.offset));
+        return Step::Done(Ok(self.offset));
       }
       self.write = api::write_at(&self.to, buf, self.offset);
     }
@@ -283,26 +284,26 @@ impl Chunks {
 impl OpStream for Chunks {
   type Item = io::Result<Vec<u8>>;
 
-  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<Self::Item>> {
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Next<Self::Item> {
     if self.failed {
-      return Poll::Ready(None);
+      return Next::End;
     }
     let (result, chunk) = ready!(self.read.poll(cx));
-    Poll::Ready(match result {
+    match result {
       // The end of the file ends the stream.
-      Ok(0) => None,
+      Ok(0) => Next::End,
       Ok(n) => {
         self.offset += n as u64;
         let next = Vec::<u8>::with_capacity(Self::SIZE);
         self.read = api::read_at(&self.from, next, self.offset);
-        Some(Ok(chunk))
+        Next::Item(Ok(chunk))
       }
       // An error is the last item.
       Err(err) => {
         self.failed = true;
-        Some(Err(err))
+        Next::Item(Err(err))
       }
-    })
+    }
   }
 }
 

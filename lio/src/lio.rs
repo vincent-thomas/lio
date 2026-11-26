@@ -2064,8 +2064,8 @@ mod tests {
   }
 
   use crate::api::ops::{Nop, Sleep};
-  use crate::model::{Cx, Join, OpModel};
-  use core::task::{Poll, ready};
+  use crate::model::{Cx, Join, OpModel, Step};
+  use crate::ready;
 
   /// Counts the models that finished.
   fn counting(count: &Rc<Cell<usize>>) -> impl FnMut(()) -> bool + 'static {
@@ -2082,8 +2082,8 @@ mod tests {
   impl OpModel for Now {
     type Item = ();
 
-    fn poll(&mut self, _: &mut Cx<'_>) -> Poll<()> {
-      Poll::Ready(())
+    fn poll(&mut self, _: &mut Cx<'_>) -> Step<()> {
+      Step::Done(())
     }
   }
 
@@ -2138,13 +2138,13 @@ mod tests {
   impl OpModel for NopTwice {
     type Item = ();
 
-    fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<()> {
+    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
       if let Some(first) = self.first.as_mut() {
         let _ = ready!(first.poll(cx));
         self.first = None;
       }
       let _ = ready!(self.second.poll(cx));
-      Poll::Ready(())
+      Step::Done(())
     }
   }
 
@@ -2215,12 +2215,12 @@ mod tests {
   impl OpModel for Fickle {
     type Item = ();
 
-    fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<()> {
+    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
       if let Some(mut nop) = self.given_up.take() {
-        assert!(matches!(nop.poll(cx), Poll::Pending));
+        assert!(matches!(nop.poll(cx), Step::Pending));
       }
       let _ = ready!(self.kept.poll(cx));
-      Poll::Ready(())
+      Step::Done(())
     }
   }
 

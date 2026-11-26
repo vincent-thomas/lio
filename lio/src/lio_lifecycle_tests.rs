@@ -13,7 +13,7 @@
 //! thousands of times slower, so the test only runs there when the depth
 //! is set explicitly (the deep workflow does).
 
-use core::task::{Poll, ready};
+use crate::ready;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
@@ -28,7 +28,7 @@ use crate::api::resource::Resource;
 use crate::api::{Io, IoStream};
 use crate::backend::op::Op;
 use crate::backend::testing::{Checked, ScriptedBackend};
-use crate::model::{Cx, OpModel, OpStream, Ticket};
+use crate::model::{Cx, Next, OpModel, OpStream, Ticket};
 
 /// A stream ends after this many items, or at its first error.
 const STREAM_ITEMS: u32 = 3;
@@ -78,9 +78,9 @@ struct TaggedStream {
 impl OpStream for TaggedStream {
   type Item = (u32, isize);
 
-  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<Self::Item>> {
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Next<Self::Item> {
     if self.ended {
-      return Poll::Ready(None);
+      return Next::End;
     }
     let item = ready!(self.step.poll(cx));
     self.completions += 1;
@@ -89,7 +89,7 @@ impl OpStream for TaggedStream {
     } else {
       self.ended = true;
     }
-    Poll::Ready(Some(item))
+    Next::Item(item)
   }
 }
 

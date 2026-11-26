@@ -188,21 +188,21 @@ macro_rules! action_io {
 /// ```
 /// use lio::api;
 /// use lio::backend::testing::ScriptedBackend;
-/// use lio::model::{Cx, OpModel};
-/// use core::task::{Poll, ready};
+/// use lio::model::{Cx, OpModel, Step};
+/// use lio::ready;
 ///
 /// struct Twice(api::ops::Nop, bool);
 ///
 /// impl OpModel for Twice {
 ///   type Item = std::io::Result<()>;
 ///
-///   fn poll(&mut self, cx: &mut Cx<'_>) -> Poll<Self::Item> {
+///   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
 ///     loop {
 ///       if let Err(err) = ready!(self.0.poll(cx)) {
-///         return Poll::Ready(Err(err));
+///         return Step::Done(Err(err));
 ///       }
 ///       if std::mem::replace(&mut self.1, true) {
-///         return Poll::Ready(Ok(()));
+///         return Step::Done(Ok(()));
 ///       }
 ///       self.0 = api::nop();
 ///     }
@@ -407,7 +407,7 @@ macro_rules! leaf {
       fn poll(
         &mut self,
         cx: &mut $crate::model::Cx<'_>,
-      ) -> ::core::task::Poll<Self::Item> {
+      ) -> $crate::model::Step<Self::Item> {
         self.state.poll(cx, |cx, ($($arg,)*)| cx.$method($($arg),*))
       }
     }

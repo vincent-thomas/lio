@@ -702,10 +702,11 @@ mod tests {
   use crate::api;
   use crate::api::ops;
   use crate::backend::testing::ScriptedBackend;
-  use crate::model::Cx;
+  use crate::model::{Cx, Next};
+  use crate::ready;
   use std::sync::Arc;
   use std::sync::atomic::{AtomicUsize, Ordering};
-  use std::task::{RawWaker, RawWakerVTable, Waker, ready};
+  use std::task::{RawWaker, RawWakerVTable, Waker};
 
   #[test]
   fn test_blocking_receiver_is_send() {
@@ -997,16 +998,16 @@ mod tests {
   impl OpStream for Counter {
     type Item = u32;
 
-    fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<u32>> {
+    fn poll_next(&mut self, cx: &mut Cx<'_>) -> Next<u32> {
       if self.0 == 3 {
-        return Poll::Ready(None);
+        return Next::End;
       }
       let _ = ready!(self.1.poll(cx));
       self.0 += 1;
       if self.0 < 3 {
         self.1 = api::nop();
       }
-      Poll::Ready(Some(self.0))
+      Next::Item(self.0)
     }
   }
 
@@ -1070,15 +1071,15 @@ mod tests {
   impl OpStream for AgainThenDone {
     type Item = u32;
 
-    fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<u32>> {
+    fn poll_next(&mut self, cx: &mut Cx<'_>) -> Next<u32> {
       if self.2 {
-        return Poll::Ready(None);
+        return Next::End;
       }
       loop {
         let _ = ready!(self.1.poll(cx));
         if std::mem::replace(&mut self.0, true) {
           self.2 = true;
-          return Poll::Ready(Some(7));
+          return Next::Item(7);
         }
         self.1 = api::nop();
       }
