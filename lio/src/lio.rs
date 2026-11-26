@@ -560,14 +560,15 @@ impl Lio {
           freed |= polled;
         }
       }
-      if !freed {
+      if freed {
+        // Slots went back: that may start models that were waiting for
+        // one, which are polled next.
+        drop(inner);
+        self.bury_and_wake();
+        inner = self.inner.borrow_mut();
+      } else {
         return;
       }
-      // Give back the slots of the models that finished, in one go. That
-      // may start models that were waiting for one.
-      drop(inner);
-      self.bury_and_wake();
-      inner = self.inner.borrow_mut();
     }
   }
 
@@ -884,10 +885,12 @@ impl Lio {
   #[cold]
   #[inline(never)]
   fn start_queued_at_home(inner: &mut LioInner, home: u64) {
-    while !inner.overflow.is_empty()
-      && inner.store.get_mut(home).is_some_and(|reg| reg.can_start_op())
-      && !inner.store.lease_held(home)
-    {
+    // A backend that still holds the lease may still use the memory of the
+    // operation that was here.
+    if inner.store.lease_held(home) {
+      return;
+    }
+    loop {
       let waiting =
         inner.overflow.iter().position(|queued| queued.home == Some(home));
       let Some(queued) = waiting.and_then(|at| inner.overflow.remove(at))
@@ -1310,7 +1313,7 @@ impl Lio {
     let Some(reg) = inner_ref.store.get_mut(id) else {
       panic!("driver: slot {id} was given back while its result was read");
     };
-    match reg.end_completion(raw.kept()) {
+    match reg.end_completion() {
       // The model that was waiting for it takes it now. A model that is
       // busy further up the stack is polled again when it is not.
       Some(waiter) => {
@@ -1645,7 +1648,7 @@ mod tests {
     use std::rc::Rc;
     use std::task::Context;
 
-    let (_, lio) = lio(2);
+    let (_, lio) = lio(3);
     crate::time::pause(&lio);
     let later = Rc::new(RefCell::new(Some(Box::pin(
       crate::api::sleep(Duration::from_millis(2)).with_lio(&lio).into_future(),
@@ -1659,9 +1662,16 @@ mod tests {
     crate::api::sleep(Duration::from_millis(1))
       .with_lio(&lio)
       .when_done(move |_| drop(first.borrow_mut().take()));
+    // Fires in that run too, after both.
+    let fired = Rc::new(Cell::new(false));
+    let set = fired.clone();
+    crate::api::sleep(Duration::from_millis(3))
+      .with_lio(&lio)
+      .when_done(move |_| set.set(true));
     lio.advance_time_by_ticks(5);
     lio.try_run().unwrap();
     assert!(later.borrow().is_none());
+    assert!(fired.get(), "only the dropped sleep's firing is forgotten");
     assert!(!lio.is_full());
   }
 
@@ -2036,5 +2046,280 @@ mod tests {
     assert_eq!(spent, u64::from(u32::MAX) << 32);
     assert_eq!(fresh, 1, "the replacement slot, at its first generation");
     assert!(lio.inner.borrow_mut().store.get_mut(spent).is_none());
+  }
+
+  use crate::api::ops::{Nop, Sleep};
+  use crate::model::{Cx, Join, Step};
+
+  /// Counts the models that finished.
+  fn counting(count: &Rc<Cell<usize>>) -> impl FnMut(()) -> bool + 'static {
+    let count = count.clone();
+    move |()| {
+      count.set(count.get() + 1);
+      true
+    }
+  }
+
+  /// Done as soon as it is polled.
+  struct Now;
+
+  impl OpModel for Now {
+    type Item = ();
+
+    fn poll(&mut self, _: &mut Cx<'_>) -> Step<()> {
+      Step::Done(())
+    }
+  }
+
+  #[test]
+  fn models_that_finish_at_once_hand_their_slots_on_in_the_same_run() {
+    let (backend, lio) = lio(2);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let done = Rc::new(Cell::new(0));
+    for _ in 0..3 {
+      let queued = lio.spawn(Now, counting(&done));
+      assert!(matches!(queued, Spawned::Queued(_)));
+    }
+
+    backend.complete_all(0);
+    lio.try_run().unwrap();
+    // The first two take the nops' slots, and the third takes one of
+    // theirs.
+    assert_eq!(done.get(), 3);
+    assert!(!lio.is_full());
+  }
+
+  #[test]
+  fn two_sleeps_of_one_model_each_get_a_slot() {
+    let (_, lio) = lio(2);
+    crate::time::pause(&lio);
+    let done = Rc::new(Cell::new(0));
+    let count = done.clone();
+    let both = Join::new(
+      Sleep::new(Duration::from_millis(1)),
+      Sleep::new(Duration::from_millis(2)),
+    );
+    lio.spawn(both, move |(first, second)| {
+      assert!(first.is_ok() && second.is_ok());
+      count.set(count.get() + 1);
+      true
+    });
+    assert!(lio.is_full(), "nothing holds a sleep's lease, and still");
+
+    lio.advance_time_by_ticks(5);
+    lio.try_run().unwrap();
+    assert_eq!(done.get(), 1);
+    assert!(!lio.is_full());
+  }
+
+  /// Runs two nops, one after the other.
+  struct NopTwice {
+    first: Option<Nop>,
+    second: Nop,
+  }
+
+  impl OpModel for NopTwice {
+    type Item = ();
+
+    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
+      if let Some(first) = self.first.as_mut() {
+        let _ = crate::ready!(first.poll(cx));
+        self.first = None;
+      }
+      let _ = crate::ready!(self.second.poll(cx));
+      Step::Done(())
+    }
+  }
+
+  /// Finishes every operation on the next wait, and keeps its lease.
+  #[derive(Default)]
+  struct Hoarding {
+    pushed: Rc<RefCell<Vec<u64>>>,
+    pending: Vec<u64>,
+    leases: Vec<crate::backend::Keep>,
+  }
+
+  // SAFETY: test backend. It never dereferences an address, and the leases
+  // it keeps only make the driver hold memory for longer.
+  unsafe impl IoBackend for Hoarding {
+    fn init(&mut self, _: usize) -> io::Result<()> {
+      Ok(())
+    }
+    fn push(
+      &mut self,
+      id: u64,
+      op: crate::backend::InFlight<'_>,
+      _: &mut Bump,
+    ) {
+      let (_, lease) = op.into_parts();
+      self.leases.push(lease);
+      self.pending.push(id);
+      self.pushed.borrow_mut().push(id);
+    }
+    fn flush(&mut self) -> io::Result<()> {
+      Ok(())
+    }
+    fn wait(
+      &mut self,
+      _: Option<Duration>,
+      completed: &mut Vec<OpCompleted>,
+    ) -> io::Result<()> {
+      completed
+        .extend(self.pending.drain(..).map(|id| OpCompleted::new(id, 0)));
+      Ok(())
+    }
+  }
+
+  #[test]
+  #[cfg_attr(miri, ignore = "leaks the registrations on purpose")]
+  fn a_slot_whose_lease_is_still_held_takes_no_further_operation() {
+    let pushed = Rc::new(RefCell::new(Vec::new()));
+    let backend = Hoarding { pushed: pushed.clone(), ..Hoarding::default() };
+    let lio = Lio::new_with_backend(backend, 2).unwrap();
+    let done = Rc::new(Cell::new(0));
+    let model = NopTwice { first: Some(Nop::new()), second: Nop::new() };
+    lio.spawn(model, counting(&done));
+
+    lio.try_run().unwrap();
+    let [first, second] = pushed.borrow()[..] else { panic!("two ops") };
+    assert_ne!(first, second, "the backend may still use the first's memory");
+
+    lio.try_run().unwrap();
+    assert_eq!(done.get(), 1);
+    assert_eq!(lio.inner.borrow().leaked, 2);
+  }
+
+  /// Starts a nop, gives up on it, and runs another.
+  struct Fickle {
+    given_up: Option<Nop>,
+    kept: Nop,
+  }
+
+  impl OpModel for Fickle {
+    type Item = ();
+
+    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
+      if let Some(mut nop) = self.given_up.take() {
+        assert!(matches!(nop.poll(cx), Step::Pending));
+      }
+      let _ = crate::ready!(self.kept.poll(cx));
+      Step::Done(())
+    }
+  }
+
+  #[test]
+  fn a_model_outlives_an_operation_it_gave_up_on() {
+    let (backend, lio) = lio(2);
+    let done = Rc::new(Cell::new(0));
+    let model = Fickle { given_up: Some(Nop::new()), kept: Nop::new() };
+    lio.spawn(model, counting(&done));
+    let [given_up, kept] = backend.pushed()[..] else { panic!("two ops") };
+    assert_eq!(backend.cancelled(), [given_up]);
+
+    // It finishes in the model's own slot, which the model still needs.
+    backend.complete(given_up, 0);
+    lio.try_run().unwrap();
+    assert_eq!(done.get(), 0);
+
+    backend.complete(kept, 0);
+    lio.try_run().unwrap();
+    assert_eq!(done.get(), 1);
+    assert!(!lio.is_full());
+  }
+
+  impl Cx<'_> {
+    /// A nop whose result cannot be read.
+    fn failing(&mut self) -> crate::model::Ticket<()> {
+      self.submit(
+        (),
+        |_| crate::api::op::Action::nop(),
+        |_, _| panic!("no result for you"),
+      )
+    }
+  }
+
+  leaf!([] struct Failing() -> () = cx.failing);
+
+  /// A blocking run after one that unwound out of `Failing`'s result:
+  /// the timeout it gave the backend.
+  fn timeout_after_a_failed_run(queue: impl FnOnce(&Lio)) -> Option<Duration> {
+    let timeouts = Rc::new(RefCell::new(Vec::new()));
+    let backend =
+      Recording { inner: ScriptedBackend::auto(0), timeouts: timeouts.clone() };
+    let lio = Lio::new_with_backend(backend, 4).unwrap();
+    crate::time::pause(&lio);
+    lio.spawn(Failing::new(), |()| true);
+    queue(&lio);
+    lio.advance_time_by_ticks(5);
+    let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      lio.try_run().unwrap();
+    }));
+    assert!(first.is_err());
+    assert!(lio.inner.borrow().woken.is_empty(), "no model is left to poll");
+    assert_eq!(
+      lio.inner.borrow().time.wait_timeout(None),
+      None,
+      "no timer is due that would keep the run from blocking either"
+    );
+
+    assert_eq!(lio.run().unwrap(), 1, "what was queued is routed");
+    let last = timeouts.borrow().last().copied();
+    last.flatten()
+  }
+
+  #[test]
+  fn a_queued_completion_alone_keeps_a_run_from_blocking() {
+    let timeout = timeout_after_a_failed_run(|lio| {
+      crate::api::nop().with_lio(lio).when_done(|_| {});
+    });
+    assert_eq!(timeout, Some(Duration::ZERO));
+  }
+
+  #[test]
+  fn a_fired_timer_alone_keeps_a_run_from_blocking() {
+    let timeout = timeout_after_a_failed_run(|lio| {
+      crate::api::sleep(Duration::from_millis(1))
+        .with_lio(lio)
+        .when_done(|_| {});
+    });
+    assert_eq!(timeout, Some(Duration::ZERO));
+  }
+
+  #[test]
+  fn a_slot_whose_result_could_not_be_read_goes_back_on_the_next_run() {
+    let (backend, lio) = lio(2);
+    // The nop takes the model's slot, and the failing one a slot of its own.
+    lio.spawn(Join::new(Nop::new(), Failing::new()), |_| true);
+    backend.complete_all(0);
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      lio.try_run().unwrap();
+    }));
+    assert!(run.is_err());
+    assert_eq!(lio.inner.borrow().dying.len(), 1);
+    assert!(lio.is_full());
+
+    // Nothing else is left for this run to do.
+    assert_eq!(lio.try_run().unwrap(), 0);
+    assert!(lio.inner.borrow().dying.is_empty());
+    assert!(!lio.is_full());
+  }
+
+  #[test]
+  fn a_cancelled_model_is_dropped_by_the_run_that_reaches_it_in_the_queue() {
+    let (backend, lio) = lio(1);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let dropped = Rc::new(Cell::new(false));
+    let flag = DropFlag(dropped.clone());
+    let queued = lio.spawn(Nop::new(), move |_| {
+      let _flag = &flag;
+      true
+    });
+    lio.cancel(&queued);
+    assert!(!dropped.get(), "it holds user values: not dropped under a borrow");
+
+    backend.complete_all(0);
+    lio.try_run().unwrap();
+    assert!(dropped.get());
   }
 }
