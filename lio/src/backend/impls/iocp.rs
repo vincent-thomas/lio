@@ -111,7 +111,14 @@ struct Overlapped {
   keep: crate::backend::Keep,
   addr: Storage,
   addr_len: i32,
+  /// For a receive: the flags it was started with, to start it again.
+  recv_flags: Option<u32>,
+  /// The backend asked the kernel to stop this operation.
+  cancelled: bool,
 }
+
+/// The `NTSTATUS` an `OVERLAPPED` holds once its operation was aborted.
+const STATUS_CANCELLED: u32 = 0xC000_0120;
 
 // Always stored inside a boxed `Overlapped`, so the variant size is moot.
 #[allow(clippy::large_enum_variant)]
@@ -150,7 +157,21 @@ impl Overlapped {
       // SAFETY: plain old data.
       addr: unsafe { mem::zeroed() },
       addr_len: mem::size_of::<Storage>() as i32,
+      recv_flags: None,
+      cancelled: false,
     })
+  }
+
+  /// Whether the kernel aborted this operation without the backend having
+  /// asked it to.
+  ///
+  /// Cancelling one receive makes Windows abort every receive queued on the
+  /// same socket. The others were not cancelled: they are started again.
+  fn aborted_with_another(&self) -> bool {
+    !self.cancelled
+      && self.recv_flags.is_some()
+      // The status is the low half of the field on 64-bit Windows.
+      && self.ov.Internal as u32 == STATUS_CANCELLED
   }
 }
 
@@ -581,15 +602,25 @@ impl Iocp {
     };
     let mut state = Overlapped::new(id, fd, kind, keep);
     state.bufs = wsa_bufs(bufs);
-    state.flags = flags;
-    let state_ptr: *mut Overlapped = &mut *state;
+    state.recv_flags = Some(flags);
+    let rc = Self::issue_recv(&mut state);
+    self.track(state, rc == 0)
+  }
+
+  /// Starts the receive `state` describes, for the first time or again.
+  fn issue_recv(state: &mut Overlapped) -> i32 {
+    // A finished attempt leaves its status, flags and address length here.
+    // SAFETY: `OVERLAPPED` is plain old data; all-zero is its initial state.
+    state.ov = unsafe { mem::zeroed() };
+    state.flags = state.recv_flags.unwrap_or(0);
+    state.addr_len = mem::size_of::<Storage>() as i32;
+    let from = matches!(state.kind, AsyncKind::RecvFrom { .. });
     // SAFETY: every pointer refers to `state`, which stays alive (boxed and
     // tracked) until the kernel reports completion.
-    let rc = unsafe {
-      let state = &mut *state_ptr;
-      if from.is_some() {
+    unsafe {
+      if from {
         ws::WSARecvFrom(
-          socket,
+          state.socket,
           state.bufs.as_ptr(),
           state.bufs.len() as u32,
           ptr::null_mut(),
@@ -601,7 +632,7 @@ impl Iocp {
         )
       } else {
         ws::WSARecv(
-          socket,
+          state.socket,
           state.bufs.as_ptr(),
           state.bufs.len() as u32,
           ptr::null_mut(),
@@ -610,8 +641,7 @@ impl Iocp {
           None,
         )
       }
-    };
-    self.track(state, rc == 0)
+    }
   }
 
   fn start_send(
@@ -635,7 +665,7 @@ impl Iocp {
       state.addr_len = len;
     }
     let state_ptr: *mut Overlapped = &mut *state;
-    // SAFETY: as in `start_recv`.
+    // SAFETY: as in `issue_recv`.
     let rc = unsafe {
       let state = &mut *state_ptr;
       if to.is_some() {
@@ -939,8 +969,16 @@ impl Iocp {
       }
       // SAFETY: `ptr` came from `Box::into_raw` in `track` and the kernel is
       // done with it.
-      let state = unsafe { Box::from_raw(ptr) };
+      let mut state = unsafe { Box::from_raw(ptr) };
       let id = state.id;
+      if state.aborted_with_another() {
+        let rc = Self::issue_recv(&mut state);
+        // Back in flight, unless it could not be started again.
+        if let Some(result) = self.track(state, rc == 0) {
+          completed.push(OpCompleted::new(id, result));
+        }
+        continue;
+      }
       completed.push(OpCompleted::new(id, self.finish(state)));
     }
     self.entries = Vec::with_capacity(MAX_ENTRIES);
@@ -974,9 +1012,13 @@ impl Iocp {
       pool.shutdown();
     }
     for &ptr in &self.in_flight {
-      let state = ptr as *const Overlapped;
-      // SAFETY: `state` is a live in-flight operation.
-      unsafe { CancelIoEx((*state).socket as HANDLE, &(*state).ov) };
+      let state = ptr as *mut Overlapped;
+      // SAFETY: `state` is a live in-flight operation. The kernel only
+      // writes its `ov`.
+      unsafe {
+        (*state).cancelled = true;
+        CancelIoEx((*state).socket as HANDLE, &(*state).ov);
+      }
     }
     // Cancelled operations still post a packet; drain them so the kernel is
     // done with their memory before it is freed.
@@ -1066,14 +1108,18 @@ unsafe impl IoBackend for Iocp {
     let found = self
       .in_flight
       .iter()
-      .map(|&ptr| ptr as *const Overlapped)
+      .map(|&ptr| ptr as *mut Overlapped)
       .find(|&state| unsafe { (*state).id } == id);
     if let Some(state) = found {
       // The operation stays in flight: the kernel reports it, aborted or
       // finished, through the port like any other completion. A job on the
       // blocking pool is not found here; it runs to completion.
-      // SAFETY: `state` is a live in-flight operation.
-      unsafe { CancelIoEx((*state).socket as HANDLE, &(*state).ov) };
+      // SAFETY: `state` is a live in-flight operation. The kernel only
+      // writes its `ov`.
+      unsafe {
+        (*state).cancelled = true;
+        CancelIoEx((*state).socket as HANDLE, &(*state).ov);
+      }
     }
   }
 
