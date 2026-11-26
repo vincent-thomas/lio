@@ -1124,20 +1124,13 @@ impl Lio {
         inner.burying += pending.len();
         drop(inner);
         let mut batch = BuryBatch { lio: self, pending, slots, dropping: None };
-        // Up to 256 slots, one release borrow after every drop is cheaper
-        // than borrowing per registration. Past that, a second pass walks
-        // slots that have left the cache, so release every 64 while the
-        // registrations just dropped are still hot.
-        let release_every =
-          if batch.pending.len() > 256 { 64 } else { usize::MAX };
+        // Only a result that could not be read leaves a registration here,
+        // so there are never many: their slots go back in one borrow.
         while let Some(Detached { registration, slot }) = batch.pending.pop() {
           batch.dropping = Some(slot);
           drop(registration);
           batch.dropping = None;
           batch.slots.push(slot);
-          if batch.slots.len() == release_every {
-            self.release_buried_slots(&mut batch.slots);
-          }
         }
         self.release_buried_slots(&mut batch.slots);
         let waiters = {
