@@ -2640,6 +2640,263 @@ macro_rules! test_io_backend {
         }
       }
     }
+
+    /// Several operations in flight on one descriptor, and descriptors the
+    /// OS cannot watch for readiness. No operation may fail because of
+    /// another one, or because of how the backend waits.
+    mod shared_descriptor {
+      use super::*;
+
+      /// Collects completions until `want` have arrived, checking that no
+      /// registration completes twice.
+      fn collect(
+        backend: &mut impl IoBackend,
+        want: usize,
+      ) -> std::collections::BTreeMap<u64, isize> {
+        let mut seen = std::collections::BTreeMap::new();
+        for _ in 0..200 {
+          if seen.len() >= want {
+            break;
+          }
+          for item in wait_completions(backend, Some(Duration::from_millis(10)))
+          {
+            let previous = seen.insert(item.registration_id(), item.result());
+            assert!(
+              previous.is_none(),
+              "registration {} completed more than once",
+              item.registration_id()
+            );
+          }
+        }
+        seen
+      }
+
+      /// Checks that nothing completes for a while.
+      fn assert_quiet(backend: &mut impl IoBackend, what: &str) {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < deadline {
+          let completed =
+            wait_completions(backend, Some(Duration::from_millis(10)));
+          assert!(completed.is_empty(), "{what}: {completed:?}");
+        }
+      }
+
+      #[test]
+      fn two_pending_recvs_on_one_socket_each_get_data() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let (read_res, write_res) = socket_pair();
+        let mut first = [0_u8; 2];
+        let mut second = [0_u8; 2];
+        {
+          let first_bufs = [BorrowedMsgBufMut::from_slice(&mut first)];
+          let second_bufs = [BorrowedMsgBufMut::from_slice(&mut second)];
+          push_op(
+            &mut backend,
+            801,
+            BorrowedOp::recv(read_res.clone(), &first_bufs, RecvFlags::empty()),
+          );
+          push_op(
+            &mut backend,
+            802,
+            BorrowedOp::recv(read_res.clone(), &second_bufs, RecvFlags::empty()),
+          );
+          backend.flush().unwrap();
+          assert_quiet(
+            &mut backend,
+            "two recvs without data must both stay pending",
+          );
+
+          // Two bytes are enough for one of them, and only one.
+          assert_eq!(send_payload(&write_res, b"ab"), 2);
+          let one = collect(&mut backend, 1);
+          assert_eq!(one.len(), 1, "one recv completes: {one:?}");
+          assert_quiet(&mut backend, "the other recv has no data yet");
+
+          assert_eq!(send_payload(&write_res, b"cd"), 2);
+          let mut both = collect(&mut backend, 1);
+          both.extend(one);
+          assert_eq!(both.get(&801), Some(&2), "{both:?}");
+          assert_eq!(both.get(&802), Some(&2), "{both:?}");
+        }
+        // Which recv gets which bytes is the backend's to decide: together
+        // they got every byte once.
+        let mut got = [first, second];
+        got.sort();
+        assert_eq!(got, [*b"ab", *b"cd"]);
+      }
+
+      #[test]
+      fn cancelling_one_of_two_pending_recvs_leaves_the_other() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let (read_res, write_res) = socket_pair();
+        let mut cancelled = [0_u8; 4];
+        let mut kept = [0_u8; 4];
+        {
+          let cancelled_bufs = [BorrowedMsgBufMut::from_slice(&mut cancelled)];
+          let kept_bufs = [BorrowedMsgBufMut::from_slice(&mut kept)];
+          push_op(
+            &mut backend,
+            811,
+            BorrowedOp::recv(
+              read_res.clone(),
+              &cancelled_bufs,
+              RecvFlags::empty(),
+            ),
+          );
+          push_op(
+            &mut backend,
+            812,
+            BorrowedOp::recv(read_res.clone(), &kept_bufs, RecvFlags::empty()),
+          );
+          backend.flush().unwrap();
+          assert_quiet(
+            &mut backend,
+            "two recvs without data must both stay pending",
+          );
+
+          backend.cancel(811);
+          let done = collect(&mut backend, 1);
+          assert!(
+            done.get(&811).is_some_and(|result| *result < 0),
+            "the cancelled recv reports an error: {done:?}"
+          );
+          assert_quiet(&mut backend, "the other recv is still waiting");
+
+          assert_eq!(send_payload(&write_res, b"kept"), 4);
+          let done = collect(&mut backend, 1);
+          assert_eq!(done.get(&812), Some(&4), "{done:?}");
+        }
+        assert_eq!(&kept, b"kept");
+        assert_eq!(cancelled, [0; 4], "a cancelled recv must not fill its buffer");
+      }
+
+      #[test]
+      fn a_send_completes_while_a_recv_waits_on_the_same_socket() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let (ours, theirs) = socket_pair();
+        let mut incoming = [0_u8; 4];
+        {
+          let incoming_bufs = [BorrowedMsgBufMut::from_slice(&mut incoming)];
+          push_op(
+            &mut backend,
+            821,
+            BorrowedOp::recv(ours.clone(), &incoming_bufs, RecvFlags::empty()),
+          );
+          backend.flush().unwrap();
+          assert_quiet(&mut backend, "a recv without data must stay pending");
+
+          let outgoing_bufs = [BorrowedMsgBuf::from_slice(b"ping")];
+          push_op(
+            &mut backend,
+            822,
+            BorrowedOp::send(ours.clone(), &outgoing_bufs, None, SendFlags::empty()),
+          );
+          backend.flush().unwrap();
+          let done = collect(&mut backend, 1);
+          assert_eq!(done.get(&822), Some(&4), "the send completes: {done:?}");
+          assert_quiet(&mut backend, "the recv still has no data");
+
+          let mut seen = [0_u8; 4];
+          assert_eq!(recv_payload(&theirs, &mut seen), 4);
+          assert_eq!(&seen, b"ping");
+
+          assert_eq!(send_payload(&theirs, b"pong"), 4);
+          let done = collect(&mut backend, 1);
+          assert_eq!(done.get(&821), Some(&4), "the recv completes: {done:?}");
+        }
+        assert_eq!(&incoming, b"pong");
+      }
+
+      #[test]
+      fn two_writes_to_one_pipe_both_complete() {
+        use std::io::Read;
+
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let (mut reader, writer) = std::io::pipe().expect("pipe() failed");
+        #[cfg(unix)]
+        let writer = own_raw(writer.into_raw_fd() as isize);
+        #[cfg(windows)]
+        let writer = own_raw(writer.into_raw_handle() as isize);
+
+        let mut first = *b"one\n";
+        let mut second = *b"two\n";
+        let first_buf = RawBuf::from_mut(&mut first);
+        let second_buf = RawBuf::from_mut(&mut second);
+        push_op(
+          &mut backend,
+          831,
+          BorrowedOp::write(
+            writer.clone(),
+            std::slice::from_ref(&first_buf),
+            None,
+            WriteFlags::empty(),
+          ),
+        );
+        push_op(
+          &mut backend,
+          832,
+          BorrowedOp::write(
+            writer.clone(),
+            std::slice::from_ref(&second_buf),
+            None,
+            WriteFlags::empty(),
+          ),
+        );
+        backend.flush().unwrap();
+
+        let done = collect(&mut backend, 2);
+        assert_eq!(done.get(&831), Some(&4), "{done:?}");
+        assert_eq!(done.get(&832), Some(&4), "{done:?}");
+
+        let mut seen = [0_u8; 8];
+        reader.read_exact(&mut seen).unwrap();
+        assert!(
+          &seen == b"one\ntwo\n" || &seen == b"two\none\n",
+          "each write arrives whole: {seen:?}"
+        );
+      }
+
+      #[test]
+      fn a_write_to_the_null_device_reports_its_byte_count() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let path = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let null = fs::OpenOptions::new()
+          .write(true)
+          .open(path)
+          .expect("the null device opens for writing");
+        #[cfg(unix)]
+        let null = own_raw(null.into_raw_fd() as isize);
+        #[cfg(windows)]
+        let null = own_raw(null.into_raw_handle() as isize);
+
+        let mut payload = *b"gone";
+        let raw_buf = RawBuf::from_mut(&mut payload);
+        push_op(
+          &mut backend,
+          841,
+          BorrowedOp::write(
+            null.clone(),
+            std::slice::from_ref(&raw_buf),
+            None,
+            WriteFlags::empty(),
+          ),
+        );
+        backend.flush().unwrap();
+
+        let completed = wait_for_single_completion(&mut backend);
+        assert_exact_result(&completed, 841, 4);
+      }
+    }
   }
 }
 
