@@ -28,7 +28,6 @@ use std::{io, path::Path};
 use crate::{
   api::{
     ShutdownHow,
-    io::Io,
     ops::{self, Recv, Shutdown},
     resource::{AsResource, FromResource, IntoResource, Resource},
   },
@@ -79,14 +78,14 @@ impl UnixListener {
   /// Returns `InvalidInput` right away if `path` contains a NUL byte or is too
   /// long for a socket address. Backends may reject paths that are shorter
   /// than lio's limit but longer than the platform's `sun_path`.
-  pub fn bind(path: impl AsRef<Path>) -> io::Result<Io<UnixBindListener>> {
+  pub fn bind(path: impl AsRef<Path>) -> io::Result<UnixBindListener> {
     let addr = path_to_addr(path.as_ref())?;
-    Ok(Io::from_op(BindListener::unix(addr)))
+    Ok(BindListener::unix(addr))
   }
 
   /// Accepts a new incoming connection from this listener.
-  pub fn accept(&self) -> Io<UnixAccept> {
-    Io::from_op(UnixAccept::new(self.0.as_resource().clone()))
+  pub fn accept(&self) -> UnixAccept {
+    UnixAccept::new(self.0.as_resource().clone())
   }
 }
 
@@ -118,13 +117,13 @@ impl UnixStream {
   ///
   /// Returns `InvalidInput` right away if `path` contains a NUL byte or is too
   /// long for a socket address.
-  pub fn connect(path: impl AsRef<Path>) -> io::Result<Io<UnixStreamConnect>> {
+  pub fn connect(path: impl AsRef<Path>) -> io::Result<UnixStreamConnect> {
     let addr = path_to_addr(path.as_ref())?;
-    Ok(Io::from_op(StreamConnect::unix(addr)))
+    Ok(StreamConnect::unix(addr))
   }
 
   /// Receives data from the stream into the provided buffer.
-  pub fn recv<V>(&self, vec: V) -> Io<Recv<V>>
+  pub fn recv<V>(&self, vec: V) -> Recv<V>
   where
     V: buf::IoBufMutVec + std::marker::Send + Sync + 'static,
   {
@@ -132,7 +131,7 @@ impl UnixStream {
   }
 
   /// Sends data through the stream.
-  pub fn send<V>(&self, vec: V) -> Io<ops::Send<V>>
+  pub fn send<V>(&self, vec: V) -> ops::Send<V>
   where
     V: buf::IoBufVec + std::marker::Send + Sync + 'static,
   {
@@ -140,7 +139,7 @@ impl UnixStream {
   }
 
   /// Shuts down the read, write, or both halves of this connection.
-  pub fn shutdown(&self, how: ShutdownHow) -> Io<Shutdown> {
+  pub fn shutdown(&self, how: ShutdownHow) -> Shutdown {
     self.0.shutdown(how)
   }
 }

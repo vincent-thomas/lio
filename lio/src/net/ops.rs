@@ -45,6 +45,7 @@ fn ip_domain(addr: &SocketAddr) -> SockDomain {
 /// its result to return a [`Socket`] instead of a raw [`Resource`](crate::api::resource::Resource).
 ///
 /// You typically won't create this directly; it's returned by [`Socket::accept()`](crate::net::Socket::accept).
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct SocketAccept {
   inner: ops::Accept,
 }
@@ -54,6 +55,8 @@ impl SocketAccept {
     Self { inner: ops::Accept::new(res) }
   }
 }
+
+runnable!([] SocketAccept);
 
 impl OpModel for SocketAccept {
   type Item = io::Result<(Socket, SocketAddr)>;
@@ -72,6 +75,7 @@ impl OpModel for SocketAccept {
 /// return a [`Socket`] instead of a raw [`Resource`](crate::api::resource::Resource).
 ///
 /// You typically won't create this directly; it's returned by [`Socket::new()`](crate::net::Socket::new).
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct SocketNew {
   inner: ops::Socket,
 }
@@ -86,6 +90,8 @@ impl SocketNew {
   }
 }
 
+runnable!([] SocketNew);
+
 impl OpModel for SocketNew {
   type Item = io::Result<Socket>;
 
@@ -94,6 +100,7 @@ impl OpModel for SocketNew {
   }
 }
 
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct TcpAccept {
   inner: ops::Accept,
 }
@@ -103,6 +110,8 @@ impl TcpAccept {
     Self { inner: ops::Accept::new(res) }
   }
 }
+
+runnable!([] TcpAccept);
 
 impl OpModel for TcpAccept {
   type Item = io::Result<(TcpStream, SocketAddr)>;
@@ -116,6 +125,7 @@ impl OpModel for TcpAccept {
 }
 
 /// Socket-create/bind/listen operation that returns a listener of type `T`.
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct BindListener<T> {
   state: BindListenerState,
   addr: SocketAddrBuf,
@@ -164,6 +174,8 @@ impl BindListener<UnixListener> {
     Self::with_addr(SockDomain::UNIX, SockProto::DEFAULT, addr)
   }
 }
+
+runnable!([T: FromResource + 'static] BindListener<T>);
 
 impl<T: FromResource + 'static> OpModel for BindListener<T> {
   type Item = io::Result<T>;
@@ -250,6 +262,7 @@ impl OpModel for Connecting {
 }
 
 /// Socket-create/connect operation that returns a stream of type `T`.
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct StreamConnect<T> {
   inner: Connecting,
   _stream: PhantomData<fn() -> T>,
@@ -286,6 +299,8 @@ impl StreamConnect<UnixStream> {
   }
 }
 
+runnable!([T: FromResource + 'static] StreamConnect<T>);
+
 impl<T: FromResource + 'static> OpModel for StreamConnect<T> {
   type Item = io::Result<T>;
 
@@ -297,6 +312,7 @@ impl<T: FromResource + 'static> OpModel for StreamConnect<T> {
 /// Accept operation specialized for [`UnixStream`].
 ///
 /// Unix peers are usually unnamed, so the peer address is not reported.
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct UnixAccept {
   inner: ops::AcceptUnix,
 }
@@ -306,6 +322,8 @@ impl UnixAccept {
     Self { inner: ops::AcceptUnix::new(res) }
   }
 }
+
+runnable!([] UnixAccept);
 
 impl OpModel for UnixAccept {
   type Item = io::Result<UnixStream>;
@@ -318,6 +336,7 @@ impl OpModel for UnixAccept {
   }
 }
 
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct UdpBindSocket {
   state: UdpBindState,
   addr: SocketAddr,
@@ -340,6 +359,8 @@ impl UdpBindSocket {
     }
   }
 }
+
+runnable!([] UdpBindSocket);
 
 impl OpModel for UdpBindSocket {
   type Item = io::Result<UdpSocket>;
@@ -370,6 +391,7 @@ impl OpModel for UdpBindSocket {
   }
 }
 
+#[must_use = "an operation does nothing until it is run or polled"]
 pub struct UdpConnectSocket {
   inner: Connecting,
 }
@@ -386,6 +408,8 @@ impl UdpConnectSocket {
     }
   }
 }
+
+runnable!([] UdpConnectSocket);
 
 impl OpModel for UdpConnectSocket {
   type Item = io::Result<UdpSocket>;

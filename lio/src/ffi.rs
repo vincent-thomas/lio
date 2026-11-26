@@ -1140,6 +1140,7 @@ pub unsafe extern "C" fn lio_interval(
   callback: extern "C" fn(libc::c_int),
 ) {
   let receiver = api::interval(Duration::from_millis(millis as u64))
+    .stream()
     .with_lio(&unsafe { handle(lio) }.inner)
     .send();
   std::thread::spawn(move || {
@@ -1254,14 +1255,9 @@ pub unsafe extern "C" fn lio_sendto(
   // SAFETY: caller guarantees fd is valid per fn contract
   let resource = unsafe { fd_to_borrowed_resource(fd) };
   // SAFETY: caller guarantees lio is valid per fn contract
-  crate::api::io::Io::from_op(api::ops::Send::new(
-    resource.clone(),
-    buf,
-    Some(socket_addr),
-    flags,
-  ))
-  .with_lio(&unsafe { handle(lio) }.inner)
-  .when_done(move |(res, buf)| return_buf(callback, res, buf));
+  api::ops::Send::new(resource.clone(), buf, Some(socket_addr), flags)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
 
 /// Open a file relative to a directory fd.
@@ -1647,13 +1643,9 @@ pub unsafe extern "C" fn lio_readlinkat(
     return;
   };
   let dir_res = unsafe { fd_to_borrowed_resource(dir_fd) };
-  crate::api::io::Io::from_op(api::ops::ReadlinkAt::new(
-    dir_res.clone(),
-    path,
-    buf,
-  ))
-  .with_lio(&unsafe { handle(lio) }.inner)
-  .when_done(move |(res, buf)| return_buf(callback, res, buf));
+  api::ops::ReadlinkAt::new(dir_res.clone(), path, buf)
+    .with_lio(&unsafe { handle(lio) }.inner)
+    .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }
 
 /// Reads the current working directory into a caller-provided buffer.
@@ -1678,7 +1670,7 @@ pub unsafe extern "C" fn lio_getcwd(
   let Some(buf) = (unsafe { lend_empty(buf, buf_len, callback) }) else {
     return;
   };
-  crate::api::io::Io::from_op(api::ops::GetCwd::new(buf))
+  api::ops::GetCwd::new(buf)
     .with_lio(&unsafe { handle(lio) }.inner)
     .when_done(move |(res, buf)| return_buf(callback, res, buf));
 }

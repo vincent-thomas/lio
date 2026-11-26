@@ -44,7 +44,8 @@ fn run_until_recv<T>(
 #[test]
 fn basic() {
   let mut lio = new_ds_lio();
-  let recv = api::interval(Duration::from_millis(20)).with_lio(&lio).send();
+  let recv =
+    api::interval(Duration::from_millis(20)).stream().with_lio(&lio).send();
 
   let first = run_until_recv(&mut lio, &recv, Duration::from_secs(1));
   assert!(first.is_ok(), "first interval tick should succeed: {first:?}");
@@ -57,7 +58,7 @@ fn basic() {
 fn spacing_is_roughly_periodic() {
   let mut lio = new_ds_lio();
   let period = Duration::from_millis(30);
-  let recv = api::interval(period).with_lio(&lio).send();
+  let recv = api::interval(period).stream().with_lio(&lio).send();
 
   let start = Instant::now();
   let first = run_until_recv(&mut lio, &recv, Duration::from_secs(1));
@@ -86,7 +87,8 @@ fn spacing_is_roughly_periodic() {
 fn drop_stream_stops_delivery() {
   let mut lio = new_ds_lio();
   let recv = {
-    let stream = api::interval(Duration::from_millis(10)).with_lio(&lio);
+    let stream =
+      api::interval(Duration::from_millis(10)).stream().with_lio(&lio);
     stream.send()
   };
 
@@ -103,7 +105,8 @@ fn drop_stream_stops_delivery() {
 #[test]
 fn pause_resume_stops_and_restores_ticks() {
   let mut lio = new_ds_lio();
-  let recv = api::interval(Duration::from_millis(40)).with_lio(&lio).send();
+  let recv =
+    api::interval(Duration::from_millis(40)).stream().with_lio(&lio).send();
 
   let first = run_until_recv(&mut lio, &recv, Duration::from_secs(1));
   assert!(first.is_ok(), "first interval tick should succeed: {first:?}");
@@ -127,7 +130,8 @@ fn pause_resume_stops_and_restores_ticks() {
 #[test]
 fn dropping_the_receiver_stops_the_interval() {
   let mut lio = Lio::new(1).unwrap();
-  let recv = api::interval(Duration::from_millis(5)).with_lio(&lio).send();
+  let recv =
+    api::interval(Duration::from_millis(5)).stream().with_lio(&lio).send();
   let first = run_until_recv(&mut lio, &recv, Duration::from_secs(1));
   assert!(first.is_ok());
   assert!(lio.is_full(), "the interval holds the only slot");

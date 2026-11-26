@@ -155,7 +155,7 @@ struct Endless(api::ops::Nop);
 
 impl Endless {
   fn new() -> Self {
-    Self(api::nop().into_inner())
+    Self(api::nop())
   }
 }
 
@@ -164,7 +164,7 @@ impl OpModel for Endless {
 
   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
     let _ = lio::ready!(self.0.poll(cx));
-    self.0 = api::nop().into_inner();
+    self.0 = api::nop();
     Step::Yield(())
   }
 }
@@ -240,7 +240,7 @@ fn stream_on_the_global_lio_cancels_on_the_driver_it_ran_on() {
   let first = Lio::new(1).unwrap();
   let guard = lio::install_global(first.clone());
   // Submitted through the global, so on `first`.
-  let mut stream = api::interval(Duration::from_secs(3600));
+  let mut stream = api::interval(Duration::from_secs(3600)).stream();
   let mut next = Box::pin(stream.next());
   let mut cx = Context::from_waker(Waker::noop());
   assert!(next.as_mut().poll(&mut cx).is_pending());

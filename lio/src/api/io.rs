@@ -6,8 +6,10 @@
 //!
 //! # Overview
 //!
-//! The [`Io<T>`] type is the core abstraction that wraps an I/O operation and
-//! provides various methods to consume its result:
+//! [`Io<T>`] is a model together with the driver it will run on. lio's own
+//! operations are run directly and only become an `Io` through `with_lio`;
+//! a model of your own becomes one through [`api::run`](crate::api::run).
+//! Either way the result is consumed in one of these ways:
 //!
 //! - **Async/await**: Implements `IntoFuture`, allowing direct `.await` syntax
 //! - **Callbacks**: [`when_done()`](Io::when_done) executes a closure on completion
@@ -66,11 +68,12 @@ use std::{
   time::Duration,
 };
 
-/// Represents an in-progress I/O operation with multiple consumption patterns.
+/// A model and the driver it will run on, with the ways to get its result.
 ///
-/// [`Io<T>`] is the primary interface for consuming I/O operation results in lio.
-/// It wraps an operation of type `T` and provides methods to retrieve the result through
-/// various patterns suited to different programming models.
+/// lio's operations can be run without one: `api::read(..).await` uses the
+/// driver installed for the thread. An `Io` is what `with_lio` on an
+/// operation returns, and what [`api::run`](crate::api::run) makes of a
+/// model of your own.
 ///
 /// # Examples
 /// See examples in each method's docs.
@@ -419,13 +422,6 @@ impl<T> Io<T> {
   fn into_lio(self) -> (Lio, T) {
     let lio = self.handle.into_lio();
     (lio, self.op)
-  }
-}
-
-impl<T> Io<T> {
-  /// The operation itself, to poll from a model of your own.
-  pub fn into_inner(self) -> T {
-    self.op
   }
 }
 
@@ -980,7 +976,7 @@ mod tests {
 
   impl Counter {
     fn new() -> Self {
-      Self(0, api::nop().into_inner())
+      Self(0, api::nop())
     }
   }
 
@@ -991,7 +987,7 @@ mod tests {
       let _ = crate::ready!(self.1.poll(cx));
       self.0 += 1;
       if self.0 < 3 {
-        self.1 = api::nop().into_inner();
+        self.1 = api::nop();
         Step::Yield(self.0)
       } else {
         Step::Done(self.0)
@@ -1052,7 +1048,7 @@ mod tests {
 
   impl AgainThenDone {
     fn new(stepped: bool) -> Self {
-      Self(stepped, api::nop().into_inner())
+      Self(stepped, api::nop())
     }
   }
 
@@ -1065,7 +1061,7 @@ mod tests {
         if std::mem::replace(&mut self.0, true) {
           return Step::Done(7);
         }
-        self.1 = api::nop().into_inner();
+        self.1 = api::nop();
       }
     }
   }
@@ -1168,7 +1164,7 @@ mod tests {
     let lio = Lio::new(64).unwrap();
 
     let receiver =
-      api::interval(Duration::from_millis(1)).with_lio(&lio).send();
+      api::interval(Duration::from_millis(1)).stream().with_lio(&lio).send();
 
     run_until_done(&lio);
 

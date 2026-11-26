@@ -179,6 +179,76 @@ macro_rules! action_io {
   }};
 }
 
+/// Gives one of lio's model types the ways to run it: `.await`, and the
+/// methods that hand it to [`Io`](crate::api::Io).
+///
+/// A model of your own gets the same through
+/// [`api::run`](crate::api::run): Rust has no way to implement `.await` for
+/// every [`OpModel`](crate::model::OpModel) at once.
+macro_rules! runnable {
+  ([$($generics:tt)*] $ty:ty) => {
+    impl<$($generics)*> $ty
+    where
+      Self: $crate::model::OpModel + 'static,
+    {
+      /// Runs this on `lio` instead of the driver installed for the thread.
+      #[inline]
+      pub fn with_lio(self, lio: &$crate::Lio) -> $crate::api::Io<Self> {
+        $crate::api::Io::from_op(self).with_lio(lio)
+      }
+
+      /// Runs this and calls `f` with the result. See
+      /// [`Io::when_done`]($crate::api::Io::when_done).
+      #[inline]
+      pub fn when_done<F>(self, f: F)
+      where
+        F: Fn(<Self as $crate::model::OpModel>::Item) + 'static,
+      {
+        $crate::api::Io::from_op(self).when_done(f)
+      }
+
+      /// Runs this and sends the result through a channel. See
+      /// [`Io::send`]($crate::api::Io::send).
+      #[inline]
+      pub fn send(
+        self,
+      ) -> $crate::api::io::Receiver<<Self as $crate::model::OpModel>::Item>
+      where
+        <Self as $crate::model::OpModel>::Item: ::std::marker::Send + 'static,
+      {
+        $crate::api::Io::from_op(self).send()
+      }
+
+      /// Runs this and sends the result through `sender`. See
+      /// [`Io::send_with`]($crate::api::Io::send_with).
+      #[inline]
+      pub fn send_with(
+        self,
+        sender: ::std::sync::mpsc::Sender<
+          <Self as $crate::model::OpModel>::Item,
+        >,
+      ) where
+        <Self as $crate::model::OpModel>::Item: ::std::marker::Send + 'static,
+      {
+        $crate::api::Io::from_op(self).send_with(sender)
+      }
+    }
+
+    impl<$($generics)*> ::std::future::IntoFuture for $ty
+    where
+      Self: $crate::model::OpModel + ::std::marker::Unpin + 'static,
+    {
+      type Output = <Self as $crate::model::OpModel>::Item;
+      type IntoFuture = $crate::model::Run<Self>;
+
+      #[inline]
+      fn into_future(self) -> Self::IntoFuture {
+        $crate::api::Io::from_op(self).into_future()
+      }
+    }
+  };
+}
+
 /// Declares the type of one operation: what it was asked to do, held
 /// until it is polled, and the [`Cx`](crate::model::Cx) method that then
 /// starts it.
@@ -188,12 +258,39 @@ macro_rules! action_io {
 macro_rules! leaf {
   (
     $(#[$meta:meta])*
-    [$($generics:tt)*] $vis:vis struct $name:ident $(<$param:ident>)? (
+    [$($generics:tt)*] pub struct $name:ident $(<$param:ident>)? (
+      $($args:tt)*
+    ) -> $item:ty = cx.$method:ident
+  ) => {
+    leaf!(
+      @model $(#[$meta])*
+      [$($generics)*] (pub) struct $name $(<$param>)? ($($args)*)
+        -> $item = cx.$method
+    );
+    // Only lio's public operations are run by users.
+    runnable!([$($generics)*] $name$(<$param>)?);
+  };
+  (
+    $(#[$meta:meta])*
+    [$($generics:tt)*] struct $name:ident $(<$param:ident>)? (
+      $($args:tt)*
+    ) -> $item:ty = cx.$method:ident
+  ) => {
+    leaf!(
+      @model $(#[$meta])*
+      [$($generics)*] () struct $name $(<$param>)? ($($args)*)
+        -> $item = cx.$method
+    );
+  };
+  (
+    @model $(#[$meta:meta])*
+    [$($generics:tt)*] ($($vis:tt)*) struct $name:ident $(<$param:ident>)? (
       $($arg:ident : $ty:ty),* $(,)?
     ) -> $item:ty = cx.$method:ident
   ) => {
     $(#[$meta])*
-    $vis struct $name<$($generics)*> {
+    #[must_use = "an operation does nothing until it is run or polled"]
+    $($vis)* struct $name<$($generics)*> {
       state: $crate::model::Leaf<($($ty,)*), $item>,
     }
 
