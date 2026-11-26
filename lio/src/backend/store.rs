@@ -506,6 +506,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn test_capacity_limit() {
     let mut store = OpStore::with_capacity(4);
     let _ids: Vec<_> =
@@ -518,6 +519,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn panicking_init_leaves_the_slot_free() {
     let mut store = OpStore::with_capacity(1);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -539,6 +541,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn panicking_drop_on_remove_still_releases_the_slot() {
     let mut store = OpStore::with_capacity(1);
     let id = store.insert_with(|arena| {
@@ -618,6 +621,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn panic_before_keep_drops_the_registration_and_frees_the_slot() {
     let (tx, rx) = mpsc::channel::<std::io::Result<()>>();
     let mut store = OpStore::with_capacity(1);
@@ -636,6 +640,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn panic_after_keep_leaves_the_registration_stored() {
     let (tx, rx) = mpsc::channel::<std::io::Result<()>>();
     let mut store = OpStore::with_capacity(1);

@@ -90,6 +90,30 @@ jobs:
       - name: ffi
         run: mise run ffi
 
+  # lio as a WebAssembly component: the tests that build for wasm32-wasip3
+  # and the WASI examples, under wasmtime. mise installs the target and the
+  # runtime.
+  wasi:
+    name: wasi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Checked downloads. The action does not restore an install tree.
+      # https://mise.jdx.dev/continuous-integration.html#trusted-cache
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/mise/downloads-cas
+          key: mise-downloads-${{ runner.os }}-${{ hashFiles('mise.lock') }}
+
+      - uses: jdx/mise-action@v5
+        with:
+          version: "2026.11.12"
+          cache: false
+
+      - name: wasi
+        run: mise run wasi
+
   # Slow, and still a merge gate: a mutant that survives in the diff fails CI.
   mutants:
     name: mutants

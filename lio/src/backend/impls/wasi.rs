@@ -61,6 +61,9 @@ use crate::backend::op::{
 };
 use crate::backend::{InFlight, IoBackend, Keep, OpCompleted};
 
+#[cfg(test)]
+mod tests;
+
 /// `user_data` of the timer that bounds a [`wait`](IoBackend::wait). No
 /// registration id is this value.
 const TIMER: u64 = u64::MAX;

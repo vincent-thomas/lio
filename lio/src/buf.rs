@@ -503,6 +503,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn proof_rejects_a_different_allocation() {
     let mut owned = vec![1u8, 2, 3];
     let mut other = vec![0u8; 3];

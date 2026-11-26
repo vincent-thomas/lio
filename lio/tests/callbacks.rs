@@ -129,6 +129,7 @@ fn dropping_a_finished_callback_may_cancel_through_the_lio() {
 }
 
 #[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
 fn panicking_callback_that_owns_an_in_flight_future_does_not_abort() {
   let lio = Lio::new(2).unwrap();
   let sleep = submitted_sleep(&lio);
@@ -232,6 +233,7 @@ fn waker_may_poll_its_future_inline() {
 }
 
 #[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
 fn panicking_callback_frees_its_slot() {
   // Capacity 1: if the panicking registration leaked, nothing more could be
   // scheduled.
@@ -307,6 +309,7 @@ unsafe impl lio::backend::IoBackend for InOrderBackend {
 }
 
 #[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
 fn panic_does_not_lose_the_rest_of_the_batch() {
   let lio = Lio::new_with_backend(InOrderBackend::default(), 4).unwrap();
   let done = Rc::new(Cell::new(false));
@@ -328,6 +331,7 @@ fn panic_does_not_lose_the_rest_of_the_batch() {
 }
 
 #[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
 fn blocking_run_delivers_what_a_panic_left_behind() {
   let lio = Lio::new_with_backend(InOrderBackend::default(), 4).unwrap();
   let done = Rc::new(Cell::new(false));
