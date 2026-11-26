@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# Runtime checks for WASI. lio-wasi's examples assert what each operation
-# did, and examples/wasi drives lio's WASI backend through lio's own API.
-# This builds them as WebAssembly components and runs every one under
-# wasmtime. A failed assertion traps, which fails the run.
+# Tests on WASI, under wasmtime.
+#
+# 1. lio's own tests that build for wasm32-wasip3: the library tests, which
+#    include the WASI backend's (lio/src/backend/impls/wasi/tests.rs), and
+#    the integration tests that do not build fixtures from std descriptors.
+# 2. The lio-wasi examples, which assert what each operation did, and
+#    examples/wasi, which drives the backend through lio's own API.
+#
+# A failed assertion aborts: wasm32-wasip3 does not unwind. Tests that catch
+# a panic are ignored there (`not(panic = "unwind")`).
 #
 # Needs the wasm32-wasip3 Rust target and wasmtime (both from mise).
 
@@ -15,6 +21,16 @@ cargo build -p lio-wasi-example --target "${target}"
 out="${CARGO_TARGET_DIR:-target}/${target}/debug/examples"
 scratch="$(mktemp -d)"
 trap 'rm -rf "${scratch}"' EXIT
+
+# The integration tests that build for WASI. The others share fixtures that
+# turn std files and sockets into resources, which WASI cannot do.
+tests=(callbacks capacity ds_cluster global model net_socket_datagram net_udp)
+
+mkdir -p "${scratch}/tests/tmp"
+echo "--- lio tests"
+CARGO_TARGET_WASM32_WASIP3_RUNNER="wasmtime run -S p3 -S inherit-network --dir ${scratch}/tests::/ --env TMPDIR=/tmp" \
+  cargo test -p lio --features high --target "${target}" --lib \
+  "${tests[@]/#/--test=}"
 
 run() {
   local name="$1"

@@ -712,10 +712,15 @@ mod tests {
   #[test]
   fn dropping_stdout_leaves_the_process_stream_open() {
     drop(Resource::stdout());
-    assert!(Resource::stdout().try_duplicate().is_ok());
+    // Duplicating fails with a bad-descriptor error if the stream was
+    // closed. A platform with no way to duplicate says so instead.
+    if let Err(error) = Resource::stdout().try_duplicate() {
+      assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn invalid_resource_is_not_a_borrowable_descriptor() {
     let invalid = Resource::invalid();
     #[cfg(any(unix, target_os = "wasi"))]

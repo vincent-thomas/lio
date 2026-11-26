@@ -1716,6 +1716,7 @@ mod tests {
   leaf!([] struct Panicking(memory: DropFlag) -> () = cx.panicking);
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_panic_while_building_the_action_does_not_keep_its_slot() {
     // Capacity 1: if the panicking op kept its slot, nothing more would run.
     let (backend, lio) = lio(1);
@@ -1830,6 +1831,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_run_routes_only_what_was_queued_when_it_started() {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1935,6 +1937,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn queued_completions_do_not_wait_on_the_backend() {
     let timeouts = Rc::new(RefCell::new(Vec::new()));
     let backend =
@@ -1954,6 +1957,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_panicking_handler_still_frees_its_slot() {
     let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 1).unwrap();
     crate::api::nop().with_lio(&lio).when_done(|_| panic!("handler failure"));
@@ -2022,6 +2026,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_panic_while_burying_a_batch_releases_the_slots_already_dropped() {
     let lio = Lio::new_with_backend(ScriptedBackend::auto(0), 3).unwrap();
     crate::api::nop().with_lio(&lio).when_done(|_| {});
@@ -2285,6 +2290,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_queued_completion_alone_keeps_a_run_from_blocking() {
     let timeout = timeout_after_a_failed_run(|lio| {
       crate::api::nop().with_lio(lio).when_done(|_| {});
@@ -2293,6 +2299,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_fired_timer_alone_keeps_a_run_from_blocking() {
     let timeout = timeout_after_a_failed_run(|lio| {
       crate::api::sleep(Duration::from_millis(1))
@@ -2303,6 +2310,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
   fn a_slot_whose_result_could_not_be_read_goes_back_on_the_next_run() {
     let (backend, lio) = lio(2);
     // The nop takes the model's slot, and the failing one a slot of its own.

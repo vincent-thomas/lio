@@ -120,7 +120,7 @@ description = "Build the C ABI, then compile and run the C and C++ tests. Linux 
 run = "scripts/test-ffi.sh"
 
 [tasks.wasi]
-description = "Build the lio-wasi examples and the lio WASI example for wasm32-wasip3 and run each under wasmtime. They assert what every operation did."
+description = "Run lio's tests that build for wasm32-wasip3, then the lio-wasi examples and the lio WASI example, all under wasmtime."
 run = "scripts/test-wasi.sh"
 
 [tasks.ci]
