@@ -14,11 +14,9 @@ impl Interest {
   pub const WRITE: Self = Self { bits: 1 << 1 };
 
   /// Both read and write. epoll can report them as one event.
-  ///
-  /// The backend does not branch on this. The poller tests do.
   #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "read by the poller contract tests")
+    allow(dead_code, reason = "named by the poller contract tests")
   )]
   pub const READ_AND_WRITE: Self =
     Self { bits: Self::READ.bits | Self::WRITE.bits };

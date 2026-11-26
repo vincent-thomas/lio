@@ -1060,46 +1060,42 @@ where
   Ok(())
 }
 
-/// Test adding already-registered fd - verify error handling
+/// A descriptor has one registration. A second `add` is refused with
+/// `EEXIST` and leaves the first as it was: whoever needs to watch for more
+/// deletes the registration and adds one that names everything.
 pub fn test_add_duplicate_fd<P>(poller: P) -> io::Result<()>
 where
   P: ReadinessPoll,
   P::NativeEvent: Clone,
 {
-  let (sock1, _sock2) = create_socket_pair()?;
+  let (sock1, sock2) = create_socket_pair()?;
   let fd1 = sock1.as_raw_fd();
+  let fd2 = sock2.as_raw_fd();
   make_nonblocking(fd1)?;
+  make_nonblocking(fd2)?;
 
   let mut events = zeroed_events(16);
 
-  // Add fd with key 1
   poller.add(fd1, 1, Interest::READ)?;
 
-  // Try to add same fd again with different key and interest
-  // Different implementations may handle this differently:
-  // - Some may error
-  // - Some may update the registration (like modify)
-  // We just verify it doesn't crash and behaves consistently
-  let result = poller.add(fd1, 2, Interest::WRITE);
+  let again = poller.add(fd1, 2, Interest::WRITE);
+  let refused = again.err().and_then(|err| err.raw_os_error());
+  assert_eq!(refused, Some(libc::EEXIST), "a second add must be refused");
 
-  // If it succeeds, verify the behavior
-  if result.is_ok() {
-    // Check which registration is active
-    let n = poller.wait(&mut events, Some(Duration::from_millis(10)))?;
+  // The socket is writable, which the refused registration asked about:
+  // nothing is reported for it.
+  let n = poller.wait(&mut events, Some(Duration::from_millis(10)))?;
+  assert_eq!(n, 0, "the refused registration must not be active");
 
-    // Should get at most 1 event for the fd
-    assert!(n <= 1, "Should not get duplicate events for same fd");
-
-    if n == 1 {
-      let key = P::event_key(&events[0]);
-      // Key should be either 1 or 2, verifying one registration is active
-      assert!(
-        key == 1 || key == 2,
-        "Key should match one of the registrations"
-      );
-    }
-  }
-  // If it errors, that's also acceptable behavior - we just verified it doesn't panic
+  // The first registration still is.
+  let data = b"hello";
+  let written =
+    syscall!(write(fd2, data.as_ptr() as *const libc::c_void, data.len()))?;
+  assert!(written > 0, "Failed to write data");
+  let n = poller.wait(&mut events, Some(Duration::from_millis(100)))?;
+  assert_eq!(n, 1, "Expected the first registration's read event");
+  assert_eq!(P::event_key(&events[0]), 1);
+  assert!(P::event_interest(&events[0]).is_readable());
 
   Ok(())
 }
