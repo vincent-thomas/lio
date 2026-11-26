@@ -28,8 +28,8 @@
 //!
 //! An operation is an [`OpModel`](crate::model::OpModel), so it goes
 //! straight into a [`Join`](crate::model::Join),
-//! [`model::spawn`](crate::model::spawn), or a model of your own. A model
-//! of your own is run the same way: see [`ModelExt`](crate::model::ModelExt).
+//! [`model::spawn`](crate::model::spawn), or a model of your own. [`run`]
+//! and [`run_stream`] run a model or stream of your own the way lio's are.
 //!
 //! # Buffer Ownership
 //!
@@ -68,8 +68,7 @@ use std::time::Duration;
 ///
 /// Nothing happens until the returned [`Io`] is consumed: `.await` it, or
 /// use [`when_done`](Io::when_done) or [`send`](Io::send).
-/// [`ModelExt`](crate::model::ModelExt) has the same methods for every model:
-/// this is for `.await` on the driver installed for the thread.
+/// [`with_lio`](Io::with_lio) names the driver, as on lio's own operations.
 ///
 /// ```
 /// use lio::api::{self, ops};
@@ -105,6 +104,18 @@ use std::time::Duration;
 /// ```
 pub fn run<M: crate::model::OpModel>(model: M) -> Io<M> {
   Io::from_op(model)
+}
+
+/// Runs a stream of your own, the way lio's streams are run.
+///
+/// Nothing happens until the returned [`IoStream`] is consumed:
+/// [`start`](IoStream::start) it for a handle to take items from, or use
+/// [`send`](IoStream::send) or [`send_with`](IoStream::send_with).
+/// [`with_lio`](IoStream::with_lio) names the driver.
+pub fn run_stream<S: crate::model::OpStream + 'static>(
+  stream: S,
+) -> IoStream<S> {
+  IoStream::from_op(stream)
 }
 
 doc_op! {

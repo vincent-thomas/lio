@@ -14,9 +14,7 @@ use lio::api::{self, OpenFlags};
 use lio::backend::ds::{DSBackend, DSConfig};
 use lio::backend::op::Op;
 use lio::backend::testing::{Checked, POISON, ScriptedBackend};
-use lio::model::{
-  self, Cx, Join, ModelExt, Next, OpModel, OpStream, Step, StreamExt, Task,
-};
+use lio::model::{self, Cx, Join, Next, OpModel, OpStream, Step, Task};
 use lio::{BufResult, Lio};
 
 fn scripted(cap: usize) -> (ScriptedBackend, Lio) {
@@ -683,9 +681,9 @@ fn io_runs_a_model_of_your_own_like_one_of_lio_s() {
   finish_only(&backend, &lio, 0);
   assert_eq!(done.borrow_mut().take().unwrap().unwrap(), 2);
 
-  // As a future, with the driver named: every model has `with_lio`.
+  // As a future.
   let mut future = Box::pin(std::future::IntoFuture::into_future(
-    TwoNops::new().with_lio(&lio),
+    api::run(TwoNops::new()).with_lio(&lio),
   ));
   let mut cx = Context::from_waker(Waker::noop());
   assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -739,11 +737,12 @@ fn a_model_takes_one_slot_however_many_steps_it_has() {
 }
 
 #[test]
-fn a_started_stream_gives_its_items_one_at_a_time() {
+fn run_stream_gives_a_stream_s_items_one_at_a_time() {
   let (backend, lio) = scripted(4);
   let from = Resource::stdin();
   let read = api::read(&from, Vec::<u8>::with_capacity(4));
-  let mut stream = Chunks { from, read, ended: false }.with_lio(&lio).start();
+  let mut stream =
+    api::run_stream(Chunks { from, read, ended: false }).with_lio(&lio).start();
   let mut cx = Context::from_waker(Waker::noop());
 
   let mut lens = Vec::new();

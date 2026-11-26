@@ -25,7 +25,7 @@ use std::time::Duration;
 use lio::api::ops::{Read, Write};
 use lio::api::resource::{IntoResource, Resource};
 use lio::api::{self, FileMode, OpenFlags, ShutdownHow};
-use lio::model::{self, Cx, Join, Next, OpModel, OpStream, Step, StreamExt};
+use lio::model::{self, Cx, Join, Next, OpModel, OpStream, Step};
 use lio::net::{TcpListener, TcpStream};
 use lio::{Lio, fs};
 
@@ -317,9 +317,8 @@ fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
     // The operations in `lio::api` take any resource: here, the files'.
     let (source, copy) = (source.into_resource(), copy.into_resource());
 
-    // A model of your own has `with_lio`, `when_done`, `send` and
-    // `send_with` like lio's, from `ModelExt`. `api::run` awaits one on
-    // the driver installed for the thread.
+    // A model of your own is run through `api::run`, which gives the same
+    // ways to get its result as lio's operations have.
     let written =
       api::run(WriteAll::new(&source, b"0123456789".to_vec())).await?;
     assert_eq!(written, 10);
@@ -331,7 +330,7 @@ fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
 
     // Work that produces several items is an `OpStream`. Starting it
     // gives the handle its items are taken from.
-    let mut chunks = Chunks::new(&copy).start();
+    let mut chunks = api::run_stream(Chunks::new(&copy)).start();
     let mut text = Vec::new();
     while let Some(chunk) = chunks.next().await {
       text.extend(chunk?);
