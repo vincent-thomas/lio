@@ -1634,3 +1634,50 @@ specifiers = ["nightly"]
 [tools.rust.options]
 components = "miri,rust-src"
 profile = "minimal"
+
+[[tools.wasmtime]]
+version = "51.0.0"
+backend = "aqua:bytecodealliance/wasmtime"
+specifiers = ["latest"]
+
+[tools.wasmtime."platforms.linux-arm64"]
+checksum = "sha256:a263f34aefad1b24ba4d9ca635ddfea415f4acfe3f3f1bb6d4525c34fc6a7397"
+url = "https://github.com/bytecodealliance/wasmtime/releases/download/v51.0.0/wasmtime-v51.0.0-aarch64-linux.tar.xz"
+url_api = "https://api.github.com/repos/bytecodealliance/wasmtime/releases/assets/772509637"
+provenance = "github-attestations"
+
+[tools.wasmtime."platforms.linux-arm64-musl"]
+checksum = "sha256:a263f34aefad1b24ba4d9ca635ddfea415f4acfe3f3f1bb6d4525c34fc6a7397"
+url = "https://github.com/bytecodealliance/wasmtime/releases/download/v51.0.0/wasmtime-v51.0.0-aarch64-linux.tar.xz"
+url_api = "https://api.github.com/repos/bytecodealliance/wasmtime/releases/assets/772509637"
+provenance = "github-attestations"
+
+[tools.wasmtime."platforms.linux-x64"]
+checksum = "sha256:a18020674fac4107f329bc9ed720ea9c88e4b30a61e8a527787bcce051123d32"
+url = "https://github.com/bytecodealliance/wasmtime/releases/download/v51.0.0/wasmtime-v51.0.0-x86_64-linux.tar.xz"
+url_api = "https://api.github.com/repos/bytecodealliance/wasmtime/releases/assets/772509947"
+provenance = "github-attestations"
+
+[tools.wasmtime."platforms.linux-x64-musl"]
+checksum = "sha256:a18020674fac4107f329bc9ed720ea9c88e4b30a61e8a527787bcce051123d32"
+url = "https://github.com/bytecodealliance/wasmtime/releases/download/v51.0.0/wasmtime-v51.0.0-x86_64-linux.tar.xz"
+url_api = "https://api.github.com/repos/bytecodealliance/wasmtime/releases/assets/772509947"
+provenance = "github-attestations"
+
+[tools.wasmtime."platforms.macos-arm64"]
+checksum = "sha256:61dd882b44bcf854b301518781f407b9f6db4c6bd157a55f8f44b1f1357f93dc"
+url = "https://github.com/bytecodealliance/wasmtime/releases/download/v51.0.0/wasmtime-v51.0.0-aarch64-macos.tar.xz"
+url_api = "https://api.github.com/repos/bytecodealliance/wasmtime/releases/assets/772509684"
+provenance = "github-attestations"
+
+[tools.wasmtime."platforms.macos-x64"]
+checksum = "sha256:51767ef35ea3c2653205c09892f174b75e507cf8ffccfcba00ed557832f0e72d"
+url = "https://github.com/bytecodealliance/wasmtime/releases/download/v51.0.0/wasmtime-v51.0.0-x86_64-macos.tar.xz"
+url_api = "https://api.github.com/repos/bytecodealliance/wasmtime/releases/assets/772509983"
+provenance = "github-attestations"
+
+[tools.wasmtime."platforms.windows-x64"]
+checksum = "sha256:d2f5853a1cded9b1256b45cd57686b6855e69049ef07fd4ad78feb78dfa3aada"
+url = "https://github.com/bytecodealliance/wasmtime/releases/download/v51.0.0/wasmtime-v51.0.0-x86_64-windows.zip"
+url_api = "https://api.github.com/repos/bytecodealliance/wasmtime/releases/assets/772510098"
+provenance = "github-attestations"

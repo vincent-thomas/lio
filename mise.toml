@@ -14,6 +14,7 @@ jq = "1.7.1"
 # C++ compiler for the FFI tests. conda clang 18 has no clang++.
 # This g++ ships libstdc++ and links it. macOS uses the image clang++.
 "conda:gxx" = { version = "16.2.0", os = ["linux"] }
+wasmtime = "latest"
 
 # The conda package ships ar as `<target>-ar` only. build.rs calls `ar`.
 [tools.clang]
