@@ -52,6 +52,10 @@ pastey = { version = "0.1" }
 proptest = { version = "1.4", default-features = false, features = ["std"] }
 lio-test = { path = "../lio-test" }
 
+[[example]]
+name = "tour"
+required-features = ["high"]
+
 [[bench]]
 name = "bookkeeping"
 harness = false
