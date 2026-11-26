@@ -25,7 +25,7 @@ use std::time::Duration;
 use lio::api::ops::{Read, Write};
 use lio::api::resource::{IntoResource, Resource};
 use lio::api::{self, FileMode, OpenFlags, ShutdownHow};
-use lio::model::{self, Cx, Join, Next, OpModel, OpStream, Step};
+use lio::model::{self, Cx, Join, Next, OpModel, OpStream, Step, StreamExt};
 use lio::net::{TcpListener, TcpStream};
 use lio::{Lio, fs};
 
@@ -239,10 +239,6 @@ impl WriteAll {
   }
 }
 
-// The ways to run it, as lio's own operations have them: `.await`,
-// `when_done`, `send`, `send_with` and `with_lio`.
-lio::runnable!(WriteAll);
-
 impl OpModel for WriteAll {
   type Item = io::Result<u64>;
 
@@ -307,9 +303,6 @@ impl OpStream for Chunks {
   }
 }
 
-// The ways to run it, as lio's own streams have them.
-lio::streamable!(Chunks);
-
 fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
   let open = |name: &str| {
     fs::OpenOptions::new()
@@ -324,8 +317,11 @@ fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
     // The operations in `lio::api` take any resource: here, the files'.
     let (source, copy) = (source.into_resource(), copy.into_resource());
 
-    // A model of your own runs like one of lio's.
-    let written = WriteAll::new(&source, b"0123456789".to_vec()).await?;
+    // A model of your own has `with_lio`, `when_done`, `send` and
+    // `send_with` like lio's, from `ModelExt`. `api::run` awaits one on
+    // the driver installed for the thread.
+    let written =
+      api::run(WriteAll::new(&source, b"0123456789".to_vec())).await?;
     assert_eq!(written, 10);
 
     // Models nest: lio's own `copy` is one, and so is a `Join` of two.

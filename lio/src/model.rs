@@ -18,11 +18,10 @@
 //! is to poll one of lio's leaves, and a leaf only produces the result of
 //! the operation it started.
 //!
-//! [`runnable!`](crate::runnable) gives a model of yours the ways lio's own
-//! are run (`.await`, `when_done`, `send`, `send_with`, `with_lio`), and
-//! [`streamable!`](crate::streamable) does the same for a stream. [`spawn`]
-//! and [`spawn_stream`] here take the driver and a callback, and give you a
-//! handle to cancel by.
+//! A model of yours is run the way lio's own are: [`ModelExt`] gives every
+//! model `when_done`, `send`, `send_with` and `with_lio`, and [`StreamExt`]
+//! does the same for a stream. [`spawn`] and [`spawn_stream`] here take the
+//! driver and a callback, and give you a handle to cancel by.
 //!
 //! ```
 //! use lio::Lio;
@@ -251,6 +250,140 @@ impl<S: OpStream> Drive for Many<S> {
     }
   }
 }
+
+/// The ways to run a model, for every [`OpModel`].
+///
+/// Implementing `OpModel` is all a model needs: these come with it, and
+/// cannot be implemented or overridden for a type.
+///
+/// ```
+/// use lio::api;
+/// use lio::backend::testing::ScriptedBackend;
+/// use lio::model::{Cx, ModelExt, OpModel, Step};
+/// use lio::ready;
+///
+/// struct Twice(api::ops::Nop, bool);
+///
+/// impl OpModel for Twice {
+///   type Item = std::io::Result<()>;
+///
+///   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+///     loop {
+///       if let Err(err) = ready!(self.0.poll(cx)) {
+///         return Step::Done(Err(err));
+///       }
+///       if std::mem::replace(&mut self.1, true) {
+///         return Step::Done(Ok(()));
+///       }
+///       self.0 = api::nop();
+///     }
+///   }
+/// }
+///
+/// let lio = lio::Lio::new_with_backend(ScriptedBackend::auto(0), 4).unwrap();
+/// Twice(api::nop(), false).with_lio(&lio).when_done(|result| result.unwrap());
+/// while lio.try_run().unwrap() > 0 {}
+/// ```
+///
+/// A type cannot supply its own version of them:
+///
+/// ```compile_fail
+/// use lio::model::{Cx, ModelExt, OpModel, Step};
+///
+/// struct Mine;
+///
+/// impl OpModel for Mine {
+///   type Item = ();
+///   fn poll(&mut self, _: &mut Cx<'_>) -> Step<()> {
+///     Step::Done(())
+///   }
+/// }
+///
+/// impl ModelExt for Mine {}
+/// ```
+///
+/// To `.await` a model on the driver installed for the thread, use
+/// [`api::run`](crate::api::run): `api::run(model).await`. With a driver
+/// named, `model.with_lio(&lio).await` works as it is.
+pub trait ModelExt: OpModel + Sized + 'static {
+  /// Runs this on `lio` instead of the driver installed for the thread.
+  #[inline]
+  fn with_lio(self, lio: &Lio) -> crate::api::Io<Self> {
+    crate::api::Io::from_op(self).with_lio(lio)
+  }
+
+  /// Runs this and calls `f` with the result. See
+  /// [`Io::when_done`](crate::api::Io::when_done).
+  #[inline]
+  fn when_done<F>(self, f: F)
+  where
+    F: Fn(Self::Item) + 'static,
+  {
+    crate::api::Io::from_op(self).when_done(f)
+  }
+
+  /// Runs this and sends the result through a channel. See
+  /// [`Io::send`](crate::api::Io::send).
+  #[inline]
+  fn send(self) -> crate::api::Receiver<Self::Item>
+  where
+    Self::Item: Send + 'static,
+  {
+    crate::api::Io::from_op(self).send()
+  }
+
+  /// Runs this and sends the result through `sender`. See
+  /// [`Io::send_with`](crate::api::Io::send_with).
+  #[inline]
+  fn send_with(self, sender: std::sync::mpsc::Sender<Self::Item>)
+  where
+    Self::Item: Send + 'static,
+  {
+    crate::api::Io::from_op(self).send_with(sender)
+  }
+}
+
+impl<M: OpModel + 'static> ModelExt for M {}
+
+/// The ways to run a stream, for every [`OpStream`].
+///
+/// As [`ModelExt`]: they come with implementing `OpStream`.
+pub trait StreamExt: OpStream + Sized + 'static {
+  /// Runs this on `lio` instead of the driver installed for the thread.
+  #[inline]
+  fn with_lio(self, lio: &Lio) -> crate::api::IoStream<Self> {
+    crate::api::IoStream::from_op(self).with_lio(lio)
+  }
+
+  /// Starts this, and gives the handle its items are taken from. See
+  /// [`IoStream::start`](crate::api::IoStream::start).
+  #[inline]
+  fn start(self) -> crate::api::Items<Self> {
+    crate::api::IoStream::from_op(self).start()
+  }
+
+  /// Runs this and sends every item through a channel. See
+  /// [`IoStream::send`](crate::api::IoStream::send).
+  #[inline]
+  fn send(self) -> crate::api::StreamReceiver<Self::Item>
+  where
+    Self::Item: Send,
+  {
+    crate::api::IoStream::from_op(self).send()
+  }
+
+  /// Runs this and sends every item through `sender`. See
+  /// [`IoStream::send_with`](crate::api::IoStream::send_with).
+  #[inline]
+  fn send_with(self, sender: std::sync::mpsc::Sender<Self::Item>)
+  where
+    Self::Item: Send,
+  {
+    crate::api::IoStream::from_op(self).send_with(sender)
+  }
+}
+
+impl<S: OpStream + 'static> StreamExt for S {}
 
 /// The driver's side of one [`OpModel::poll`] call.
 ///

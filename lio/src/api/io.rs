@@ -451,8 +451,7 @@ struct LocalFutureSlot<T> {
 ///
 /// lio's streams can be run without one: `api::interval(d).start()` uses
 /// the driver installed for the thread. An `IoStream` is what `with_lio` on
-/// a stream returns, and what [`api::run_stream`](crate::api::run_stream)
-/// makes of a stream of your own.
+/// a stream returns.
 ///
 /// Every method consumes it, so a stream cannot be started twice.
 #[must_use = "a stream does nothing until it is started"]
