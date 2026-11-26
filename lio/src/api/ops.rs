@@ -20,7 +20,7 @@
 //! private to lio, so the result an operation produces is always the result
 //! of what it submitted.
 
-use core::task::{Poll, ready};
+use crate::ready;
 use std::ffi::{CString, OsString};
 use std::io;
 use std::net::SocketAddr;
@@ -38,7 +38,7 @@ use crate::backend::op::{
   StatTarget, UnlinkKind, WriteFlags, is_valid_file_offset,
   socket_addr_from_buf,
 };
-use crate::model::{Cx, OpModel, OpStream, Ticket};
+use crate::model::{Cx, Next, OpModel, OpStream, Ticket};
 use crate::registration::Regions;
 use crate::{BufResult, Initialized, IoBufMutVec, IoBufVec, IoSlicesMut};
 
@@ -233,11 +233,11 @@ impl Interval {
 impl OpStream for Interval {
   type Item = io::Result<()>;
 
-  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Poll<Option<Self::Item>> {
+  fn poll_next(&mut self, cx: &mut Cx<'_>) -> Next<Self::Item> {
     let tick = ready!(self.sleep.poll(cx));
     // The next period starts when this item has been delivered.
     self.sleep = Sleep::new(self.period);
-    Poll::Ready(Some(tick))
+    Next::Item(tick)
   }
 }
 
