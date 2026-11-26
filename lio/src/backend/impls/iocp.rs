@@ -108,7 +108,8 @@ struct Overlapped {
   kind: AsyncKind,
   bufs: Vec<ws::WSABUF>,
   flags: u32,
-  keep: crate::backend::Keep,
+  /// Given up when the kernel reports the operation. `None` once taken.
+  keep: Option<crate::backend::Ticket>,
   addr: Storage,
   addr_len: i32,
   /// For a receive: the flags it was started with, to start it again.
@@ -142,7 +143,7 @@ impl Overlapped {
     id: u64,
     resource: &Resource,
     kind: AsyncKind,
-    keep: crate::backend::Keep,
+    keep: &mut Option<crate::backend::Ticket>,
   ) -> Box<Self> {
     Box::new(Self {
       // SAFETY: `OVERLAPPED` is plain old data; all-zero is its initial state.
@@ -150,7 +151,7 @@ impl Overlapped {
       id,
       socket: socket_of(resource),
       _resource: resource.clone(),
-      keep,
+      keep: keep.take(),
       kind,
       bufs: Vec::new(),
       flags: 0,
@@ -188,9 +189,8 @@ impl Drop for Overlapped {
 
 /// An operation with no overlapped form, run on a pool worker.
 struct BlockingJob {
-  id: u64,
   op: Op,
-  keep: crate::backend::Keep,
+  keep: crate::backend::Ticket,
 }
 
 // SAFETY: the op's raw pointers refer to op-model storage that stays alive
@@ -200,8 +200,9 @@ unsafe impl Send for BlockingJob {}
 
 /// A worker's result, posted back through the completion port.
 struct BlockingDone {
-  id: u64,
   result: isize,
+  /// The ticket of the job that produced `result`.
+  keep: crate::backend::Ticket,
 }
 
 /// Threads that run blocking operations (files, pipes, path operations,
@@ -264,16 +265,16 @@ fn worker_loop(
       Ok(rx) => rx.recv(),
       Err(_) => return,
     };
-    let Ok(BlockingJob { id, op, keep }) = job else { return };
+    let Ok(BlockingJob { op, keep }) = job else { return };
     if shutting_down.load(Ordering::SeqCst) {
       // The backend is going away; nobody will reap this.
+      // SAFETY: the job was not run, so nothing has used its addresses.
+      unsafe { keep.release() };
       return;
     }
     let result = run_blocking(op);
-    // Drop the lease before the completion is posted. The driver may reap
-    // it as soon as the post returns.
-    drop(keep);
-    let done = Box::into_raw(Box::new(BlockingDone { id, result }));
+    // The ticket travels with the result: whoever reaps it reports it.
+    let done = Box::into_raw(Box::new(BlockingDone { result, keep }));
     // SAFETY: the pointer is only passed through the port and turned back
     // into a `Box` by `reap`.
     let posted =
@@ -288,7 +289,7 @@ fn worker_loop(
 struct Queued {
   id: u64,
   op: Op,
-  keep: crate::backend::Keep,
+  keep: crate::backend::Ticket,
 }
 
 /// Windows I/O completion port backend.
@@ -411,11 +412,20 @@ impl Iocp {
 
   /// Hands `state` to the kernel bookkeeping; `rc` is the result of the call
   /// that started the overlapped operation.
-  fn track(&mut self, state: Box<Overlapped>, started: bool) -> Option<isize> {
+  ///
+  /// An operation the kernel refused gives its ticket back through `keep`,
+  /// for the caller to report it with.
+  fn track(
+    &mut self,
+    mut state: Box<Overlapped>,
+    started: bool,
+    keep: &mut Option<crate::backend::Ticket>,
+  ) -> Option<isize> {
     if !started {
       // SAFETY: reads the calling thread's last Winsock error.
       let code = unsafe { ws::WSAGetLastError() };
       if code != ws::WSA_IO_PENDING {
+        *keep = state.keep.take();
         return Some(-(code as isize));
       }
     }
@@ -427,7 +437,7 @@ impl Iocp {
     &mut self,
     id: u64,
     op: Op,
-    keep: crate::backend::Keep,
+    keep: &mut Option<crate::backend::Ticket>,
   ) -> Option<isize> {
     match op {
       Op::Nop => Some(0),
@@ -563,7 +573,7 @@ impl Iocp {
     &mut self,
     id: u64,
     op: Op,
-    keep: crate::backend::Keep,
+    keep: &mut Option<crate::backend::Ticket>,
   ) -> Option<isize> {
     if self.pool.is_none() {
       match BlockingPool::new(self.port) {
@@ -571,12 +581,16 @@ impl Iocp {
         Err(err) => return Some(io_error(err)),
       }
     }
-    let sent = self
-      .pool
-      .as_ref()
-      .and_then(|pool| pool.jobs.as_ref())
-      .is_some_and(|jobs| jobs.send(BlockingJob { id, op, keep }).is_ok());
-    if !sent {
+    let Some(jobs) = self.pool.as_ref().and_then(|pool| pool.jobs.as_ref())
+    else {
+      return Some(neg(ERROR_NOT_SUPPORTED));
+    };
+    let Some(ticket) = keep.take() else {
+      unreachable!("iocp: operation {id} reached the pool without its ticket");
+    };
+    if let Err(refused) = jobs.send(BlockingJob { op, keep: ticket }) {
+      // Nobody will run it: the caller reports it.
+      *keep = Some(refused.0.keep);
       return Some(neg(ERROR_NOT_SUPPORTED));
     }
     self.blocking_in_flight += 1;
@@ -590,7 +604,7 @@ impl Iocp {
     bufs: impl Iterator<Item = (*mut u8, usize)>,
     flags: u32,
     from: Option<NonNull<SocketAddrBuf>>,
-    keep: crate::backend::Keep,
+    keep: &mut Option<crate::backend::Ticket>,
   ) -> Option<isize> {
     let socket = socket_of(fd);
     if let Err(code) = self.associate(socket as HANDLE) {
@@ -604,7 +618,7 @@ impl Iocp {
     state.bufs = wsa_bufs(bufs);
     state.recv_flags = Some(flags);
     let rc = Self::issue_recv(&mut state);
-    self.track(state, rc == 0)
+    self.track(state, rc == 0, keep)
   }
 
   /// Starts the receive `state` describes, for the first time or again.
@@ -651,7 +665,7 @@ impl Iocp {
     bufs: impl Iterator<Item = (*mut u8, usize)>,
     flags: u32,
     to: Option<std::net::SocketAddr>,
-    keep: crate::backend::Keep,
+    keep: &mut Option<crate::backend::Ticket>,
   ) -> Option<isize> {
     let socket = socket_of(fd);
     if let Err(code) = self.associate(socket as HANDLE) {
@@ -692,7 +706,7 @@ impl Iocp {
         )
       }
     };
-    self.track(state, rc == 0)
+    self.track(state, rc == 0, keep)
   }
 
   fn start_accept(
@@ -700,7 +714,7 @@ impl Iocp {
     id: u64,
     fd: &Resource,
     out: NonNull<SocketAddrBuf>,
-    keep: crate::backend::Keep,
+    keep: &mut Option<crate::backend::Ticket>,
   ) -> Option<isize> {
     let listener = socket_of(fd);
     if let Err(code) = probe_socket(listener) {
@@ -731,6 +745,8 @@ impl Iocp {
       keep,
     );
     if let Err(code) = self.associate(listener as HANDLE) {
+      // Not started: the caller reports it.
+      *keep = state.keep.take();
       return Some(code);
     }
     let state_ptr: *mut Overlapped = &mut *state;
@@ -753,7 +769,7 @@ impl Iocp {
         &mut state.ov,
       )
     };
-    self.track(state, ok != FALSE)
+    self.track(state, ok != FALSE, keep)
   }
 
   fn start_connect(
@@ -761,7 +777,7 @@ impl Iocp {
     id: u64,
     fd: &Resource,
     addr: &SocketAddrBuf,
-    keep: crate::backend::Keep,
+    keep: &mut Option<crate::backend::Ticket>,
   ) -> Option<isize> {
     let socket = socket_of(fd);
     if let Err(code) = probe_socket(socket) {
@@ -809,7 +825,7 @@ impl Iocp {
         &mut state.ov,
       )
     };
-    self.track(state, ok != FALSE)
+    self.track(state, ok != FALSE, keep)
   }
 
   fn connect_ex(&mut self, socket: ws::SOCKET) -> Result<ConnectExFn, isize> {
@@ -957,7 +973,10 @@ impl Iocp {
         let done =
           unsafe { Box::from_raw(entry.lpOverlapped.cast::<BlockingDone>()) };
         self.blocking_in_flight -= 1;
-        completed.push(OpCompleted::new(done.id, done.result));
+        let BlockingDone { result, keep } = *done;
+        // SAFETY: the worker finished the job before it posted this, so
+        // nothing uses the operation's addresses. The result is the job's.
+        completed.push(unsafe { keep.complete(result) });
         continue;
       }
       if entry.lpCompletionKey == NOTIFY_KEY || entry.lpOverlapped.is_null() {
@@ -974,20 +993,31 @@ impl Iocp {
       if state.aborted_with_another() {
         let rc = Self::issue_recv(&mut state);
         // Back in flight, unless it could not be started again.
-        if let Some(result) = self.track(state, rc == 0) {
-          completed.push(OpCompleted::new(id, result));
+        let mut refused = None;
+        if let Some(result) = self.track(state, rc == 0, &mut refused) {
+          let Some(ticket) = refused else {
+            unreachable!("iocp: operation {id} was refused with no ticket");
+          };
+          // SAFETY: the kernel refused to start the operation again, so it
+          // has none of its addresses. An error claims nothing.
+          completed.push(unsafe { ticket.complete(result) });
         }
         continue;
       }
       let asked_to_stop = state.cancelled;
+      let Some(ticket) = state.keep.take() else {
+        unreachable!("iocp: operation {id} completed with no ticket");
+      };
       let result = self.finish(state);
-      completed.push(
+      // SAFETY: this is the operation's own completion packet, so the
+      // kernel is done with its memory, and the result is the kernel's.
+      completed.push(unsafe {
         if asked_to_stop && result == neg(ERROR_OPERATION_ABORTED) {
-          OpCompleted::cancelled(id, result)
+          ticket.cancelled(result)
         } else {
-          OpCompleted::new(id, result)
-        },
-      );
+          ticket.complete(result)
+        }
+      });
     }
     self.entries = Vec::with_capacity(MAX_ENTRIES);
     Ok(true)
@@ -1049,10 +1079,7 @@ impl Iocp {
   }
 }
 
-// SAFETY: each started op and blocking job stores its `Keep` until its
-// packet or worker result. `drain` stops workers and reaps cancelled packets
-// before it returns `true`.
-unsafe impl IoBackend for Iocp {
+impl IoBackend for Iocp {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     ensure_wsa()?;
     // SAFETY: creating a fresh completion port.
@@ -1079,14 +1106,9 @@ unsafe impl IoBackend for Iocp {
     Ok(())
   }
 
-  fn push(
-    &mut self,
-    id: u64,
-    op: crate::backend::InFlight<'_>,
-    _step_bump: &mut Bump,
-  ) {
-    // The model stays pinned while `keep` is stored with the operation.
+  fn push(&mut self, op: crate::backend::InFlight<'_>, _step_bump: &mut Bump) {
     let (op, keep) = op.into_parts();
+    let id = keep.id();
     assert!(
       self.backlog.len() + self.in_flight.len() + self.blocking_in_flight
         < self.capacity,
@@ -1098,8 +1120,15 @@ unsafe impl IoBackend for Iocp {
 
   fn flush(&mut self) -> io::Result<()> {
     for Queued { id, op, keep } in mem::take(&mut self.backlog) {
-      if let Some(result) = self.submit(id, op, keep) {
-        self.ready.push(OpCompleted::new(id, result));
+      let mut keep = Some(keep);
+      if let Some(result) = self.submit(id, op, &mut keep) {
+        let Some(ticket) = keep else {
+          unreachable!("iocp: operation {id} finished at once with no ticket");
+        };
+        // SAFETY: the operation was performed on this thread or refused,
+        // so neither the kernel nor a worker has its addresses. The result
+        // is that call's own.
+        self.ready.push(unsafe { ticket.complete(result) });
       }
     }
     Ok(())
@@ -1108,8 +1137,12 @@ unsafe impl IoBackend for Iocp {
   fn cancel(&mut self, id: u64) {
     if let Some(index) = self.backlog.iter().position(|queued| queued.id == id)
     {
-      self.backlog.swap_remove(index);
-      self.ready.push(OpCompleted::cancelled(id, neg(ERROR_OPERATION_ABORTED)));
+      let queued = self.backlog.swap_remove(index);
+      // SAFETY: the operation was never started, so nothing has its
+      // addresses.
+      self
+        .ready
+        .push(unsafe { queued.keep.cancelled(neg(ERROR_OPERATION_ABORTED)) });
       return;
     }
     // SAFETY: every pointer in `in_flight` is a live boxed `Overlapped`.
@@ -1132,6 +1165,14 @@ unsafe impl IoBackend for Iocp {
   }
 
   fn drain(&mut self) -> bool {
+    for queued in self.backlog.drain(..) {
+      // SAFETY: the operation was never started, so nothing has its
+      // addresses.
+      unsafe { queued.keep.release() };
+    }
+    // What the kernel reports while it drains is given up as its completion
+    // is dropped. The rest keep their tickets, which leaks their memory
+    // instead of freeing it under the kernel.
     self.drain_in_flight()
   }
 

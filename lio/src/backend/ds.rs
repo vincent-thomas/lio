@@ -29,7 +29,7 @@
 //! not syscall fidelity.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::env;
 use std::fmt;
 use std::io;
@@ -49,7 +49,72 @@ use crate::backend::op::{
   ShutdownHow, SockDomain, SockProto, SockType, SocketAddrBuf,
   SocketAddrFamily, UnlinkKind,
 };
-use crate::backend::{IoBackend, OpCompleted};
+use crate::backend::{IoBackend, OpCompleted, Ticket};
+
+/// Stands where an operation's lease used to travel with it. The ticket
+/// that holds the lease now waits in its backend's `tickets` table until
+/// the operation's result comes out of `wait`.
+#[derive(Clone, Copy, Debug)]
+struct Held;
+
+/// A result the simulation has decided on, by operation id. It becomes an
+/// [`OpCompleted`] where it leaves the backend, which is where the
+/// operation's ticket is.
+#[derive(Clone, Copy, Debug)]
+struct Done {
+  id: u64,
+  result: isize,
+}
+
+impl Done {
+  fn new(id: u64, result: isize) -> Self {
+    Self { id, result }
+  }
+
+  #[cfg(test)]
+  fn registration_id(&self) -> u64 {
+    self.id
+  }
+
+  #[cfg(test)]
+  fn result(&self) -> isize {
+    self.result
+  }
+}
+
+/// Turns the results the simulation decided on into completions, each with
+/// the ticket of its operation.
+fn report(
+  tickets: &mut HashMap<u64, Ticket>,
+  ready: &mut Vec<Done>,
+  completed: &mut Vec<OpCompleted>,
+) {
+  for done in ready.drain(..) {
+    // A result for an operation the driver did not submit has no ticket.
+    let Some(ticket) = tickets.remove(&done.id) else {
+      continue;
+    };
+    // SAFETY: the simulator performs every operation itself, inside `flush`
+    // and `wait`, and is done with this one: nothing else has its
+    // addresses. The result is what the simulated operation did.
+    completed.push(unsafe {
+      if done.result == -(errno::ECANCELED as isize) {
+        ticket.cancelled(done.result)
+      } else {
+        ticket.complete(done.result)
+      }
+    });
+  }
+}
+
+/// Gives up every ticket: the simulator has let go of the operations.
+fn release_all(tickets: &mut HashMap<u64, Ticket>) {
+  for (_, ticket) in tickets.drain() {
+    // SAFETY: the simulator only dereferences operations it still stores,
+    // from `flush` and `wait`, and the caller has dropped them.
+    unsafe { ticket.release() };
+  }
+}
 use crate::{Lio, install_global};
 
 /// Simulation key for `Resource::cwd()` on Windows, mirroring `AT_FDCWD`.
@@ -438,15 +503,17 @@ struct DSWorld {
   bound_listeners: BTreeMap<Vec<u8>, i32>,
   occupied_addr_keys: Vec<Vec<u8>>,
   events: Vec<ScheduledEvent>,
-  pending: Vec<(u64, Op, crate::backend::Keep)>,
+  pending: Vec<(u64, Op, Held)>,
 }
 
 #[derive(Debug)]
 pub struct DSBackend {
   cap: usize,
   initialized: bool,
-  queued: Vec<(u64, Op, crate::backend::Keep)>,
-  ready: Vec<OpCompleted>,
+  queued: Vec<(u64, Op, Held)>,
+  /// The ticket of every operation `push` took and `wait` has not reported.
+  tickets: HashMap<u64, Ticket>,
+  ready: Vec<Done>,
   schedule_rng: Prng,
   fault_rng: Prng,
   payload_rng: Prng,
@@ -704,9 +771,9 @@ struct DSTNodeState {
   next_fd: i32,
   next_network_seq: u64,
   sockets: BTreeMap<i32, DSTSocketHandle>,
-  outgoing: VecDeque<(u64, Op, crate::backend::Keep)>,
-  pending: Vec<(u64, Op, crate::backend::Keep)>,
-  ready: Vec<OpCompleted>,
+  outgoing: VecDeque<(u64, Op, Held)>,
+  pending: Vec<(u64, Op, Held)>,
+  ready: Vec<Done>,
 }
 
 impl Default for DSTNodeState {
@@ -1046,7 +1113,10 @@ struct DSTBackend {
   node_id: DSTNodeId,
   node: Rc<RefCell<DSTNodeState>>,
   inner: Rc<RefCell<DSTInner>>,
-  queued: Vec<(u64, Op, crate::backend::Keep)>,
+  queued: Vec<(u64, Op, Held)>,
+  /// The ticket of every network operation `push` took and `wait` has not
+  /// reported. Local ones travel on to the local backend.
+  tickets: HashMap<u64, Ticket>,
 }
 
 struct DSTNodeRunner {
@@ -1122,6 +1192,7 @@ impl DSBackend {
       cap: 0,
       initialized: false,
       queued: Vec::new(),
+      tickets: HashMap::new(),
       ready: Vec::new(),
       schedule_rng: Prng::new(split_seed(config.seed, b"schedule")),
       fault_rng: Prng::new(split_seed(config.seed, b"faults")),
@@ -1367,7 +1438,7 @@ impl DSBackend {
       self.world.tick, id, result, ready_at_tick
     ));
     if ready_at_tick == self.world.tick {
-      self.ready.push(OpCompleted::new(id, result));
+      self.ready.push(Done::new(id, result));
     } else {
       self.world.events.push(ScheduledEvent::Complete {
         ready_at_tick,
@@ -1398,7 +1469,7 @@ impl DSBackend {
               "tick={} deliver-complete id={} result={}",
               self.world.tick, id, result
             ));
-            self.ready.push(OpCompleted::new(id, result));
+            self.ready.push(Done::new(id, result));
           }
           ScheduledEvent::ConnectEstablished {
             id,
@@ -1415,7 +1486,7 @@ impl DSBackend {
             {
               listener.pending_accept.push_back(accepted_fd);
             }
-            self.ready.push(OpCompleted::new(id, 0));
+            self.ready.push(Done::new(id, 0));
           }
           ScheduledEvent::StreamDelivered { to_fd, bytes, .. } => {
             self.record_trace(format!(
@@ -1941,7 +2012,7 @@ impl DSBackend {
             "tick={} deliver-pending id={} result={}",
             self.world.tick, id, result
           ));
-          self.ready.push(OpCompleted::new(id, result));
+          self.ready.push(Done::new(id, result));
         }
         PendingAction::KeepPending(op) => {
           self.world.pending.insert(idx, (id, op, keep));
@@ -2688,10 +2759,7 @@ impl DSBackend {
   }
 }
 
-// SAFETY: each queued or pending op is stored with its `Keep`. The
-// simulator reads addresses only inside `flush` and `wait`, so `drain` may
-// return `true` after it drops them.
-unsafe impl IoBackend for DSBackend {
+impl IoBackend for DSBackend {
   fn resource_close(&self) -> crate::api::resource::ResourceClose {
     crate::api::resource::ResourceClose::noop()
   }
@@ -2706,16 +2774,13 @@ unsafe impl IoBackend for DSBackend {
     Ok(())
   }
 
-  fn push(
-    &mut self,
-    id: u64,
-    op: crate::backend::InFlight<'_>,
-    _step_bump: &mut Bump,
-  ) {
-    let (op, keep) = op.into_parts();
+  fn push(&mut self, op: crate::backend::InFlight<'_>, _step_bump: &mut Bump) {
+    let (op, ticket) = op.into_parts();
+    let id = ticket.id();
     self.assert_initialized();
     self.assert_capacity();
-    self.queued.push((id, op, keep));
+    self.tickets.insert(id, ticket);
+    self.queued.push((id, op, Held));
   }
 
   fn cancel(&mut self, id: u64) {
@@ -2742,6 +2807,7 @@ unsafe impl IoBackend for DSBackend {
     // `wait`. Dropping them here means a later call cannot see them.
     self.queued.clear();
     self.world.pending.clear();
+    release_all(&mut self.tickets);
     true
   }
 
@@ -2807,13 +2873,7 @@ unsafe impl IoBackend for DSBackend {
       }
     }
 
-    completed.append(&mut self.ready);
-    // A stopped operation is scheduled like any other result.
-    for done in completed.iter_mut() {
-      if done.result() == -(errno::ECANCELED as isize) {
-        *done = OpCompleted::cancelled(done.registration_id(), done.result());
-      }
-    }
+    report(&mut self.tickets, &mut self.ready, completed);
     Ok(())
   }
 }
@@ -2906,10 +2966,9 @@ impl DST {
                   client_socket.state = DSTSocketState::Created;
                   client_socket.peer = None;
                 }
-                client_node.ready.push(OpCompleted::new(
-                  connect_id,
-                  -(errno::EHOSTUNREACH as isize),
-                ));
+                client_node
+                  .ready
+                  .push(Done::new(connect_id, -(errno::EHOSTUNREACH as isize)));
               }
 
               {
@@ -2941,7 +3000,7 @@ impl DST {
                 client_socket.peer_addr =
                   client_socket.peer_addr.or(listener_bound);
               }
-              client_node.ready.push(OpCompleted::new(connect_id, 0));
+              client_node.ready.push(Done::new(connect_id, 0));
             }
 
             {
@@ -2976,6 +3035,7 @@ impl DST {
                 node: self.inner.borrow().node(from.node_id),
                 inner: self.inner.clone(),
                 queued: Vec::new(),
+                tickets: HashMap::new(),
               };
               backend.schedule_stream_link_reset(from, to, errno::ECONNRESET);
               continue;
@@ -3056,7 +3116,7 @@ impl DST {
   fn next_outgoing_network_op(
     &mut self,
     arbitration_round: u64,
-  ) -> Option<(DSTNodeId, u64, Op, crate::backend::Keep)> {
+  ) -> Option<(DSTNodeId, u64, Op, Held)> {
     let tick = self.inner.borrow().tick;
     let (chosen_node, stale_nodes) = {
       let inner = self.inner.borrow();
@@ -3108,7 +3168,7 @@ impl DST {
     node_id: DSTNodeId,
     id: u64,
     op: Op,
-    keep: crate::backend::Keep,
+    keep: Held,
   ) {
     let node = self.inner.borrow().node(node_id);
     let mut backend = DSTBackend {
@@ -3117,6 +3177,7 @@ impl DST {
       node,
       inner: self.inner.clone(),
       queued: Vec::new(),
+      tickets: HashMap::new(),
     };
     backend.finish_network_op(id, op, keep);
     self.mark_runner_ready(node_id);
@@ -3215,6 +3276,7 @@ fn create_dst_backend(dst: &mut DST) -> DSTBackend {
     node,
     inner: dst.inner.clone(),
     queued: Vec::new(),
+    tickets: HashMap::new(),
   }
 }
 
@@ -3229,7 +3291,7 @@ impl DSTBackend {
     self.node.borrow().sockets.contains_key(&raw)
   }
 
-  fn queue_network_op(&mut self, id: u64, op: Op, keep: crate::backend::Keep) {
+  fn queue_network_op(&mut self, id: u64, op: Op, keep: Held) {
     self.queued.push((id, op, keep));
   }
 
@@ -3325,7 +3387,7 @@ impl DSTBackend {
 
   fn drain_node_ready(&mut self, completed: &mut Vec<OpCompleted>) {
     let mut node = self.node.borrow_mut();
-    completed.append(&mut node.ready);
+    report(&mut self.tickets, &mut node.ready, completed);
   }
 
   fn allocate_socket_fd(node: &mut DSTNodeState) -> i32 {
@@ -3520,7 +3582,7 @@ impl DSTBackend {
       };
       match action {
         PendingAction::Complete(result) => {
-          node.ready.push(OpCompleted::new(id, result));
+          node.ready.push(Done::new(id, result));
         }
         PendingAction::KeepPending(op) => {
           node.pending.push((id, op, keep));
@@ -3646,10 +3708,10 @@ impl DSTBackend {
 
   #[cfg(test)]
   fn network_complete_op(&mut self, id: u64, op: Op) {
-    self.finish_network_op(id, op, crate::backend::Keep::new());
+    self.finish_network_op(id, op, Held);
   }
 
-  fn finish_network_op(&mut self, id: u64, op: Op, keep: crate::backend::Keep) {
+  fn finish_network_op(&mut self, id: u64, op: Op, keep: Held) {
     match op {
       Op::Socket { domain, ty, proto } => {
         if !op::is_supported_socket(domain, ty, proto) {
@@ -3657,7 +3719,7 @@ impl DSTBackend {
             .node
             .borrow_mut()
             .ready
-            .push(OpCompleted::new(id, -(errno::EINVAL as isize)));
+            .push(Done::new(id, -(errno::EINVAL as isize)));
           return;
         }
         let fd = {
@@ -3666,14 +3728,14 @@ impl DSTBackend {
           node.sockets.insert(fd, DSTSocketHandle::new(domain, ty, proto));
           fd
         };
-        self.node.borrow_mut().ready.push(OpCompleted::new(id, fd as isize));
+        self.node.borrow_mut().ready.push(Done::new(id, fd as isize));
       }
       Op::Bind { fd, addr } => {
         let raw = DSBackend::resource_key(&fd);
         let key = DSBackend::socket_addr_key(&addr);
         let mut node = self.node.borrow_mut();
         let Some(socket) = node.sockets.get_mut(&raw) else {
-          node.ready.push(OpCompleted::new(id, -(errno::EBADF as isize)));
+          node.ready.push(Done::new(id, -(errno::EBADF as isize)));
           return;
         };
         let mut inner = self.inner.borrow_mut();
@@ -3681,7 +3743,7 @@ impl DSTBackend {
           || inner.listeners.contains_key(&key)
           || inner.occupied_addr_keys.iter().any(|occupied| occupied == &key)
         {
-          node.ready.push(OpCompleted::new(id, -(errno::EADDRINUSE as isize)));
+          node.ready.push(Done::new(id, -(errno::EADDRINUSE as isize)));
           return;
         }
         socket.bound = Some(addr);
@@ -3689,21 +3751,21 @@ impl DSTBackend {
         inner
           .bound
           .insert(key, DSTSocketRef { node_id: self.node_id, fd: raw });
-        node.ready.push(OpCompleted::new(id, 0));
+        node.ready.push(Done::new(id, 0));
       }
       Op::Listen { fd, backlog } => {
         let raw = DSBackend::resource_key(&fd);
         let mut node = self.node.borrow_mut();
         let Some(socket) = node.sockets.get_mut(&raw) else {
-          node.ready.push(OpCompleted::new(id, -(errno::EBADF as isize)));
+          node.ready.push(Done::new(id, -(errno::EBADF as isize)));
           return;
         };
         if socket.ty != SockType::STREAM {
-          node.ready.push(OpCompleted::new(id, -(errno::EOPNOTSUPP as isize)));
+          node.ready.push(Done::new(id, -(errno::EOPNOTSUPP as isize)));
           return;
         }
         let Some(bound) = socket.bound else {
-          node.ready.push(OpCompleted::new(id, -(errno::EINVAL as isize)));
+          node.ready.push(Done::new(id, -(errno::EINVAL as isize)));
           return;
         };
         let key = DSBackend::socket_addr_key(&bound);
@@ -3713,7 +3775,7 @@ impl DSTBackend {
         inner
           .listeners
           .insert(key, DSTSocketRef { node_id: self.node_id, fd: raw });
-        node.ready.push(OpCompleted::new(id, 0));
+        node.ready.push(Done::new(id, 0));
       }
       Op::Connect { fd, addr } => {
         let raw = DSBackend::resource_key(&fd);
@@ -3726,7 +3788,7 @@ impl DSTBackend {
               .node
               .borrow_mut()
               .ready
-              .push(OpCompleted::new(id, -(errno::EBADF as isize)));
+              .push(Done::new(id, -(errno::EBADF as isize)));
             return;
           };
           (socket.domain, socket.ty, socket.proto, socket.bound, socket.state)
@@ -3742,7 +3804,7 @@ impl DSTBackend {
                 .node
                 .borrow_mut()
                 .ready
-                .push(OpCompleted::new(id, -(errno::EISCONN as isize)));
+                .push(Done::new(id, -(errno::EISCONN as isize)));
               return;
             }
             let listener_ref = {
@@ -3754,7 +3816,7 @@ impl DSTBackend {
                 .node
                 .borrow_mut()
                 .ready
-                .push(OpCompleted::new(id, -(errno::ENOENT as isize)));
+                .push(Done::new(id, -(errno::ENOENT as isize)));
               return;
             };
             if !self.link_is_available(listener_ref) {
@@ -3762,7 +3824,7 @@ impl DSTBackend {
                 .node
                 .borrow_mut()
                 .ready
-                .push(OpCompleted::new(id, -(errno::EHOSTUNREACH as isize)));
+                .push(Done::new(id, -(errno::EHOSTUNREACH as isize)));
               return;
             }
             let client_peer_addr = client_bound.unwrap_or_else(|| {
@@ -3770,41 +3832,42 @@ impl DSTBackend {
             });
 
             let listener_node = self.inner.borrow().node(listener_ref.node_id);
-            let server_fd =
-              {
-                let mut listener_node = listener_node.borrow_mut();
-                let Some(listener_socket) =
-                  listener_node.sockets.get_mut(&listener_ref.fd)
-                else {
-                  self.node.borrow_mut().ready.push(OpCompleted::new(
-                    id,
-                    -(errno::ECONNREFUSED as isize),
-                  ));
-                  return;
-                };
-                let backlog_limit = listener_socket.backlog.max(0) as usize;
-                if listener_socket.state != DSTSocketState::Listening
-                  || backlog_limit == 0
-                  || listener_socket.pending_accept.len()
-                    + listener_socket.backlog_reserved
-                    >= backlog_limit
-                {
-                  self.node.borrow_mut().ready.push(OpCompleted::new(
-                    id,
-                    -(errno::ECONNREFUSED as isize),
-                  ));
-                  return;
-                }
-                listener_socket.backlog_reserved += 1;
-                let server_fd = Self::allocate_socket_fd(&mut listener_node);
-                let mut accepted = DSTSocketHandle::new(domain, ty, proto);
-                accepted.state = DSTSocketState::Connected;
-                accepted.peer_addr = Some(client_peer_addr);
-                accepted.peer =
-                  Some(DSTSocketRef { node_id: self.node_id, fd: raw });
-                listener_node.sockets.insert(server_fd, accepted);
-                server_fd
+            let server_fd = {
+              let mut listener_node = listener_node.borrow_mut();
+              let Some(listener_socket) =
+                listener_node.sockets.get_mut(&listener_ref.fd)
+              else {
+                self
+                  .node
+                  .borrow_mut()
+                  .ready
+                  .push(Done::new(id, -(errno::ECONNREFUSED as isize)));
+                return;
               };
+              let backlog_limit = listener_socket.backlog.max(0) as usize;
+              if listener_socket.state != DSTSocketState::Listening
+                || backlog_limit == 0
+                || listener_socket.pending_accept.len()
+                  + listener_socket.backlog_reserved
+                  >= backlog_limit
+              {
+                self
+                  .node
+                  .borrow_mut()
+                  .ready
+                  .push(Done::new(id, -(errno::ECONNREFUSED as isize)));
+                return;
+              }
+              listener_socket.backlog_reserved += 1;
+              let server_fd = Self::allocate_socket_fd(&mut listener_node);
+              let mut accepted = DSTSocketHandle::new(domain, ty, proto);
+              accepted.state = DSTSocketState::Connected;
+              accepted.peer_addr = Some(client_peer_addr);
+              accepted.peer =
+                Some(DSTSocketRef { node_id: self.node_id, fd: raw });
+              listener_node.sockets.insert(server_fd, accepted);
+              server_fd
+            };
 
             let source_seq = {
               let mut node = self.node.borrow_mut();
@@ -3842,7 +3905,7 @@ impl DSTBackend {
                 .node
                 .borrow_mut()
                 .ready
-                .push(OpCompleted::new(id, -(errno::ENOENT as isize)));
+                .push(Done::new(id, -(errno::ENOENT as isize)));
               return;
             };
             if !self.link_is_available(peer_ref) {
@@ -3850,7 +3913,7 @@ impl DSTBackend {
                 .node
                 .borrow_mut()
                 .ready
-                .push(OpCompleted::new(id, -(errno::EHOSTUNREACH as isize)));
+                .push(Done::new(id, -(errno::EHOSTUNREACH as isize)));
               return;
             }
             let peer_is_dgram = self
@@ -3866,25 +3929,25 @@ impl DSTBackend {
                 .node
                 .borrow_mut()
                 .ready
-                .push(OpCompleted::new(id, -(errno::EPROTOTYPE as isize)));
+                .push(Done::new(id, -(errno::EPROTOTYPE as isize)));
               return;
             }
             let mut node = self.node.borrow_mut();
             let Some(socket) = node.sockets.get_mut(&raw) else {
-              node.ready.push(OpCompleted::new(id, -(errno::EBADF as isize)));
+              node.ready.push(Done::new(id, -(errno::EBADF as isize)));
               return;
             };
             socket.state = DSTSocketState::Connected;
             socket.peer = Some(peer_ref);
             socket.peer_addr = Some(addr);
-            node.ready.push(OpCompleted::new(id, 0));
+            node.ready.push(Done::new(id, 0));
           }
           _ => {
             self
               .node
               .borrow_mut()
               .ready
-              .push(OpCompleted::new(id, -(errno::ENOTSUP as isize)));
+              .push(Done::new(id, -(errno::ENOTSUP as isize)));
           }
         }
       }
@@ -3894,13 +3957,13 @@ impl DSTBackend {
             .node
             .borrow_mut()
             .ready
-            .push(OpCompleted::new(id, -(errno::ENOTSUP as isize)));
+            .push(Done::new(id, -(errno::ENOTSUP as isize)));
           return;
         }
         let target = msg.to.map(op::socket_addr_into_buf);
         let bytes = DSBackend::read_msg_send(msg);
         let result = self.process_network_write(&fd, &bytes, None, target);
-        self.node.borrow_mut().ready.push(OpCompleted::new(
+        self.node.borrow_mut().ready.push(Done::new(
           id,
           result.map(|len| len as isize).unwrap_or_else(|err| err),
         ));
@@ -3909,7 +3972,7 @@ impl DSTBackend {
         let position = match DSBackend::file_position(offset) {
           Ok(position) => position,
           Err(err) => {
-            self.node.borrow_mut().ready.push(OpCompleted::new(id, err));
+            self.node.borrow_mut().ready.push(Done::new(id, err));
             return;
           }
         };
@@ -3918,12 +3981,12 @@ impl DSTBackend {
             .node
             .borrow_mut()
             .ready
-            .push(OpCompleted::new(id, -(errno::ENOTSUP as isize)));
+            .push(Done::new(id, -(errno::ENOTSUP as isize)));
           return;
         }
         let bytes = DSBackend::extract_iovec_bytes(iovecs, iov_count);
         let result = self.process_network_write(&fd, &bytes, position, None);
-        self.node.borrow_mut().ready.push(OpCompleted::new(
+        self.node.borrow_mut().ready.push(Done::new(
           id,
           result.map(|len| len as isize).unwrap_or_else(|err| err),
         ));
@@ -3933,7 +3996,7 @@ impl DSTBackend {
         let action = Self::process_network_recv(&mut node, &fd, msg, flags);
         match action {
           PendingAction::Complete(result) => {
-            node.ready.push(OpCompleted::new(id, result));
+            node.ready.push(Done::new(id, result));
           }
           PendingAction::KeepPending(op) => node.pending.push((id, op, keep)),
         }
@@ -3945,7 +4008,7 @@ impl DSTBackend {
         );
         match action {
           PendingAction::Complete(result) => {
-            node.ready.push(OpCompleted::new(id, result));
+            node.ready.push(Done::new(id, result));
           }
           PendingAction::KeepPending(op) => node.pending.push((id, op, keep)),
         }
@@ -3955,7 +4018,7 @@ impl DSTBackend {
         let action = Self::process_network_accept(&mut node, &fd, addr);
         match action {
           PendingAction::Complete(result) => {
-            node.ready.push(OpCompleted::new(id, result));
+            node.ready.push(Done::new(id, result));
           }
           PendingAction::KeepPending(op) => node.pending.push((id, op, keep)),
         }
@@ -3965,7 +4028,7 @@ impl DSTBackend {
         let peer = {
           let mut node = self.node.borrow_mut();
           let Some(socket) = node.sockets.get_mut(&raw) else {
-            node.ready.push(OpCompleted::new(id, -(errno::EBADF as isize)));
+            node.ready.push(Done::new(id, -(errno::EBADF as isize)));
             return;
           };
           match how {
@@ -4005,27 +4068,32 @@ impl DSTBackend {
             });
           }
         }
-        self.node.borrow_mut().ready.push(OpCompleted::new(id, 0));
+        self.node.borrow_mut().ready.push(Done::new(id, 0));
       }
       Op::Fsync { .. } => {
         self
           .node
           .borrow_mut()
           .ready
-          .push(OpCompleted::new(id, -(errno::EINVAL as isize)));
+          .push(Done::new(id, -(errno::EINVAL as isize)));
       }
       other => {
         // SAFETY: `other` was accepted by `push` and stays in flight here.
-        // The same lease goes with it. A new lease would let the driver free
+        // The same ticket goes with it. A new one would let the driver free
         // the model while the local backend still holds these addresses.
         let borrowed = unsafe { BorrowedOp::from_op(other) };
+        let Held = keep;
+        let Some(ticket) = self.tickets.remove(&id) else {
+          unreachable!(
+            "DST: operation {id} reached the local backend unticketed"
+          );
+        };
         self
           .local
           .as_mut()
           .expect("non-network DST backend op requires local backend")
           .push(
-            id,
-            crate::backend::InFlight::from_model(borrowed, keep),
+            crate::backend::InFlight::from_parts(borrowed, ticket),
             &mut Bump::new(),
           );
       }
@@ -4033,9 +4101,7 @@ impl DSTBackend {
   }
 }
 
-// SAFETY: local ops go to the inner `DSBackend`. Network ops are stored
-// with their `Keep` and are read only inside `flush` and `wait`.
-unsafe impl IoBackend for DSTBackend {
+impl IoBackend for DSTBackend {
   fn resource_close(&self) -> crate::api::resource::ResourceClose {
     crate::api::resource::ResourceClose::noop()
   }
@@ -4060,13 +4126,9 @@ unsafe impl IoBackend for DSTBackend {
     Ok(())
   }
 
-  fn push(
-    &mut self,
-    id: u64,
-    op: crate::backend::InFlight<'_>,
-    step_bump: &mut Bump,
-  ) {
-    let (stored, keep) = op.into_parts();
+  fn push(&mut self, op: crate::backend::InFlight<'_>, step_bump: &mut Bump) {
+    let (stored, ticket) = op.into_parts();
+    let id = ticket.id();
     let use_network = match &stored {
       Op::Socket { .. } => true,
       Op::Bind { fd, .. }
@@ -4086,18 +4148,18 @@ unsafe impl IoBackend for DSTBackend {
     };
 
     if use_network {
-      self.queue_network_op(id, stored, keep);
+      self.tickets.insert(id, ticket);
+      self.queue_network_op(id, stored, Held);
     } else {
-      // SAFETY: `stored` was just taken from this `InFlight`. The same lease
-      // goes with it into the local backend.
+      // SAFETY: `stored` was just taken from this `InFlight`. The same
+      // ticket goes with it into the local backend.
       let borrowed = unsafe { BorrowedOp::from_op(stored) };
       self
         .local
         .as_mut()
         .expect("non-network DST backend push requires local backend")
         .push(
-          id,
-          crate::backend::InFlight::from_model(borrowed, keep),
+          crate::backend::InFlight::from_parts(borrowed, ticket),
           step_bump,
         );
     }
@@ -4106,7 +4168,7 @@ unsafe impl IoBackend for DSTBackend {
   fn cancel(&mut self, id: u64) {
     if self.cancel_network_op(id) {
       let result = -(errno::ECANCELED as isize);
-      self.node.borrow_mut().ready.push(OpCompleted::new(id, result));
+      self.node.borrow_mut().ready.push(Done::new(id, result));
     } else if let Some(local) = self.local.as_mut() {
       local.cancel(id);
     }
@@ -4120,6 +4182,7 @@ unsafe impl IoBackend for DSTBackend {
       node.pending.clear();
     }
     self.inner.borrow_mut().active_outgoing_nodes.remove(&self.node_id);
+    release_all(&mut self.tickets);
     match self.local.as_mut() {
       Some(local) => local.drain(),
       None => true,
@@ -4171,8 +4234,7 @@ mod tests {
     // backend reports the completion.
     unsafe {
       backend.push(
-        id,
-        crate::backend::InFlight::attest(BorrowedOp::from_op(op)),
+        crate::backend::InFlight::attest(id, BorrowedOp::from_op(op)),
         bump,
       )
     };
@@ -4194,7 +4256,7 @@ mod tests {
       // SAFETY: `drain` below drops the queued operation before `iov` and
       // `bytes` are released.
       unsafe {
-        backend.push(1, crate::backend::InFlight::attest(op), &mut Bump::new())
+        backend.push(crate::backend::InFlight::attest(1, op), &mut Bump::new())
       };
       assert!(backend.drain());
     }
@@ -4223,7 +4285,7 @@ mod tests {
     }
   }
 
-  fn dst_take_ready(node: &Rc<RefCell<DSTNodeState>>) -> Vec<OpCompleted> {
+  fn dst_take_ready(node: &Rc<RefCell<DSTNodeState>>) -> Vec<Done> {
     let mut node = node.borrow_mut();
     std::mem::take(&mut node.ready)
   }

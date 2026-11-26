@@ -723,8 +723,7 @@ impl Lio {
         *armed = false;
         match action {
           Action::Io(op) => io.push(
-            id,
-            crate::backend::InFlight::from_model(op, lease.clone()),
+            crate::backend::InFlight::from_model(id, op, lease.clone()),
             step_bump,
           ),
           Action::Sleep(duration) => time.schedule(id, duration),
@@ -756,8 +755,7 @@ impl Lio {
           insert.keep_on_panic();
           match action {
             Action::Io(op) => io.push(
-              id,
-              crate::backend::InFlight::from_model(op, lease.clone()),
+              crate::backend::InFlight::from_model(id, op, lease.clone()),
               step_bump,
             ),
             Action::Sleep(duration) => time.schedule(id, duration),
@@ -1623,16 +1621,14 @@ mod tests {
 
   /// Reports a completion for every pushed op, twice.
   #[derive(Default)]
-  struct Twice(Vec<u64>);
+  struct Twice(Vec<crate::backend::Ticket>);
 
-  // SAFETY: test backend. It never dereferences an address. It completes
-  // twice on purpose.
-  unsafe impl IoBackend for Twice {
+  impl IoBackend for Twice {
     fn init(&mut self, _: usize) -> io::Result<()> {
       Ok(())
     }
-    fn push(&mut self, id: u64, _: crate::backend::InFlight<'_>, _: &mut Bump) {
-      self.0.extend([id, id]);
+    fn push(&mut self, op: crate::backend::InFlight<'_>, _: &mut Bump) {
+      self.0.push(op.into_parts().1);
     }
     fn flush(&mut self) -> io::Result<()> {
       Ok(())
@@ -1643,7 +1639,14 @@ mod tests {
       completed: &mut Vec<OpCompleted>,
     ) -> io::Result<()> {
       completed.clear();
-      completed.extend(self.0.drain(..).map(|id| OpCompleted::new(id, 0)));
+      for ticket in self.0.drain(..) {
+        let id = ticket.id();
+        // SAFETY: test backend. It never copied an address, and reports
+        // only nops, for which 0 is what happened.
+        completed.push(unsafe { ticket.complete(0) });
+        // A ticket reports once: the second report is made up.
+        completed.push(OpCompleted::forged(id, 0));
+      }
       Ok(())
     }
 
@@ -1794,20 +1797,14 @@ mod tests {
     first_allocs: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
   }
 
-  // SAFETY: every call goes to the inner `ScriptedBackend`.
-  unsafe impl IoBackend for Lowering {
+  impl IoBackend for Lowering {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    fn push(
-      &mut self,
-      id: u64,
-      op: crate::backend::InFlight<'_>,
-      bump: &mut Bump,
-    ) {
+    fn push(&mut self, op: crate::backend::InFlight<'_>, bump: &mut Bump) {
       let at = bump.alloc(0u64) as *mut u64 as usize;
       self.first_allocs.borrow_mut().push(at);
-      self.inner.push(id, op, bump);
+      self.inner.push(op, bump);
     }
     fn flush(&mut self) -> io::Result<()> {
       self.inner.flush()
@@ -1925,21 +1922,15 @@ mod tests {
     timeouts: Rc<RefCell<Vec<Option<Duration>>>>,
   }
 
-  // SAFETY: every call goes to the inner `ScriptedBackend`.
-  unsafe impl IoBackend for Recording {
+  impl IoBackend for Recording {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
     fn resource_close(&self) -> crate::api::resource::ResourceClose {
       self.inner.resource_close()
     }
-    fn push(
-      &mut self,
-      id: u64,
-      op: crate::backend::InFlight<'_>,
-      bump: &mut Bump,
-    ) {
-      self.inner.push(id, op, bump);
+    fn push(&mut self, op: crate::backend::InFlight<'_>, bump: &mut Bump) {
+      self.inner.push(op, bump);
     }
     fn flush(&mut self) -> io::Result<()> {
       self.inner.flush()
@@ -2177,27 +2168,25 @@ mod tests {
   }
 
   /// Finishes every operation on the next wait, and keeps its lease.
+  ///
+  /// What a backend does that reports an operation while something still
+  /// uses its memory: the driver must not reuse that memory.
   #[derive(Default)]
   struct Hoarding {
     pushed: Rc<RefCell<Vec<u64>>>,
     pending: Vec<u64>,
-    leases: Vec<crate::backend::Keep>,
+    tickets: Vec<crate::backend::Ticket>,
   }
 
-  // SAFETY: test backend. It never dereferences an address, and the leases
-  // it keeps only make the driver hold memory for longer.
-  unsafe impl IoBackend for Hoarding {
+  impl IoBackend for Hoarding {
     fn init(&mut self, _: usize) -> io::Result<()> {
       Ok(())
     }
-    fn push(
-      &mut self,
-      id: u64,
-      op: crate::backend::InFlight<'_>,
-      _: &mut Bump,
-    ) {
-      let (_, lease) = op.into_parts();
-      self.leases.push(lease);
+    fn push(&mut self, op: crate::backend::InFlight<'_>, _: &mut Bump) {
+      let (_, ticket) = op.into_parts();
+      let id = ticket.id();
+      // Never given up: its lease stays held.
+      self.tickets.push(ticket);
       self.pending.push(id);
       self.pushed.borrow_mut().push(id);
     }
@@ -2209,8 +2198,9 @@ mod tests {
       _: Option<Duration>,
       completed: &mut Vec<OpCompleted>,
     ) -> io::Result<()> {
+      // Reported without its ticket, which a real backend cannot do.
       completed
-        .extend(self.pending.drain(..).map(|id| OpCompleted::new(id, 0)));
+        .extend(self.pending.drain(..).map(|id| OpCompleted::forged(id, 0)));
       Ok(())
     }
 

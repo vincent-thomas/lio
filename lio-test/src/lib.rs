@@ -210,8 +210,7 @@ macro_rules! test_io_backend {
         // returns the completion, which is the `InFlight::attest` contract.
         IoBackend::push(
           backend,
-          id,
-          unsafe { __lio_test_lio::backend::InFlight::attest(op) },
+          unsafe { __lio_test_lio::backend::InFlight::attest(id, op) },
           step_bump,
         );
       });
@@ -784,8 +783,8 @@ macro_rules! test_io_backend {
       for _ in 0..500 {
         let completed =
           wait_completions(backend, Some(Duration::from_millis(10)));
-        if let Some(first) = completed.first() {
-          return *first;
+        if let Some(first) = completed.into_iter().next() {
+          return first;
         }
       }
 

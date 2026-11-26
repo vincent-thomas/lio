@@ -96,8 +96,7 @@ mod immediate_sockets {
     // borrows boxed, so the buffers and message descriptors stay in place
     // until the backend finishes. `from_model` names that borrow.
     backend.push(
-      id,
-      crate::backend::InFlight::from_model(op, crate::backend::Keep::new()),
+      crate::backend::InFlight::from_model(id, op, crate::backend::Keep::new()),
       &mut Bump::new(),
     );
   }
@@ -181,9 +180,11 @@ mod immediate_sockets {
     peer.write_all(b"hello").unwrap();
     // SAFETY: a no-op borrows nothing.
     backend.push(
-      16,
       unsafe {
-        crate::backend::InFlight::attest(crate::backend::op::BorrowedOp::nop())
+        crate::backend::InFlight::attest(
+          16,
+          crate::backend::op::BorrowedOp::nop(),
+        )
       },
       &mut Bump::new(),
     );
@@ -272,8 +273,8 @@ mod immediate_sockets {
     // SAFETY: `raws` and `socket` stay alive until this backend finishes.
     unsafe {
       backend.push(
-        18,
         crate::backend::InFlight::attest(
+          18,
           crate::backend::op::BorrowedOp::from_op(Op::Read {
             fd: socket,
             iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),

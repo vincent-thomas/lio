@@ -48,8 +48,8 @@ struct Script {
   pushed: Vec<u64>,
   /// Pushed and not yet completed, in push order.
   in_flight: Vec<(u64, Op)>,
-  /// Leases for `in_flight`, dropped with those operations.
-  keeps: HashMap<u64, crate::backend::Keep>,
+  /// The tickets of `in_flight`, given up with those operations.
+  tickets: HashMap<u64, crate::backend::Ticket>,
   cancelled: Vec<u64>,
   /// Completed, waiting for the next `wait()`.
   ready: VecDeque<OpCompleted>,
@@ -145,13 +145,19 @@ impl ScriptedBackend {
       panic!("ScriptedBackend::complete: operation {id} is not in flight");
     };
     let (_, op) = script.in_flight.remove(pos);
-    script.keeps.remove(&id);
+    let Some(ticket) = script.tickets.remove(&id) else {
+      unreachable!("ScriptedBackend: operation {id} is in flight unticketed");
+    };
     if !script.no_poison {
       // SAFETY: the operation is still in flight, so the driver keeps the
       // memory it points to valid until it sees this completion.
       unsafe { touch(&op) };
     }
-    script.ready.push_back(OpCompleted::new(id, result));
+    // SAFETY: no kernel or thread ever sees the addresses. Every byte the
+    // operation could receive was just written, so any byte count the test
+    // scripts is one that was written; `without_poison` hands that claim to
+    // the test.
+    script.ready.push_back(unsafe { ticket.complete(result) });
   }
 
   /// Finishes every in-flight operation with `result`, in push order.
@@ -162,9 +168,7 @@ impl ScriptedBackend {
   }
 }
 
-// SAFETY: `keeps` holds each lease while its op is in flight. No kernel
-// or thread uses the addresses, so `drain` may return `true`.
-unsafe impl IoBackend for ScriptedBackend {
+impl IoBackend for ScriptedBackend {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.0.borrow_mut().init = Some(cap);
     Ok(())
@@ -174,17 +178,13 @@ unsafe impl IoBackend for ScriptedBackend {
     ResourceClose::noop()
   }
 
-  fn push(
-    &mut self,
-    id: u64,
-    op: crate::backend::InFlight<'_>,
-    _step_bump: &mut Bump,
-  ) {
-    let (op, keep) = op.into_parts();
+  fn push(&mut self, op: crate::backend::InFlight<'_>, _step_bump: &mut Bump) {
+    let (op, ticket) = op.into_parts();
+    let id = ticket.id();
     let mut script = self.0.borrow_mut();
     script.pushed.push(id);
     script.in_flight.push((id, op));
-    script.keeps.insert(id, keep);
+    script.tickets.insert(id, ticket);
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -204,13 +204,16 @@ unsafe impl IoBackend for ScriptedBackend {
     if script.stuck {
       return false;
     }
-    script.keeps.clear();
     for (_, op) in std::mem::take(&mut script.in_flight) {
       if !script.no_poison {
         // SAFETY: a drained operation may still be finishing, so the driver
-        // keeps its memory valid until `drain` returns.
+        // keeps its memory valid until its ticket is given up.
         unsafe { touch(&op) };
       }
+    }
+    for (_, ticket) in script.tickets.drain() {
+      // SAFETY: no kernel or thread ever sees the addresses.
+      unsafe { ticket.release() };
     }
     script.ready.clear();
     true
@@ -354,8 +357,7 @@ impl<B: IoBackend> Checked<B> {
   }
 }
 
-// SAFETY: every call goes to `B`, which upholds the contract.
-unsafe impl<B: IoBackend> IoBackend for Checked<B> {
+impl<B: IoBackend> IoBackend for Checked<B> {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     assert!(self.cap.is_none(), "contract: `init` called twice");
     self.inner.init(cap)?;
@@ -367,13 +369,9 @@ unsafe impl<B: IoBackend> IoBackend for Checked<B> {
     self.inner.resource_close()
   }
 
-  fn push(
-    &mut self,
-    id: u64,
-    op: crate::backend::InFlight<'_>,
-    step_bump: &mut Bump,
-  ) {
+  fn push(&mut self, op: crate::backend::InFlight<'_>, step_bump: &mut Bump) {
     let cap = self.cap("push");
+    let id = op.id();
     assert!(
       self.in_flight.len() < cap,
       "contract: pushed operation {id} with {cap} already in flight (capacity \
@@ -383,7 +381,7 @@ unsafe impl<B: IoBackend> IoBackend for Checked<B> {
       self.in_flight.insert(id),
       "contract: pushed operation {id} while it is still in flight"
     );
-    self.inner.push(id, op, step_bump);
+    self.inner.push(op, step_bump);
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -445,8 +443,7 @@ mod tests {
     // completes or drains the operation.
     unsafe {
       backend.push(
-        id,
-        crate::backend::InFlight::attest(BorrowedOp::from_op(op)),
+        crate::backend::InFlight::attest(id, BorrowedOp::from_op(op)),
         &mut Bump::new(),
       )
     };
@@ -644,19 +641,12 @@ mod tests {
   #[should_panic(expected = "which is not in flight")]
   fn completing_twice_breaks_the_contract() {
     struct Twice(Option<u64>);
-    // SAFETY: it never dereferences an address. It completes twice on
-    // purpose so `Checked` panics first.
-    unsafe impl IoBackend for Twice {
+    impl IoBackend for Twice {
       fn init(&mut self, _: usize) -> io::Result<()> {
         Ok(())
       }
-      fn push(
-        &mut self,
-        id: u64,
-        _: crate::backend::InFlight<'_>,
-        _: &mut Bump,
-      ) {
-        self.0 = Some(id);
+      fn push(&mut self, op: crate::backend::InFlight<'_>, _: &mut Bump) {
+        self.0 = Some(op.id());
       }
       fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -667,7 +657,8 @@ mod tests {
         completed: &mut Vec<OpCompleted>,
       ) -> io::Result<()> {
         completed.clear();
-        completed.extend(self.0.map(|id| OpCompleted::new(id, 0)));
+        // Reported without a ticket, which only a test can do.
+        completed.extend(self.0.map(|id| OpCompleted::forged(id, 0)));
         Ok(())
       }
 

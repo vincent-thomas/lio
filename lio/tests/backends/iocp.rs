@@ -33,13 +33,15 @@ fn drop_cancels_a_blocked_pipe_read() {
   // SAFETY: `buf` stays alive until this backend is dropped.
   unsafe {
     backend.push(
-      1,
-      lio::backend::InFlight::attest(lio::backend::op::BorrowedOp::read(
-        reader,
-        std::slice::from_ref(&raw),
-        None,
-        ReadFlags::empty(),
-      )),
+      lio::backend::InFlight::attest(
+        1,
+        lio::backend::op::BorrowedOp::read(
+          reader,
+          std::slice::from_ref(&raw),
+          None,
+          ReadFlags::empty(),
+        ),
+      ),
       &mut bumpalo::Bump::new(),
     );
   }

@@ -454,7 +454,7 @@ impl<T> Slab<T> {
   /// Remove a value by key.
   ///
   /// Returns `true` if removed, `false` if key was invalid or stale.
-  #[inline]
+  #[cfg(test)]
   pub fn remove(&mut self, key: SlabKey) -> bool {
     // Drop the value only once its slot is released.
     self.remove_value(key).is_some()
