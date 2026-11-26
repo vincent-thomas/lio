@@ -149,6 +149,47 @@ fn main() -> io::Result<()> {
     drop(notes);
     println!("lio::fs: ok");
 
+    // Listing: by batches small enough to need several, then all at once.
+    let listed = fs::Directory::open(c("/work")).await?;
+    let mut names = Vec::new();
+    let mut batches = 0;
+    loop {
+      let batch = listed.readdir(api::ReadDirBuf::with_capacity(64, 2)).await?;
+      batches += 1;
+      assert!(batch.result.entries <= 2);
+      names.extend(
+        batch.iter().map(|e| String::from_utf8_lossy(e.name).into_owned()),
+      );
+      if batch.result.eof {
+        break;
+      }
+    }
+    names.sort();
+    assert_eq!(
+      names,
+      ["hard.txt", "log.txt", "notes.txt", "raw.txt", "soft.txt"]
+    );
+    assert!(batches >= 3, "five entries came in {batches} batches of two");
+    let again = listed.readdir(api::ReadDirBuf::with_capacity(64, 2)).await?;
+    assert_eq!((again.result.entries, again.result.eof), (0, true));
+    // A name that fits no buffer is an error, not a silent stall.
+    let cramped = fs::Directory::open(c("/work")).await?;
+    let tiny = cramped.readdir(api::ReadDirBuf::with_capacity(2, 2)).await;
+    assert!(tiny.is_err(), "a name was squeezed into two bytes");
+    drop((listed, cramped));
+
+    let mut seen = Vec::new();
+    for entry in fs::read_dir("/work").await? {
+      let entry = entry?;
+      let kind = entry.file_type();
+      seen.push((entry.file_name().to_string_lossy().into_owned(), kind));
+    }
+    seen.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(seen.len(), 5);
+    assert_eq!(seen[0].0, "hard.txt");
+    assert_eq!(seen[4], ("soft.txt".into(), Some(api::FileType::Symlink)));
+    println!("readdir, read_dir: ok");
+
     // Rename and clean up.
     api::renameat(&dir, c("hard.txt"), &cwd, c("moved.txt")).await?;
     assert_eq!(api::statat(&cwd, c("moved.txt"), true).await?.size, 11);
@@ -161,6 +202,19 @@ fn main() -> io::Result<()> {
     drop((file, dir));
     api::unlinkat(&cwd, c("work"), UnlinkKind::Directory).await?;
     println!("renameat, unlinkat: ok");
+
+    // A whole tree removed at once, which lists every level of it.
+    api::mkdirat(&cwd, c("tree"), mode(0o755)).await?;
+    api::mkdirat(&cwd, c("tree/a"), mode(0o755)).await?;
+    api::mkdirat(&cwd, c("tree/a/b"), mode(0o755)).await?;
+    for path in ["tree/top.txt", "tree/a/mid.txt", "tree/a/b/deep.txt"] {
+      let flags = OpenFlags::WRITE | OpenFlags::CREATE;
+      drop(api::openat(&cwd, c(path), flags, mode(0o644)).await?);
+    }
+    fs::remove_dir_all(c("/tree")).await?;
+    let gone = api::statat(&cwd, c("tree"), true).await;
+    assert_eq!(gone.unwrap_err().kind(), io::ErrorKind::NotFound);
+    println!("remove_dir_all: ok");
 
     // Standard output, and two writes to it at once.
     let out = Resource::stdout();

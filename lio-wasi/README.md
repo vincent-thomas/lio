@@ -41,7 +41,8 @@ let read = queue.wait().unwrap().outcome().count();
 
 ## Safety
 
-`push_read`, `push_write`, `push_accept` and `push_call` are `unsafe`. The
+`push_read`, `push_write`, `push_accept`, `push_read_dir` and `push_call` are
+`unsafe`. The
 host uses the buffer or operation value after the call returns, so the caller
 keeps it allocated, unmoved and untouched until its completion has been
 returned. Everything else is safe, and every pushed operation produces
@@ -77,7 +78,8 @@ How each `lio-uring` operation maps onto WASI 0.3.
 | `TimeoutRemove`, `AsyncCancel` | `Queue::cancel` |
 
 Beyond io_uring's set: `fs::ReadlinkAt`, `fs::SetTimes`, `fs::SetTimesAt`,
-`fs::GetFlags`, `fs::GetType`.
+`fs::GetFlags`, `fs::GetType`, and directory listing through
+`Queue::add_dir_reader` and `Queue::push_read_dir` into an `fs::DirEntryBuf`.
 
 ### No WASI 0.3 equivalent
 
@@ -92,6 +94,8 @@ Beyond io_uring's set: `fs::ReadlinkAt`, `fs::SetTimes`, `fs::SetTimesAt`,
 
 - **One operation per stream end at a time.** A second push on a busy
   stream returns `Error::Busy`.
+- **A directory listing allocates.** The host allocates each entry's name in
+  the component.
 - **A UDP receive allocates.** WASI 0.3 hands a datagram over as a list the
   host allocates in the component; it cannot be received into caller memory.
 - **Files have no cursor.** `read_via_stream` and `write_via_stream` take an
@@ -100,7 +104,6 @@ Beyond io_uring's set: `fs::ReadlinkAt`, `fs::SetTimes`, `fs::SetTimesAt`,
 
 ### Not bound yet
 
-- `descriptor.read-directory` (a stream of directory entries).
 - `ip-name-lookup.resolve-addresses`.
 - `descriptor.is-same-object`, `metadata-hash`, `metadata-hash-at`.
 

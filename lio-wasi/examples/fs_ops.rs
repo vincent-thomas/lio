@@ -9,10 +9,10 @@
 
 use lio_wasi::fs::{
   Advice, Advise, CreateDirectoryAt, Descriptor, DescriptorFlags,
-  DescriptorType, ErrorCode, GetFlags, GetType, LinkAt, NewTimestamp, OpenAt,
-  OpenFlags, PathFlags, ReadlinkAt, RemoveDirectoryAt, RenameAt, SetSize,
-  SetTimes, SetTimesAt, Stat, StatAt, StreamStatus, SymlinkAt, Sync, SyncData,
-  UnlinkFileAt,
+  DescriptorType, DirEntryBuf, ErrorCode, GetFlags, GetType, LinkAt,
+  NewTimestamp, OpenAt, OpenFlags, PathFlags, ReadlinkAt, RemoveDirectoryAt,
+  RenameAt, SetSize, SetTimes, SetTimesAt, Stat, StatAt, StreamStatus,
+  SymlinkAt, Sync, SyncData, UnlinkFileAt,
 };
 use lio_wasi::{Call, Completion, Nop, Outcome, Queue};
 use wasip3::clocks::system_clock::Instant;
@@ -344,4 +344,89 @@ fn main() {
     ok!(call);
   }
   println!("batched calls: ok");
+
+  // List a directory with a buffer smaller than its contents, so the
+  // listing takes several reads.
+  let mut mkdir = CreateDirectoryAt::new(&root, "ls");
+  run(queue, &mut mkdir);
+  ok!(mkdir);
+  let listed = match open(
+    queue,
+    &root,
+    "ls",
+    OpenFlags::DIRECTORY,
+    DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
+  ) {
+    Ok(dir) => dir,
+    Err(error) => panic!("opening the listed directory failed: {error:?}"),
+  };
+  for name in ["one.txt", "two.txt", "three.txt"] {
+    let created =
+      open(queue, &listed, name, OpenFlags::CREATE, DescriptorFlags::WRITE);
+    assert!(created.is_ok());
+  }
+  let mut sub = CreateDirectoryAt::new(&listed, "sub");
+  run(queue, &mut sub);
+  ok!(sub);
+
+  let (entries, status) = listed.read_directory();
+  let mut status = StreamStatus::new(status);
+  let entries = queue.add_dir_reader(entries);
+  let mut buf = DirEntryBuf::with_capacity(2);
+  let mut found = Vec::new();
+  let mut reads = 0;
+  loop {
+    // SAFETY: `buf` outlives the completion taken on the next line.
+    let pushed = unsafe { queue.push_read_dir(entries, &mut buf, 1) };
+    assert_eq!(pushed, Ok(()));
+    let done = next(queue).outcome();
+    reads += 1;
+    let before = found.len();
+    found.extend(buf.drain().map(|entry| {
+      (entry.name, matches!(entry.type_, DescriptorType::Directory))
+    }));
+    assert_eq!(found.len() - before, done.count());
+    assert!(done.count() <= 2, "a read delivered more than the buffer holds");
+    if let Outcome::Closed(_) = done {
+      break;
+    }
+  }
+  run(queue, &mut status);
+  assert!(matches!(status.result(), Some(Ok(()))));
+  assert_eq!(queue.close_dir_reader(entries), Ok(()));
+  found.sort();
+  assert_eq!(
+    found,
+    [
+      ("one.txt".to_string(), false),
+      ("sub".to_string(), true),
+      ("three.txt".to_string(), false),
+      ("two.txt".to_string(), false),
+    ]
+  );
+  assert!(reads >= 2, "four entries fit a two-entry buffer in one read");
+
+  // A cancelled listing read leaves nothing behind.
+  let (entries, _status) = listed.read_directory();
+  let entries = queue.add_dir_reader(entries);
+  // SAFETY: `buf` outlives the completion taken below.
+  let pushed = unsafe { queue.push_read_dir(entries, &mut buf, 7) };
+  assert_eq!(pushed, Ok(()));
+  queue.cancel(7);
+  let cancelled = next(queue).outcome();
+  assert_eq!(buf.drain().count(), cancelled.count());
+  assert_eq!(queue.close_dir_reader(entries), Ok(()));
+
+  for name in ["one.txt", "two.txt", "three.txt"] {
+    let mut unlink = UnlinkFileAt::new(&listed, name);
+    run(queue, &mut unlink);
+    ok!(unlink);
+  }
+  let mut rmdir = RemoveDirectoryAt::new(&listed, "sub");
+  run(queue, &mut rmdir);
+  ok!(rmdir);
+  let mut rmdir = RemoveDirectoryAt::new(&root, "ls");
+  run(queue, &mut rmdir);
+  ok!(rmdir);
+  println!("read-directory: ok ({reads} reads for 4 entries)");
 }

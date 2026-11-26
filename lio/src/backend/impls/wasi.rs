@@ -25,9 +25,9 @@
 //!
 //! # What is supported
 //!
-//! Files, directories-as-anchors, standard streams, TCP and UDP sockets,
-//! timeouts and cancellation. Directory listing, process spawning and
-//! Unix-domain sockets complete with an error.
+//! Files, directories and their listings, standard streams, TCP and UDP
+//! sockets, timeouts and cancellation. Process spawning and Unix-domain
+//! sockets complete with an error.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -41,8 +41,8 @@ use std::time::Duration;
 use bumpalo::Bump;
 use lio_wasi::clock::WaitFor;
 use lio_wasi::fs::{
-  self, Descriptor, DescriptorFlags, DescriptorStat, DescriptorType, ErrorCode,
-  PathFlags,
+  self, Descriptor, DescriptorFlags, DescriptorStat, DescriptorType,
+  DirEntryBuf, DirStream, DirectoryEntry, ErrorCode, PathFlags,
 };
 use lio_wasi::sockets::{
   self, Accepted, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress,
@@ -54,10 +54,10 @@ use lio_wasi::{Completion, Outcome, Queue, ReadStream, WriteStream};
 use crate::api::resource::{RawResource, ResourceClose};
 use crate::backend::native;
 use crate::backend::op::{
-  ByteSpan, FileStat, FileType, LinkKind, Op, OpenFlags, ShutdownHow,
-  SockDomain, SockType, SocketAddrBuf, StatTarget, UnlinkKind, WriteFlags,
-  is_supported_socket, is_valid_file_offset, socket_addr_from_buf,
-  socket_addr_into_buf,
+  ByteSpan, DirEntryRef, FileStat, FileType, LinkKind, Op, OpenFlags,
+  ReadDirResult, ShutdownHow, SockDomain, SockType, SocketAddrBuf, StatTarget,
+  UnlinkKind, WriteFlags, is_supported_socket, is_valid_file_offset,
+  socket_addr_from_buf, socket_addr_into_buf,
 };
 use crate::backend::{InFlight, IoBackend, Keep, OpCompleted};
 
@@ -201,6 +201,53 @@ struct File {
   cursor: u64,
   /// Opened for appending: writes without an offset go to the end.
   append: bool,
+  /// The directory's listing, once one was asked for. Boxed so the entry
+  /// buffer stays put while the host fills it.
+  listing: Option<Box<Listing>>,
+}
+
+/// How many entries are asked of the host per read.
+const LISTING_BATCH: usize = 64;
+
+/// How far a directory's listing has got.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListingState {
+  /// The stream still has entries.
+  Reading,
+  /// The stream ended; its status has not been read.
+  Ending,
+  /// The stream ended without an error. Nothing more will come.
+  Ended,
+}
+
+/// A directory being listed. It lives with the directory, so that each
+/// `ReadDir` continues where the last one stopped.
+struct Listing {
+  /// The backend whose queue holds the stream.
+  owner: u64,
+  /// Open until the listing has ended.
+  stream: Option<DirStream>,
+  status: fs::StreamStatus,
+  state: ListingState,
+  /// Where the host writes a batch.
+  buf: DirEntryBuf,
+  /// Entries read from the host that an operation had no room for.
+  carry: VecDeque<DirectoryEntry>,
+}
+
+/// Something closed whose streams still sit in a live backend's queue.
+enum Orphan {
+  Tcp(Tcp),
+  Listing(Listing),
+}
+
+impl Orphan {
+  fn owner(&self) -> u64 {
+    match self {
+      Orphan::Tcp(tcp) => tcp.owner,
+      Orphan::Listing(listing) => listing.owner,
+    }
+  }
 }
 
 /// A TCP socket and the streams WASI gave for it. Each can be asked for
@@ -275,9 +322,9 @@ thread_local! {
   /// Resources closed while the table was in use. A backend closes them the
   /// next time it runs.
   static DEFERRED: RefCell<Vec<RawResource>> = const { RefCell::new(Vec::new()) };
-  /// Closed sockets whose streams still sit in a live backend's queue. That
-  /// backend closes the streams the next time it runs.
-  static ORPHANS: RefCell<Vec<Tcp>> = const { RefCell::new(Vec::new()) };
+  /// Closed resources whose streams still sit in a live backend's queue.
+  /// That backend closes the streams the next time it runs.
+  static ORPHANS: RefCell<Vec<Orphan>> = const { RefCell::new(Vec::new()) };
   /// The backends alive on this thread.
   static LIVE: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
   static NEXT_BACKEND: Cell<u64> = const { Cell::new(0) };
@@ -300,14 +347,20 @@ fn close_resource(raw: RawResource) {
   }
 }
 
-/// Drops a removed entry. A socket whose streams are in a live backend's
-/// queue is handed to that backend instead, which has to close them first.
+/// Drops a removed entry. One whose streams are in a live backend's queue
+/// is handed to that backend instead, which has to close them first.
 fn dispose(entry: Option<Entry>) {
-  if let Some(Entry::Tcp(tcp)) = entry {
-    let owned = LIVE.with(|live| live.borrow().contains(&tcp.owner));
-    if tcp.has_streams() && owned {
-      ORPHANS.with(|orphans| orphans.borrow_mut().push(*tcp));
+  let orphan = match entry {
+    Some(Entry::Tcp(tcp)) if tcp.has_streams() => Orphan::Tcp(*tcp),
+    Some(Entry::File(File { listing: Some(listing), .. }))
+      if listing.stream.is_some() =>
+    {
+      Orphan::Listing(*listing)
     }
+    _ => return,
+  };
+  if LIVE.with(|live| live.borrow().contains(&orphan.owner())) {
+    ORPHANS.with(|orphans| orphans.borrow_mut().push(orphan));
   }
 }
 
@@ -548,6 +601,7 @@ impl Call {
             descriptor,
             cursor: 0,
             append: *append,
+            listing: None,
           }))
         }),
         Some(Err(error)) => fail(errno(&error)),
@@ -616,16 +670,7 @@ fn write_stat(
     Some(Err(error)) => return fail(errno(&error)),
     None => unreachable!("a returned call has a result"),
   };
-  let file_type = match stat.type_ {
-    DescriptorType::RegularFile => FileType::File,
-    DescriptorType::Directory => FileType::Directory,
-    DescriptorType::SymbolicLink => FileType::Symlink,
-    DescriptorType::BlockDevice => FileType::BlockDevice,
-    DescriptorType::CharacterDevice => FileType::CharDevice,
-    DescriptorType::Fifo => FileType::Fifo,
-    DescriptorType::Socket => FileType::Socket,
-    DescriptorType::Other(_) => FileType::Unknown,
-  };
+  let file_type = file_type(&stat.type_);
   // WASI reports no permissions or ownership.
   let stat = FileStat {
     file_type,
@@ -637,6 +682,66 @@ fn write_stat(
   // is reported.
   unsafe { out.as_ptr().write(stat) };
   0
+}
+
+fn file_type(kind: &DescriptorType) -> FileType {
+  match kind {
+    DescriptorType::RegularFile => FileType::File,
+    DescriptorType::Directory => FileType::Directory,
+    DescriptorType::SymbolicLink => FileType::Symlink,
+    DescriptorType::BlockDevice => FileType::BlockDevice,
+    DescriptorType::CharacterDevice => FileType::CharDevice,
+    DescriptorType::Fifo => FileType::Fifo,
+    DescriptorType::Socket => FileType::Socket,
+    DescriptorType::Other(_) => FileType::Unknown,
+  }
+}
+
+/// Moves entries from `carry` into a `ReadDir`'s buffers, in order, until
+/// one does not fit. Returns how many entries and name bytes were written.
+fn write_entries(
+  op: &Op,
+  carry: &mut VecDeque<DirectoryEntry>,
+) -> (usize, usize) {
+  let Op::ReadDir { raw_buf, raw_cap, entries, entries_cap, .. } = op else {
+    unreachable!("a listing belongs to a directory read")
+  };
+  let (mut written, mut raw_written) = (0, 0);
+  while let Some(entry) = carry.front() {
+    let name = entry.name.as_bytes();
+    let (Ok(offset), Ok(len)) =
+      (u32::try_from(raw_written), u16::try_from(name.len()))
+    else {
+      break;
+    };
+    if written == *entries_cap || raw_written + name.len() > *raw_cap {
+      break;
+    }
+    // SAFETY: the driver keeps `raw_cap` bytes at `raw_buf` and
+    // `entries_cap` slots at `entries` valid and unaliased until this
+    // operation is reported. The checks above keep both writes in range.
+    unsafe {
+      std::ptr::copy_nonoverlapping(
+        name.as_ptr(),
+        raw_buf.as_ptr().add(raw_written),
+        name.len(),
+      );
+      entries.as_ptr().add(written).write(DirEntryRef {
+        name_offset: offset,
+        name_len: len,
+        file_type: match file_type(&entry.type_) {
+          FileType::Unknown => None,
+          known => Some(known),
+        },
+        // WASI does not report inode numbers in a listing.
+        ino: None,
+      });
+    }
+    raw_written += name.len();
+    written += 1;
+    carry.pop_front();
+  }
+  (written, raw_written)
 }
 
 /// Copies a received datagram into the operation's buffers and reports its
@@ -833,6 +938,17 @@ enum Stage {
   Call(Call),
   Transfer(Transfer),
   Accept(Accepted),
+  /// Listing a directory. The listing itself is with the directory.
+  ReadDir(ListStep),
+}
+
+/// What a directory listing operation is waiting for.
+#[derive(Clone, Copy)]
+enum ListStep {
+  /// A batch of entries from the host.
+  Entries,
+  /// The status of a stream that ended.
+  Status,
 }
 
 /// The WASI 0.3 backend.
@@ -886,22 +1002,31 @@ impl Wasi {
     let mine = ORPHANS.with(|orphans| {
       let mut orphans = orphans.borrow_mut();
       let (mine, others) =
-        orphans.drain(..).partition(|tcp| tcp.owner == self.id);
+        orphans.drain(..).partition(|orphan| orphan.owner() == self.id);
       *orphans = others;
       mine
     });
-    let mine: Vec<Tcp> = mine;
-    for tcp in mine {
+    let mine: Vec<Orphan> = mine;
+    for orphan in mine {
       // Nothing is in flight on these: an operation keeps its resource
       // open. A stream this queue does not know was already closed.
-      if let Some(listener) = tcp.listener {
-        let _ = self.queue.close_listener(listener);
-      }
-      if let Some(input) = tcp.input {
-        let _ = self.queue.close_reader(input);
-      }
-      if let Some(output) = tcp.output {
-        let _ = self.queue.close_writer(output);
+      match orphan {
+        Orphan::Tcp(tcp) => {
+          if let Some(listener) = tcp.listener {
+            let _ = self.queue.close_listener(listener);
+          }
+          if let Some(input) = tcp.input {
+            let _ = self.queue.close_reader(input);
+          }
+          if let Some(output) = tcp.output {
+            let _ = self.queue.close_writer(output);
+          }
+        }
+        Orphan::Listing(listing) => {
+          if let Some(stream) = listing.stream {
+            let _ = self.queue.close_dir_reader(stream);
+          }
+        }
       }
     }
   }
@@ -909,6 +1034,8 @@ impl Wasi {
   /// The lane an operation needs, if its stream is shared.
   fn lane_of(op: &Op) -> Option<LaneKey> {
     let (raw, way) = match op {
+      // A directory has one listing, read by one operation at a time.
+      Op::ReadDir { fd, .. } => return Some((fd.as_raw_fd(), Way::In)),
       Op::Read { fd, .. } | Op::Recv { fd, .. } | Op::Accept { fd, .. } => {
         (fd.as_raw_fd(), Way::In)
       }
@@ -1199,7 +1326,32 @@ impl Wasi {
         unsafe { *out.as_ptr() = OsString::from(cwd) };
         return Err(0);
       }
-      // Directory listing and processes are not implemented here.
+      Op::ReadDir { fd, .. } => {
+        let raw = fd.as_raw_fd();
+        with_table(|table| {
+          let file = table.file(raw).map_err(fail)?;
+          let listing = file.listing.get_or_insert_with(|| {
+            let (entries, status) = file.descriptor.read_directory();
+            Box::new(Listing {
+              owner: self.id,
+              stream: Some(self.queue.add_dir_reader(entries)),
+              status: fs::StreamStatus::new(status),
+              state: ListingState::Reading,
+              buf: DirEntryBuf::with_capacity(LISTING_BATCH),
+              carry: VecDeque::new(),
+            })
+          });
+          if listing.owner != self.id {
+            return Err(fail(libc::EBADF));
+          }
+          Ok(())
+        })?;
+        return match self.list(id, pending) {
+          Some(result) => Err(result),
+          None => Ok(()),
+        };
+      }
+      // WASI has no processes to spawn.
       _ => return Err(fail(libc::ENOTSUP)),
     };
     pending.stage = Stage::Call(call);
@@ -1562,6 +1714,10 @@ impl Wasi {
         Outcome::Cancelled(_) => CANCELLED,
         Outcome::Returned => unreachable!("an accept returned"),
       }),
+      Stage::ReadDir(step) => {
+        let step = *step;
+        self.listed(id, pending, step, outcome)
+      }
       Stage::Transfer(transfer) => match transfer.phase {
         Phase::Data => {
           transfer.total += outcome.count();
@@ -1644,6 +1800,121 @@ impl Wasi {
           Some(result)
         }
       },
+    }
+  }
+
+  /// Gives a `ReadDir` what the listing has for it, or asks the host for
+  /// more. Returns the operation's result once it has entries or the
+  /// listing is over.
+  fn list(&mut self, id: u64, pending: &mut Pending) -> Option<isize> {
+    let Pending { op, stage, .. } = pending;
+    let Op::ReadDir { fd, out, .. } = &*op else {
+      unreachable!("only a directory read lists")
+    };
+    with_table(|table| {
+      let Ok(File { listing: Some(listing), .. }) = table.file(fd.as_raw_fd())
+      else {
+        unreachable!("a listing operation keeps its directory open")
+      };
+      let (entries, raw_written) = write_entries(op, &mut listing.carry);
+      let ended = listing.state == ListingState::Ended;
+      if entries > 0 || (ended && listing.carry.is_empty()) {
+        let result = ReadDirResult {
+          entries,
+          raw_written,
+          eof: ended && listing.carry.is_empty(),
+        };
+        // SAFETY: the driver keeps `out` valid and unaliased until this
+        // operation is reported.
+        unsafe { out.as_ptr().write(result) };
+        return Some(0);
+      }
+      if !listing.carry.is_empty() {
+        // The next entry fits no buffer this operation brought.
+        return Some(fail(native::BUFFER_TOO_SMALL));
+      }
+      // SAFETY (both arms): the listing is boxed in the table and its
+      // directory stays open until this operation's completion is handled.
+      match (listing.state, listing.stream) {
+        (ListingState::Reading, Some(stream)) => {
+          *stage = Stage::ReadDir(ListStep::Entries);
+          // SAFETY: see above.
+          let pushed =
+            unsafe { self.queue.push_read_dir(stream, &mut listing.buf, id) };
+          if pushed.is_err() {
+            unreachable!("a listing's stream is open and read one at a time")
+          }
+        }
+        _ => {
+          *stage = Stage::ReadDir(ListStep::Status);
+          // SAFETY: see above.
+          unsafe { self.queue.push_call(&mut listing.status, id) };
+        }
+      }
+      None
+    })
+  }
+
+  /// Handles a listing step that completed.
+  fn listed(
+    &mut self,
+    id: u64,
+    pending: &mut Pending,
+    step: ListStep,
+    outcome: Outcome,
+  ) -> Option<isize> {
+    let Op::ReadDir { fd, .. } = &pending.op else {
+      unreachable!("only a directory read lists")
+    };
+    let raw = fd.as_raw_fd();
+    let failed = with_table(|table| {
+      let Ok(file) = table.file(raw) else {
+        unreachable!("a listing operation keeps its directory open")
+      };
+      let Some(listing) = file.listing.as_mut() else {
+        unreachable!("a listing operation has a listing")
+      };
+      match (step, outcome) {
+        (ListStep::Entries, _) => {
+          // Entries that arrived are kept, also when the read was
+          // cancelled: the next operation delivers them.
+          let Listing { buf, carry, .. } = &mut **listing;
+          carry.extend(buf.drain().filter(|e| e.name != "." && e.name != ".."));
+          if let Outcome::Closed(_) = outcome {
+            listing.state = ListingState::Ending;
+          }
+          matches!(outcome, Outcome::Cancelled(_)).then_some(CANCELLED)
+        }
+        (ListStep::Status, Outcome::Returned) => {
+          let stream = listing.stream.take();
+          let result = listing.status.result();
+          if let Some(stream) = stream
+            && self.queue.close_dir_reader(stream).is_err()
+          {
+            unreachable!("a listing's stream is open until it is closed here")
+          }
+          match result {
+            Some(Ok(())) => {
+              listing.state = ListingState::Ended;
+              None
+            }
+            Some(Err(error)) => {
+              // The listing failed. The next one starts over.
+              file.listing = None;
+              Some(fail(errno(&error)))
+            }
+            None => unreachable!("a returned status has a result"),
+          }
+        }
+        (ListStep::Status, Outcome::Cancelled(_)) => Some(CANCELLED),
+        (ListStep::Status, other) => {
+          unreachable!("a listing status ended as {other:?}")
+        }
+      }
+    });
+    match failed {
+      Some(result) => Some(result),
+      None => self.list(id, pending),
     }
   }
 
@@ -1789,10 +2060,10 @@ impl Default for Wasi {
 impl Drop for Wasi {
   fn drop(&mut self) {
     LIVE.with(|live| live.borrow_mut().retain(|id| *id != self.id));
-    // This backend's queue closes its streams as it drops, so the sockets
+    // This backend's queue closes its streams as it drops, so what was
     // waiting on it can go.
     ORPHANS.with(|orphans| {
-      orphans.borrow_mut().retain(|tcp| tcp.owner != self.id);
+      orphans.borrow_mut().retain(|orphan| orphan.owner() != self.id);
     });
   }
 }
