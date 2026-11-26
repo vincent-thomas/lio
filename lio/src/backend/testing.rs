@@ -474,6 +474,24 @@ mod tests {
   }
 
   #[test]
+  fn dropping_the_backend_gives_up_the_operations_it_still_holds() {
+    let keep = crate::backend::Keep::new();
+    let mut backend = ScriptedBackend::new();
+    backend.init(4).unwrap();
+    // SAFETY: a nop carries no addresses.
+    let op = unsafe { BorrowedOp::from_op(Op::Nop) };
+    backend.push(
+      crate::backend::InFlight::from_model(1, op, keep.clone()),
+      &mut Bump::new(),
+    );
+    assert!(keep.held_elsewhere(), "the backend holds the operation");
+
+    drop(backend);
+
+    assert!(!keep.held_elsewhere(), "the operation was given up");
+  }
+
+  #[test]
   fn holds_operations_until_completed() {
     let (backend, mut checked) = init(4);
     push_op(&mut checked, 1, Op::Nop);
