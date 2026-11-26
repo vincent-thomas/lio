@@ -276,8 +276,11 @@ impl<'a> Iterator for IoSlicesMutIter<'a> {
     }
     let slot = self.regions.slices.get(self.next)?;
     self.next += 1;
-    // SAFETY: `push` wrote the first `len` slots, and `next` only moves
-    // forward, so each of them is read out once.
+    // SAFETY: `push` wrote the first `len` slots. `next` only moves forward
+    // and nothing else reads a slot (the type is neither `Clone` nor has a
+    // `Drop` that would), so each reference is moved out exactly once. The
+    // bytes left behind in the `MaybeUninit` are never used as a reference
+    // again, as with `std::array::IntoIter`.
     Some(unsafe { slot.assume_init_read() })
   }
 
