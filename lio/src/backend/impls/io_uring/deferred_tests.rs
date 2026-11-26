@@ -88,18 +88,12 @@ fn trace_read_batches() {
     inner: IoUring,
     stats: Rc<RefCell<Stats>>,
   }
-  // SAFETY: every call goes to the inner `IoUring`.
-  unsafe impl IoBackend for Observed {
+  impl IoBackend for Observed {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    fn push(
-      &mut self,
-      id: u64,
-      op: crate::backend::InFlight<'_>,
-      bump: &mut Bump,
-    ) {
-      self.inner.push(id, op, bump)
+    fn push(&mut self, op: crate::backend::InFlight<'_>, bump: &mut Bump) {
+      self.inner.push(op, bump)
     }
     fn flush(&mut self) -> io::Result<()> {
       let t = Instant::now();
@@ -281,14 +275,16 @@ fn nonblocking_waits_make_progress_on_file_completions() {
     // SAFETY: `raw` and `file` stay alive until this backend is dropped.
     unsafe {
       backend.push(
-        id as u64,
-        crate::backend::InFlight::attest(BorrowedOp::from_op(Op::Read {
-          fd: file.clone(),
-          iovecs: NonNull::from(raw).cast(),
-          iov_count: 1,
-          offset: Some(0),
-          flags: ReadFlags::empty(),
-        })),
+        crate::backend::InFlight::attest(
+          id as u64,
+          BorrowedOp::from_op(Op::Read {
+            fd: file.clone(),
+            iovecs: NonNull::from(raw).cast(),
+            iov_count: 1,
+            offset: Some(0),
+            flags: ReadFlags::empty(),
+          }),
+        ),
         &mut arena,
       );
     }
@@ -340,14 +336,16 @@ fn read_with_more_iovecs_than_the_native_array_is_rejected() {
   // SAFETY: `raws` and `reader` stay alive until this backend finishes the read.
   unsafe {
     backend.push(
-      1,
-      crate::backend::InFlight::attest(BorrowedOp::from_op(Op::Read {
-        fd: reader,
-        iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
-        iov_count: raws.len(),
-        offset: None,
-        flags: ReadFlags::empty(),
-      })),
+      crate::backend::InFlight::attest(
+        1,
+        BorrowedOp::from_op(Op::Read {
+          fd: reader,
+          iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
+          iov_count: raws.len(),
+          offset: None,
+          flags: ReadFlags::empty(),
+        }),
+      ),
       &mut arena,
     );
   }
@@ -376,14 +374,16 @@ fn drop_waits_for_operations_in_the_kernel() {
   // SAFETY: `raw` and `reader` stay alive until this backend is dropped.
   unsafe {
     backend.push(
-      1,
-      crate::backend::InFlight::attest(BorrowedOp::from_op(Op::Read {
-        fd: reader.clone(),
-        iovecs: NonNull::from(&raw).cast(),
-        iov_count: 1,
-        offset: None,
-        flags: ReadFlags::empty(),
-      })),
+      crate::backend::InFlight::attest(
+        1,
+        BorrowedOp::from_op(Op::Read {
+          fd: reader.clone(),
+          iovecs: NonNull::from(&raw).cast(),
+          iov_count: 1,
+          offset: None,
+          flags: ReadFlags::empty(),
+        }),
+      ),
       &mut arena,
     );
   }

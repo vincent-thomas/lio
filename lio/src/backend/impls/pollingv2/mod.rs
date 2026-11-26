@@ -208,12 +208,41 @@ impl Default for Poller {
   }
 }
 
+/// One operation the poller holds, queued or waiting for its descriptor.
+///
+/// The poller performs the I/O itself, in [`Poller::exec_op`]: no address
+/// from `op` is ever left with the kernel or another thread between calls.
+/// That is what lets every method here give the ticket up.
 pub struct PendingOp {
-  registration_id: u64,
   op: crate::backend::op::Op,
-  // Held so the driver does not free the model while this entry is stored.
-  #[allow(dead_code)]
-  keep: crate::backend::Keep,
+  ticket: crate::backend::Ticket,
+}
+
+impl PendingOp {
+  fn id(&self) -> u64 {
+    self.ticket.id()
+  }
+
+  /// Reports the operation. `result` is what [`Poller::exec_op`] returned
+  /// for it, or a negative code for an operation that was not performed.
+  fn report(self, result: isize) -> OpCompleted {
+    // SAFETY: nothing but this thread ever uses the operation's addresses,
+    // and it is done with them. The result is the syscall's own, or an
+    // error, which claims nothing about the operation's memory.
+    unsafe { self.ticket.complete(result) }
+  }
+
+  /// Reports the operation as stopped before it was performed.
+  fn stopped(self) -> OpCompleted {
+    // SAFETY: as in `report`.
+    unsafe { self.ticket.cancelled(-(libc::ECANCELED as isize)) }
+  }
+
+  /// Gives the operation up unreported.
+  fn release(self) {
+    // SAFETY: as in `report`.
+    unsafe { self.ticket.release() }
+  }
 }
 
 // EAGAIN and EWOULDBLOCK are the same on Linux, but may differ on other systems
@@ -266,7 +295,7 @@ impl Poller {
     };
     for key in waiting.readers.into_iter().chain(waiting.writers) {
       if let Some(entry) = pending.remove_value(key) {
-        completed.push(OpCompleted::new(entry.registration_id, result));
+        completed.push(entry.report(result));
       }
     }
   }
@@ -287,10 +316,10 @@ impl Poller {
       if result == EAGAIN_NEG || result == EWOULDBLOCK_NEG {
         return;
       }
-      let registration_id = entry.registration_id;
       queue.pop_front();
-      pending.remove(key);
-      completed.push(OpCompleted::new(registration_id, result));
+      if let Some(entry) = pending.remove_value(key) {
+        completed.push(entry.report(result));
+      }
     }
   }
 
@@ -298,11 +327,8 @@ impl Poller {
   /// descriptor, and has the OS poller watch for it.
   fn park(&mut self, entry: PendingOp) {
     let (fd, interest) = self.extract_fd_interest(&entry.op);
-    let registration_id = entry.registration_id;
     let Some((key, _)) = self.pending.insert_get_mut(entry) else {
-      let result = -(libc::EIO as isize);
-      self.queued_completed.push(OpCompleted::new(registration_id, result));
-      return;
+      unreachable!("poller: no room to park an operation `push` accepted");
     };
     let queue = self.waiters.entry(fd).or_default().queue(interest);
     let already_watched = !queue.is_empty();
@@ -329,7 +355,7 @@ impl Poller {
       if result == EAGAIN_NEG || result == EWOULDBLOCK_NEG {
         result = raw_error(&err);
       }
-      self.queued_completed.push(OpCompleted::new(registration_id, result));
+      self.queued_completed.push(entry.report(result));
     }
     // Whoever waits for the other direction goes on waiting.
     if let Err(err) = Self::rearm(sys, &mut self.waiters, fd) {
@@ -1222,9 +1248,7 @@ impl Poller {
   }
 }
 
-// SAFETY: each `PendingOp` stores its `Keep`. Syscalls run only inside
-// `flush` and `wait`, so no address is used after an op is reported.
-unsafe impl IoBackend for Poller {
+impl IoBackend for Poller {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.sys = Some(sys::OsPoller::new()?);
     self.events = Events::with_capacity(cap.min(4096));
@@ -1238,20 +1262,14 @@ unsafe impl IoBackend for Poller {
     Ok(())
   }
 
-  fn push(
-    &mut self,
-    id: u64,
-    op: crate::backend::InFlight<'_>,
-    _step_bump: &mut Bump,
-  ) {
-    // The model stays pinned while `keep` is stored with the operation.
-    let (op, keep) = op.into_parts();
+  fn push(&mut self, op: crate::backend::InFlight<'_>, _step_bump: &mut Bump) {
+    let (op, ticket) = op.into_parts();
     assert!(
       self.backlog.len() + self.pending.len() < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
-    self.backlog.push(PendingOp { registration_id: id, op, keep });
+    self.backlog.push(PendingOp { op, ticket });
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -1260,38 +1278,29 @@ unsafe impl IoBackend for Poller {
     let mut backlog = std::mem::take(&mut self.backlog);
     for entry in backlog.drain(..) {
       if matches!(entry.op, Op::Nop) {
-        self.queued_completed.push(OpCompleted::new(entry.registration_id, 0));
+        self.queued_completed.push(entry.report(0));
         continue;
       };
 
       if let Some(result) = Self::validate_op(&entry.op) {
-        self
-          .queued_completed
-          .push(OpCompleted::new(entry.registration_id, result));
+        self.queued_completed.push(entry.report(result));
         continue;
       }
 
       if Self::should_complete_immediately(&entry.op) {
         let result = Self::exec_op(&entry.op);
-        self
-          .queued_completed
-          .push(OpCompleted::new(entry.registration_id, result));
+        self.queued_completed.push(entry.report(result));
         continue;
       }
 
       if let Some(result) = Self::try_socket_immediately(&entry.op) {
-        self
-          .queued_completed
-          .push(OpCompleted::new(entry.registration_id, result));
+        self.queued_completed.push(entry.report(result));
         continue;
       }
 
       if let Op::Connect { fd, addr } = &entry.op {
         let Ok((storage, len)) = Self::lower_socket_addr(addr) else {
-          self.queued_completed.push(OpCompleted::new(
-            entry.registration_id,
-            -(libc::EINVAL as isize),
-          ));
+          self.queued_completed.push(entry.report(-(libc::EINVAL as isize)));
           continue;
         };
         let result = syscall!(raw connect(
@@ -1302,9 +1311,7 @@ unsafe impl IoBackend for Poller {
 
         match result {
           0 => {
-            self
-              .queued_completed
-              .push(OpCompleted::new(entry.registration_id, 0));
+            self.queued_completed.push(entry.report(0));
             continue;
           }
           #[allow(unreachable_patterns)]
@@ -1312,9 +1319,7 @@ unsafe impl IoBackend for Poller {
           #[cfg(unix)]
           x if x == -(libc::EINPROGRESS as isize) => {}
           _ => {
-            self
-              .queued_completed
-              .push(OpCompleted::new(entry.registration_id, result));
+            self.queued_completed.push(entry.report(result));
             continue;
           }
         }
@@ -1329,28 +1334,24 @@ unsafe impl IoBackend for Poller {
   }
 
   fn cancel(&mut self, id: u64) {
-    const CANCELED: isize = -(libc::ECANCELED as isize);
-    if let Some(index) =
-      self.backlog.iter().position(|entry| entry.registration_id == id)
+    if let Some(index) = self.backlog.iter().position(|entry| entry.id() == id)
     {
-      self.backlog.swap_remove(index);
-      self.queued_completed.push(OpCompleted::cancelled(id, CANCELED));
+      let entry = self.backlog.swap_remove(index);
+      self.queued_completed.push(entry.stopped());
       return;
     }
     // This backend performs the I/O itself once the descriptor is ready, so
     // nothing outside it uses the op's memory: it can be dropped right away.
-    let Some(key) =
-      self.pending.keys_where(|entry| entry.registration_id == id).next()
+    let Some(key) = self.pending.keys_where(|entry| entry.id() == id).next()
     else {
       return;
     };
     let Some(entry) = self.pending.remove_value(key) else {
       return;
     };
-    self.queued_completed.push(OpCompleted::cancelled(id, CANCELED));
-
     // The others waiting on its descriptor go on waiting.
     let (fd, interest) = self.extract_fd_interest(&entry.op);
+    self.queued_completed.push(entry.stopped());
     let Some(waiting) = self.waiters.get_mut(&fd) else {
       return;
     };
@@ -1376,8 +1377,10 @@ unsafe impl IoBackend for Poller {
   fn drain(&mut self) -> bool {
     // Readiness interest is the only thing the kernel holds. The bytes live
     // in `backlog` and `pending`, and this backend only dereferences them
-    // from `flush` and `wait`, so dropping them here releases every address.
-    self.backlog.clear();
+    // from `flush` and `wait`, so every operation can be given up here.
+    for entry in self.backlog.drain(..) {
+      entry.release();
+    }
     for (fd, waiting) in self.waiters.drain() {
       if waiting.registered
         && let Some(sys) = self.sys.as_ref()
@@ -1387,7 +1390,9 @@ unsafe impl IoBackend for Poller {
     }
     let keys: Vec<_> = self.pending.keys_where(|_| true).collect();
     for key in keys {
-      self.pending.remove(key);
+      if let Some(entry) = self.pending.remove_value(key) {
+        entry.release();
+      }
     }
     true
   }

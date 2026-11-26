@@ -50,7 +50,7 @@ use criterion::{
 };
 use lio::api::resource::Resource;
 use lio::backend::op::{BorrowedOp, Op};
-use lio::backend::{IoBackend, OpCompleted};
+use lio::backend::{IoBackend, OpCompleted, Ticket};
 use lio::model::{Cx, Next, OpModel, OpStream};
 use lio::time::Clock;
 use lio::{Lio, api};
@@ -76,11 +76,11 @@ const SLOT_IN_FLIGHT: u8 = 2;
 /// a batch cancel is not a scan.
 #[derive(Default)]
 struct BenchBackend {
-  queued: Vec<(u64, isize)>,
-  ready: Vec<(u64, isize)>,
+  queued: Vec<(Ticket, isize)>,
+  ready: Vec<(Ticket, isize)>,
   hold: bool,
   slots: Vec<u8>,
-  slot_id: Vec<u64>,
+  slot_ticket: Vec<Option<Ticket>>,
 }
 
 impl BenchBackend {
@@ -90,29 +90,25 @@ impl BenchBackend {
   }
 }
 
-// SAFETY: it never dereferences an address, so no lease needs to be held.
-unsafe impl IoBackend for BenchBackend {
+impl IoBackend for BenchBackend {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.queued.reserve(cap);
     self.ready.reserve(cap);
     if self.hold {
       self.slots.resize(cap, SLOT_EMPTY);
-      self.slot_id.resize(cap, 0);
+      self.slot_ticket.resize_with(cap, || None);
     }
     Ok(())
   }
 
-  fn push(
-    &mut self,
-    id: u64,
-    op: lio::backend::InFlight<'_>,
-    _step_bump: &mut Bump,
-  ) {
+  fn push(&mut self, op: lio::backend::InFlight<'_>, _step_bump: &mut Bump) {
     let result = match op.as_op() {
       Op::Nop => 0,
       Op::Read { .. } => BUFFER_LEN as isize,
       _ => panic!("bench backend only supports nop and read"),
     };
+    let (_, ticket) = op.into_parts();
+    let id = ticket.id();
     if self.hold {
       let slot = id as u32 as usize;
       assert!(
@@ -124,9 +120,9 @@ unsafe impl IoBackend for BenchBackend {
         "bench backend slot {slot} is still in use"
       );
       self.slots[slot] = SLOT_QUEUED;
-      self.slot_id[slot] = id;
+      self.slot_ticket[slot] = Some(ticket);
     } else {
-      self.queued.push((id, result));
+      self.queued.push((ticket, result));
     }
   }
 
@@ -147,20 +143,21 @@ unsafe impl IoBackend for BenchBackend {
     if self.hold {
       let slot = id as u32 as usize;
       if slot < self.slots.len()
-        && self.slot_id[slot] == id
         && (self.slots[slot] == SLOT_QUEUED
           || self.slots[slot] == SLOT_IN_FLIGHT)
+        && self.slot_ticket[slot].as_ref().is_some_and(|held| held.id() == id)
+        && let Some(ticket) = self.slot_ticket[slot].take()
       {
         self.slots[slot] = SLOT_EMPTY;
-        self.ready.push((id, CANCEL_RESULT));
+        self.ready.push((ticket, CANCEL_RESULT));
       }
       return;
     }
     if let Some(index) =
-      self.queued.iter().position(|(queued, _)| *queued == id)
+      self.queued.iter().position(|(queued, _)| queued.id() == id)
     {
-      self.queued.swap_remove(index);
-      self.ready.push((id, CANCEL_RESULT));
+      let (ticket, _) = self.queued.swap_remove(index);
+      self.ready.push((ticket, CANCEL_RESULT));
     }
   }
 
@@ -170,9 +167,16 @@ unsafe impl IoBackend for BenchBackend {
     completed: &mut Vec<OpCompleted>,
   ) -> io::Result<()> {
     completed.clear();
-    completed.extend(
-      self.ready.drain(..).map(|(id, result)| OpCompleted::new(id, result)),
-    );
+    // SAFETY: this backend never copies an address. Every buffer the
+    // benches submit is initialized for the length a read reports, and the
+    // only negative result is the one for a cancelled operation.
+    completed.extend(self.ready.drain(..).map(|(ticket, result)| unsafe {
+      if result < 0 {
+        ticket.cancelled(result)
+      } else {
+        ticket.complete(result)
+      }
+    }));
     Ok(())
   }
 
@@ -203,8 +207,7 @@ fn no_driver(criterion: &mut Criterion) {
           for id in 0..depth as u64 {
             // SAFETY: a no-op borrows nothing.
             backend.push(
-              id,
-              unsafe { lio::backend::InFlight::attest(BorrowedOp::nop()) },
+              unsafe { lio::backend::InFlight::attest(id, BorrowedOp::nop()) },
               &mut bump,
             );
           }

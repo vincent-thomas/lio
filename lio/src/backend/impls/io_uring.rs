@@ -48,10 +48,21 @@ mod single_socket_tests;
 struct PendingOp {
   registration_id: u64,
   op: Op,
-  // Held so the driver does not free the model while this entry is stored.
-  #[allow(dead_code)]
-  keep: crate::backend::Keep,
+  /// Given up when the kernel reports the request, or when it turns out
+  /// never to reach the kernel.
+  ticket: crate::backend::Ticket,
   lowered: LoweredState,
+}
+
+impl PendingOp {
+  /// Reports an operation that never reached the ring: it was performed on
+  /// this thread, or not at all. `result` is that syscall's, or an error.
+  fn finish_here(self, result: isize) -> OpCompleted {
+    // SAFETY: the kernel never saw this request, so nothing but this thread
+    // has its addresses, and this thread is done with them. The result is
+    // the immediate syscall's own, or an error, which claims nothing.
+    unsafe { self.ticket.complete(result) }
+  }
 }
 
 #[derive(Debug)]
@@ -646,12 +657,16 @@ impl IoUring {
       self.pending.remove_value(SlabKey::from_u64(user_data))
     {
       pending.lowered.finalize(result);
-      let id = pending.registration_id;
-      // The kernel reports a request it stopped this way, and nothing else.
-      completed.push(if result == -libc::ECANCELED {
-        OpCompleted::cancelled(id, result as isize)
-      } else {
-        OpCompleted::new(id, result as isize)
+      let ticket = pending.ticket;
+      // SAFETY: this is the request's own completion, so the kernel is done
+      // with its memory, and the result is the kernel's. The kernel reports
+      // a request it stopped with `ECANCELED`, and nothing else that way.
+      completed.push(unsafe {
+        if result == -libc::ECANCELED {
+          ticket.cancelled(result as isize)
+        } else {
+          ticket.complete(result as isize)
+        }
       });
     }
   }
@@ -1286,9 +1301,7 @@ impl IoUring {
   }
 }
 
-// SAFETY: each `PendingOp` stores its `Keep` until its CQE is reaped.
-// `drain` returns `true` only when `drain_in_flight` saw every entry finish.
-unsafe impl IoBackend for IoUring {
+impl IoBackend for IoUring {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.ring = Some(if self.deferred_completions {
       Self::create_ring_with(cap as u32, LioUring::with_params)?
@@ -1309,14 +1322,9 @@ unsafe impl IoBackend for IoUring {
     Ok(())
   }
 
-  fn push(
-    &mut self,
-    id: u64,
-    op: crate::backend::InFlight<'_>,
-    step_bump: &mut Bump,
-  ) {
-    // The model stays pinned while `keep` is stored with the operation.
-    let (op, keep) = op.into_parts();
+  fn push(&mut self, op: crate::backend::InFlight<'_>, step_bump: &mut Bump) {
+    let (op, ticket) = op.into_parts();
+    let id = ticket.id();
     assert!(
       self.backlog.len() + self.in_flight < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
@@ -1326,14 +1334,14 @@ unsafe impl IoBackend for IoUring {
       match LoweredState::lower_in(&op, step_bump, self.single_socket) {
         Ok(lowered) => lowered,
         Err(err) => {
-          self.queued_completed.push(OpCompleted::new(
-            id,
-            -(err.raw_os_error().unwrap_or(libc::EIO) as isize),
-          ));
+          let result = -(err.raw_os_error().unwrap_or(libc::EIO) as isize);
+          // SAFETY: the request was never built, so nothing has the
+          // operation's addresses. An error claims nothing about them.
+          self.queued_completed.push(unsafe { ticket.complete(result) });
           return;
         }
       };
-    self.backlog.push(PendingOp { registration_id: id, op, keep, lowered });
+    self.backlog.push(PendingOp { registration_id: id, op, ticket, lowered });
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -1378,9 +1386,7 @@ unsafe impl IoBackend for IoUring {
           validate_time += started.elapsed();
         }
         validated_ops += 1;
-        self
-          .queued_completed
-          .push(OpCompleted::new(entry.registration_id, result));
+        self.queued_completed.push(entry.finish_here(result));
         continue;
       }
       if let Some(started) = validate_started {
@@ -1389,7 +1395,7 @@ unsafe impl IoBackend for IoUring {
 
       if matches!(&entry.op, Op::Nop) {
         nop_ops += 1;
-        self.queued_completed.push(OpCompleted::new(entry.registration_id, 0));
+        self.queued_completed.push(entry.finish_here(0));
         continue;
       }
 
@@ -1404,9 +1410,7 @@ unsafe impl IoBackend for IoUring {
           Ok(value) => value,
           Err(err) => -(err.raw_os_error().unwrap_or(libc::EIO) as isize),
         };
-        self
-          .queued_completed
-          .push(OpCompleted::new(entry.registration_id, result));
+        self.queued_completed.push(entry.finish_here(result));
         continue;
       }
       if let Some(started) = immediate_started {
@@ -1440,7 +1444,20 @@ unsafe impl IoBackend for IoUring {
       let pending = unsafe { &*pending_ptr };
       let push_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
-      self.push_entry(pending, pending_key.as_u64(), &mut sq_space_left)?;
+      if let Err(err) =
+        self.push_entry(pending, pending_key.as_u64(), &mut sq_space_left)
+      {
+        // The request never reached the ring. It is reported with the
+        // error, like one performed here, so that it neither stays stored
+        // with a ticket nobody gives up nor takes the rest of the batch
+        // down with it.
+        let Some(entry) = self.pending.remove_value(pending_key) else {
+          unreachable!("the operation was stored just above");
+        };
+        let errno = err.raw_os_error().unwrap_or(libc::EIO);
+        self.queued_completed.push(entry.finish_here(-(errno as isize)));
+        continue;
+      }
       if let Some(started) = push_started {
         push_time += started.elapsed();
       }
@@ -1476,10 +1493,12 @@ unsafe impl IoBackend for IoUring {
     if let Some(index) =
       self.backlog.iter().position(|entry| entry.registration_id == id)
     {
-      self.backlog.swap_remove(index);
+      let entry = self.backlog.swap_remove(index);
+      // SAFETY: the request never reached the ring, so nothing has the
+      // operation's addresses.
       self
         .queued_completed
-        .push(OpCompleted::cancelled(id, -(libc::ECANCELED as isize)));
+        .push(unsafe { entry.ticket.cancelled(-(libc::ECANCELED as isize)) });
       return;
     }
     let Some(key) =
@@ -1502,6 +1521,14 @@ unsafe impl IoBackend for IoUring {
   }
 
   fn drain(&mut self) -> bool {
+    for entry in self.backlog.drain(..) {
+      // SAFETY: the request never reached the ring, so nothing has the
+      // operation's addresses.
+      unsafe { entry.ticket.release() };
+    }
+    // The requests the kernel reports while it drains are given up as their
+    // completions are dropped. The rest keep their tickets, which leaks
+    // their memory instead of freeing it under the kernel.
     self.drain_in_flight()
   }
 

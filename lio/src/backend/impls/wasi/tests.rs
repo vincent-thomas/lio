@@ -33,7 +33,7 @@ fn backend() -> Wasi {
 fn push(backend: &mut Wasi, id: u64, op: BorrowedOp<'_>) {
   // SAFETY: every buffer these tests submit outlives the `wait` that
   // returns its completion, or the `drain` that drops it.
-  backend.push(id, unsafe { InFlight::attest(op) }, &mut Bump::new());
+  backend.push(unsafe { InFlight::attest(id, op) }, &mut Bump::new());
 }
 
 /// Completions ready now, as `(id, result)`, ordered by id.

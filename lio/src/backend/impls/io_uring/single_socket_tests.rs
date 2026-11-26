@@ -26,8 +26,7 @@ fn complete(backend: &mut IoUring, arena: &mut Bump, op: Op) -> isize {
   // SAFETY: `op`'s buffers stay alive until `wait` returns below.
   unsafe {
     backend.push(
-      123,
-      crate::backend::InFlight::attest(BorrowedOp::from_op(op)),
+      crate::backend::InFlight::attest(123, BorrowedOp::from_op(op)),
       arena,
     )
   };

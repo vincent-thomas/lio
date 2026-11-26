@@ -60,7 +60,7 @@ use crate::backend::op::{
   UnlinkKind, WriteFlags, is_supported_socket, is_valid_file_offset,
   socket_addr_from_buf, socket_addr_into_buf,
 };
-use crate::backend::{InFlight, IoBackend, Keep, OpCompleted};
+use crate::backend::{InFlight, IoBackend, OpCompleted, Ticket};
 
 #[cfg(test)]
 mod tests;
@@ -941,8 +941,9 @@ struct Lane {
 struct Pending {
   /// Owns the paths the calls point into and keeps the resources open.
   op: Op,
-  /// Keeps the operation's buffers allocated.
-  _keep: Keep,
+  /// The right to report the operation, which keeps its buffers allocated
+  /// until then.
+  ticket: Ticket,
   /// The lane this operation holds until it is reported.
   lane: Option<LaneKey>,
   stage: Stage,
@@ -973,7 +974,7 @@ pub struct Wasi {
   id: u64,
   queue: Queue,
   /// Pushed but not yet flushed.
-  queued: Vec<(u64, Op, Keep)>,
+  queued: Vec<(Op, Ticket)>,
   /// Boxed so that an operation's storage does not move while the host
   /// writes into it.
   ops: HashMap<u64, Box<Pending>>,
@@ -1088,16 +1089,26 @@ impl Wasi {
       Ok(()) => {
         self.ops.insert(id, pending);
       }
-      Err(result) => self.finish(id, pending, result),
+      Err(result) => self.finish(pending, result),
     }
   }
 
   /// Reports an operation, frees what it held, and lets the next one onto
   /// its lane.
-  fn finish(&mut self, id: u64, pending: Box<Pending>, result: isize) {
-    let lane = pending.lane;
-    self.ready.push(OpCompleted::new(id, result));
-    drop(pending);
+  fn finish(&mut self, pending: Box<Pending>, result: isize) {
+    let Pending { op, ticket, lane, stage } = *pending;
+    // SAFETY: the host has finished every step of the operation, or
+    // confirmed that it stopped the one in flight, so it no longer uses the
+    // operation's memory. The result is the host's. Only a step the host
+    // stopped reports `CANCELLED`.
+    self.ready.push(unsafe {
+      if result == CANCELLED {
+        ticket.cancelled(result)
+      } else {
+        ticket.complete(result)
+      }
+    });
+    drop((op, stage));
     self.close_deferred();
     let Some(key) = lane else {
       return;
@@ -1717,7 +1728,7 @@ impl Wasi {
       unreachable!("a completion for an operation that is not in flight")
     };
     match self.advance(id, &mut pending, done.outcome()) {
-      Some(result) => self.finish(id, pending, result),
+      Some(result) => self.finish(pending, result),
       None => {
         self.ops.insert(id, pending);
       }
@@ -2239,18 +2250,7 @@ fn open_flags(
   Ok((open, descriptor))
 }
 
-// SAFETY:
-// - Each pushed operation's `Keep` lives in its `Pending` (or in `queued`)
-//   until the operation is reported or drained.
-// - An operation is reported once: when its last step completes, or with a
-//   cancellation after the host confirmed it stopped. `lio_wasi::Queue`
-//   cancels synchronously, so the host no longer uses the operation's
-//   memory when the cancelled completion is handled.
-// - Results are what the host returned. A new resource is a fresh table
-//   entry, closed by `close_resource`.
-// - Nothing runs between calls: a component has one thread, and the host
-//   only writes while this backend waits.
-unsafe impl IoBackend for Wasi {
+impl IoBackend for Wasi {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.queued.reserve(cap);
     self.ops.reserve(cap);
@@ -2262,26 +2262,29 @@ unsafe impl IoBackend for Wasi {
     ResourceClose::with(close_resource)
   }
 
-  fn push(&mut self, id: u64, op: InFlight<'_>, _step_bump: &mut Bump) {
-    let (op, keep) = op.into_parts();
-    self.queued.push((id, op, keep));
+  fn push(&mut self, op: InFlight<'_>, _step_bump: &mut Bump) {
+    self.queued.push(op.into_parts());
   }
 
   fn flush(&mut self) -> io::Result<()> {
     self.close_deferred();
-    for (id, op, keep) in std::mem::take(&mut self.queued) {
+    for (op, ticket) in std::mem::take(&mut self.queued) {
+      let id = ticket.id();
       let pending =
-        Box::new(Pending { op, _keep: keep, lane: None, stage: Stage::Queued });
+        Box::new(Pending { op, ticket, lane: None, stage: Stage::Queued });
       self.start(id, pending);
     }
     Ok(())
   }
 
   fn cancel(&mut self, id: u64) {
-    if let Some(at) = self.queued.iter().position(|(queued, ..)| *queued == id)
+    if let Some(at) =
+      self.queued.iter().position(|(_, ticket)| ticket.id() == id)
     {
-      self.queued.swap_remove(at);
-      self.ready.push(OpCompleted::new(id, CANCELLED));
+      let (_, ticket) = self.queued.swap_remove(at);
+      // SAFETY: the operation was never started, so the host never saw its
+      // addresses.
+      self.ready.push(unsafe { ticket.cancelled(CANCELLED) });
       return;
     }
     let waiting = match self.ops.get(&id).map(|pending| &pending.stage) {
@@ -2293,8 +2296,12 @@ unsafe impl IoBackend for Wasi {
       for lane in self.lanes.values_mut() {
         lane.waiting.retain(|queued| *queued != id);
       }
-      self.ops.remove(&id);
-      self.ready.push(OpCompleted::new(id, CANCELLED));
+      let Some(pending) = self.ops.remove(&id) else {
+        unreachable!("the operation was just found in `ops`")
+      };
+      // SAFETY: the operation was waiting for its lane and never started,
+      // so the host never saw its addresses.
+      self.ready.push(unsafe { pending.ticket.cancelled(CANCELLED) });
       self.close_deferred();
       return;
     }
@@ -2305,12 +2312,19 @@ unsafe impl IoBackend for Wasi {
   }
 
   fn drain(&mut self) -> bool {
-    self.queued.clear();
+    for (_, ticket) in self.queued.drain(..) {
+      // SAFETY: the operation was never started, so the host never saw its
+      // addresses.
+      unsafe { ticket.release() };
+    }
     // Operations waiting for a lane never started. Dropping them first
     // keeps a finishing operation from starting one.
     for lane in self.lanes.values_mut() {
       for id in lane.waiting.drain(..) {
-        self.ops.remove(&id);
+        if let Some(pending) = self.ops.remove(&id) {
+          // SAFETY: as above, the operation never started.
+          unsafe { pending.ticket.release() };
+        }
       }
     }
     // A cancel only finds a step that is still in flight. If the step had
@@ -2328,7 +2342,11 @@ unsafe impl IoBackend for Wasi {
         break;
       }
     }
-    self.ops.clear();
+    for (_, pending) in self.ops.drain() {
+      // SAFETY: the loop above ended with nothing outstanding in the queue,
+      // so the host holds no step of any operation.
+      unsafe { pending.ticket.release() };
+    }
     self.ready.clear();
     self.close_deferred();
     true

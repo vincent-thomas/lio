@@ -258,22 +258,20 @@ const MAX_BLOCK: Duration = Duration::from_secs(2);
 /// like a real backend would.
 #[derive(Default)]
 struct InOrderBackend {
-  queued: Vec<u64>,
+  queued: Vec<lio::backend::Ticket>,
 }
 
-// SAFETY: it never dereferences an address, so no lease needs to be held.
-unsafe impl lio::backend::IoBackend for InOrderBackend {
+impl lio::backend::IoBackend for InOrderBackend {
   fn init(&mut self, _cap: usize) -> std::io::Result<()> {
     Ok(())
   }
 
   fn push(
     &mut self,
-    id: u64,
-    _op: lio::backend::InFlight<'_>,
+    op: lio::backend::InFlight<'_>,
     _step_bump: &mut bumpalo::Bump,
   ) {
-    self.queued.push(id);
+    self.queued.push(op.into_parts().1);
   }
 
   fn flush(&mut self) -> std::io::Result<()> {
@@ -289,8 +287,10 @@ unsafe impl lio::backend::IoBackend for InOrderBackend {
     if self.queued.is_empty() {
       std::thread::sleep(timeout.unwrap_or(Duration::MAX).min(MAX_BLOCK));
     }
+    // SAFETY: it never copied an address, and reports only nops, for which
+    // 0 is what happened.
     completed.extend(
-      self.queued.drain(..).map(|id| lio::backend::OpCompleted::new(id, 0)),
+      self.queued.drain(..).map(|ticket| unsafe { ticket.complete(0) }),
     );
     Ok(())
   }

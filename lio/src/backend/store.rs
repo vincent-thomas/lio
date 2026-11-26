@@ -210,6 +210,19 @@ impl OpStore {
     self.slots.get_mut(key).is_some_and(|slot| slot.lease.held_elsewhere())
   }
 
+  /// Whether a share of the lease of any stored operation is still held
+  /// outside the store: by a ticket that was never given up, or by a
+  /// completion that is still alive.
+  pub fn any_lease_held(&mut self) -> bool {
+    let mut held = false;
+    self.slots.for_each_occupied(|slot| {
+      if slot.lease.held_elsewhere() {
+        held = true;
+      }
+    });
+    held
+  }
+
   /// Frees slot `id` and drops its registration where it is.
   ///
   /// For a registration whose drop runs no user code. Returns whether the
