@@ -267,10 +267,12 @@ fn worker_loop(
     };
     let Ok(BlockingJob { op, keep }) = job else { return };
     if shutting_down.load(Ordering::SeqCst) {
-      // The backend is going away; nobody will reap this.
+      // The backend is going away; nobody will reap this. The worker goes
+      // on taking jobs until the queue is empty and closed, so that every
+      // job still queued is given up, not only the first.
       // SAFETY: the job was not run, so nothing has used its addresses.
       unsafe { keep.release() };
-      return;
+      continue;
     }
     let result = run_blocking(op);
     // The ticket travels with the result: whoever reaps it reports it.
