@@ -1444,7 +1444,20 @@ impl IoBackend for IoUring {
       let pending = unsafe { &*pending_ptr };
       let push_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
-      self.push_entry(pending, pending_key.as_u64(), &mut sq_space_left)?;
+      if let Err(err) =
+        self.push_entry(pending, pending_key.as_u64(), &mut sq_space_left)
+      {
+        // The request never reached the ring. It is reported with the
+        // error, like one performed here, so that it neither stays stored
+        // with a ticket nobody gives up nor takes the rest of the batch
+        // down with it.
+        let Some(entry) = self.pending.remove_value(pending_key) else {
+          unreachable!("the operation was stored just above");
+        };
+        let errno = err.raw_os_error().unwrap_or(libc::EIO);
+        self.queued_completed.push(entry.finish_here(-(errno as isize)));
+        continue;
+      }
       if let Some(started) = push_started {
         push_time += started.elapsed();
       }
