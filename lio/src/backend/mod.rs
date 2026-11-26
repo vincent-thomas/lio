@@ -224,6 +224,10 @@ impl OpCompleted {
 ///
 /// A ticket that is dropped without either leaks the operation's memory:
 /// forgetting one is a leak, never a use after free.
+///
+/// An address copied from an [`Op`] may be used only by whoever holds that
+/// operation's ticket. That is the rule the `unsafe` blocks of a backend
+/// answer to.
 pub trait IoBackend {
   /// Initialize backend with capacity for `cap` concurrent operations.
   ///
@@ -408,7 +412,19 @@ impl Ticket {
 /// call returned.
 pub struct InFlight<'a> {
   op: BorrowedOp<'a>,
-  ticket: Ticket,
+  /// `None` once [`into_parts`](Self::into_parts) has handed it out.
+  ticket: Option<Ticket>,
+}
+
+impl Drop for InFlight<'_> {
+  fn drop(&mut self) {
+    if let Some(ticket) = self.ticket.take() {
+      // SAFETY: the ticket was never handed out, and an address from the
+      // operation may only be used by whoever holds its ticket, so nothing
+      // uses one.
+      unsafe { ticket.release() };
+    }
+  }
 }
 
 impl<'a> InFlight<'a> {
@@ -418,13 +434,14 @@ impl<'a> InFlight<'a> {
   /// the action, and does not move or drop that memory until the backend
   /// has given the ticket up.
   pub(crate) fn from_model(id: u64, op: BorrowedOp<'a>, keep: Keep) -> Self {
-    Self { op, ticket: Ticket { id, keep: std::mem::ManuallyDrop::new(keep) } }
+    let ticket = Ticket { id, keep: std::mem::ManuallyDrop::new(keep) };
+    Self { op, ticket: Some(ticket) }
   }
 
   /// Puts an operation and its ticket back together, to hand both on to
   /// another backend.
   pub(crate) fn from_parts(op: BorrowedOp<'a>, ticket: Ticket) -> Self {
-    Self { op, ticket }
+    Self { op, ticket: Some(ticket) }
   }
 
   /// Wraps an operation whose buffers the caller keeps alive itself.
@@ -446,7 +463,10 @@ impl<'a> InFlight<'a> {
   /// The id the driver knows the operation by.
   #[inline]
   pub fn id(&self) -> u64 {
-    self.ticket.id
+    let Some(ticket) = self.ticket.as_ref() else {
+      unreachable!("an `InFlight` holds its ticket until it is taken apart");
+    };
+    ticket.id
   }
 
   /// The operation the backend copies addresses out of.
@@ -458,9 +478,14 @@ impl<'a> InFlight<'a> {
   /// The operation, and the ticket to report it with.
   ///
   /// Keep the [`Ticket`] with every copy of the addresses, and give it up
-  /// only once those copies are gone.
+  /// only once those copies are gone. An address may be used only by
+  /// whoever holds the ticket: an `InFlight` that is dropped whole gives its
+  /// operation up.
   #[inline]
-  pub fn into_parts(self) -> (Op, Ticket) {
-    (self.op.as_op().clone(), self.ticket)
+  pub fn into_parts(mut self) -> (Op, Ticket) {
+    let Some(ticket) = self.ticket.take() else {
+      unreachable!("an `InFlight` holds its ticket until it is taken apart");
+    };
+    (self.op.as_op().clone(), ticket)
   }
 }

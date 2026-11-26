@@ -934,6 +934,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg_attr(miri, ignore = "leaks the operation's memory on purpose")]
   fn an_operation_whose_result_could_not_be_read_frees_its_slot() {
     let drops = Rc::new(Cell::new(0));
     let mut arena = Bump::new();
