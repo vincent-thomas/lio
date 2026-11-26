@@ -14,7 +14,7 @@ use lio::api::{self, Io, OpenFlags};
 use lio::backend::ds::{DSBackend, DSConfig};
 use lio::backend::op::Op;
 use lio::backend::testing::{Checked, POISON, ScriptedBackend};
-use lio::model::{self, Cx, Join, Next, OpModel, OpStream, Step, Task};
+use lio::model::{Cx, Join, Next, OpModel, OpStream, Step, Task};
 use lio::{BufResult, Lio};
 
 /// A read into a `Vec`, as `api::read` returns it.
@@ -33,7 +33,9 @@ where
 {
   let items = Rc::new(RefCell::new(Vec::new()));
   let sink = Rc::clone(&items);
-  let task = model::spawn(lio, model, move |item| sink.borrow_mut().push(item));
+  let task = api::run(model)
+    .with_lio(lio)
+    .when_done(move |item| sink.borrow_mut().push(item));
   (items, task)
 }
 
@@ -329,11 +331,9 @@ fn a_stream_yields_until_it_is_done() {
   let read = api::read(&from, Vec::<u8>::with_capacity(4));
   let items = Rc::new(RefCell::new(Vec::new()));
   let sink = Rc::clone(&items);
-  let _task = model::spawn_stream(
-    &lio,
-    Chunks { from, read, ended: false },
-    move |item| sink.borrow_mut().push(item),
-  );
+  let _task = api::run_stream(Chunks { from, read, ended: false })
+    .with_lio(&lio)
+    .for_each(move |item| sink.borrow_mut().push(item));
 
   finish_only(&backend, &lio, 4);
   finish_only(&backend, &lio, 2);
@@ -549,11 +549,9 @@ fn an_operation_in_flight_can_move_to_another_model() {
   let (backend, lio) = scripted(2);
   let out = Rc::new(RefCell::new(None));
   let read = api::read(&Resource::stdin(), Vec::with_capacity(8));
-  let _task = model::spawn(
-    &lio,
-    Leaks { read: Some(read), out: Rc::clone(&out) },
-    |()| {},
-  );
+  let _task = api::run(Leaks { read: Some(read), out: Rc::clone(&out) })
+    .with_lio(&lio)
+    .when_done(|()| {});
   // The model that started the read is done. The read is still in flight,
   // in that model's slot, and its ticket is here.
   let in_flight = out.borrow_mut().take().unwrap();
@@ -617,11 +615,10 @@ fn an_operation_waiting_for_a_slot_can_move_to_another_model() {
 
   // The first read fills the driver: the second waits for a slot.
   let read = || api::read(&Resource::stdin(), Vec::with_capacity(8));
-  let _task = model::spawn(
-    &lio,
-    HandsOut { reads: Some([read(), read()]), out: Rc::clone(&out) },
-    |()| {},
-  );
+  let _task =
+    api::run(HandsOut { reads: Some([read(), read()]), out: Rc::clone(&out) })
+      .with_lio(&lio)
+      .when_done(|()| {});
   assert_eq!(backend.pushed().len(), 2);
 
   // The other model takes the waiting read over, and asks for its result

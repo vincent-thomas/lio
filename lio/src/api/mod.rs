@@ -26,9 +26,8 @@
 //! ## Composing
 //!
 //! An [`Io`] is also an [`OpModel`](crate::model::OpModel): it goes
-//! straight into a [`Join`](crate::model::Join),
-//! [`model::spawn`](crate::model::spawn), or a model of your own, which
-//! polls it. [`run`] makes an `Io` of a model of your own, so it is run the
+//! straight into a [`Join`](crate::model::Join) or a model of your own,
+//! which polls it. [`run`] makes an `Io` of a model of your own, so it is run the
 //! same way, and [`run_stream`] does that for a stream.
 //!
 //! # Buffer Ownership

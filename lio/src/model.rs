@@ -20,14 +20,13 @@
 //!
 //! [`api::run`](crate::api::run) runs a model of yours the way lio's own
 //! are run, and [`api::run_stream`](crate::api::run_stream) does the same
-//! for a stream. [`spawn`] and [`spawn_stream`] here take the driver and a
-//! callback, and give you a handle to cancel by.
+//! for a stream.
 //!
 //! ```
 //! use lio::Lio;
 //! use lio::api::{self, ops, resource::Resource};
 //! use lio::backend::testing::ScriptedBackend;
-//! use lio::model::{self, Cx, OpModel, Step};
+//! use lio::model::{Cx, OpModel, Step};
 //! use lio::ready;
 //!
 //! /// Reads twice from the same resource, one read after the other.
@@ -66,7 +65,9 @@
 //!   from,
 //!   first: None,
 //! };
-//! model::spawn(&lio, model, |total| assert_eq!(total.unwrap(), 6));
+//! api::run(model)
+//!   .with_lio(&lio)
+//!   .when_done(|total| assert_eq!(total.unwrap(), 6));
 //! while lio.try_run().unwrap() > 0 {}
 //! ```
 //!
@@ -393,7 +394,7 @@ impl Task {
 /// The model moves into the driver, which polls it for the first time here
 /// and then whenever one of its operations finishes, while `lio` runs.
 /// Over the driver's capacity it starts once a slot is free.
-pub fn spawn<M>(
+pub(crate) fn spawn<M>(
   lio: &Lio,
   model: M,
   mut on_done: impl FnMut(M::Item) + 'static,
@@ -411,7 +412,7 @@ where
 ///
 /// As [`spawn`], for work that produces several items. It runs until it
 /// ends or the handle cancels it.
-pub fn spawn_stream<S>(
+pub(crate) fn spawn_stream<S>(
   lio: &Lio,
   stream: S,
   mut on_item: impl FnMut(S::Item) + 'static,

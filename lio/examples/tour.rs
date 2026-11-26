@@ -25,7 +25,7 @@ use std::time::Duration;
 use lio::api::ops::{Read, Write};
 use lio::api::resource::{IntoResource, Resource};
 use lio::api::{self, FileMode, Io, OpenFlags, ShutdownHow};
-use lio::model::{self, Cx, Next, OpModel, OpStream, Step};
+use lio::model::{Cx, Next, OpModel, OpStream, Step};
 use lio::net::{TcpListener, TcpStream};
 use lio::{Lio, fs};
 
@@ -339,10 +339,10 @@ fn models(lio: &Lio, dir: &Path) -> io::Result<()> {
     io::Result::Ok(())
   })?;
 
-  // `spawn_stream` hands every item to a callback, and gives back a handle that
+  // `for_each` hands every item to a callback, and gives back a handle that
   // can stop the model.
   let ticks = api::interval(Duration::from_millis(1));
-  let task = model::spawn_stream(lio, ticks, |tick| println!("tick: {tick:?}"));
+  let task = ticks.with_lio(lio).for_each(|tick| println!("tick: {tick:?}"));
   // One tick per run. Dropping the handle would leave the model running:
   // cancelling stops it here.
   lio.run()?;
