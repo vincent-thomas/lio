@@ -28,6 +28,8 @@ pub(crate) const EVENT_SUBTASK: u32 = 1;
 pub(crate) const EVENT_STREAM_READ: u32 = 2;
 /// A blocked `stream.write` finished.
 pub(crate) const EVENT_STREAM_WRITE: u32 = 3;
+/// A blocked `future.read` finished.
+pub(crate) const EVENT_FUTURE_READ: u32 = 4;
 
 /// A call's state: the callee has not taken the arguments yet.
 pub(crate) const STATUS_STARTING: u32 = 0;
@@ -177,3 +179,36 @@ impl Drop for WaitableSet {
     unsafe { imports::set_drop(self.0.get()) }
   }
 }
+
+/// Declares async-lowered imports of one WASI interface as `mod imports`.
+///
+/// Off wasm there is no component-model host to call, so each import
+/// becomes a function that panics: reaching one is misuse.
+macro_rules! wasm_imports {
+  ($module:literal {
+    $( $link:literal fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> i32; )*
+  }) => {
+    #[cfg(target_arch = "wasm32")]
+    mod imports {
+      #[link(wasm_import_module = $module)]
+      unsafe extern "C" {
+        $(
+          #[link_name = $link]
+          pub(super) fn $name($($arg: $ty),*) -> i32;
+        )*
+      }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod imports {
+      $(
+        pub(super) unsafe fn $name($($arg: $ty),*) -> i32 {
+          $( let _ = $arg; )*
+          panic!("lio-wasi runs only inside a WebAssembly component")
+        }
+      )*
+    }
+  };
+}
+
+pub(crate) use wasm_imports;

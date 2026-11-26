@@ -2,7 +2,9 @@
 
 use core::time::Duration;
 
-use crate::{Call, sealed};
+use crate::Call;
+use crate::sealed::{self, Started};
+use crate::sys::wasm_imports;
 
 /// Completes after a duration has passed, like a one-shot timer.
 ///
@@ -26,31 +28,48 @@ impl WaitFor {
 impl Call for WaitFor {}
 
 impl sealed::Sealed for WaitFor {
-  unsafe fn start(&mut self) -> u32 {
+  unsafe fn start(&mut self) -> Started {
     // The canonical ABI passes a `u64` as an `i64` with the same bits.
     let nanos = self.nanos.cast_signed();
     // SAFETY: the argument is passed by value and there is no result, so
     // the host keeps no pointer into this component.
-    unsafe { imports::wait_for(nanos) as u32 }
+    Started::Subtask(unsafe { imports::wait_for(nanos) } as u32)
   }
 }
 
-#[cfg(target_arch = "wasm32")]
-mod imports {
-  #[link(wasm_import_module = "wasi:clocks/monotonic-clock@0.3.2")]
-  unsafe extern "C" {
-    #[link_name = "[async-lower]wait-for"]
-    pub(super) fn wait_for(how_long: i64) -> i32;
+/// Completes when the monotonic clock reaches a mark, like an absolute
+/// timer.
+///
+/// A mark is a count of nanoseconds on the clock that
+/// `wasip3::clocks::monotonic_clock::now` reads. Like [`WaitFor`], it has no
+/// result.
+#[derive(Clone, Copy, Debug)]
+pub struct WaitUntil {
+  mark: u64,
+}
+
+impl WaitUntil {
+  /// A timer for the moment the clock reads `mark`.
+  pub fn new(mark: u64) -> Self {
+    Self { mark }
   }
 }
 
-/// See `sys::imports`: there is no host to call off wasm.
-#[cfg(not(target_arch = "wasm32"))]
-mod imports {
-  pub(super) unsafe fn wait_for(_how_long: i64) -> i32 {
-    panic!("lio-wasi runs only inside a WebAssembly component")
+impl Call for WaitUntil {}
+
+impl sealed::Sealed for WaitUntil {
+  unsafe fn start(&mut self) -> Started {
+    // SAFETY: as for `WaitFor`.
+    Started::Subtask(
+      unsafe { imports::wait_until(self.mark.cast_signed()) } as u32
+    )
   }
 }
+
+wasm_imports!("wasi:clocks/monotonic-clock@0.3.2" {
+  "[async-lower]wait-for" fn wait_for(how_long: i64) -> i32;
+  "[async-lower]wait-until" fn wait_until(when: i64) -> i32;
+});
 
 #[cfg(test)]
 mod tests {

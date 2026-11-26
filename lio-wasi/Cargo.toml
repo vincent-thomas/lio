@@ -8,6 +8,7 @@ repository = "https://github.com/vincent-thomas/lio"
 documentation = "https://docs.rs/lio-wasi"
 keywords = ["wasi", "async", "io", "wasm", "component-model"]
 categories = ["asynchronous", "wasm", "network-programming"]
+readme = "README.md"
 
 [package.metadata.docs.rs]
 default-target = "wasm32-wasip3"
