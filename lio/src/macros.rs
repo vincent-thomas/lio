@@ -179,12 +179,48 @@ macro_rules! action_io {
   }};
 }
 
-/// Gives one of lio's model types the ways to run it: `.await`, and the
-/// methods that hand it to [`Io`](crate::api::Io).
+/// Gives a model type the ways to run it: `.await`, `when_done`, `send`,
+/// `send_with`, and `with_lio` to name the driver.
 ///
-/// A model of your own gets the same through
-/// [`api::run`](crate::api::run): Rust has no way to implement `.await` for
-/// every [`OpModel`](crate::model::OpModel) at once.
+/// Every operation and model lio provides has these. Use this for a model
+/// of your own, so it is run the same way:
+///
+/// ```
+/// use lio::api;
+/// use lio::backend::testing::ScriptedBackend;
+/// use lio::model::{Cx, OpModel, Step};
+///
+/// struct Twice(api::ops::Nop, bool);
+///
+/// impl OpModel for Twice {
+///   type Item = std::io::Result<()>;
+///
+///   fn poll(&mut self, cx: &mut Cx<'_>) -> Step<Self::Item> {
+///     loop {
+///       if let Err(err) = lio::ready!(self.0.poll(cx)) {
+///         return Step::Done(Err(err));
+///       }
+///       if std::mem::replace(&mut self.1, true) {
+///         return Step::Done(Ok(()));
+///       }
+///       self.0 = api::nop();
+///     }
+///   }
+/// }
+///
+/// lio::runnable!(Twice);
+///
+/// let lio = lio::Lio::new_with_backend(ScriptedBackend::auto(0), 4).unwrap();
+/// Twice(api::nop(), false).with_lio(&lio).when_done(|result| result.unwrap());
+/// while lio.try_run().unwrap() > 0 {}
+/// ```
+///
+/// A type with parameters lists them first:
+/// `lio::runnable!([B: IoBuf] WriteAll<B>)`.
+///
+/// It is a macro because Rust cannot implement `.await` for every
+/// [`OpModel`](crate::model::OpModel) at once.
+#[macro_export]
 macro_rules! runnable {
   ([$($generics:tt)*] $ty:ty) => {
     impl<$($generics)*> $ty
@@ -212,7 +248,7 @@ macro_rules! runnable {
       #[inline]
       pub fn send(
         self,
-      ) -> $crate::api::io::Receiver<<Self as $crate::model::OpModel>::Item>
+      ) -> $crate::api::Receiver<<Self as $crate::model::OpModel>::Item>
       where
         <Self as $crate::model::OpModel>::Item: ::std::marker::Send + 'static,
       {
@@ -246,6 +282,9 @@ macro_rules! runnable {
         $crate::api::Io::from_op(self).into_future()
       }
     }
+  };
+  ($ty:ty) => {
+    $crate::runnable!([] $ty);
   };
 }
 
