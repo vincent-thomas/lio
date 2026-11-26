@@ -123,8 +123,8 @@ impl Driver for Lio {
 }
 
 /// An `Io` that has not been given a driver is a model like any other: it
-/// goes into a [`Join`](crate::model::Join), [`model::spawn`], or a model
-/// of your own, which polls it.
+/// goes into a [`Join`](crate::model::Join) or a model of your own, which
+/// polls it.
 ///
 /// One that names its driver is not, so a driver chosen for a part of a
 /// model, which could not be honoured, does not compile:
@@ -226,7 +226,8 @@ where
   where
     T::Item: Send + 'static,
   {
-    self.when_done(move |res| {
+    // The handle is dropped: the model runs until it is done.
+    let _task = self.when_done(move |res| {
       let _ = sender.send(res);
     });
   }
@@ -236,6 +237,9 @@ where
   /// The callback runs during [`Lio::run`](crate::Lio::run) (or a sibling),
   /// without the driver locked: it may schedule follow-up operations on the
   /// same `Lio`, drop other in-flight operations, or drive the loop itself.
+  ///
+  /// Returns a handle to [`cancel`](Task::cancel) the model by. Dropping
+  /// the handle leaves it running.
   ///
   /// # Example
   ///
@@ -269,13 +273,12 @@ where
   /// }
   /// ```
   #[inline]
-  pub fn when_done<F>(self, f: F)
+  pub fn when_done<F>(self, f: F) -> Task
   where
-    F: Fn(T::Item) + 'static,
+    F: FnMut(T::Item) + 'static,
   {
     let (lio, op) = self.into_lio();
-    // The handle is dropped: the model runs until it is done.
-    let _task = model::spawn(&lio, op, f);
+    model::spawn(&lio, op, f)
   }
 }
 
@@ -500,8 +503,7 @@ pub struct IoStream<T, D = Installed> {
 }
 
 /// An `IoStream` that has not been given a driver is a stream like any
-/// other, to poll from a stream of your own or hand to
-/// [`model::spawn_stream`].
+/// other, to poll from a stream of your own.
 impl<T: OpStream> OpStream for IoStream<T, Installed> {
   type Item = T::Item;
 
@@ -604,6 +606,18 @@ where
   /// [`next`](Items::next) at a time.
   pub fn start(self) -> Items<T> {
     Items { state: ItemsState::Pending(self.op), lio: self.driver.into_lio() }
+  }
+
+  /// Runs the stream and calls `f` with every item.
+  ///
+  /// Returns a handle to [`cancel`](Task::cancel) the stream by. Dropping
+  /// the handle leaves it running until it ends.
+  pub fn for_each<F>(self, f: F) -> Task
+  where
+    F: FnMut(T::Item) + 'static,
+  {
+    let lio = self.driver.into_lio();
+    model::spawn_stream(&lio, self.op, f)
   }
 
   /// Runs the stream and gives a receiver for its items.
