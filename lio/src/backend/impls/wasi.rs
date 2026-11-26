@@ -21,7 +21,8 @@
 //!
 //! A WASI stream carries one read or write at a time. Operations on the
 //! same standard stream, or the same direction of a TCP socket, wait their
-//! turn in a [`Lane`].
+//! turn in a [`Lane`]. So do a file's reads and writes without an offset,
+//! which share its cursor.
 //!
 //! # What is supported
 //!
@@ -823,6 +824,8 @@ enum Phase {
   Status,
   /// The data is written; the requested sync is running.
   Sync,
+  /// An append is done; the file's new size is being read for its cursor.
+  Position,
 }
 
 /// A read or write: bytes moved over a stream, buffer by buffer.
@@ -844,6 +847,9 @@ struct Transfer {
   /// A sync to run after the data is written.
   sync: Option<fs::Sync<'static>>,
   sync_data: Option<fs::SyncData<'static>>,
+  /// Reads the file's size after an append at the cursor, which leaves the
+  /// cursor at the new end of the file.
+  position: Option<fs::Stat<'static>>,
   phase: Phase,
   /// The buffer being filled or drained, and how far into it.
   index: usize,
@@ -865,6 +871,7 @@ impl Transfer {
       broken: false,
       sync: None,
       sync_data: None,
+      position: None,
       phase: Phase::Data,
       index: 0,
       within: 0,
@@ -908,10 +915,12 @@ fn buffer(op: &Op, index: usize) -> Option<(*mut u8, usize)> {
 }
 
 /// Which direction of a resource an operation uses.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Way {
   In,
   Out,
+  /// A file's cursor, which reads and writes without an offset share.
+  Cursor,
 }
 
 /// One direction of a standard stream or TCP socket.
@@ -1045,8 +1054,15 @@ impl Wasi {
       Op::Write { fd, .. } | Op::Send { fd, .. } => (fd.as_raw_fd(), Way::Out),
       _ => return None,
     };
+    let at_cursor = matches!(
+      op,
+      Op::Read { offset: None, .. } | Op::Write { offset: None, .. }
+    );
     match with_table(|table| table.kind(raw)) {
       Some(Kind::Standard | Kind::Tcp) => Some((raw, way)),
+      // Each operation starts where the one before it stopped, so they
+      // run one at a time. An operation with its own offset does not wait.
+      Some(Kind::File) if at_cursor => Some((raw, Way::Cursor)),
       _ => None,
     }
   }
@@ -1522,36 +1538,46 @@ impl Wasi {
       }
       Some(Kind::File) => {
         let append = flags.contains(WriteFlags::APPEND);
-        let (stream, status, sync, sync_data) = with_table(|table| {
-          let file = table.file(raw).map_err(fail)?;
-          let at = offset.unwrap_or(file.cursor);
-          // SAFETY: the `Resource` in `pending.op` keeps the file open
-          // until these calls are dropped.
-          let descriptor = unsafe { held(&file.descriptor) };
-          let (stream, status) = if writing {
-            let (writer, reader) = wasip3::wit_stream::new::<u8>();
-            let status = if append || (offset.is_none() && file.append) {
-              descriptor.append_via_stream(reader)
+        let (stream, status, sync, sync_data, position) =
+          with_table(|table| {
+            let file = table.file(raw).map_err(fail)?;
+            let at = offset.unwrap_or(file.cursor);
+            // SAFETY: the `Resource` in `pending.op` keeps the file open
+            // until these calls are dropped.
+            let descriptor = unsafe { held(&file.descriptor) };
+            let appends =
+              writing && (append || (offset.is_none() && file.append));
+            let (stream, status) = if writing {
+              let (writer, reader) = wasip3::wit_stream::new::<u8>();
+              let status = if appends {
+                descriptor.append_via_stream(reader)
+              } else {
+                descriptor.write_via_stream(reader, at)
+              };
+              (Stream::Write(self.queue.add_writer(writer)), status)
             } else {
-              descriptor.write_via_stream(reader, at)
+              let (reader, status) = descriptor.read_via_stream(at);
+              (Stream::Read(self.queue.add_reader(reader)), status)
             };
-            (Stream::Write(self.queue.add_writer(writer)), status)
-          } else {
-            let (reader, status) = descriptor.read_via_stream(at);
-            (Stream::Read(self.queue.add_reader(reader)), status)
-          };
-          let sync =
-            flags.contains(WriteFlags::SYNC).then(|| fs::Sync::new(descriptor));
-          let sync_data = (flags.contains(WriteFlags::DSYNC) && sync.is_none())
+            let sync = flags
+              .contains(WriteFlags::SYNC)
+              .then(|| fs::Sync::new(descriptor));
+            let sync_data = (flags.contains(WriteFlags::DSYNC)
+              && sync.is_none())
             .then(|| fs::SyncData::new(descriptor));
-          Ok::<_, isize>((stream, status, sync, sync_data))
-        })?;
+            // An append lands at the end of the file, wherever the cursor
+            // was. Like `O_APPEND`, it leaves the cursor at the new end.
+            let position =
+              (appends && offset.is_none()).then(|| fs::Stat::new(descriptor));
+            Ok::<_, isize>((stream, status, sync, sync_data, position))
+          })?;
         let mut transfer = Transfer::new(raw, stream);
         transfer.owned = true;
         transfer.status = Some(Status::File(fs::StreamStatus::new(status)));
         transfer.sync = sync;
         transfer.sync_data = sync_data;
-        transfer.moves_cursor = offset.is_none();
+        transfer.moves_cursor = offset.is_none() && position.is_none();
+        transfer.position = position;
         transfer
       }
     };
@@ -1791,7 +1817,7 @@ impl Wasi {
                 (None, None) => unreachable!("a sync phase has a sync call"),
               };
               match synced {
-                Some(Ok(())) => transfer.total as isize,
+                Some(Ok(())) => return self.after_sync(id, pending),
                 Some(Err(error)) => fail(errno(&error)),
                 None => unreachable!("a returned call has a result"),
               }
@@ -1801,6 +1827,27 @@ impl Wasi {
           };
           self.release(pending);
           Some(result)
+        }
+        Phase::Position => {
+          // The data is written either way. A size that could not be read
+          // leaves the cursor where it was.
+          let size = match (outcome, transfer.position.as_mut()) {
+            (Outcome::Returned, Some(stat)) => match stat.result() {
+              Some(Ok(stat)) => Some(stat.size),
+              _ => None,
+            },
+            _ => None,
+          };
+          let (raw, total) = (transfer.raw, transfer.total);
+          if let Some(size) = size {
+            with_table(|table| {
+              if let Ok(file) = table.file(raw) {
+                file.cursor = size;
+              }
+            });
+          }
+          self.release(pending);
+          Some(total as isize)
         }
       },
     }
@@ -2005,15 +2052,33 @@ impl Wasi {
       match (&mut transfer.sync, &mut transfer.sync_data) {
         (Some(sync), _) => self.queue.push_call(sync, id),
         (None, Some(sync)) => self.queue.push_call(sync, id),
-        (None, None) => {
-          let total = transfer.total;
-          self.release(pending);
-          return Some(total as isize);
-        }
+        (None, None) => return self.after_sync(id, pending),
       }
     }
     transfer.phase = Phase::Sync;
     None
+  }
+
+  /// The data is written and synced if that was asked. An append at the
+  /// cursor reads the file's new size; anything else is finished.
+  fn after_sync(&mut self, id: u64, pending: &mut Pending) -> Option<isize> {
+    let Stage::Transfer(transfer) = &mut pending.stage else {
+      unreachable!("only a transfer syncs")
+    };
+    match &mut transfer.position {
+      Some(stat) => {
+        transfer.phase = Phase::Position;
+        // SAFETY: `pending` is boxed and stays in `ops` until the
+        // completion.
+        unsafe { self.queue.push_call(stat, id) };
+        None
+      }
+      None => {
+        let total = transfer.total;
+        self.release(pending);
+        Some(total as isize)
+      }
+    }
   }
 
   /// Closes a stream that belongs to one operation.
@@ -2062,6 +2127,11 @@ impl Default for Wasi {
 
 impl Drop for Wasi {
   fn drop(&mut self) {
+    // Stop the host before any operation's memory is freed. The driver
+    // drains first, and `queue` is declared before `ops` so it would be
+    // dropped, and cancel everything, first anyway; this does not rely on
+    // either.
+    self.drain();
     LIVE.with(|live| live.borrow_mut().retain(|id| *id != self.id));
     // This backend's queue closes its streams as it drops, so what was
     // waiting on it can go.

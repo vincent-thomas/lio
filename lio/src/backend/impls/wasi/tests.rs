@@ -395,6 +395,105 @@ fn a_unix_socket_is_an_unsupported_family() {
   assert_eq!(mismatched, fail(libc::EINVAL));
 }
 
+#[test]
+fn cursor_reads_in_one_batch_each_get_their_own_part() {
+  let mut backend = backend();
+  let root = scratch("cursor-batch");
+  let path = format!("{root}/data");
+  std::fs::write(&path, b"abcdef").unwrap();
+  let raw = open(&mut backend, &path, READ);
+  let file = own(&backend, raw);
+
+  let (mut first, mut second) = ([0u8; 3], [0u8; 3]);
+  let first_bufs = [RawBufMut::from_mut(&mut first)];
+  let second_bufs = [RawBufMut::from_mut(&mut second)];
+  push(
+    &mut backend,
+    1,
+    BorrowedOp::read(file.clone(), &first_bufs, None, ReadFlags::empty()),
+  );
+  push(
+    &mut backend,
+    2,
+    BorrowedOp::read(file.clone(), &second_bufs, None, ReadFlags::empty()),
+  );
+  backend.flush().unwrap();
+  let mut done = Vec::new();
+  while done.len() < 2 {
+    done.extend(wait(&mut backend, None));
+  }
+  done.sort_unstable();
+  assert_eq!(done, [(1, 3), (2, 3)]);
+  assert_eq!((&first, &second), (b"abc", b"def"));
+}
+
+#[test]
+fn a_read_with_its_own_offset_does_not_wait_for_the_cursor() {
+  let mut backend = backend();
+  let root = scratch("offset-skips-lane");
+  let path = format!("{root}/data");
+  std::fs::write(&path, b"abcdef").unwrap();
+  let raw = open(&mut backend, &path, READ);
+  let file = own(&backend, raw);
+  assert!(
+    Wasi::lane_of(
+      BorrowedOp::read(file.clone(), &[], Some(0), ReadFlags::empty()).as_op()
+    )
+    .is_none()
+  );
+  assert_eq!(
+    Wasi::lane_of(
+      BorrowedOp::read(file.clone(), &[], None, ReadFlags::empty()).as_op()
+    ),
+    Some((file.as_raw_fd(), Way::Cursor))
+  );
+}
+
+#[test]
+fn an_append_leaves_the_cursor_at_the_new_end() {
+  let mut backend = backend();
+  let root = scratch("append-cursor");
+  let path = format!("{root}/log");
+  std::fs::write(&path, b"12345").unwrap();
+  let raw = open(&mut backend, &path, OpenFlags::READ | OpenFlags::APPEND);
+  let file = own(&backend, raw);
+
+  let parts = [RawBuf::new(b"67")];
+  let written = run(
+    &mut backend,
+    BorrowedOp::write(file.clone(), &parts, None, WriteFlags::empty()),
+  );
+  assert_eq!(written, 2);
+  assert_eq!(std::fs::read(&path).unwrap(), b"1234567");
+  let cursor = with_table(|table| table.file(file.as_raw_fd()).unwrap().cursor);
+  assert_eq!(cursor, 7, "the cursor is at the end the append made");
+
+  // So a read at the cursor finds nothing left.
+  let mut buf = [0u8; 8];
+  let bufs = [RawBufMut::from_mut(&mut buf)];
+  let read =
+    run(&mut backend, BorrowedOp::read(file, &bufs, None, ReadFlags::empty()));
+  assert_eq!(read, 0);
+}
+
+#[test]
+fn a_synced_append_still_moves_the_cursor() {
+  let mut backend = backend();
+  let root = scratch("append-synced");
+  let path = format!("{root}/log");
+  std::fs::write(&path, b"abc").unwrap();
+  let raw = open(&mut backend, &path, OpenFlags::READ | OpenFlags::WRITE);
+  let file = own(&backend, raw);
+  let parts = [RawBuf::new(b"de")];
+  let flags = WriteFlags::APPEND | WriteFlags::SYNC;
+  let written =
+    run(&mut backend, BorrowedOp::write(file.clone(), &parts, None, flags));
+  assert_eq!(written, 2);
+  assert_eq!(std::fs::read(&path).unwrap(), b"abcde");
+  let cursor = with_table(|table| table.file(file.as_raw_fd()).unwrap().cursor);
+  assert_eq!(cursor, 5);
+}
+
 // ─────────────────────────────── cancellation ───────────────────────────────
 
 #[test]
@@ -535,6 +634,23 @@ fn drain_stops_everything_in_flight() {
   assert_eq!(backend.queue.outstanding(), 0);
   // Drained operations are not reported.
   assert!(poll(&mut backend).is_empty());
+}
+
+#[test]
+fn dropping_the_backend_stops_what_is_in_flight() {
+  let mut backend = backend();
+  let (listening, _) = listener(&mut backend, loopback());
+  let (_listener, _client, server) = pair(&mut backend, loopback());
+  let mut peer = SocketAddrBuf::unspecified();
+  let mut buf = [0u8; 8];
+  let bufs = [BorrowedMsgBufMut::from_slice(&mut buf)];
+  push(&mut backend, 1, BorrowedOp::accept(listening, &mut peer));
+  push(&mut backend, 2, BorrowedOp::recv(server, &bufs, RecvFlags::empty()));
+  backend.flush().unwrap();
+  assert!(poll(&mut backend).is_empty());
+  // The host is told to stop before the operations' memory goes away.
+  drop(backend);
+  assert!(ORPHANS.with(|orphans| orphans.borrow().is_empty()));
 }
 
 // ─────────────────────────────── resources ──────────────────────────────────
