@@ -23,6 +23,7 @@ use os::kqueue as sys;
 pub(crate) mod tests;
 
 use std::{
+  collections::{HashMap, VecDeque},
   io,
   os::fd::{AsRawFd, RawFd},
   time::Duration,
@@ -80,15 +81,8 @@ pub(crate) trait ReadinessPoll {
   /// Extract the key from a native event
   fn event_key(event: &Self::NativeEvent) -> u64;
 
-  /// Interest the kernel reported for this event.
-  ///
-  /// The backend does not branch on it. A registration is one operation,
-  /// and any event for its key means that operation should run. The poller
-  /// tests read this to lock what epoll and kqueue report.
-  #[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "read by the poller contract tests")
-  )]
+  /// Interest the kernel reported for this event: which of a descriptor's
+  /// waiting operations to try.
   fn event_interest(event: &Self::NativeEvent) -> Interest;
 }
 
@@ -142,9 +136,44 @@ impl Events {
     unsafe { self.events.set_len(len) }
   }
 
-  fn pop_key(&mut self) -> Option<u64> {
+  /// The next event: its key, and what the kernel says is ready.
+  fn pop_event(&mut self) -> Option<(u64, Interest)> {
     let native_event = self.events.pop()?;
-    Some(sys::OsPoller::event_key(&native_event))
+    Some((
+      sys::OsPoller::event_key(&native_event),
+      sys::OsPoller::event_interest(&native_event),
+    ))
+  }
+}
+
+/// The operations waiting for one descriptor to become ready, oldest first.
+///
+/// The OS poller holds one registration per descriptor, however many
+/// operations wait on it. Its key is the descriptor itself.
+#[derive(Default)]
+struct Waiters {
+  readers: VecDeque<SlabKey>,
+  writers: VecDeque<SlabKey>,
+  /// Whether the OS poller holds a registration for the descriptor.
+  registered: bool,
+}
+
+impl Waiters {
+  /// What somebody is waiting for.
+  fn interest(&self) -> Interest {
+    let mut interest = Interest::NONE;
+    if !self.readers.is_empty() {
+      interest |= Interest::READ;
+    }
+    if !self.writers.is_empty() {
+      interest |= Interest::WRITE;
+    }
+    interest
+  }
+
+  /// The operations waiting for what `interest` names.
+  fn queue(&mut self, interest: Interest) -> &mut VecDeque<SlabKey> {
+    if interest.is_writable() { &mut self.writers } else { &mut self.readers }
   }
 }
 
@@ -154,8 +183,10 @@ pub struct Poller {
   events: Events,
   capacity: usize,
   backlog: Vec<PendingOp>,
-  /// Operations that have been registered with the poller and are waiting for readiness
+  /// Operations that are waiting for their descriptor to become ready.
   pending: Slab<PendingOp>,
+  /// Which of `pending` wait on which descriptor.
+  waiters: HashMap<RawFd, Waiters>,
   /// Immediate completions produced during `flush()` and surfaced on the next `wait()`.
   queued_completed: Vec<OpCompleted>,
   /// Reusable buffer for completed operations
@@ -170,6 +201,7 @@ impl Default for Poller {
       capacity: 0,
       backlog: Vec::new(),
       pending: Slab::new(0),
+      waiters: HashMap::new(),
       queued_completed: Vec::new(),
       completed: Vec::new(),
     }
@@ -187,7 +219,130 @@ pub struct PendingOp {
 // EAGAIN and EWOULDBLOCK are the same on Linux, but may differ on other systems
 const EAGAIN_NEG: isize = -(libc::EAGAIN as isize);
 const EWOULDBLOCK_NEG: isize = -(libc::EWOULDBLOCK as isize);
+/// An error from the OS poller, as an operation's raw result.
+fn raw_error(err: &io::Error) -> isize {
+  err.raw_os_error().map_or(-(libc::EIO as isize), |code| -(code as isize))
+}
+
 impl Poller {
+  /// Registers `fd` for what its waiters wait for, in place of what was
+  /// registered. With no waiter left, the descriptor is forgotten.
+  ///
+  /// A registration is used up by the event it reports, and names every
+  /// direction at once, so this runs after an event and whenever a
+  /// direction gains its first waiter or loses its last.
+  fn rearm(
+    sys: &sys::OsPoller,
+    waiters: &mut HashMap<RawFd, Waiters>,
+    fd: RawFd,
+  ) -> io::Result<()> {
+    let Some(waiting) = waiters.get_mut(&fd) else {
+      return Ok(());
+    };
+    if std::mem::take(&mut waiting.registered) {
+      let _ = sys.delete(fd);
+    }
+    let interest = waiting.interest();
+    if interest.is_none() {
+      waiters.remove(&fd);
+      return Ok(());
+    }
+    sys.add(fd, fd as u64, interest)?;
+    waiting.registered = true;
+    Ok(())
+  }
+
+  /// Completes every operation waiting on `fd` with `result`: the
+  /// descriptor can no longer be watched.
+  fn fail_waiters(
+    pending: &mut Slab<PendingOp>,
+    waiters: &mut HashMap<RawFd, Waiters>,
+    fd: RawFd,
+    result: isize,
+    completed: &mut Vec<OpCompleted>,
+  ) {
+    let Some(waiting) = waiters.remove(&fd) else {
+      return;
+    };
+    for key in waiting.readers.into_iter().chain(waiting.writers) {
+      if let Some(entry) = pending.remove_value(key) {
+        completed.push(OpCompleted::new(entry.registration_id, result));
+      }
+    }
+  }
+
+  /// Runs the operations at the front of `queue` until one would have to
+  /// wait. The rest stay queued behind it, in order.
+  fn serve(
+    queue: &mut VecDeque<SlabKey>,
+    pending: &mut Slab<PendingOp>,
+    completed: &mut Vec<OpCompleted>,
+  ) {
+    while let Some(&key) = queue.front() {
+      let Some(entry) = pending.get_mut(key) else {
+        queue.pop_front();
+        continue;
+      };
+      let result = Poller::exec_op(&entry.op);
+      if result == EAGAIN_NEG || result == EWOULDBLOCK_NEG {
+        return;
+      }
+      let registration_id = entry.registration_id;
+      queue.pop_front();
+      pending.remove(key);
+      completed.push(OpCompleted::new(registration_id, result));
+    }
+  }
+
+  /// Queues `entry` behind the operations already waiting on its
+  /// descriptor, and has the OS poller watch for it.
+  fn park(&mut self, entry: PendingOp) {
+    let (fd, interest) = self.extract_fd_interest(&entry.op);
+    let registration_id = entry.registration_id;
+    let Some((key, _)) = self.pending.insert_get_mut(entry) else {
+      let result = -(libc::EIO as isize);
+      self.queued_completed.push(OpCompleted::new(registration_id, result));
+      return;
+    };
+    let queue = self.waiters.entry(fd).or_default().queue(interest);
+    let already_watched = !queue.is_empty();
+    queue.push_back(key);
+    if already_watched {
+      return;
+    }
+
+    let Some(sys) = self.sys.as_ref() else {
+      panic!("Poller not initialized: the driver calls init first");
+    };
+    let Err(err) = Self::rearm(sys, &mut self.waiters, fd) else {
+      return;
+    };
+    // The OS will not watch this descriptor for that. Such a descriptor
+    // never makes an operation wait, so the operation runs now. Registering
+    // is the operation's own business: its failure is the operation's
+    // result, not the backend's.
+    if let Some(waiting) = self.waiters.get_mut(&fd) {
+      waiting.queue(interest).pop_back();
+    }
+    if let Some(entry) = self.pending.remove_value(key) {
+      let mut result = Self::exec_op(&entry.op);
+      if result == EAGAIN_NEG || result == EWOULDBLOCK_NEG {
+        result = raw_error(&err);
+      }
+      self.queued_completed.push(OpCompleted::new(registration_id, result));
+    }
+    // Whoever waits for the other direction goes on waiting.
+    if let Err(err) = Self::rearm(sys, &mut self.waiters, fd) {
+      Self::fail_waiters(
+        &mut self.pending,
+        &mut self.waiters,
+        fd,
+        raw_error(&err),
+        &mut self.queued_completed,
+      );
+    }
+  }
+
   fn set_fd_cloexec(fd: RawFd) -> io::Result<()> {
     let flags = syscall!(fcntl(fd, libc::F_GETFD))?;
     syscall!(fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC))?;
@@ -439,14 +594,6 @@ impl Poller {
 
   pub fn new() -> Self {
     Self::default()
-  }
-
-  #[inline]
-  fn sys(&self) -> &sys::OsPoller {
-    let Some(sys) = self.sys.as_ref() else {
-      panic!("Poller not initialized: the driver calls init first");
-    };
-    sys
   }
 
   #[cfg(unix)]
@@ -1085,6 +1232,7 @@ unsafe impl IoBackend for Poller {
     self.backlog.clear();
     self.backlog.reserve_exact(cap);
     self.pending = Slab::new(cap);
+    self.waiters.clear();
     self.queued_completed = Vec::with_capacity(cap.min(256));
     self.completed = Vec::with_capacity(cap.min(256));
     Ok(())
@@ -1107,7 +1255,10 @@ unsafe impl IoBackend for Poller {
   }
 
   fn flush(&mut self) -> io::Result<()> {
-    while let Some(entry) = self.backlog.pop() {
+    // In the order they were pushed: operations on one descriptor wait in
+    // that order.
+    let mut backlog = std::mem::take(&mut self.backlog);
+    for entry in backlog.drain(..) {
       if matches!(entry.op, Op::Nop) {
         self.queued_completed.push(OpCompleted::new(entry.registration_id, 0));
         continue;
@@ -1169,29 +1320,10 @@ unsafe impl IoBackend for Poller {
         }
       }
 
-      let (fd, interest) = self.extract_fd_interest(&entry.op);
-
-      // Operation-local registration failures still belong to the op result
-      // contract, so surface them as raw completions instead of bubbling them
-      // out as backend infrastructure errors.
-      let registration_id = entry.registration_id;
-      let Some((pending_key, _entry)) = self.pending.insert_get_mut(entry)
-      else {
-        let result = -(libc::EIO as isize);
-        self.queued_completed.push(OpCompleted::new(registration_id, result));
-        continue;
-      };
-
-      if let Err(err) = self.sys().add(fd, pending_key.as_u64(), interest) {
-        let result = err
-          .raw_os_error()
-          .map(|code| -(code as isize))
-          .unwrap_or(-(libc::EIO as isize));
-        self.queued_completed.push(OpCompleted::new(registration_id, result));
-        let _ = self.pending.remove(pending_key);
-        continue;
-      }
+      self.park(entry);
     }
+    // Keep the allocation for the next batch.
+    self.backlog = backlog;
 
     Ok(())
   }
@@ -1207,16 +1339,38 @@ unsafe impl IoBackend for Poller {
     }
     // This backend performs the I/O itself once the descriptor is ready, so
     // nothing outside it uses the op's memory: it can be dropped right away.
-    let key =
-      self.pending.keys_where(|entry| entry.registration_id == id).next();
-    let Some(entry) = key.and_then(|key| self.pending.remove_value(key)) else {
+    let Some(key) =
+      self.pending.keys_where(|entry| entry.registration_id == id).next()
+    else {
       return;
     };
-    let (fd, interest) = self.extract_fd_interest(&entry.op);
-    if !interest.is_none() {
-      let _ = self.sys().delete(fd);
-    }
+    let Some(entry) = self.pending.remove_value(key) else {
+      return;
+    };
     self.queued_completed.push(OpCompleted::new(id, CANCELED));
+
+    // The others waiting on its descriptor go on waiting.
+    let (fd, interest) = self.extract_fd_interest(&entry.op);
+    let Some(waiting) = self.waiters.get_mut(&fd) else {
+      return;
+    };
+    let queue = waiting.queue(interest);
+    queue.retain(|waiting| *waiting != key);
+    if !queue.is_empty() {
+      return;
+    }
+    let Some(sys) = self.sys.as_ref() else {
+      return;
+    };
+    if let Err(err) = Self::rearm(sys, &mut self.waiters, fd) {
+      Self::fail_waiters(
+        &mut self.pending,
+        &mut self.waiters,
+        fd,
+        raw_error(&err),
+        &mut self.queued_completed,
+      );
+    }
   }
 
   fn drain(&mut self) -> bool {
@@ -1224,17 +1378,16 @@ unsafe impl IoBackend for Poller {
     // in `backlog` and `pending`, and this backend only dereferences them
     // from `flush` and `wait`, so dropping them here releases every address.
     self.backlog.clear();
-    let keys: Vec<_> = self.pending.keys_where(|_| true).collect();
-    for key in keys {
-      let Some(entry) = self.pending.remove_value(key) else {
-        continue;
-      };
-      let (fd, interest) = self.extract_fd_interest(&entry.op);
-      if !interest.is_none()
+    for (fd, waiting) in self.waiters.drain() {
+      if waiting.registered
         && let Some(sys) = self.sys.as_ref()
       {
         let _ = sys.delete(fd);
       }
+    }
+    let keys: Vec<_> = self.pending.keys_where(|_| true).collect();
+    for key in keys {
+      self.pending.remove(key);
     }
     true
   }
@@ -1277,44 +1430,42 @@ unsafe impl IoBackend for Poller {
       unsafe { self.events.set_len(event_count) };
     }
 
-    while let Some(key) = self.events.pop_key() {
-      let key = SlabKey::from_u64(key);
-      let Some(entry) = self.pending.remove_value(key) else {
-        continue; // Cancelled or doesn't exist
+    while let Some((key, ready)) = self.events.pop_event() {
+      let Ok(fd) = RawFd::try_from(key) else {
+        continue; // Not a descriptor's key.
+      };
+      let Some(waiting) = self.waiters.get_mut(&fd) else {
+        continue; // Everything that waited on it was cancelled.
       };
 
-      // Execute the operation
-      let result = Poller::exec_op(&entry.op);
+      // An event that names a direction nobody waits for (a hang-up, say)
+      // still has to reach whoever is waiting.
+      let readers = ready.is_readable() || waiting.writers.is_empty();
+      let writers = ready.is_writable() || waiting.readers.is_empty();
+      if readers {
+        Self::serve(
+          &mut waiting.readers,
+          &mut self.pending,
+          &mut self.completed,
+        );
+      }
+      if writers {
+        Self::serve(
+          &mut waiting.writers,
+          &mut self.pending,
+          &mut self.completed,
+        );
+      }
 
-      match result {
-        #[allow(unreachable_patterns)]
-        EAGAIN_NEG | EWOULDBLOCK_NEG => {
-          // EAGAIN/EWOULDBLOCK - re-register for retry
-          let (fd, interest) = self.extract_fd_interest(&entry.op);
-          let registration_id = entry.registration_id;
-          // The entry came out of `pending` above, freeing a slot.
-          let Some((pending_key, _entry)) = self.pending.insert_get_mut(entry)
-          else {
-            unreachable!("pending retry must fit backend capacity");
-          };
-          if let Err(err) = sys.add(fd, pending_key.as_u64(), interest) {
-            let _ = self.pending.remove(pending_key);
-            let result = err
-              .raw_os_error()
-              .map(|code| -(code as isize))
-              .unwrap_or(-(libc::EIO as isize));
-            self.completed.push(OpCompleted::new(registration_id, result));
-            continue;
-          }
-        }
-        _ => {
-          let (fd, interest) = self.extract_fd_interest(&entry.op);
-          if !interest.is_none() {
-            let _ = sys.delete(fd);
-          }
-          // Success or real error - add to completions
-          self.completed.push(OpCompleted::new(entry.registration_id, result));
-        }
+      // The event used the registration up.
+      if let Err(err) = Self::rearm(sys, &mut self.waiters, fd) {
+        Self::fail_waiters(
+          &mut self.pending,
+          &mut self.waiters,
+          fd,
+          raw_error(&err),
+          &mut self.completed,
+        );
       }
     }
 
