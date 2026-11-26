@@ -41,7 +41,7 @@ use crate::backend::{
 };
 use crate::slab::{Slab, SlabKey};
 mod interest;
-pub use interest::Interest;
+pub(crate) use interest::Interest;
 
 /// What a [`Poller`] needs from the operating system: watch descriptors,
 /// and say which became ready.
@@ -67,7 +67,7 @@ pub use interest::Interest;
 /// ## Thread Safety
 ///
 /// Implementations are used from a single thread, and need not be `Send`.
-pub trait ReadinessPoll {
+pub(crate) trait ReadinessPoll {
   /// The event record [`wait`](Self::wait) fills in.
   type NativeEvent: Copy;
 
