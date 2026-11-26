@@ -2760,8 +2760,13 @@ macro_rules! test_io_backend {
 
           backend.cancel(811);
           let done = collect(&mut backend, 1);
+          assert_eq!(
+            done.keys().collect::<Vec<_>>(),
+            [&811],
+            "only the cancelled recv completes: {done:?}"
+          );
           assert!(
-            done.get(&811).is_some_and(|result| *result < 0),
+            done[&811] < 0,
             "the cancelled recv reports an error: {done:?}"
           );
           assert_quiet(&mut backend, "the other recv is still waiting");
