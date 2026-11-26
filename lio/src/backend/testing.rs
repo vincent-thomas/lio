@@ -58,6 +58,16 @@ struct Script {
   no_poison: bool,
 }
 
+impl Drop for Script {
+  fn drop(&mut self) {
+    for (_, ticket) in self.tickets.drain() {
+      // SAFETY: no kernel or thread ever sees the addresses, and this
+      // backend is gone: nothing uses them.
+      unsafe { ticket.release() };
+    }
+  }
+}
+
 /// A backend that only does what the test tells it to.
 ///
 /// Clones share their state: hand one clone to [`Lio`](crate::Lio) and keep
