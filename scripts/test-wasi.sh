@@ -47,7 +47,7 @@ run sockets -S inherit-network </dev/null
 
 mkdir "${scratch}/lio"
 echo "--- lio backend"
-wasmtime run -S p3 --dir "${scratch}/lio::/" \
+wasmtime run -S p3 -S inherit-network --dir "${scratch}/lio::/" \
   "${out}/../lio-wasi-example.wasm" </dev/null
 if [ -n "$(ls -A "${scratch}/lio")" ]; then
   echo "the lio example left files behind:"

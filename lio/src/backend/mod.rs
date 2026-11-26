@@ -153,9 +153,17 @@ pub(crate) mod sockaddr {
     socket: &crate::api::resource::Resource,
     peer: bool,
   ) -> std::io::Result<std::net::SocketAddr> {
-    // The WASI backend does not create sockets yet.
-    let _ = (socket, peer);
-    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    #[cfg(feature = "backend_impls")]
+    {
+      use std::os::fd::AsRawFd;
+      super::impls::wasi::socket_name(socket.as_raw_fd(), peer)
+    }
+    // Without the WASI backend nothing creates sockets.
+    #[cfg(not(feature = "backend_impls"))]
+    {
+      let _ = (socket, peer);
+      Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
   }
 }
 
