@@ -63,6 +63,10 @@ pub(crate) trait ReadinessPoll {
 
   /// Add interest for a file descriptor (one-shot mode).
   /// This is not idempotent.
+  ///
+  /// A poller may leave the registration for its next [`wait`](Self::wait)
+  /// to make. If the OS then refuses it, that wait reports an event for the
+  /// descriptor with an [`event_error`](Self::event_error).
   fn add(&self, fd: RawFd, key: u64, interest: Interest) -> io::Result<()>;
 
   /// Remove all interest for a file descriptor
@@ -79,6 +83,12 @@ pub(crate) trait ReadinessPoll {
 
   /// Extract the key from a native event
   fn event_key(event: &Self::NativeEvent) -> u64;
+
+  /// The errno the OS refused this event's registration with, for a poller
+  /// that registers as it waits.
+  fn event_error(_event: &Self::NativeEvent) -> Option<i32> {
+    None
+  }
 
   /// Interest the kernel reported for this event: which of a descriptor's
   /// waiting operations to try.
@@ -136,11 +146,12 @@ impl Events {
   }
 
   /// The next event: its key, and what the kernel says is ready.
-  fn pop_event(&mut self) -> Option<(u64, Interest)> {
+  fn pop_event(&mut self) -> Option<(u64, Interest, Option<i32>)> {
     let native_event = self.events.pop()?;
     Some((
       sys::OsPoller::event_key(&native_event),
       sys::OsPoller::event_interest(&native_event),
+      sys::OsPoller::event_error(&native_event),
     ))
   }
 }
@@ -1346,10 +1357,29 @@ impl IoBackend for Poller {
       unsafe { self.events.set_len(event_count) };
     }
 
-    while let Some((key, ready)) = self.events.pop_event() {
+    while let Some((key, ready, refused)) = self.events.pop_event() {
       let Ok(fd) = RawFd::try_from(key) else {
         continue; // Not a descriptor's key.
       };
+      if let Some(errno) = refused {
+        // The OS will not watch this descriptor, as `park` finds out at
+        // once from a poller that registers at once. Such a descriptor
+        // never makes an operation wait, so its operations run now.
+        let Some(waiting) = self.waiters.remove(&fd) else {
+          continue;
+        };
+        let _ = sys.delete(fd);
+        for key in waiting.readers.into_iter().chain(waiting.writers) {
+          if let Some(op) = self.parked.take(key) {
+            let mut result = Self::exec_op(&op);
+            if result == EAGAIN_NEG || result == EWOULDBLOCK_NEG {
+              result = -(errno as isize);
+            }
+            report(done, key, result);
+          }
+        }
+        continue;
+      }
       let Some(waiting) = self.waiters.get_mut(&fd) else {
         continue; // Everything that waited on it was cancelled.
       };
