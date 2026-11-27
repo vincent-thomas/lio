@@ -1102,6 +1102,86 @@ impl IoUring {
     0
   }
 
+  /// Makes a path operation's system call on this thread, if it is one the
+  /// kernel never completes as it is submitted, and returns its result.
+  ///
+  /// Like `statx`, the ring hands every unlink, mkdir, rename and link to a
+  /// worker thread, and so every open that may create or truncate. Each is
+  /// made here instead, as `stat_here` makes a stat, and waits on this
+  /// thread when the file system has to. `None` is an open of something
+  /// that exists, which `try_here` asks for without waiting.
+  fn path_here(op: &Op, state: &NativePathState) -> Option<isize> {
+    let path1 = state.path1.as_ptr();
+    // Each call below is given NUL-terminated paths from the arena `state`
+    // is in, which outlives it.
+    let result = match op {
+      Op::OpenAt { dir_fd, flags, mode, .. } => {
+        // Invalid flags were rejected by `validate_op`.
+        let flags = crate::backend::native::open_flags(*flags).ok()?;
+        if flags & (libc::O_CREAT | libc::O_TRUNC) == 0 {
+          return None;
+        }
+        let mode = libc::c_uint::from(crate::backend::native::file_mode(*mode));
+        // SAFETY: the path is NUL-terminated and outlives the call.
+        unsafe { libc::openat(dir_fd.as_raw_fd(), path1, flags, mode) }
+      }
+      Op::UnlinkAt { dir_fd, kind, .. } => {
+        let flags = match kind {
+          crate::backend::op::UnlinkKind::File => 0,
+          crate::backend::op::UnlinkKind::Directory => libc::AT_REMOVEDIR,
+        };
+        // SAFETY: the path is NUL-terminated and outlives the call.
+        unsafe { libc::unlinkat(dir_fd.as_raw_fd(), path1, flags) }
+      }
+      Op::MkdirAt { dir_fd, mode, .. } => {
+        let mode = crate::backend::native::file_mode(*mode);
+        // SAFETY: the path is NUL-terminated and outlives the call.
+        unsafe { libc::mkdirat(dir_fd.as_raw_fd(), path1, mode) }
+      }
+      Op::RenameAt { old_dir_fd, new_dir_fd, .. } => {
+        let Some(path2) = state.path2.as_ref() else {
+          unreachable!("RenameAt must have path2");
+        };
+        // SAFETY: both paths are NUL-terminated and outlive the call.
+        unsafe {
+          libc::renameat(
+            old_dir_fd.as_raw_fd(),
+            path1,
+            new_dir_fd.as_raw_fd(),
+            path2.as_ptr(),
+          )
+        }
+      }
+      Op::LinkAt { kind, source_dir_fd, new_dir_fd, .. } => {
+        let Some(path2) = state.path2.as_ref() else {
+          unreachable!("LinkAt must have path2");
+        };
+        match kind {
+          // SAFETY: both paths are NUL-terminated and outlive the call.
+          LinkKind::Hard => unsafe {
+            libc::linkat(
+              source_dir_fd.as_raw_fd(),
+              path1,
+              new_dir_fd.as_raw_fd(),
+              path2.as_ptr(),
+              0,
+            )
+          },
+          // SAFETY: both paths are NUL-terminated and outlive the call.
+          LinkKind::Soft => unsafe {
+            libc::symlinkat(path1, new_dir_fd.as_raw_fd(), path2.as_ptr())
+          },
+        }
+      }
+      _ => return None,
+    };
+    Some(if result < 0 {
+      -(crate::backend::impls::syscall::last_os_error_code() as isize)
+    } else {
+      result as isize
+    })
+  }
+
   /// Makes the operation's system call on this thread, in a form that
   /// cannot wait, and returns its result if it had one.
   ///
@@ -1193,11 +1273,6 @@ impl IoUring {
       (Op::OpenAt { dir_fd, flags, .. }, LoweredState::Path(state)) => {
         // Invalid flags were rejected by `validate_op`.
         let flags = crate::backend::native::open_flags(*flags).ok()?;
-        // An open that may create or truncate has to wait for the file
-        // system, and the kernel refuses to try.
-        if flags & (libc::O_CREAT | libc::O_TRUNC) != 0 {
-          return None;
-        }
         // SAFETY: `open_how` is plain data, valid when zeroed.
         let mut how: libc::open_how = unsafe { mem::zeroed() };
         how.flags = flags as u64;
@@ -1217,6 +1292,18 @@ impl IoUring {
       }
       _ => None,
     }
+  }
+
+  /// What this thread can do for the operation itself: `path_here`, then
+  /// `try_here`.
+  fn here(op: &Op, lowered: LoweredState) -> Option<isize> {
+    if let LoweredState::Path(state) = &lowered {
+      // SAFETY: `state` points into an arena that outlives this call.
+      if let Some(result) = Self::path_here(op, unsafe { state.as_ref() }) {
+        return Some(result);
+      }
+    }
+    Self::try_here(op, lowered)
   }
 
   /// `preadv2` or `pwritev2` with `RWF_NOWAIT`. `None` when the call failed,
@@ -1435,6 +1522,10 @@ impl IoBackend for IoUring {
       Op::Recv { .. }
       | Op::Send { .. }
       | Op::OpenAt { .. }
+      | Op::UnlinkAt { .. }
+      | Op::MkdirAt { .. }
+      | Op::RenameAt { .. }
+      | Op::LinkAt { .. }
       | Op::Stat { .. }
         if Self::validate_op(op).is_none() =>
       {
@@ -1445,7 +1536,7 @@ impl IoBackend for IoUring {
             // call does not reset again, and nothing else refers to it.
             Some(Self::stat_here(op, unsafe { state.as_mut() }))
           }
-          Ok(lowered) => Self::try_here(op, lowered),
+          Ok(lowered) => Self::here(op, lowered),
           Err(_) => None,
         }
       }
@@ -1533,7 +1624,7 @@ impl IoBackend for IoUring {
       return started;
     }
 
-    if !attempted && let Some(result) = Self::try_here(op, lowered) {
+    if !attempted && let Some(result) = Self::here(op, lowered) {
       if let Some(profile) = self.profile.as_mut() {
         profile.immediate_ops += 1;
       }
