@@ -40,20 +40,25 @@
 //! - Buffers are not accessed mutably while operations are in flight
 //! - File descriptors remain valid until operations complete
 
+// Tests use std's prelude (`vec!`, `println!`) and fixtures.
+#![cfg_attr(not(test), no_std)]
 #![allow(clippy::new_without_default, clippy::module_inception)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
-extern crate alloc;
-extern crate core;
+
+#[cfg(all(feature = "std", not(test)))]
+extern crate std;
 
 use core::mem::MaybeUninit;
 use core::ptr;
-use std::io::{self, IoSlice};
-use std::time::{Duration, Instant};
+use core::time::Duration;
 
 pub mod operation;
 
 mod bindings;
 pub use bindings::statx;
+
+mod errno;
+pub use errno::Errno;
 
 /// A completed operation with result and metadata
 #[derive(Debug, Clone, Copy)]
@@ -148,7 +153,7 @@ impl SqeFlags {
   }
 }
 
-impl std::ops::BitOr for SqeFlags {
+impl core::ops::BitOr for SqeFlags {
   type Output = Self;
   fn bitor(self, rhs: Self) -> Self::Output {
     self.or(rhs)
@@ -237,7 +242,7 @@ impl LioUring {
   /// # Errors
   /// Returns an error if io_uring initialization fails (e.g., insufficient
   /// permissions, kernel doesn't support io_uring, or out of resources).
-  pub fn new(capacity: u32) -> io::Result<Self> {
+  pub fn new(capacity: u32) -> Result<Self, Errno> {
     Self::with_params(Params { sq_entries: capacity, ..Default::default() })
   }
 
@@ -245,7 +250,7 @@ impl LioUring {
   ///
   /// # Errors
   /// Returns an error if io_uring initialization fails.
-  pub fn with_params(params: Params) -> io::Result<Self> {
+  pub fn with_params(params: Params) -> Result<Self, Errno> {
     let mut ring = MaybeUninit::zeroed();
     let mut raw_params = bindings::io_uring_params {
       sq_entries: params.sq_entries,
@@ -256,8 +261,8 @@ impl LioUring {
       features: 0,
       wq_fd: 0,
       resv: [0; 3],
-      sq_off: unsafe { std::mem::zeroed() },
-      cq_off: unsafe { std::mem::zeroed() },
+      sq_off: unsafe { core::mem::zeroed() },
+      cq_off: unsafe { core::mem::zeroed() },
     };
 
     let ret = unsafe {
@@ -269,7 +274,7 @@ impl LioUring {
     };
 
     if ret < 0 {
-      return Err(io::Error::from_raw_os_error(-ret));
+      return Err(Errno::new(-ret));
     }
 
     let ring_init = unsafe { ring.assume_init() };
@@ -306,13 +311,13 @@ impl LioUring {
   /// valid until the operation completes.
   ///
   /// # Errors
-  /// Returns an error if the submission queue is full. Call `submit()` to
+  /// Returns `EAGAIN` if the submission queue is full. Call `submit()` to
   /// drain the queue and try again.
   pub unsafe fn push(
     &mut self,
     entry: Entry,
     user_data: u64,
-  ) -> io::Result<()> {
+  ) -> Result<(), Errno> {
     unsafe { self.push_with_flags(entry, user_data, SqeFlags::NONE) }
   }
 
@@ -328,13 +333,10 @@ impl LioUring {
     entry: Entry,
     user_data: u64,
     flags: SqeFlags,
-  ) -> io::Result<()> {
+  ) -> Result<(), Errno> {
     let sqe = unsafe { bindings::io_uring_get_sqe(&raw mut self.ring) };
     if sqe.is_null() {
-      return Err(io::Error::new(
-        io::ErrorKind::WouldBlock,
-        "submission queue is full",
-      ));
+      return Err(Errno::new(libc::EAGAIN));
     }
 
     unsafe {
@@ -356,12 +358,12 @@ impl LioUring {
   ///
   /// # Errors
   /// Returns an error if submission fails.
-  pub fn submit(&mut self) -> io::Result<usize> {
+  pub fn submit(&mut self) -> Result<usize, Errno> {
     if !self.is_sqpoll() {
       let ret =
         unsafe { bindings::io_uring_submit_and_wait(&raw mut self.ring, 0) };
       if ret < 0 {
-        return Err(io::Error::from_raw_os_error(-ret));
+        return Err(Errno::new(-ret));
       }
       return Ok(ret as usize);
     }
@@ -373,8 +375,8 @@ impl LioUring {
 
       if sq_head != sq_tail {
         self.ring.sq.sqe_head = sq_tail;
-        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        std::ptr::write_volatile(self.ring.sq.ktail, sq_tail);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        core::ptr::write_volatile(self.ring.sq.ktail, sq_tail);
       }
 
       sq_tail.wrapping_sub(*self.ring.sq.khead)
@@ -390,7 +392,7 @@ impl LioUring {
     if needs_wakeup {
       let ret = unsafe { bindings::io_uring_submit(&raw mut self.ring) };
       if ret < 0 {
-        return Err(io::Error::from_raw_os_error(-ret));
+        return Err(Errno::new(-ret));
       }
       Ok(ret as usize)
     } else {
@@ -401,12 +403,12 @@ impl LioUring {
   /// Submit queued operations and wait for at least `want` completions.
   ///
   /// Returns the number of operations submitted.
-  pub fn submit_and_wait(&mut self, want: usize) -> io::Result<usize> {
+  pub fn submit_and_wait(&mut self, want: usize) -> Result<usize, Errno> {
     let ret = unsafe {
       bindings::io_uring_submit_and_wait(&raw mut self.ring, want as u32)
     };
     if ret < 0 {
-      return Err(io::Error::from_raw_os_error(-ret));
+      return Err(Errno::new(-ret));
     }
     Ok(ret as usize)
   }
@@ -432,7 +434,7 @@ impl LioUring {
   ///
   /// # Errors
   /// Returns an error if waiting fails.
-  pub fn wait(&mut self) -> io::Result<Completion> {
+  pub fn wait(&mut self) -> Result<Completion, Errno> {
     loop {
       let mut cqe_ptr = ptr::null_mut();
       let ret = unsafe {
@@ -444,7 +446,7 @@ impl LioUring {
         if errno == libc::EINTR {
           continue;
         }
-        return Err(io::Error::from_raw_os_error(errno));
+        return Err(Errno::new(errno));
       }
 
       let cqe = unsafe { &*cqe_ptr };
@@ -466,11 +468,11 @@ impl LioUring {
   pub fn wait_timeout(
     &mut self,
     timeout: Duration,
-  ) -> io::Result<Option<Completion>> {
-    let deadline = Instant::now() + timeout;
+  ) -> Result<Option<Completion>, Errno> {
+    let deadline = monotonic_now().saturating_add(timeout);
 
     loop {
-      let remaining = deadline.saturating_duration_since(Instant::now());
+      let remaining = deadline.saturating_sub(monotonic_now());
       if remaining.is_zero() {
         return Ok(None);
       }
@@ -497,7 +499,7 @@ impl LioUring {
         if errno == libc::ETIME {
           return Ok(None);
         }
-        return Err(io::Error::from_raw_os_error(errno));
+        return Err(Errno::new(errno));
       }
 
       let cqe = unsafe { &*cqe_ptr };
@@ -516,7 +518,7 @@ impl LioUring {
   ///
   /// # Errors
   /// Returns an error if peeking fails (not including "no data available").
-  pub fn try_wait(&mut self) -> io::Result<Option<Completion>> {
+  pub fn try_wait(&mut self) -> Result<Option<Completion>, Errno> {
     let mut cqe_ptr = ptr::null_mut();
     let ret = unsafe {
       bindings::io_uring_peek_cqe(&raw mut self.ring, &raw mut cqe_ptr)
@@ -526,7 +528,7 @@ impl LioUring {
       if -ret == libc::EAGAIN {
         return Ok(None);
       }
-      return Err(io::Error::from_raw_os_error(-ret));
+      return Err(Errno::new(-ret));
     }
 
     if cqe_ptr.is_null() {
@@ -545,7 +547,7 @@ impl LioUring {
   /// Peek at the next completion without removing it from the queue.
   ///
   /// Returns `None` if no completions are available.
-  pub fn peek(&self) -> io::Result<Option<Completion>> {
+  pub fn peek(&self) -> Result<Option<Completion>, Errno> {
     let mut cqe_ptr = ptr::null_mut();
     let ret = unsafe {
       bindings::io_uring_peek_cqe(
@@ -558,7 +560,7 @@ impl LioUring {
       if -ret == libc::EAGAIN {
         return Ok(None);
       }
-      return Err(io::Error::from_raw_os_error(-ret));
+      return Err(Errno::new(-ret));
     }
 
     if cqe_ptr.is_null() {
@@ -588,44 +590,36 @@ impl LioUring {
   /// Registered buffers can be used with `ReadFixed` and `WriteFixed` operations.
   ///
   /// # Safety
-  /// The buffers must remain valid and not be modified or moved until they are
-  /// unregistered or the io_uring instance is dropped.
+  /// Each `iovec` must describe memory that stays valid, and is not moved,
+  /// until it is unregistered or the io_uring instance is dropped.
   ///
   /// # Errors
   /// Returns an error if registration fails (e.g., insufficient resources).
   pub unsafe fn register_buffers(
     &mut self,
-    buffers: &[IoSlice<'_>],
-  ) -> io::Result<()> {
-    let iovecs: Vec<libc::iovec> = buffers
-      .iter()
-      .map(|buf| libc::iovec {
-        iov_base: buf.as_ptr() as *mut _,
-        iov_len: buf.len(),
-      })
-      .collect();
-
+    buffers: &[libc::iovec],
+  ) -> Result<(), Errno> {
     let ret = unsafe {
       bindings::io_uring_register_buffers(
         &raw mut self.ring,
-        iovecs.as_ptr().cast(),
-        iovecs.len() as u32,
+        buffers.as_ptr().cast(),
+        buffers.len() as u32,
       )
     };
 
     if ret < 0 {
-      return Err(io::Error::from_raw_os_error(-ret));
+      return Err(Errno::new(-ret));
     }
     Ok(())
   }
 
   /// Unregister previously registered buffers.
-  pub fn unregister_buffers(&mut self) -> io::Result<()> {
+  pub fn unregister_buffers(&mut self) -> Result<(), Errno> {
     let ret =
       unsafe { bindings::io_uring_unregister_buffers(&raw mut self.ring) };
 
     if ret < 0 {
-      return Err(io::Error::from_raw_os_error(-ret));
+      return Err(Errno::new(-ret));
     }
     Ok(())
   }
@@ -637,7 +631,7 @@ impl LioUring {
   ///
   /// # Errors
   /// Returns an error if registration fails.
-  pub fn register_files(&mut self, fds: &[i32]) -> io::Result<()> {
+  pub fn register_files(&mut self, fds: &[i32]) -> Result<(), Errno> {
     let ret = unsafe {
       bindings::io_uring_register_files(
         &raw mut self.ring,
@@ -647,7 +641,7 @@ impl LioUring {
     };
 
     if ret < 0 {
-      return Err(io::Error::from_raw_os_error(-ret));
+      return Err(Errno::new(-ret));
     }
     Ok(())
   }
@@ -659,7 +653,7 @@ impl LioUring {
     &mut self,
     offset: u32,
     fds: &[i32],
-  ) -> io::Result<()> {
+  ) -> Result<(), Errno> {
     let ret = unsafe {
       bindings::io_uring_register_files_update(
         &raw mut self.ring,
@@ -670,21 +664,32 @@ impl LioUring {
     };
 
     if ret < 0 {
-      return Err(io::Error::from_raw_os_error(-ret));
+      return Err(Errno::new(-ret));
     }
     Ok(())
   }
 
   /// Unregister all previously registered files.
-  pub fn unregister_files(&mut self) -> io::Result<()> {
+  pub fn unregister_files(&mut self) -> Result<(), Errno> {
     let ret =
       unsafe { bindings::io_uring_unregister_files(&raw mut self.ring) };
 
     if ret < 0 {
-      return Err(io::Error::from_raw_os_error(-ret));
+      return Err(Errno::new(-ret));
     }
     Ok(())
   }
+}
+
+/// Time on the monotonic clock, which `wait_timeout` measures its deadline
+/// against.
+fn monotonic_now() -> Duration {
+  let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+  // SAFETY: `ts` is a valid, writable timespec.
+  let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+  // CLOCK_MONOTONIC is always present on Linux, and the pointer is valid.
+  assert_eq!(ret, 0, "clock_gettime(CLOCK_MONOTONIC) failed");
+  Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
 #[cfg(test)]

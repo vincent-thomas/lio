@@ -7,8 +7,8 @@ fn main() -> io::Result<()> {
   let params = Params::default().sqpoll(1000);
   let mut ring = match LioUring::with_params(params) {
     Ok(ring) => ring,
-    Err(e) if e.raw_os_error() == Some(libc::EPERM) => return Ok(()),
-    Err(e) => return Err(e),
+    Err(e) if e.raw() == libc::EPERM => return Ok(()),
+    Err(e) => return Err(e.into()),
   };
 
   let nop1 = Nop::new();

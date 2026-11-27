@@ -81,7 +81,7 @@ fn test_sq_full_error() {
   let op = Nop::new().build();
   let result = unsafe { ring.push(op, 999) };
   assert!(result.is_err());
-  assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+  assert_eq!(result.unwrap_err().raw(), libc::EAGAIN);
 }
 
 #[test]
@@ -392,9 +392,12 @@ fn test_register_buffers() {
   let buf1 = vec![0u8; 4096];
   let buf2 = vec![0u8; 4096];
 
-  let slices = [std::io::IoSlice::new(&buf1), std::io::IoSlice::new(&buf2)];
+  let iovecs = [
+    libc::iovec { iov_base: buf1.as_ptr() as *mut _, iov_len: buf1.len() },
+    libc::iovec { iov_base: buf2.as_ptr() as *mut _, iov_len: buf2.len() },
+  ];
 
-  let result = unsafe { ring.register_buffers(&slices) };
+  let result = unsafe { ring.register_buffers(&iovecs) };
   assert!(result.is_ok());
 
   let result = ring.unregister_buffers();

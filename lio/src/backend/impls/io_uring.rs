@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use bumpalo::Bump;
 use lio_uring::{
-  Entry, LioUring,
+  Entry, Errno, LioUring,
   operation::{
     Accept, AsyncCancel, Bind, Connect, Fsync, LinkAt, Listen, MkDirAt, Nop,
     OpenAt, Readv, Recv, RecvMsg, RenameAt, Send, SendMsg, Shutdown, Socket,
@@ -581,20 +581,18 @@ impl IoUring {
 
   fn create_ring_with(
     cap: u32,
-    mut initialize: impl FnMut(lio_uring::Params) -> io::Result<LioUring>,
+    mut initialize: impl FnMut(lio_uring::Params) -> Result<LioUring, Errno>,
   ) -> io::Result<LioUring> {
     let params = lio_uring::Params { sq_entries: cap, ..Default::default() };
     // The driver is thread-local. Defer completion work until it explicitly
     // checks the ring, so a batch submission is not interrupted per completion.
-    initialize(params.clone().deferred_taskrun()).or_else(|err| {
-      // Old kernels reject unsupported setup flags. Preserve their original
-      // behavior, but do not mask resource/permission failures with retries.
-      if err.raw_os_error() == Some(libc::EINVAL) {
-        initialize(params)
-      } else {
-        Err(err)
-      }
-    })
+    let ring =
+      initialize(params.clone().deferred_taskrun()).or_else(|err| {
+        // Old kernels reject unsupported setup flags. Preserve their original
+        // behavior, but do not mask resource/permission failures with retries.
+        if err.raw() == libc::EINVAL { initialize(params) } else { Err(err) }
+      })?;
+    Ok(ring)
   }
 
   unsafe fn drop_read_dir_state(state: *mut ()) {

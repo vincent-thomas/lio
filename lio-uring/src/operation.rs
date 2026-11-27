@@ -35,7 +35,8 @@
 //! ```
 
 use core::mem;
-use std::os::fd::RawFd;
+/// A file descriptor, as the kernel takes it.
+pub type RawFd = core::ffi::c_int;
 
 use crate::{Entry, SqeFlags, bindings};
 
@@ -2051,7 +2052,7 @@ opcode! {
         id: { libc::id_t },
         options: { libc::c_int },
         ;;
-        infop: *const libc::siginfo_t = std::ptr::null(),
+        infop: *const libc::siginfo_t = core::ptr::null(),
         flags: libc::c_uint = 0,
     }
 
