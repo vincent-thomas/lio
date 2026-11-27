@@ -1,0 +1,45 @@
+[package]
+name = "lio-wasi-host"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "A WASI 0.3 host for wasmtime whose I/O runs on lio"
+
+# Its own workspace: wasmtime's dependency tree stays out of lio's lockfile.
+[workspace]
+
+[dependencies]
+lio = { path = "../lio", features = ["high"] }
+wasmtime = { version = "=51.0.0", default-features = false, features = [
+  "std",
+  "runtime",
+  "cranelift",
+  "async",
+  "component-model",
+  "component-model-async",
+  "parallel-compilation",
+  "cache",
+] }
+getrandom = "0.3"
+libc = "0.2"
+rustix = { version = "1", features = ["fs", "net", "time"] }
+
+# The comparison host for the benchmarks.
+wasmtime-wasi = { version = "51.0.0", default-features = false, features = ["p3"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+
+[features]
+baseline = ["dep:wasmtime-wasi", "dep:tokio"]
+
+[[bin]]
+name = "lio-wasi-run"
+path = "src/bin/run.rs"
+
+[[bin]]
+name = "baseline-run"
+path = "src/bin/baseline.rs"
+required-features = ["baseline"]
+
+[profile.release]
+debug = 1

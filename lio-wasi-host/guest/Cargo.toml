@@ -1,0 +1,15 @@
+[package]
+name = "bench-guest"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "The WASI 0.3 workloads the two hosts are timed on"
+
+[workspace]
+
+[dependencies]
+lio-wasi = { path = "../../lio-wasi", features = ["std"] }
+
+[profile.release]
+opt-level = 3
