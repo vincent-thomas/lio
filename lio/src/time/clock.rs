@@ -253,9 +253,16 @@ impl Clock {
     })
   }
 
+  /// Yields the timers that have fired, each once.
+  ///
+  /// # Panics
+  ///
+  /// A tracked timer fires at most once per poll, so a poll that yields
+  /// more timers than are tracked would never end; it panics instead.
   #[inline]
   pub fn poll_expired(&mut self) -> impl Iterator<Item = TimerId> + '_ {
-    ExpiredIterator { clock: self }
+    let tracked = self.len();
+    at_most(tracked, ExpiredIterator { clock: self })
   }
 
   #[inline]
@@ -271,8 +278,20 @@ impl Clock {
         self.current_tick = now_ticks;
         break;
       }
+      // The loop ends because each pass moves the clock forward to `next`.
+      assert!(
+        self.current_tick < next,
+        "clock: the next busy tick {next} is not after tick {}",
+        self.current_tick
+      );
       self.current_tick = next - 1;
       self.tick();
+      assert!(
+        self.current_tick == next,
+        "clock: a tick from {} ended at {}",
+        next - 1,
+        self.current_tick
+      );
     }
     // Every timer due by now has fired, so its deadline is no longer
     // counted. One still counted lost its wheel entry and never will.
@@ -580,10 +599,10 @@ impl Clock {
 
   #[inline]
   fn pop_expired(&mut self) -> Option<TimerId> {
-    while self.pending_index < self.pending_fire.len() {
-      let pending = self.pending_fire[self.pending_index];
-      let index = self.pending_index;
-      self.pending_index += 1;
+    // A range, so the search ends whatever becomes of the cursor.
+    for index in self.pending_index..self.pending_fire.len() {
+      let pending = self.pending_fire[index];
+      self.pending_index = index + 1;
 
       if !self.pending_has_stale {
         // The flag lets delivery skip the stale check; verify it was right.
@@ -609,6 +628,18 @@ impl Clock {
     self.pending_has_stale = false;
     None
   }
+}
+
+/// Yields what `timers` does, panicking once it yields more than `max`.
+pub(super) fn at_most(
+  max: usize,
+  timers: impl Iterator<Item = TimerId>,
+) -> impl Iterator<Item = TimerId> {
+  let mut left = max;
+  timers.inspect(move |_| {
+    assert!(left > 0, "clock: a poll fired more timers than the {max} tracked");
+    left -= 1;
+  })
 }
 
 struct ExpiredIterator<'a> {
@@ -880,14 +911,30 @@ mod tests {
       assert!(collect_expired(&mut clock).is_empty(), "{id} fired early");
       clock.advance_to(deadline);
       assert_eq!(collect_expired(&mut clock), vec![id], "at {deadline}");
+      // A level that keeps or miscounts its entries is never idle, and the
+      // gaps ahead are then stepped a tick at a time: fail here instead.
+      assert_wheel_counts(&clock);
     }
   }
 
-  /// Each level counts exactly the entries its slots hold.
+  /// Each level counts exactly the entries its slots hold, and holds none
+  /// that was due by now: the tick that reached its slot took it out.
   fn assert_wheel_counts(clock: &Clock) {
     fn held<const N: usize>(wheel: &Wheel<N>) -> usize {
       wheel.slots.iter().map(Vec::len).sum()
     }
+    fn overdue<const N: usize>(wheel: &Wheel<N>, now: u64) -> usize {
+      let entries = wheel.slots.iter().flatten();
+      entries.filter(|entry| entry.deadline_ticks <= now).count()
+    }
+    let now = clock.current_tick;
+    let overdue = [
+      overdue(&clock.level0, now),
+      overdue(&clock.level1, now),
+      overdue(&clock.level2, now),
+      overdue(&clock.level3, now),
+    ];
+    assert_eq!(overdue, [0; 4], "wheel entries left behind at tick {now}");
     let counted =
       [clock.level0.len, clock.level1.len, clock.level2.len, clock.level3.len];
     let held = [
@@ -1197,13 +1244,10 @@ mod tests {
           Step::Poll(limit) => {
             let got: Vec<TimerId> = match limit {
               Some(limit) => clock.poll_expired().take(limit).collect(),
-              // `for_each` takes the iterator's `fold`, as the driver does;
-              // bounded, so a broken one fails rather than runs forever.
+              // `for_each` takes the iterator's `fold`, as the driver does.
               None => {
                 let mut got = Vec::new();
-                let tracked = clock.len();
-                crate::time::at_most(tracked, clock.poll_expired())
-                  .for_each(|id| got.push(id));
+                clock.poll_expired().for_each(|id| got.push(id));
                 got
               }
             };

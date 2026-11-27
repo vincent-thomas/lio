@@ -136,15 +136,11 @@ impl TimeManager {
   ///
   /// Doesn't read the clock when no timer is tracked, including fired ones
   /// waiting to be drained.
-  ///
-  /// A tracked timer fires at most once per poll, so a poll that yields more
-  /// timers than are tracked would never end; it panics instead.
   pub fn poll_expired(&mut self) -> impl Iterator<Item = TimerId> + '_ {
     if !self.is_empty() {
       self.sync_to_now();
     }
-    let tracked = self.clock.len();
-    at_most(tracked, self.clock.poll_expired())
+    self.clock.poll_expired()
   }
 
   /// The completion a fired timer is delivered with.
@@ -196,18 +192,6 @@ impl TimeManager {
   pub fn is_paused(&self) -> bool {
     matches!(self.state, TimeState::Paused)
   }
-}
-
-/// Yields what `timers` does, panicking once it yields more than `max`.
-fn at_most(
-  max: usize,
-  timers: impl Iterator<Item = TimerId>,
-) -> impl Iterator<Item = TimerId> {
-  let mut left = max;
-  timers.inspect(move |_| {
-    assert!(left > 0, "clock: a poll fired more timers than the {max} tracked");
-    left -= 1;
-  })
 }
 
 /// Pause wall-clock advancement for the given [`Lio`] instance.
