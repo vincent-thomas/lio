@@ -128,6 +128,52 @@ pub struct Queued<'a> {
   id: u64,
   /// Dropped when `start` returns, unless the backend takes it.
   op: &'a mut Op,
+  /// The backend was offered it, and declined.
+  attempted: bool,
+}
+
+/// One operation the backend is offered before it is started: it may
+/// perform it there and then, if that takes no waiting.
+///
+/// [`IoBackend::attempt`] gets it and must turn it into an [`Attempted`]:
+/// [`finish`](Self::finish) it, or [`decline`](Self::decline) it. There is
+/// no key: an operation that is finished here was never in flight.
+#[derive(Debug)]
+pub struct Offered<'a> {
+  op: &'a Op,
+}
+
+/// Proof that [`IoBackend::attempt`] dealt with the operation it was
+/// offered. Only [`Offered::finish`] and [`Offered::decline`] make one.
+#[derive(Debug)]
+#[must_use]
+pub struct Attempted(Option<isize>);
+
+impl<'a> Offered<'a> {
+  /// The operation. Its addresses are valid until `attempt` returns.
+  #[inline]
+  pub fn as_op(&self) -> &'a Op {
+    self.op
+  }
+
+  /// Reports the operation as performed, with `result`: non-negative for
+  /// success, a negative errno for an error.
+  ///
+  /// # Safety
+  ///
+  /// As for [`Done::complete`]: nothing uses an address copied from the
+  /// operation any more, and `result` is what happened.
+  #[inline]
+  pub unsafe fn finish(self, result: isize) -> Attempted {
+    Attempted(Some(result))
+  }
+
+  /// Leaves the operation to [`IoBackend::start`]: it would have to wait,
+  /// or this backend performs nothing here.
+  #[inline]
+  pub fn decline(self) -> Attempted {
+    Attempted(None)
+  }
 }
 
 /// Proof that [`IoBackend::start`] dealt with the operation it was given.
@@ -163,6 +209,13 @@ impl<'a> Queued<'a> {
   #[inline]
   pub fn as_op(&self) -> &Op {
     self.op
+  }
+
+  /// Whether [`IoBackend::attempt`] was offered this operation and
+  /// declined it: what it tried there need not be tried again.
+  #[inline]
+  pub fn was_attempted(&self) -> bool {
+    self.attempted
   }
 
   /// Begins the operation: the [`Op`] to act on, and the key to report it
@@ -448,6 +501,22 @@ pub trait IoBackend {
   /// close unrelated descriptors of the process.
   fn resource_close(&self) -> ResourceClose;
 
+  /// Performs an operation there and then, if that takes no waiting:
+  /// [`finish`](Offered::finish) it, or [`decline`](Offered::decline) it.
+  ///
+  /// The driver offers an operation here before it gives it a place in
+  /// the table. One that is finished costs none of that bookkeeping. One
+  /// that is declined comes to [`start`](Self::start) next, where
+  /// [`Queued::was_attempted`] says so.
+  ///
+  /// The operation's addresses are valid only until this returns, and it
+  /// has no arena: what the backend needs to perform it lives on the stack.
+  /// The default declines everything.
+  #[inline]
+  fn attempt(&mut self, op: Offered<'_>) -> Attempted {
+    op.decline()
+  }
+
   /// Takes one operation: [`begin`](Queued::begin) it, or
   /// [`refuse`](Queued::refuse) it.
   ///
@@ -508,6 +577,11 @@ impl<B: IoBackend + ?Sized> IoBackend for Box<B> {
   #[inline]
   fn resource_close(&self) -> ResourceClose {
     (**self).resource_close()
+  }
+
+  #[inline]
+  fn attempt(&mut self, op: Offered<'_>) -> Attempted {
+    (**self).attempt(op)
   }
 
   #[inline]
@@ -626,6 +700,13 @@ impl<B: IoBackend> Tracked<B> {
     self.live
   }
 
+  /// Whether nothing is started and no report waits to be collected: a
+  /// wait would have nothing to bring.
+  #[inline]
+  pub(crate) fn is_idle(&self) -> bool {
+    self.live == 0 && self.ready.is_empty()
+  }
+
   /// The slot of `id`, with room made for it in the table.
   #[inline]
   fn slot_of(&mut self, id: u64) -> usize {
@@ -663,9 +744,24 @@ impl<B: IoBackend> Tracked<B> {
   /// the action, and does not move or drop that memory while `keep` is held
   /// elsewhere. That is what lets the borrow end here.
   #[inline]
-  pub(crate) fn push_model(&mut self, id: u64, op: BorrowedOp<'_>, keep: Keep) {
+  pub(crate) fn push_model(
+    &mut self,
+    id: u64,
+    op: BorrowedOp<'_>,
+    keep: Keep,
+    attempted: bool,
+  ) {
     let slot = self.claim(id);
-    self.start(slot, op, keep);
+    self.start(slot, op, keep, attempted);
+  }
+
+  /// Offers the backend an operation before it has a place here. Returns
+  /// its result if the backend performed it.
+  ///
+  /// `op` borrows the operation's memory for this call only.
+  #[inline]
+  pub(crate) fn attempt(&mut self, op: &Op) -> Option<isize> {
+    self.backend.attempt(Offered { op }).0
   }
 
   /// Checks that operation `id` may start, and returns its slot.
@@ -691,7 +787,13 @@ impl<B: IoBackend> Tracked<B> {
 
   /// Hands the backend the operation of a slot that was just claimed.
   #[inline]
-  fn start(&mut self, slot: usize, op: BorrowedOp<'_>, keep: Keep) {
+  fn start(
+    &mut self,
+    slot: usize,
+    op: BorrowedOp<'_>,
+    keep: Keep,
+    attempted: bool,
+  ) {
     let Self { backend, entries, arenas, ready, live, .. } = self;
     let entry = &mut entries[slot];
     *live += 1;
@@ -706,7 +808,7 @@ impl<B: IoBackend> Tracked<B> {
     // backend does not take goes when this returns, with the resources it
     // holds.
     let mut op = op.into_op();
-    let queued = Queued { key, id, op: &mut op };
+    let queued = Queued { key, id, op: &mut op, attempted };
     let mut done = Done { entries: &mut entries[..], ready, live };
     let started = backend.start(queued, &mut arenas[slot], &mut done);
     if let Outcome::Refused(result) = started.0 {
@@ -751,7 +853,7 @@ impl<B: IoBackend> Tracked<B> {
     // backend lowered for the operation there.
     let slot = self.claim(id);
     self.arenas[slot].reset();
-    self.start(slot, op, Keep::new());
+    self.start(slot, op, Keep::new(), false);
   }
 
   /// Asks for operation `id` to finish early.

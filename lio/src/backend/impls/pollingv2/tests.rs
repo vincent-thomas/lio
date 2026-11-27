@@ -94,7 +94,7 @@ mod immediate_sockets {
     // Poller does not use the step arena. The caller keeps what `action`
     // borrows boxed, so the buffers and message descriptors stay in place
     // until the backend finishes. `from_model` names that borrow.
-    backend.push_model(id, op, crate::backend::Keep::new());
+    backend.push_model(id, op, crate::backend::Keep::new(), false);
   }
 
   #[test]

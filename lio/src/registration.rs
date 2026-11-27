@@ -67,6 +67,12 @@ impl<R> Regions<R> {
     unsafe { (&raw mut (*this).count).write(0) };
   }
 
+  /// No regions, for an operation that is attempted before it has a slot.
+  #[inline]
+  pub(crate) fn empty() -> Self {
+    Self { slots: [const { MaybeUninit::uninit() }; MAX_IOV_COUNT], count: 0 }
+  }
+
   /// Lends `regions`, in place of what was lent before. Regions past
   /// [`MAX_IOV_COUNT`] are left out.
   #[inline]
@@ -445,6 +451,16 @@ impl Registration {
       (*payload).mailbox.item = None;
       (*payload).mailbox.waker = None;
     }
+  }
+
+  /// Takes over the model of `made`, a registration that holds nothing
+  /// else, for a slot that held an operation and ran no model.
+  pub(crate) fn adopt(&mut self, mut made: Registration) {
+    assert!(
+      self.task.is_none() && made.cell.stage == Stage::Free,
+      "driver: a slot that runs a model was given another"
+    );
+    self.task = made.task.take();
   }
 
   /// Whether this slot's model, if it runs one, is done and dropped.

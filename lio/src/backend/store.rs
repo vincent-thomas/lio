@@ -198,6 +198,27 @@ impl OpStore {
     Some(f(registration, lease))
   }
 
+  /// Gives slot `id`, which holds an operation and runs no model, the
+  /// model `make` builds in its arena. Returns whether the slot is taken.
+  ///
+  /// The arena is reset first: the slot's last model is long gone.
+  #[inline]
+  pub fn adopt(
+    &mut self,
+    id: u64,
+    make: impl FnOnce(&mut Bump) -> Registration,
+  ) -> bool {
+    let key = SlabKey::from_u64(id);
+    let Some(slot) = self.slots.get_mut(key) else {
+      return false;
+    };
+    slot.model_bump.reset();
+    let made = make(&mut slot.model_bump);
+    // SAFETY: an occupied slot's registration is initialized.
+    unsafe { slot.registration.assume_init_mut() }.adopt(made);
+    true
+  }
+
   /// Whether a backend still holds a share of the lease of slot `id`: it
   /// may still use the memory of an operation that slot held.
   #[inline]

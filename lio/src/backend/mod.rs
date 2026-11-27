@@ -173,5 +173,6 @@ mod table;
 
 pub(crate) use table::Keep;
 pub use table::{
-  Done, IoBackend, OpCompleted, OpKey, PerOp, Queued, Started, Tracked,
+  Attempted, Done, IoBackend, Offered, OpCompleted, OpKey, PerOp, Queued,
+  Started, Tracked,
 };

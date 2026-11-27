@@ -19,7 +19,7 @@ use lio_uring::{
 };
 
 use crate::backend::{
-  Done, IoBackend, OpKey, PerOp, Queued, Started,
+  Attempted, Done, IoBackend, Offered, OpKey, PerOp, Queued, Started,
   impls::{
     iovec::fill_iovecs,
     unix_stat::{file_type_from_dirent_dtype, file_type_from_mode},
@@ -63,8 +63,8 @@ struct NativeMsgState {
 
 #[derive(Debug)]
 struct NativePathState {
-  path1: std::ffi::CString,
-  path2: Option<std::ffi::CString>,
+  path1: CPath,
+  path2: Option<CPath>,
 }
 
 impl NativeMsgState {
@@ -181,7 +181,7 @@ struct NativeSocketState {
 struct NativeStatState {
   statx: lio_uring::statx,
   out: std::ptr::NonNull<crate::backend::op::FileStat>,
-  path: Option<std::ffi::CString>,
+  path: Option<CPath>,
 }
 
 impl NativeStatState {
@@ -193,7 +193,7 @@ impl NativeStatState {
 
   fn with_path(
     out: std::ptr::NonNull<crate::backend::op::FileStat>,
-    path: std::ffi::CString,
+    path: CPath,
   ) -> Self {
     // SAFETY: `statx` is a POD output struct written by the kernel before
     // being read during finalize.
@@ -239,6 +239,16 @@ impl NativeSocketState {
   }
 }
 
+/// A NUL-terminated path in an operation's step arena.
+#[derive(Debug, Clone, Copy)]
+struct CPath(NonNull<libc::c_char>);
+
+impl CPath {
+  fn as_ptr(self) -> *const libc::c_char {
+    self.0.as_ptr()
+  }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum LoweredState {
   Plain,
@@ -251,12 +261,18 @@ enum LoweredState {
 }
 
 impl LoweredState {
-  fn os_path_to_cstring(
-    path: &std::ffi::OsString,
-  ) -> io::Result<std::ffi::CString> {
+  /// `path` as a NUL-terminated string in `arena`, where it lives as long
+  /// as the rest of what the operation was lowered to, and is freed with
+  /// it.
+  fn c_path_in(arena: &Bump, path: &std::ffi::OsString) -> io::Result<CPath> {
     use std::os::unix::ffi::OsStrExt;
-    std::ffi::CString::new(path.as_os_str().as_bytes())
-      .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.contains(&0) {
+      return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let terminated = arena.alloc_slice_fill_copy(bytes.len() + 1, 0u8);
+    terminated[..bytes.len()].copy_from_slice(bytes);
+    Ok(CPath(NonNull::from(terminated).cast()))
   }
 
   fn lower_in(op: &Op, arena: &Bump, single_socket: bool) -> io::Result<Self> {
@@ -312,7 +328,7 @@ impl LoweredState {
       Op::Stat { target, out } => {
         let state = match target {
           crate::backend::op::StatTarget::Path { path, .. } => {
-            let path_cstr = Self::os_path_to_cstring(path)?;
+            let path_cstr = Self::c_path_in(arena, path)?;
             NativeStatState::with_path(*out, path_cstr)
           }
           crate::backend::op::StatTarget::Fd { .. } => {
@@ -324,15 +340,15 @@ impl LoweredState {
       Op::OpenAt { path, .. }
       | Op::UnlinkAt { path, .. }
       | Op::MkdirAt { path, .. } => {
-        let path1 = Self::os_path_to_cstring(path)?;
+        let path1 = Self::c_path_in(arena, path)?;
         Self::Path(NonNull::from(
           arena.alloc(NativePathState { path1, path2: None }),
         ))
       }
       Op::RenameAt { old_path, new_path, .. }
       | Op::LinkAt { source_path: old_path, new_path, .. } => {
-        let path1 = Self::os_path_to_cstring(old_path)?;
-        let path2 = Some(Self::os_path_to_cstring(new_path)?);
+        let path1 = Self::c_path_in(arena, old_path)?;
+        let path2 = Some(Self::c_path_in(arena, new_path)?);
         Self::Path(NonNull::from(arena.alloc(NativePathState { path1, path2 })))
       }
       _ => Self::Plain,
@@ -442,6 +458,9 @@ pub struct IoUring {
   /// The requests the ring has, by the key that is their `user_data`.
   pending: PerOp<PendingOp>,
   profile: Option<IoUringProfile>,
+  /// What an operation is lowered to while it is attempted: nothing in it
+  /// outlives the attempt.
+  scratch: Bump,
 }
 
 #[derive(Debug, Default)]
@@ -1392,6 +1411,55 @@ impl IoUring {
 }
 
 impl IoBackend for IoUring {
+  fn attempt(&mut self, offered: Offered<'_>) -> Attempted {
+    let op = offered.as_op();
+    let result = match op {
+      Op::Nop => Some(0),
+      // What `try_here` and `stat_here` perform. An operation that is not
+      // valid is left for `start` to refuse.
+      // Lowered on the stack: the common case needs no arena.
+      Op::Read { iovecs, iov_count, offset: Some(_), .. }
+        if Self::validate_op(op).is_none() =>
+      {
+        NativeRwState::from_raws(*iovecs, *iov_count).and_then(|mut state| {
+          Self::try_here(op, LoweredState::Rw(NonNull::from(&mut state)))
+        })
+      }
+      Op::Write { iovecs, iov_count, .. }
+        if Self::validate_op(op).is_none() =>
+      {
+        NativeRwState::from_raws(*iovecs, *iov_count).and_then(|mut state| {
+          Self::try_here(op, LoweredState::Rw(NonNull::from(&mut state)))
+        })
+      }
+      Op::Recv { .. }
+      | Op::Send { .. }
+      | Op::OpenAt { .. }
+      | Op::Stat { .. }
+        if Self::validate_op(op).is_none() =>
+      {
+        self.scratch.reset();
+        match LoweredState::lower_in(op, &self.scratch, self.single_socket) {
+          Ok(LoweredState::Stat(mut state)) => {
+            // SAFETY: `state` points into the scratch arena, which this
+            // call does not reset again, and nothing else refers to it.
+            Some(Self::stat_here(op, unsafe { state.as_mut() }))
+          }
+          Ok(lowered) => Self::try_here(op, lowered),
+          Err(_) => None,
+        }
+      }
+      _ => None,
+    };
+    match result {
+      // SAFETY: the kernel never saw a request, so nothing but this thread
+      // had the operation's addresses, and this thread is done with them.
+      // The result is the system call's own.
+      Some(result) => unsafe { offered.finish(result) },
+      None => offered.decline(),
+    }
+  }
+
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.ring = Some(if self.deferred_completions {
       Self::create_ring_with(cap as u32, LioUring::with_params)?
@@ -1435,6 +1503,8 @@ impl IoBackend for IoUring {
       return queued.refuse(refused.unwrap_or(-(libc::EIO as isize)));
     };
 
+    // What was tried when it was offered need not be tried again.
+    let attempted = queued.was_attempted();
     let (started, key, op) = queued.begin();
     if matches!(op, Op::Nop) {
       if let Some(profile) = self.profile.as_mut() {
@@ -1455,7 +1525,7 @@ impl IoBackend for IoUring {
       return started;
     }
 
-    if let Some(result) = Self::try_here(op, lowered) {
+    if !attempted && let Some(result) = Self::try_here(op, lowered) {
       if let Some(profile) = self.profile.as_mut() {
         profile.immediate_ops += 1;
       }
