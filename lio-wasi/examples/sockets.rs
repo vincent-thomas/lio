@@ -7,6 +7,7 @@
 //!   target/wasm32-wasip3/debug/examples/sockets.wasm
 //! ```
 
+use lio_wasi::sockets::ip_name_lookup::{IpAddress, ResolveAddresses};
 use lio_wasi::sockets::{
   Accepted, Connect, ErrorCode, IpAddressFamily, IpSocketAddress,
   Ipv4SocketAddress, ReceiveFrom, SendTo, StreamStatus, TcpSocket, UdpSocket,
@@ -243,6 +244,32 @@ fn tcp(set: &mut WaitableSet, out: &mut Out) {
   say!(out, "tcp connect to a closed port: {error:?}");
 }
 
+/// Resolves names that need no resolver: an address in text form is its
+/// own answer.
+fn lookup(set: &mut WaitableSet, out: &mut Out) {
+  let mut v4 = ResolveAddresses::new("127.0.0.1");
+  run(set, &mut v4);
+  let Some(Ok(addresses)) = v4.result() else {
+    panic!("resolving an IPv4 address in text form failed");
+  };
+  assert!(matches!(addresses[..], [IpAddress::Ipv4((127, 0, 0, 1))]));
+  assert!(v4.result().is_none(), "a result is taken once");
+
+  let mut v6 = ResolveAddresses::new("::1");
+  run(set, &mut v6);
+  let Some(Ok(addresses)) = v6.result() else {
+    panic!("resolving an IPv6 address in text form failed");
+  };
+  assert!(matches!(addresses[..], [IpAddress::Ipv6((0, 0, 0, 0, 0, 0, 0, 1))]));
+
+  let mut invalid = ResolveAddresses::new("not a host name!");
+  run(set, &mut invalid);
+  let Some(Err(error)) = invalid.result() else {
+    panic!("resolved a name that is not a host name");
+  };
+  say!(out, "resolve-addresses: ok (an invalid name: {error:?})");
+}
+
 fn udp(set: &mut WaitableSet, out: &mut Out) {
   let a = must("create", UdpSocket::create(IpAddressFamily::Ipv4));
   let b = must("create", UdpSocket::create(IpAddressFamily::Ipv4));
@@ -309,5 +336,6 @@ fn main() {
   let mut out = Out::stdout();
   tcp(&mut set, &mut out);
   udp(&mut set, &mut out);
+  lookup(&mut set, &mut out);
   assert_eq!(set.in_flight(), 0);
 }

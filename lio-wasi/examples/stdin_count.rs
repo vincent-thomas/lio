@@ -7,13 +7,15 @@
 //!   target/wasm32-wasip3/debug/examples/stdin_count.wasm
 //! ```
 
+use lio_wasi::cli::{StreamStatus, stdin};
 use lio_wasi::{Event, Started, StreamResult, WaitableSet};
 
 mod common;
 
 fn main() -> Result<(), lio_wasi::Error> {
   let mut out = common::Out::stdout();
-  let (stdin, _result) = lio_wasi::cli::stdin();
+  let (stdin, status) = stdin::read_via_stream();
+  let mut status = StreamStatus::new(status);
   let mut set = WaitableSet::new();
   let stdin = set.add_reader(stdin);
 
@@ -36,6 +38,15 @@ fn main() -> Result<(), lio_wasi::Error> {
       break;
     }
   }
+  // The stream ended. Its status says whether that was the end of the
+  // input or an error.
+  // SAFETY: `status` stays put until its value is delivered, which the
+  // wait below sees.
+  if let Some(future) = unsafe { set.read_future(&mut status) } {
+    assert_eq!(set.wait(), Some(Event::FutureRead(future)));
+  }
+  assert!(matches!(status.result(), Some(Ok(()))), "standard input failed");
+  assert!(status.result().is_none(), "a status is taken once");
   say!(out, "{total} bytes in {reads} reads");
   Ok(())
 }

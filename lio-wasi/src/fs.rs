@@ -8,10 +8,10 @@
 //! at once or by [`Event::Returned`](crate::Event::Returned), take the
 //! result with its `result` method.
 //!
-//! Calls that do not wait are not operations: [`preopens`] is a plain
-//! function, `read_via_stream`, `write_via_stream`, `append_via_stream` and
-//! `read_directory` are methods of [`Descriptor`], and dropping a
-//! [`Descriptor`] closes it. A directory is listed through the stream `read_directory`
+//! Functions that do not wait are WASI's own, passed on as they are:
+//! [`preopens::get_directories`], and the methods of [`Descriptor`] such as
+//! `read_via_stream`, `write_via_stream`, `append_via_stream` and
+//! `read_directory`. Dropping a [`Descriptor`] closes it. A directory is listed through the stream `read_directory`
 //! returns: see [`DirEntryBuf`].
 //!
 //! The layouts are written by hand to match what `wit-bindgen` generates for
@@ -21,9 +21,11 @@
 use core::marker::PhantomData;
 
 pub use wasip3::clocks::system_clock::Instant;
+pub use wasip3::filesystem::preopens;
 pub use wasip3::filesystem::types::{
   Advice, Descriptor, DescriptorFlags, DescriptorStat, DescriptorType,
-  DirectoryEntry, ErrorCode, NewTimestamp, OpenFlags, PathFlags,
+  DirectoryEntry, ErrorCode, MetadataHashValue, NewTimestamp, OpenFlags,
+  PathFlags,
 };
 use wasip3::wit_bindgen::FutureReader;
 use wasip3::wit_future::FuturePayload;
@@ -50,6 +52,12 @@ wasm_imports!("wasi:filesystem/types@0.3.2" {
     fn advise(file: i32, offset: i64, length: i64, advice: i32, reply: *mut u8) -> i32;
   "[async-lower][method]descriptor.stat"
     fn stat(file: i32, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.is-same-object"
+    fn is_same_object(file: i32, other: i32, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.metadata-hash"
+    fn metadata_hash(file: i32, reply: *mut u8) -> i32;
+  "[async-lower][method]descriptor.metadata-hash-at"
+    fn metadata_hash_at(dir: i32, path_flags: i32, path: *const u8, len: usize, reply: *mut u8) -> i32;
   "[async-lower][method]descriptor.stat-at"
     fn stat_at(dir: i32, path_flags: i32, path: *const u8, len: usize, reply: *mut u8) -> i32;
   "[async-lower][method]descriptor.create-directory-at"
@@ -152,12 +160,6 @@ impl LiftOk for DescriptorType {
       other => unreachable!("unknown descriptor-type case {other}"),
     }
   }
-}
-
-/// The directories the host opened for this component, each with the path
-/// it stands for. This does not wait.
-pub fn preopens() -> Vec<(Descriptor, String)> {
-  wasip3::filesystem::preopens::get_directories()
 }
 
 /// A descriptor argument: its handle, as the ABI passes it.
@@ -871,6 +873,186 @@ impl<'a> StatAt<'a> {
 
 call!(StatAt => DescriptorStat, |op, reply| {
   imports::stat_at(
+    op.dir,
+    i32::from(op.path_flags.bits()),
+    op.path.as_ptr(),
+    op.path.len(),
+    reply,
+  )
+});
+
+// ───────────────────────────────── identity ─────────────────────────────────
+
+/// Tells whether two descriptors refer to the same file or directory.
+///
+/// Its result is a plain `bool`: this call cannot fail.
+pub struct IsSameObject<'a> {
+  file: i32,
+  other: i32,
+  /// The host writes the answer through a pointer into this: `0` or `1`.
+  /// [`NO_RESULT`] while no answer is there.
+  reply: core::cell::UnsafeCell<u8>,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> IsSameObject<'a> {
+  pub fn new(file: &'a Descriptor, other: &'a Descriptor) -> Self {
+    Self {
+      file: handle(file),
+      other: handle(other),
+      reply: core::cell::UnsafeCell::new(NO_RESULT),
+      borrows: PhantomData,
+    }
+  }
+
+  /// Takes the call's result.
+  ///
+  /// Returns `None` if the call has not returned, was cancelled, or its
+  /// result was already taken.
+  pub fn result(&mut self) -> Option<bool> {
+    match core::mem::replace(self.reply.get_mut(), NO_RESULT) {
+      NO_RESULT => None,
+      0 => Some(false),
+      1 => Some(true),
+      other => unreachable!("unknown bool {other:#x}"),
+    }
+  }
+}
+
+impl Call for IsSameObject<'_> {}
+
+impl sealed::Call for IsSameObject<'_> {
+  unsafe fn start(&mut self) -> u32 {
+    *self.reply.get_mut() = NO_RESULT;
+    // SAFETY: the arguments are handles, and the caller keeps `self`, which
+    // the host writes into, in place until the call returns.
+    let packed = unsafe {
+      imports::is_same_object(self.file, self.other, self.reply.get())
+    };
+    packed as u32
+  }
+}
+
+/// What follows the tag of a `result<metadata-hash-value, error-code>`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+union HashPayload {
+  /// Ok: the hash's lower then upper half.
+  hash: [u64; 2],
+  /// Error: the error code.
+  error: Words,
+}
+
+/// `result<metadata-hash-value, error-code>` as the host writes it. The
+/// hash holds 64-bit fields, so the payload starts at offset 8.
+#[repr(C)]
+struct HashReply {
+  /// `0` for ok, `1` for error, [`NO_RESULT`] otherwise.
+  tag: u8,
+  pad: [u8; 7],
+  payload: HashPayload,
+}
+
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+  assert!(size_of::<HashReply>() == 24);
+  assert!(align_of::<HashReply>() == 8);
+  assert!(core::mem::offset_of!(HashReply, payload) == 8);
+};
+
+/// Storage for one metadata hash result.
+struct HashSlot {
+  /// The host writes through a pointer into this.
+  reply: core::cell::UnsafeCell<HashReply>,
+}
+
+impl HashSlot {
+  const fn new() -> Self {
+    Self {
+      reply: core::cell::UnsafeCell::new(HashReply {
+        tag: NO_RESULT,
+        pad: [0; 7],
+        payload: HashPayload { hash: [0; 2] },
+      }),
+    }
+  }
+
+  /// Releases any result still here and returns where the host writes the
+  /// next one.
+  fn arm(&mut self) -> *mut u8 {
+    drop(self.take());
+    self.reply.get().cast()
+  }
+
+  fn take(&mut self) -> Option<Result<MetadataHashValue, ErrorCode>> {
+    let reply = self.reply.get_mut();
+    match core::mem::replace(&mut reply.tag, NO_RESULT) {
+      NO_RESULT => None,
+      0 => {
+        // SAFETY: the host wrote a hash, which is plain data.
+        let [lower, upper] = unsafe { reply.payload.hash };
+        Some(Ok(MetadataHashValue { lower, upper }))
+      }
+      // SAFETY: the host wrote an error, and the tag was cleared, so it is
+      // lifted once.
+      1 => Some(Err(unsafe { reply.payload.error.error() })),
+      other => unreachable!("unknown result tag {other:#x}"),
+    }
+  }
+}
+
+impl Drop for HashSlot {
+  fn drop(&mut self) {
+    // An untaken error may own a string. Release it.
+    drop(self.take());
+  }
+}
+
+/// Reads a hash of a file's metadata. It changes when the file does, so it
+/// tells whether a file is still the one seen before.
+pub struct MetadataHash<'a> {
+  file: i32,
+  reply: HashSlot,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> MetadataHash<'a> {
+  pub fn new(file: &'a Descriptor) -> Self {
+    Self { file: handle(file), reply: HashSlot::new(), borrows: PhantomData }
+  }
+}
+
+call!(MetadataHash => MetadataHashValue, |op, reply| {
+  imports::metadata_hash(op.file, reply)
+});
+
+/// Reads a hash of the metadata of a path, like [`MetadataHash`].
+pub struct MetadataHashAt<'a> {
+  dir: i32,
+  path_flags: PathFlags,
+  path: &'a str,
+  reply: HashSlot,
+  borrows: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> MetadataHashAt<'a> {
+  pub fn new(
+    dir: &'a Descriptor,
+    path_flags: PathFlags,
+    path: &'a str,
+  ) -> Self {
+    Self {
+      dir: handle(dir),
+      path_flags,
+      path,
+      reply: HashSlot::new(),
+      borrows: PhantomData,
+    }
+  }
+}
+
+call!(MetadataHashAt => MetadataHashValue, |op, reply| {
+  imports::metadata_hash_at(
     op.dir,
     i32::from(op.path_flags.bits()),
     op.path.as_ptr(),

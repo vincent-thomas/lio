@@ -20,13 +20,15 @@ impl Out {
   /// Standard output.
   pub fn stdout() -> Self {
     let (writer, reader) = lio_wasi::stream();
-    Self::over(writer, cli::stdout(reader))
+    let status = cli::stdout::write_via_stream(reader);
+    Self::over(writer, StreamStatus::new(status))
   }
 
   /// Standard error.
   pub fn stderr() -> Self {
     let (writer, reader) = lio_wasi::stream();
-    Self::over(writer, cli::stderr(reader))
+    let status = cli::stderr::write_via_stream(reader);
+    Self::over(writer, StreamStatus::new(status))
   }
 
   fn over(writer: lio_wasi::StreamWriter<u8>, status: StreamStatus) -> Self {

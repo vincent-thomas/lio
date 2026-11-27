@@ -9,10 +9,11 @@
 
 use lio_wasi::fs::{
   Advice, Advise, CreateDirectoryAt, Descriptor, DescriptorFlags,
-  DescriptorType, DirEntryBuf, ErrorCode, GetFlags, GetType, Instant, LinkAt,
-  NewTimestamp, OpenAt, OpenFlags, PathFlags, ReadlinkAt, RemoveDirectoryAt,
-  RenameAt, SetSize, SetTimes, SetTimesAt, Stat, StatAt, StreamStatus,
-  SymlinkAt, Sync, SyncData, UnlinkFileAt,
+  DescriptorType, DirEntryBuf, ErrorCode, GetFlags, GetType, Instant,
+  IsSameObject, LinkAt, MetadataHash, MetadataHashAt, NewTimestamp, OpenAt,
+  OpenFlags, PathFlags, ReadlinkAt, RemoveDirectoryAt, RenameAt, SetSize,
+  SetTimes, SetTimesAt, Stat, StatAt, StreamStatus, SymlinkAt, Sync, SyncData,
+  UnlinkFileAt,
 };
 use lio_wasi::{
   Call, Event, ReadStream, ReadableFuture, Started, StreamResult, Subtask,
@@ -156,7 +157,9 @@ fn read_from(
 
 fn main() {
   let mut out = common::Out::stdout();
-  let Some((root, _name)) = lio_wasi::fs::preopens().into_iter().next() else {
+  let Some((root, _name)) =
+    lio_wasi::fs::preopens::get_directories().into_iter().next()
+  else {
     panic!("run with a preopened scratch directory");
   };
   let mut set = WaitableSet::new();
@@ -256,6 +259,37 @@ fn main() {
   run(set, &mut stat);
   assert_eq!(ok!(stat).size, 8);
   say!(out, "stat, set-size: ok");
+
+  // A descriptor is the same object as itself and no other, and a file's
+  // metadata hashes the same through its descriptor and through its path.
+  let mut same = IsSameObject::new(&file, &file);
+  run(set, &mut same);
+  assert_eq!(same.result(), Some(true));
+  assert_eq!(same.result(), None, "a result is taken once");
+  let mut different = IsSameObject::new(&file, &dir);
+  run(set, &mut different);
+  assert_eq!(different.result(), Some(false));
+  let mut hash = MetadataHash::new(&file);
+  run(set, &mut hash);
+  let by_descriptor = ok!(hash);
+  let mut hash_at = MetadataHashAt::new(&dir, PathFlags::empty(), "data.txt");
+  run(set, &mut hash_at);
+  let by_path = ok!(hash_at);
+  assert_eq!(
+    (by_descriptor.lower, by_descriptor.upper),
+    (by_path.lower, by_path.upper)
+  );
+  let mut dir_hash = MetadataHash::new(&dir);
+  run(set, &mut dir_hash);
+  let of_dir = ok!(dir_hash);
+  assert_ne!(
+    (by_descriptor.lower, by_descriptor.upper),
+    (of_dir.lower, of_dir.upper)
+  );
+  let mut absent = MetadataHashAt::new(&dir, PathFlags::empty(), "absent");
+  run(set, &mut absent);
+  assert!(matches!(absent.result(), Some(Err(ErrorCode::NoEntry))));
+  say!(out, "is-same-object, metadata-hash, metadata-hash-at: ok");
 
   // Times, through the descriptor and through a path.
   let at =

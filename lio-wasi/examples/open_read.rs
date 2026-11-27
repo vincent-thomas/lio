@@ -66,8 +66,12 @@ fn read_all(set: &mut WaitableSet, file: &Descriptor) -> usize {
 
 fn main() {
   let mut out = common::Out::stdout();
-  let path = std::env::args().nth(1).unwrap_or_else(|| "Cargo.toml".into());
-  let Some((dir, _name)) = lio_wasi::fs::preopens().into_iter().next() else {
+  let arguments = lio_wasi::cli::environment::get_arguments();
+  let path =
+    arguments.into_iter().nth(1).unwrap_or_else(|| "Cargo.toml".into());
+  let Some((dir, _name)) =
+    lio_wasi::fs::preopens::get_directories().into_iter().next()
+  else {
     panic!("run with a preopened directory: wasmtime run --dir . ...");
   };
   let mut set = WaitableSet::new();
