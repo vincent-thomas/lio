@@ -1083,6 +1083,154 @@ impl IoUring {
     0
   }
 
+  /// Makes the operation's system call on this thread, in a form that
+  /// cannot wait, and returns its result if it had one.
+  ///
+  /// A request on the ring that the kernel can finish at once is finished
+  /// as it is submitted, on this thread too, but only after the ring's own
+  /// bookkeeping on both sides. Asking directly for only what needs no
+  /// waiting does the same work without it: a read of cached file data
+  /// (`RWF_NOWAIT`), a write the page cache can take, a socket with bytes
+  /// or room waiting (`MSG_DONTWAIT`), an open of a path the kernel has
+  /// cached (`RESOLVE_CACHED`).
+  ///
+  /// `None` means the kernel would have had to wait, cannot promise not to,
+  /// or failed: the request then goes on the ring, which reports whatever
+  /// there is to report.
+  fn try_here(op: &Op, lowered: LoweredState) -> Option<isize> {
+    match (op, lowered) {
+      (
+        Op::Read { fd, iov_count, offset: Some(offset), .. },
+        LoweredState::Rw(state),
+      ) => {
+        // SAFETY: `state` points into the step arena, which outlives this
+        // call.
+        let iovecs = unsafe { &state.as_ref().iovecs };
+        let wanted: usize =
+          iovecs.iter().take(*iov_count).map(|region| region.iov_len).sum();
+        let fd = fd.as_raw_fd();
+        let read = Self::rw_nowait(
+          libc::SYS_preadv2,
+          fd,
+          iovecs.as_ptr(),
+          *iov_count,
+          *offset,
+          0,
+        )?;
+        if read == wanted || read == 0 {
+          return Some(read as isize);
+        }
+        // Short of what was asked: either the file ends here, or the rest
+        // is not cached. One more byte tells which. A read that stops
+        // before the end of a file is left to the ring, which does not.
+        let mut byte = 0u8;
+        let probe =
+          libc::iovec { iov_base: (&raw mut byte).cast(), iov_len: 1 };
+        let rest = Self::rw_nowait(
+          libc::SYS_preadv2,
+          fd,
+          &probe,
+          1,
+          *offset + read as u64,
+          0,
+        );
+        (rest == Some(0)).then_some(read as isize)
+      }
+      (
+        Op::Write { fd, iov_count, offset, flags, .. },
+        LoweredState::Rw(state),
+      ) => {
+        // SAFETY: as above.
+        let iovecs = unsafe { &state.as_ref().iovecs };
+        Self::rw_nowait(
+          libc::SYS_pwritev2,
+          fd.as_raw_fd(),
+          iovecs.as_ptr(),
+          *iov_count,
+          Self::io_offset(*offset),
+          crate::backend::native::write_flags(*flags),
+        )
+        .map(|written| written as isize)
+      }
+      (Op::Recv { fd, flags, .. }, LoweredState::SingleMsg { ptr, len }) => {
+        let flags =
+          crate::backend::native::recv_flags(*flags) | libc::MSG_DONTWAIT;
+        // SAFETY: `ptr` is the operation's buffer of `len` bytes, valid
+        // until the operation is reported.
+        let received = unsafe {
+          libc::recv(fd.as_raw_fd(), ptr.as_ptr().cast(), len as usize, flags)
+        };
+        (received >= 0).then_some(received)
+      }
+      (Op::Send { fd, flags, .. }, LoweredState::SingleMsg { ptr, len }) => {
+        let flags =
+          crate::backend::native::send_flags(*flags) | libc::MSG_DONTWAIT;
+        // SAFETY: as for the receive.
+        let sent = unsafe {
+          libc::send(fd.as_raw_fd(), ptr.as_ptr().cast(), len as usize, flags)
+        };
+        (sent >= 0).then_some(sent)
+      }
+      (Op::OpenAt { dir_fd, flags, .. }, LoweredState::Path(state)) => {
+        // Invalid flags were rejected by `validate_op`.
+        let flags = crate::backend::native::open_flags(*flags).ok()?;
+        // An open that may create or truncate has to wait for the file
+        // system, and the kernel refuses to try.
+        if flags & (libc::O_CREAT | libc::O_TRUNC) != 0 {
+          return None;
+        }
+        // SAFETY: `open_how` is plain data, valid when zeroed.
+        let mut how: libc::open_how = unsafe { mem::zeroed() };
+        how.flags = flags as u64;
+        how.resolve = libc::RESOLVE_CACHED;
+        // SAFETY: `state` points into the step arena, its path is a
+        // NUL-terminated string, and `how` is the size passed.
+        let opened = unsafe {
+          libc::syscall(
+            libc::SYS_openat2,
+            dir_fd.as_raw_fd(),
+            state.as_ref().path1.as_ptr(),
+            &raw const how,
+            mem::size_of::<libc::open_how>(),
+          )
+        };
+        (opened >= 0).then_some(opened as isize)
+      }
+      _ => None,
+    }
+  }
+
+  /// `preadv2` or `pwritev2` with `RWF_NOWAIT`. `None` when the call failed,
+  /// which includes when it would have had to wait.
+  fn rw_nowait(
+    call: libc::c_long,
+    fd: std::os::fd::RawFd,
+    iovecs: *const libc::iovec,
+    count: usize,
+    offset: u64,
+    flags: libc::c_int,
+  ) -> Option<usize> {
+    // The kernel takes the offset as two words. On a 64-bit target the
+    // first holds all of it.
+    let low = offset as libc::c_long;
+    let high =
+      offset.checked_shr(libc::c_long::BITS).unwrap_or(0) as libc::c_long;
+    // SAFETY: `iovecs` points to `count` regions that stay valid for this
+    // call, which reads or writes only within them.
+    let moved = unsafe {
+      libc::syscall(
+        call,
+        fd,
+        iovecs,
+        count as libc::c_int,
+        low,
+        high,
+        flags | libc::RWF_NOWAIT,
+      )
+    };
+    usize::try_from(moved).ok()
+  }
+
   fn execute_immediate(op: &Op) -> Option<io::Result<isize>> {
     match op {
       Op::ReadlinkAt { dir_fd, path, buf, buf_len } => {
@@ -1303,6 +1451,14 @@ impl IoBackend for IoUring {
       // SAFETY: `state` points into the step arena, which outlives this
       // call, and nothing else refers to it.
       let result = Self::stat_here(op, unsafe { state.as_mut() });
+      Self::finish_here(done, key, result);
+      return started;
+    }
+
+    if let Some(result) = Self::try_here(op, lowered) {
+      if let Some(profile) = self.profile.as_mut() {
+        profile.immediate_ops += 1;
+      }
       Self::finish_here(done, key, result);
       return started;
     }
