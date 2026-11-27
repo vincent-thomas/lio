@@ -8,11 +8,11 @@ use std::time::Instant;
 
 use lio_wasi::fs::{
   Descriptor, DescriptorFlags, DirEntryBuf, OpenAt, OpenFlags, PathFlags,
-  StatAt, StreamStatus,
+  StatAt, StreamStatus, UnlinkFileAt,
 };
 use lio_wasi::sockets::{
   Accepted, Connect, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress,
-  TcpSocket,
+  Listener, TcpSocket,
 };
 use lio_wasi::{
   Call, Event, ReadStream, ReadableFuture, Started, StreamResult, WaitableSet,
@@ -108,17 +108,22 @@ fn read_file(set: &mut WaitableSet, dir: &Descriptor) -> String {
   format!("{total} bytes in {reads} reads")
 }
 
-/// One stream into `out.bin`, written a chunk at a time.
-fn write_file(set: &mut WaitableSet, dir: &Descriptor, total: usize) -> String {
+/// One stream into `out.bin`, written `chunk` bytes at a time.
+fn write_file(
+  set: &mut WaitableSet,
+  dir: &Descriptor,
+  total: usize,
+  chunk: usize,
+) -> String {
   let how = OpenFlags::CREATE | OpenFlags::TRUNCATE;
   let file = open(set, dir, "out.bin", how, DescriptorFlags::WRITE);
   let (writer, reader) = lio_wasi::stream();
   let mut status = StreamStatus::new(file.write_via_stream(reader, 0));
   let writer = set.add_writer(writer);
-  let data = vec![0x5au8; CHUNK];
+  let data = vec![0x5au8; chunk];
   let (mut sent, mut writes) = (0usize, 0usize);
   while sent < total {
-    let wrote = write(set, writer, &data[..CHUNK.min(total - sent)]);
+    let wrote = write(set, writer, &data[..chunk.min(total - sent)]);
     assert!(
       matches!(wrote, StreamResult::Completed(_)),
       "write ended: {wrote:?}"
@@ -223,12 +228,12 @@ fn list(set: &mut WaitableSet, dir: &Descriptor) -> String {
   format!("{found} entries in {reads} reads")
 }
 
-/// Sends `total` bytes over a loopback TCP connection whose two ends are
-/// both in this component.
-fn tcp(set: &mut WaitableSet, total: usize) -> String {
-  let loopback = |port| {
-    IpSocketAddress::Ipv4(Ipv4SocketAddress { port, address: (127, 0, 0, 1) })
-  };
+fn loopback(port: u16) -> IpSocketAddress {
+  IpSocketAddress::Ipv4(Ipv4SocketAddress { port, address: (127, 0, 0, 1) })
+}
+
+/// A listening socket on a loopback port of the system's choosing.
+fn listen(set: &mut WaitableSet) -> (TcpSocket, Listener, u16) {
   let listener = TcpSocket::create(IpAddressFamily::Ipv4).expect("create");
   listener.bind(loopback(0)).expect("bind");
   let connections = listener.listen().expect("listen");
@@ -236,8 +241,15 @@ fn tcp(set: &mut WaitableSet, total: usize) -> String {
     IpSocketAddress::Ipv4(v4) => v4.port,
     IpSocketAddress::Ipv6(v6) => v6.port,
   };
-  let connections = set.add_listener(connections);
+  (listener, set.add_listener(connections), port)
+}
 
+/// Connects to `port` and accepts that connection: `(client, server)`.
+fn connect(
+  set: &mut WaitableSet,
+  connections: Listener,
+  port: u16,
+) -> (TcpSocket, TcpSocket) {
   let client = TcpSocket::create(IpAddressFamily::Ipv4).expect("create");
   let mut accepted = Accepted::new();
   let mut connect = Connect::new(&client, loopback(port));
@@ -249,7 +261,16 @@ fn tcp(set: &mut WaitableSet, total: usize) -> String {
   assert!(accept.is_ok());
   while set.wait().is_some() {}
   assert!(matches!(connect.result(), Some(Ok(()))));
+  drop(connect);
   let server = accepted.socket().expect("an accepted connection");
+  (client, server)
+}
+
+/// Sends `total` bytes over a loopback TCP connection whose two ends are
+/// both in this component.
+fn tcp(set: &mut WaitableSet, total: usize) -> String {
+  let (_listener, connections, port) = listen(set);
+  let (client, server) = connect(set, connections, port);
 
   let (input, _input_status) = server.receive();
   let input = set.add_reader(input);
@@ -349,9 +370,6 @@ fn burst(set: &mut WaitableSet, dir: &Descriptor, count: usize) -> String {
 fn fan(set: &mut WaitableSet, rounds: usize) -> String {
   use lio_wasi::sockets::{ReceiveFrom, SendTo, UdpSocket};
   const AT_ONCE: usize = 64;
-  let loopback = |port| {
-    IpSocketAddress::Ipv4(Ipv4SocketAddress { port, address: (127, 0, 0, 1) })
-  };
   let sockets: Vec<UdpSocket> = (0..AT_ONCE)
     .map(|_| {
       let socket = UdpSocket::create(IpAddressFamily::Ipv4).expect("create");
@@ -405,6 +423,100 @@ fn splice(set: &mut WaitableSet, dir: &Descriptor) -> String {
   String::from("standard input to spliced.bin")
 }
 
+/// Hands `big.bin`'s stream straight to `copy.bin`: file to file inside the
+/// host, with nothing entering this component.
+fn copy(set: &mut WaitableSet, dir: &Descriptor) -> String {
+  let from =
+    open(set, dir, "big.bin", OpenFlags::empty(), DescriptorFlags::READ);
+  let how = OpenFlags::CREATE | OpenFlags::TRUNCATE;
+  let to = open(set, dir, "copy.bin", how, DescriptorFlags::WRITE);
+  let (data, _read_status) = from.read_via_stream(0);
+  let mut status = StreamStatus::new(to.write_via_stream(data, 0));
+  read_status(set, &mut status);
+  assert!(matches!(status.result(), Some(Ok(()))));
+  String::from("big.bin to copy.bin")
+}
+
+/// Reads until `buf` is full.
+fn read_all(set: &mut WaitableSet, stream: ReadStream, buf: &mut [u8]) {
+  let mut filled = 0;
+  while filled < buf.len() {
+    let done = read(set, stream, &mut buf[filled..]);
+    assert!(matches!(done, StreamResult::Completed(_)), "ended: {done:?}");
+    filled += done.count();
+  }
+}
+
+/// A 64-byte request and a 64-byte reply, `count` times over one loopback
+/// connection: every read waits for the other side.
+fn echo(set: &mut WaitableSet, count: usize) -> String {
+  const MESSAGE: usize = 64;
+  let (_listener, connections, port) = listen(set);
+  let (client, server) = connect(set, connections, port);
+
+  let (requests, _) = server.receive();
+  let requests = set.add_reader(requests);
+  let (replies, _) = client.receive();
+  let replies = set.add_reader(replies);
+  let (writer, reader) = lio_wasi::stream();
+  let _requesting = client.send(reader);
+  let request = set.add_writer(writer);
+  let (writer, reader) = lio_wasi::stream();
+  let _replying = server.send(reader);
+  let reply = set.add_writer(writer);
+
+  let message = [0x3cu8; MESSAGE];
+  let mut buf = [0u8; MESSAGE];
+  for _ in 0..count {
+    assert_eq!(write(set, request, &message).count(), MESSAGE);
+    read_all(set, requests, &mut buf);
+    assert_eq!(write(set, reply, &buf).count(), MESSAGE);
+    read_all(set, replies, &mut buf);
+  }
+  let _ = set.close_writer(request);
+  let _ = set.close_writer(reply);
+  let _ = set.close_reader(requests);
+  let _ = set.close_reader(replies);
+  let _ = set.close_listener(connections);
+  format!("{count} round trips of {MESSAGE} bytes")
+}
+
+/// Makes `count` loopback connections one after another, dropping both ends
+/// of each: what a connection costs to set up and tear down.
+fn conns(set: &mut WaitableSet, count: usize) -> String {
+  let (_listener, connections, port) = listen(set);
+  for _ in 0..count {
+    drop(connect(set, connections, port));
+  }
+  let _ = set.close_listener(connections);
+  format!("{count} connections")
+}
+
+/// Create a file, write 4 KiB to it, close it, stat it and remove it,
+/// `count` times: a temporary file's whole life.
+fn churn(set: &mut WaitableSet, dir: &Descriptor, count: usize) -> String {
+  let data = vec![0x7eu8; 4096];
+  for _ in 0..count {
+    let how = OpenFlags::CREATE | OpenFlags::TRUNCATE;
+    let file = open(set, dir, "churn.tmp", how, DescriptorFlags::WRITE);
+    let (writer, reader) = lio_wasi::stream();
+    let mut status = StreamStatus::new(file.write_via_stream(reader, 0));
+    let writer = set.add_writer(writer);
+    assert_eq!(write(set, writer, &data).count(), data.len());
+    assert_eq!(set.close_writer(writer), Ok(None));
+    read_status(set, &mut status);
+    assert!(matches!(status.result(), Some(Ok(()))));
+    drop(file);
+    let mut stat = StatAt::new(dir, PathFlags::empty(), "churn.tmp");
+    run(set, &mut stat);
+    assert!(matches!(stat.result(), Some(Ok(_))));
+    let mut unlink = UnlinkFileAt::new(dir, "churn.tmp");
+    run(set, &mut unlink);
+    assert!(matches!(unlink.result(), Some(Ok(()))));
+  }
+  format!("{count} files made, written, checked and removed")
+}
+
 fn main() {
   let arguments = lio_wasi::cli::environment::get_arguments();
   let workload = arguments.get(1).map_or("", String::as_str).to_owned();
@@ -418,7 +530,12 @@ fn main() {
   let started = Instant::now();
   let did = match workload.as_str() {
     "read" => read_file(&mut set, dir()),
-    "write" => write_file(&mut set, dir(), count),
+    "write" => write_file(&mut set, dir(), count, CHUNK),
+    "smallw" => write_file(&mut set, dir(), count * 4096, 4096),
+    "copy" => copy(&mut set, dir()),
+    "echo" => echo(&mut set, count),
+    "conns" => conns(&mut set, count),
+    "churn" => churn(&mut set, dir(), count),
     "stat" => stat(&mut set, dir(), count),
     "open" => open_close(&mut set, dir(), count),
     "nofollow" => open_nofollow(&mut set, dir(), count),
