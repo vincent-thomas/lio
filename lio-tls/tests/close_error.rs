@@ -63,11 +63,11 @@ fn recv_reports_eof_when_peer_closes_without_application_data() -> io::Result<()
     Ok(())
   });
 
-  let (buf, n) = common::block_on(&lio, async {
+  let (n, buf) = common::block_on(&lio, async {
     let tcp = TcpStream::connect(addr).await?;
-    let mut tls =
-      TlsConnector::new(client_cfg).connect("localhost", tcp).await?;
-    tls.recv(vec![0; 64]).await
+    let tls = TlsConnector::new(client_cfg).connect("localhost", tcp).await?;
+    let (result, buf, _tls) = tls.recv(vec![0; 64]).await;
+    io::Result::Ok((result?, buf))
   })?;
 
   assert_eq!(n, 0);

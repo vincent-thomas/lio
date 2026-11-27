@@ -40,11 +40,11 @@ fn rustls_client_interoperates_with_lio_tls_server() -> io::Result<()> {
 
   common::block_on(&lio, async {
     let (tcp, _) = listener.accept().await?;
-    let mut tls = TlsAcceptor::new(server_cfg).accept(tcp).await?;
-    let (buf, n) = tls.recv(vec![0; 64]).await?;
-    assert_eq!(&buf[..n], common::CLIENT_PING);
-    let (_, n) = tls.send(common::SERVER_PONG.to_vec()).await?;
-    assert_eq!(n, common::SERVER_PONG.len());
+    let tls = TlsAcceptor::new(server_cfg).accept(tcp).await?;
+    let (result, buf, tls) = tls.recv(vec![0; 64]).await;
+    assert_eq!(&buf[..result?], common::CLIENT_PING);
+    let (result, _, _tls) = tls.send(common::SERVER_PONG.to_vec()).await;
+    assert_eq!(result?, common::SERVER_PONG.len());
     io::Result::Ok(())
   })?;
 

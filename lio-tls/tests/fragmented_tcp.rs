@@ -54,11 +54,11 @@ fn client_handles_tls_bytes_arriving_one_tcp_byte_at_a_time() -> io::Result<()>
 
   common::block_on(&lio, async {
     let tcp = LioTcpStream::connect(addr).await?;
-    let mut tls =
-      TlsConnector::new(client_cfg).connect("localhost", tcp).await?;
-    tls.send(common::CLIENT_PING.to_vec()).await?;
-    let (buf, n) = tls.recv(vec![0; 64]).await?;
-    assert_eq!(&buf[..n], common::SERVER_PONG);
+    let tls = TlsConnector::new(client_cfg).connect("localhost", tcp).await?;
+    let (result, _, tls) = tls.send(common::CLIENT_PING.to_vec()).await;
+    result?;
+    let (result, buf, _tls) = tls.recv(vec![0; 64]).await;
+    assert_eq!(&buf[..result?], common::SERVER_PONG);
     io::Result::Ok(())
   })?;
 
