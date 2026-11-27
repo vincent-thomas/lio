@@ -1088,7 +1088,23 @@ mod tests {
     // `iter` blocks until the stream ends, so make sure it has: its slot,
     // the only one, is free again.
     assert!(!lio.is_full(), "the stream has not ended");
-    assert_eq!(receiver.iter().collect::<Vec<_>>(), [1, 2, 3]);
+    // And if the receiver is never told that it ended, fail and do not
+    // hang: nothing else on this thread could notice. (Not on WASI, the
+    // target that does not unwind: it has no threads to watch with.)
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if cfg!(panic = "unwind") {
+      let watched = Arc::clone(&finished);
+      std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(10));
+        if !watched.load(Ordering::SeqCst) {
+          eprintln!("the receiver's iterator never ended");
+          std::process::abort();
+        }
+      });
+    }
+    let items = receiver.iter().collect::<Vec<_>>();
+    finished.store(true, Ordering::SeqCst);
+    assert_eq!(items, [1, 2, 3]);
   }
 
   #[test]

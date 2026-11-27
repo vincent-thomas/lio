@@ -45,6 +45,11 @@ additional_cargo_args = [
   "--test", "capacity",
   "--test", "model",
 ]
+# The real backends' own tests are in the library too (io_uring runs the
+# whole contract suite there). They are left out for the same reason: under
+# a mutant that keeps operations from being reported, each of them waits
+# out its own five-second deadline, which adds up to minutes.
+additional_cargo_test_args = ["--", "--skip", "backend::impls::"]
 # A mutant can turn a loop infinite. cargo test has no per-test limit, so
 # this process timeout is what stops it. It follows the baseline copy
 # (timeout_multiplier), with a floor so that a short suite does not wait
