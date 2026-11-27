@@ -3259,9 +3259,18 @@ impl DSTBackend {
     self.inner.borrow_mut().active_outgoing_nodes.insert(self.node_id);
   }
 
-  /// Removes a network operation that is waiting for its peer.
+  /// Removes a network operation the simulated network has not taken yet,
+  /// or one that is waiting for its peer.
   fn cancel_network_op(&mut self, id: u64) -> bool {
     let mut node = self.node.borrow_mut();
+    // A node left in the active set with nothing outgoing is dropped from
+    // it the next time the network looks for work.
+    if let Some(index) =
+      node.outgoing.iter().position(|(outgoing, _, _)| *outgoing == id)
+    {
+      node.outgoing.remove(index);
+      return true;
+    }
     let Some(index) =
       node.pending.iter().position(|(pending, _, _)| *pending == id)
     else {
@@ -5481,6 +5490,42 @@ mod tests {
       socket_result,
       OpAction::Complete(result) if result == -(errno::EINVAL as isize)
     ));
+  }
+
+  #[test]
+  fn dst_cancel_stops_an_operation_the_network_has_not_taken() {
+    let mut dst = DST::with_config(DSConfig {
+      seed: 7,
+      max_delay_ticks: 0,
+      fault_every: 0,
+      network_faults: DSNetworkFaults::Off,
+    });
+    let mut backend = Tracked::new(create_dst_backend(&mut dst));
+    backend.init(8).unwrap();
+    dst_test_socket(&backend.backend().node, 91);
+
+    // Flushed, so the simulator has it, and not stepped, so the network
+    // has not looked at it.
+    submit(
+      &mut backend,
+      1,
+      Op::Fsync { fd: dst_resource(91) },
+      &mut Bump::new(),
+    );
+    backend.flush();
+    backend.cancel(1);
+
+    let mut completed = Vec::new();
+    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert!(completed[0].is_cancelled());
+    assert_eq!(completed[0].result(), -(errno::ECANCELED as isize));
+
+    // The network finds nothing to run, and nothing is reported twice.
+    assert!(!dst.step());
+    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    assert!(completed.is_empty());
+    assert_eq!(backend.in_flight(), 0);
   }
 
   #[test]
