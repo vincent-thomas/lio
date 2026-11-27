@@ -1085,6 +1085,9 @@ mod tests {
     for _ in 0..3 {
       lio.try_run().unwrap();
     }
+    // `iter` blocks until the stream ends, so make sure it has: its slot,
+    // the only one, is free again.
+    assert!(!lio.is_full(), "the stream has not ended");
     assert_eq!(receiver.iter().collect::<Vec<_>>(), [1, 2, 3]);
   }
 

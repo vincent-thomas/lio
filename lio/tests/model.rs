@@ -350,12 +350,13 @@ fn open(lio: &Lio, path: &str, flags: OpenFlags) -> Resource {
   let path = CString::new(path).unwrap();
   let mut opened =
     api::openat(&Resource::cwd(), path, flags, mode).with_lio(lio).send();
-  loop {
+  for _ in 0..10_000 {
     if let Some(resource) = opened.try_recv() {
       return resource.unwrap();
     }
     lio.try_run().unwrap();
   }
+  panic!("the open did not finish");
 }
 
 /// Runs the driver until `items` holds one item.
