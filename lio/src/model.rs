@@ -378,6 +378,57 @@ impl<'a> Cx<'a> {
     self.submit_attempted(Some(op), action, complete, attempted)
   }
 
+  /// [`submit`](Self::submit) for an operation whose `action` builds the
+  /// same operation each time it is called: the backend is offered it
+  /// first, where its memory is, and one it performs there never gets a
+  /// slot. `action` is called again for one that does, on the memory's
+  /// place in the slot.
+  #[inline]
+  pub(crate) fn submit_repeatable<S: 'static, Out: 'static>(
+    &mut self,
+    mut state: S,
+    action: ActionFn<S>,
+    complete: CompleteFn<S, Out>,
+  ) -> Ticket<Out> {
+    let attempt = match action(&mut state) {
+      Action::Io(op) => self.lio.attempt(op.as_op()),
+      Action::Sleep(_) => Attempt::NotOffered,
+    };
+    let attempted = match attempt {
+      Attempt::Done(completion) => {
+        return Ticket::done(complete(&mut state, completion));
+      }
+      Attempt::Declined => true,
+      Attempt::NotOffered => false,
+    };
+    self.submit_attempted(state, action, complete, attempted)
+  }
+
+  /// The backend's answer to `op`, offered before it has a slot.
+  #[inline]
+  pub(crate) fn offer(&mut self, op: &crate::backend::op::Op) -> Attempt {
+    self.lio.attempt(op)
+  }
+
+  /// [`submit`](Self::submit) for an operation the backend has already
+  /// been offered, or not.
+  #[inline]
+  pub(crate) fn submit_offered<S: 'static, Out: 'static>(
+    &mut self,
+    state: S,
+    action: ActionFn<S>,
+    complete: CompleteFn<S, Out>,
+    attempted: bool,
+  ) -> Ticket<Out> {
+    self.submit_attempted(state, action, complete, attempted)
+  }
+
+  /// A ticket for an operation that is over.
+  #[inline]
+  pub(crate) fn finished<Out>(&mut self, out: Out) -> Ticket<Out> {
+    Ticket::done(out)
+  }
+
   #[inline]
   fn submit_attempted<S: 'static, Out: 'static>(
     &mut self,
