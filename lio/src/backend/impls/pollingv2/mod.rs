@@ -31,6 +31,7 @@ use std::{
 
 use bumpalo::Bump;
 
+use crate::backend::op::ByteSpan;
 use crate::backend::{
   Attempted, Done, IoBackend, Offered, OpKey, PerOp, Queued, Started,
   impls::pollingv2::interest::Interest,
@@ -644,6 +645,25 @@ impl Poller {
     result
   }
 
+  /// Reads into one region: `read`, or `pread` at an offset.
+  #[inline]
+  fn do_read(
+    fd: RawFd,
+    buf: *mut libc::c_void,
+    len: usize,
+    offset: Option<u64>,
+  ) -> isize {
+    let Ok(offset) = offset.map(libc::off_t::try_from).transpose() else {
+      return -(libc::EINVAL as isize);
+    };
+    let result = match offset {
+      None => syscall!(raw read(fd, buf, len)?),
+      Some(offset) => syscall!(raw pread(fd, buf, len, offset)?),
+    };
+    assert!(result >= 0, "error did not return");
+    result
+  }
+
   /// Perform vectored write, choosing the appropriate syscall based on offset and flags
   #[inline]
   fn do_writev(
@@ -683,9 +703,21 @@ impl Poller {
         offset
       };
 
-      let result = match write_offset {
-        None => syscall!(raw writev(fd, iovecs, iov_count as i32)?),
-        Some(offset) => {
+      let result = match (write_offset, iov_count) {
+        // One region is a plain write: a cheaper call than the vectored
+        // one.
+        (None, 1) => {
+          // SAFETY: the caller's array has one live entry.
+          let one = unsafe { &*iovecs };
+          syscall!(raw write(fd, one.iov_base, one.iov_len)?)
+        }
+        (Some(offset), 1) => {
+          // SAFETY: as above.
+          let one = unsafe { &*iovecs };
+          syscall!(raw pwrite(fd, one.iov_base, one.iov_len, offset)?)
+        }
+        (None, _) => syscall!(raw writev(fd, iovecs, iov_count as i32)?),
+        (Some(offset), _) => {
           syscall!(raw pwritev(fd, iovecs, iov_count as i32, offset)?)
         }
       };
@@ -849,6 +881,19 @@ impl Poller {
     use crate::backend::op::Op;
 
     match op {
+      // One region, the common case, is a plain read: no array of regions
+      // to build, and a cheaper call than the vectored one.
+      Op::Read { fd, iovecs, iov_count: 1, offset, flags: _ } => {
+        // SAFETY: the op's one region stays live until this call returns.
+        let region = unsafe { iovecs.as_ref() };
+        Self::do_read(
+          fd.as_raw_fd(),
+          region.bytes_ptr().cast(),
+          region.bytes_len(),
+          *offset,
+        )
+      }
+
       Op::Read { fd, iovecs, iov_count, offset, flags: _ } => {
         // SAFETY: the op's descriptor array stays live until this syscall returns.
         let Some(native_iovecs) = (unsafe {
@@ -862,6 +907,16 @@ impl Poller {
           *iov_count,
           *offset,
         )
+      }
+
+      Op::Write { fd, iovecs, iov_count: 1, offset, flags } => {
+        // SAFETY: the op's one region stays live until this call returns.
+        let region = unsafe { iovecs.as_ref() };
+        let one = libc::iovec {
+          iov_base: region.bytes_ptr().cast(),
+          iov_len: region.bytes_len(),
+        };
+        Self::do_writev(fd.as_raw_fd(), &raw const one, 1, *offset, *flags)
       }
 
       Op::Write { fd, iovecs, iov_count, offset, flags } => {
