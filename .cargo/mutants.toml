@@ -47,7 +47,9 @@ additional_cargo_args = [
 ]
 # A mutant can turn a loop infinite. cargo test has no per-test limit, so
 # this process timeout is what stops it. It follows the baseline copy
-# (timeout_multiplier). The floor is 20s, the old per-test hang limit, so a
-# short suite does not wait two minutes on a loop.
+# (timeout_multiplier), with a floor so that a short suite does not wait
+# minutes on a loop. A failing run is slower than a passing one: a mutant
+# that leaves operations unreported makes every driver dropped with one wait
+# out its shutdown grace. The floor leaves room for that.
 timeout_multiplier = 3.0
-minimum_test_timeout = 20
+minimum_test_timeout = 60

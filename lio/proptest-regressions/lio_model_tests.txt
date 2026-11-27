@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 51a55dd85055b359bc2d2e0b1ad2685fa627ae9afa56d28527e0b29344b71ff3 # shrinks to cap = 1, steps = [Drop(3132535790076646445), Complete(15190605020315919320, false), Run, Complete(8762322832305385139, true), Complete(476844609257689019, false), Future, Advance(30), Poll, Drop(18148233449795447831), Callback, Run, Poll, Drop(4342686085012308847), Complete(18445474089480927219, false), Drop(5673188945667433570), Complete(9741180376619364989, false), Run, Complete(1407180330269970974, false), Future, Callback, Poll, Poll, Complete(10277088448089743195, false), Callback, Callback, Run, Future, Run, Callback, Sleep(25), Complete(9069915032174143602, true), Run, Future, Sleep(17), Callback, Drop(3660294214642579906)]

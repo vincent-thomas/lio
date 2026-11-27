@@ -107,7 +107,9 @@ mod immediate_sockets {
     backend.flush();
     assert_eq!(backend.backend().parked.len(), 0);
     let mut completed = Vec::new();
-    backend.wait(None, &mut completed).unwrap();
+    // It finished at the flush: a wait with a limit fails where one without
+    // would hang, if it had not.
+    backend.wait(Some(Duration::from_secs(2)), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].registration_id(), 11);
     assert_eq!(completed[0].result(), 5);
@@ -157,7 +159,7 @@ mod immediate_sockets {
     backend.flush();
     assert_eq!(backend.backend().parked.len(), 0);
     let mut completed = Vec::new();
-    backend.wait(None, &mut completed).unwrap();
+    backend.wait(Some(Duration::from_secs(2)), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].result(), 5);
     let mut bytes = [0; 5];
@@ -178,7 +180,7 @@ mod immediate_sockets {
     unsafe { backend.push(16, crate::backend::op::BorrowedOp::nop()) };
     backend.flush();
     let mut completed = Vec::new();
-    backend.wait(None, &mut completed).unwrap();
+    backend.wait(Some(Duration::from_secs(2)), &mut completed).unwrap();
     let mut ids: Vec<_> =
       completed.iter().map(|c| c.registration_id()).collect();
     ids.sort_unstable();
