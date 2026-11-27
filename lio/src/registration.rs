@@ -155,8 +155,9 @@ struct AwaitedPayload<M: Drive> {
 
 /// What a future finds in its slot.
 pub(crate) enum Mail<T> {
-  /// The model's item.
-  Item(T),
+  /// The model's item, and the waker that was left in the slot, if one
+  /// was, to be dropped with the driver not borrowed.
+  Item(T, Option<Waker>),
   /// Nothing yet. The waker that was replaced, if one was, to be dropped
   /// with the driver not borrowed.
   Waiting(Option<Waker>),
@@ -495,7 +496,9 @@ impl Registration {
     let mailbox = unsafe { &mut *task.payload.cast::<Mailbox<T>>() };
     if let Some(item) = mailbox.item.take() {
       task.held = false;
-      return Mail::Item(item);
+      // Nothing drops what is left in a slot that is no longer held: a
+      // waker that was put there after the item goes with the item.
+      return Mail::Item(item, mailbox.waker.take());
     }
     // A finished model with no item left has nothing more to say: its
     // future waits for ever, and needs no waker.
