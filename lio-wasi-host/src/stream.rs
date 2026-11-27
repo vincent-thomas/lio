@@ -147,9 +147,15 @@ impl<D, E: Ends + Send> StreamProducer<D> for ByteReader<E> {
     let me = self.get_mut();
     let wanted = dst.remaining(&mut store)?;
     // A read of nothing asks whether the stream is readable. Saying yes is
-    // allowed: the read that follows waits.
+    // allowed: the read that follows waits. One that has ended, with
+    // nothing left to give, says so.
     if wanted == Some(0) {
-      return Poll::Ready(Ok(StreamResult::Completed));
+      let ended = me.status.is_none() && me.given == me.buf.len();
+      return Poll::Ready(Ok(if ended {
+        StreamResult::Dropped
+      } else {
+        StreamResult::Completed
+      }));
     }
 
     let size = wanted.unwrap_or(MAX_IO).min(MAX_IO);

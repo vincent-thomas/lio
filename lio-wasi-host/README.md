@@ -31,7 +31,8 @@ target/release/lio-wasi-run --dir .::/ --inherit-network guest.wasm
   not reported over until then either, and reports any bytes that arrived
   first.
 - A guest's write is the same the other way: the kernel reads from the
-  guest's memory. A write in flight is not cancelled.
+  guest's memory. A write in flight is not cancelled, and the guest's
+  write is not over until it is. Only a store being torn down stops one.
 - A stream the guest got from the host and passed to another host function
   has no guest memory at either end, so it keeps a host buffer and one copy.
   wasmtime does not say which kind a write is, so `Origin` in
