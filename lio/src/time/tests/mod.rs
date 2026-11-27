@@ -11,13 +11,15 @@ use std::{
 
 #[test]
 fn a_poll_may_fire_every_tracked_timer() {
-  assert_eq!(time::at_most(2, [1, 2].into_iter()).count(), 2);
+  assert_eq!(time::clock::at_most(2, [1, 2].into_iter()).count(), 2);
 }
 
 #[test]
 #[should_panic(expected = "fired more timers than the 2 tracked")]
 fn a_poll_firing_more_timers_than_tracked_panics() {
-  time::at_most(2, std::iter::repeat(7)).for_each(drop);
+  // One more than allowed, not an endless supply: a bound that never
+  // trips has to fail this test, not hang it.
+  time::clock::at_most(2, [7; 3].into_iter()).for_each(drop);
 }
 
 #[test]
