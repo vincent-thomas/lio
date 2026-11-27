@@ -7,6 +7,7 @@
 use super::common::{poll_until_recv, raw_id, socket_resource};
 use lio::api::resource::Resource;
 use lio::{Lio, api};
+use std::future::IntoFuture;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
@@ -111,4 +112,29 @@ fn ipv6() {
   let _ = raw_id(&accepted_fd);
   assert!(client_addr.is_ipv6());
   client.join().expect("client thread panicked");
+}
+
+#[test]
+fn dropped_accept_frees_its_slot() {
+  // An accept with no client never completes on its own.
+  let lio = Lio::new(1).unwrap();
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+  listener.set_nonblocking(true).unwrap();
+  let listener = socket_resource(listener);
+
+  let mut accept: std::pin::Pin<Box<_>> =
+    Box::pin(api::accept(&listener).with_lio(&lio).into_future());
+  let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+  assert!(accept.as_mut().poll(&mut cx).is_pending());
+  lio.run_timeout(std::time::Duration::from_millis(10)).unwrap();
+  assert!(accept.as_mut().poll(&mut cx).is_pending());
+  drop(accept);
+
+  for _ in 0..200 {
+    if !lio.is_full() {
+      return;
+    }
+    lio.run_timeout(std::time::Duration::from_millis(5)).unwrap();
+  }
+  panic!("the cancelled accept never released its slot");
 }

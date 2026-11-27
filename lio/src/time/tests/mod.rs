@@ -145,7 +145,8 @@ fn wait_timeout_is_bounded_by_the_next_timer() {
 
 #[test]
 fn public_pause_resume_helpers_toggle_lio_time() {
-  let lio = Lio::new(8).unwrap();
+  let backend = crate::backend::testing::ScriptedBackend::new();
+  let lio = Lio::new_with_backend(backend, 8).unwrap();
   time::pause(&lio);
   time::resume(&lio);
 }
