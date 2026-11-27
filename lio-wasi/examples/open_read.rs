@@ -12,6 +12,8 @@ use lio_wasi::fs::{
 };
 use lio_wasi::{Cancel, Event, Started, StreamResult, Subtask, WaitableSet};
 
+mod common;
+
 fn open(
   set: &mut WaitableSet,
   dir: &Descriptor,
@@ -63,24 +65,23 @@ fn read_all(set: &mut WaitableSet, file: &Descriptor) -> usize {
 }
 
 fn main() {
+  let mut out = common::Out::stdout();
   let path = std::env::args().nth(1).unwrap_or_else(|| "Cargo.toml".into());
-  let Some((dir, _name)) =
-    wasip3::filesystem::preopens::get_directories().into_iter().next()
-  else {
+  let Some((dir, _name)) = lio_wasi::fs::preopens().into_iter().next() else {
     panic!("run with a preopened directory: wasmtime run --dir . ...");
   };
   let mut set = WaitableSet::new();
 
   match open(&mut set, &dir, &path) {
     Ok(file) => {
-      println!("{path}: {} bytes", read_all(&mut set, &file));
+      say!(out, "{path}: {} bytes", read_all(&mut set, &file));
     }
-    Err(error) => println!("{path}: {error:?}"),
+    Err(error) => say!(out, "{path}: {error:?}"),
   }
 
   match open(&mut set, &dir, "no/such/file") {
     Ok(_) => panic!("opened a file that does not exist"),
-    Err(error) => println!("no/such/file: {error:?}"),
+    Err(error) => say!(out, "no/such/file: {error:?}"),
   }
 
   // Many opens started together. Each is told apart by its subtask.
@@ -113,7 +114,7 @@ fn main() {
   assert!(waiting.iter().all(Option::is_none), "a call never returned");
   let opened: Vec<bool> =
     calls.iter_mut().map(|call| matches!(call.result(), Some(Ok(_)))).collect();
-  println!("batch of four opened: {opened:?}");
+  say!(out, "batch of four opened: {opened:?}");
 
   // Cancel right after starting. The call either beat the cancel or not;
   // either way the cancel says which, no event follows, and the result
@@ -129,7 +130,7 @@ fn main() {
   match unsafe { set.start(&mut call) } {
     None => {
       assert!(call.result().is_some());
-      println!("the open returned before it could be cancelled");
+      say!(out, "the open returned before it could be cancelled");
     }
     Some(subtask) => {
       let found = set.cancel(subtask);
@@ -140,7 +141,7 @@ fn main() {
         Some(Cancel::Cancelled) => assert!(call.result().is_none()),
         None => panic!("the cancel did not find the call it was given"),
       }
-      println!("cancelling an open in flight found: {found:?}");
+      say!(out, "cancelling an open in flight found: {found:?}");
     }
   }
 }

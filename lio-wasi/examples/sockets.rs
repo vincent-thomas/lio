@@ -16,6 +16,10 @@ use lio_wasi::{
   WaitableSet, WriteStream,
 };
 
+mod common;
+
+use common::Out;
+
 fn loopback(port: u16) -> IpSocketAddress {
   IpSocketAddress::Ipv4(Ipv4SocketAddress { port, address: (127, 0, 0, 1) })
 }
@@ -99,7 +103,7 @@ struct Side {
 impl Side {
   fn new(set: &mut WaitableSet, socket: &TcpSocket) -> Self {
     let (input, input_status) = socket.receive();
-    let (writer, reader) = wasip3::wit_stream::new::<u8>();
+    let (writer, reader) = lio_wasi::stream();
     let output_status = socket.send(reader);
     Self {
       input: set.add_reader(input),
@@ -135,7 +139,7 @@ impl Side {
   }
 }
 
-fn tcp(set: &mut WaitableSet) {
+fn tcp(set: &mut WaitableSet, out: &mut Out) {
   let listener = must("create", TcpSocket::create(IpAddressFamily::Ipv4));
   must("bind", listener.bind(loopback(0)));
   let connections = must("listen", listener.listen());
@@ -187,7 +191,7 @@ fn tcp(set: &mut WaitableSet) {
   let peer = port_of(must("remote address", server.get_remote_address()));
   let local = port_of(must("local address", client.get_local_address()));
   assert_eq!(peer, local);
-  println!("tcp accept, connect: ok (port {port})");
+  say!(out, "tcp accept, connect: ok (port {port})");
 
   // Echo in both directions, with more data than one read holds.
   let near = Side::new(set, &client);
@@ -199,7 +203,7 @@ fn tcp(set: &mut WaitableSet) {
   let big: Vec<u8> = (0..20_000u32).map(|n| (n % 251) as u8).collect();
   near.send(set, &big);
   assert_eq!(far.receive(set, big.len()).0, big);
-  println!("tcp send, receive: ok");
+  say!(out, "tcp send, receive: ok");
 
   // Closing the client's writer shuts down its write side: the server reads
   // to the end, and both statuses report a clean close.
@@ -225,7 +229,7 @@ fn tcp(set: &mut WaitableSet) {
   assert!(matches!(near_in_status.result(), Some(Ok(()))));
   assert_eq!(set.close_reader(near_in), Ok(None));
   assert_eq!(set.close_reader(far_in), Ok(None));
-  println!("tcp shutdown, stream status: ok");
+  say!(out, "tcp shutdown, stream status: ok");
 
   // Connecting to a port nobody listens on fails with a reason.
   assert_eq!(set.close_listener(connections), Ok(None));
@@ -236,10 +240,10 @@ fn tcp(set: &mut WaitableSet) {
   let Some(Err(error)) = refused.result() else {
     panic!("connected to a closed port");
   };
-  println!("tcp connect to a closed port: {error:?}");
+  say!(out, "tcp connect to a closed port: {error:?}");
 }
 
-fn udp(set: &mut WaitableSet) {
+fn udp(set: &mut WaitableSet, out: &mut Out) {
   let a = must("create", UdpSocket::create(IpAddressFamily::Ipv4));
   let b = must("create", UdpSocket::create(IpAddressFamily::Ipv4));
   must("bind", a.bind(loopback(0)));
@@ -273,7 +277,7 @@ fn udp(set: &mut WaitableSet) {
   assert_eq!(data, b"datagram");
   assert_eq!(port_of(from), a_port);
   assert!(receive.result().is_none(), "a datagram is taken once");
-  println!("udp send, receive: ok");
+  say!(out, "udp send, receive: ok");
 
   // On a connected socket the destination is implied.
   must("connect", b.connect(loopback(a_port)));
@@ -286,7 +290,7 @@ fn udp(set: &mut WaitableSet) {
     panic!("the receive delivered no datagram");
   };
   assert_eq!((data.as_slice(), port_of(from)), (&b"reply"[..], b_port));
-  println!("udp connected send: ok");
+  say!(out, "udp connected send: ok");
 
   // A receive nobody answers is cancelled and leaves no result.
   let mut idle = ReceiveFrom::new(&a);
@@ -297,12 +301,13 @@ fn udp(set: &mut WaitableSet) {
   assert_eq!(set.cancel(waiting), Some(Cancel::Cancelled));
   assert!(set.wait().is_none());
   assert!(idle.result().is_none());
-  println!("udp cancelled receive: ok");
+  say!(out, "udp cancelled receive: ok");
 }
 
 fn main() {
   let mut set = WaitableSet::new();
-  tcp(&mut set);
-  udp(&mut set);
+  let mut out = Out::stdout();
+  tcp(&mut set, &mut out);
+  udp(&mut set, &mut out);
   assert_eq!(set.in_flight(), 0);
 }

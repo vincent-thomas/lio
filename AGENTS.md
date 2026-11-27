@@ -56,10 +56,12 @@ contract (`backend::op`) stays pure data.
   (`.github/workflows/deep.yaml`).
 - WASI: `mise run wasi` runs what builds for `wasm32-wasip3` under wasmtime
   (`scripts/test-wasi.sh`): the library tests, the integration tests that do
-  not build fixtures from std descriptors, and the WASI examples. The WASI
-  backend's own tests are in `backend/impls/wasi/tests.rs`; the shared
-  contract macro cannot run there, because a WASI resource is not a
-  descriptor std can make or inspect. That target does not unwind, so a test
+  not build fixtures from std descriptors, and the WASI examples. The
+  `lio-wasi` examples do their I/O through `lio-wasi` alone: no `std::io`
+  (so no `println!`; use `examples/common`) and no direct `wasip3` use. The
+  script rejects either. The WASI backend's own tests are in
+  `backend/impls/wasi/tests.rs`; the shared contract macro cannot run there,
+  because a WASI resource is not a descriptor std can make or inspect. That target does not unwind, so a test
   that catches a panic carries
   `#[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]`.
 - Search sizes: `PROPTEST_CASES` (model tests) and `LIO_LIFECYCLE_DEPTH`
