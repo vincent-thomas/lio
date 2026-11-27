@@ -33,13 +33,13 @@ fn lio_tls_client_interoperates_with_rustls_server() -> io::Result<()> {
 
   common::block_on(&lio, async {
     let tcp = TcpStream::connect(addr).await?;
-    let mut tls =
-      TlsConnector::new(client_cfg).connect("localhost", tcp).await?;
+    let tls = TlsConnector::new(client_cfg).connect("localhost", tcp).await?;
 
-    let (_, n) = tls.send(common::CLIENT_PING.to_vec()).await?;
-    assert_eq!(n, common::CLIENT_PING.len());
+    let (result, _, tls) = tls.send(common::CLIENT_PING.to_vec()).await;
+    assert_eq!(result?, common::CLIENT_PING.len());
 
-    let (buf, n) = tls.recv(vec![0; 64]).await?;
+    let (result, buf, _tls) = tls.recv(vec![0; 64]).await;
+    let n = result?;
     assert_eq!(&buf[..n], common::SERVER_PONG);
     io::Result::Ok(())
   })?;

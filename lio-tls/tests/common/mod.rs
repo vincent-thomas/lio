@@ -94,3 +94,38 @@ pub fn join_io(
 ) -> io::Result<()> {
   handle.join().unwrap()
 }
+
+/// A rustls server on another thread that reads [`CLIENT_PING`] and
+/// answers [`SERVER_PONG`].
+pub fn spawn_ping_pong_server(
+  server_cfg: Arc<rustls::ServerConfig>,
+) -> io::Result<(std::net::SocketAddr, std::thread::JoinHandle<io::Result<()>>)>
+{
+  use std::io::{Read, Write};
+
+  let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+  let addr = listener.local_addr()?;
+  let server = std::thread::spawn(move || {
+    let (tcp, _) = listener.accept()?;
+    let conn =
+      rustls::ServerConnection::new(server_cfg).map_err(io::Error::other)?;
+    let mut tls = rustls::StreamOwned::new(conn, tcp);
+
+    let mut buf = [0; 64];
+    let n = tls.read(&mut buf)?;
+    assert_eq!(&buf[..n], CLIENT_PING);
+    tls.write_all(SERVER_PONG)?;
+    tls.flush()?;
+    Ok(())
+  });
+  Ok((addr, server))
+}
+
+/// Runs `lio` until `done` says so.
+pub fn run_until(lio: &Lio, mut done: impl FnMut() -> bool) {
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while !done() {
+    assert!(Instant::now() < deadline, "timed out");
+    lio.run_timeout(Duration::from_millis(5)).unwrap();
+  }
+}

@@ -35,22 +35,20 @@ fn large_payload_round_trip_spans_many_tls_records() -> io::Result<()> {
 
   common::block_on(&lio, async {
     let tcp = TcpStream::connect(addr).await?;
-    let mut tls =
-      TlsConnector::new(client_cfg).connect("localhost", tcp).await?;
+    let tls = TlsConnector::new(client_cfg).connect("localhost", tcp).await?;
 
-    let mut written = 0;
-    while written < payload.len() {
-      let end = (written + 8192).min(payload.len());
-      let (_, n) = tls.send(payload[written..end].to_vec()).await?;
-      written += n;
-    }
-    assert_eq!(written, payload.len());
+    // One send takes all of it, past what rustls buffers at once.
+    let (result, payload, mut tls) = tls.send(payload).await;
+    assert_eq!(result?, payload.len());
 
     let mut got = Vec::with_capacity(payload.len());
+    let mut buf = vec![0; 8192];
     while got.len() < payload.len() {
-      let (buf, n) = tls.recv(vec![0; 8192]).await?;
+      let (result, back, back_tls) = tls.recv(buf).await;
+      let n = result?;
       assert!(n > 0);
-      got.extend_from_slice(&buf[..n]);
+      got.extend_from_slice(&back[..n]);
+      (buf, tls) = (back, back_tls);
     }
     assert_eq!(got, payload);
     io::Result::Ok(())
