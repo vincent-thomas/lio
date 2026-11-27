@@ -365,6 +365,10 @@ impl OsPoller {
 
   /// Submits the queued registrations on their own, when too many have
   /// gathered to leave for a wait. A refusal is kept for the next wait.
+  ///
+  /// When the call itself fails, nothing says which registrations the
+  /// kernel took, so all stay queued: adding one it has again changes
+  /// nothing.
   fn submit_pending(&self) -> io::Result<()> {
     let mut changes = std::mem::take(&mut *self.pending.borrow_mut());
     // With a receipt asked for, the call reports on each change and takes
@@ -380,7 +384,17 @@ impl OsPoller {
       receipts.spare_capacity_mut().as_mut_ptr().cast(),
       changes.len() as libc::c_int,
       ptr::null(),
-    ))?;
+    ));
+    let count = match count {
+      Ok(count) => count,
+      Err(error) => {
+        for change in &mut changes {
+          change.flags &= !libc::EV_RECEIPT;
+        }
+        self.requeue(changes);
+        return Err(error);
+      }
+    };
     // SAFETY: the kernel wrote `count` receipts, at most the capacity.
     unsafe { receipts.set_len(count as usize) };
     let mut registered = self.registered_fds.borrow_mut();
@@ -395,6 +409,14 @@ impl OsPoller {
     changes.clear();
     *self.pending.borrow_mut() = changes;
     Ok(())
+  }
+
+  /// Puts back registrations a failed call may not have applied, ahead of
+  /// any queued since.
+  fn requeue(&self, mut changes: Vec<libc::kevent>) {
+    let mut pending = self.pending.borrow_mut();
+    changes.append(&mut pending);
+    *pending = changes;
   }
 }
 
@@ -476,11 +498,18 @@ impl ReadinessPoll for OsPoller {
       room.len() as i32,
       timeout_ptr,
     ));
-    // Applied or not, the changes are spent: an interrupted call has
-    // applied them all, and any other failure is the poller's own.
+    let ret = match ret {
+      Ok(ret) => ret,
+      Err(error) => {
+        // Nothing says which registrations the kernel took, and a refusal
+        // among them was not reported. All stay queued: adding one the
+        // kernel has again changes nothing, and a refusal is made again.
+        self.requeue(changes);
+        return Err(error);
+      }
+    };
     changes.clear();
     *self.pending.borrow_mut() = changes;
-    let ret = ret?;
 
     let n = ret as usize;
     assert!(
@@ -529,6 +558,33 @@ mod tests {
   use super::*;
 
   crate::test_readiness_poll_contract!(OsPoller::new().unwrap());
+
+  #[test]
+  fn registrations_outlive_a_kevent_call_that_fails() {
+    use std::io::Write;
+
+    let mut poller = OsPoller::new().unwrap();
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    poller.add(reader.as_raw_fd(), 7, Interest::READ).unwrap();
+
+    // A descriptor that is no queue makes every call fail.
+    let no_queue: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    let queue = std::mem::replace(&mut poller.kq_fd, no_queue);
+    // SAFETY: `libc::kevent` is plain data, valid when zeroed.
+    let mut events: [libc::kevent; 8] = unsafe { std::mem::zeroed() };
+    assert!(poller.wait(&mut events, Some(Duration::ZERO)).is_err());
+    assert!(poller.submit_pending().is_err());
+    assert_eq!(poller.pending.borrow().len(), 1, "still to be submitted");
+    assert_eq!(poller.pending.borrow()[0].flags & libc::EV_RECEIPT, 0);
+
+    // With the queue back, the registration reaches the kernel.
+    poller.kq_fd = queue;
+    writer.write_all(b"x").unwrap();
+    let ready = poller.wait(&mut events, Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(ready, 1);
+    let ident = events[0].ident;
+    assert_eq!(ident, reader.as_raw_fd() as libc::uintptr_t);
+  }
 }
 
 mod utils {
