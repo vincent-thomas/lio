@@ -39,6 +39,7 @@ use crate::backend::op::{
   StatTarget, UnlinkKind, WriteFlags, is_valid_file_offset,
   socket_addr_from_buf,
 };
+use crate::driver::Attempt;
 use crate::model::{Cx, Next, OpModel, OpStream, Ticket};
 use crate::registration::Regions;
 use crate::{BufResult, Initialized, IoBufMutVec, IoBufVec, IoSlicesMut};
@@ -751,7 +752,20 @@ impl Cx<'_> {
       StatOf::File(fd) => StatTarget::Fd { fd },
       StatOf::InvalidPath => return self.refused(|| Err(nul_path_error())),
     };
-    self.submit(
+    // Offered to the backend first, with the result on the stack: a stat
+    // never waits on a descriptor, so it is nearly always performed here
+    // and never has a slot.
+    let mut out = FileStat::zeroed();
+    let op = Op::Stat { target, out: NonNull::from(&mut out) };
+    let attempted = match self.offer(&op) {
+      Attempt::Done(done) => return self.finished(done.status().map(|()| out)),
+      Attempt::Declined => true,
+      Attempt::NotOffered => false,
+    };
+    let Op::Stat { target, .. } = op else {
+      unreachable!("a stat that was just built");
+    };
+    self.submit_offered(
       (Some(target), FileStat::zeroed()),
       |(target, out)| {
         action_io!(Op::Stat {
@@ -760,6 +774,7 @@ impl Cx<'_> {
         })
       },
       |(_, out), done| done.status().map(|()| *out),
+      attempted,
     )
   }
 }
@@ -777,7 +792,7 @@ impl Cx<'_> {
     dir: Resource,
     buf: ReadDirBuf,
   ) -> Ticket<io::Result<ReadDirBuf>> {
-    self.submit(
+    self.submit_repeatable(
       (dir, buf),
       |(dir, buf)| {
         action_lent!(Op::ReadDir {

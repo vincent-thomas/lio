@@ -1449,6 +1449,14 @@ impl IoBackend for IoUring {
           Err(_) => None,
         }
       }
+      // What `start` performs with a system call of its own, which never
+      // goes on the ring.
+      Op::ReadDir { .. } | Op::ReadlinkAt { .. } | Op::GetCwd { .. } => {
+        Self::execute_immediate(op).map(|result| match result {
+          Ok(value) => value,
+          Err(err) => -(err.raw_os_error().unwrap_or(libc::EIO) as isize),
+        })
+      }
       _ => None,
     };
     match result {
