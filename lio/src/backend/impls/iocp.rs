@@ -63,7 +63,7 @@ use crate::backend::op::{
   SocketAddrBuf, SocketAddrFamily, SpawnSpec, StatTarget, UnlinkKind,
   is_valid_file_offset,
 };
-use crate::backend::{Done, IoBackend, OpKey, Queued, Started};
+use crate::backend::{Done, IoBackend, OpKey, PerOp, Queued, Started};
 
 /// Completion key for wake-up packets posted by [`Iocp::notify`].
 const NOTIFY_KEY: usize = usize::MAX;
@@ -282,7 +282,11 @@ fn worker_loop(
 /// Windows I/O completion port backend.
 pub struct Iocp {
   port: HANDLE,
+  /// Every overlapped operation the kernel has, as the pointer the port
+  /// hands back. A packet's pointer is looked up here before it is used.
   in_flight: HashSet<usize>,
+  /// The same pointers by operation, which is how `cancel` names one.
+  by_key: PerOp<usize>,
   entries: Vec<OVERLAPPED_ENTRY>,
   connect_ex: Option<ConnectExFn>,
   pool: Option<BlockingPool>,
@@ -295,6 +299,7 @@ impl Default for Iocp {
     Self {
       port: ptr::null_mut(),
       in_flight: HashSet::new(),
+      by_key: PerOp::default(),
       entries: Vec::new(),
       connect_ex: None,
       pool: None,
@@ -404,7 +409,10 @@ impl Iocp {
         return Some(-(code as isize));
       }
     }
-    self.in_flight.insert(Box::into_raw(state) as usize);
+    let key = state.key;
+    let ptr = Box::into_raw(state) as usize;
+    self.in_flight.insert(ptr);
+    self.by_key.insert(key, ptr);
     None
   }
 
@@ -942,6 +950,7 @@ impl Iocp {
       // done with it.
       let mut state = unsafe { Box::from_raw(ptr) };
       let key = state.key;
+      self.by_key.take(key);
       if state.aborted_with_another() {
         let rc = Self::issue_recv(&mut state);
         // Back in flight, unless it could not be started again.
@@ -1047,6 +1056,7 @@ impl IoBackend for Iocp {
     }
     self.port = port;
     self.in_flight = HashSet::with_capacity(cap);
+    self.by_key = PerOp::new(cap);
     self.entries = Vec::with_capacity(MAX_ENTRIES);
     Ok(())
   }
@@ -1070,22 +1080,19 @@ impl IoBackend for Iocp {
   }
 
   fn cancel(&mut self, key: OpKey, _done: &mut Done<'_>) {
-    // SAFETY: every pointer in `in_flight` is a live boxed `Overlapped`.
-    let found = self
-      .in_flight
-      .iter()
-      .map(|&ptr| ptr as *mut Overlapped)
-      .find(|&state| unsafe { (*state).key } == key);
-    if let Some(state) = found {
-      // The operation stays in flight: the kernel reports it, aborted or
-      // finished, through the port like any other completion. A job on the
-      // blocking pool is not found here; it runs to completion.
-      // SAFETY: `state` is a live in-flight operation. The kernel only
-      // writes its `ov`.
-      unsafe {
-        (*state).cancelled = true;
-        CancelIoEx((*state).socket as HANDLE, &(*state).ov);
-      }
+    // A job on the blocking pool is not found here; it runs to completion.
+    let Some(&ptr) = self.by_key.get(key) else {
+      return;
+    };
+    let state = ptr as *mut Overlapped;
+    // The operation stays in flight: the kernel reports it, aborted or
+    // finished, through the port like any other completion.
+    // SAFETY: `by_key` holds a pointer for as long as `in_flight` does, and
+    // every pointer in `in_flight` is a live boxed `Overlapped`. The kernel
+    // only writes its `ov`.
+    unsafe {
+      (*state).cancelled = true;
+      CancelIoEx((*state).socket as HANDLE, &(*state).ov);
     }
   }
 
