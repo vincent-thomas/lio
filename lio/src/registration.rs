@@ -463,11 +463,6 @@ impl Registration {
     self.task = made.task.take();
   }
 
-  /// Whether this slot's model, if it runs one, is done and dropped.
-  pub(crate) fn is_finished(&self) -> bool {
-    self.task.as_ref().is_none_or(|task| task.finished)
-  }
-
   /// Names what wakes the future this slot's model runs for, when its item
   /// is there.
   pub(crate) fn arm_mail(&mut self, waker: Waker) {
