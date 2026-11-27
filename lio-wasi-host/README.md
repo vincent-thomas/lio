@@ -54,8 +54,11 @@ the file's size before each write.
 
 ## Not a sandbox
 
-Paths are checked lexically. A symbolic link inside a preopened directory
-that points outside it is followed.
+Paths are checked by their text. Every `..` is resolved against the names
+before it, and none reaches the system, so a path cannot step out by way of
+a symbolic link. A link a guest makes stores a relative target with no
+`..`. A link that was already inside a preopened directory and points
+outside it is still followed.
 
 ## Benchmarks
 

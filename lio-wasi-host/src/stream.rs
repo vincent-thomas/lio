@@ -163,24 +163,27 @@ impl<D, E: Ends + Send> StreamProducer<D> for ByteReader<E> {
         me.tried = false;
         me.reading = Some(match (&me.lending, wanted) {
           (Some(lending), Some(_)) => {
+            // Only the range's address is kept: lio makes its own
+            // reference to it, and this one must not be alive then.
             let room = direct.remaining()?;
             let len = room.len().min(MAX_IO);
-            let room = &mut room[..len];
+            let room = room.as_mut_ptr();
             // SAFETY: `room` is the buffer of the guest read this poll is
             // for, on a `crate::Store`. Below, the read is reported over
             // only once the lease is `Ready`.
             let done = unsafe {
               match &me.from {
                 ReadFrom::File(file, offset) => {
-                  lending.read(&mut me.lease, room, |buf| {
+                  lending.read(&mut me.lease, room, len, |buf| {
                     api::read_at(file, buf, *offset)
                   })
                 }
                 ReadFrom::Cursor(file) => {
-                  lending.read(&mut me.lease, room, |buf| api::read(file, buf))
+                  lending
+                    .read(&mut me.lease, room, len, |buf| api::read(file, buf))
                 }
                 ReadFrom::Socket(socket) => {
-                  lending.read(&mut me.lease, room, |buf| {
+                  lending.read(&mut me.lease, room, len, |buf| {
                     api::recv(socket, buf, None)
                   })
                 }
@@ -454,25 +457,29 @@ impl<E: Ends> ByteWriter<E> {
     self.tried = false;
     if let (true, Some(lending)) = (self.guest, &self.lending) {
       let stream = &mut self.lease;
+      // Only the range's address is kept, as for a read.
+      let (data, len) = (data.as_ptr(), data.len());
       // SAFETY: `data` is the buffer of the guest write this poll is for
       // (`Origin` said so), on a `crate::Store`. The write is reported over
       // only once the lease is `Ready`.
       let done = unsafe {
         match (&self.to, end) {
           (WriteTo::File(file, offset), _) => {
-            lending.write(stream, data, |buf| api::write_at(file, buf, *offset))
+            lending
+              .write(stream, data, len, |buf| api::write_at(file, buf, *offset))
           }
           (WriteTo::Append(file), Some(end)) => {
-            lending.write(stream, data, |buf| api::write_at(file, buf, end))
+            lending
+              .write(stream, data, len, |buf| api::write_at(file, buf, end))
           }
           (WriteTo::Append(file), None) => {
             return Writing::Size(op(api::fstat(file)));
           }
           (WriteTo::Cursor(file), _) => {
-            lending.write(stream, data, |buf| api::write(file, buf))
+            lending.write(stream, data, len, |buf| api::write(file, buf))
           }
           (WriteTo::Socket(socket), _) => {
-            lending.write(stream, data, |buf| api::send(socket, buf, None))
+            lending.write(stream, data, len, |buf| api::send(socket, buf, None))
           }
         }
       };
