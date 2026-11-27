@@ -179,6 +179,21 @@ macro_rules! action_io {
   }};
 }
 
+/// [`action_io!`] for an operation that names its resources by
+/// [`Resource::alias`](crate::api::resource::Resource::alias) of ones the
+/// model holds, and owns nothing else.
+macro_rules! action_lent {
+  ($op:expr) => {{
+    let op = $op;
+    // SAFETY: as for `action_io!`. The resources `op` names are aliases
+    // of ones in the model that builds this action, which the action
+    // borrows, and `op` owns nothing besides.
+    $crate::api::op::Action::Io(unsafe {
+      $crate::backend::op::BorrowedOp::aliasing(op)
+    })
+  }};
+}
+
 /// Declares the type of one operation: what it was asked to do, held
 /// until it is polled, and the [`Cx`](crate::model::Cx) method that then
 /// starts it.

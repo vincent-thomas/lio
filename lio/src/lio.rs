@@ -2771,6 +2771,34 @@ mod tests {
   }
 
   #[test]
+  fn an_operation_leaves_its_resource_counted_as_it_found_it() {
+    use crate::api::resource::Resource;
+
+    let file = Resource::stdin();
+    let before = file.handles();
+    let read = || crate::api::read_at(&file, Vec::<u8>::with_capacity(8), 0);
+
+    // Performed as it is offered: the backend only looks at it.
+    let offered = Lio::new_with_backend(OnlyOffered::default(), 1).unwrap();
+    read().with_lio(&offered).when_done(|_| {});
+    assert_eq!(file.handles(), before);
+
+    // Started, and finished there.
+    let started = Lio::new_with_backend(AtOnce, 1).unwrap();
+    read().with_lio(&started).when_done(|_| {});
+    assert_eq!(file.handles(), before);
+
+    // Started, and kept by the backend until it is finished: the
+    // operation's memory holds one handle, and the backend another.
+    let (backend, held) = lio(1);
+    read().with_lio(&held).when_done(|_| {});
+    assert_eq!(file.handles(), before + 2);
+    backend.complete_all(0);
+    held.try_run().unwrap();
+    assert_eq!(file.handles(), before);
+  }
+
+  #[test]
   fn a_run_with_nothing_to_wait_for_does_not_block() {
     let (_, lio) = lio(1);
     assert_eq!(lio.run().unwrap(), 0);
