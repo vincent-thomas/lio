@@ -4,6 +4,8 @@
 //! five pointer-sized words. [`Slot`] holds one such result, hands the host a
 //! pointer to it, and gives the lifted value back exactly once.
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 
@@ -285,6 +287,8 @@ pub(crate) use call;
 
 #[cfg(test)]
 mod tests {
+  use alloc::boxed::Box;
+
   use super::*;
 
   #[derive(Debug, PartialEq)]

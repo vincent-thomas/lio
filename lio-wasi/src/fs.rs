@@ -18,6 +18,8 @@
 //! the same functions. The assertions next to each one pin them for
 //! `wasm32`.
 
+use alloc::boxed::Box;
+use alloc::string::String;
 use core::marker::PhantomData;
 
 pub use wasip3::clocks::system_clock::Instant;
@@ -1218,6 +1220,8 @@ impl sealed::Future for StreamStatus {
 
 #[cfg(test)]
 mod tests {
+  use alloc::vec::Vec;
+
   use super::*;
 
   fn words(a: usize) -> Words {

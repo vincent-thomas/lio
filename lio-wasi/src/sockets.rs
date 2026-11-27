@@ -18,6 +18,8 @@
 
 pub mod ip_name_lookup;
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 
@@ -466,6 +468,9 @@ impl sealed::Call for ReceiveFrom<'_> {
 
 #[cfg(test)]
 mod tests {
+  use alloc::boxed::Box;
+  use alloc::vec;
+
   use super::*;
 
   #[test]
