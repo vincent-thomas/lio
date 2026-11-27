@@ -6,6 +6,7 @@
 //! from then on knows it by an [`OpKey`]. Reporting it is a call on [`Done`],
 //! which is the table as a backend sees it.
 
+use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
@@ -572,9 +573,8 @@ pub struct Tracked<B> {
   ops: Vec<Op>,
   /// One per slot: the step arena of the operation there.
   arenas: Vec<Bump>,
-  /// Queued operations, in push order. Those before `next` were handed out.
-  backlog: Vec<OpKey>,
-  next: usize,
+  /// Queued operations, in push order.
+  backlog: VecDeque<OpKey>,
   cap: usize,
   /// Operations queued or started, and not reported.
   live: usize,
@@ -590,8 +590,7 @@ impl<B: IoBackend> Tracked<B> {
       entries: Vec::new(),
       ops: Vec::new(),
       arenas: Vec::new(),
-      backlog: Vec::new(),
-      next: 0,
+      backlog: VecDeque::new(),
       cap: 0,
       live: 0,
       ready: Vec::new(),
@@ -617,8 +616,7 @@ impl<B: IoBackend> Tracked<B> {
     self.ops.resize_with(cap, || Op::Nop);
     self.arenas.clear();
     self.arenas.resize_with(cap, Bump::new);
-    self.backlog = Vec::with_capacity(cap);
-    self.next = 0;
+    self.backlog = VecDeque::with_capacity(cap);
     self.cap = cap;
     self.live = 0;
     self.ready = Vec::with_capacity(cap);
@@ -707,7 +705,7 @@ impl<B: IoBackend> Tracked<B> {
     entry.state = State::Queued;
     entry.id = id;
     entry.keep = Some(keep);
-    self.backlog.push(OpKey::new(slot as u32, entry.generation));
+    self.backlog.push_back(OpKey::new(slot as u32, entry.generation));
     self.ops[slot].clone_from(op.as_op());
   }
 
@@ -739,13 +737,10 @@ impl<B: IoBackend> Tracked<B> {
   /// Gives the backend every queued operation, in the order they were
   /// pushed.
   pub fn flush(&mut self) {
-    let Self {
-      backend, entries, ops, arenas, backlog, next, ready, live, ..
-    } = self;
-    // The cursor is kept in `self`: a backend that panics leaves the rest
-    // queued for the next flush.
-    while let Some(&key) = backlog.get(*next) {
-      *next += 1;
+    let Self { backend, entries, ops, arenas, backlog, ready, live, .. } = self;
+    // Taken one at a time: a backend that panics leaves the rest queued
+    // for the next flush.
+    while let Some(key) = backlog.pop_front() {
       let slot = key.slot();
       let entry = &mut entries[slot];
       if entry.generation != key.generation() || entry.state != State::Queued {
@@ -767,8 +762,6 @@ impl<B: IoBackend> Tracked<B> {
       // What the backend did not take goes, with the resources it holds.
       ops[slot] = Op::Nop;
     }
-    backlog.clear();
-    *next = 0;
   }
 
   /// Asks for operation `id` to finish early.
@@ -849,7 +842,7 @@ impl<B> std::fmt::Debug for Tracked<B> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("Tracked")
       .field("capacity", &self.entries.len())
-      .field("queued", &(self.backlog.len() - self.next))
+      .field("queued", &self.backlog.len())
       .field("ready", &self.ready.len())
       .finish_non_exhaustive()
   }
@@ -982,6 +975,50 @@ mod tests {
   }
 
   #[test]
+  fn a_stale_key_does_not_report_the_slot_s_next_operation() {
+    let mut io = tracked(2);
+    push(&mut io, 1);
+    io.flush();
+    let (_, stale) = io.backend().begun[0];
+    io.cancel(1);
+    assert_eq!(collect(&mut io), [(1, -1, true)]);
+
+    // The slot's next operation is with the backend when the old key is
+    // reported again.
+    push(&mut io, 1);
+    io.flush();
+    let mut completed = Vec::new();
+    let mut done = Done {
+      entries: &mut io.entries,
+      ready: &mut completed,
+      live: &mut io.live,
+    };
+    // SAFETY: a nop has no addresses, and 0 is what a nop does.
+    unsafe { done.complete(stale, 0) };
+    assert!(completed.is_empty(), "the stale key names nothing");
+    assert_eq!(io.in_flight(), 1);
+
+    let (_, current) = io.backend().begun[1];
+    assert_ne!(current, stale);
+    io.cancel(1);
+    assert_eq!(collect(&mut io), [(1, -1, true)]);
+  }
+
+  #[test]
+  fn the_table_prints_what_it_holds() {
+    let mut io = tracked(4);
+    push(&mut io, 1);
+    io.flush();
+    push(&mut io, 2);
+    push(&mut io, 3);
+    io.cancel(1);
+    let printed = format!("{io:?}");
+    assert!(printed.contains("capacity: 4"), "{printed}");
+    assert!(printed.contains("queued: 2"), "{printed}");
+    assert!(printed.contains("ready: 1"), "{printed}");
+  }
+
+  #[test]
   fn a_cancel_names_the_operation_by_its_whole_id() {
     let mut io = tracked(4);
     push(&mut io, 1);
@@ -1027,6 +1064,7 @@ mod tests {
     assert!(state.is_empty());
     assert_eq!(state.insert(first, 'a'), None);
     assert_eq!((state.len(), state.contains(first)), (1, true));
+    assert!(!state.is_empty() && !state.contains(next));
     assert_eq!(state.get(next), None, "a stale key finds nothing");
     assert_eq!(state.get_mut(next), None);
     assert_eq!(state.take(next), None);
