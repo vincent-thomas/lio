@@ -191,7 +191,10 @@ const SPARE: usize = 64;
 pub(crate) type LendingRef = Local<Rc<Lending>>;
 
 impl Lending {
-  /// Starts a read into `room`, a range of guest memory.
+  /// Starts a read into the `len` bytes at `room`, a range of guest memory.
+  ///
+  /// The range is named by address, not borrowed: lio makes its own
+  /// reference to it, and no other may be alive while it does.
   ///
   /// `start` makes the operation from the buffer. Its result arrives in
   /// `stream`'s lease: a stream has one operation at a time, so it keeps
@@ -201,23 +204,25 @@ impl Lending {
   /// # Safety
   ///
   /// `room` is the buffer of a guest read on a [`Store`] made from an
-  /// [`Engine`], and that read is not reported to the guest as over until
-  /// the lease's [`poll`](Lease::poll) has returned `Ready`.
+  /// [`Engine`], no reference to it is alive, and that read is not
+  /// reported to the guest as over until the lease's
+  /// [`poll`](Lease::poll) has returned `Ready`.
   pub(crate) unsafe fn read<M>(
     self: &Rc<Self>,
     stream: &mut StreamLease,
-    room: &mut [u8],
+    room: *mut u8,
+    len: usize,
     start: impl FnOnce(GuestBuf) -> Io<M>,
   ) -> bool
   where
     M: OpModel<Item = (io::Result<usize>, GuestBuf)> + 'static,
   {
     count(|stats| stats.reads_lent += 1);
-    self.lend(stream, room.as_mut_ptr(), room.len(), 0, start)
+    self.lend(stream, room, len, 0, start)
   }
 
-  /// Starts a write of `data`, a range of guest memory, like
-  /// [`read`](Self::read).
+  /// Starts a write of the `len` bytes at `data`, a range of guest memory,
+  /// like [`read`](Self::read).
   ///
   /// # Safety
   ///
@@ -226,7 +231,8 @@ impl Lending {
   pub(crate) unsafe fn write<M>(
     self: &Rc<Self>,
     stream: &mut StreamLease,
-    data: &[u8],
+    data: *const u8,
+    len: usize,
     start: impl FnOnce(GuestBuf) -> Io<M>,
   ) -> bool
   where
@@ -235,7 +241,7 @@ impl Lending {
     count(|stats| stats.writes_lent += 1);
     // The buffer is only ever read through this pointer: a write uses
     // `IoBuf::as_slice`, never `IoBufMut`.
-    self.lend(stream, data.as_ptr().cast_mut(), data.len(), data.len(), start)
+    self.lend(stream, data.cast_mut(), len, len, start)
   }
 
   fn lend<M>(

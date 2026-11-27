@@ -562,11 +562,12 @@ impl<T: Send + 'static> types::HostTcpSocketWithStore<T> for LioWasi {
         if remote.ip().is_unspecified() || remote.port() == 0 {
           return Err(ErrorCode::InvalidArgument);
         }
+        let before = socket.state;
         socket.state = TcpState::Connecting;
-        Ok((socket.resource.clone(), remote))
+        Ok((socket.resource.clone(), remote, before))
       })())
     })?;
-    let (resource, remote) = match started {
+    let (resource, remote, before) = match started {
       Ok(started) => started,
       Err(error) => return Ok(Err(error)),
     };
@@ -576,7 +577,8 @@ impl<T: Send + 'static> types::HostTcpSocketWithStore<T> for LioWasi {
       if let Ok(socket) = store.get().tcp(&this) {
         socket.state = match connected {
           Ok(()) => TcpState::Connected,
-          Err(_) => TcpState::Unbound,
+          // What it was bound to, it still is.
+          Err(_) => before,
         };
       }
     });

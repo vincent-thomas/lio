@@ -88,6 +88,11 @@ fn get<T>(
 
 /// A guest path as the C string lio takes, refused if it could leave the
 /// directory it is relative to.
+///
+/// Every `..` is resolved here, against the names before it, and none
+/// reaches the system. There, one that follows a symbolic link steps out of
+/// wherever the link leads: with a link to `.`, `link/..` is the parent of
+/// the directory itself.
 fn path(path: &str) -> Result<CString, ErrorCode> {
   if path.is_empty() {
     return Err(ErrorCode::NoEntry);
@@ -95,17 +100,32 @@ fn path(path: &str) -> Result<CString, ErrorCode> {
   if path.starts_with('/') {
     return Err(ErrorCode::NotPermitted);
   }
-  let mut depth = 0usize;
+  let mut names: Vec<&str> = Vec::new();
   for part in path.split('/') {
     match part {
       "" | "." => {}
       ".." => {
-        depth = depth.checked_sub(1).ok_or(ErrorCode::NotPermitted)?;
+        names.pop().ok_or(ErrorCode::NotPermitted)?;
       }
-      _ => depth += 1,
+      name => names.push(name),
     }
   }
-  CString::new(path).map_err(|_| ErrorCode::Invalid)
+  let resolved =
+    if names.is_empty() { String::from(".") } else { names.join("/") };
+  CString::new(resolved).map_err(|_| ErrorCode::Invalid)
+}
+
+/// The text a symbolic link a guest makes may store: relative, and with no
+/// `..`. The system resolves it, wherever the link is followed from, so
+/// one with a `..` could leave the directory by way of another link.
+fn link_target(target: &str) -> Result<CString, ErrorCode> {
+  if target.is_empty() {
+    return Err(ErrorCode::NoEntry);
+  }
+  if target.starts_with('/') || target.split('/').any(|part| part == "..") {
+    return Err(ErrorCode::NotPermitted);
+  }
+  CString::new(target).map_err(|_| ErrorCode::Invalid)
 }
 
 fn mode(octal: u32) -> FileMode {
@@ -609,7 +629,12 @@ impl<T: Send + 'static> types::HostDescriptorWithStore<T> for LioWasi {
       let writes = flags.contains(DescriptorFlags::WRITE) && !directory;
       let changes = writes
         || open_flags.intersects(OpenFlags::CREATE | OpenFlags::TRUNCATE);
-      if changes && !parent.flags.contains(DescriptorFlags::MUTATE_DIRECTORY) {
+      // The right to change a directory's entries comes from its parent:
+      // a descriptor cannot have it if the one it was opened from did not.
+      let mutates = flags.contains(DescriptorFlags::MUTATE_DIRECTORY);
+      if (changes || mutates)
+        && !parent.flags.contains(DescriptorFlags::MUTATE_DIRECTORY)
+      {
         return Err(ErrorCode::NotPermitted);
       }
 
@@ -720,11 +745,10 @@ impl<T: Send + 'static> types::HostDescriptorWithStore<T> for LioWasi {
     Ok(
       async {
         let dir = descriptor.dir_mut()?;
-        // The target is text the link stores. It is checked like a path so
-        // that a guest cannot plant a link that leaves the directory.
+        // The target is text the link stores, which the system resolves.
         let link = api::linkat(
           dir,
-          path(&old_path)?,
+          link_target(&old_path)?,
           dir,
           path(&new_path)?,
           LinkKind::Soft,
@@ -803,4 +827,44 @@ fn write<T: Send + 'static>(
     ByteWriter::new(to(descriptor.resource), fs_error, nothing, lending);
   data.pipe(&mut host, writer)?;
   FutureReader::new(&mut host, status)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn resolved(guest: &str) -> Option<String> {
+    path(guest).ok().map(|path| path.into_string().unwrap())
+  }
+
+  #[test]
+  fn no_parent_step_reaches_the_system() {
+    assert_eq!(resolved("a/b").as_deref(), Some("a/b"));
+    assert_eq!(resolved("./a//b/").as_deref(), Some("a/b"));
+    assert_eq!(resolved("a/../b").as_deref(), Some("b"));
+    // A link named `a` that leads to `.` would make `a/..` the parent of
+    // the directory itself.
+    assert_eq!(resolved("a/..").as_deref(), Some("."));
+    assert_eq!(resolved("a/b/../..").as_deref(), Some("."));
+  }
+
+  #[test]
+  fn a_path_that_leaves_its_directory_is_refused() {
+    for leaves in ["..", "a/../..", "../a", "/a", "/"] {
+      assert!(matches!(path(leaves), Err(ErrorCode::NotPermitted)), "{leaves}");
+    }
+    assert!(matches!(path(""), Err(ErrorCode::NoEntry)));
+  }
+
+  #[test]
+  fn a_link_a_guest_makes_stores_no_parent_step() {
+    assert!(link_target(".").is_ok());
+    assert!(link_target("a/b").is_ok());
+    for leaves in ["..", "a/..", "a/../b", "/etc"] {
+      assert!(
+        matches!(link_target(leaves), Err(ErrorCode::NotPermitted)),
+        "{leaves}"
+      );
+    }
+  }
 }
