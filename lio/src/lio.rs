@@ -634,24 +634,18 @@ impl Lio {
     M: Drive + 'static,
     F: FnMut(M::Item) -> bool + 'static,
   {
-    self
-      .spawn_in(move |arena| Registration::running(arena, model, sink), None)
-      .0
+    self.spawn_in(move |arena| Registration::running(arena, model, sink), None)
   }
 
   /// Runs `model` for a future: its item waits in the slot until
   /// [`take_awaited`](Self::take_awaited) returns it.
   ///
-  /// Returns whether the model is done already, with its item in the slot.
-  /// If it is not, `waker` is woken when it is.
+  /// `waker` is woken when the item is there, unless it is already when
+  /// this returns.
   ///
   /// The slot is not given back before the item is taken or
   /// [`drop_awaited`](Self::drop_awaited) is called.
-  pub(crate) fn spawn_awaited<M>(
-    &self,
-    model: M,
-    waker: &Waker,
-  ) -> (Spawned, bool)
+  pub(crate) fn spawn_awaited<M>(&self, model: M, waker: &Waker) -> Spawned
   where
     M: Drive + 'static,
   {
@@ -756,13 +750,12 @@ impl Lio {
   /// Fills a slot with what `make` builds in its arena, and polls its model
   /// for the first time. Over capacity it waits in a queue.
   ///
-  /// Returns whether the model is done already. `mail` is what wakes the
-  /// future of a model that runs for one and is not done.
+  /// `mail` is what wakes the future of a model that runs for one.
   fn spawn_in(
     &self,
     make: impl FnOnce(&mut Bump) -> Registration + 'static,
     mail: Option<&Waker>,
-  ) -> (Spawned, bool) {
+  ) -> Spawned {
     let mut inner = self.inner.borrow_mut();
     // Queued submissions go first.
     if !inner.overflow.is_empty() || inner.store.is_full() {
@@ -779,7 +772,7 @@ impl Lio {
         (id, FIRST_OP)
       };
       Self::enqueue(&mut inner, start, Some(Rc::clone(&token)), None);
-      return (Spawned::Queued(token), false);
+      return Spawned::Queued(token);
     }
     let id = Self::insert_task(&mut inner, make);
     let begun = Self::begin(&mut inner, id);
@@ -787,23 +780,18 @@ impl Lio {
       unreachable!("driver: a model that was just started cannot be polled");
     };
     let (mut inner, freed) = self.poll_begun(inner, id, begun);
-    // It may be done already: the backend may have finished what it
-    // started. A slot that is gone held a model that was.
-    let finished = match inner.store.get_mut(id) {
-      None => true,
-      Some(reg) => {
-        let finished = reg.is_finished();
-        if !finished && let Some(waker) = mail {
-          reg.arm_mail(waker.clone());
-        }
-        finished
-      }
-    };
+    // Armed after the poll, so that a model done already has woken
+    // nothing: whoever spawned it asks for its item next.
+    if let Some(waker) = mail
+      && let Some(reg) = inner.store.get_mut(id)
+    {
+      reg.arm_mail(waker.clone());
+    }
     drop(inner);
     if freed {
       self.bury_and_wake();
     }
-    (Spawned::Now(id), finished)
+    Spawned::Now(id)
   }
 
   /// Stops a model started with [`spawn`](Self::spawn): it is dropped, and
@@ -2486,22 +2474,166 @@ mod tests {
     assert!(!lio.is_full());
   }
 
-  /// Runs one nop after another, for ever.
+  /// Runs one nop after another: for ever, as far as a test goes.
   struct Spinner {
     nop: Nop,
     turns: Rc<Cell<u32>>,
   }
 
+  /// Where a [`Spinner`] gives up, so that a driver that never makes it
+  /// wait fails a test instead of hanging it.
+  const SPINS: u32 = 10_000;
+
   impl OpModel for Spinner {
     type Item = ();
 
     fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
-      loop {
+      while self.turns.get() < SPINS {
         let _ = ready!(self.nop.poll(cx));
         self.turns.set(self.turns.get() + 1);
         self.nop = Nop::new();
       }
+      Step::Done(())
     }
+  }
+
+  /// Performs a nop it is offered, and holds one it is given to start
+  /// until it is cancelled.
+  #[derive(Default)]
+  struct OnlyOffered {
+    held: Vec<OpKey>,
+  }
+
+  impl IoBackend for OnlyOffered {
+    fn init(&mut self, _: usize) -> io::Result<()> {
+      Ok(())
+    }
+    fn resource_close(&self) -> crate::api::resource::ResourceClose {
+      crate::api::resource::ResourceClose::noop()
+    }
+    fn attempt(
+      &mut self,
+      op: crate::backend::Offered<'_>,
+    ) -> crate::backend::Attempted {
+      // SAFETY: a nop has no addresses, and 0 is what a nop does.
+      unsafe { op.finish(0) }
+    }
+    fn start(
+      &mut self,
+      op: Queued<'_>,
+      _: &mut Bump,
+      _: &mut Done<'_>,
+    ) -> Started {
+      let (started, key, _) = op.begin();
+      self.held.push(key);
+      started
+    }
+    fn cancel(&mut self, key: OpKey, done: &mut Done<'_>) {
+      // SAFETY: a nop has no addresses, and the result is negative.
+      unsafe { done.cancelled(key, -1) };
+    }
+    fn wait(
+      &mut self,
+      _: Option<Duration>,
+      _: &mut Done<'_>,
+    ) -> io::Result<()> {
+      Ok(())
+    }
+  }
+
+  #[test]
+  fn every_poll_that_is_not_nested_gets_its_own_share_of_results() {
+    let lio = Lio::new_with_backend(OnlyOffered::default(), 4).unwrap();
+    let done = Rc::new(Cell::new(0));
+    for _ in 0..3 * STARTED_PER_POLL {
+      let count = done.clone();
+      crate::api::nop()
+        .with_lio(&lio)
+        .when_done(move |_| count.set(count.get() + 1));
+    }
+    // The backend performed each as it was offered: none had to be started.
+    assert_eq!(done.get(), 3 * STARTED_PER_POLL);
+    assert!(!lio.is_full());
+  }
+
+  #[test]
+  fn what_the_backend_performs_as_offered_counts_against_the_share() {
+    let lio = Lio::new_with_backend(OnlyOffered::default(), 1).unwrap();
+    let turns = Rc::new(Cell::new(0));
+    let model = Spinner { nop: Nop::new(), turns: turns.clone() };
+    let task = crate::api::run(model).with_lio(&lio).when_done(|()| {});
+    // After a poll's worth, the next is started, which this backend holds.
+    assert_eq!(turns.get(), STARTED_PER_POLL);
+    assert!(lio.is_full(), "the model waits in a slot");
+    task.cancel();
+    lio.try_run().unwrap();
+    assert!(!lio.is_full());
+  }
+
+  /// Says that it was polled, then runs a nop.
+  struct Seen {
+    polled: Rc<Cell<bool>>,
+    nop: Nop,
+  }
+
+  impl OpModel for Seen {
+    type Item = ();
+
+    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
+      self.polled.set(true);
+      let _ = ready!(self.nop.poll(cx));
+      Step::Done(())
+    }
+  }
+
+  #[test]
+  fn a_model_is_not_polled_while_every_slot_is_taken() {
+    let (backend, lio) = lio(1);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    assert!(lio.is_full());
+    let polled = Rc::new(Cell::new(false));
+    let model = Seen { polled: polled.clone(), nop: Nop::new() };
+    crate::api::run(model).with_lio(&lio).when_done(|()| {});
+    assert!(!polled.get(), "it waits for a slot first");
+    backend.complete_all(0);
+    lio.try_run().unwrap();
+    assert!(polled.get());
+    backend.complete_all(0);
+    lio.try_run().unwrap();
+    assert!(!lio.is_full());
+  }
+
+  /// Yields the numbers down from `left`, with a nop before each.
+  struct Countdown {
+    left: u32,
+    nop: Nop,
+  }
+
+  impl crate::model::OpStream for Countdown {
+    type Item = u32;
+
+    fn poll_next(&mut self, cx: &mut Cx<'_>) -> crate::model::Next<u32> {
+      if self.left == 0 {
+        return crate::model::Next::End;
+      }
+      let _ = ready!(self.nop.poll(cx));
+      self.nop = Nop::new();
+      self.left -= 1;
+      crate::model::Next::Item(self.left)
+    }
+  }
+
+  #[test]
+  fn a_stream_goes_on_after_an_item_it_yields_at_its_first_poll() {
+    let lio = Lio::new_with_backend(AtOnce, 1).unwrap();
+    let items = Rc::new(RefCell::new(Vec::new()));
+    let sink = items.clone();
+    let stream = Countdown { left: 3, nop: Nop::new() };
+    crate::model::spawn_stream(&lio, stream, move |item| {
+      sink.borrow_mut().push(item)
+    });
+    assert_eq!(*items.borrow(), [2, 1, 0]);
+    assert!(!lio.is_full());
   }
 
   #[test]
@@ -2554,10 +2686,12 @@ mod tests {
     let left = Rc::new(Cell::new(10_000));
     let depth = Rc::new(Cell::new((0, 0)));
     chain(&lio, &left, &depth);
-    while left.get() > 0 {
+    // Each run delivers at least one. A driver that stops delivering
+    // fails the count below, where a loop until done would hang.
+    for _ in 0..10_000 {
       lio.try_run().unwrap();
     }
-    lio.try_run().unwrap();
+    assert_eq!(left.get(), 0, "every link of the chain ran");
     let (now, deepest) = depth.get();
     assert_eq!(now, 0);
     assert!(deepest <= STARTED_PER_POLL + 1, "nested {deepest} deep");
@@ -2609,6 +2743,17 @@ mod tests {
   fn a_run_with_nothing_to_wait_for_does_not_block() {
     let (_, lio) = lio(1);
     assert_eq!(lio.run().unwrap(), 0);
+  }
+
+  #[test]
+  fn a_run_with_nothing_to_wait_for_leaves_the_backend_alone() {
+    let timeouts = Rc::new(RefCell::new(Vec::new()));
+    let backend =
+      Recording { inner: ScriptedBackend::new(), timeouts: timeouts.clone() };
+    let lio = Lio::new_with_backend(backend, 1).unwrap();
+    assert_eq!(lio.run().unwrap(), 0);
+    assert_eq!(lio.try_run().unwrap(), 0);
+    assert!(timeouts.borrow().is_empty(), "no wait was made");
   }
 
   #[test]

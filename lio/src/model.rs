@@ -635,7 +635,7 @@ where
         // One item is all a future takes.
         false
       });
-      let (spawned, finished) = match trial {
+      let spawned = match trial {
         Trial::Finished => {
           return match item {
             Some(item) => Poll::Ready(item),
@@ -652,18 +652,17 @@ where
             move |arena| Registration::awaited(arena, model),
             Some(cx.waker()),
           );
-          (spawned, false)
+          this.state =
+            RunState::Running(Task { lio: lio.downgrade(), spawned });
+          // The waker is in the slot.
+          return Poll::Pending;
         }
         Trial::Waiting(model, None) | Trial::Skipped(model) => {
           lio.spawn_awaited(model, cx.waker())
         }
       };
       this.state = RunState::Running(Task { lio: lio.downgrade(), spawned });
-      if !finished {
-        // The waker is in the slot.
-        return Poll::Pending;
-      }
-      // The item is in the slot already.
+      // Its item may be in the slot already: asked for below.
     }
     match &this.state {
       RunState::Running(task) => {
