@@ -673,7 +673,7 @@ impl Lio {
     // SAFETY: a slot id is never reused with the same generation, so `id`
     // names the slot `spawn_awaited` filled, for a model whose item is `T`.
     match unsafe { reg.take_mail::<T>(waker) } {
-      Mail::Item(item) => {
+      Mail::Item(item, waker) => {
         // Still running when its own waker polled the future: whoever
         // polls the model gives the slot back.
         let spent = reg.is_spent();
@@ -682,6 +682,8 @@ impl Lio {
         }
         let settle = spent && Self::slot_is_wanted(inner_ref);
         drop(inner);
+        // A waker's drop is the caller's code.
+        drop(waker);
         if settle {
           // The slot goes to a model that was waiting for one, which is
           // polled now: no run is under way to do it.
@@ -2737,6 +2739,35 @@ mod tests {
     lio.try_run().unwrap();
     assert!(done.get());
     assert!(!lio.is_full());
+  }
+
+  #[test]
+  fn a_future_done_as_it_was_spawned_leaves_no_waker_behind() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
+
+    /// Counts its wakes. Its reference count says who still holds it.
+    struct Counted(AtomicUsize);
+    impl Wake for Counted {
+      fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+      }
+    }
+
+    let lio = Lio::new_with_backend(AtOnce, 1).unwrap();
+    let quiet = Arc::new(Counted(AtomicUsize::new(0)));
+    let waker = Waker::from(quiet.clone());
+    // In a slot from the start, where the backend finishes it at once.
+    let spawned = lio.spawn_awaited(Nop::new(), &waker);
+    // SAFETY: spawned just above, for a model whose item is this.
+    let item = unsafe { lio.take_awaited::<io::Result<()>>(&spawned, &waker) };
+    assert!(matches!(item, Some(Ok(()))));
+    assert!(!lio.is_full());
+    drop(waker);
+    drop(lio);
+    assert_eq!(Arc::strong_count(&quiet), 1, "the slot kept a waker");
+    assert_eq!(quiet.0.load(Ordering::Relaxed), 0, "nothing was waiting");
   }
 
   #[test]
