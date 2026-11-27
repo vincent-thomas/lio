@@ -177,6 +177,15 @@ fn shut_write(resource: &Resource) {
   let _ = rustix::net::shutdown(resource, Shutdown::Write);
 }
 
+/// Whether an accept failed for the one connection it was taking, which
+/// says nothing about the next.
+fn lost_connection(error: &std::io::Error) -> bool {
+  matches!(
+    error.raw_os_error(),
+    Some(libc::ECONNABORTED | libc::ECONNRESET | libc::EPROTO | libc::EINTR)
+  )
+}
+
 /// A status that is already known.
 fn ended(how: Result<(), ErrorCode>) -> Status<ErrorCode> {
   Status::ready(how)
@@ -209,20 +218,26 @@ impl<D: 'static> StreamProducer<D> for Acceptor<D> {
     if dst.remaining(&mut store)? == Some(0) {
       return Poll::Ready(Ok(StreamResult::Completed));
     }
-    let accepting =
-      me.accepting.get_or_insert_with(|| op_waits(api::accept(&me.listener)));
-    let accepted = match Pin::new(accepting).poll(cx) {
-      Poll::Ready(accepted) => accepted,
-      Poll::Pending if finish => {
-        return Poll::Ready(Ok(StreamResult::Cancelled));
+    let resource = loop {
+      let accepting =
+        me.accepting.get_or_insert_with(|| op_waits(api::accept(&me.listener)));
+      let accepted = match Pin::new(accepting).poll(cx) {
+        Poll::Ready(accepted) => accepted,
+        Poll::Pending if finish => {
+          return Poll::Ready(Ok(StreamResult::Cancelled));
+        }
+        Poll::Pending => return Poll::Pending,
+      };
+      me.accepting = None;
+      match accepted {
+        Ok((resource, _peer)) => break resource,
+        // That connection is gone, and the listener is as it was: the
+        // next one is accepted.
+        Err(error) if lost_connection(&error) => {}
+        // The listener is unusable, or the host is out of something a
+        // retry would only spin on: the stream ends.
+        Err(_) => return Poll::Ready(Ok(StreamResult::Dropped)),
       }
-      Poll::Pending => return Poll::Pending,
-    };
-    me.accepting = None;
-    let resource = match accepted {
-      Ok((resource, _peer)) => resource,
-      // The listener is unusable: the stream ends.
-      Err(_) => return Poll::Ready(Ok(StreamResult::Dropped)),
     };
     let socket = TcpSocket {
       resource,

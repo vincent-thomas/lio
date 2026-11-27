@@ -104,7 +104,9 @@ impl<E: Ends> ByteReader<E> {
     (reader, ended)
   }
 
-  fn end(&mut self, how: Result<(), E>) {
+  /// Ends the stream, with `how` as its status. Later reads find it
+  /// ended.
+  pub(crate) fn end(&mut self, how: Result<(), E>) {
     if let Some(status) = self.status.take() {
       status.send(how);
     }
