@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::time::Duration;
 use std::{
@@ -69,6 +69,9 @@ pub struct OsPoller {
   /// many descriptors gained a waiter since the last one, that is one
   /// system call instead of one each.
   pending: RefCell<Vec<libc::kevent>>,
+  /// How many registrations at the front of `pending` a call that failed
+  /// may have given the kernel all the same: an interrupted one has.
+  maybe_applied: Cell<usize>,
   /// Registrations the kernel refused when a full `pending` was submitted
   /// on its own. They are handed out by the next wait, as it would have
   /// reported them.
@@ -92,6 +95,7 @@ impl OsPoller {
       registered_fds: RefCell::new(HashMap::new()),
       registered_timers: RefCell::new(HashSet::new()),
       pending: RefCell::new(Vec::new()),
+      maybe_applied: Cell::new(0),
       refused: RefCell::new(Vec::new()),
       notify: notify::Notify::new()?,
       _not_send: PhantomData,
@@ -408,12 +412,15 @@ impl OsPoller {
     }
     changes.clear();
     *self.pending.borrow_mut() = changes;
+    self.maybe_applied.set(0);
     Ok(())
   }
 
   /// Puts back registrations a failed call may not have applied, ahead of
-  /// any queued since.
+  /// any queued since. It may have applied them too, which `delete` has to
+  /// allow for.
   fn requeue(&self, mut changes: Vec<libc::kevent>) {
+    self.maybe_applied.set(changes.len());
     let mut pending = self.pending.borrow_mut();
     changes.append(&mut pending);
     *pending = changes;
@@ -434,12 +441,26 @@ impl ReadinessPoll for OsPoller {
     };
 
     // A registration still queued never reached the kernel: taking it out
-    // of the queue removes it.
+    // of the queue removes it. Unless a call that failed had it: then the
+    // kernel may hold it, and it is removed there as well.
     {
       let mut pending = self.pending.borrow_mut();
-      let queued = pending.len();
-      pending.retain(|change| !Self::is_for(change, fd));
-      if pending.len() != queued {
+      let maybe_applied = self.maybe_applied.get();
+      let (mut at, mut queued, mut submitted) = (0, false, 0);
+      pending.retain(|change| {
+        let index = at;
+        at += 1;
+        if !Self::is_for(change, fd) {
+          return true;
+        }
+        queued = true;
+        if index < maybe_applied {
+          submitted += 1;
+        }
+        false
+      });
+      self.maybe_applied.set(maybe_applied - submitted);
+      if queued && submitted == 0 {
         return Ok(());
       }
     }
@@ -510,6 +531,7 @@ impl ReadinessPoll for OsPoller {
     };
     changes.clear();
     *self.pending.borrow_mut() = changes;
+    self.maybe_applied.set(0);
 
     let n = ret as usize;
     assert!(
@@ -584,6 +606,38 @@ mod tests {
     assert_eq!(ready, 1);
     let ident = events[0].ident;
     assert_eq!(ident, reader.as_raw_fd() as libc::uintptr_t);
+  }
+
+  #[test]
+  fn deleting_after_a_call_that_failed_removes_what_the_kernel_took() {
+    use std::io::Write;
+
+    let poller = OsPoller::new().unwrap();
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    poller.add(reader.as_raw_fd(), 7, Interest::READ).unwrap();
+
+    // An interrupted call: the kernel has taken the registration, and the
+    // poller, told the call failed, has it queued again.
+    let changes = poller.pending.borrow().clone();
+    syscall!(kevent(
+      poller.kq_fd.as_raw_fd(),
+      changes.as_ptr(),
+      changes.len() as libc::c_int,
+      ptr::null_mut(),
+      0,
+      ptr::null(),
+    ))
+    .unwrap();
+    poller.maybe_applied.set(changes.len());
+
+    poller.delete(reader.as_raw_fd()).unwrap();
+    assert!(poller.pending.borrow().is_empty());
+    assert_eq!(poller.maybe_applied.get(), 0);
+    writer.write_all(b"x").unwrap();
+    // SAFETY: `libc::kevent` is plain data, valid when zeroed.
+    let mut events: [libc::kevent; 8] = unsafe { std::mem::zeroed() };
+    let ready = poller.wait(&mut events, Some(Duration::ZERO)).unwrap();
+    assert_eq!(ready, 0, "the kernel no longer watches it");
   }
 }
 
