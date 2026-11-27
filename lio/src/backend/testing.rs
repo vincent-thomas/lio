@@ -250,14 +250,12 @@ impl IoBackend for ScriptedBackend {
 impl Script {
   /// Reports every in-flight operation the driver asked to cancel.
   fn stop_cancelled(&mut self) {
-    let mut at = 0;
-    while at < self.in_flight.len() {
-      let id = self.in_flight[at].0;
-      if !self.cancelled.contains(&id) {
-        at += 1;
-        continue;
-      }
-      let (_, op) = self.in_flight.remove(at);
+    let cancelled = &self.cancelled;
+    let (stopped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.in_flight)
+      .into_iter()
+      .partition(|(id, _)| cancelled.contains(id));
+    self.in_flight = kept;
+    for (id, op) in stopped {
       let Some(ticket) = self.tickets.remove(&id) else {
         unreachable!("ScriptedBackend: operation {id} is in flight unticketed");
       };
