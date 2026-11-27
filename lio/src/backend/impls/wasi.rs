@@ -1584,14 +1584,13 @@ impl Wasi {
       }
       Op::OpenAt { dir_fd, path, flags, mode: _ } => {
         let (open_flags, descriptor_flags) = open_flags(*flags)?;
+        let follow = if flags.contains(OpenFlags::NOFOLLOW) {
+          PathFlags::empty()
+        } else {
+          PathFlags::SYMLINK_FOLLOW
+        };
         let call = locate(dir_fd.as_raw_fd(), path, |dir, path| {
-          fs::OpenAt::new(
-            dir,
-            PathFlags::SYMLINK_FOLLOW,
-            path,
-            open_flags,
-            descriptor_flags,
-          )
+          fs::OpenAt::new(dir, follow, path, open_flags, descriptor_flags)
         })?;
         Call::Open { call, append: flags.contains(OpenFlags::APPEND) }
       }

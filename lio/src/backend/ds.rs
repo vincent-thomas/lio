@@ -2393,6 +2393,10 @@ impl DSBackend {
         if !flags.reads() && !flags.writes() {
           return OpAction::Complete(-(errno::EINVAL as isize));
         }
+        // The simulated open does not tell a link from its target.
+        if flags.contains(OpenFlags::NOFOLLOW) {
+          return OpAction::Complete(-(errno::ENOTSUP as isize));
+        }
         let exists = self.world.fs.contains_key(&path);
         if exists && flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
           return OpAction::Complete(-(errno::EEXIST as isize));

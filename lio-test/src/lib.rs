@@ -1944,6 +1944,42 @@ macro_rules! test_io_backend {
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 81, expect::NOENT);
       }
+
+      #[cfg(unix)]
+      #[test]
+      fn nofollow_refuses_a_link_and_opens_a_file() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let path = temp_path("openat-nofollow");
+        let link = temp_path("openat-nofollow-link");
+        fs::write(&path, b"hello").unwrap();
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let how = OpenFlags::READ | OpenFlags::NOFOLLOW;
+
+        push_op(&mut backend,
+          82,
+          BorrowedOp::open_at(Resource::cwd(), link.as_os_str().to_os_string(), how, FileMode::empty()),
+        );
+        let completed = wait_for_single_completion(&mut backend);
+        assert_eq!(completed.registration_id(), 82);
+        assert!(
+          completed.result() < 0,
+          "a link must not be opened, got {}",
+          completed.result()
+        );
+
+        push_op(&mut backend,
+          83,
+          BorrowedOp::open_at(Resource::cwd(), path.as_os_str().to_os_string(), how, FileMode::empty()),
+        );
+        let completed = wait_for_single_completion(&mut backend);
+        assert_eq!(completed.registration_id(), 83);
+        assert!(completed.result() >= 0, "got {}", completed.result());
+        close_raw(completed.result());
+        fs::remove_file(link).ok();
+        fs::remove_file(path).ok();
+      }
     }
 
     mod stat {
