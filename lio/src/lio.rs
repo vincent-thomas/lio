@@ -2185,20 +2185,7 @@ mod tests {
         let _note = &note;
       });
     }
-    let routed = lio.try_run().unwrap();
-    {
-      let inner = lio.inner.borrow();
-      eprintln!(
-        "DBG cap={cap} routed={routed} noted={} leaked={} dying={} ready_io={} in_flight={} woken={} full={}",
-        full.borrow().len(),
-        inner.leaked,
-        inner.dying.len(),
-        inner.ready_io.len(),
-        inner.io.in_flight(),
-        inner.woken.len(),
-        inner.store.is_full()
-      );
-    }
+    lio.try_run().unwrap();
     full.take()
   }
 
@@ -2252,6 +2239,179 @@ mod tests {
     crate::api::nop().with_lio(&lio).when_done(|_| {});
     lio.try_run().unwrap();
     assert!(!lio.is_full(), "a later registration still accounts for its slot");
+  }
+
+  /// Nothing is waiting to be dropped, being dropped, or retired.
+  fn assert_nothing_buried(lio: &Lio) {
+    let inner = lio.inner.borrow();
+    assert_eq!(
+      (inner.dying.len(), inner.burying, inner.store.retired()),
+      (0, 0, 0),
+      "dying, burying, retired"
+    );
+  }
+
+  /// Counts its drops.
+  struct NoteDrop(Rc<Cell<usize>>);
+
+  impl Drop for NoteDrop {
+    fn drop(&mut self) {
+      self.0.set(self.0.get() + 1);
+    }
+  }
+
+  /// Starts a nop whose registration holds `held`, and takes the
+  /// registration out of the store to wait in `dying`, as a run does with
+  /// one it has to drop later. The nop stays with the backend.
+  fn leave_to_bury<T: 'static>(backend: &Kernel, lio: &Lio, held: T) {
+    crate::api::nop().with_lio(lio).when_done(move |_| {
+      let _held = &held;
+    });
+    let Some(&id) = backend.pushed().last() else {
+      panic!("the nop was not handed to the backend");
+    };
+    let mut inner = lio.inner.borrow_mut();
+    let detached = inner.store.detach(id).unwrap();
+    inner.dying.push(detached);
+  }
+
+  #[test]
+  fn several_registrations_are_buried_together() {
+    let (backend, lio) = lio(3);
+    let dropped = Rc::new(Cell::new(0));
+    for _ in 0..3 {
+      leave_to_bury(&backend, &lio, NoteDrop(dropped.clone()));
+    }
+    assert!(lio.is_full(), "their slots are held until they are dropped");
+
+    lio.bury_and_wake();
+    assert_eq!(dropped.get(), 3);
+    assert_nothing_buried(&lio);
+    assert!(!lio.is_full());
+  }
+
+  #[test]
+  #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
+  fn a_panic_in_the_middle_of_a_batch_keeps_every_slot_accounted() {
+    let (backend, lio) = lio(3);
+    let dropped = Rc::new(Cell::new(0));
+    // Buried last to first: one is dropped, the next panics, one is left.
+    leave_to_bury(&backend, &lio, NoteDrop(dropped.clone()));
+    leave_to_bury(&backend, &lio, Bomb);
+    leave_to_bury(&backend, &lio, NoteDrop(dropped.clone()));
+
+    let bury = std::panic::AssertUnwindSafe(|| lio.bury_and_wake());
+    assert!(std::panic::catch_unwind(bury).is_err(), "the bomb went off");
+    assert_eq!(dropped.get(), 1, "the one before the panic was dropped");
+    {
+      let inner = lio.inner.borrow();
+      assert_eq!(inner.dying.len(), 1, "the one after it waits");
+      assert_eq!(inner.burying, 0, "nothing is being dropped any more");
+      assert_eq!(inner.store.retired(), 1, "two slots went back");
+    }
+
+    lio.bury_and_wake();
+    assert_eq!(dropped.get(), 2);
+    assert_nothing_buried(&lio);
+    assert!(!lio.is_full());
+  }
+
+  #[test]
+  fn the_retired_slot_check_adds_up_what_waits_and_what_is_being_dropped() {
+    let (backend, lio) = lio(2);
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    crate::api::nop().with_lio(&lio).when_done(|_| {});
+    let (waiting, dropping) = (backend.pushed()[0], backend.pushed()[1]);
+    // One registration waits in `dying`, and one is held as if a bury were
+    // dropping it right now.
+    let (waiting, dropping) = {
+      let mut inner = lio.inner.borrow_mut();
+      let waiting = inner.store.detach(waiting).unwrap();
+      let dropping = inner.store.detach(dropping).unwrap();
+      inner.dying.push(waiting);
+      inner.burying += 1;
+      Lio::assert_retired_slots_tracked(&inner);
+      (inner.dying.pop().unwrap(), dropping)
+    };
+    // Put back as a bury would leave it. Dropped with the driver not
+    // borrowed: they hold models.
+    let slots = [waiting.slot, dropping.slot];
+    drop((waiting.registration, dropping.registration));
+    {
+      let mut inner = lio.inner.borrow_mut();
+      for slot in slots {
+        inner.store.release(slot);
+      }
+      inner.burying -= 1;
+      Lio::assert_retired_slots_tracked(&inner);
+    }
+    assert_nothing_buried(&lio);
+  }
+
+  /// Starts a nop and hands it out before it is done.
+  struct HandsOut {
+    nop: Option<Nop>,
+    out: Rc<RefCell<Option<Nop>>>,
+  }
+
+  impl OpModel for HandsOut {
+    type Item = ();
+
+    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
+      if let Some(mut nop) = self.nop.take() {
+        assert!(matches!(nop.poll(cx), Step::Pending));
+        *self.out.borrow_mut() = Some(nop);
+      }
+      Step::Done(())
+    }
+  }
+
+  /// Waits for the nop it finds in `from`.
+  struct PicksUp {
+    from: Rc<RefCell<Option<Nop>>>,
+  }
+
+  impl OpModel for PicksUp {
+    type Item = ();
+
+    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
+      let mut from = self.from.borrow_mut();
+      let Some(nop) = from.as_mut() else {
+        panic!("no operation was handed out");
+      };
+      let _ = ready!(nop.poll(cx));
+      Step::Done(())
+    }
+  }
+
+  #[test]
+  fn an_operation_is_never_taken_from_another_driver() {
+    let (first_backend, first) = lio(2);
+    let (second_backend, second) = lio(2);
+    // An operation of the first driver, in its first slot.
+    let out = Rc::new(RefCell::new(None));
+    first
+      .spawn(HandsOut { nop: Some(Nop::new()), out: out.clone() }, |()| true);
+    assert_eq!(first_backend.pushed().len(), 1);
+
+    // The second driver has one of its own in the same slot, with the same
+    // id, and a model there is handed the first driver's.
+    let own = Rc::new(Cell::new(0));
+    let delivered = own.clone();
+    crate::api::nop()
+      .with_lio(&second)
+      .when_done(move |_| delivered.set(delivered.get() + 1));
+    let foreign = Rc::new(Cell::new(0));
+    second.spawn(PicksUp { from: out.clone() }, counting(&foreign));
+
+    second_backend.complete_all(0);
+    second.try_run().unwrap();
+    assert_eq!(own.get(), 1, "its own operation went to its own consumer");
+    assert_eq!(foreign.get(), 0, "the other driver's operation is not here");
+
+    // Dropped on the driver it belongs to, which is asked to stop it.
+    drop(out.borrow_mut().take());
+    assert_eq!(first_backend.cancelled().len(), 1);
   }
 
   #[test]

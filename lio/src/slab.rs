@@ -473,6 +473,20 @@ mod tests {
   }
 
   #[test]
+  #[should_panic(expected = "allocated slot 0, which is not free")]
+  fn an_occupied_slot_is_not_free() {
+    let mut pool: SlotPool<()> = SlotPool::with_capacity(1, || ());
+    let (key, _) = pool.allocate().unwrap();
+    pool.assert_free(key.slot());
+  }
+
+  #[test]
+  fn a_free_slot_is_free() {
+    let mut pool: SlotPool<()> = SlotPool::with_capacity(1, || ());
+    pool.assert_free(0);
+  }
+
+  #[test]
   fn a_retired_slot_is_reused_only_after_release() {
     let mut pool: SlotPool<()> = SlotPool::with_capacity(1, || ());
     let (key, _) = pool.allocate().unwrap();
