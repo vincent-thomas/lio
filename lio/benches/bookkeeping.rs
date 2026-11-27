@@ -52,7 +52,9 @@ use criterion::{
 };
 use lio::api::resource::Resource;
 use lio::backend::op::{BorrowedOp, Op};
-use lio::backend::{Done, IoBackend, OpKey, PerOp, Queued, Started, Tracked};
+use lio::backend::{
+  Attempted, Done, IoBackend, Offered, OpKey, PerOp, Queued, Started, Tracked,
+};
 use lio::model::{Cx, Next, OpModel, OpStream};
 use lio::time::Clock;
 use lio::{Lio, api};
@@ -91,6 +93,20 @@ impl IoBackend for BenchBackend {
       self.held = PerOp::new(cap);
     }
     Ok(())
+  }
+
+  fn attempt(&mut self, op: Offered<'_>) -> Attempted {
+    if self.hold {
+      return op.decline();
+    }
+    let result = match op.as_op() {
+      Op::Nop => 0,
+      Op::Read { .. } => BUFFER_LEN as isize,
+      _ => panic!("bench backend only supports nop and read"),
+    };
+    // SAFETY: this backend never copies an address. Every buffer the
+    // benches submit is initialized for the length a read reports.
+    unsafe { op.finish(result) }
   }
 
   fn start(

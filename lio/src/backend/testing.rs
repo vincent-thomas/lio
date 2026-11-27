@@ -36,7 +36,9 @@ use bumpalo::Bump;
 
 use crate::api::resource::ResourceClose;
 use crate::backend::op::{MsgBuf, MsgBufMut, Op};
-use crate::backend::{Done, IoBackend, OpKey, Queued, Started};
+use crate::backend::{
+  Attempted, Done, IoBackend, Offered, OpKey, Queued, Started,
+};
 
 /// The byte [`ScriptedBackend`] writes into the buffers it fills.
 pub const POISON: u8 = 0xA5;
@@ -420,6 +422,11 @@ impl<B: IoBackend> IoBackend for Checked<B> {
     self.inner.resource_close()
   }
 
+  fn attempt(&mut self, op: Offered<'_>) -> Attempted {
+    self.cap("attempt");
+    self.inner.attempt(op)
+  }
+
   fn start(
     &mut self,
     op: Queued<'_>,
@@ -498,7 +505,7 @@ mod tests {
     io.init(4).unwrap();
     // SAFETY: a nop carries no addresses.
     let op = unsafe { BorrowedOp::from_op(Op::Nop) };
-    io.push_model(1, op, keep.clone());
+    io.push_model(1, op, keep.clone(), false);
     assert!(keep.held_elsewhere(), "the backend has the operation");
 
     drop(io);

@@ -4,7 +4,7 @@ use crate::{
     IoBackend, OpCompleted, Tracked,
     store::{Detached, OpStore},
   },
-  model::{Cx, Drive},
+  model::{Cx, Drive, Turn},
   registration::{Abandon, AfterPoll, Mail, RawTask, Registration},
   time::TimeManager,
 };
@@ -148,6 +148,8 @@ struct LioInner {
   /// How many more operations the model being polled may have finished
   /// as they are started. See [`Lio::finish_started`].
   started_left: u32,
+  /// How many models are being polled, one inside another.
+  polling: u32,
   profile: Option<LioProfile>,
 }
 
@@ -172,6 +174,8 @@ struct Queued {
 
 /// Where a model that was asked to run is.
 pub(crate) enum Spawned {
+  /// Done already: it never needed a slot.
+  Done,
   /// In this slot.
   Now(u64),
   /// Waiting for a slot.
@@ -182,6 +186,7 @@ impl Spawned {
   /// The slot it is in, once it has one.
   fn id(&self) -> Option<u64> {
     match self {
+      Spawned::Done => None,
       Spawned::Now(id) => Some(*id),
       Spawned::Queued(token) => token.id(),
     }
@@ -210,10 +215,61 @@ enum Begun {
 
 /// The operation a ticket stands for.
 pub(crate) enum OpRef {
+  /// The backend performed it as it was offered: it never had a slot.
+  Finished,
+  /// Started by a model that had no slot yet, with every slot taken: it is
+  /// started once that model has one.
+  Unplaced(Option<BoxedPlace>),
   /// Operation `seq` of slot `id`.
   At { id: u64, seq: u64 },
   /// Waiting for a slot of its own, where it will be the first operation.
   Queued(Rc<QueueToken>),
+}
+
+/// [`PlaceOp`], kept for later.
+pub(crate) type BoxedPlace =
+  Box<dyn FnOnce(&mut Registration, &mut Bump, u64) -> u64>;
+
+/// How a model's first poll, made before it has a slot, ended.
+pub(crate) enum Trial<M> {
+  /// The model is done, and dropped.
+  Finished,
+  /// It has to wait. With a slot, that slot holds the operation it waits
+  /// for, and takes the model.
+  Waiting(M, Option<u64>),
+  /// It was not polled: every slot is taken.
+  Skipped(M),
+}
+
+/// Counts one model being polled, until dropped.
+struct Polling<'a>(&'a Lio);
+
+impl Polling<'_> {
+  /// The poll is over, with the driver borrowed.
+  fn leave(self, inner: &mut LioInner) {
+    inner.polling -= 1;
+    std::mem::forget(self);
+  }
+}
+
+// For a poll that unwinds, or ends with the driver not borrowed.
+impl Drop for Polling<'_> {
+  fn drop(&mut self) {
+    if let Ok(mut inner) = self.0.inner.try_borrow_mut() {
+      inner.polling -= 1;
+    }
+  }
+}
+
+/// What the backend made of an operation it was offered before it had a
+/// slot.
+pub(crate) enum Attempt {
+  /// Performed: this is its result.
+  Done(Completion),
+  /// It has to be started.
+  Declined,
+  /// The model has had its share of results for this poll.
+  NotOffered,
 }
 
 /// The sequence number of a slot's first operation.
@@ -240,6 +296,7 @@ impl OpRef {
   /// The slot and sequence number, once the operation has a slot.
   fn resolved(&self) -> Option<(u64, u64)> {
     match self {
+      OpRef::Finished | OpRef::Unplaced(_) => None,
       OpRef::At { id, seq } => Some((*id, *seq)),
       OpRef::Queued(token) => token.at.get(),
     }
@@ -457,6 +514,11 @@ pub(crate) struct WeakLio {
 }
 
 impl WeakLio {
+  /// A handle to no driver.
+  pub(crate) fn none() -> Self {
+    Self { inner: Weak::new() }
+  }
+
   /// Whether this is a handle to `lio`.
   pub(crate) fn is(&self, lio: &Lio) -> bool {
     std::ptr::eq(self.inner.as_ptr(), Rc::as_ptr(&lio.inner))
@@ -556,6 +618,7 @@ impl Lio {
       woken: VecDeque::new(),
       capacity_waiters: Vec::new(),
       started_left: 0,
+      polling: 0,
       profile: std::env::var_os("LIO_PROFILE").map(|_| LioProfile::default()),
     };
     Ok(Self { inner: Rc::new(RefCell::new(inner)) })
@@ -747,6 +810,7 @@ impl Lio {
   /// what it has in flight is cancelled.
   pub(crate) fn cancel(&self, spawned: &Spawned) {
     let id = match spawned {
+      Spawned::Done => None,
       Spawned::Now(id) => Some(*id),
       Spawned::Queued(token) => {
         // Still queued: it never starts.
@@ -838,7 +902,7 @@ impl Lio {
       Begun::Poll(raw) => (raw, false),
       Begun::Drop(raw) => (raw, true),
     };
-    inner.started_left = STARTED_PER_POLL;
+    let polling = Self::enter_poll(self, &mut inner);
     loop {
       drop(inner);
       let finished = if dropping {
@@ -863,12 +927,16 @@ impl Lio {
       match reg.end_poll(finished) {
         AfterPoll::Again => {}
         AfterPoll::Cancelled => dropping = true,
-        AfterPoll::Pending => return (inner, false),
+        AfterPoll::Pending => {
+          polling.leave(inner_ref);
+          return (inner, false);
+        }
         AfterPoll::Finished => {
           let spent = reg.is_spent();
           if spent {
             Self::retire(inner_ref, id);
           }
+          polling.leave(inner_ref);
           return (inner, spent);
         }
       }
@@ -902,9 +970,128 @@ impl Lio {
   ///
   /// The operation goes into the model's own slot when that holds none, and
   /// otherwise into a slot of its own, waiting for one over capacity.
-  pub(crate) fn submit_op(&self, task: u64, place: impl PlaceOp) -> OpRef {
+  pub(crate) fn submit_op(
+    &self,
+    task: u64,
+    place: impl PlaceOp,
+    attempted: bool,
+  ) -> OpRef {
+    let inner = self.inner.borrow_mut();
+    self.submit_at(inner, task, place, attempted)
+  }
+
+  /// [`submit_op`](Self::submit_op) for a model that is polled before it
+  /// has a slot. `home` is the slot it will get: the slot of the first
+  /// operation it started that has to wait, once there is one.
+  pub(crate) fn submit_detached(
+    &self,
+    home: &mut Option<u64>,
+    place: impl PlaceOp,
+    attempted: bool,
+  ) -> OpRef {
     let mut inner = self.inner.borrow_mut();
-    let place = match Self::start_in_slot(&mut inner, task, place) {
+    // Its operation there may be over, and the slot given back.
+    if home.is_some_and(|home| inner.store.get_mut(home).is_none()) {
+      *home = None;
+    }
+    if let Some(home) = *home {
+      return self.submit_at(inner, home, place, attempted);
+    }
+    if !inner.overflow.is_empty() || inner.store.is_full() {
+      // Queued, it could get the slot its model then waits for.
+      return OpRef::Unplaced(Some(Box::new(place)));
+    }
+    // The operation's slot is the model's, so the model is the one polled
+    // when it is over.
+    let id = Self::insert_op(&mut inner, None, place, attempted);
+    *home = Some(id);
+    self.finish_started(inner, id);
+    OpRef::At { id, seq: FIRST_OP }
+  }
+
+  /// Polls `model` for the first time, here, before it has a slot. What
+  /// the backend performs as the model starts it needs none, and a model
+  /// that is done after that never had one.
+  ///
+  /// Items go to `sink`, as in a slot.
+  pub(crate) fn trial<M: Drive>(
+    &self,
+    mut model: M,
+    sink: &mut impl FnMut(M::Item) -> bool,
+  ) -> Trial<M> {
+    let polling = {
+      let mut inner = self.inner.borrow_mut();
+      if !inner.overflow.is_empty() || inner.store.is_full() {
+        return Trial::Skipped(model);
+      }
+      Self::enter_poll(self, &mut inner)
+    };
+    let mut cx = Cx::detached(self);
+    loop {
+      match model.drive(&mut cx) {
+        Turn::Pending => {
+          drop(polling);
+          let home = cx.home().filter(|&home| {
+            self.inner.borrow_mut().store.get_mut(home).is_some()
+          });
+          return Trial::Waiting(model, home);
+        }
+        Turn::Yield(item) => {
+          if !sink(item) {
+            return Trial::Finished;
+          }
+        }
+        Turn::End => return Trial::Finished,
+        Turn::Done(item) => {
+          // Dropped before its item is delivered, as in a slot.
+          drop(model);
+          sink(item);
+          return Trial::Finished;
+        }
+      }
+    }
+  }
+
+  /// Gives slot `home`, which holds the operation a model waits for, that
+  /// model: what `make` builds in the slot's arena. `mail` is what wakes
+  /// the future of a model that runs for one.
+  pub(crate) fn adopt(
+    &self,
+    home: u64,
+    make: impl FnOnce(&mut Bump) -> Registration,
+    mail: Option<&Waker>,
+  ) -> Spawned {
+    let mut inner = self.inner.borrow_mut();
+    let adopted = inner.store.adopt(home, make);
+    assert!(adopted, "driver: the slot a model waits in was given back");
+    if let Some(waker) = mail
+      && let Some(reg) = inner.store.get_mut(home)
+    {
+      reg.arm_mail(waker.clone());
+    }
+    Spawned::Now(home)
+  }
+
+  /// Counts a poll that is starting. The first of a nest gets the share of
+  /// results models may have at their submits: polls inside it (a callback
+  /// that submits, whose callback submits) draw on the same share, so they
+  /// cannot nest without end.
+  fn enter_poll<'a>(lio: &'a Lio, inner: &mut LioInner) -> Polling<'a> {
+    if inner.polling == 0 {
+      inner.started_left = STARTED_PER_POLL;
+    }
+    inner.polling += 1;
+    Polling(lio)
+  }
+
+  fn submit_at(
+    &self,
+    mut inner: RefMut<'_, LioInner>,
+    task: u64,
+    place: impl PlaceOp,
+    attempted: bool,
+  ) -> OpRef {
+    let place = match Self::start_in_slot(&mut inner, task, place, attempted) {
       Ok(seq) => {
         self.finish_started(inner, task);
         return OpRef::At { id: task, seq };
@@ -915,10 +1102,10 @@ impl Lio {
       let token = Rc::new(QueueToken::default());
       let start = move |inner: &mut LioInner, home: Option<u64>| {
         let Some(home) = home else {
-          let id = Self::insert_op(inner, task, place);
+          let id = Self::insert_op(inner, Some(task), place, attempted);
           return (id, FIRST_OP);
         };
-        match Self::start_in_slot(inner, home, place) {
+        match Self::start_in_slot(inner, home, place, attempted) {
           Ok(seq) => (home, seq),
           Err(_) => unreachable!(
             "driver: a queued operation was sent to a slot that holds one"
@@ -928,9 +1115,29 @@ impl Lio {
       Self::enqueue(&mut inner, start, Some(Rc::clone(&token)), Some(task));
       return OpRef::Queued(token);
     }
-    let id = Self::insert_op(&mut inner, task, place);
+    let id = Self::insert_op(&mut inner, Some(task), place, attempted);
     self.finish_started(inner, id);
     OpRef::At { id, seq: FIRST_OP }
+  }
+
+  /// Offers the backend `op` before it has a slot or a place in the table.
+  ///
+  /// `op` borrows its memory for this call only: a backend that performs
+  /// it is done with that memory when this returns. One poll of a model
+  /// gets [`STARTED_PER_POLL`] results at its submits, from here or from
+  /// [`finish_started`](Self::finish_started).
+  pub(crate) fn attempt(&self, op: &crate::backend::op::Op) -> Attempt {
+    let mut inner = self.inner.borrow_mut();
+    if inner.started_left == 0 {
+      return Attempt::NotOffered;
+    }
+    let Some(result) = inner.io.attempt(op) else {
+      return Attempt::Declined;
+    };
+    inner.started_left -= 1;
+    Attempt::Done(
+      Completion::new(result).with_resource_close(inner.resource_close),
+    )
   }
 
   /// Reads the result of operation `id`, which was just started, into its
@@ -976,6 +1183,7 @@ impl Lio {
     inner: &mut LioInner,
     id: u64,
     place: P,
+    attempted: bool,
   ) -> Result<u64, P> {
     let LioInner { io, store, time, .. } = inner;
     let started = store.with_slot(id, move |reg, lease| {
@@ -997,7 +1205,7 @@ impl Lio {
         // happens first, and frees it.
         *armed = false;
         match action {
-          Action::Io(op) => io.push_model(id, op, lease.clone()),
+          Action::Io(op) => io.push_model(id, op, lease.clone(), attempted),
           Action::Sleep(duration) => time.schedule(id, duration),
         }
       });
@@ -1010,8 +1218,14 @@ impl Lio {
   }
 
   /// Starts an operation in a slot of its own, for the model in slot
-  /// `waiter`. The store must have a free slot.
-  fn insert_op(inner: &mut LioInner, waiter: u64, place: impl PlaceOp) -> u64 {
+  /// `waiter`, or for one that will be given this very slot. The store
+  /// must have a free slot.
+  fn insert_op(
+    inner: &mut LioInner,
+    waiter: Option<u64>,
+    place: impl PlaceOp,
+    attempted: bool,
+  ) -> u64 {
     let LioInner { io, store, time, .. } = inner;
     let inserted = store.insert_submitting(
       |_arena| Registration::vacant(),
@@ -1020,14 +1234,14 @@ impl Lio {
         // arena any more.
         let step_bump = io.arena(id);
         step_bump.reset();
-        place(reg, step_bump, waiter);
+        place(reg, step_bump, waiter.unwrap_or(id));
         reg.with_action(&mut |action| {
           // After this, a panic must not free the operation's memory: the
           // table has a copy of its addresses. A panic while building
           // the action happens first and still frees the slot.
           insert.keep_on_panic();
           match action {
-            Action::Io(op) => io.push_model(id, op, lease.clone()),
+            Action::Io(op) => io.push_model(id, op, lease.clone(), attempted),
             Action::Sleep(duration) => time.schedule(id, duration),
           }
         });
@@ -1330,6 +1544,12 @@ impl Lio {
 
   fn run_inner(&self, timeout: Option<Duration>) -> io::Result<usize> {
     let inner = self.inner.borrow_mut();
+    // Nothing in flight, nothing queued, no timer: a turn would bring
+    // nothing. Only a run that was asked to wait a while still does.
+    if timeout.is_none_or(|timeout| timeout.is_zero()) && Self::is_idle(&inner)
+    {
+      return Ok(0);
+    }
     let ran = if inner.profile.is_some() {
       self.run_with::<true>(inner, timeout)
     } else {
@@ -1346,6 +1566,16 @@ impl Lio {
       waker.wake();
     }
     Ok(processed)
+  }
+
+  /// Whether the driver has nothing in flight and nothing left to do.
+  #[inline]
+  fn is_idle(inner: &LioInner) -> bool {
+    inner.io.is_idle()
+      && inner.time.is_empty()
+      && inner.ready_io.is_empty()
+      && inner.ready_timers.is_empty()
+      && !Self::slot_is_wanted(inner)
   }
 
   /// Drops the registrations removed while the driver was borrowed, then
@@ -1477,12 +1707,7 @@ impl Lio {
     let queued = !inner_ref.ready_io.is_empty()
       || !inner_ref.ready_timers.is_empty()
       || !inner_ref.woken.is_empty();
-    // With nothing in flight and no timer set, nothing would ever end a
-    // wait without a timeout.
-    let idle = timeout.is_none()
-      && inner_ref.io.in_flight() == 0
-      && inner_ref.time.is_empty();
-    let effective_timeout = if queued || idle {
+    let effective_timeout = if queued {
       Some(Duration::ZERO)
     } else {
       timed!(
@@ -2291,6 +2516,92 @@ mod tests {
     assert_eq!(turns.get(), 2 * STARTED_PER_POLL + 1);
     lio.cancel(&spawned);
     lio.try_run().unwrap();
+    assert!(!lio.is_full());
+  }
+
+  #[test]
+  fn a_model_done_at_its_first_poll_never_takes_a_slot() {
+    let lio = Lio::new_with_backend(AtOnce, 1).unwrap();
+    let seen = Rc::new(Cell::new(false));
+    let (set, inside) = (seen.clone(), lio.clone());
+    crate::api::nop().with_lio(&lio).when_done(move |_| {
+      assert!(!inside.is_full(), "the only slot is free while it runs");
+      set.set(true);
+    });
+    assert!(seen.get());
+  }
+
+  /// Submits a nop whose callback submits the next, `left` times.
+  fn chain(lio: &Lio, left: &Rc<Cell<u32>>, depth: &Rc<Cell<(u32, u32)>>) {
+    if left.get() == 0 {
+      return;
+    }
+    left.set(left.get() - 1);
+    let (lio_in, left_in, depth_in) =
+      (lio.clone(), left.clone(), depth.clone());
+    crate::api::nop().with_lio(lio).when_done(move |_| {
+      let (now, deepest) = depth_in.get();
+      depth_in.set((now + 1, deepest.max(now + 1)));
+      chain(&lio_in, &left_in, &depth_in);
+      let (now, deepest) = depth_in.get();
+      depth_in.set((now - 1, deepest));
+    });
+  }
+
+  #[test]
+  fn callbacks_that_submit_from_callbacks_do_not_nest_without_end() {
+    let lio = Lio::new_with_backend(AtOnce, 4).unwrap();
+    let left = Rc::new(Cell::new(10_000));
+    let depth = Rc::new(Cell::new((0, 0)));
+    chain(&lio, &left, &depth);
+    while left.get() > 0 {
+      lio.try_run().unwrap();
+    }
+    lio.try_run().unwrap();
+    let (now, deepest) = depth.get();
+    assert_eq!(now, 0);
+    assert!(deepest <= STARTED_PER_POLL + 1, "nested {deepest} deep");
+    assert!(!lio.is_full());
+  }
+
+  /// Fills the driver from inside its own first poll, then runs a nop.
+  struct Greedy {
+    lio: Lio,
+    grabbed: bool,
+    nop: Nop,
+  }
+
+  impl OpModel for Greedy {
+    type Item = ();
+
+    fn poll(&mut self, cx: &mut Cx<'_>) -> Step<()> {
+      if !self.grabbed {
+        self.grabbed = true;
+        crate::api::nop().with_lio(&self.lio).when_done(|_| {});
+      }
+      let _ = ready!(self.nop.poll(cx));
+      Step::Done(())
+    }
+  }
+
+  #[test]
+  fn an_operation_started_with_no_slot_to_be_had_waits_for_its_model_s() {
+    let (backend, lio) = lio(1);
+    let done = Rc::new(Cell::new(false));
+    let set = done.clone();
+    let model = Greedy { lio: lio.clone(), grabbed: false, nop: Nop::new() };
+    crate::api::run(model).with_lio(&lio).when_done(move |()| set.set(true));
+    // The one slot holds what the model submitted on the side: its own
+    // operation has not reached the backend.
+    let [aside] = backend.pushed()[..] else { panic!("one op") };
+    backend.complete(aside, 0);
+    lio.try_run().unwrap();
+    lio.try_run().unwrap();
+    let [_, own] = backend.pushed()[..] else { panic!("two ops") };
+    assert!(!done.get());
+    backend.complete(own, 0);
+    lio.try_run().unwrap();
+    assert!(done.get());
     assert!(!lio.is_full());
   }
 

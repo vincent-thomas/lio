@@ -87,9 +87,10 @@ use std::task::{Context, Poll};
 use crate::Lio;
 use bumpalo::Bump;
 
-use crate::driver::{OpRef, PlaceOp, Spawned, WeakLio};
+use crate::api::op::Action;
+use crate::driver::{Attempt, OpRef, PlaceOp, Spawned, Trial, WeakLio};
 use crate::registration::{
-  ActionFn, CompleteFn, LendFn, Registration, ReturnFn,
+  ActionFn, CompleteFn, LendFn, Regions, Registration, ReturnFn,
 };
 
 /// A piece of I/O work that produces one result, run by polling it.
@@ -257,31 +258,83 @@ impl<S: OpStream> Drive for Many<S> {
 /// passes it on to the models it polls.
 pub struct Cx<'a> {
   lio: &'a Lio,
-  /// The slot of the model being polled.
-  task: u64,
+  /// Where the model being polled is.
+  at: At,
+}
+
+/// Where the model a [`Cx`] is for is.
+#[derive(Clone, Copy)]
+enum At {
+  /// In this slot.
+  Slot(u64),
+  /// Not in a slot yet: this is its first poll. The slot is the one it
+  /// will be given, once an operation it started has taken one.
+  Nowhere(Option<u64>),
 }
 
 impl<'a> Cx<'a> {
   pub(crate) fn new(lio: &'a Lio, task: u64) -> Self {
-    Self { lio, task }
+    Self { lio, at: At::Slot(task) }
+  }
+
+  /// For a model's first poll, made before it has a slot.
+  pub(crate) fn detached(lio: &'a Lio) -> Self {
+    Self { lio, at: At::Nowhere(None) }
+  }
+
+  /// The slot a model polled without one will be given, if an operation
+  /// it started has taken one.
+  pub(crate) fn home(&self) -> Option<u64> {
+    match self.at {
+      At::Slot(_) => None,
+      At::Nowhere(home) => home,
+    }
   }
 
   /// Whether the model being polled was asked to stop.
   pub(crate) fn stopped(&self) -> bool {
-    self.lio.is_stopped(self.task)
+    match self.at {
+      At::Slot(task) => self.lio.is_stopped(task),
+      // Nothing can ask yet: its consumer has no handle to it.
+      At::Nowhere(_) => false,
+    }
   }
 
   /// The result of the operation `ticket` stands for, once, when it has
   /// finished. Until then, the model being polled is the one polled again
   /// when it has.
   fn take<T>(&mut self, ticket: &mut Ticket<T>) -> Option<T> {
+    // The backend performed it as it was offered.
+    if let Some(out) = ticket.done.take() {
+      ticket.taken = true;
+      return Some(out);
+    }
     // A ticket names a slot of the driver it came from.
     if ticket.taken || !ticket.lio.is(self.lio) {
       return None;
     }
+    let waiter = match self.at {
+      At::Slot(task) => {
+        // Started while its model had no slot, and none was free: the
+        // model has one now.
+        if let OpRef::Unplaced(place) = &mut ticket.op
+          && let Some(place) = place.take()
+        {
+          ticket.op = self.lio.submit_op(task, place, false);
+        }
+        task
+      }
+      // The model gets the slot of its first operation, which for that
+      // operation is its own.
+      At::Nowhere(home) => match (&ticket.op, home) {
+        (_, Some(home)) => home,
+        (OpRef::At { id, .. }, None) => *id,
+        (_, None) => return None,
+      },
+    };
     // SAFETY: only `submit` makes a ticket, from the `OpRef` of an
     // operation whose result is `T`, and it was made on this driver.
-    let out = unsafe { self.lio.take_op::<T>(&ticket.op, self.task) }?;
+    let out = unsafe { self.lio.take_op::<T>(&ticket.op, waiter) }?;
     ticket.taken = true;
     Some(out)
   }
@@ -300,9 +353,45 @@ impl<'a> Cx<'a> {
     action: ActionFn<S>,
     complete: CompleteFn<S, Out>,
   ) -> Ticket<Out> {
-    self.ticket(move |reg: &mut Registration, arena: &mut Bump, waiter| {
-      reg.start_op(arena, state, action, complete, waiter)
-    })
+    self.submit_attempted(state, action, complete, false)
+  }
+
+  /// [`submit`](Self::submit) for an operation that owns everything it
+  /// names: the backend is offered it first, and one it performs there
+  /// never gets a slot.
+  #[inline]
+  pub(crate) fn submit_owned<Out: 'static>(
+    &mut self,
+    op: crate::backend::op::Op,
+    action: ActionFn<Option<crate::backend::op::Op>>,
+    complete: CompleteFn<Option<crate::backend::op::Op>, Out>,
+  ) -> Ticket<Out> {
+    let attempted = match self.lio.attempt(&op) {
+      Attempt::Done(completion) => {
+        // The operation is over, and so is its memory.
+        drop(op);
+        return Ticket::done(complete(&mut None, completion));
+      }
+      Attempt::Declined => true,
+      Attempt::NotOffered => false,
+    };
+    self.submit_attempted(Some(op), action, complete, attempted)
+  }
+
+  #[inline]
+  fn submit_attempted<S: 'static, Out: 'static>(
+    &mut self,
+    state: S,
+    action: ActionFn<S>,
+    complete: CompleteFn<S, Out>,
+    attempted: bool,
+  ) -> Ticket<Out> {
+    self.ticket(
+      move |reg: &mut Registration, arena: &mut Bump, waiter| {
+        reg.start_op(arena, state, action, complete, waiter)
+      },
+      attempted,
+    )
   }
 
   /// [`submit`](Self::submit) for an operation that lends a buffer.
@@ -311,24 +400,53 @@ impl<'a> Cx<'a> {
   /// given, and `complete` gets those regions back to tell how much of each
   /// was used. They are part of the operation's memory but not of `state`:
   /// they are made in the driver, where they stay.
+  ///
+  /// The backend is offered the operation first, where it is: one it
+  /// performs there never gets a slot. `action` is called again for one
+  /// that does, on the memory's place in the slot, so it must build the
+  /// same operation each time.
   #[inline]
   pub(crate) fn submit_lending<S: 'static, R: 'static, Out: 'static>(
     &mut self,
-    state: S,
+    mut state: S,
     action: LendFn<S, R>,
     complete: ReturnFn<S, R, Out>,
   ) -> Ticket<Out> {
-    self.ticket(move |reg: &mut Registration, arena: &mut Bump, waiter| {
-      reg.start_lending_op(arena, state, action, complete, waiter)
-    })
+    let mut regions = Regions::<R>::empty();
+    let attempt = match action(&mut state, &mut regions) {
+      Action::Io(op) => self.lio.attempt(op.as_op()),
+      Action::Sleep(_) => Attempt::NotOffered,
+    };
+    let attempted = match attempt {
+      Attempt::Done(completion) => {
+        return Ticket::done(complete(&mut state, &regions, completion));
+      }
+      Attempt::Declined => true,
+      Attempt::NotOffered => false,
+    };
+    self.ticket(
+      move |reg: &mut Registration, arena: &mut Bump, waiter| {
+        reg.start_lending_op(arena, state, action, complete, waiter)
+      },
+      attempted,
+    )
   }
 
   #[inline]
-  fn ticket<Out>(&mut self, place: impl PlaceOp) -> Ticket<Out> {
+  fn ticket<Out>(
+    &mut self,
+    place: impl PlaceOp,
+    attempted: bool,
+  ) -> Ticket<Out> {
+    let op = match &mut self.at {
+      At::Slot(task) => self.lio.submit_op(*task, place, attempted),
+      At::Nowhere(home) => self.lio.submit_detached(home, place, attempted),
+    };
     Ticket {
-      op: self.lio.submit_op(self.task, place),
+      op,
       lio: self.lio.downgrade(),
       taken: false,
+      done: None,
       _out: PhantomData,
     }
   }
@@ -344,7 +462,23 @@ pub(crate) struct Ticket<T> {
   op: OpRef,
   lio: WeakLio,
   taken: bool,
+  /// The result of an operation the backend performed as it was offered.
+  done: Option<T>,
   _out: PhantomData<fn() -> T>,
+}
+
+impl<T> Ticket<T> {
+  /// A ticket for an operation that is over, with its result.
+  #[inline]
+  fn done(out: T) -> Self {
+    Ticket {
+      op: OpRef::Finished,
+      lio: WeakLio::none(),
+      taken: false,
+      done: Some(out),
+      _out: PhantomData,
+    }
+  }
 }
 
 impl<T> Drop for Ticket<T> {
@@ -433,7 +567,21 @@ pub(crate) fn spawn_while<M>(
 where
   M: Drive + 'static,
 {
-  Task { lio: lio.downgrade(), spawned: lio.spawn(model, on_item) }
+  let mut on_item = on_item;
+  // Polled here first: a model that is done once the backend has performed
+  // what it started never needs a slot.
+  let spawned = match lio.trial(model, &mut on_item) {
+    Trial::Finished => Spawned::Done,
+    Trial::Waiting(model, Some(home)) => lio.adopt(
+      home,
+      move |arena| Registration::running(arena, model, on_item),
+      None,
+    ),
+    Trial::Waiting(model, None) | Trial::Skipped(model) => {
+      lio.spawn(model, on_item)
+    }
+  };
+  Task { lio: lio.downgrade(), spawned }
 }
 
 /// The future of a model: what an [`Io`](crate::api::Io) turns into. It
@@ -455,6 +603,8 @@ enum RunState<M: OpModel> {
   Idle(Lio, M),
   /// In a driver slot, where its item waits for this future.
   Running(Task),
+  /// Its model ended with no item: nothing will ever arrive.
+  Empty,
   Done,
 }
 
@@ -477,13 +627,43 @@ where
       else {
         unreachable!("a future that was idle is not");
       };
-      let (spawned, finished) = lio.spawn_awaited(model, cx.waker());
+      // Polled here first: a model that is done once the backend has
+      // performed what it started never needs a slot.
+      let mut item = None;
+      let trial = lio.trial(model, &mut |got| {
+        item = Some(got);
+        // One item is all a future takes.
+        false
+      });
+      let (spawned, finished) = match trial {
+        Trial::Finished => {
+          return match item {
+            Some(item) => Poll::Ready(item),
+            // A model that ended with no item leaves its future waiting.
+            None => {
+              this.state = RunState::Empty;
+              Poll::Pending
+            }
+          };
+        }
+        Trial::Waiting(model, Some(home)) => {
+          let spawned = lio.adopt(
+            home,
+            move |arena| Registration::awaited(arena, model),
+            Some(cx.waker()),
+          );
+          (spawned, false)
+        }
+        Trial::Waiting(model, None) | Trial::Skipped(model) => {
+          lio.spawn_awaited(model, cx.waker())
+        }
+      };
       this.state = RunState::Running(Task { lio: lio.downgrade(), spawned });
       if !finished {
         // The waker is in the slot.
         return Poll::Pending;
       }
-      // The backend had the answer: the item is in the slot already.
+      // The item is in the slot already.
     }
     match &this.state {
       RunState::Running(task) => {
@@ -503,6 +683,7 @@ where
           None => Poll::Pending,
         }
       }
+      RunState::Empty => Poll::Pending,
       RunState::Idle(..) => unreachable!("an idle future was just started"),
       RunState::Done => panic!("model future polled after completion"),
     }

@@ -105,7 +105,7 @@ impl Cx<'_> {
   /// succeeded.
   #[inline]
   fn status(&mut self, op: Op) -> Ticket<io::Result<()>> {
-    self.submit(Some(op), owned, |_, done| done.status())
+    self.submit_owned(op, owned, |_, done| done.status())
   }
 
   /// Submits `op`, which must not point at memory, and takes ownership of
@@ -117,7 +117,7 @@ impl Cx<'_> {
   /// else owns.
   #[inline]
   unsafe fn created(&mut self, op: Op) -> Ticket<io::Result<Resource>> {
-    self.submit(Some(op), owned, |_, done| {
+    self.submit_owned(op, owned, |_, done| {
       // SAFETY: the caller promised that a successful completion of this
       // operation carries a new owned resource.
       unsafe { Resource::from_completion(&done) }
@@ -191,7 +191,7 @@ leaf!(
 impl Cx<'_> {
   #[inline]
   pub(crate) fn nop(&mut self) -> Ticket<io::Result<()>> {
-    self.submit((), |_| action_io!(Op::Nop), |_, done| done.status())
+    self.status(Op::Nop)
   }
 }
 
