@@ -310,8 +310,15 @@ impl<D> StreamProducer<D> for DirReader {
   ) -> Poll<wasmtime::Result<StreamResult>> {
     let me = self.get_mut();
     let wanted = dst.remaining(&mut store)?;
+    // A read of nothing asks whether there is more: not once the listing
+    // is over and everything read has been given out.
     if wanted == Some(0) {
-      return Poll::Ready(Ok(StreamResult::Completed));
+      let over = matches!(me.listing, Listing::Ended) && me.ready.is_empty();
+      return Poll::Ready(Ok(if over {
+        StreamResult::Dropped
+      } else {
+        StreamResult::Completed
+      }));
     }
     let waiting = |finish: bool| {
       if finish {
