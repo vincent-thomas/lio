@@ -412,11 +412,28 @@ impl Poller {
       let mut raw_written = 0usize;
       let mut eof = false;
       loop {
-        // SAFETY: `dir` is a valid `DIR*` stream owned by this function.
-        let pos = unsafe { libc::telldir(dir) };
-        if pos < 0 {
-          return Err(io::Error::last_os_error());
+        // A full batch ends here, before the stream moves: the next call
+        // carries on from this entry, and reports the end if there is none.
+        if written == out.len() {
+          break;
         }
+        // An entry that does not fit is handed back by seeking to where it
+        // started. `telldir` records every position it returns for the life
+        // of the stream, and on some systems searches them all on each
+        // call, so it is asked only once a name could overflow what is left
+        // of `raw`. No name is longer than a `dirent`.
+        let tight =
+          raw.len() - raw_written < std::mem::size_of::<libc::dirent>();
+        let pos = if tight {
+          // SAFETY: `dir` is a valid `DIR*` stream owned by this function.
+          let pos = unsafe { libc::telldir(dir) };
+          if pos < 0 {
+            return Err(io::Error::last_os_error());
+          }
+          Some(pos)
+        } else {
+          None
+        };
         #[cfg(any(target_os = "linux", target_os = "android"))]
         // SAFETY: resetting thread-local errno before `readdir`.
         unsafe {
@@ -455,7 +472,10 @@ impl Poller {
           continue;
         }
 
-        if written == out.len() || raw_written + name.len() > raw.len() {
+        if raw_written + name.len() > raw.len() {
+          let Some(pos) = pos else {
+            unreachable!("a name longer than a directory entry")
+          };
           // SAFETY: `pos` came from `telldir(dir)` on the same directory stream.
           unsafe {
             libc::seekdir(dir, pos);
