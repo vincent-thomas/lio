@@ -94,7 +94,7 @@ fn drop_driver_with_op_in_flight(backend: &ScriptedBackend) -> Arc<AtomicBool> {
 }
 
 #[test]
-fn dropping_the_driver_frees_ops_the_backend_drained() {
+fn dropping_the_driver_frees_ops_the_backend_stopped() {
   let backend = ScriptedBackend::new();
   let dropped = drop_driver_with_op_in_flight(&backend);
   assert!(dropped.load(Ordering::SeqCst), "the store releases the op");
@@ -102,7 +102,7 @@ fn dropping_the_driver_frees_ops_the_backend_drained() {
 
 #[test]
 #[cfg_attr(miri, ignore = "leaks on purpose, which Miri's leak check reports")]
-fn dropping_the_driver_leaks_ops_the_backend_could_not_drain() {
+fn dropping_the_driver_leaks_ops_the_backend_could_not_stop() {
   let backend = ScriptedBackend::new();
   backend.set_stuck(true);
   let dropped = drop_driver_with_op_in_flight(&backend);

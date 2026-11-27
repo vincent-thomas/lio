@@ -44,10 +44,9 @@ use crate::api::resource::Resource;
 #[cfg(test)]
 use crate::backend::op::SendFlags;
 use crate::backend::op::{
-  self, BorrowedOp, DirEntryRef, FileStat, FileType, MsgRecv, MsgSend, Op,
-  OpaqueDropFn, OpenFlags, RawBuf, ReadDirResult, ReadFlags, RecvFlags,
-  ShutdownHow, SockDomain, SockProto, SockType, SocketAddrBuf,
-  SocketAddrFamily, UnlinkKind,
+  self, DirEntryRef, FileStat, FileType, MsgRecv, MsgSend, Op, OpaqueDropFn,
+  OpenFlags, RawBuf, ReadDirResult, ReadFlags, RecvFlags, ShutdownHow,
+  SockDomain, SockProto, SockType, SocketAddrBuf, SocketAddrFamily, UnlinkKind,
 };
 use crate::backend::{IoBackend, OpCompleted, Ticket};
 
@@ -107,14 +106,6 @@ fn report(
   }
 }
 
-/// Gives up every ticket: the simulator has let go of the operations.
-fn release_all(tickets: &mut HashMap<u64, Ticket>) {
-  for (_, ticket) in tickets.drain() {
-    // SAFETY: the simulator only dereferences operations it still stores,
-    // from `flush` and `wait`, and the caller has dropped them.
-    unsafe { ticket.release() };
-  }
-}
 use crate::{Lio, install_global};
 
 /// Simulation key for `Resource::cwd()` on Windows, mirroring `AT_FDCWD`.
@@ -2774,8 +2765,9 @@ impl IoBackend for DSBackend {
     Ok(())
   }
 
-  fn push(&mut self, op: crate::backend::InFlight<'_>, _step_bump: &mut Bump) {
-    let (op, ticket) = op.into_parts();
+  fn push(&mut self, op: crate::backend::InFlight, _step_bump: &mut Bump) {
+    // The simulator is the kernel here: it has the operation from now on.
+    let (op, ticket) = op.start();
     let id = ticket.id();
     self.assert_initialized();
     self.assert_capacity();
@@ -2800,15 +2792,6 @@ impl IoBackend for DSBackend {
       self.record_trace(format!("tick={} cancel id={}", self.world.tick, id));
       self.schedule_completion(id, -(errno::ECANCELED as isize));
     }
-  }
-
-  fn drain(&mut self) -> bool {
-    // The simulator only dereferences stored operations from `flush` and
-    // `wait`. Dropping them here means a later call cannot see them.
-    self.queued.clear();
-    self.world.pending.clear();
-    release_all(&mut self.tickets);
-    true
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -4078,10 +4061,6 @@ impl DSTBackend {
           .push(Done::new(id, -(errno::EINVAL as isize)));
       }
       other => {
-        // SAFETY: `other` was accepted by `push` and stays in flight here.
-        // The same ticket goes with it. A new one would let the driver free
-        // the model while the local backend still holds these addresses.
-        let borrowed = unsafe { BorrowedOp::from_op(other) };
         let Held = keep;
         let Some(ticket) = self.tickets.remove(&id) else {
           unreachable!(
@@ -4093,7 +4072,11 @@ impl DSTBackend {
           .as_mut()
           .expect("non-network DST backend op requires local backend")
           .push(
-            crate::backend::InFlight::from_parts(borrowed, ticket),
+            // SAFETY: the simulator did not act on `other`, so it used none
+            // of its addresses, and this is the ticket it was started
+            // with. A new one would let the driver free the model while
+            // the local backend still holds these addresses.
+            unsafe { crate::backend::InFlight::unstarted(other, ticket) },
             &mut Bump::new(),
           );
       }
@@ -4126,10 +4109,8 @@ impl IoBackend for DSTBackend {
     Ok(())
   }
 
-  fn push(&mut self, op: crate::backend::InFlight<'_>, step_bump: &mut Bump) {
-    let (stored, ticket) = op.into_parts();
-    let id = ticket.id();
-    let use_network = match &stored {
+  fn push(&mut self, op: crate::backend::InFlight, step_bump: &mut Bump) {
+    let use_network = match op.as_op() {
       Op::Socket { .. } => true,
       Op::Bind { fd, .. }
       | Op::Listen { fd, .. }
@@ -4148,20 +4129,17 @@ impl IoBackend for DSTBackend {
     };
 
     if use_network {
+      // The simulated network has the operation from now on.
+      let (stored, ticket) = op.start();
+      let id = ticket.id();
       self.tickets.insert(id, ticket);
       self.queue_network_op(id, stored, Held);
     } else {
-      // SAFETY: `stored` was just taken from this `InFlight`. The same
-      // ticket goes with it into the local backend.
-      let borrowed = unsafe { BorrowedOp::from_op(stored) };
       self
         .local
         .as_mut()
         .expect("non-network DST backend push requires local backend")
-        .push(
-          crate::backend::InFlight::from_parts(borrowed, ticket),
-          step_bump,
-        );
+        .push(op, step_bump);
     }
   }
 
@@ -4171,21 +4149,6 @@ impl IoBackend for DSTBackend {
       self.node.borrow_mut().ready.push(Done::new(id, result));
     } else if let Some(local) = self.local.as_mut() {
       local.cancel(id);
-    }
-  }
-
-  fn drain(&mut self) -> bool {
-    self.queued.clear();
-    {
-      let mut node = self.node.borrow_mut();
-      node.outgoing.clear();
-      node.pending.clear();
-    }
-    self.inner.borrow_mut().active_outgoing_nodes.remove(&self.node_id);
-    release_all(&mut self.tickets);
-    match self.local.as_mut() {
-      Some(local) => local.drain(),
-      None => true,
     }
   }
 
@@ -4241,33 +4204,38 @@ mod tests {
   }
 
   #[test]
-  fn drain_drops_a_queued_read() {
+  fn cancel_reports_a_queued_read_without_performing_it() {
     let mut backend = DSBackend::new();
     backend.init(4).unwrap();
     let mut bytes = [1u8; 4];
-    {
-      let iov = [crate::backend::op::RawBufMut::from_mut(&mut bytes)];
-      let op = BorrowedOp::read(
-        crate::api::resource::Resource::invalid(),
-        &iov,
-        None,
-        Default::default(),
-      );
-      // SAFETY: `drain` below drops the queued operation before `iov` and
-      // `bytes` are released.
-      unsafe {
-        backend.push(crate::backend::InFlight::attest(1, op), &mut Bump::new())
-      };
-      assert!(backend.drain());
-    }
+    let iov = [crate::backend::op::RawBufMut::from_mut(&mut bytes)];
+    let op = BorrowedOp::read(
+      crate::api::resource::Resource::invalid(),
+      &iov,
+      None,
+      Default::default(),
+    );
+    // SAFETY: `iov` and `bytes` outlive the completion taken below.
+    unsafe {
+      backend.push(crate::backend::InFlight::attest(1, op), &mut Bump::new())
+    };
+    backend.cancel(1);
     backend.flush().unwrap();
     let mut completed = Vec::new();
-    backend.wait(Some(std::time::Duration::ZERO), &mut completed).unwrap();
-    assert!(completed.is_empty());
+    for _ in 0..8 {
+      backend.wait(Some(std::time::Duration::ZERO), &mut completed).unwrap();
+      if !completed.is_empty() {
+        break;
+      }
+    }
+    assert_eq!(completed.len(), 1);
+    assert!(completed[0].is_cancelled());
+    drop(completed);
     assert_eq!(bytes, [1u8; 4]);
   }
 
   use super::*;
+  use crate::backend::op::BorrowedOp;
   use crate::backend::op::{MsgBufMut, MsgRecv};
   use std::net::SocketAddr;
 

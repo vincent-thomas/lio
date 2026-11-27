@@ -32,7 +32,7 @@ fn backend() -> Wasi {
 
 fn push(backend: &mut Wasi, id: u64, op: BorrowedOp<'_>) {
   // SAFETY: every buffer these tests submit outlives the `wait` that
-  // returns its completion, or the `drain` that drops it.
+  // returns its completion, or the backend.
   backend.push(unsafe { InFlight::attest(id, op) }, &mut Bump::new());
 }
 
@@ -46,6 +46,27 @@ fn wait(backend: &mut Wasi, timeout: Option<Duration>) -> Vec<(u64, isize)> {
   backend.wait(timeout, &mut completed).unwrap();
   let mut done: Vec<(u64, isize)> =
     completed.iter().map(|c| (c.registration_id(), c.result())).collect();
+  done.sort_unstable();
+  done
+}
+
+/// Shuts the backend down the way a dropped driver does: cancels what is
+/// not reported yet, then waits, until everything is. Returns what was
+/// reported, ordered by id.
+fn shut_down(backend: &mut Wasi, ids: &[u64]) -> Vec<(u64, isize)> {
+  let mut done: Vec<(u64, isize)> = Vec::new();
+  for _ in 0..64 {
+    for &id in ids {
+      if !done.iter().any(|(reported, _)| *reported == id) {
+        backend.cancel(id);
+      }
+    }
+    backend.flush().unwrap();
+    done.extend(wait(backend, Some(Duration::from_millis(10))));
+    if done.len() >= ids.len() {
+      break;
+    }
+  }
   done.sort_unstable();
   done
 }
@@ -606,7 +627,7 @@ fn cancelling_a_receive_waiting_its_turn_leaves_the_one_ahead() {
 }
 
 #[test]
-fn drain_stops_everything_in_flight() {
+fn cancelling_everything_stops_everything_in_flight() {
   let mut backend = backend();
   let (listening, _) = listener(&mut backend, loopback());
   let (_listener, _client, server) = pair(&mut backend, loopback());
@@ -629,11 +650,14 @@ fn drain_stops_everything_in_flight() {
   backend.flush().unwrap();
   push(&mut backend, 4, BorrowedOp::nop());
 
-  assert!(backend.drain());
+  let done = shut_down(&mut backend, &[1, 2, 3, 4]);
+  assert_eq!(
+    done,
+    [(1, CANCELLED), (2, CANCELLED), (3, CANCELLED), (4, CANCELLED)]
+  );
   assert!(backend.ops.is_empty() && backend.queued.is_empty());
   assert_eq!(backend.queue.outstanding(), 0);
-  // Drained operations are not reported.
-  assert!(poll(&mut backend).is_empty());
+  assert!(poll(&mut backend).is_empty(), "each is reported once");
 }
 
 #[test]
@@ -654,7 +678,7 @@ fn dropping_the_backend_stops_what_is_in_flight() {
 }
 
 #[test]
-fn drain_follows_operations_through_their_later_steps() {
+fn cancelling_follows_operations_through_their_later_steps() {
   let mut backend = backend();
   let root = scratch("drain-steps");
   let path = format!("{root}/log");
@@ -681,7 +705,10 @@ fn drain_follows_operations_through_their_later_steps() {
   );
   backend.flush().unwrap();
 
-  assert!(backend.drain());
+  // Each is reported once, stopped or finished, whichever came first.
+  let done = shut_down(&mut backend, &[1, 2]);
+  let ids: Vec<u64> = done.iter().map(|(id, _)| *id).collect();
+  assert_eq!(ids, [1, 2]);
   assert!(backend.ops.is_empty());
   assert_eq!(backend.queue.outstanding(), 0, "the host still holds a step");
   assert!(poll(&mut backend).is_empty());

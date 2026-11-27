@@ -398,7 +398,7 @@ impl Harness {
         }
       }
     }
-    assert!(self.backend.in_flight().is_empty(), "drained or completed");
+    assert!(self.backend.in_flight().is_empty(), "stopped or completed");
 
     for (index, op) in self.ops.iter().enumerate() {
       if let Some(before) = op.pushed_at_drop {

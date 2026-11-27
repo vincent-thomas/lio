@@ -974,7 +974,7 @@ pub struct Wasi {
   id: u64,
   queue: Queue,
   /// Pushed but not yet flushed.
-  queued: Vec<(Op, Ticket)>,
+  queued: Vec<InFlight>,
   /// Boxed so that an operation's storage does not move while the host
   /// writes into it.
   ops: HashMap<u64, Box<Pending>>,
@@ -2140,6 +2140,48 @@ impl Wasi {
   }
 }
 
+impl Wasi {
+  /// Stops everything the host holds and gives every operation up
+  /// unreported, for a backend that is going away.
+  fn stop(&mut self) {
+    // Never started: the host never saw their addresses.
+    self.queued.clear();
+    // Operations waiting for a lane never started. Dropping them first
+    // keeps a finishing operation from starting one.
+    for lane in self.lanes.values_mut() {
+      for id in lane.waiting.drain(..) {
+        if let Some(pending) = self.ops.remove(&id) {
+          // SAFETY: the operation was waiting for its lane and never
+          // started, so the host never saw its addresses.
+          drop(unsafe { pending.ticket.cancelled(CANCELLED) });
+        }
+      }
+    }
+    // A cancel only finds a step that is still in flight. If the step had
+    // already completed, the pump moves its operation on to the next step,
+    // which the host then holds. So cancel and pump until no operation is
+    // left: each pass ends a step, and an operation has finitely many.
+    while !self.ops.is_empty() {
+      let ids: Vec<u64> = self.ops.keys().copied().collect();
+      for id in ids {
+        self.queue.cancel(id);
+      }
+      self.pump();
+      if self.queue.outstanding() == 0 {
+        // Nothing can complete any more, so nothing is held by the host.
+        break;
+      }
+    }
+    for (_, pending) in self.ops.drain() {
+      // SAFETY: the loop above ended with nothing outstanding in the queue,
+      // so the host holds no step of any operation.
+      drop(unsafe { pending.ticket.cancelled(CANCELLED) });
+    }
+    self.ready.clear();
+    self.close_deferred();
+  }
+}
+
 impl Default for Wasi {
   fn default() -> Self {
     Self::new()
@@ -2149,10 +2191,10 @@ impl Default for Wasi {
 impl Drop for Wasi {
   fn drop(&mut self) {
     // Stop the host before any operation's memory is freed. The driver
-    // drains first, and `queue` is declared before `ops` so it would be
-    // dropped, and cancel everything, first anyway; this does not rely on
-    // either.
-    self.drain();
+    // has cancelled and waited for everything before it drops a backend,
+    // and `queue` is declared before `ops` so it would be dropped, and
+    // cancel everything, first anyway; this does not rely on either.
+    self.stop();
     LIVE.with(|live| live.borrow_mut().retain(|id| *id != self.id));
     // This backend's queue closes its streams as it drops, so what was
     // waiting on it can go.
@@ -2262,13 +2304,14 @@ impl IoBackend for Wasi {
     ResourceClose::with(close_resource)
   }
 
-  fn push(&mut self, op: InFlight<'_>, _step_bump: &mut Bump) {
-    self.queued.push(op.into_parts());
+  fn push(&mut self, op: InFlight, _step_bump: &mut Bump) {
+    self.queued.push(op);
   }
 
   fn flush(&mut self) -> io::Result<()> {
     self.close_deferred();
-    for (op, ticket) in std::mem::take(&mut self.queued) {
+    for queued in std::mem::take(&mut self.queued) {
+      let (op, ticket) = queued.start();
       let id = ticket.id();
       let pending =
         Box::new(Pending { op, ticket, lane: None, stage: Stage::Queued });
@@ -2278,13 +2321,9 @@ impl IoBackend for Wasi {
   }
 
   fn cancel(&mut self, id: u64) {
-    if let Some(at) =
-      self.queued.iter().position(|(_, ticket)| ticket.id() == id)
-    {
-      let (_, ticket) = self.queued.swap_remove(at);
-      // SAFETY: the operation was never started, so the host never saw its
-      // addresses.
-      self.ready.push(unsafe { ticket.cancelled(CANCELLED) });
+    if let Some(at) = self.queued.iter().position(|queued| queued.id() == id) {
+      let queued = self.queued.swap_remove(at);
+      self.ready.push(queued.cancelled(CANCELLED));
       return;
     }
     let waiting = match self.ops.get(&id).map(|pending| &pending.stage) {
@@ -2309,47 +2348,6 @@ impl IoBackend for Wasi {
     // If nothing was in flight, the operation's own completion is already
     // queued.
     self.queue.cancel(id);
-  }
-
-  fn drain(&mut self) -> bool {
-    for (_, ticket) in self.queued.drain(..) {
-      // SAFETY: the operation was never started, so the host never saw its
-      // addresses.
-      unsafe { ticket.release() };
-    }
-    // Operations waiting for a lane never started. Dropping them first
-    // keeps a finishing operation from starting one.
-    for lane in self.lanes.values_mut() {
-      for id in lane.waiting.drain(..) {
-        if let Some(pending) = self.ops.remove(&id) {
-          // SAFETY: as above, the operation never started.
-          unsafe { pending.ticket.release() };
-        }
-      }
-    }
-    // A cancel only finds a step that is still in flight. If the step had
-    // already completed, the pump moves its operation on to the next step,
-    // which the host then holds. So cancel and pump until no operation is
-    // left: each pass ends a step, and an operation has finitely many.
-    while !self.ops.is_empty() {
-      let ids: Vec<u64> = self.ops.keys().copied().collect();
-      for id in ids {
-        self.queue.cancel(id);
-      }
-      self.pump();
-      if self.queue.outstanding() == 0 {
-        // Nothing can complete any more, so nothing is held by the host.
-        break;
-      }
-    }
-    for (_, pending) in self.ops.drain() {
-      // SAFETY: the loop above ended with nothing outstanding in the queue,
-      // so the host holds no step of any operation.
-      unsafe { pending.ticket.release() };
-    }
-    self.ready.clear();
-    self.close_deferred();
-    true
   }
 
   fn wait(

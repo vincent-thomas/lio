@@ -412,6 +412,28 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
       }
     }
   }
+
+  /// Calls `f` on the state of every slot that is occupied, or retired and
+  /// not released yet, with the key it has or had last.
+  pub(crate) fn for_each_reserved(
+    &mut self,
+    mut f: impl FnMut(SlabKey, &mut T),
+  ) {
+    // The slots go first in each `zip`, so no index past the last is made.
+    let first_spare = self.slots.len() as u32;
+    let slots = self.slots[..self.next_slot as usize].iter_mut().zip(0..);
+    let spares = self.spares.iter_mut().map(|spare| &mut **spare);
+    let spares = spares.zip(first_spare..);
+    for (slot, index) in slots.chain(spares) {
+      let generation = match slot.status {
+        Status::Occupied | Status::Exhausted => slot.generation,
+        // Retiring moved the slot on to its next generation.
+        Status::Retired => slot.generation - 1,
+        Status::Free | Status::Spent => continue,
+      };
+      f(SlabKey { slot: index, generation }, &mut slot.state);
+    }
+  }
 }
 
 /// Generic slab allocator with generational indices.
@@ -745,6 +767,33 @@ mod tests {
     let (fresh, _) = pool.allocate().unwrap();
     assert_eq!((fresh.slot(), fresh.generation()), (2, 0));
     assert_eq!(pool.get_mut(last), None);
+  }
+
+  #[test]
+  fn reserved_slots_are_visited_with_the_key_they_had_last() {
+    let (mut pool, spent) = on_last_generation(2);
+    let (other, _) = pool.allocate().unwrap();
+    let reserved = |pool: &mut SlotPool<u32>| {
+      let mut seen = Vec::new();
+      pool.for_each_reserved(|key, _| seen.push(key));
+      seen
+    };
+    assert_eq!(reserved(&mut pool), [spent, other]);
+
+    // Retired, each keeps the key it was allocated with: one used its last
+    // generation, the other moved on to its next.
+    pool.retire_with(spent, |_| ()).unwrap();
+    pool.retire_with(other, |_| ()).unwrap();
+    assert_eq!(reserved(&mut pool), [spent, other]);
+
+    // Released, neither is reserved. The spent slot's replacement is.
+    pool.release(spent.slot());
+    pool.release(other.slot());
+    assert!(reserved(&mut pool).is_empty());
+    let (again, _) = pool.allocate().unwrap();
+    let (spare, _) = pool.allocate().unwrap();
+    assert_eq!((again.slot(), spare.slot()), (1, 2));
+    assert_eq!(reserved(&mut pool), [again, spare]);
   }
 
   #[test]

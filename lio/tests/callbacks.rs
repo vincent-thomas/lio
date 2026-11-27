@@ -268,10 +268,10 @@ impl lio::backend::IoBackend for InOrderBackend {
 
   fn push(
     &mut self,
-    op: lio::backend::InFlight<'_>,
+    op: lio::backend::InFlight,
     _step_bump: &mut bumpalo::Bump,
   ) {
-    self.queued.push(op.into_parts().1);
+    self.queued.push(op.start().1);
   }
 
   fn flush(&mut self) -> std::io::Result<()> {
@@ -301,11 +301,6 @@ impl lio::backend::IoBackend for InOrderBackend {
 
   // Its operations finish on their own: there is nothing to stop.
   fn cancel(&mut self, _id: u64) {}
-
-  // Nothing outside this type ever holds an address.
-  fn drain(&mut self) -> bool {
-    true
-  }
 }
 
 #[test]

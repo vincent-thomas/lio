@@ -101,13 +101,13 @@ impl IoBackend for BenchBackend {
     Ok(())
   }
 
-  fn push(&mut self, op: lio::backend::InFlight<'_>, _step_bump: &mut Bump) {
+  fn push(&mut self, op: lio::backend::InFlight, _step_bump: &mut Bump) {
     let result = match op.as_op() {
       Op::Nop => 0,
       Op::Read { .. } => BUFFER_LEN as isize,
       _ => panic!("bench backend only supports nop and read"),
     };
-    let (_, ticket) = op.into_parts();
+    let (_, ticket) = op.start();
     let id = ticket.id();
     if self.hold {
       let slot = id as u32 as usize;
@@ -182,11 +182,6 @@ impl IoBackend for BenchBackend {
 
   fn resource_close(&self) -> lio::api::resource::ResourceClose {
     lio::api::resource::ResourceClose::native()
-  }
-
-  // Nothing outside this type ever holds an address.
-  fn drain(&mut self) -> bool {
-    true
   }
 }
 

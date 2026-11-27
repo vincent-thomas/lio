@@ -44,6 +44,29 @@ mod deferred_tests;
 #[cfg(test)]
 mod single_socket_tests;
 
+/// An operation `flush` has not looked at yet.
+///
+/// `lowered` is built from the operation's addresses, and nothing has used
+/// them: the operation is still whole, and is given up without `unsafe`.
+#[derive(Debug)]
+struct QueuedOp {
+  op: crate::backend::InFlight,
+  lowered: LoweredState,
+}
+
+impl QueuedOp {
+  /// Starts the operation: `flush` is about to perform or submit it.
+  fn start(self) -> PendingOp {
+    let (op, ticket) = self.op.start();
+    PendingOp {
+      registration_id: ticket.id(),
+      op,
+      ticket,
+      lowered: self.lowered,
+    }
+  }
+}
+
 #[derive(Debug)]
 struct PendingOp {
   registration_id: u64,
@@ -460,7 +483,7 @@ pub struct IoUring {
   needs_submit: bool,
   single_socket: bool,
   deferred_completions: bool,
-  backlog: Vec<PendingOp>,
+  backlog: Vec<QueuedOp>,
   pending: Slab<PendingOp>,
   queued_completed: Vec<OpCompleted>,
   profile: Option<IoUringProfile>,
@@ -593,10 +616,11 @@ impl IoUring {
   /// an io-wq worker (blocking file or pipe I/O) could still write into op
   /// memory after its owner freed it.
   ///
-  /// Returns whether nothing is left in the kernel.
-  fn drain_in_flight(&mut self) -> bool {
+  /// The driver has done this already, through `cancel` and `wait`, before
+  /// it drops a backend. This is for a backend dropped on its own.
+  fn drain_in_flight(&mut self) {
     if self.ring.is_none() || self.in_flight == 0 {
-      return true;
+      return;
     }
     let keys: Vec<SlabKey> = self.pending.keys_where(|_| true).collect();
     for key in keys {
@@ -636,9 +660,7 @@ impl IoUring {
       // Some request outlived the grace period. Keep the state it points
       // into alive rather than free it under the kernel.
       mem::forget(mem::replace(&mut self.pending, Slab::new(0)));
-      return false;
     }
-    true
   }
 
   #[inline]
@@ -1322,26 +1344,22 @@ impl IoBackend for IoUring {
     Ok(())
   }
 
-  fn push(&mut self, op: crate::backend::InFlight<'_>, step_bump: &mut Bump) {
-    let (op, ticket) = op.into_parts();
-    let id = ticket.id();
+  fn push(&mut self, op: crate::backend::InFlight, step_bump: &mut Bump) {
     assert!(
       self.backlog.len() + self.in_flight < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
     let lowered =
-      match LoweredState::lower_in(&op, step_bump, self.single_socket) {
+      match LoweredState::lower_in(op.as_op(), step_bump, self.single_socket) {
         Ok(lowered) => lowered,
         Err(err) => {
           let result = -(err.raw_os_error().unwrap_or(libc::EIO) as isize);
-          // SAFETY: the request was never built, so nothing has the
-          // operation's addresses. An error claims nothing about them.
-          self.queued_completed.push(unsafe { ticket.complete(result) });
+          self.queued_completed.push(op.failed(result));
           return;
         }
       };
-    self.backlog.push(PendingOp { registration_id: id, op, ticket, lowered });
+    self.backlog.push(QueuedOp { op, lowered });
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -1379,6 +1397,7 @@ impl IoBackend for IoUring {
     let mut sq_space_left = self.ring().sq_space_left();
 
     for entry in processing_backlog {
+      let entry = entry.start();
       let validate_started =
         if profiling_enabled { Some(Instant::now()) } else { None };
       if let Some(result) = Self::validate_op(&entry.op) {
@@ -1491,14 +1510,12 @@ impl IoBackend for IoUring {
 
   fn cancel(&mut self, id: u64) {
     if let Some(index) =
-      self.backlog.iter().position(|entry| entry.registration_id == id)
+      self.backlog.iter().position(|entry| entry.op.id() == id)
     {
       let entry = self.backlog.swap_remove(index);
-      // SAFETY: the request never reached the ring, so nothing has the
-      // operation's addresses.
       self
         .queued_completed
-        .push(unsafe { entry.ticket.cancelled(-(libc::ECANCELED as isize)) });
+        .push(entry.op.cancelled(-(libc::ECANCELED as isize)));
       return;
     }
     let Some(key) =
@@ -1518,18 +1535,6 @@ impl IoBackend for IoUring {
     if unsafe { ring.push(entry, CANCEL_USER_DATA) }.is_ok() {
       self.needs_submit = true;
     }
-  }
-
-  fn drain(&mut self) -> bool {
-    for entry in self.backlog.drain(..) {
-      // SAFETY: the request never reached the ring, so nothing has the
-      // operation's addresses.
-      unsafe { entry.ticket.release() };
-    }
-    // The requests the kernel reports while it drains are given up as their
-    // completions are dropped. The rest keep their tickets, which leaks
-    // their memory instead of freeing it under the kernel.
-    self.drain_in_flight()
   }
 
   fn wait(

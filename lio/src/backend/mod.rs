@@ -252,17 +252,28 @@ impl OpCompleted {
 /// are claimed where they are made, by calling an `unsafe` method of the
 /// operation's [`Ticket`]:
 ///
-/// - reporting or releasing it says nothing outside the backend (the
-///   kernel, a worker thread) uses an address copied from that [`Op`] any
-///   more;
+/// - reporting it says nothing outside the backend (the kernel, a worker
+///   thread) uses an address copied from that [`Op`] any more;
 /// - [`Ticket::complete`] says the result is what happened.
 ///
-/// A ticket that is dropped without either leaks the operation's memory:
-/// forgetting one is a leak, never a use after free.
+/// A ticket exists only for an operation the backend has
+/// [started](InFlight::start). Until then the operation is an [`InFlight`],
+/// which is given up without `unsafe`. A ticket that is dropped unreported
+/// leaks the operation's memory: forgetting one is a leak, never a use
+/// after free.
 ///
 /// An address copied from an [`Op`] may be used only by whoever holds that
 /// operation's ticket. That is the rule the `unsafe` blocks of a backend
 /// answer to.
+///
+/// # Shutdown
+///
+/// There is no method for it. When the driver is dropped it
+/// [`cancel`](IoBackend::cancel)s everything it has not seen a completion
+/// for and [`wait`](IoBackend::wait)s, for a bounded time, for those
+/// completions. It then drops the backend if every operation was reported,
+/// and leaks it, with the operations' memory, if one was not. A backend
+/// whose `cancel` and `wait` keep their contracts shuts down correctly.
 pub trait IoBackend {
   /// Initialize backend with capacity for `cap` concurrent operations.
   ///
@@ -282,42 +293,32 @@ pub trait IoBackend {
   ///
   /// Call `flush()` to submit queued operations.
   ///
-  /// `op` borrows the memory that owns its buffers. Take
-  /// [`InFlight::into_parts`]: the [`Op`] to act on, and the [`Ticket`] to
-  /// keep until the operation is reported from [`wait`](IoBackend::wait).
-  fn push(&mut self, op: InFlight<'_>, step_bump: &mut Bump);
+  /// Keep `op` whole until the operation is handed to the kernel or a
+  /// worker. [`InFlight::start`] then gives the [`Op`] to act on and the
+  /// [`Ticket`] to keep until the operation is reported from
+  /// [`wait`](IoBackend::wait).
+  fn push(&mut self, op: InFlight, step_bump: &mut Bump);
 
   /// Submit all queued operations to kernel.
   fn flush(&mut self) -> io::Result<()>;
 
-  /// Asks the backend to finish operation `id` early: its consumer is gone.
+  /// Asks the backend to finish operation `id` early: its consumer is gone,
+  /// or the driver is shutting down.
   ///
   /// The operation must still produce exactly one completion, from a later
-  /// `wait()`: [`Ticket::cancelled`], or its own result if it finished
-  /// first. Until then the memory its [`Op`] points to stays valid.
+  /// `wait()`: [`Ticket::cancelled`] ([`InFlight::cancelled`] for one that
+  /// was never started), or its own result if it finished first. Until then
+  /// the memory its [`Op`] points to stays valid.
   ///
   /// `id` may be unknown to the backend (already completed, or not an I/O
-  /// operation); that is not an error.
+  /// operation); that is not an error. The driver may ask again for an
+  /// operation it already asked about.
   ///
   /// A backend may do nothing here only if every operation it accepts
   /// finishes on its own. One that may never complete (an accept, a read
-  /// from an idle socket) would otherwise keep its slot forever.
+  /// from an idle socket) would otherwise keep its slot forever, and its
+  /// memory after the driver is gone.
   fn cancel(&mut self, id: u64);
-
-  /// Stops what is in flight and waits, for a bounded time, until nothing
-  /// outside this call can dereference the operations. Each one that is
-  /// finished is given up with [`Ticket::release`].
-  ///
-  /// Returns whether the kernel and any worker threads are finished with
-  /// everything. The driver drops the backend after `true`, and leaks it
-  /// after `false`. Tickets still held either way are dropped unreported,
-  /// which leaks their operations' memory instead of freeing it under a
-  /// thread that may still be writing. Completions for the drained
-  /// operations are discarded.
-  ///
-  /// Returning `true` at once is right only for a backend that leaves no
-  /// work in the kernel or on other threads between calls.
-  fn drain(&mut self) -> bool;
 
   /// Wait for completions with optional timeout.
   ///
@@ -356,9 +357,9 @@ impl Keep {
 
 /// The right to report one operation, and the lease on its memory.
 ///
-/// A backend gets one per operation from [`InFlight::into_parts`], keeps it
-/// while the operation is in flight, and gives it up exactly once: to
-/// report the operation, or to [`release`](Self::release) it unreported.
+/// A backend gets one per operation from [`InFlight::start`], keeps it
+/// while the operation is in flight, and gives it up exactly once, to
+/// report the operation.
 ///
 /// Dropping a ticket leaks the operation's memory. That is the safe thing
 /// to happen to an operation the kernel may still be writing to.
@@ -423,59 +424,59 @@ impl Ticket {
       _keep: self.into_keep(),
     }
   }
-
-  /// Gives the operation up without reporting it, from
-  /// [`IoBackend::drain`].
-  ///
-  /// # Safety
-  ///
-  /// Nothing outside the caller uses an address copied from the operation's
-  /// [`Op`] any more.
-  #[inline]
-  pub unsafe fn release(self) {
-    drop(self.into_keep());
-  }
 }
 
-/// One operation borrowed from the memory that owns its buffers.
+/// One operation the backend has been given and has not started.
 ///
-/// [`Lio`](crate::Lio) builds this while that memory is borrowed, then
-/// passes it to [`IoBackend::push`]. The memory stays in place until the
-/// operation's [`Ticket`] is given up. A buffer that lives only on the
-/// caller's stack cannot be turned into an `InFlight` without
-/// [`attest`](Self::attest), because nothing would keep it alive after the
-/// call returned.
-pub struct InFlight<'a> {
-  op: BorrowedOp<'a>,
-  /// `None` once [`into_parts`](Self::into_parts) has handed it out.
+/// [`Lio`](crate::Lio) builds this while it borrows the memory that owns the
+/// operation's buffers, then passes it to [`IoBackend::push`]. That memory
+/// stays in place until the backend has given the operation up.
+///
+/// A backend may keep an `InFlight` for as long as it likes, in a queue of
+/// work it has not submitted yet. No address has left it, so giving it up
+/// needs no `unsafe`: report it with [`cancelled`](Self::cancelled) or
+/// [`failed`](Self::failed). [`start`](Self::start) is the step that hands
+/// the addresses out.
+///
+/// Dropping one gives the operation's memory back without reporting it. A
+/// backend that is itself being dropped does that; one still in use would
+/// leave the driver waiting for a completion that never comes.
+#[derive(Debug)]
+pub struct InFlight {
+  op: Op,
+  /// `None` once it has been started or reported.
   ticket: Option<Ticket>,
 }
 
-impl Drop for InFlight<'_> {
+impl Drop for InFlight {
   fn drop(&mut self) {
     if let Some(ticket) = self.ticket.take() {
-      // SAFETY: the ticket was never handed out, and an address from the
-      // operation may only be used by whoever holds its ticket, so nothing
-      // uses one.
-      unsafe { ticket.release() };
+      // The operation was never started, so nothing uses its addresses and
+      // the lease can go.
+      drop(ticket.into_keep());
     }
   }
 }
 
-impl<'a> InFlight<'a> {
+impl InFlight {
   /// Wraps an operation borrowed from a model the driver has pinned.
   ///
   /// The driver calls this while it borrows the operation's memory to build
   /// the action, and does not move or drop that memory until the backend
-  /// has given the ticket up.
-  pub(crate) fn from_model(id: u64, op: BorrowedOp<'a>, keep: Keep) -> Self {
+  /// has given the operation up. That is what lets the borrow end here.
+  pub(crate) fn from_model(id: u64, op: BorrowedOp<'_>, keep: Keep) -> Self {
     let ticket = Ticket { id, keep: std::mem::ManuallyDrop::new(keep) };
-    Self { op, ticket: Some(ticket) }
+    Self { op: op.as_op().clone(), ticket: Some(ticket) }
   }
 
-  /// Puts an operation and its ticket back together, to hand both on to
-  /// another backend.
-  pub(crate) fn from_parts(op: BorrowedOp<'a>, ticket: Ticket) -> Self {
+  /// Puts a started operation back together, to hand it on to another
+  /// backend unstarted.
+  ///
+  /// # Safety
+  ///
+  /// No address copied from `op` has been used or is kept anywhere but in
+  /// `op` itself, and `ticket` is the one `op` was started with.
+  pub(crate) unsafe fn unstarted(op: Op, ticket: Ticket) -> Self {
     Self { op, ticket: Some(ticket) }
   }
 
@@ -487,40 +488,80 @@ impl<'a> InFlight<'a> {
   /// # Safety
   ///
   /// The addresses in `op` stay allocated and unmoved, and nothing but the
-  /// backend mutates them, until the [`Ticket`] from
-  /// [`into_parts`](Self::into_parts) has been given up and the
-  /// [`OpCompleted`] made from it dropped. This lease is not tied to a
-  /// driver registration.
-  pub unsafe fn attest(id: u64, op: BorrowedOp<'a>) -> Self {
+  /// backend mutates them, until the backend has given the operation up:
+  /// the `InFlight` was dropped unstarted, or the [`OpCompleted`] made from
+  /// it was dropped. This lease is not tied to a driver registration.
+  pub unsafe fn attest(id: u64, op: BorrowedOp<'_>) -> Self {
     Self::from_model(id, op, Keep::new())
   }
 
-  /// The id the driver knows the operation by.
+  #[inline]
+  fn take_ticket(&mut self) -> Ticket {
+    let Some(ticket) = self.ticket.take() else {
+      unreachable!("an `InFlight` holds its ticket until it is consumed");
+    };
+    ticket
+  }
+
+  /// The id the driver knows the operation by, as [`IoBackend::cancel`]
+  /// names it.
   #[inline]
   pub fn id(&self) -> u64 {
     let Some(ticket) = self.ticket.as_ref() else {
-      unreachable!("an `InFlight` holds its ticket until it is taken apart");
+      unreachable!("an `InFlight` holds its ticket until it is consumed");
     };
     ticket.id
   }
 
-  /// The operation the backend copies addresses out of.
+  /// The operation, to look at. Its addresses are not to be used before
+  /// [`start`](Self::start).
   #[inline]
   pub fn as_op(&self) -> &Op {
-    self.op.as_op()
+    &self.op
   }
 
-  /// The operation, and the ticket to report it with.
+  /// Starts the operation: the [`Op`] to act on, and the [`Ticket`] to
+  /// report it with.
   ///
-  /// Keep the [`Ticket`] with every copy of the addresses, and give it up
-  /// only once those copies are gone. An address may be used only by
-  /// whoever holds the ticket: an `InFlight` that is dropped whole gives its
-  /// operation up.
+  /// Keep the ticket with every copy of the addresses, and give it up only
+  /// once those copies are gone. An address may be used only by whoever
+  /// holds the ticket.
   #[inline]
-  pub fn into_parts(mut self) -> (Op, Ticket) {
-    let Some(ticket) = self.ticket.take() else {
-      unreachable!("an `InFlight` holds its ticket until it is taken apart");
-    };
-    (self.op.as_op().clone(), ticket)
+  pub fn start(mut self) -> (Op, Ticket) {
+    let ticket = self.take_ticket();
+    // `self` has a `Drop`, so the operation is swapped out, not moved.
+    (std::mem::replace(&mut self.op, Op::Nop), ticket)
+  }
+
+  /// Reports the operation as failed before it was started: the backend
+  /// would not or could not begin it. `result` is the error.
+  ///
+  /// # Panics
+  ///
+  /// If `result` is not negative: an operation that never ran has no
+  /// success to report.
+  #[inline]
+  pub fn failed(mut self, result: isize) -> OpCompleted {
+    assert!(result < 0, "an operation that never ran reports an error");
+    let ticket = self.take_ticket();
+    // SAFETY: the operation was never started, so nothing has its
+    // addresses, and an error claims nothing about its memory.
+    unsafe { ticket.complete(result) }
+  }
+
+  /// Reports the operation as stopped by [`IoBackend::cancel`] before it
+  /// was started. `result` is the error the platform has for that.
+  ///
+  /// # Panics
+  ///
+  /// If `result` is not negative: an operation that never ran has no
+  /// success to report.
+  #[inline]
+  pub fn cancelled(mut self, result: isize) -> OpCompleted {
+    assert!(result < 0, "a cancelled operation reports an error: {result}");
+    let ticket = self.take_ticket();
+    // SAFETY: the operation was never started, so nothing has its
+    // addresses, and `result` is negative.
+    unsafe { ticket.cancelled(result) }
   }
 }
