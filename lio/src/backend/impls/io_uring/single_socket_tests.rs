@@ -1,5 +1,6 @@
 use super::*;
 use crate::api::resource::Resource;
+use crate::backend::Tracked;
 use crate::backend::op::{
   BorrowedOp, MsgBuf, MsgBufMut, MsgRecv, MsgSend, RecvFlags, SendFlags,
   SocketAddrBuf,
@@ -22,15 +23,10 @@ fn pair() -> (Resource, UdpSocket) {
   )
 }
 
-fn complete(backend: &mut IoUring, arena: &mut Bump, op: Op) -> isize {
+fn complete(backend: &mut Tracked<IoUring>, op: Op) -> isize {
   // SAFETY: `op`'s buffers stay alive until `wait` returns below.
-  unsafe {
-    backend.push(
-      crate::backend::InFlight::attest(123, BorrowedOp::from_op(op)),
-      arena,
-    )
-  };
-  backend.flush().unwrap();
+  unsafe { backend.push(123, BorrowedOp::from_op(op)) };
+  backend.flush();
   let deadline = Instant::now() + Duration::from_secs(2);
   let mut completed = Vec::new();
   loop {
@@ -149,12 +145,11 @@ fn assert_lowered_len(arena: &Bump, op: &Op, len: usize) {
 #[test]
 fn udp_peek_truncation_and_zero_length_match_general_path() {
   for general in [false, true] {
-    let mut backend = IoUring::default();
+    let mut backend = Tracked::new(IoUring::default());
     backend.init(8).unwrap();
     if general {
-      backend.single_socket = false;
+      backend.backend_mut().single_socket = false;
     }
-    let mut arena = Bump::new();
     let (fd, peer) = pair();
     peer.send(b"payload").unwrap();
     // A peek leaves the datagram queued; the plain recv then truncates it.
@@ -162,7 +157,7 @@ fn udp_peek_truncation_and_zero_length_match_general_path() {
       let mut data = [0; 3];
       let bufs = [MsgBufMut::from_slice(&mut data)];
       let op = Op::Recv { fd: fd.clone(), msg: MsgRecv::new(&bufs), flags };
-      assert_eq!(complete(&mut backend, &mut arena, op), 3);
+      assert_eq!(complete(&mut backend, op), 3);
       assert_eq!(&data, b"pay");
     }
     // A zero-length datagram must still be sent and consumed as a message.
@@ -172,13 +167,13 @@ fn udp_peek_truncation_and_zero_length_match_general_path() {
       msg: MsgSend::new(&bufs, None),
       flags: SendFlags::empty(),
     };
-    assert_eq!(complete(&mut backend, &mut arena, op), 0);
+    assert_eq!(complete(&mut backend, op), 0);
     assert_eq!(peer.recv(&mut [0; 1]).unwrap(), 0);
     peer.send(&[]).unwrap();
     let mut empty = [];
     let bufs = [MsgBufMut::from_slice(&mut empty)];
     let op =
       Op::Recv { fd, msg: MsgRecv::new(&bufs), flags: RecvFlags::empty() };
-    assert_eq!(complete(&mut backend, &mut arena, op), 0);
+    assert_eq!(complete(&mut backend, op), 0);
   }
 }

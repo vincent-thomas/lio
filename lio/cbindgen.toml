@@ -28,6 +28,7 @@ exclude = [
   "MAX_IOV_COUNT",
   "POISON",
   "CANCELLED",
+  "CANCELLED_BEFORE_START",
   "CompletionFlags",
   "Interest",
   "SockDomain",

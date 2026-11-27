@@ -3,7 +3,8 @@
 //! This module provides [`OpStore`], a fixed-capacity slot store for managing
 //! in-flight I/O operations. Each slot owns both the [`Registration`] and a
 //! persistent model-lifetime bump arena reused across registrations occupying
-//! that slot, plus a separate per-step bump reserved for lowered backend state.
+//! that slot. The per-step arena lives with the backend's table
+//! ([`Tracked`](crate::backend::Tracked)), which hands it to the backend.
 
 use std::mem::MaybeUninit;
 
@@ -18,7 +19,6 @@ use crate::slab::{SlabKey, SlotPool};
 struct StoreSlot {
   registration: MaybeUninit<Registration>,
   model_bump: Bump,
-  step_bump: Bump,
   /// The driver's share of the lease on the memory of the slot's operation.
   /// A backend holds the other shares. It belongs to the slot, not to the
   /// registration in it, so using a slot again allocates nothing.
@@ -28,9 +28,8 @@ struct StoreSlot {
 /// Store for in-flight I/O operations using contiguous memory.
 ///
 /// Uses fixed slots with free-list reuse for O(1) operations and cache-friendly
-/// memory layout. Each slot owns:
-/// - a persistent model-lifetime bump reset before slot reuse
-/// - a step-lifetime bump reserved for backend-lowered state
+/// memory layout. Each slot owns a persistent model-lifetime bump, reset
+/// before slot reuse.
 pub(crate) struct OpStore {
   slots: SlotPool<StoreSlot, false>,
 }
@@ -62,7 +61,6 @@ impl OpStore {
       slots: SlotPool::with_capacity(cap, || StoreSlot {
         registration: MaybeUninit::uninit(),
         model_bump: Bump::new(),
-        step_bump: Bump::new(),
         lease: Keep::new(),
       }),
     }
@@ -85,7 +83,6 @@ impl OpStore {
   ) -> Result<u64, StoreAtCapacity> {
     let Some((key, _)) = self.slots.allocate_with(|slot| {
       slot.model_bump.reset();
-      slot.step_bump.reset();
       slot.registration.write(init(&mut slot.model_bump));
     }) else {
       return Err(StoreAtCapacity);
@@ -113,11 +110,10 @@ impl OpStore {
   pub fn insert_with_action(
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
-  ) -> (u64, Option<Action<'static>>, &mut Bump) {
+  ) -> (u64, Option<Action<'static>>) {
     let mut action = None;
-    let Some((key, slot)) = self.slots.allocate_with(|slot| {
+    let Some((key, _)) = self.slots.allocate_with(|slot| {
       slot.model_bump.reset();
-      slot.step_bump.reset();
       let registration = slot.registration.write(init(&mut slot.model_bump));
       let mut guard = DropOnUnwind { registration, armed: true };
       action = guard.registration.action();
@@ -126,7 +122,7 @@ impl OpStore {
     }) else {
       panic!("insert_with_action on a full store: check is_full first");
     };
-    (key.as_u64(), action, &mut slot.step_bump)
+    (key.as_u64(), action)
   }
 
   /// Removes an operation from the store and drops it.
@@ -184,7 +180,7 @@ impl OpStore {
     Some(unsafe { slot.registration.assume_init_mut() })
   }
 
-  /// Borrows a registration and its step arena together.
+  /// Borrows a registration and the slot's lease together.
   ///
   /// The driver uses this to start another operation in a slot that is
   /// already taken, and hand it to the backend in the same call.
@@ -192,14 +188,14 @@ impl OpStore {
   pub fn with_slot<R>(
     &mut self,
     id: u64,
-    f: impl FnOnce(&mut Registration, &mut Bump, &Keep) -> R,
+    f: impl FnOnce(&mut Registration, &Keep) -> R,
   ) -> Option<R> {
     let key = SlabKey::from_u64(id);
     let slot = self.slots.get_mut(key)?;
     let lease = &slot.lease;
     // SAFETY: an occupied slot's registration is initialized.
     let registration = unsafe { slot.registration.assume_init_mut() };
-    Some(f(registration, &mut slot.step_bump, lease))
+    Some(f(registration, lease))
   }
 
   /// Whether a backend still holds a share of the lease of slot `id`: it
@@ -211,8 +207,8 @@ impl OpStore {
   }
 
   /// Whether a share of the lease of any slot is still held outside the
-  /// store: by a ticket that was never given up, or by a completion that is
-  /// still alive. Slots whose registration was detached count too.
+  /// store: by the table, for an operation that was not reported, or by a
+  /// completion that is still alive. Slots whose registration was detached count too.
   pub fn any_lease_held(&mut self) -> bool {
     let mut held = false;
     self.slots.for_each_reserved(|_, slot| {
@@ -263,7 +259,7 @@ impl OpStore {
   pub fn insert_submitting(
     &mut self,
     init: impl FnOnce(&mut Bump) -> Registration,
-    submit: impl FnOnce(u64, &mut Registration, &mut Bump, &Keep, &mut Insert),
+    submit: impl FnOnce(u64, &mut Registration, &Keep, &mut Insert),
   ) -> Option<u64> {
     let Some(slot_idx) = self.slots.peek_free() else {
       panic!("insert on a full store: check is_full first");
@@ -276,7 +272,6 @@ impl OpStore {
       (*slots).assert_free(slot_idx);
       let slot = (*slots).state_mut(slot_idx);
       slot.model_bump.reset();
-      // The step arena is reset by whoever starts an operation in the slot.
       slot.registration.write(init(&mut slot.model_bump));
     }
     // SAFETY: same pointer as above, still the only use of this pool.
@@ -284,15 +279,14 @@ impl OpStore {
     let mut guard =
       InsertGuard { slots, slot_idx, drop_registration: true, keep: false };
     let id = key.as_u64();
-    // SAFETY: the registration was just written, and `step_bump` is a
+    // SAFETY: the registration was just written, and the lease is a
     // different field. Both borrows end before `guard` drops the registration
     // or `commit` publishes the slot.
     unsafe {
       let slot = (*slots).state_mut(slot_idx);
       let registration = slot.registration.assume_init_mut();
-      let step_bump = &mut slot.step_bump as *mut Bump;
       let lease = &slot.lease as *const Keep;
-      submit(id, registration, &mut *step_bump, &*lease, &mut guard.token());
+      submit(id, registration, &*lease, &mut guard.token());
     }
     if !guard.keep {
       if guard.drop_registration {
@@ -315,15 +309,6 @@ impl OpStore {
     // free one `peek_free` returned.
     unsafe { (*slots).commit(slot_idx) };
     Some(id)
-  }
-
-  /// Gets mutable access to an operation's per-step lowering arena.
-  #[cfg(test)]
-  #[inline]
-  pub fn step_bump_mut(&mut self, id: u64) -> Option<&mut Bump> {
-    let key = SlabKey::from_u64(id);
-    let slot = self.slots.get_mut(key)?;
-    Some(&mut slot.step_bump)
   }
 
   /// Sets the generation of a slot, as if it had been used that many times.
@@ -465,7 +450,7 @@ mod tests {
     assert!(held.is_empty() && !store.any_lease_held());
 
     let share = |store: &mut OpStore, id| {
-      store.with_slot(id, |_, _, lease| lease.clone()).unwrap()
+      store.with_slot(id, |_, lease| lease.clone()).unwrap()
     };
     let (first_share, second_share) =
       (share(&mut store, first), share(&mut store, second));
@@ -627,20 +612,17 @@ mod tests {
     let mut store = OpStore::with_capacity(1);
     store.set_generation(0, u32::MAX);
     let spent = store.insert_with(dummy_stored_op);
-    store.step_bump_mut(spent).unwrap().alloc(0u8);
     let Detached { registration, slot } = store.detach(spent).unwrap();
     drop(registration);
     assert!(store.is_full(), "held until released");
     store.release(slot);
     assert!(!store.is_full(), "a replacement is free");
 
-    let (id, _, bump) = store.insert_with_action(dummy_stored_op);
-    assert!(bump.allocated_bytes() > 0, "the replacement took the arenas");
+    let (id, _) = store.insert_with_action(dummy_stored_op);
     let key = SlabKey::from_u64(id);
     assert_eq!((key.slot(), key.generation()), (1, 0));
     assert!(store.is_full(), "the capacity is still one");
     assert!(store.get_mut(spent).is_none());
-    assert!(store.step_bump_mut(spent).is_none());
     assert!(store.get_mut(id).is_some());
     assert!(store.remove(id));
   }
@@ -664,7 +646,7 @@ mod tests {
     let mut store = OpStore::with_capacity(1);
     let id = store.insert_submitting(
       |arena| holding(arena, tx),
-      |_id, _reg, _bump, _lease, _insert| {},
+      |_id, _reg, _lease, _insert| {},
     );
     assert!(id.is_none());
     assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
@@ -678,7 +660,7 @@ mod tests {
     let id = store
       .insert_submitting(
         |arena| holding(arena, tx),
-        |_id, _reg, _bump, _lease, insert| insert.keep_on_panic(),
+        |_id, _reg, _lease, insert| insert.keep_on_panic(),
       )
       .expect("the slot was claimed");
     assert!(store.is_full());
@@ -694,7 +676,7 @@ mod tests {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       store.insert_submitting(
         |arena| holding(arena, tx),
-        |_id, _reg, _bump, _lease, _insert| panic!("action failed"),
+        |_id, _reg, _lease, _insert| panic!("action failed"),
       );
     }));
     assert!(result.is_err());
@@ -714,7 +696,7 @@ mod tests {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       store.insert_submitting(
         |arena| holding(arena, tx),
-        |new_id, _reg, _bump, _lease, insert| {
+        |new_id, _reg, _lease, insert| {
           id.set(new_id);
           insert.keep_on_panic();
           panic!("push failed");

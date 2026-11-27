@@ -960,9 +960,8 @@ mod tests {
     assert!(result.unwrap().is_ok());
   }
 
-  fn scripted(cap: usize) -> (ScriptedBackend, Lio) {
-    let backend = ScriptedBackend::new();
-    (backend.clone(), Lio::new_with_backend(backend, cap).unwrap())
+  fn scripted(cap: usize) -> (crate::driver::Kernel, Lio) {
+    crate::driver::Kernel::with_lio(cap)
   }
 
   /// Counts the clones and wakes of the wakers made by [`counting_waker`].

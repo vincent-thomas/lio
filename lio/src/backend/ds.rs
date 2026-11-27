@@ -48,17 +48,16 @@ use crate::backend::op::{
   OpenFlags, RawBuf, ReadDirResult, ReadFlags, RecvFlags, ShutdownHow,
   SockDomain, SockProto, SockType, SocketAddrBuf, SocketAddrFamily, UnlinkKind,
 };
-use crate::backend::{IoBackend, OpCompleted, Ticket};
+use crate::backend::{IoBackend, OpKey, Queued, Started};
 
-/// Stands where an operation's lease used to travel with it. The ticket
-/// that holds the lease now waits in its backend's `tickets` table until
-/// the operation's result comes out of `wait`.
+/// Stands where an operation's lease used to travel with it. The table the
+/// backend reports to holds the lease now, until the operation's result
+/// comes out of `wait`.
 #[derive(Clone, Copy, Debug)]
 struct Held;
 
-/// A result the simulation has decided on, by operation id. It becomes an
-/// [`OpCompleted`] where it leaves the backend, which is where the
-/// operation's ticket is.
+/// A result the simulation has decided on, by operation id. It is reported
+/// where it leaves the backend, by the key the operation was begun with.
 #[derive(Clone, Copy, Debug)]
 struct Done {
   id: u64,
@@ -81,29 +80,34 @@ impl Done {
   }
 }
 
-/// Turns the results the simulation decided on into completions, each with
-/// the ticket of its operation.
+/// Reports the results the simulation decided on, each by the key of its
+/// operation.
 fn report(
-  tickets: &mut HashMap<u64, Ticket>,
+  keys: &mut HashMap<u64, OpKey>,
   ready: &mut Vec<Done>,
-  completed: &mut Vec<OpCompleted>,
+  done: &mut crate::backend::Done<'_>,
 ) {
-  for done in ready.drain(..) {
-    // A result for an operation the driver did not submit has no ticket.
-    let Some(ticket) = tickets.remove(&done.id) else {
+  for result in ready.drain(..) {
+    // A result for an operation the driver did not submit has no key.
+    let Some(key) = keys.remove(&result.id) else {
       continue;
     };
-    // SAFETY: the simulator performs every operation itself, inside `flush`
+    // SAFETY: the simulator performs every operation itself, inside `start`
     // and `wait`, and is done with this one: nothing else has its
     // addresses. The result is what the simulated operation did.
-    completed.push(unsafe {
-      if done.result == -(errno::ECANCELED as isize) {
-        ticket.cancelled(done.result)
+    unsafe {
+      if result.result == -(errno::ECANCELED as isize) {
+        done.cancelled(key, result.result)
       } else {
-        ticket.complete(done.result)
+        done.complete(key, result.result)
       }
-    });
+    }
   }
+}
+
+/// The id of the operation that was begun with `key`.
+fn id_of(keys: &HashMap<u64, OpKey>, key: OpKey) -> Option<u64> {
+  keys.iter().find(|(_, held)| **held == key).map(|(id, _)| *id)
 }
 
 use crate::{Lio, install_global};
@@ -501,9 +505,8 @@ struct DSWorld {
 pub struct DSBackend {
   cap: usize,
   initialized: bool,
-  queued: Vec<(u64, Op, Held)>,
-  /// The ticket of every operation `push` took and `wait` has not reported.
-  tickets: HashMap<u64, Ticket>,
+  /// The key of every operation that was begun and not reported, by id.
+  keys: HashMap<u64, OpKey>,
   ready: Vec<Done>,
   schedule_rng: Prng,
   fault_rng: Prng,
@@ -542,7 +545,6 @@ pub struct DSTraceSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DSProgressSnapshot {
   pub tick: u64,
-  pub queued: usize,
   pub pending: usize,
   pub scheduled_events: usize,
   pub ready: usize,
@@ -1104,10 +1106,9 @@ struct DSTBackend {
   node_id: DSTNodeId,
   node: Rc<RefCell<DSTNodeState>>,
   inner: Rc<RefCell<DSTInner>>,
-  queued: Vec<(u64, Op, Held)>,
-  /// The ticket of every network operation `push` took and `wait` has not
-  /// reported. Local ones travel on to the local backend.
-  tickets: HashMap<u64, Ticket>,
+  /// The key of every network operation that was begun and not reported,
+  /// by id. Local ones are begun by the local backend.
+  keys: HashMap<u64, OpKey>,
 }
 
 struct DSTNodeRunner {
@@ -1182,8 +1183,7 @@ impl DSBackend {
     let mut backend = Self {
       cap: 0,
       initialized: false,
-      queued: Vec::new(),
-      tickets: HashMap::new(),
+      keys: HashMap::new(),
       ready: Vec::new(),
       schedule_rng: Prng::new(split_seed(config.seed, b"schedule")),
       fault_rng: Prng::new(split_seed(config.seed, b"faults")),
@@ -1213,7 +1213,6 @@ impl DSBackend {
   pub fn progress_snapshot(&self) -> DSProgressSnapshot {
     DSProgressSnapshot {
       tick: self.world.tick,
-      queued: self.queued.len(),
       pending: self.world.pending.len(),
       scheduled_events: self.world.events.len(),
       ready: self.ready.len(),
@@ -1223,27 +1222,17 @@ impl DSBackend {
   }
 
   pub fn is_quiescent(&self) -> bool {
-    self.queued.is_empty()
-      && self.world.pending.is_empty()
+    self.world.pending.is_empty()
       && self.world.events.is_empty()
       && self.ready.is_empty()
   }
 
   pub fn has_pending_work(&self) -> bool {
-    !self.queued.is_empty()
-      || !self.world.pending.is_empty()
-      || !self.world.events.is_empty()
+    !self.world.pending.is_empty() || !self.world.events.is_empty()
   }
 
   fn assert_initialized(&self) {
     assert!(self.initialized, "DSBackend not initialized");
-  }
-
-  fn assert_capacity(&self) {
-    assert!(
-      self.queued.len() + self.world.events.len() + self.ready.len() < self.cap,
-      "IoBackend capacity exceeded"
-    );
   }
 
   fn build_scenario(rng: &mut Prng) -> DSScenario {
@@ -2758,105 +2747,98 @@ impl IoBackend for DSBackend {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.cap = cap;
     self.initialized = true;
-    self.queued = Vec::with_capacity(cap);
     self.world.events = Vec::with_capacity(cap);
     self.ready = Vec::with_capacity(cap.min(256));
     self.reset_world();
     Ok(())
   }
 
-  fn push(&mut self, op: crate::backend::InFlight, _step_bump: &mut Bump) {
+  fn start(
+    &mut self,
+    op: Queued<'_>,
+    _step_bump: &mut Bump,
+    _done: &mut crate::backend::Done<'_>,
+  ) -> Started {
+    self.assert_initialized();
     // The simulator is the kernel here: it has the operation from now on.
-    let (op, ticket) = op.start();
-    let id = ticket.id();
-    self.assert_initialized();
-    self.assert_capacity();
-    self.tickets.insert(id, ticket);
-    self.queued.push((id, op, Held));
-  }
-
-  fn cancel(&mut self, id: u64) {
-    let queued = self.queued.iter().position(|(queued, _, _)| *queued == id);
-    let removed = if let Some(index) = queued {
-      self.queued.remove(index);
-      true
-    } else if let Some(index) =
-      self.world.pending.iter().position(|(pending, _, _)| *pending == id)
-    {
-      self.world.pending.remove(index);
-      true
-    } else {
-      false
-    };
-    if removed {
-      self.record_trace(format!("tick={} cancel id={}", self.world.tick, id));
-      self.schedule_completion(id, -(errno::ECANCELED as isize));
-    }
-  }
-
-  fn flush(&mut self) -> io::Result<()> {
-    self.assert_initialized();
-    let queued = mem::take(&mut self.queued);
-    for (id, op, keep) in queued {
-      match self.complete_op(op) {
-        OpAction::Complete(result) => self.schedule_completion(id, result),
-        OpAction::Pending(op) => {
-          self.record_trace(format!(
-            "tick={} pending id={}",
-            self.world.tick, id
-          ));
-          self.world.pending.push((id, op, keep));
-        }
-        OpAction::StartConnect {
-          accepted_fd,
-          listener_fd,
+    let id = op.id();
+    let (started, key, op) = op.begin();
+    self.keys.insert(id, key);
+    match self.complete_op(mem::replace(op, Op::Nop)) {
+      OpAction::Complete(result) => self.schedule_completion(id, result),
+      OpAction::Pending(op) => {
+        self
+          .record_trace(format!("tick={} pending id={}", self.world.tick, id));
+        self.world.pending.push((id, op, Held));
+      }
+      OpAction::StartConnect {
+        accepted_fd,
+        listener_fd,
+        ready_at_tick,
+        ..
+      } => {
+        self.record_trace(format!(
+          "tick={} schedule-connect id={} listener_fd={} accepted_fd={} at={}",
+          self.world.tick, id, listener_fd, accepted_fd, ready_at_tick
+        ));
+        self.world.events.push(ScheduledEvent::ConnectEstablished {
           ready_at_tick,
-          ..
-        } => {
-          self.record_trace(format!(
-            "tick={} schedule-connect id={} listener_fd={} accepted_fd={} at={}",
-            self.world.tick, id, listener_fd, accepted_fd, ready_at_tick
-          ));
-          self.world.events.push(ScheduledEvent::ConnectEstablished {
-            ready_at_tick,
-            id,
-            listener_fd,
-            accepted_fd,
-          });
-        }
+          id,
+          listener_fd,
+          accepted_fd,
+        });
       }
     }
-    self.schedule_rng.shuffle(&mut self.ready);
-    Ok(())
+    started
+  }
+
+  fn cancel(&mut self, key: OpKey, _done: &mut crate::backend::Done<'_>) {
+    let Some(id) = id_of(&self.keys, key) else {
+      return;
+    };
+    let Some(index) =
+      self.world.pending.iter().position(|(pending, _, _)| *pending == id)
+    else {
+      return;
+    };
+    self.world.pending.remove(index);
+    self.record_trace(format!("tick={} cancel id={}", self.world.tick, id));
+    self.schedule_completion(id, -(errno::ECANCELED as isize));
   }
 
   fn wait(
     &mut self,
     timeout: Option<Duration>,
-    completed: &mut Vec<OpCompleted>,
+    done: &mut crate::backend::Done<'_>,
   ) -> io::Result<()> {
     self.assert_initialized();
-    completed.clear();
+    // What was started since the last wait finishes in a seeded order.
+    self.schedule_rng.shuffle(&mut self.ready);
+    // A report the driver has not collected is a reason not to move time.
+    let idle = self.ready.is_empty() && done.waiting() == 0;
 
     match timeout {
       Some(duration) if duration.is_zero() => {
-        if self.ready.is_empty() && !self.world.events.is_empty() {
+        if idle && !self.world.events.is_empty() {
           self.advance_tick();
         }
       }
       Some(_) => {
-        if self.ready.is_empty() {
+        if idle {
           self.advance_tick();
         }
       }
       None => {
-        while self.ready.is_empty() && !self.world.events.is_empty() {
+        while self.ready.is_empty()
+          && done.waiting() == 0
+          && !self.world.events.is_empty()
+        {
           self.advance_tick();
         }
       }
     }
 
-    report(&mut self.tickets, &mut self.ready, completed);
+    report(&mut self.keys, &mut self.ready, done);
     Ok(())
   }
 }
@@ -3017,8 +2999,7 @@ impl DST {
                 node_id: from.node_id,
                 node: self.inner.borrow().node(from.node_id),
                 inner: self.inner.clone(),
-                queued: Vec::new(),
-                tickets: HashMap::new(),
+                keys: HashMap::new(),
               };
               backend.schedule_stream_link_reset(from, to, errno::ECONNRESET);
               continue;
@@ -3159,8 +3140,7 @@ impl DST {
       node_id,
       node,
       inner: self.inner.clone(),
-      queued: Vec::new(),
-      tickets: HashMap::new(),
+      keys: HashMap::new(),
     };
     backend.finish_network_op(id, op, keep);
     self.mark_runner_ready(node_id);
@@ -3258,8 +3238,7 @@ fn create_dst_backend(dst: &mut DST) -> DSTBackend {
     node_id,
     node,
     inner: dst.inner.clone(),
-    queued: Vec::new(),
-    tickets: HashMap::new(),
+    keys: HashMap::new(),
   }
 }
 
@@ -3274,18 +3253,14 @@ impl DSTBackend {
     self.node.borrow().sockets.contains_key(&raw)
   }
 
+  /// Hands a network operation to the simulated network.
   fn queue_network_op(&mut self, id: u64, op: Op, keep: Held) {
-    self.queued.push((id, op, keep));
+    self.node.borrow_mut().outgoing.push_back((id, op, keep));
+    self.inner.borrow_mut().active_outgoing_nodes.insert(self.node_id);
   }
 
-  /// Removes a network operation that has not completed yet.
+  /// Removes a network operation that is waiting for its peer.
   fn cancel_network_op(&mut self, id: u64) -> bool {
-    if let Some(index) =
-      self.queued.iter().position(|(queued, _, _)| *queued == id)
-    {
-      self.queued.remove(index);
-      return true;
-    }
     let mut node = self.node.borrow_mut();
     let Some(index) =
       node.pending.iter().position(|(pending, _, _)| *pending == id)
@@ -3368,9 +3343,9 @@ impl DSTBackend {
     }
   }
 
-  fn drain_node_ready(&mut self, completed: &mut Vec<OpCompleted>) {
+  fn drain_node_ready(&mut self, done: &mut crate::backend::Done<'_>) {
     let mut node = self.node.borrow_mut();
-    report(&mut self.tickets, &mut node.ready, completed);
+    report(&mut self.keys, &mut node.ready, done);
   }
 
   fn allocate_socket_fd(node: &mut DSTNodeState) -> i32 {
@@ -4062,23 +4037,8 @@ impl DSTBackend {
       }
       other => {
         let Held = keep;
-        let Some(ticket) = self.tickets.remove(&id) else {
-          unreachable!(
-            "DST: operation {id} reached the local backend unticketed"
-          );
-        };
-        self
-          .local
-          .as_mut()
-          .expect("non-network DST backend op requires local backend")
-          .push(
-            // SAFETY: the simulator did not act on `other`, so it used none
-            // of its addresses, and this is the ticket it was started
-            // with. A new one would let the driver free the model while
-            // the local backend still holds these addresses.
-            unsafe { crate::backend::InFlight::unstarted(other, ticket) },
-            &mut Bump::new(),
-          );
+        // `start` hands the local backend everything else, unbegun.
+        unreachable!("DST: {other:?} is not a network operation");
       }
     }
   }
@@ -4095,7 +4055,6 @@ impl IoBackend for DSTBackend {
       .as_mut()
       .expect("DST backend init requires local backend")
       .init(cap)?;
-    self.queued = Vec::with_capacity(cap);
     let mut node = self.node.borrow_mut();
     node.initialized = true;
     node.cap = cap;
@@ -4109,7 +4068,12 @@ impl IoBackend for DSTBackend {
     Ok(())
   }
 
-  fn push(&mut self, op: crate::backend::InFlight, step_bump: &mut Bump) {
+  fn start(
+    &mut self,
+    op: Queued<'_>,
+    step_bump: &mut Bump,
+    done: &mut crate::backend::Done<'_>,
+  ) -> Started {
     let use_network = match op.as_op() {
       Op::Socket { .. } => true,
       Op::Bind { fd, .. }
@@ -4130,58 +4094,47 @@ impl IoBackend for DSTBackend {
 
     if use_network {
       // The simulated network has the operation from now on.
-      let (stored, ticket) = op.start();
-      let id = ticket.id();
-      self.tickets.insert(id, ticket);
-      self.queue_network_op(id, stored, Held);
+      let id = op.id();
+      let (started, key, stored) = op.begin();
+      self.keys.insert(id, key);
+      self.queue_network_op(id, mem::replace(stored, Op::Nop), Held);
+      started
     } else {
+      // Whole and unbegun: the local backend begins it, and reports it by
+      // the key it gets, to the same table.
       self
         .local
         .as_mut()
-        .expect("non-network DST backend push requires local backend")
-        .push(op, step_bump);
+        .expect("non-network DST backend start requires local backend")
+        .start(op, step_bump, done)
     }
   }
 
-  fn cancel(&mut self, id: u64) {
+  fn cancel(&mut self, key: OpKey, done: &mut crate::backend::Done<'_>) {
+    let Some(id) = id_of(&self.keys, key) else {
+      // Not on the network: the local backend began it.
+      if let Some(local) = self.local.as_mut() {
+        local.cancel(key, done);
+      }
+      return;
+    };
     if self.cancel_network_op(id) {
       let result = -(errno::ECANCELED as isize);
       self.node.borrow_mut().ready.push(Done::new(id, result));
-    } else if let Some(local) = self.local.as_mut() {
-      local.cancel(id);
     }
-  }
-
-  fn flush(&mut self) -> io::Result<()> {
-    self
-      .local
-      .as_mut()
-      .expect("DST backend flush requires local backend")
-      .flush()?;
-    let queued = mem::take(&mut self.queued);
-    if !queued.is_empty() {
-      self.node.borrow_mut().outgoing.extend(queued);
-      self.inner.borrow_mut().active_outgoing_nodes.insert(self.node_id);
-    }
-    Ok(())
   }
 
   fn wait(
     &mut self,
     _timeout: Option<Duration>,
-    completed: &mut Vec<OpCompleted>,
+    done: &mut crate::backend::Done<'_>,
   ) -> io::Result<()> {
-    completed.clear();
-    self.drain_node_ready(completed);
-
-    let mut local_completed = Vec::new();
+    self.drain_node_ready(done);
     self
       .local
       .as_mut()
       .expect("DST backend wait requires local backend")
-      .wait(Some(Duration::ZERO), &mut local_completed)?;
-    completed.append(&mut local_completed);
-    Ok(())
+      .wait(Some(Duration::ZERO), done)
   }
 }
 
@@ -4192,20 +4145,20 @@ impl IoBackend for DSTBackend {
 
 #[cfg(test)]
 mod tests {
-  fn submit(backend: &mut impl IoBackend, id: u64, op: Op, bump: &mut Bump) {
+  fn submit<B: IoBackend>(
+    backend: &mut Tracked<B>,
+    id: u64,
+    op: Op,
+    _bump: &mut Bump,
+  ) {
     // SAFETY: these tests keep every buffer named by `op` alive until the
     // backend reports the completion.
-    unsafe {
-      backend.push(
-        crate::backend::InFlight::attest(id, BorrowedOp::from_op(op)),
-        bump,
-      )
-    };
+    unsafe { backend.push(id, BorrowedOp::from_op(op)) };
   }
 
   #[test]
   fn cancel_reports_a_queued_read_without_performing_it() {
-    let mut backend = DSBackend::new();
+    let mut backend = Tracked::new(DSBackend::new());
     backend.init(4).unwrap();
     let mut bytes = [1u8; 4];
     let iov = [crate::backend::op::RawBufMut::from_mut(&mut bytes)];
@@ -4216,11 +4169,9 @@ mod tests {
       Default::default(),
     );
     // SAFETY: `iov` and `bytes` outlive the completion taken below.
-    unsafe {
-      backend.push(crate::backend::InFlight::attest(1, op), &mut Bump::new())
-    };
+    unsafe { backend.push(1, op) };
     backend.cancel(1);
-    backend.flush().unwrap();
+    backend.flush();
     let mut completed = Vec::new();
     for _ in 0..8 {
       backend.wait(Some(std::time::Duration::ZERO), &mut completed).unwrap();
@@ -4235,6 +4186,7 @@ mod tests {
   }
 
   use super::*;
+  use crate::backend::Tracked;
   use crate::backend::op::BorrowedOp;
   use crate::backend::op::{MsgBufMut, MsgRecv};
   use std::net::SocketAddr;
@@ -4376,8 +4328,8 @@ mod tests {
 
   #[test]
   fn nop_is_deterministic_for_a_seed() {
-    let mut a = DSBackend::with_seed(42);
-    let mut b = DSBackend::with_seed(42);
+    let mut a = Tracked::new(DSBackend::with_seed(42));
+    let mut b = Tracked::new(DSBackend::with_seed(42));
     a.init(8).unwrap();
     b.init(8).unwrap();
 
@@ -4385,8 +4337,8 @@ mod tests {
     let mut step_b = Bump::new();
     submit(&mut a, 1, Op::Nop, &mut step_a);
     submit(&mut b, 1, Op::Nop, &mut step_b);
-    a.flush().unwrap();
-    b.flush().unwrap();
+    a.flush();
+    b.flush();
 
     let mut done_a = Vec::new();
     let mut done_b = Vec::new();
@@ -4400,12 +4352,12 @@ mod tests {
 
   #[test]
   fn getcwd_writes_simulated_path() {
-    let mut backend = DSBackend::with_config(DSConfig {
+    let mut backend = Tracked::new(DSBackend::with_config(DSConfig {
       seed: 7,
       max_delay_ticks: 0,
       fault_every: 0,
       network_faults: DSNetworkFaults::Off,
-    });
+    }));
     backend.init(8).unwrap();
 
     let mut out = std::ffi::OsString::new();
@@ -4416,7 +4368,7 @@ mod tests {
       Op::GetCwd { out: NonNull::from(&mut out) },
       &mut step_bump,
     );
-    backend.flush().unwrap();
+    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
@@ -4425,18 +4377,21 @@ mod tests {
     #[cfg(unix)]
     {
       use std::os::unix::ffi::OsStrExt;
-      assert_eq!(out.as_os_str().as_bytes(), backend.scenario.cwd.as_slice());
+      assert_eq!(
+        out.as_os_str().as_bytes(),
+        backend.backend().scenario.cwd.as_slice()
+      );
     }
   }
 
   #[test]
   fn recv_on_stdin_is_not_supported() {
-    let mut backend = DSBackend::with_config(DSConfig {
+    let mut backend = Tracked::new(DSBackend::with_config(DSConfig {
       seed: 9,
       max_delay_ticks: 0,
       fault_every: 0,
       network_faults: DSNetworkFaults::Off,
-    });
+    }));
     backend.init(8).unwrap();
 
     let mut buf = [0_u8; 16];
@@ -4449,7 +4404,7 @@ mod tests {
       Op::Recv { fd: Resource::stdin(), msg, flags: RecvFlags::empty() },
       &mut step_bump,
     );
-    backend.flush().unwrap();
+    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
@@ -4459,15 +4414,15 @@ mod tests {
 
   #[test]
   fn recv_on_empty_socket_is_not_supported() {
-    let mut backend = DSBackend::with_config(DSConfig {
+    let mut backend = Tracked::new(DSBackend::with_config(DSConfig {
       seed: 11,
       max_delay_ticks: 0,
       fault_every: 0,
       network_faults: DSNetworkFaults::Off,
-    });
+    }));
     backend.init(8).unwrap();
 
-    let socket_fd = backend.create_socket_resource(
+    let socket_fd = backend.backend_mut().create_socket_resource(
       SockDomain::IPV4,
       SockType::STREAM,
       SockProto::TCP,
@@ -4484,7 +4439,7 @@ mod tests {
       Op::Recv { fd: socket, msg, flags: RecvFlags::empty() },
       &mut step_bump,
     );
-    backend.flush().unwrap();
+    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
@@ -4494,34 +4449,34 @@ mod tests {
 
   #[test]
   fn recv_on_socket_reads_only_bytes_sent_by_peer() {
-    let mut backend = DSBackend::with_config(DSConfig {
+    let mut backend = Tracked::new(DSBackend::with_config(DSConfig {
       seed: 13,
       max_delay_ticks: 0,
       fault_every: 0,
       network_faults: DSNetworkFaults::Off,
-    });
+    }));
     backend.init(16).unwrap();
 
-    let sender_fd = backend.create_socket_resource(
+    let sender_fd = backend.backend_mut().create_socket_resource(
       SockDomain::IPV4,
       SockType::STREAM,
       SockProto::TCP,
     );
-    let receiver_fd = backend.create_socket_resource(
+    let receiver_fd = backend.backend_mut().create_socket_resource(
       SockDomain::IPV4,
       SockType::STREAM,
       SockProto::TCP,
     );
 
     if let Some(SimResource::Socket(sender)) =
-      backend.world.resources.get_mut(&sender_fd)
+      backend.backend_mut().world.resources.get_mut(&sender_fd)
     {
       sender.peer = Some(receiver_fd);
     } else {
       panic!("sender socket resource missing");
     }
     if let Some(SimResource::Socket(receiver)) =
-      backend.world.resources.get_mut(&receiver_fd)
+      backend.backend_mut().world.resources.get_mut(&receiver_fd)
     {
       receiver.peer = Some(sender_fd);
     } else {
@@ -4541,7 +4496,7 @@ mod tests {
       Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
     );
-    backend.flush().unwrap();
+    backend.flush();
 
     let mut send_done = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut send_done).unwrap();
@@ -4559,7 +4514,7 @@ mod tests {
       Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
     );
-    backend.flush().unwrap();
+    backend.flush();
 
     let mut recv_done = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut recv_done).unwrap();
@@ -4572,27 +4527,27 @@ mod tests {
 
   #[test]
   fn send_and_recv_flags_are_not_supported() {
-    let mut backend = DSBackend::with_config(DSConfig {
+    let mut backend = Tracked::new(DSBackend::with_config(DSConfig {
       seed: 13,
       max_delay_ticks: 0,
       fault_every: 0,
       network_faults: DSNetworkFaults::Off,
-    });
+    }));
     backend.init(16).unwrap();
 
-    let sender_fd = backend.create_socket_resource(
+    let sender_fd = backend.backend_mut().create_socket_resource(
       SockDomain::IPV4,
       SockType::STREAM,
       SockProto::TCP,
     );
-    let receiver_fd = backend.create_socket_resource(
+    let receiver_fd = backend.backend_mut().create_socket_resource(
       SockDomain::IPV4,
       SockType::STREAM,
       SockProto::TCP,
     );
     for (fd, peer) in [(sender_fd, receiver_fd), (receiver_fd, sender_fd)] {
       let Some(SimResource::Socket(socket)) =
-        backend.world.resources.get_mut(&fd)
+        backend.backend_mut().world.resources.get_mut(&fd)
       else {
         panic!("socket resource missing");
       };
@@ -4608,7 +4563,7 @@ mod tests {
     let mut bump = Bump::new();
     let mut run = |id, op| {
       submit(&mut backend, id, op, &mut bump);
-      backend.flush().unwrap();
+      backend.flush();
       let mut done = Vec::new();
       backend.wait(Some(Duration::ZERO), &mut done).unwrap();
       assert_eq!(done.len(), 1);
@@ -4644,34 +4599,34 @@ mod tests {
 
   #[test]
   fn recv_on_connected_empty_socket_waits_for_delivery() {
-    let mut backend = DSBackend::with_config(DSConfig {
+    let mut backend = Tracked::new(DSBackend::with_config(DSConfig {
       seed: 17,
       max_delay_ticks: 0,
       fault_every: 0,
       network_faults: DSNetworkFaults::Off,
-    });
+    }));
     backend.init(16).unwrap();
 
-    let sender_fd = backend.create_socket_resource(
+    let sender_fd = backend.backend_mut().create_socket_resource(
       SockDomain::IPV4,
       SockType::STREAM,
       SockProto::TCP,
     );
-    let receiver_fd = backend.create_socket_resource(
+    let receiver_fd = backend.backend_mut().create_socket_resource(
       SockDomain::IPV4,
       SockType::STREAM,
       SockProto::TCP,
     );
 
     if let Some(SimResource::Socket(sender)) =
-      backend.world.resources.get_mut(&sender_fd)
+      backend.backend_mut().world.resources.get_mut(&sender_fd)
     {
       sender.peer = Some(receiver_fd);
     } else {
       panic!("sender socket resource missing");
     }
     if let Some(SimResource::Socket(receiver)) =
-      backend.world.resources.get_mut(&receiver_fd)
+      backend.backend_mut().world.resources.get_mut(&receiver_fd)
     {
       receiver.peer = Some(sender_fd);
     } else {
@@ -4691,7 +4646,7 @@ mod tests {
       Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
     );
-    backend.flush().unwrap();
+    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
@@ -4710,7 +4665,7 @@ mod tests {
       Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
     );
-    backend.flush().unwrap();
+    backend.flush();
 
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
@@ -4726,27 +4681,27 @@ mod tests {
 
   #[test]
   fn accept_waits_for_connect_event() {
-    let mut backend = DSBackend::with_config(DSConfig {
+    let mut backend = Tracked::new(DSBackend::with_config(DSConfig {
       seed: 19,
       max_delay_ticks: 0,
       fault_every: 0,
       network_faults: DSNetworkFaults::Off,
-    });
+    }));
     backend.init(16).unwrap();
 
-    let listener_fd = backend.create_socket_resource(
+    let listener_fd = backend.backend_mut().create_socket_resource(
       SockDomain::IPV4,
       SockType::STREAM,
       SockProto::TCP,
     );
-    let client_fd = backend.create_socket_resource(
+    let client_fd = backend.backend_mut().create_socket_resource(
       SockDomain::IPV4,
       SockType::STREAM,
       SockProto::TCP,
     );
 
     if let Some(SimResource::Socket(listener)) =
-      backend.world.resources.get_mut(&listener_fd)
+      backend.backend_mut().world.resources.get_mut(&listener_fd)
     {
       listener.listening = true;
       listener.bound =
@@ -4757,7 +4712,11 @@ mod tests {
     let listener_key = DSBackend::socket_addr_key(&op::socket_addr_into_buf(
       "127.0.0.1:7000".parse().unwrap(),
     ));
-    backend.world.bound_listeners.insert(listener_key, listener_fd);
+    backend
+      .backend_mut()
+      .world
+      .bound_listeners
+      .insert(listener_key, listener_fd);
 
     let listener = dst_resource(listener_fd);
     let client = dst_resource(client_fd);
@@ -4782,7 +4741,7 @@ mod tests {
       Op::Connect { fd: client, addr: op::socket_addr_into_buf(connect_addr) },
       &mut connect_bump,
     );
-    backend.flush().unwrap();
+    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
@@ -4807,34 +4766,34 @@ mod tests {
 
   #[test]
   fn progress_snapshot_reflects_pending_connected_recv() {
-    let mut backend = DSBackend::with_config(DSConfig {
+    let mut backend = Tracked::new(DSBackend::with_config(DSConfig {
       seed: 23,
       max_delay_ticks: 0,
       fault_every: 0,
       network_faults: DSNetworkFaults::Off,
-    });
+    }));
     backend.init(16).unwrap();
 
-    let sender_fd = backend.create_socket_resource(
+    let sender_fd = backend.backend_mut().create_socket_resource(
       SockDomain::IPV4,
       SockType::STREAM,
       SockProto::TCP,
     );
-    let receiver_fd = backend.create_socket_resource(
+    let receiver_fd = backend.backend_mut().create_socket_resource(
       SockDomain::IPV4,
       SockType::STREAM,
       SockProto::TCP,
     );
 
     if let Some(SimResource::Socket(sender)) =
-      backend.world.resources.get_mut(&sender_fd)
+      backend.backend_mut().world.resources.get_mut(&sender_fd)
     {
       sender.peer = Some(receiver_fd);
     } else {
       panic!("sender socket resource missing");
     }
     if let Some(SimResource::Socket(receiver)) =
-      backend.world.resources.get_mut(&receiver_fd)
+      backend.backend_mut().world.resources.get_mut(&receiver_fd)
     {
       receiver.peer = Some(sender_fd);
     } else {
@@ -4846,7 +4805,7 @@ mod tests {
     let mut buf = [0_u8; 16];
     let mut recv_buf = MsgBufMut::from_slice(&mut buf);
     let recv_msg = MsgRecv::new(std::slice::from_mut(&mut recv_buf));
-    let before = backend.progress_snapshot();
+    let before = backend.backend_mut().progress_snapshot();
 
     let mut recv_bump = Bump::new();
     submit(
@@ -4855,45 +4814,44 @@ mod tests {
       Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
     );
-    backend.flush().unwrap();
+    backend.flush();
 
-    let after_flush = backend.progress_snapshot();
-    assert_eq!(after_flush.queued, 0);
+    let after_flush = backend.backend_mut().progress_snapshot();
     assert_eq!(after_flush.pending, before.pending + 1);
-    assert!(backend.has_pending_work());
-    assert!(!backend.is_quiescent());
+    assert!(backend.backend_mut().has_pending_work());
+    assert!(!backend.backend_mut().is_quiescent());
   }
 
   #[test]
   fn backend_becomes_quiescent_after_delivery_and_completion_drain() {
-    let mut backend = DSBackend::with_config(DSConfig {
+    let mut backend = Tracked::new(DSBackend::with_config(DSConfig {
       seed: 29,
       max_delay_ticks: 0,
       fault_every: 0,
       network_faults: DSNetworkFaults::Off,
-    });
+    }));
     backend.init(16).unwrap();
 
-    let sender_fd = backend.create_socket_resource(
+    let sender_fd = backend.backend_mut().create_socket_resource(
       SockDomain::IPV4,
       SockType::STREAM,
       SockProto::TCP,
     );
-    let receiver_fd = backend.create_socket_resource(
+    let receiver_fd = backend.backend_mut().create_socket_resource(
       SockDomain::IPV4,
       SockType::STREAM,
       SockProto::TCP,
     );
 
     if let Some(SimResource::Socket(sender)) =
-      backend.world.resources.get_mut(&sender_fd)
+      backend.backend_mut().world.resources.get_mut(&sender_fd)
     {
       sender.peer = Some(receiver_fd);
     } else {
       panic!("sender socket resource missing");
     }
     if let Some(SimResource::Socket(receiver)) =
-      backend.world.resources.get_mut(&receiver_fd)
+      backend.backend_mut().world.resources.get_mut(&receiver_fd)
     {
       receiver.peer = Some(sender_fd);
     } else {
@@ -4924,18 +4882,18 @@ mod tests {
       Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
     );
-    backend.flush().unwrap();
+    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
-    assert!(!backend.is_quiescent());
+    assert!(!backend.backend_mut().is_quiescent());
 
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
-    let final_snapshot = backend.progress_snapshot();
+    let final_snapshot = backend.backend_mut().progress_snapshot();
     assert_eq!(final_snapshot.pending, 0);
     assert_eq!(final_snapshot.scheduled_events, 0);
     assert_eq!(final_snapshot.ready, 0);
-    assert!(backend.is_quiescent());
+    assert!(backend.backend_mut().is_quiescent());
   }
 
   #[test]
@@ -5441,14 +5399,14 @@ mod tests {
 
   #[test]
   fn openat_then_read_uses_simulated_file_state() {
-    let mut backend = DSBackend::with_config(DSConfig {
+    let mut backend = Tracked::new(DSBackend::with_config(DSConfig {
       seed: 1,
       max_delay_ticks: 0,
       fault_every: 0,
       network_faults: DSNetworkFaults::Off,
-    });
+    }));
     backend.init(8).unwrap();
-    backend.world.fs.insert(
+    backend.backend_mut().world.fs.insert(
       b"/tmp/demo".to_vec(),
       SimNode::File { bytes: b"demo-bytes".to_vec(), mode: 0o644 },
     );
@@ -5466,7 +5424,7 @@ mod tests {
       },
       &mut step_bump,
     );
-    backend.flush().unwrap();
+    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
@@ -5476,27 +5434,30 @@ mod tests {
 
   #[test]
   fn ds_fsync_succeeds_for_simulated_files_and_rejects_sockets() {
-    let mut backend = DSBackend::with_config(DSConfig {
+    let mut backend = Tracked::new(DSBackend::with_config(DSConfig {
       seed: 1,
       max_delay_ticks: 0,
       fault_every: 0,
       network_faults: DSNetworkFaults::Off,
-    });
+    }));
 
     let file_fd = 1_000_000;
-    backend.world.resources.insert(
-      file_fd,
-      SimResource::File(backend.make_file_handle(
-        b"/tmp/file".to_vec(),
-        OpenFlags::READ | OpenFlags::WRITE,
-      )),
+    let file = backend.backend_mut().make_file_handle(
+      b"/tmp/file".to_vec(),
+      OpenFlags::READ | OpenFlags::WRITE,
     );
+    backend
+      .backend_mut()
+      .world
+      .resources
+      .insert(file_fd, SimResource::File(file));
     let file_resource = dst_resource(file_fd);
-    let file_result = backend.complete_op(Op::Fsync { fd: file_resource });
+    let file_result =
+      backend.backend_mut().complete_op(Op::Fsync { fd: file_resource });
     assert!(matches!(file_result, OpAction::Complete(0)));
 
     let socket_fd = 1_000_001;
-    backend.world.resources.insert(
+    backend.backend_mut().world.resources.insert(
       socket_fd,
       SimResource::Socket(SimSocketHandle {
         domain: SockDomain::IPV4,
@@ -5514,7 +5475,8 @@ mod tests {
       }),
     );
     let socket_resource = dst_resource(socket_fd);
-    let socket_result = backend.complete_op(Op::Fsync { fd: socket_resource });
+    let socket_result =
+      backend.backend_mut().complete_op(Op::Fsync { fd: socket_resource });
     assert!(matches!(
       socket_result,
       OpAction::Complete(result) if result == -(errno::EINVAL as isize)
@@ -5529,13 +5491,13 @@ mod tests {
       fault_every: 0,
       network_faults: DSNetworkFaults::Off,
     });
-    let mut backend = create_dst_backend(&mut dst);
+    let mut backend = Tracked::new(create_dst_backend(&mut dst));
     backend.init(8).unwrap();
-    dst_test_socket(&backend.node, 91);
+    dst_test_socket(&backend.backend().node, 91);
 
     let fd = dst_resource(91);
     submit(&mut backend, 1, Op::Fsync { fd }, &mut Bump::new());
-    backend.flush().unwrap();
+    backend.flush();
     assert!(dst.step());
 
     let mut completed = Vec::new();

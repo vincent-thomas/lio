@@ -10,11 +10,10 @@ use std::time::Duration;
 mod immediate_sockets {
   use super::super::Poller;
   use crate::api::{op::Action, resource::Resource};
-  use crate::backend::IoBackend;
+  use crate::backend::Tracked;
   use crate::backend::op::{
     MsgBuf, MsgBufMut, MsgRecv, MsgSend, Op, RecvFlags, SendFlags,
   };
-  use bumpalo::Bump;
   use std::io::{Read, Write};
   use std::os::fd::{FromRawFd, IntoRawFd};
   use std::os::unix::net::UnixStream;
@@ -33,8 +32,8 @@ mod immediate_sockets {
     )
   }
 
-  fn backend() -> Poller {
-    let mut backend = Poller::new();
+  fn backend() -> Tracked<Poller> {
+    let mut backend = Tracked::new(Poller::new());
     backend.init(4).unwrap();
     backend
   }
@@ -88,17 +87,14 @@ mod immediate_sockets {
     }
   }
 
-  fn queue(backend: &mut Poller, id: u64, action: Action<'_>) {
+  fn queue(backend: &mut Tracked<Poller>, id: u64, action: Action<'_>) {
     let Action::Io(op) = action else {
       panic!("expected I/O");
     };
     // Poller does not use the step arena. The caller keeps what `action`
     // borrows boxed, so the buffers and message descriptors stay in place
     // until the backend finishes. `from_model` names that borrow.
-    backend.push(
-      crate::backend::InFlight::from_model(id, op, crate::backend::Keep::new()),
-      &mut Bump::new(),
-    );
+    backend.push_model(id, op, crate::backend::Keep::new());
   }
 
   #[test]
@@ -108,8 +104,8 @@ mod immediate_sockets {
     let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 11, model.action());
-    backend.flush().unwrap();
-    assert_eq!(backend.pending.len(), 0);
+    backend.flush();
+    assert_eq!(backend.backend().parked.len(), 0);
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
@@ -124,8 +120,8 @@ mod immediate_sockets {
     let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 12, model.action());
-    backend.flush().unwrap();
-    assert_eq!(backend.pending.len(), 1);
+    backend.flush();
+    assert_eq!(backend.backend().parked.len(), 1);
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
     assert!(completed.is_empty());
@@ -133,7 +129,7 @@ mod immediate_sockets {
     backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].result(), 5);
-    assert_eq!(backend.pending.len(), 0);
+    assert_eq!(backend.backend().parked.len(), 0);
   }
 
   #[test]
@@ -142,9 +138,9 @@ mod immediate_sockets {
     let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 13, model.action());
-    backend.flush().unwrap();
-    assert_eq!(backend.pending.len(), 1);
-    assert!(backend.queued_completed.is_empty());
+    backend.flush();
+    assert_eq!(backend.backend().parked.len(), 1);
+    assert_eq!(backend.in_flight(), 1, "nothing was reported");
     peer.write_all(b"hello").unwrap();
     let mut completed = Vec::new();
     backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
@@ -158,8 +154,8 @@ mod immediate_sockets {
     let mut model = Send::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 14, model.action());
-    backend.flush().unwrap();
-    assert_eq!(backend.pending.len(), 0);
+    backend.flush();
+    assert_eq!(backend.backend().parked.len(), 0);
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
@@ -175,27 +171,19 @@ mod immediate_sockets {
     let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 15, model.action());
-    backend.flush().unwrap();
-    assert_eq!(backend.pending.len(), 1);
+    backend.flush();
+    assert_eq!(backend.backend().parked.len(), 1);
     peer.write_all(b"hello").unwrap();
     // SAFETY: a no-op borrows nothing.
-    backend.push(
-      unsafe {
-        crate::backend::InFlight::attest(
-          16,
-          crate::backend::op::BorrowedOp::nop(),
-        )
-      },
-      &mut Bump::new(),
-    );
-    backend.flush().unwrap();
+    unsafe { backend.push(16, crate::backend::op::BorrowedOp::nop()) };
+    backend.flush();
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
     let mut ids: Vec<_> =
       completed.iter().map(|c| c.registration_id()).collect();
     ids.sort_unstable();
     assert_eq!(ids, [15, 16]);
-    assert_eq!(backend.pending.len(), 0);
+    assert_eq!(backend.backend().parked.len(), 0);
   }
 
   #[test]
@@ -204,10 +192,10 @@ mod immediate_sockets {
     let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 15, model.action());
-    backend.flush().unwrap();
-    assert_eq!(backend.pending.len(), 1);
+    backend.flush();
+    assert_eq!(backend.backend().parked.len(), 1);
     backend.cancel(15);
-    assert_eq!(backend.pending.len(), 0);
+    assert_eq!(backend.backend().parked.len(), 0);
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
@@ -223,8 +211,12 @@ mod immediate_sockets {
     let mut backend = backend();
     queue(&mut backend, 15, model.action());
     backend.cancel(15);
-    backend.flush().unwrap();
-    assert_eq!(backend.pending.len(), 0, "it was not started afterwards");
+    backend.flush();
+    assert_eq!(
+      backend.backend().parked.len(),
+      0,
+      "it was not started afterwards"
+    );
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
@@ -251,9 +243,9 @@ mod immediate_sockets {
     let mut model = Send::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 17, model.action());
-    backend.flush().unwrap();
-    assert_eq!(backend.pending.len(), 1);
-    assert!(backend.queued_completed.is_empty());
+    backend.flush();
+    assert_eq!(backend.backend().parked.len(), 1);
+    assert_eq!(backend.in_flight(), 1, "nothing was reported");
     let mut drain = [0u8; 8192];
     loop {
       match peer.read(&mut drain) {
@@ -266,7 +258,7 @@ mod immediate_sockets {
     backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].result(), 5);
-    assert_eq!(backend.pending.len(), 0);
+    assert_eq!(backend.backend().parked.len(), 0);
     assert_eq!(peer.read(&mut drain).unwrap(), 5);
     assert_eq!(&drain[..5], b"hello");
   }
@@ -290,20 +282,17 @@ mod immediate_sockets {
     // SAFETY: `raws` and `socket` stay alive until this backend finishes.
     unsafe {
       backend.push(
-        crate::backend::InFlight::attest(
-          18,
-          crate::backend::op::BorrowedOp::from_op(Op::Read {
-            fd: socket,
-            iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
-            iov_count: raws.len(),
-            offset: None,
-            flags: ReadFlags::empty(),
-          }),
-        ),
-        &mut Bump::new(),
+        18,
+        crate::backend::op::BorrowedOp::from_op(Op::Read {
+          fd: socket,
+          iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
+          iov_count: raws.len(),
+          offset: None,
+          flags: ReadFlags::empty(),
+        }),
       );
     }
-    backend.flush().unwrap();
+    backend.flush();
     let mut completed = Vec::new();
     backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);

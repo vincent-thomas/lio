@@ -20,6 +20,7 @@ use crate::api::Io;
 use crate::api::resource::Resource;
 use crate::backend::op::Op;
 use crate::backend::testing::{Checked, ScriptedBackend};
+use crate::driver::Kernel;
 
 impl crate::model::Cx<'_> {
   /// An operation whose submission carries its tag, so the test can tell
@@ -87,7 +88,7 @@ type Deliveries = Rc<RefCell<Vec<(u32, Delivered)>>>;
 type Pending = Pin<Box<dyn Future<Output = ()>>>;
 
 struct Harness {
-  backend: ScriptedBackend,
+  backend: Kernel,
   lio: Lio,
   futures: Vec<(u32, Pending)>,
   delivered: Deliveries,
@@ -103,7 +104,7 @@ impl Harness {
       Lio::new_with_backend(Checked::new(backend.clone()), cap).unwrap();
     crate::time::pause(&lio);
     Self {
-      backend,
+      backend: Kernel::new(backend, &lio),
       lio,
       futures: Vec::new(),
       delivered: Rc::default(),

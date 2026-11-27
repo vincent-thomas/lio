@@ -52,7 +52,7 @@ lib_list="$(list_tests --lib)"
 int_list="$(list_tests --test cancellation --test capacity)"
 while IFS= read -r name; do
   [[ -n "$name" ]] || continue
-  if [[ "$name" =~ ^(slab|backend::store|backend::testing|registration|time::clock|driver):: ]]; then
+  if [[ "$name" =~ ^(slab|backend::store|backend::table|backend::testing|registration|time::clock|driver):: ]]; then
     selected+=("$name")
   fi
 done <<< "$lib_list"

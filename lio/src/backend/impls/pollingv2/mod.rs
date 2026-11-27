@@ -32,7 +32,7 @@ use std::{
 use bumpalo::Bump;
 
 use crate::backend::{
-  IoBackend, OpCompleted,
+  Done, IoBackend, OpKey, PerOp, Queued, Started,
   impls::pollingv2::interest::Interest,
   impls::unix_stat::{file_stat_from_raw, file_type_from_dirent_dtype},
   op::{
@@ -40,7 +40,6 @@ use crate::backend::{
     is_valid_file_offset,
   },
 };
-use crate::slab::{Slab, SlabKey};
 mod interest;
 
 /// Trait for OS-specific readiness polling implementations
@@ -152,8 +151,8 @@ impl Events {
 /// operations wait on it. Its key is the descriptor itself.
 #[derive(Default)]
 struct Waiters {
-  readers: VecDeque<SlabKey>,
-  writers: VecDeque<SlabKey>,
+  readers: VecDeque<OpKey>,
+  writers: VecDeque<OpKey>,
   /// Whether the OS poller holds a registration for the descriptor.
   registered: bool,
 }
@@ -172,72 +171,34 @@ impl Waiters {
   }
 
   /// The operations waiting for what `interest` names.
-  fn queue(&mut self, interest: Interest) -> &mut VecDeque<SlabKey> {
+  fn queue(&mut self, interest: Interest) -> &mut VecDeque<OpKey> {
     if interest.is_writable() { &mut self.writers } else { &mut self.readers }
   }
 }
 
 /// Polling-based I/O backend for epoll (Linux) and kqueue (BSD/macOS).
+#[derive(Default)]
 pub struct Poller {
   sys: Option<sys::OsPoller>,
   events: Events,
-  capacity: usize,
-  backlog: Vec<crate::backend::InFlight>,
   /// Operations that are waiting for their descriptor to become ready.
-  pending: Slab<PendingOp>,
-  /// Which of `pending` wait on which descriptor.
+  ///
+  /// The poller performs the I/O itself, in [`Poller::exec_op`]: no address
+  /// from a parked operation is with the kernel or another thread between
+  /// calls. That is what lets it report one at any time.
+  parked: PerOp<Op>,
+  /// Which of `parked` wait on which descriptor.
   waiters: HashMap<RawFd, Waiters>,
-  /// Immediate completions produced during `flush()` and surfaced on the next `wait()`.
-  queued_completed: Vec<OpCompleted>,
-  /// Reusable buffer for completed operations
-  completed: Vec<OpCompleted>,
 }
 
-impl Default for Poller {
-  fn default() -> Self {
-    Self {
-      sys: None,
-      events: Events::default(),
-      capacity: 0,
-      backlog: Vec::new(),
-      pending: Slab::new(0),
-      waiters: HashMap::new(),
-      queued_completed: Vec::new(),
-      completed: Vec::new(),
-    }
-  }
-}
-
-/// One operation the poller has started: being performed, or waiting for
-/// its descriptor.
-///
-/// The poller performs the I/O itself, in [`Poller::exec_op`]: no address
-/// from `op` is ever left with the kernel or another thread between calls.
-/// That is what lets every method here give the ticket up.
-pub struct PendingOp {
-  op: crate::backend::op::Op,
-  ticket: crate::backend::Ticket,
-}
-
-impl PendingOp {
-  fn id(&self) -> u64 {
-    self.ticket.id()
-  }
-
-  /// Reports the operation. `result` is what [`Poller::exec_op`] returned
-  /// for it, or a negative code for an operation that was not performed.
-  fn report(self, result: isize) -> OpCompleted {
-    // SAFETY: nothing but this thread ever uses the operation's addresses,
-    // and it is done with them. The result is the syscall's own, or an
-    // error, which claims nothing about the operation's memory.
-    unsafe { self.ticket.complete(result) }
-  }
-
-  /// Reports the operation as stopped before it was performed.
-  fn stopped(self) -> OpCompleted {
-    // SAFETY: as in `report`.
-    unsafe { self.ticket.cancelled(-(libc::ECANCELED as isize)) }
-  }
+/// Reports an operation. `result` is what [`Poller::exec_op`] returned for
+/// it, or a negative code for an operation that was not performed.
+fn report(done: &mut Done<'_>, key: OpKey, result: isize) {
+  // SAFETY: nothing but this thread ever uses the operation's addresses,
+  // and it is done with them: `exec_op` has returned. The result is the
+  // syscall's own, or an error, which claims nothing about the operation's
+  // memory.
+  unsafe { done.complete(key, result) }
 }
 
 // EAGAIN and EWOULDBLOCK are the same on Linux, but may differ on other systems
@@ -279,18 +240,18 @@ impl Poller {
   /// Completes every operation waiting on `fd` with `result`: the
   /// descriptor can no longer be watched.
   fn fail_waiters(
-    pending: &mut Slab<PendingOp>,
+    parked: &mut PerOp<Op>,
     waiters: &mut HashMap<RawFd, Waiters>,
     fd: RawFd,
     result: isize,
-    completed: &mut Vec<OpCompleted>,
+    done: &mut Done<'_>,
   ) {
     let Some(waiting) = waiters.remove(&fd) else {
       return;
     };
     for key in waiting.readers.into_iter().chain(waiting.writers) {
-      if let Some(entry) = pending.remove_value(key) {
-        completed.push(entry.report(result));
+      if parked.take(key).is_some() {
+        report(done, key, result);
       }
     }
   }
@@ -298,33 +259,30 @@ impl Poller {
   /// Runs the operations at the front of `queue` until one would have to
   /// wait. The rest stay queued behind it, in order.
   fn serve(
-    queue: &mut VecDeque<SlabKey>,
-    pending: &mut Slab<PendingOp>,
-    completed: &mut Vec<OpCompleted>,
+    queue: &mut VecDeque<OpKey>,
+    parked: &mut PerOp<Op>,
+    done: &mut Done<'_>,
   ) {
     while let Some(&key) = queue.front() {
-      let Some(entry) = pending.get_mut(key) else {
+      let Some(op) = parked.get(key) else {
         queue.pop_front();
         continue;
       };
-      let result = Poller::exec_op(&entry.op);
+      let result = Poller::exec_op(op);
       if result == EAGAIN_NEG || result == EWOULDBLOCK_NEG {
         return;
       }
       queue.pop_front();
-      if let Some(entry) = pending.remove_value(key) {
-        completed.push(entry.report(result));
-      }
+      parked.take(key);
+      report(done, key, result);
     }
   }
 
-  /// Queues `entry` behind the operations already waiting on its
-  /// descriptor, and has the OS poller watch for it.
-  fn park(&mut self, entry: PendingOp) {
-    let (fd, interest) = self.extract_fd_interest(&entry.op);
-    let Some((key, _)) = self.pending.insert_get_mut(entry) else {
-      unreachable!("poller: no room to park an operation `push` accepted");
-    };
+  /// Queues the operation behind those already waiting on its descriptor,
+  /// and has the OS poller watch for it.
+  fn park(&mut self, key: OpKey, op: Op, done: &mut Done<'_>) {
+    let (fd, interest) = self.extract_fd_interest(&op);
+    self.parked.insert(key, op);
     let queue = self.waiters.entry(fd).or_default().queue(interest);
     let already_watched = !queue.is_empty();
     queue.push_back(key);
@@ -345,21 +303,21 @@ impl Poller {
     if let Some(waiting) = self.waiters.get_mut(&fd) {
       waiting.queue(interest).pop_back();
     }
-    if let Some(entry) = self.pending.remove_value(key) {
-      let mut result = Self::exec_op(&entry.op);
+    if let Some(op) = self.parked.take(key) {
+      let mut result = Self::exec_op(&op);
       if result == EAGAIN_NEG || result == EWOULDBLOCK_NEG {
         result = raw_error(&err);
       }
-      self.queued_completed.push(entry.report(result));
+      report(done, key, result);
     }
     // Whoever waits for the other direction goes on waiting.
     if let Err(err) = Self::rearm(sys, &mut self.waiters, fd) {
       Self::fail_waiters(
-        &mut self.pending,
+        &mut self.parked,
         &mut self.waiters,
         fd,
         raw_error(&err),
-        &mut self.queued_completed,
+        done,
       );
     }
   }
@@ -1247,107 +1205,79 @@ impl IoBackend for Poller {
   fn init(&mut self, cap: usize) -> io::Result<()> {
     self.sys = Some(sys::OsPoller::new()?);
     self.events = Events::with_capacity(cap.min(4096));
-    self.capacity = cap;
-    self.backlog.clear();
-    self.backlog.reserve_exact(cap);
-    self.pending = Slab::new(cap);
+    self.parked = PerOp::new(cap);
     self.waiters.clear();
-    self.queued_completed = Vec::with_capacity(cap.min(256));
-    self.completed = Vec::with_capacity(cap.min(256));
     Ok(())
   }
 
-  fn push(&mut self, op: crate::backend::InFlight, _step_bump: &mut Bump) {
-    assert!(
-      self.backlog.len() + self.pending.len() < self.capacity,
-      "IoBackend capacity exceeded: attempted to queue more than {} operations",
-      self.capacity
-    );
-    self.backlog.push(op);
-  }
+  fn start(
+    &mut self,
+    queued: Queued<'_>,
+    _step_bump: &mut Bump,
+    done: &mut Done<'_>,
+  ) -> Started {
+    if let Some(result) = Self::validate_op(queued.as_op()) {
+      return queued.refuse(result);
+    }
+    let (started, key, op) = queued.begin();
+    if matches!(op, Op::Nop) {
+      report(done, key, 0);
+      return started;
+    };
 
-  fn flush(&mut self) -> io::Result<()> {
-    // In the order they were pushed: operations on one descriptor wait in
-    // that order.
-    let mut backlog = std::mem::take(&mut self.backlog);
-    for queued in backlog.drain(..) {
-      let (op, ticket) = queued.start();
-      let entry = PendingOp { op, ticket };
-      if matches!(entry.op, Op::Nop) {
-        self.queued_completed.push(entry.report(0));
-        continue;
+    if Self::should_complete_immediately(op) {
+      report(done, key, Self::exec_op(op));
+      return started;
+    }
+
+    if let Some(result) = Self::try_socket_immediately(op) {
+      report(done, key, result);
+      return started;
+    }
+
+    if let Op::Connect { fd, addr } = &*op {
+      let Ok((storage, len)) = Self::lower_socket_addr(addr) else {
+        report(done, key, -(libc::EINVAL as isize));
+        return started;
       };
+      let result = syscall!(raw connect(
+        fd.as_raw_fd(),
+        (&storage as *const libc::sockaddr_storage).cast(),
+        len,
+      ));
 
-      if let Some(result) = Self::validate_op(&entry.op) {
-        self.queued_completed.push(entry.report(result));
-        continue;
-      }
-
-      if Self::should_complete_immediately(&entry.op) {
-        let result = Self::exec_op(&entry.op);
-        self.queued_completed.push(entry.report(result));
-        continue;
-      }
-
-      if let Some(result) = Self::try_socket_immediately(&entry.op) {
-        self.queued_completed.push(entry.report(result));
-        continue;
-      }
-
-      if let Op::Connect { fd, addr } = &entry.op {
-        let Ok((storage, len)) = Self::lower_socket_addr(addr) else {
-          self.queued_completed.push(entry.report(-(libc::EINVAL as isize)));
-          continue;
-        };
-        let result = syscall!(raw connect(
-          fd.as_raw_fd(),
-          (&storage as *const libc::sockaddr_storage).cast(),
-          len,
-        ));
-
-        match result {
-          0 => {
-            self.queued_completed.push(entry.report(0));
-            continue;
-          }
-          #[allow(unreachable_patterns)]
-          EAGAIN_NEG | EWOULDBLOCK_NEG => {}
-          #[cfg(unix)]
-          x if x == -(libc::EINPROGRESS as isize) => {}
-          _ => {
-            self.queued_completed.push(entry.report(result));
-            continue;
-          }
+      match result {
+        0 => {
+          report(done, key, 0);
+          return started;
+        }
+        #[allow(unreachable_patterns)]
+        EAGAIN_NEG | EWOULDBLOCK_NEG => {}
+        #[cfg(unix)]
+        x if x == -(libc::EINPROGRESS as isize) => {}
+        _ => {
+          report(done, key, result);
+          return started;
         }
       }
-
-      self.park(entry);
     }
-    // Keep the allocation for the next batch.
-    self.backlog = backlog;
 
-    Ok(())
+    // It waits for its descriptor: the poller keeps it until then.
+    self.park(key, std::mem::replace(op, Op::Nop), done);
+    started
   }
 
-  fn cancel(&mut self, id: u64) {
-    if let Some(index) = self.backlog.iter().position(|entry| entry.id() == id)
-    {
-      let entry = self.backlog.swap_remove(index);
-      self.queued_completed.push(entry.cancelled(-(libc::ECANCELED as isize)));
-      return;
-    }
+  fn cancel(&mut self, key: OpKey, done: &mut Done<'_>) {
     // This backend performs the I/O itself once the descriptor is ready, so
     // nothing outside it uses the op's memory: it can be dropped right away.
-    let Some(key) = self.pending.keys_where(|entry| entry.id() == id).next()
-    else {
+    let Some(op) = self.parked.take(key) else {
       return;
     };
-    let Some(entry) = self.pending.remove_value(key) else {
-      return;
-    };
+    // SAFETY: the operation was parked, so no call is using its addresses,
+    // and none will: it is out of `parked`. The result is negative.
+    unsafe { done.cancelled(key, -(libc::ECANCELED as isize)) };
     // The others waiting on its descriptor go on waiting.
-    let (fd, interest) = self.extract_fd_interest(&entry.op);
-    self.queued_completed.push(entry.stopped());
+    let (fd, interest) = self.extract_fd_interest(&op);
     let Some(waiting) = self.waiters.get_mut(&fd) else {
       return;
     };
@@ -1361,11 +1291,11 @@ impl IoBackend for Poller {
     };
     if let Err(err) = Self::rearm(sys, &mut self.waiters, fd) {
       Self::fail_waiters(
-        &mut self.pending,
+        &mut self.parked,
         &mut self.waiters,
         fd,
         raw_error(&err),
-        &mut self.queued_completed,
+        done,
       );
     }
   }
@@ -1373,37 +1303,25 @@ impl IoBackend for Poller {
   fn wait(
     &mut self,
     timeout: Option<Duration>,
-    completed: &mut Vec<OpCompleted>,
+    done: &mut Done<'_>,
   ) -> io::Result<()> {
-    completed.clear();
-    if !self.queued_completed.is_empty() {
-      completed.append(&mut self.queued_completed);
-      if self.pending.len() == 0 {
-        return Ok(());
-      }
+    let reported = done.waiting() > 0;
+    if reported && self.parked.is_empty() {
+      return Ok(());
     }
 
     // Immediate socket completions must not starve previously registered I/O.
     // Poll pending readiness too, without blocking delivery of ready results.
-    let timeout =
-      if completed.is_empty() { timeout } else { Some(Duration::ZERO) };
+    let timeout = if reported { Some(Duration::ZERO) } else { timeout };
 
     // Borrows only the field, unlike `sys()`: the loop below updates
-    // `pending` while `sys` is live.
+    // `parked` while `sys` is live.
     let Some(sys) = self.sys.as_ref() else {
       panic!("Poller not initialized: the driver calls init first");
     };
 
     {
-      let event_count = match sys.wait(self.events.as_buf(), timeout) {
-        Ok(count) => count,
-        Err(err) => {
-          // The driver cannot consume `completed` on an error. Preserve any
-          // immediate results so its next call can still deliver them.
-          self.queued_completed.append(completed);
-          return Err(err);
-        }
-      };
+      let event_count = sys.wait(self.events.as_buf(), timeout)?;
       // SAFETY: `wait()` initialized exactly `event_count` events in the buffer.
       unsafe { self.events.set_len(event_count) };
     }
@@ -1421,33 +1339,23 @@ impl IoBackend for Poller {
       let readers = ready.is_readable() || waiting.writers.is_empty();
       let writers = ready.is_writable() || waiting.readers.is_empty();
       if readers {
-        Self::serve(
-          &mut waiting.readers,
-          &mut self.pending,
-          &mut self.completed,
-        );
+        Self::serve(&mut waiting.readers, &mut self.parked, done);
       }
       if writers {
-        Self::serve(
-          &mut waiting.writers,
-          &mut self.pending,
-          &mut self.completed,
-        );
+        Self::serve(&mut waiting.writers, &mut self.parked, done);
       }
 
       // The event used the registration up.
       if let Err(err) = Self::rearm(sys, &mut self.waiters, fd) {
         Self::fail_waiters(
-          &mut self.pending,
+          &mut self.parked,
           &mut self.waiters,
           fd,
           raw_error(&err),
-          &mut self.completed,
+          done,
         );
       }
     }
-
-    completed.append(&mut self.completed);
 
     Ok(())
   }

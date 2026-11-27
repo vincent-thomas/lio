@@ -4,9 +4,9 @@ lio_test::test_io_backend!(lio, Iocp::new());
 
 #[test]
 fn notify_wakes_a_blocked_wait() {
-  let mut backend = Iocp::new();
+  let mut backend = lio::backend::Tracked::new(Iocp::new());
   backend.init(64).unwrap();
-  backend.notify().unwrap();
+  backend.backend().notify().unwrap();
 
   let mut completed = Vec::new();
   backend.wait(Some(Duration::from_secs(5)), &mut completed).unwrap();
@@ -28,24 +28,21 @@ fn drop_cancels_a_blocked_pipe_read() {
   let mut buf = [0_u8; 4];
   let raw = RawBufMut::from_mut(&mut buf);
 
-  let mut backend = Iocp::new();
+  let mut backend = lio::backend::Tracked::new(Iocp::new());
   backend.init(8).unwrap();
   // SAFETY: `buf` stays alive until this backend is dropped.
   unsafe {
     backend.push(
-      lio::backend::InFlight::attest(
-        1,
-        lio::backend::op::BorrowedOp::read(
-          reader,
-          std::slice::from_ref(&raw),
-          None,
-          ReadFlags::empty(),
-        ),
+      1,
+      lio::backend::op::BorrowedOp::read(
+        reader,
+        std::slice::from_ref(&raw),
+        None,
+        ReadFlags::empty(),
       ),
-      &mut bumpalo::Bump::new(),
     );
   }
-  backend.flush().unwrap();
+  backend.flush();
   // Give a worker time to block in ReadFile on the empty pipe.
   std::thread::sleep(Duration::from_millis(50));
 

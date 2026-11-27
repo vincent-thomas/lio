@@ -25,7 +25,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::hint::black_box;
 use std::io;
 use std::ptr;
@@ -36,7 +36,7 @@ use bumpalo::Bump;
 
 use crate::api::resource::ResourceClose;
 use crate::backend::op::{MsgBuf, MsgBufMut, Op};
-use crate::backend::{IoBackend, OpCompleted};
+use crate::backend::{Done, IoBackend, OpKey, Queued, Started};
 
 /// The byte [`ScriptedBackend`] writes into the buffers it fills.
 pub const POISON: u8 = 0xA5;
@@ -51,26 +51,15 @@ struct Script {
   init: Option<usize>,
   /// Every id ever pushed, in push order.
   pushed: Vec<u64>,
-  /// Pushed and not yet completed, in push order.
-  in_flight: Vec<(u64, Op)>,
-  /// The tickets of `in_flight`, given up with those operations.
-  tickets: HashMap<u64, crate::backend::Ticket>,
+  /// Started and not yet completed, in push order.
+  in_flight: Vec<(u64, OpKey, Op)>,
   cancelled: Vec<u64>,
-  /// Completed, waiting for the next `wait()`.
-  ready: VecDeque<OpCompleted>,
+  /// Completed, waiting for the next `wait()`: the key, the result, and
+  /// whether the operation was stopped.
+  ready: VecDeque<(OpKey, isize, bool)>,
   auto: Option<isize>,
   stuck: bool,
   no_poison: bool,
-}
-
-impl Drop for Script {
-  fn drop(&mut self) {
-    for (_, ticket) in self.tickets.drain() {
-      // SAFETY: no kernel or thread ever sees the addresses, and this
-      // backend is gone: nothing uses them. The result is negative.
-      drop(unsafe { ticket.cancelled(CANCELLED) });
-    }
-  }
 }
 
 /// A backend that only does what the test tells it to.
@@ -145,13 +134,13 @@ impl ScriptedBackend {
 
   /// Ids pushed and not yet completed, in push order.
   pub fn in_flight(&self) -> Vec<u64> {
-    self.0.borrow().in_flight.iter().map(|(id, _)| *id).collect()
+    self.0.borrow().in_flight.iter().map(|(id, ..)| *id).collect()
   }
 
   /// The operation `id` was pushed with, while it is in flight.
   pub fn op(&self, id: u64) -> Option<Op> {
     let script = self.0.borrow();
-    script.in_flight.iter().find(|(i, _)| *i == id).map(|(_, op)| op.clone())
+    script.in_flight.iter().find(|(i, ..)| *i == id).map(|(.., op)| op.clone())
   }
 
   /// Every id the driver asked to cancel, in order.
@@ -168,23 +157,16 @@ impl ScriptedBackend {
   /// real backend could produce.
   pub fn complete(&self, id: u64, result: isize) {
     let mut script = self.0.borrow_mut();
-    let Some(pos) = script.in_flight.iter().position(|(i, _)| *i == id) else {
+    let Some(pos) = script.in_flight.iter().position(|(i, ..)| *i == id) else {
       panic!("ScriptedBackend::complete: operation {id} is not in flight");
     };
-    let (_, op) = script.in_flight.remove(pos);
-    let Some(ticket) = script.tickets.remove(&id) else {
-      unreachable!("ScriptedBackend: operation {id} is in flight unticketed");
-    };
+    let (_, key, op) = script.in_flight.remove(pos);
     if !script.no_poison {
       // SAFETY: the operation is still in flight, so the driver keeps the
       // memory it points to valid until it sees this completion.
       unsafe { touch(&op) };
     }
-    // SAFETY: no kernel or thread ever sees the addresses. Every byte the
-    // operation could receive was just written, so any byte count the test
-    // scripts is one that was written; `without_poison` hands that claim to
-    // the test.
-    script.ready.push_back(unsafe { ticket.complete(result) });
+    script.ready.push_back((key, result, false));
   }
 
   /// Finishes every in-flight operation with `result`, in push order.
@@ -205,36 +187,42 @@ impl IoBackend for ScriptedBackend {
     ResourceClose::noop()
   }
 
-  fn push(&mut self, op: crate::backend::InFlight, _step_bump: &mut Bump) {
+  fn start(
+    &mut self,
+    op: Queued<'_>,
+    _step_bump: &mut Bump,
+    _done: &mut Done<'_>,
+  ) -> Started {
     // The scripted kernel has the operation from here on.
-    let (op, ticket) = op.start();
-    let id = ticket.id();
-    let mut script = self.0.borrow_mut();
-    script.pushed.push(id);
-    script.in_flight.push((id, op));
-    script.tickets.insert(id, ticket);
-  }
-
-  fn flush(&mut self) -> io::Result<()> {
-    let auto = self.0.borrow().auto;
+    let id = op.id();
+    let (started, key, op) = op.begin();
+    let auto = {
+      let mut script = self.0.borrow_mut();
+      script.pushed.push(id);
+      script.in_flight.push((id, key, std::mem::replace(op, Op::Nop)));
+      script.auto
+    };
     if let Some(result) = auto {
-      self.complete_all(result);
+      self.complete(id, result);
     }
-    Ok(())
+    started
   }
 
-  fn cancel(&mut self, id: u64) {
-    self.0.borrow_mut().cancelled.push(id);
+  fn cancel(&mut self, key: OpKey, _done: &mut Done<'_>) {
+    let mut script = self.0.borrow_mut();
+    let id = script.in_flight.iter().find(|(_, k, _)| *k == key).map(|e| e.0);
+    // One completed by the test already reports that completion.
+    script.cancelled.extend(id);
   }
 
   fn wait(
     &mut self,
     timeout: Option<Duration>,
-    completed: &mut Vec<OpCompleted>,
+    done: &mut Done<'_>,
   ) -> io::Result<()> {
-    completed.clear();
     let mut script = self.0.borrow_mut();
-    if script.ready.is_empty() && timeout != Some(Duration::ZERO) {
+    let idle = script.ready.is_empty() && done.waiting() == 0;
+    if idle && timeout != Some(Duration::ZERO) {
       if script.stuck {
         drop(script);
         std::thread::sleep(timeout.unwrap_or(Duration::ZERO));
@@ -242,7 +230,21 @@ impl IoBackend for ScriptedBackend {
       }
       script.stop_cancelled();
     }
-    completed.extend(script.ready.drain(..));
+    for (key, result, stopped) in script.ready.drain(..) {
+      // SAFETY: no kernel or thread ever sees the addresses, and the
+      // operation left `in_flight` when this report was queued. Every byte
+      // the operation could receive was written then, so any byte count the
+      // test scripts is one that was written; `without_poison` hands that
+      // claim to the test. A stopped operation reports `CANCELLED`, which
+      // is negative.
+      unsafe {
+        if stopped {
+          done.cancelled(key, result)
+        } else {
+          done.complete(key, result)
+        }
+      }
+    }
     Ok(())
   }
 }
@@ -253,20 +255,15 @@ impl Script {
     let cancelled = &self.cancelled;
     let (stopped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.in_flight)
       .into_iter()
-      .partition(|(id, _)| cancelled.contains(id));
+      .partition(|(id, ..)| cancelled.contains(id));
     self.in_flight = kept;
-    for (id, op) in stopped {
-      let Some(ticket) = self.tickets.remove(&id) else {
-        unreachable!("ScriptedBackend: operation {id} is in flight unticketed");
-      };
+    for (_, key, op) in stopped {
       if !self.no_poison {
         // SAFETY: a stopped operation may have been finishing, so the driver
         // keeps its memory valid until it sees this completion.
         unsafe { touch(&op) };
       }
-      // SAFETY: no kernel or thread ever sees the addresses, and the result
-      // is negative.
-      self.ready.push_back(unsafe { ticket.cancelled(CANCELLED) });
+      self.ready.push_back((key, CANCELLED, true));
     }
   }
 }
@@ -354,23 +351,22 @@ unsafe fn read_bytes(ptr: *const u8, len: usize) {
   }
 }
 
-/// Wraps a backend and panics when either side breaks the [`IoBackend`]
+/// Wraps a backend and panics when the driver breaks the [`IoBackend`]
 /// contract.
 ///
 /// It checks that the driver:
 /// - calls `init` exactly once, before anything else
-/// - never pushes an id that is still in flight
-/// - never has more operations in flight than the initialized capacity
 /// - never drops the backend with operations in flight
 ///
-/// and that the backend:
-/// - completes only ids that are in flight, each exactly once
-///
-/// An operation is in flight from its `push` until its completion is
-/// returned by `wait`.
+/// An operation is in flight from the `start` that begins it until the
+/// backend reports it. What a backend could get wrong about reporting (an
+/// unknown operation, one reported twice) the table it reports to rules
+/// out, and so does [`Tracked`](crate::backend::Tracked) for an id pushed
+/// twice or past the capacity.
 pub struct Checked<B> {
   inner: B,
   cap: Option<usize>,
+  /// The ids of the operations that were begun and not reported.
   in_flight: HashSet<u64>,
 }
 
@@ -395,6 +391,21 @@ impl<B: IoBackend> Checked<B> {
       .cap
       .unwrap_or_else(|| panic!("contract: `{call}` called before `init`"))
   }
+
+  /// Runs one call of the wrapped backend, and takes what it reported out
+  /// of the operations in flight.
+  fn tracking<R>(
+    &mut self,
+    done: &mut Done<'_>,
+    call: impl FnOnce(&mut B, &mut Done<'_>) -> R,
+  ) -> R {
+    let before = done.waiting();
+    let result = call(&mut self.inner, done);
+    for reported in &done.reported()[before..] {
+      self.in_flight.remove(&reported.registration_id());
+    }
+    result
+  }
 }
 
 impl<B: IoBackend> IoBackend for Checked<B> {
@@ -409,47 +420,36 @@ impl<B: IoBackend> IoBackend for Checked<B> {
     self.inner.resource_close()
   }
 
-  fn push(&mut self, op: crate::backend::InFlight, step_bump: &mut Bump) {
-    let cap = self.cap("push");
+  fn start(
+    &mut self,
+    op: Queued<'_>,
+    step_bump: &mut Bump,
+    done: &mut Done<'_>,
+  ) -> Started {
+    self.cap("start");
+    // In flight before the call: the backend may report it from there.
     let id = op.id();
-    assert!(
-      self.in_flight.len() < cap,
-      "contract: pushed operation {id} with {cap} already in flight (capacity \
-       {cap})"
-    );
-    assert!(
-      self.in_flight.insert(id),
-      "contract: pushed operation {id} while it is still in flight"
-    );
-    self.inner.push(op, step_bump);
+    self.in_flight.insert(id);
+    let started =
+      self.tracking(done, |inner, done| inner.start(op, step_bump, done));
+    if !started.began() {
+      self.in_flight.remove(&id);
+    }
+    started
   }
 
-  fn flush(&mut self) -> io::Result<()> {
-    self.cap("flush");
-    self.inner.flush()
-  }
-
-  fn cancel(&mut self, id: u64) {
+  fn cancel(&mut self, key: OpKey, done: &mut Done<'_>) {
     self.cap("cancel");
-    self.inner.cancel(id);
+    self.tracking(done, |inner, done| inner.cancel(key, done));
   }
 
   fn wait(
     &mut self,
     timeout: Option<Duration>,
-    completed: &mut Vec<OpCompleted>,
+    done: &mut Done<'_>,
   ) -> io::Result<()> {
     self.cap("wait");
-    self.inner.wait(timeout, completed)?;
-    for done in completed.iter() {
-      let id = done.registration_id();
-      assert!(
-        self.in_flight.remove(&id),
-        "contract: backend completed operation {id}, which is not in flight \
-         (unknown, or already completed)"
-      );
-    }
-    Ok(())
+    self.tracking(done, |inner, done| inner.wait(timeout, done))
   }
 }
 
@@ -467,80 +467,77 @@ impl<B> Drop for Checked<B> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::backend::op::BorrowedOp;
+  use crate::backend::Tracked;
+  use crate::backend::op::{BorrowedOp, RawBuf};
 
-  fn push_op(backend: &mut impl IoBackend, id: u64, op: Op) {
+  type Driven = Tracked<Checked<ScriptedBackend>>;
+
+  fn push_op<B: IoBackend>(io: &mut Tracked<B>, id: u64, op: Op) {
     // SAFETY: every buffer these tests submit stays alive until the backend
     // has reported the operation.
-    unsafe {
-      backend.push(
-        crate::backend::InFlight::attest(id, BorrowedOp::from_op(op)),
-        &mut Bump::new(),
-      )
-    };
+    unsafe { io.push(id, BorrowedOp::from_op(op)) };
   }
-  use crate::backend::op::RawBuf;
 
-  fn init(cap: usize) -> (ScriptedBackend, Checked<ScriptedBackend>) {
+  fn init(cap: usize) -> (ScriptedBackend, Driven) {
     let backend = ScriptedBackend::new();
-    let mut checked = Checked::new(backend.clone());
-    checked.init(cap).unwrap();
-    (backend, checked)
+    let mut io = Tracked::new(Checked::new(backend.clone()));
+    io.init(cap).unwrap();
+    (backend, io)
   }
 
-  fn wait(backend: &mut impl IoBackend) -> Vec<u64> {
+  fn wait<B: IoBackend>(io: &mut Tracked<B>) -> Vec<u64> {
     let mut completed = Vec::new();
-    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    io.wait(Some(Duration::ZERO), &mut completed).unwrap();
     completed.iter().map(|c| c.registration_id()).collect()
   }
 
   #[test]
   fn dropping_the_backend_gives_up_the_operations_it_still_holds() {
     let keep = crate::backend::Keep::new();
-    let mut backend = ScriptedBackend::new();
-    backend.init(4).unwrap();
+    let mut io = Tracked::new(ScriptedBackend::new());
+    io.init(4).unwrap();
     // SAFETY: a nop carries no addresses.
     let op = unsafe { BorrowedOp::from_op(Op::Nop) };
-    backend.push(
-      crate::backend::InFlight::from_model(1, op, keep.clone()),
-      &mut Bump::new(),
-    );
-    assert!(keep.held_elsewhere(), "the backend holds the operation");
+    io.push_model(1, op, keep.clone());
+    io.flush();
+    assert!(keep.held_elsewhere(), "the backend has the operation");
 
-    drop(backend);
+    drop(io);
 
     assert!(!keep.held_elsewhere(), "the operation was given up");
   }
 
   #[test]
   fn holds_operations_until_completed() {
-    let (backend, mut checked) = init(4);
-    push_op(&mut checked, 1, Op::Nop);
-    push_op(&mut checked, 2, Op::Nop);
-    checked.flush().unwrap();
-    assert!(wait(&mut checked).is_empty());
+    let (backend, mut io) = init(4);
+    push_op(&mut io, 1, Op::Nop);
+    push_op(&mut io, 2, Op::Nop);
+    assert!(backend.pushed().is_empty(), "queued, not started");
+    io.flush();
+    assert!(wait(&mut io).is_empty());
 
     backend.complete(2, 0);
-    assert_eq!(wait(&mut checked), vec![2]);
+    assert_eq!(wait(&mut io), vec![2]);
     assert_eq!(backend.in_flight(), vec![1]);
-    assert_eq!(checked.in_flight(), 1);
+    assert_eq!(io.backend().in_flight(), 1);
 
     backend.complete(1, -1);
-    assert_eq!(wait(&mut checked), vec![1]);
+    assert_eq!(wait(&mut io), vec![1]);
     assert_eq!(backend.pushed(), vec![1, 2]);
+    assert_eq!(io.backend().in_flight(), 0);
   }
 
   #[test]
   fn auto_completes_on_flush_in_push_order() {
-    let mut backend = Checked::new(ScriptedBackend::auto(7));
-    backend.init(4).unwrap();
+    let mut io = Tracked::new(Checked::new(ScriptedBackend::auto(7)));
+    io.init(4).unwrap();
     for id in [3, 1, 2] {
-      push_op(&mut backend, id, Op::Nop);
+      push_op(&mut io, id, Op::Nop);
     }
-    assert!(wait(&mut backend).is_empty(), "nothing before the flush");
-    backend.flush().unwrap();
+    assert!(wait(&mut io).is_empty(), "nothing before the flush");
+    io.flush();
     let mut completed = Vec::new();
-    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    io.wait(Some(Duration::ZERO), &mut completed).unwrap();
     assert_eq!(
       completed
         .iter()
@@ -548,11 +545,12 @@ mod tests {
         .collect::<Vec<_>>(),
       vec![(3, 7), (1, 7), (2, 7)]
     );
+    assert_eq!(io.backend().in_flight(), 0, "each was counted out once");
   }
 
   #[test]
   fn poisons_received_bytes_and_reads_sent_bytes() {
-    let (backend, mut checked) = init(2);
+    let (backend, mut io) = init(2);
     let mut into = [0u8; 8];
     let read_buf = [crate::backend::op::RawBufMut::from_mut(&mut into)];
     let from = *b"payload!";
@@ -573,12 +571,13 @@ mod tests {
       flags: Default::default(),
     };
 
-    push_op(&mut checked, 1, read);
-    push_op(&mut checked, 2, write);
+    push_op(&mut io, 1, read);
+    push_op(&mut io, 2, write);
+    io.flush();
     backend.complete_all(8);
     assert_eq!(into, [POISON; 8]);
     assert_eq!(&from, b"payload!", "sent bytes are only read");
-    assert_eq!(wait(&mut checked), vec![1, 2]);
+    assert_eq!(wait(&mut io), vec![1, 2]);
   }
 
   /// A read of one byte into `into`.
@@ -599,7 +598,7 @@ mod tests {
 
   #[test]
   fn records_its_capacity() {
-    let (backend, _checked) = init(4);
+    let (backend, _io) = init(4);
     assert_eq!(backend.capacity(), Some(4));
     assert_eq!(ScriptedBackend::new().capacity(), None);
   }
@@ -608,18 +607,20 @@ mod tests {
   fn stopping_poisons_unless_told_not_to() {
     for poison in [true, false] {
       let backend = ScriptedBackend::new();
-      let mut backend = if poison {
+      let backend = if poison {
         backend
       } else {
         // SAFETY: the operation below is stopped, never completed.
         unsafe { backend.without_poison() }
       };
-      backend.init(1).unwrap();
+      let mut io = Tracked::new(backend);
+      io.init(1).unwrap();
       let (mut into, mut iovec) = (0u8, crate::backend::op::RawBufMut::empty());
-      push_op(&mut backend, 1, read_into(&mut into, &mut iovec));
-      backend.cancel(1);
+      push_op(&mut io, 1, read_into(&mut into, &mut iovec));
+      io.flush();
+      io.cancel(1);
       let mut completed = Vec::new();
-      backend.wait(None, &mut completed).unwrap();
+      io.wait(None, &mut completed).unwrap();
       assert!(completed[0].is_cancelled());
       assert_eq!(completed[0].result(), CANCELLED);
       assert_eq!(into, if poison { POISON } else { 0 }, "poison: {poison}");
@@ -630,38 +631,97 @@ mod tests {
   fn without_poison_completes_without_touching_buffers() {
     // SAFETY: the one read completed below points at an initialized byte.
     let backend = unsafe { ScriptedBackend::new().without_poison() };
-    let mut driver = backend.clone();
-    driver.init(1).unwrap();
+    let mut io = Tracked::new(backend.clone());
+    io.init(1).unwrap();
     let (mut into, mut iovec) = (0u8, crate::backend::op::RawBufMut::empty());
-    push_op(&mut driver, 1, read_into(&mut into, &mut iovec));
+    push_op(&mut io, 1, read_into(&mut into, &mut iovec));
+    io.flush();
     backend.complete(1, 1);
     assert_eq!(into, 0);
-    assert_eq!(wait(&mut driver), vec![1]);
+    assert_eq!(wait(&mut io), vec![1]);
   }
 
   #[test]
   fn a_cancel_is_recorded_and_acted_on_when_the_driver_blocks() {
-    let (backend, mut checked) = init(2);
-    push_op(&mut checked, 1, Op::Nop);
-    push_op(&mut checked, 2, Op::Nop);
-    checked.cancel(1);
-    checked.cancel(99);
-    assert_eq!(backend.cancelled(), vec![1, 99]);
-    assert!(wait(&mut checked).is_empty(), "a poll leaves it in flight");
+    let (backend, mut io) = init(2);
+    push_op(&mut io, 1, Op::Nop);
+    push_op(&mut io, 2, Op::Nop);
+    io.flush();
+    io.cancel(1);
+    io.cancel(99);
+    assert_eq!(
+      backend.cancelled(),
+      vec![1],
+      "an unknown id stops at the table"
+    );
+    assert!(wait(&mut io).is_empty(), "a poll leaves it in flight");
     assert_eq!(backend.in_flight(), vec![1, 2]);
 
     backend.set_stuck(true);
     let mut completed = Vec::new();
-    checked.wait(Some(Duration::from_millis(1)), &mut completed).unwrap();
+    io.wait(Some(Duration::from_millis(1)), &mut completed).unwrap();
     assert!(completed.is_empty(), "a stuck backend ignores the cancel");
 
     backend.set_stuck(false);
-    checked.wait(None, &mut completed).unwrap();
+    io.wait(None, &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
     assert!(completed[0].is_cancelled());
     assert_eq!(backend.in_flight(), vec![2], "only what was cancelled");
     backend.complete(2, 0);
-    assert_eq!(wait(&mut checked), vec![2]);
+    assert_eq!(wait(&mut io), vec![2]);
+  }
+
+  #[test]
+  fn a_stuck_backend_still_reports_what_the_test_completed() {
+    let (backend, mut io) = init(2);
+    push_op(&mut io, 1, Op::Nop);
+    push_op(&mut io, 2, Op::Nop);
+    io.flush();
+    io.cancel(2);
+    backend.set_stuck(true);
+    backend.complete(1, 0);
+    let mut completed = Vec::new();
+    io.wait(Some(Duration::from_millis(1)), &mut completed).unwrap();
+    let ids: Vec<u64> = completed.iter().map(|c| c.registration_id()).collect();
+    assert_eq!(ids, [1], "the completion is not held back, the cancel is");
+    assert_eq!(backend.in_flight(), vec![2]);
+    backend.complete(2, 0);
+    assert_eq!(wait(&mut io), vec![2]);
+  }
+
+  #[test]
+  fn a_report_the_driver_has_not_collected_keeps_a_wait_from_blocking() {
+    // The cancel of a queued operation is reported by the table. With that
+    // report waiting, the scripted kernel is not idle: it does not act on
+    // the other cancel yet.
+    let (backend, mut io) = init(2);
+    push_op(&mut io, 1, Op::Nop);
+    io.flush();
+    io.cancel(1);
+    push_op(&mut io, 2, Op::Nop);
+    io.cancel(2);
+    let mut completed = Vec::new();
+    io.wait(None, &mut completed).unwrap();
+    let ids: Vec<u64> = completed.iter().map(|c| c.registration_id()).collect();
+    assert_eq!(ids, [2], "what the kernel was asked to stop waits its turn");
+    assert_eq!(backend.in_flight(), vec![1]);
+    io.wait(None, &mut completed).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert!(completed[0].is_cancelled());
+  }
+
+  #[test]
+  fn a_cancel_before_the_flush_never_reaches_the_backend() {
+    let (backend, mut io) = init(2);
+    push_op(&mut io, 1, Op::Nop);
+    io.cancel(1);
+    io.flush();
+    let mut completed = Vec::new();
+    io.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert!(completed[0].is_cancelled());
+    assert_eq!(completed[0].result(), crate::backend::CANCELLED_BEFORE_START);
+    assert!(backend.pushed().is_empty() && backend.cancelled().is_empty());
   }
 
   #[test]
@@ -672,77 +732,164 @@ mod tests {
 
   #[test]
   #[should_panic(expected = "before `init`")]
-  fn push_before_init_breaks_the_contract() {
-    push_op(&mut Checked::new(ScriptedBackend::new()), 1, Op::Nop);
+  fn start_before_init_breaks_the_contract() {
+    // The table is initialized here, and the backend under `Checked` is not.
+    let mut io = Tracked::new(Uninit(Checked::new(ScriptedBackend::new())));
+    io.init(1).unwrap();
+    push_op(&mut io, 1, Op::Nop);
+    io.flush();
+  }
+
+  /// Forwards everything but `init`.
+  struct Uninit<B>(B);
+
+  impl<B: IoBackend> IoBackend for Uninit<B> {
+    fn init(&mut self, _: usize) -> io::Result<()> {
+      Ok(())
+    }
+    fn resource_close(&self) -> ResourceClose {
+      self.0.resource_close()
+    }
+    fn start(
+      &mut self,
+      op: Queued<'_>,
+      step_bump: &mut Bump,
+      done: &mut Done<'_>,
+    ) -> Started {
+      self.0.start(op, step_bump, done)
+    }
+    fn cancel(&mut self, key: OpKey, done: &mut Done<'_>) {
+      self.0.cancel(key, done)
+    }
+    fn wait(
+      &mut self,
+      timeout: Option<Duration>,
+      done: &mut Done<'_>,
+    ) -> io::Result<()> {
+      self.0.wait(timeout, done)
+    }
   }
 
   #[test]
   #[should_panic(expected = "`init` called twice")]
   fn second_init_breaks_the_contract() {
-    let (_, mut checked) = init(1);
-    let _ = checked.init(1);
+    let (_, mut io) = init(1);
+    let _ = io.backend_mut().init(1);
   }
 
   #[test]
   #[should_panic(expected = "still in flight")]
-  fn pushing_an_in_flight_id_breaks_the_contract() {
-    let (_, mut checked) = init(2);
-    push_op(&mut checked, 1, Op::Nop);
-    push_op(&mut checked, 1, Op::Nop);
+  fn pushing_an_in_flight_id_is_refused_by_the_table() {
+    let (_, mut io) = init(2);
+    push_op(&mut io, 1, Op::Nop);
+    push_op(&mut io, 1, Op::Nop);
   }
 
   #[test]
-  #[should_panic(expected = "already in flight (capacity 1)")]
-  fn pushing_over_capacity_breaks_the_contract() {
-    let (_, mut checked) = init(1);
-    push_op(&mut checked, 1, Op::Nop);
-    push_op(&mut checked, 2, Op::Nop);
+  #[should_panic(expected = "capacity exceeded")]
+  fn pushing_over_capacity_is_refused_by_the_table() {
+    let (_, mut io) = init(1);
+    push_op(&mut io, 1, Op::Nop);
+    push_op(&mut io, 2, Op::Nop);
+  }
+
+  /// Reports the one operation it is given at every chance it gets.
+  struct Eager(Option<OpKey>);
+
+  impl IoBackend for Eager {
+    fn init(&mut self, _: usize) -> io::Result<()> {
+      Ok(())
+    }
+    fn resource_close(&self) -> ResourceClose {
+      ResourceClose::noop()
+    }
+    fn start(
+      &mut self,
+      op: Queued<'_>,
+      _: &mut Bump,
+      _: &mut Done<'_>,
+    ) -> Started {
+      let (started, key, _) = op.begin();
+      self.0 = Some(key);
+      started
+    }
+    // Its operations finish on their own: there is nothing to stop.
+    fn cancel(&mut self, _: OpKey, _: &mut Done<'_>) {}
+    fn wait(
+      &mut self,
+      _: Option<Duration>,
+      done: &mut Done<'_>,
+    ) -> io::Result<()> {
+      if let Some(key) = self.0 {
+        // SAFETY: a nop has no addresses, and 0 is what a nop does.
+        unsafe { done.complete(key, 0) };
+      }
+      Ok(())
+    }
   }
 
   #[test]
-  #[should_panic(expected = "which is not in flight")]
-  fn completing_twice_breaks_the_contract() {
-    struct Twice(Option<u64>);
-    impl IoBackend for Twice {
+  fn a_second_report_of_an_operation_is_ignored() {
+    let mut io = Tracked::new(Checked::new(Eager(None)));
+    io.init(1).unwrap();
+    push_op(&mut io, 1, Op::Nop);
+    io.flush();
+    assert_eq!(wait(&mut io), vec![1]);
+    assert!(wait(&mut io).is_empty(), "reported once");
+
+    // The slot's next operation is not the one the stale key names.
+    push_op(&mut io, 1, Op::Nop);
+    assert!(wait(&mut io).is_empty(), "the stale key reports nothing");
+    assert_eq!(io.in_flight(), 1);
+    io.flush();
+    assert_eq!(wait(&mut io), vec![1]);
+  }
+
+  #[test]
+  fn a_refused_operation_is_reported_failed() {
+    struct Refusing;
+    impl IoBackend for Refusing {
       fn init(&mut self, _: usize) -> io::Result<()> {
         Ok(())
       }
-      fn push(&mut self, op: crate::backend::InFlight, _: &mut Bump) {
-        self.0 = Some(op.id());
+      fn resource_close(&self) -> ResourceClose {
+        ResourceClose::noop()
       }
-      fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+      fn start(
+        &mut self,
+        op: Queued<'_>,
+        _: &mut Bump,
+        _: &mut Done<'_>,
+      ) -> Started {
+        op.refuse(-22)
       }
+      fn cancel(&mut self, _: OpKey, _: &mut Done<'_>) {}
       fn wait(
         &mut self,
         _: Option<Duration>,
-        completed: &mut Vec<OpCompleted>,
+        _: &mut Done<'_>,
       ) -> io::Result<()> {
-        completed.clear();
-        // Reported without a ticket, which only a test can do.
-        completed.extend(self.0.map(|id| OpCompleted::forged(id, 0)));
         Ok(())
       }
-
-      fn resource_close(&self) -> crate::api::resource::ResourceClose {
-        crate::api::resource::ResourceClose::native()
-      }
-
-      // Its operations finish on their own: there is nothing to stop.
-      fn cancel(&mut self, _id: u64) {}
     }
 
-    let mut checked = Checked::new(Twice(None));
-    checked.init(1).unwrap();
-    push_op(&mut checked, 1, Op::Nop);
-    wait(&mut checked);
-    wait(&mut checked);
+    let mut io = Tracked::new(Checked::new(Refusing));
+    io.init(1).unwrap();
+    push_op(&mut io, 1, Op::Nop);
+    io.flush();
+    let mut completed = Vec::new();
+    io.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].result(), -22);
+    assert!(!completed[0].is_cancelled());
+    assert_eq!(io.backend().in_flight(), 0);
   }
 
   #[test]
   #[should_panic(expected = "operations in flight")]
   fn dropping_with_operations_in_flight_breaks_the_contract() {
-    let (_, mut checked) = init(1);
-    push_op(&mut checked, 1, Op::Nop);
+    let (_, mut io) = init(1);
+    push_op(&mut io, 1, Op::Nop);
+    io.flush();
   }
 }

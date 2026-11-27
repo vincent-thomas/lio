@@ -1,5 +1,6 @@
 use super::*;
 use crate::api::resource::Resource;
+use crate::backend::Tracked;
 use crate::backend::op::{BorrowedOp, RawBufMut, ReadFlags};
 use std::os::fd::{FromRawFd, IntoRawFd};
 
@@ -92,27 +93,30 @@ fn trace_read_batches() {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    fn push(&mut self, op: crate::backend::InFlight, bump: &mut Bump) {
-      self.inner.push(op, bump)
-    }
-    fn flush(&mut self) -> io::Result<()> {
+    fn start(
+      &mut self,
+      op: Queued<'_>,
+      bump: &mut Bump,
+      done: &mut Done<'_>,
+    ) -> Started {
       let t = Instant::now();
-      let result = self.inner.flush();
+      let started = self.inner.start(op, bump, done);
       self.stats.borrow_mut().flush_ns += t.elapsed().as_nanos();
-      result
+      started
     }
     fn wait(
       &mut self,
       timeout: Option<Duration>,
-      completed: &mut Vec<OpCompleted>,
+      done: &mut Done<'_>,
     ) -> io::Result<()> {
+      let before = done.waiting();
       let t = Instant::now();
-      let result = self.inner.wait(timeout, completed);
+      let result = self.inner.wait(timeout, done);
       let elapsed = t.elapsed().as_nanos();
       let mut stats = self.stats.borrow_mut();
       stats.waits += 1;
       stats.wait_ns += elapsed;
-      stats.chunks[completed.len()] += 1;
+      stats.chunks[done.waiting() - before] += 1;
       result
     }
 
@@ -120,8 +124,8 @@ fn trace_read_batches() {
       self.inner.resource_close()
     }
 
-    fn cancel(&mut self, id: u64) {
-      self.inner.cancel(id)
+    fn cancel(&mut self, key: OpKey, done: &mut Done<'_>) {
+      self.inner.cancel(key, done)
     }
   }
   let depth: usize =
@@ -256,9 +260,8 @@ fn nonblocking_waits_make_progress_on_file_completions() {
   let file = Resource::from(unsafe {
     std::os::fd::OwnedFd::from_raw_fd(file.into_raw_fd())
   });
-  let mut backend = IoUring::with_deferred_completions();
+  let mut backend = Tracked::new(IoUring::with_deferred_completions());
   backend.init(DEPTH).unwrap();
-  let mut arena = Bump::new();
   let mut buffers = vec![vec![0u8; 4096]; DEPTH];
   let raws: Vec<_> = buffers
     .iter_mut()
@@ -271,21 +274,18 @@ fn nonblocking_waits_make_progress_on_file_completions() {
     // SAFETY: `raw` and `file` stay alive until this backend is dropped.
     unsafe {
       backend.push(
-        crate::backend::InFlight::attest(
-          id as u64,
-          BorrowedOp::from_op(Op::Read {
-            fd: file.clone(),
-            iovecs: NonNull::from(raw).cast(),
-            iov_count: 1,
-            offset: Some(0),
-            flags: ReadFlags::empty(),
-          }),
-        ),
-        &mut arena,
+        id as u64,
+        BorrowedOp::from_op(Op::Read {
+          fd: file.clone(),
+          iovecs: NonNull::from(raw).cast(),
+          iov_count: 1,
+          offset: Some(0),
+          flags: ReadFlags::empty(),
+        }),
       );
     }
   }
-  backend.flush().unwrap();
+  backend.flush();
   let mut seen = [false; DEPTH];
   let mut count = 0;
   let mut completed = Vec::new();
@@ -318,9 +318,8 @@ fn read_with_more_iovecs_than_the_native_array_is_rejected() {
   let reader = Resource::from(unsafe {
     std::os::fd::OwnedFd::from_raw_fd(reader.into_raw_fd())
   });
-  let mut backend = IoUring::new();
+  let mut backend = Tracked::new(IoUring::new());
   backend.init(8).unwrap();
-  let mut arena = Bump::new();
   let mut buffers = [[0u8; 4]; crate::buf::MAX_IOV_COUNT + 1];
   let raws: Vec<RawBufMut<'static>> = buffers
     .iter_mut()
@@ -332,20 +331,17 @@ fn read_with_more_iovecs_than_the_native_array_is_rejected() {
   // SAFETY: `raws` and `reader` stay alive until this backend finishes the read.
   unsafe {
     backend.push(
-      crate::backend::InFlight::attest(
-        1,
-        BorrowedOp::from_op(Op::Read {
-          fd: reader,
-          iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
-          iov_count: raws.len(),
-          offset: None,
-          flags: ReadFlags::empty(),
-        }),
-      ),
-      &mut arena,
+      1,
+      BorrowedOp::from_op(Op::Read {
+        fd: reader,
+        iovecs: NonNull::new(raws.as_ptr().cast_mut()).unwrap(),
+        iov_count: raws.len(),
+        offset: None,
+        flags: ReadFlags::empty(),
+      }),
     );
   }
-  backend.flush().unwrap();
+  backend.flush();
   let mut completed = Vec::new();
   backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
   assert_eq!(completed.len(), 1);
@@ -361,40 +357,39 @@ fn drop_waits_for_operations_in_the_kernel() {
   let reader = Resource::from(unsafe {
     std::os::fd::OwnedFd::from_raw_fd(reader.into_raw_fd())
   });
-  let mut backend = IoUring::new();
+  let mut backend = Tracked::new(IoUring::new());
   backend.init(8).unwrap();
-  let mut arena = Bump::new();
   let mut buf = [0u8; 4];
   // SAFETY: `buf` outlives every use of the backend below.
   let raw = unsafe { RawBufMut::from_raw_parts(buf.as_mut_ptr(), buf.len()) };
   // SAFETY: `raw` and `reader` stay alive until this backend is dropped.
   unsafe {
     backend.push(
-      crate::backend::InFlight::attest(
-        1,
-        BorrowedOp::from_op(Op::Read {
-          fd: reader.clone(),
-          iovecs: NonNull::from(&raw).cast(),
-          iov_count: 1,
-          offset: None,
-          flags: ReadFlags::empty(),
-        }),
-      ),
-      &mut arena,
+      1,
+      BorrowedOp::from_op(Op::Read {
+        fd: reader.clone(),
+        iovecs: NonNull::from(&raw).cast(),
+        iov_count: 1,
+        offset: None,
+        flags: ReadFlags::empty(),
+      }),
     );
   }
-  backend.flush().unwrap();
+  backend.flush();
   let mut completed = Vec::new();
   backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
   assert!(completed.is_empty(), "the read waits for data");
-  assert_eq!(backend.in_flight, 1);
+  assert_eq!(backend.backend().pending.len(), 1);
 
   let start = Instant::now();
   // What `Drop` does first.
-  backend.drain_in_flight();
+  backend.backend_mut().drain_in_flight();
   assert!(start.elapsed() < Duration::from_secs(1), "cancelled promptly");
-  assert_eq!(backend.in_flight, 0, "nothing is left in the kernel");
-  assert_eq!(backend.pending.len(), 0);
+  assert_eq!(
+    backend.backend().pending.len(),
+    0,
+    "nothing is left in the kernel"
+  );
 
   // Data arriving afterwards no longer reaches the buffer.
   writer.write_all(b"late").unwrap();
