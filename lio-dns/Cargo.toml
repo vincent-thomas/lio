@@ -1,0 +1,12 @@
+[package]
+name = "lio-dns"
+version = "0.1.0"
+edition = "2024"
+description = "A DNS stub resolver for lio, on hickory-proto"
+license = "MIT"
+repository = "https://github.com/vincent-thomas/lio"
+
+[dependencies]
+lio = { path = "../lio", features = ["high"] }
+hickory-proto = { version = "0.26.4", default-features = false, features = ["std"] }
+resolv-conf = "0.7.6"
