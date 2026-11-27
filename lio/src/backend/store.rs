@@ -300,11 +300,14 @@ impl OpStore {
           );
         }
       }
+      // Nothing unwound: the guard has nothing to do, and owns nothing.
+      std::mem::forget(guard);
       return None;
     }
-    // Publishing is done on drop if `submit` panics after `keep_on_panic`.
-    // Doing it here as well would claim the slot twice, so disarm first.
-    guard.keep = false;
+    // Publishing is the guard's job only if `submit` panics after
+    // `keep_on_panic`. It did not: the guard owns nothing, and is let go
+    // without running, so that the slot is not claimed twice.
+    std::mem::forget(guard);
     // SAFETY: `slots` still points at this store's pool, and the slot is the
     // free one `peek_free` returned.
     unsafe { (*slots).commit(slot_idx) };
@@ -354,11 +357,11 @@ impl InsertGuard {
   }
 }
 
+// Runs only when `submit` unwinds: `insert_submitting` forgets the guard
+// once `submit` has returned.
 impl Drop for InsertGuard {
+  #[cold]
   fn drop(&mut self) {
-    if !std::thread::panicking() {
-      return;
-    }
     if self.drop_registration {
       // SAFETY: the registration was written and has not been claimed, so
       // nothing else will drop it. A panic before `keep_on_panic` must not

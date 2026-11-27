@@ -15,6 +15,7 @@
 use std::alloc::Layout;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
+use std::task::Waker;
 
 use bumpalo::Bump;
 
@@ -127,6 +128,33 @@ struct TaskPayload<M, F> {
   sink: Option<F>,
 }
 
+/// Where the model a future runs leaves its item, and what wakes that
+/// future, in the slot's arena.
+///
+/// The future reaches it through the slot, knowing `T` but not the model:
+/// it comes first in [`AwaitedPayload`].
+#[repr(C)]
+struct Mailbox<T> {
+  item: Option<T>,
+  waker: Option<Waker>,
+}
+
+/// A model run for a future, and that future's mailbox.
+#[repr(C)]
+struct AwaitedPayload<M: Drive> {
+  mailbox: Mailbox<M::Item>,
+  model: Option<M>,
+}
+
+/// What a future finds in its slot.
+pub(crate) enum Mail<T> {
+  /// The model's item.
+  Item(T),
+  /// Nothing yet. The waker that was replaced, if one was, to be dropped
+  /// with the driver not borrowed.
+  Waiting(Option<Waker>),
+}
+
 struct Task {
   payload: *mut (),
   poll_fn: fn(*mut (), &mut Cx<'_>) -> bool,
@@ -141,6 +169,9 @@ struct Task {
   cancelled: bool,
   /// The model and its sink have been dropped.
   finished: bool,
+  /// A future still reads this slot's mailbox: the slot is not given back
+  /// before it has taken its item, or is gone.
+  held: bool,
 }
 
 /// A copy of what is needed to poll or drop a slot's model without holding
@@ -337,8 +368,131 @@ impl Registration {
       notified: false,
       cancelled: false,
       finished: false,
+      held: false,
     });
     registration
+  }
+
+  /// A slot that runs `model` for a future: the model's item waits in the
+  /// slot for that future, which `waker` wakes when it is there.
+  ///
+  /// The slot is held until [`take_mail`](Self::take_mail) has returned the
+  /// item or [`release_mail`](Self::release_mail) was called.
+  pub(crate) fn awaited<M>(arena: &mut Bump, model: M, waker: Waker) -> Self
+  where
+    M: Drive + 'static,
+  {
+    let payload: &mut AwaitedPayload<M> = arena.alloc(AwaitedPayload {
+      mailbox: Mailbox { item: None, waker: Some(waker) },
+      model: Some(model),
+    });
+    let mut registration = Self::vacant();
+    registration.task = Some(Task {
+      payload: (payload as *mut AwaitedPayload<M>).cast(),
+      poll_fn: Self::poll_awaited_impl::<M>,
+      drop_fn: Self::drop_awaited_impl::<M>,
+      busy: false,
+      woken: false,
+      notified: false,
+      cancelled: false,
+      finished: false,
+      held: true,
+    });
+    registration
+  }
+
+  fn poll_awaited_impl<M: Drive>(payload: *mut (), cx: &mut Cx<'_>) -> bool {
+    let payload = payload.cast::<AwaitedPayload<M>>();
+    // SAFETY: `payload` was created from an `AwaitedPayload<M>` in `awaited`
+    // and lives in the slot's arena. The task is marked busy, so nothing
+    // else touches the model.
+    let turn = match unsafe { &mut (*payload).model } {
+      Some(model) => model.drive(cx),
+      None => return true,
+    };
+    let item = match turn {
+      Turn::Pending => return false,
+      // One item is all a future takes.
+      Turn::Yield(item) | Turn::Done(item) => Some(item),
+      Turn::End => None,
+    };
+    // SAFETY: as above. No reference into the payload is alive here.
+    unsafe { (*payload).model = None };
+    let Some(item) = item else { return true };
+    // SAFETY: as above. The future reaches the mailbox only from the
+    // driver's thread, through the slot, and not during this block.
+    let waker = unsafe {
+      let mailbox = &mut (*payload).mailbox;
+      mailbox.item = Some(item);
+      mailbox.waker.take()
+    };
+    // Woken with no reference to the mailbox alive: the waker may poll or
+    // drop the future inline, and both reach it.
+    if let Some(waker) = waker {
+      waker.wake();
+    }
+    true
+  }
+
+  fn drop_awaited_impl<M: Drive>(payload: *mut ()) {
+    let payload = payload.cast::<AwaitedPayload<M>>();
+    // SAFETY: as in `poll_awaited_impl`. Each is taken, so nothing is
+    // dropped twice.
+    unsafe {
+      (*payload).model = None;
+      (*payload).mailbox.item = None;
+      (*payload).mailbox.waker = None;
+    }
+  }
+
+  /// The item of the model this slot runs for a future, once it is there.
+  /// Until then, `waker` is what wakes that future.
+  ///
+  /// # Safety
+  ///
+  /// This slot was made by [`awaited`](Self::awaited) for a model whose
+  /// item is `T`.
+  pub(crate) unsafe fn take_mail<T>(&mut self, waker: &Waker) -> Mail<T> {
+    let Some(task) = self.task.as_mut() else {
+      unreachable!("a future's slot runs no model");
+    };
+    // SAFETY: the payload is an `AwaitedPayload` whose item is `T`, which
+    // is `repr(C)` with a `Mailbox<T>` first, and nothing else refers to
+    // the mailbox: whoever polls the model holds no reference to it while
+    // other code runs.
+    let mailbox = unsafe { &mut *task.payload.cast::<Mailbox<T>>() };
+    if let Some(item) = mailbox.item.take() {
+      task.held = false;
+      return Mail::Item(item);
+    }
+    // A finished model with no item left has nothing more to say: its
+    // future waits for ever, and needs no waker.
+    if task.finished && !task.busy {
+      return Mail::Waiting(None);
+    }
+    match &mailbox.waker {
+      Some(current) if current.will_wake(waker) => Mail::Waiting(None),
+      _ => Mail::Waiting(mailbox.waker.replace(waker.clone())),
+    }
+  }
+
+  /// The future of this slot is gone: lets go of the slot, and returns
+  /// what was left in its mailbox, to be dropped with the driver not
+  /// borrowed.
+  ///
+  /// # Safety
+  ///
+  /// As for [`take_mail`](Self::take_mail).
+  pub(crate) unsafe fn release_mail<T>(
+    &mut self,
+  ) -> (Option<T>, Option<Waker>) {
+    let Some(task) = self.task.as_mut() else {
+      return (None, None);
+    };
+    task.held = false;
+    // SAFETY: as in `take_mail`.
+    let mailbox = unsafe { &mut *task.payload.cast::<Mailbox<T>>() };
+    (mailbox.item.take(), mailbox.waker.take())
   }
 
   fn poll_impl<M, F>(payload: *mut (), cx: &mut Cx<'_>) -> bool
@@ -793,7 +947,7 @@ impl Registration {
   pub(crate) fn is_spent(&self) -> bool {
     // A model is marked finished only once whoever had it busy is done.
     self.cell.stage == Stage::Free
-      && self.task.as_ref().is_none_or(|task| task.finished)
+      && self.task.as_ref().is_none_or(|task| task.finished && !task.held)
   }
 
   /// The operation's action, with its borrow of the operation's memory
@@ -832,8 +986,9 @@ impl Drop for Registration {
       self.cell.stage = Stage::Free;
       (self.cell.drop_fn)(self.cell.payload);
     }
+    // A finished model whose future never took its item still has it.
     if let Some(task) = self.task.take()
-      && !task.finished
+      && (!task.finished || task.held)
     {
       (task.drop_fn)(task.payload);
     }

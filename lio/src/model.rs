@@ -79,12 +79,10 @@
 //! takes one slot and allocates nothing. An operation started while that
 //! one is still busy takes a slot of its own.
 
-use std::cell::RefCell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
 use crate::Lio;
 use bumpalo::Bump;
@@ -455,13 +453,9 @@ impl<M: OpModel> Run<M> {
 
 enum RunState<M: OpModel> {
   Idle(Lio, M),
-  Running { shared: Rc<RefCell<Shared<M::Item>>>, task: Task },
+  /// In a driver slot, where its item waits for this future.
+  Running(Task),
   Done,
-}
-
-struct Shared<T> {
-  item: Option<T>,
-  waker: Option<Waker>,
 }
 
 impl<M> Future for Run<M>
@@ -472,50 +466,42 @@ where
 
   fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<M::Item> {
     let this = &mut *self;
-    match std::mem::replace(&mut this.state, RunState::Done) {
-      RunState::Idle(lio, model) => {
-        if lio.is_full() {
-          // Wait for a slot; the driver wakes us when one frees up.
-          lio.wait_for_capacity(cx.waker());
-          this.state = RunState::Idle(lio, model);
+    if let RunState::Idle(lio, _) = &this.state {
+      if lio.is_full() {
+        // Wait for a slot; the driver wakes us when one frees up.
+        lio.wait_for_capacity(cx.waker());
+        return Poll::Pending;
+      }
+      let RunState::Idle(lio, model) =
+        std::mem::replace(&mut this.state, RunState::Done)
+      else {
+        unreachable!("a future that was idle is not");
+      };
+      let spawned = lio.spawn_awaited(model, cx.waker().clone());
+      this.state = RunState::Running(Task { lio: lio.downgrade(), spawned });
+      // A model that finished inside the spawn has woken this future's
+      // waker, which is given its item when it is polled again.
+      return Poll::Pending;
+    }
+    match &this.state {
+      RunState::Running(task) => {
+        // Without a driver nothing will ever arrive.
+        let Some(lio) = task.lio.upgrade() else {
           return Poll::Pending;
-        }
-        let shared = Rc::new(RefCell::new(Shared {
-          item: None,
-          waker: Some(cx.waker().clone()),
-        }));
-        let sink = Rc::clone(&shared);
-        let task = spawn_while(&lio, model, move |item| {
-          let waker = {
-            let mut shared = sink.borrow_mut();
-            shared.item = Some(item);
-            shared.waker.take()
-          };
-          // Wake with the cell released: the waker may poll or drop this
-          // future inline, and both borrow it.
-          if let Some(waker) = waker {
-            waker.wake();
+        };
+        // SAFETY: `task` was started by `spawn_awaited` on this driver for
+        // `M`, and is dropped only by this future's `Drop`.
+        let item =
+          unsafe { lio.take_awaited::<M::Item>(&task.spawned, cx.waker()) };
+        match item {
+          Some(item) => {
+            this.state = RunState::Done;
+            Poll::Ready(item)
           }
-          // One item is all a future takes.
-          false
-        });
-        this.state = RunState::Running { shared, task };
-        // The model may have finished inside `spawn`.
-        Pin::new(this).poll(cx)
-      }
-      RunState::Running { shared, task } => {
-        let mut waiting = shared.borrow_mut();
-        if let Some(item) = waiting.item.take() {
-          return Poll::Ready(item);
+          None => Poll::Pending,
         }
-        match &waiting.waker {
-          Some(waker) if waker.will_wake(cx.waker()) => {}
-          _ => waiting.waker = Some(cx.waker().clone()),
-        }
-        drop(waiting);
-        this.state = RunState::Running { shared, task };
-        Poll::Pending
       }
+      RunState::Idle(..) => unreachable!("an idle future was just started"),
       RunState::Done => panic!("model future polled after completion"),
     }
   }
@@ -523,10 +509,12 @@ where
 
 impl<M: OpModel> Drop for Run<M> {
   fn drop(&mut self) {
-    if let RunState::Running { shared, task } = &self.state {
-      // The operation may still complete; nobody is left to wake then.
-      shared.borrow_mut().waker = None;
-      task.stop();
+    if let RunState::Running(task) = &self.state
+      && let Some(lio) = task.lio.upgrade()
+    {
+      // SAFETY: as in `poll`. The state is `Running` only until the item
+      // was taken, and this runs once.
+      unsafe { lio.drop_awaited::<M::Item>(&task.spawned) };
     }
   }
 }
@@ -554,7 +542,13 @@ impl<Req, Out> Leaf<Req, Out> {
     submit: impl FnOnce(&mut Cx<'_>, Req) -> Ticket<Out>,
   ) -> Step<Out> {
     let mut ticket = match std::mem::replace(self, Leaf::Done) {
-      Leaf::Idle(request) => submit(cx, request),
+      Leaf::Idle(request) => {
+        // Nothing is reported before the driver runs, so there is no result
+        // to ask for yet, and the model that submits an operation is the
+        // one polled when it has one.
+        *self = Leaf::InFlight(submit(cx, request));
+        return Step::Pending;
+      }
       Leaf::InFlight(ticket) => ticket,
       Leaf::Done => panic!("operation polled after it was done"),
     };

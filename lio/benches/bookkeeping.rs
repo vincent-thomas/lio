@@ -297,6 +297,41 @@ impl OpStream for SteppedNop {
 #[derive(Default)]
 struct NopWaker(AtomicBool);
 
+/// One operation awaited: polled, the driver run, polled again.
+fn awaited(criterion: &mut Criterion) {
+  let mut group = criterion.benchmark_group("bookkeeping/await");
+  let ready = Arc::new(NopWaker::default());
+  let waker = Waker::from(Arc::clone(&ready));
+  let mut cx = Context::from_waker(&waker);
+  for depth in QUEUE_DEPTHS {
+    let lio = Lio::new_with_backend(BenchBackend::default(), depth).unwrap();
+    let mut futures = Vec::with_capacity(depth);
+
+    group.throughput(Throughput::Elements(depth as u64));
+    group.bench_with_input(
+      BenchmarkId::from_parameter(format!("qd_{depth}")),
+      &depth,
+      |bencher, &depth| {
+        bencher.iter(|| {
+          for _ in 0..depth {
+            let mut fut = api::nop().with_lio(&lio).into_future();
+            assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+            futures.push(fut);
+          }
+          assert_eq!(lio.try_run().unwrap(), depth);
+          for mut fut in futures.drain(..) {
+            let Poll::Ready(result) = Pin::new(&mut fut).poll(&mut cx) else {
+              panic!("an operation the driver completed is not ready");
+            };
+            result.unwrap();
+          }
+        });
+      },
+    );
+  }
+  group.finish();
+}
+
 impl Wake for NopWaker {
   fn wake(self: Arc<Self>) {
     self.wake_by_ref();
@@ -366,6 +401,6 @@ criterion_group! {
     .warm_up_time(Duration::from_millis(500))
     .measurement_time(Duration::from_secs(2))
     .sample_size(50);
-  targets = no_driver, round_trip, cancel, buffer, resubmit, timer
+  targets = no_driver, round_trip, awaited, cancel, buffer, resubmit, timer
 }
 criterion_main!(benches);
