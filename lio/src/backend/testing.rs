@@ -3,7 +3,7 @@
 //! - [`ScriptedBackend`] performs nothing on its own: the test decides which
 //!   operations complete, in which order and with which result. By default it
 //!   also touches the memory of every operation when it completes or is
-//!   drained, the way the kernel would, so a buffer freed or reused too early
+//!   stopped, the way the kernel would, so a buffer freed or reused too early
 //!   shows up under Miri or a sanitizer.
 //! - [`Checked`] wraps any backend and panics as soon as either side breaks
 //!   the [`IoBackend`] contract.
@@ -41,6 +41,11 @@ use crate::backend::{IoBackend, OpCompleted};
 /// The byte [`ScriptedBackend`] writes into the buffers it fills.
 pub const POISON: u8 = 0xA5;
 
+/// The result [`ScriptedBackend`] reports for an operation it stopped.
+pub const CANCELLED: isize = -125;
+// A stopped operation reports an error.
+const _: () = assert!(CANCELLED < 0);
+
 #[derive(Default)]
 struct Script {
   init: Option<usize>,
@@ -62,8 +67,8 @@ impl Drop for Script {
   fn drop(&mut self) {
     for (_, ticket) in self.tickets.drain() {
       // SAFETY: no kernel or thread ever sees the addresses, and this
-      // backend is gone: nothing uses them.
-      unsafe { ticket.release() };
+      // backend is gone: nothing uses them. The result is negative.
+      drop(unsafe { ticket.cancelled(CANCELLED) });
     }
   }
 }
@@ -73,7 +78,16 @@ impl Drop for Script {
 /// Clones share their state: hand one clone to [`Lio`](crate::Lio) and keep
 /// another to drive it. Pushed operations stay in flight until
 /// [`complete`](Self::complete) is called for them; the completion is then
-/// reported by the next `wait()`. `wait()` never blocks.
+/// reported by the next `wait()`.
+///
+/// The driver and the test share a thread, so nothing can be scripted while
+/// the driver blocks. A `wait()` that is allowed to block (any timeout but
+/// zero) and has nothing to report is therefore when the scripted kernel
+/// acts on [`cancel`](IoBackend::cancel): every operation the driver asked
+/// to stop is reported with [`CANCELLED`]. Until then a cancel is only
+/// recorded, and the test may still complete the operation itself.
+/// [`set_stuck`](Self::set_stuck) makes the kernel ignore cancels. `wait()`
+/// never blocks otherwise.
 ///
 /// Operations do not refer to real descriptors, so the resources they carry
 /// are never closed.
@@ -94,7 +108,8 @@ impl ScriptedBackend {
     backend
   }
 
-  /// Stops touching operation memory on completion and drain.
+  /// Stops touching operation memory when an operation completes or is
+  /// stopped.
   ///
   /// Only for tests that check buffer contents the scripted results do not
   /// fill in.
@@ -110,8 +125,10 @@ impl ScriptedBackend {
     self
   }
 
-  /// Makes [`drain`](IoBackend::drain) report operations still running, so
-  /// the driver has to leak their memory.
+  /// Makes the backend ignore [`cancel`](IoBackend::cancel): cancelled
+  /// operations stay in flight, so a driver dropped with one has to leak
+  /// its memory. A `wait()` with a timeout then takes that long, as a
+  /// kernel with nothing to report would.
   pub fn set_stuck(&self, stuck: bool) {
     self.0.borrow_mut().stuck = stuck;
   }
@@ -188,8 +205,9 @@ impl IoBackend for ScriptedBackend {
     ResourceClose::noop()
   }
 
-  fn push(&mut self, op: crate::backend::InFlight<'_>, _step_bump: &mut Bump) {
-    let (op, ticket) = op.into_parts();
+  fn push(&mut self, op: crate::backend::InFlight, _step_bump: &mut Bump) {
+    // The scripted kernel has the operation from here on.
+    let (op, ticket) = op.start();
     let id = ticket.id();
     let mut script = self.0.borrow_mut();
     script.pushed.push(id);
@@ -209,34 +227,49 @@ impl IoBackend for ScriptedBackend {
     self.0.borrow_mut().cancelled.push(id);
   }
 
-  fn drain(&mut self) -> bool {
-    let mut script = self.0.borrow_mut();
-    if script.stuck {
-      return false;
-    }
-    for (_, op) in std::mem::take(&mut script.in_flight) {
-      if !script.no_poison {
-        // SAFETY: a drained operation may still be finishing, so the driver
-        // keeps its memory valid until its ticket is given up.
-        unsafe { touch(&op) };
-      }
-    }
-    for (_, ticket) in script.tickets.drain() {
-      // SAFETY: no kernel or thread ever sees the addresses.
-      unsafe { ticket.release() };
-    }
-    script.ready.clear();
-    true
-  }
-
   fn wait(
     &mut self,
-    _timeout: Option<Duration>,
+    timeout: Option<Duration>,
     completed: &mut Vec<OpCompleted>,
   ) -> io::Result<()> {
     completed.clear();
-    completed.extend(self.0.borrow_mut().ready.drain(..));
+    let mut script = self.0.borrow_mut();
+    if script.ready.is_empty() && timeout != Some(Duration::ZERO) {
+      if script.stuck {
+        drop(script);
+        std::thread::sleep(timeout.unwrap_or(Duration::ZERO));
+        return Ok(());
+      }
+      script.stop_cancelled();
+    }
+    completed.extend(script.ready.drain(..));
     Ok(())
+  }
+}
+
+impl Script {
+  /// Reports every in-flight operation the driver asked to cancel.
+  fn stop_cancelled(&mut self) {
+    let mut at = 0;
+    while at < self.in_flight.len() {
+      let id = self.in_flight[at].0;
+      if !self.cancelled.contains(&id) {
+        at += 1;
+        continue;
+      }
+      let (_, op) = self.in_flight.remove(at);
+      let Some(ticket) = self.tickets.remove(&id) else {
+        unreachable!("ScriptedBackend: operation {id} is in flight unticketed");
+      };
+      if !self.no_poison {
+        // SAFETY: a stopped operation may have been finishing, so the driver
+        // keeps its memory valid until it sees this completion.
+        unsafe { touch(&op) };
+      }
+      // SAFETY: no kernel or thread ever sees the addresses, and the result
+      // is negative.
+      self.ready.push_back(unsafe { ticket.cancelled(CANCELLED) });
+    }
   }
 }
 
@@ -330,14 +363,13 @@ unsafe fn read_bytes(ptr: *const u8, len: usize) {
 /// - calls `init` exactly once, before anything else
 /// - never pushes an id that is still in flight
 /// - never has more operations in flight than the initialized capacity
-/// - never drops the backend with operations in flight unless `drain`
-///   succeeded
+/// - never drops the backend with operations in flight
 ///
 /// and that the backend:
 /// - completes only ids that are in flight, each exactly once
 ///
 /// An operation is in flight from its `push` until its completion is
-/// returned by `wait`, or until a successful `drain`.
+/// returned by `wait`.
 pub struct Checked<B> {
   inner: B,
   cap: Option<usize>,
@@ -379,7 +411,7 @@ impl<B: IoBackend> IoBackend for Checked<B> {
     self.inner.resource_close()
   }
 
-  fn push(&mut self, op: crate::backend::InFlight<'_>, step_bump: &mut Bump) {
+  fn push(&mut self, op: crate::backend::InFlight, step_bump: &mut Bump) {
     let cap = self.cap("push");
     let id = op.id();
     assert!(
@@ -402,14 +434,6 @@ impl<B: IoBackend> IoBackend for Checked<B> {
   fn cancel(&mut self, id: u64) {
     self.cap("cancel");
     self.inner.cancel(id);
-  }
-
-  fn drain(&mut self) -> bool {
-    let drained = self.inner.drain();
-    if drained {
-      self.in_flight.clear();
-    }
-    drained
   }
 
   fn wait(
@@ -435,8 +459,7 @@ impl<B> Drop for Checked<B> {
   fn drop(&mut self) {
     if !std::thread::panicking() && !self.in_flight.is_empty() {
       panic!(
-        "contract: backend dropped with {} operations in flight and no \
-         successful `drain`",
+        "contract: backend dropped with {} operations in flight",
         self.in_flight.len()
       );
     }
@@ -450,7 +473,7 @@ mod tests {
 
   fn push_op(backend: &mut impl IoBackend, id: u64, op: Op) {
     // SAFETY: every buffer these tests submit stays alive until the backend
-    // completes or drains the operation.
+    // has reported the operation.
     unsafe {
       backend.push(
         crate::backend::InFlight::attest(id, BorrowedOp::from_op(op)),
@@ -584,19 +607,23 @@ mod tests {
   }
 
   #[test]
-  fn drain_poisons_unless_told_not_to() {
+  fn stopping_poisons_unless_told_not_to() {
     for poison in [true, false] {
       let backend = ScriptedBackend::new();
       let mut backend = if poison {
         backend
       } else {
-        // SAFETY: the operation below is drained, never completed.
+        // SAFETY: the operation below is stopped, never completed.
         unsafe { backend.without_poison() }
       };
       backend.init(1).unwrap();
       let (mut into, mut iovec) = (0u8, crate::backend::op::RawBufMut::empty());
       push_op(&mut backend, 1, read_into(&mut into, &mut iovec));
-      assert!(backend.drain());
+      backend.cancel(1);
+      let mut completed = Vec::new();
+      backend.wait(None, &mut completed).unwrap();
+      assert!(completed[0].is_cancelled());
+      assert_eq!(completed[0].result(), CANCELLED);
       assert_eq!(into, if poison { POISON } else { 0 }, "poison: {poison}");
     }
   }
@@ -615,19 +642,28 @@ mod tests {
   }
 
   #[test]
-  fn records_cancels_and_drains() {
+  fn a_cancel_is_recorded_and_acted_on_when_the_driver_blocks() {
     let (backend, mut checked) = init(2);
     push_op(&mut checked, 1, Op::Nop);
+    push_op(&mut checked, 2, Op::Nop);
     checked.cancel(1);
     checked.cancel(99);
     assert_eq!(backend.cancelled(), vec![1, 99]);
+    assert!(wait(&mut checked).is_empty(), "a poll leaves it in flight");
+    assert_eq!(backend.in_flight(), vec![1, 2]);
 
     backend.set_stuck(true);
-    assert!(!checked.drain());
+    let mut completed = Vec::new();
+    checked.wait(Some(Duration::from_millis(1)), &mut completed).unwrap();
+    assert!(completed.is_empty(), "a stuck backend ignores the cancel");
+
     backend.set_stuck(false);
-    assert!(checked.drain());
-    assert!(backend.in_flight().is_empty());
-    assert_eq!(checked.in_flight(), 0);
+    checked.wait(None, &mut completed).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert!(completed[0].is_cancelled());
+    assert_eq!(backend.in_flight(), vec![2], "only what was cancelled");
+    backend.complete(2, 0);
+    assert_eq!(wait(&mut checked), vec![2]);
   }
 
   #[test]
@@ -673,7 +709,7 @@ mod tests {
       fn init(&mut self, _: usize) -> io::Result<()> {
         Ok(())
       }
-      fn push(&mut self, op: crate::backend::InFlight<'_>, _: &mut Bump) {
+      fn push(&mut self, op: crate::backend::InFlight, _: &mut Bump) {
         self.0 = Some(op.id());
       }
       fn flush(&mut self) -> io::Result<()> {
@@ -696,11 +732,6 @@ mod tests {
 
       // Its operations finish on their own: there is nothing to stop.
       fn cancel(&mut self, _id: u64) {}
-
-      // Nothing outside this type ever holds an address.
-      fn drain(&mut self) -> bool {
-        true
-      }
     }
 
     let mut checked = Checked::new(Twice(None));
@@ -711,7 +742,7 @@ mod tests {
   }
 
   #[test]
-  #[should_panic(expected = "no successful `drain`")]
+  #[should_panic(expected = "operations in flight")]
   fn dropping_with_operations_in_flight_breaks_the_contract() {
     let (_, mut checked) = init(1);
     push_op(&mut checked, 1, Op::Nop);

@@ -199,19 +199,36 @@ mod immediate_sockets {
   }
 
   #[test]
-  fn drain_drops_a_registered_receive() {
+  fn cancel_reports_a_registered_receive() {
     let (socket, _peer) = pair(true);
     let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 15, model.action());
     backend.flush().unwrap();
     assert_eq!(backend.pending.len(), 1);
-    assert!(backend.drain());
+    backend.cancel(15);
     assert_eq!(backend.pending.len(), 0);
-    drop(model);
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
-    assert!(completed.is_empty());
+    assert_eq!(completed.len(), 1);
+    assert!(completed[0].is_cancelled());
+    drop(completed);
+    drop(model);
+  }
+
+  #[test]
+  fn cancel_reports_a_receive_that_was_never_started() {
+    let (socket, _peer) = pair(true);
+    let mut model = Receive::new(&socket);
+    let mut backend = backend();
+    queue(&mut backend, 15, model.action());
+    backend.cancel(15);
+    backend.flush().unwrap();
+    assert_eq!(backend.pending.len(), 0, "it was not started afterwards");
+    let mut completed = Vec::new();
+    backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert!(completed[0].is_cancelled());
   }
 
   #[test]

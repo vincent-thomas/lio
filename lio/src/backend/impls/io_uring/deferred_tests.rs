@@ -92,7 +92,7 @@ fn trace_read_batches() {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    fn push(&mut self, op: crate::backend::InFlight<'_>, bump: &mut Bump) {
+    fn push(&mut self, op: crate::backend::InFlight, bump: &mut Bump) {
       self.inner.push(op, bump)
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -122,10 +122,6 @@ fn trace_read_batches() {
 
     fn cancel(&mut self, id: u64) {
       self.inner.cancel(id)
-    }
-
-    fn drain(&mut self) -> bool {
-      self.inner.drain()
     }
   }
   let depth: usize =
@@ -394,7 +390,8 @@ fn drop_waits_for_operations_in_the_kernel() {
   assert_eq!(backend.in_flight, 1);
 
   let start = Instant::now();
-  backend.drain();
+  // What `Drop` does first.
+  backend.drain_in_flight();
   assert!(start.elapsed() < Duration::from_secs(1), "cancelled promptly");
   assert_eq!(backend.in_flight, 0, "nothing is left in the kernel");
   assert_eq!(backend.pending.len(), 0);

@@ -270,8 +270,9 @@ fn worker_loop(
       // The backend is going away; nobody will reap this. The worker goes
       // on taking jobs until the queue is empty and closed, so that every
       // job still queued is given up, not only the first.
-      // SAFETY: the job was not run, so nothing has used its addresses.
-      unsafe { keep.release() };
+      // SAFETY: the job was not run, so nothing has used its addresses,
+      // and the result is an error.
+      drop(unsafe { keep.cancelled(neg(ERROR_OPERATION_ABORTED)) });
       continue;
     }
     let result = run_blocking(op);
@@ -288,17 +289,12 @@ fn worker_loop(
   }
 }
 
-struct Queued {
-  id: u64,
-  op: Op,
-  keep: crate::backend::Ticket,
-}
-
 /// Windows I/O completion port backend.
 pub struct Iocp {
   port: HANDLE,
   capacity: usize,
-  backlog: Vec<Queued>,
+  /// Pushed and not started: `flush` has not looked at them yet.
+  backlog: Vec<crate::backend::InFlight>,
   in_flight: HashSet<usize>,
   ready: Vec<OpCompleted>,
   entries: Vec<OVERLAPPED_ENTRY>,
@@ -1042,10 +1038,11 @@ impl Iocp {
   /// for at most `DRAIN_GRACE`, for their packets. Anything left after that
   /// is leaked rather than freed while possibly in use.
   ///
-  /// Returns whether nothing is left in the kernel or on a worker.
-  fn drain_in_flight(&mut self) -> bool {
+  /// The driver has asked for this already, through `cancel` and `wait`,
+  /// before it drops a backend. This is for a backend dropped on its own.
+  fn drain_in_flight(&mut self) {
     if self.port.is_null() {
-      return true;
+      return;
     }
     // Workers write into op memory; stop them first.
     if let Some(mut pool) = self.pool.take() {
@@ -1077,7 +1074,6 @@ impl Iocp {
     }
     // Free results the workers posted that were never reaped.
     while self.reap(0, &mut completed).unwrap_or(false) {}
-    self.in_flight.is_empty()
   }
 }
 
@@ -1108,20 +1104,20 @@ impl IoBackend for Iocp {
     Ok(())
   }
 
-  fn push(&mut self, op: crate::backend::InFlight<'_>, _step_bump: &mut Bump) {
-    let (op, keep) = op.into_parts();
-    let id = keep.id();
+  fn push(&mut self, op: crate::backend::InFlight, _step_bump: &mut Bump) {
     assert!(
       self.backlog.len() + self.in_flight.len() + self.blocking_in_flight
         < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
-    self.backlog.push(Queued { id, op, keep });
+    self.backlog.push(op);
   }
 
   fn flush(&mut self) -> io::Result<()> {
-    for Queued { id, op, keep } in mem::take(&mut self.backlog) {
+    for queued in mem::take(&mut self.backlog) {
+      let (op, keep) = queued.start();
+      let id = keep.id();
       let mut keep = Some(keep);
       if let Some(result) = self.submit(id, op, &mut keep) {
         let Some(ticket) = keep else {
@@ -1137,14 +1133,11 @@ impl IoBackend for Iocp {
   }
 
   fn cancel(&mut self, id: u64) {
-    if let Some(index) = self.backlog.iter().position(|queued| queued.id == id)
+    if let Some(index) =
+      self.backlog.iter().position(|queued| queued.id() == id)
     {
       let queued = self.backlog.swap_remove(index);
-      // SAFETY: the operation was never started, so nothing has its
-      // addresses.
-      self
-        .ready
-        .push(unsafe { queued.keep.cancelled(neg(ERROR_OPERATION_ABORTED)) });
+      self.ready.push(queued.cancelled(neg(ERROR_OPERATION_ABORTED)));
       return;
     }
     // SAFETY: every pointer in `in_flight` is a live boxed `Overlapped`.
@@ -1164,18 +1157,6 @@ impl IoBackend for Iocp {
         CancelIoEx((*state).socket as HANDLE, &(*state).ov);
       }
     }
-  }
-
-  fn drain(&mut self) -> bool {
-    for queued in self.backlog.drain(..) {
-      // SAFETY: the operation was never started, so nothing has its
-      // addresses.
-      unsafe { queued.keep.release() };
-    }
-    // What the kernel reports while it drains is given up as its completion
-    // is dropped. The rest keep their tickets, which leaks their memory
-    // instead of freeing it under the kernel.
-    self.drain_in_flight()
   }
 
   fn wait(

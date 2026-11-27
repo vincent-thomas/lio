@@ -182,7 +182,7 @@ pub struct Poller {
   sys: Option<sys::OsPoller>,
   events: Events,
   capacity: usize,
-  backlog: Vec<PendingOp>,
+  backlog: Vec<crate::backend::InFlight>,
   /// Operations that are waiting for their descriptor to become ready.
   pending: Slab<PendingOp>,
   /// Which of `pending` wait on which descriptor.
@@ -208,7 +208,8 @@ impl Default for Poller {
   }
 }
 
-/// One operation the poller holds, queued or waiting for its descriptor.
+/// One operation the poller has started: being performed, or waiting for
+/// its descriptor.
 ///
 /// The poller performs the I/O itself, in [`Poller::exec_op`]: no address
 /// from `op` is ever left with the kernel or another thread between calls.
@@ -236,12 +237,6 @@ impl PendingOp {
   fn stopped(self) -> OpCompleted {
     // SAFETY: as in `report`.
     unsafe { self.ticket.cancelled(-(libc::ECANCELED as isize)) }
-  }
-
-  /// Gives the operation up unreported.
-  fn release(self) {
-    // SAFETY: as in `report`.
-    unsafe { self.ticket.release() }
   }
 }
 
@@ -1262,21 +1257,22 @@ impl IoBackend for Poller {
     Ok(())
   }
 
-  fn push(&mut self, op: crate::backend::InFlight<'_>, _step_bump: &mut Bump) {
-    let (op, ticket) = op.into_parts();
+  fn push(&mut self, op: crate::backend::InFlight, _step_bump: &mut Bump) {
     assert!(
       self.backlog.len() + self.pending.len() < self.capacity,
       "IoBackend capacity exceeded: attempted to queue more than {} operations",
       self.capacity
     );
-    self.backlog.push(PendingOp { op, ticket });
+    self.backlog.push(op);
   }
 
   fn flush(&mut self) -> io::Result<()> {
     // In the order they were pushed: operations on one descriptor wait in
     // that order.
     let mut backlog = std::mem::take(&mut self.backlog);
-    for entry in backlog.drain(..) {
+    for queued in backlog.drain(..) {
+      let (op, ticket) = queued.start();
+      let entry = PendingOp { op, ticket };
       if matches!(entry.op, Op::Nop) {
         self.queued_completed.push(entry.report(0));
         continue;
@@ -1337,7 +1333,7 @@ impl IoBackend for Poller {
     if let Some(index) = self.backlog.iter().position(|entry| entry.id() == id)
     {
       let entry = self.backlog.swap_remove(index);
-      self.queued_completed.push(entry.stopped());
+      self.queued_completed.push(entry.cancelled(-(libc::ECANCELED as isize)));
       return;
     }
     // This backend performs the I/O itself once the descriptor is ready, so
@@ -1372,29 +1368,6 @@ impl IoBackend for Poller {
         &mut self.queued_completed,
       );
     }
-  }
-
-  fn drain(&mut self) -> bool {
-    // Readiness interest is the only thing the kernel holds. The bytes live
-    // in `backlog` and `pending`, and this backend only dereferences them
-    // from `flush` and `wait`, so every operation can be given up here.
-    for entry in self.backlog.drain(..) {
-      entry.release();
-    }
-    for (fd, waiting) in self.waiters.drain() {
-      if waiting.registered
-        && let Some(sys) = self.sys.as_ref()
-      {
-        let _ = sys.delete(fd);
-      }
-    }
-    let keys: Vec<_> = self.pending.keys_where(|_| true).collect();
-    for key in keys {
-      if let Some(entry) = self.pending.remove_value(key) {
-        entry.release();
-      }
-    }
-    true
   }
 
   fn wait(

@@ -2614,8 +2614,8 @@ fn file_mode_from_posix(mode: libc::mode_t) -> Option<api::FileMode> {
 #[cfg(test)]
 mod buffer_ownership_tests {
   //! lio borrows C buffers and never frees them. These tests drive the
-  //! scripted backend, which writes into read buffers on completion and drain
-  //! as the kernel would, so Miri also checks that lio neither frees nor
+  //! scripted backend, which writes into read buffers when an operation
+  //! completes or is stopped, as the kernel would, so Miri also checks that lio neither frees nor
   //! touches C memory it does not own at the wrong time.
 
   use super::*;

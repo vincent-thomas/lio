@@ -27,6 +27,7 @@ exclude = [
   "MAX_FILE_OFFSET",
   "MAX_IOV_COUNT",
   "POISON",
+  "CANCELLED",
   "CompletionFlags",
   "Interest",
   "SockDomain",

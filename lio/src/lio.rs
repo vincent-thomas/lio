@@ -101,9 +101,9 @@ pub(crate) fn get_global() -> Option<Lio> {
 }
 
 struct LioInner {
-  // Dropped by hand in `Drop`: the backend must drain in-flight work before
-  // `store` frees the memory that work points into, and both are leaked
-  // when it cannot.
+  // Dropped by hand in `Drop`: the backend must have reported what was in
+  // flight before `store` frees the memory that work points into, and both
+  // are leaked when it has not.
   io: ManuallyDrop<Box<dyn IoBackend>>,
   store: ManuallyDrop<OpStore>,
   /// The backend's close for resources its completions carry.
@@ -312,24 +312,85 @@ macro_rules! timed {
   }};
 }
 
-impl Drop for LioInner {
-  fn drop(&mut self) {
-    // They point into the store's arenas, so they go before it.
-    drop(std::mem::take(&mut self.dying));
-    if self.io.drain() {
+/// How long a dropped driver waits for its backend to report what is still
+/// in flight, before it leaks that memory instead.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+
+/// How long one wait of that shutdown blocks before the driver asks again.
+const SHUTDOWN_STEP: Duration = Duration::from_millis(10);
+
+impl LioInner {
+  /// Asks the backend to finish everything it has not reported, and waits
+  /// up to [`SHUTDOWN_GRACE`] for those completions.
+  ///
+  /// The backend is told nothing it is not told while the driver runs: a
+  /// cancel for each operation, then waits. What it has not reported when
+  /// this returns still holds its lease.
+  fn stop_backend(&mut self) {
+    // Set at the first wait: the grace is time spent waiting on the
+    // backend, not time the driver took to ask.
+    let mut deadline = None;
+    let mut held = Vec::new();
+    loop {
       // Completions the driver never routed hold a share of their
       // operations' leases. Nothing reads them any more.
       self.completed.clear();
       self.ready_io.clear();
+      held.clear();
+      self.store.leases_held(&mut held);
+      if held.is_empty() {
+        return;
+      }
+      // Asked again each round: a backend may only be able to stop the step
+      // an operation is at, and the operation has moved on since, or the
+      // request may have come before there was anything to stop.
+      for &id in &held {
+        self.io.cancel(id);
+      }
+      if self.io.flush().is_err() {
+        return;
+      }
+      let now = Instant::now();
+      let remaining = deadline
+        .get_or_insert(now + SHUTDOWN_GRACE)
+        .saturating_duration_since(now);
+      if remaining.is_zero() {
+        return;
+      }
+      let mut timeout = remaining.min(SHUTDOWN_STEP);
+      // Then whatever else is ready, so the next round asks about less.
+      loop {
+        if self.io.wait(Some(timeout), &mut self.completed).is_err() {
+          return;
+        }
+        if self.completed.is_empty() {
+          break;
+        }
+        self.completed.clear();
+        timeout = Duration::ZERO;
+      }
+    }
+  }
+}
+
+impl Drop for LioInner {
+  fn drop(&mut self) {
+    // They point into the store's arenas, so they go before it.
+    drop(std::mem::take(&mut self.dying));
+    self.stop_backend();
+    self.completed.clear();
+    self.ready_io.clear();
+    // A lease still held belongs to an operation the backend has not
+    // reported: it may still be running in the kernel or on a backend
+    // thread, writing into buffers and lowered state owned by the store.
+    // Leaking both keeps that memory valid, and keeps the backend from
+    // waiting again in its own `Drop`.
+    if !self.store.any_lease_held() {
       // SAFETY: this field is not used again.
       unsafe { ManuallyDrop::drop(&mut self.io) };
       // `leaked` counts registrations forgotten while a backend still held
-      // their lease. Their arenas live in the store, so the store stays too.
-      //
-      // A lease still held now belongs to a ticket the backend never gave
-      // up, whatever its `drain` said: something may still use that
-      // operation's memory, so the store stays as well.
-      if self.leaked == 0 && !self.store.any_lease_held() {
+      // their lease. Their arenas live in the store, so the store stays.
+      if self.leaked == 0 {
         #[cfg(test)]
         STORE_DROPPED.with(|dropped| dropped.set(true));
         // SAFETY: every registration was dropped, and this field is not
@@ -337,10 +398,6 @@ impl Drop for LioInner {
         unsafe { ManuallyDrop::drop(&mut self.store) };
       }
     }
-    // Otherwise an operation may still be running in the kernel or on a
-    // backend thread, writing into buffers and lowered state owned by the
-    // store. Leaking both keeps that memory valid, and keeps the backend
-    // from waiting again in its own `Drop`.
 
     let Some(profile) = &self.profile else {
       return;
@@ -1604,7 +1661,7 @@ mod tests {
   #[test]
   #[cfg_attr(miri, ignore = "leaks the registration on purpose")]
   fn a_ticket_never_given_up_keeps_the_store_after_the_driver_drops() {
-    // `Hoarding` says it drained, and still holds its tickets.
+    // `Hoarding` ignores the cancel, and still holds its tickets.
     let lio = Lio::new_with_backend(Hoarding::default(), 1).unwrap();
     crate::api::nop().with_lio(&lio).when_done(|_| {});
     assert_eq!(lio.inner.borrow().leaked, 0);
@@ -1645,7 +1702,41 @@ mod tests {
   }
 
   #[test]
-  fn dropping_a_drained_driver_frees_the_store() {
+  fn dropping_the_driver_stops_what_nobody_cancelled() {
+    let (backend, lio) = lio(2);
+    // Their consumers are alive, so nothing has asked to cancel them.
+    let _first = crate::api::nop().with_lio(&lio).send();
+    let _second = crate::api::nop().with_lio(&lio).send();
+    let ids = backend.pushed();
+    assert_eq!(ids.len(), 2);
+    assert!(backend.cancelled().is_empty());
+    STORE_DROPPED.with(|dropped| dropped.set(false));
+    drop(lio);
+    assert_eq!(backend.cancelled(), ids, "each is asked once");
+    assert!(backend.in_flight().is_empty());
+    assert!(STORE_DROPPED.with(|dropped| dropped.get()));
+  }
+
+  #[test]
+  #[cfg_attr(miri, ignore = "leaks the store on purpose")]
+  fn dropping_the_driver_keeps_asking_until_its_grace_is_over() {
+    let (backend, lio) = lio(1);
+    let _held = crate::api::nop().with_lio(&lio).send();
+    backend.set_stuck(true);
+    STORE_DROPPED.with(|dropped| dropped.set(false));
+    let started = Instant::now();
+    drop(lio);
+    assert!(started.elapsed() >= SHUTDOWN_GRACE);
+    assert!(backend.cancelled().len() > 1, "asked again while it waited");
+    assert_eq!(backend.in_flight().len(), 1);
+    assert!(
+      !STORE_DROPPED.with(|dropped| dropped.get()),
+      "the store was freed under an operation the backend never reported"
+    );
+  }
+
+  #[test]
+  fn dropping_a_driver_with_nothing_in_flight_frees_the_store() {
     let (backend, lio) = lio(1);
     crate::api::nop().with_lio(&lio).when_done(|_| {});
     let id = backend.pushed()[0];
@@ -1664,8 +1755,8 @@ mod tests {
     fn init(&mut self, _: usize) -> io::Result<()> {
       Ok(())
     }
-    fn push(&mut self, op: crate::backend::InFlight<'_>, _: &mut Bump) {
-      self.0.push(op.into_parts().1);
+    fn push(&mut self, op: crate::backend::InFlight, _: &mut Bump) {
+      self.0.push(op.start().1);
     }
     fn flush(&mut self) -> io::Result<()> {
       Ok(())
@@ -1693,11 +1784,6 @@ mod tests {
 
     // Its operations finish on their own: there is nothing to stop.
     fn cancel(&mut self, _id: u64) {}
-
-    // Nothing outside this type ever holds an address.
-    fn drain(&mut self) -> bool {
-      true
-    }
   }
 
   #[test]
@@ -1839,16 +1925,13 @@ mod tests {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    fn push(&mut self, op: crate::backend::InFlight<'_>, bump: &mut Bump) {
+    fn push(&mut self, op: crate::backend::InFlight, bump: &mut Bump) {
       let at = bump.alloc(0u64) as *mut u64 as usize;
       self.first_allocs.borrow_mut().push(at);
       self.inner.push(op, bump);
     }
     fn flush(&mut self) -> io::Result<()> {
       self.inner.flush()
-    }
-    fn drain(&mut self) -> bool {
-      self.inner.drain()
     }
     fn wait(
       &mut self,
@@ -1968,7 +2051,7 @@ mod tests {
     fn resource_close(&self) -> crate::api::resource::ResourceClose {
       self.inner.resource_close()
     }
-    fn push(&mut self, op: crate::backend::InFlight<'_>, bump: &mut Bump) {
+    fn push(&mut self, op: crate::backend::InFlight, bump: &mut Bump) {
       self.inner.push(op, bump);
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -1985,10 +2068,6 @@ mod tests {
 
     fn cancel(&mut self, id: u64) {
       self.inner.cancel(id)
-    }
-
-    fn drain(&mut self) -> bool {
-      self.inner.drain()
     }
   }
 
@@ -2224,8 +2303,8 @@ mod tests {
     fn init(&mut self, _: usize) -> io::Result<()> {
       Ok(())
     }
-    fn push(&mut self, op: crate::backend::InFlight<'_>, _: &mut Bump) {
-      let (_, ticket) = op.into_parts();
+    fn push(&mut self, op: crate::backend::InFlight, _: &mut Bump) {
+      let (_, ticket) = op.start();
       let id = ticket.id();
       // Never given up: its lease stays held.
       self.tickets.push(ticket);
@@ -2252,11 +2331,6 @@ mod tests {
 
     // Its operations finish on their own: there is nothing to stop.
     fn cancel(&mut self, _id: u64) {}
-
-    // Nothing outside this type ever holds an address.
-    fn drain(&mut self) -> bool {
-      true
-    }
   }
 
   #[test]

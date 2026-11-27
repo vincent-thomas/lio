@@ -210,17 +210,29 @@ impl OpStore {
     self.slots.get_mut(key).is_some_and(|slot| slot.lease.held_elsewhere())
   }
 
-  /// Whether a share of the lease of any stored operation is still held
-  /// outside the store: by a ticket that was never given up, or by a
-  /// completion that is still alive.
+  /// Whether a share of the lease of any slot is still held outside the
+  /// store: by a ticket that was never given up, or by a completion that is
+  /// still alive. Slots whose registration was detached count too.
   pub fn any_lease_held(&mut self) -> bool {
     let mut held = false;
-    self.slots.for_each_occupied(|slot| {
+    self.slots.for_each_reserved(|_, slot| {
       if slot.lease.held_elsewhere() {
         held = true;
       }
     });
     held
+  }
+
+  /// Adds to `ids` every operation whose lease is still held outside the
+  /// store, by the id it was submitted with. That includes operations
+  /// whose registration was detached, which is when the id stops
+  /// resolving here: the backend still knows them by it.
+  pub fn leases_held(&mut self, ids: &mut Vec<u64>) {
+    self.slots.for_each_reserved(|key, slot| {
+      if slot.lease.held_elsewhere() {
+        ids.push(key.as_u64());
+      }
+    });
   }
 
   /// Frees slot `id` and drops its registration where it is.
@@ -411,8 +423,9 @@ impl Drop for OpStore {
   /// Drops the registrations still in the store: their buffers, resources
   /// and callbacks. Runs before the slots' arenas, which they point into.
   ///
-  /// The driver only lets this run once its backend reported that no
-  /// operation can touch this memory any more; otherwise it leaks the store.
+  /// The driver only lets this run once no lease is held outside the store,
+  /// so no operation can touch this memory any more; otherwise it leaks the
+  /// store.
   fn drop(&mut self) {
     self.slots.for_each_occupied(|slot| {
       // SAFETY: occupied slots always contain an initialized registration,
@@ -439,6 +452,46 @@ mod tests {
     tx: mpsc::Sender<std::io::Result<()>>,
   ) -> Registration {
     Registration::nop_in(arena, tx)
+  }
+
+  #[test]
+  fn held_leases_are_found_while_stored_and_after_detaching() {
+    let mut store = OpStore::with_capacity(3);
+    let first = store.insert_with(dummy_stored_op);
+    let second = store.insert_with(dummy_stored_op);
+    let third = store.insert_with(dummy_stored_op);
+    let mut held = Vec::new();
+    store.leases_held(&mut held);
+    assert!(held.is_empty() && !store.any_lease_held());
+
+    let share = |store: &mut OpStore, id| {
+      store.with_slot(id, |_, _, lease| lease.clone()).unwrap()
+    };
+    let (first_share, second_share) =
+      (share(&mut store, first), share(&mut store, second));
+    store.leases_held(&mut held);
+    assert_eq!(held, [first, second]);
+    assert!(store.any_lease_held());
+    assert!(store.lease_held(second) && !store.lease_held(third));
+
+    // Detached, `second` stops resolving, and its lease still counts.
+    let detached = store.detach(second).unwrap();
+    assert!(!store.lease_held(second));
+    held.clear();
+    store.leases_held(&mut held);
+    assert_eq!(held, [first, second], "listed by the id it had");
+    drop(first_share);
+    held.clear();
+    store.leases_held(&mut held);
+    assert_eq!(held, [second]);
+    assert!(store.any_lease_held());
+    drop(second_share);
+    held.clear();
+    store.leases_held(&mut held);
+    assert!(held.is_empty() && !store.any_lease_held());
+
+    store.release(detached.slot);
+    drop(detached.registration);
   }
 
   #[test]

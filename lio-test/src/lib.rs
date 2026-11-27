@@ -935,6 +935,53 @@ macro_rules! test_io_backend {
         assert!(extra.is_empty(), "cancelled op completed again: {extra:?}");
       }
 
+      /// What a dropped driver does: it has no other way to stop a backend.
+      #[test]
+      fn cancelling_until_reported_reports_every_op_exactly_once() {
+        let mut backend = new_backend();
+        backend.init(64).unwrap();
+
+        let (read_res, _write_res) = socket_pair();
+        let (mut first, mut second) = ([0_u8; 4], [0_u8; 4]);
+        let first_bufs = [BorrowedMsgBufMut::from_slice(&mut first)];
+        let second_bufs = [BorrowedMsgBufMut::from_slice(&mut second)];
+        // In flight, with nothing to receive.
+        push_op(
+          &mut backend,
+          1,
+          BorrowedOp::recv(read_res.clone(), &first_bufs, RecvFlags::empty()),
+        );
+        backend.flush().unwrap();
+        // Pushed and never flushed.
+        push_op(
+          &mut backend,
+          2,
+          BorrowedOp::recv(read_res.clone(), &second_bufs, RecvFlags::empty()),
+        );
+        push_op(&mut backend, 3, BorrowedOp::nop());
+
+        let mut reported: Vec<u64> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reported.len() < 3 {
+          assert!(Instant::now() < deadline, "only {reported:?} were reported");
+          // Asked again every round, also for what was asked about before.
+          for id in [1, 2, 3] {
+            if !reported.contains(&id) {
+              backend.cancel(id);
+            }
+          }
+          backend.flush().unwrap();
+          let done =
+            wait_completions(&mut backend, Some(Duration::from_millis(10)));
+          reported.extend(done.iter().map(|done| done.registration_id()));
+        }
+        reported.sort_unstable();
+        assert_eq!(reported, [1, 2, 3]);
+        let extra = drain_for(&mut backend, Duration::from_millis(50));
+        assert!(extra.is_empty(), "an op was reported again: {extra:?}");
+        assert_eq!((first, second), ([0; 4], [0; 4]));
+      }
+
       #[test]
       fn cancel_of_an_unknown_id_is_ignored() {
         let mut backend = new_backend();
