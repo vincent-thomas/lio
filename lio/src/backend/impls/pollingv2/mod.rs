@@ -898,6 +898,11 @@ impl Poller {
   /// Only a send that stops short has to know whether its socket blocks.
   /// One that blocks would have gone on until everything was sent, so the
   /// rest is sent that way. Any other is reported as it is.
+  ///
+  /// Sending the rest blocks this thread until the peer has taken it. So
+  /// did the send this replaces: it waited for room, then sent everything
+  /// with a call that blocks. A socket that must never hold the driver up
+  /// is one that does not block.
   fn send_one(
     fd: RawFd,
     bytes: *const u8,
