@@ -32,7 +32,7 @@ use std::{
 use bumpalo::Bump;
 
 use crate::backend::{
-  Done, IoBackend, OpKey, PerOp, Queued, Started,
+  Attempted, Done, IoBackend, Offered, OpKey, PerOp, Queued, Started,
   impls::pollingv2::interest::Interest,
   impls::unix_stat::{file_stat_from_raw, file_type_from_dirent_dtype},
   op::{
@@ -751,6 +751,12 @@ impl Poller {
 
   fn should_complete_immediately(op: &crate::backend::op::Op) -> bool {
     let fd = match op {
+      // Only a file that can be sought takes an offset: a pipe or a
+      // socket fails with `ESPIPE`, without waiting. That saves asking
+      // what the descriptor is.
+      Op::Read { offset: Some(_), .. } | Op::Write { offset: Some(_), .. } => {
+        return true;
+      }
       Op::Read { fd, .. } | Op::Write { fd, .. } => fd.as_raw_fd(),
       Op::Socket { .. } => return true,
       Op::Bind { .. } => return true,
@@ -799,16 +805,35 @@ impl Poller {
     Self::exec_op_with_socket_flags(op, 0)
   }
 
+  /// Performs `op` on this thread if that takes no waiting: one that never
+  /// waits on a descriptor, or a socket operation with data or room there
+  /// already. `None` for one that has to wait.
+  fn perform_now(op: &Op) -> Option<isize> {
+    if matches!(op, Op::Nop) {
+      return Some(0);
+    }
+    if Self::should_complete_immediately(op) {
+      return Some(Self::exec_op(op));
+    }
+    Self::try_socket_immediately(op)
+  }
+
   /// Try nonblocking sockets before paying for readiness registration. Preserve
   /// the existing behavior for externally supplied blocking descriptors.
   fn try_socket_immediately(op: &Op) -> Option<isize> {
-    let fd = match op {
-      Op::Recv { fd, .. } | Op::Send { fd, .. } => fd.as_raw_fd(),
+    match op {
+      // A receive that does not wait takes what is there, whichever mode
+      // the socket is in: there is nothing to ask the descriptor.
+      Op::Recv { .. } => {}
+      // A send that does not wait may stop short where a blocking socket
+      // would go on, so a blocking one is left to wait for room.
+      Op::Send { fd, .. } => {
+        let flags = syscall!(raw fcntl(fd.as_raw_fd(), libc::F_GETFL));
+        if flags < 0 || flags & libc::O_NONBLOCK as isize == 0 {
+          return None;
+        }
+      }
       _ => return None,
-    };
-    let flags = syscall!(raw fcntl(fd, libc::F_GETFL));
-    if flags < 0 || flags & libc::O_NONBLOCK as isize == 0 {
-      return None;
     }
     // Also set the per-call flag so a concurrent change to O_NONBLOCK cannot
     // turn this speculative attempt into a blocking call.
@@ -1241,6 +1266,21 @@ impl IoBackend for Poller {
     Ok(())
   }
 
+  fn attempt(&mut self, offered: Offered<'_>) -> Attempted {
+    let op = offered.as_op();
+    // One that is not valid is left for `start` to refuse.
+    if Self::validate_op(op).is_some() {
+      return offered.decline();
+    }
+    match Self::perform_now(op) {
+      // SAFETY: the call was made on this thread and has returned, so
+      // nothing uses the operation's addresses any more, and the result is
+      // the system call's own.
+      Some(result) => unsafe { offered.finish(result) },
+      None => offered.decline(),
+    }
+  }
+
   fn start(
     &mut self,
     queued: Queued<'_>,
@@ -1250,18 +1290,11 @@ impl IoBackend for Poller {
     if let Some(result) = Self::validate_op(queued.as_op()) {
       return queued.refuse(result);
     }
+    // What was tried when it was offered need not be tried again: it was
+    // declined because it has to wait.
+    let attempted = queued.was_attempted();
     let (started, key, op) = queued.begin();
-    if matches!(op, Op::Nop) {
-      report(done, key, 0);
-      return started;
-    };
-
-    if Self::should_complete_immediately(op) {
-      report(done, key, Self::exec_op(op));
-      return started;
-    }
-
-    if let Some(result) = Self::try_socket_immediately(op) {
+    if !attempted && let Some(result) = Self::perform_now(op) {
       report(done, key, result);
       return started;
     }
