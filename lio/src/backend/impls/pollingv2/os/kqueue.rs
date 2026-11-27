@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::time::Duration;
 use std::{
-  collections::HashSet,
+  collections::{HashMap, HashSet},
   os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 use std::{io, ptr};
@@ -40,16 +40,39 @@ fn make_kevent(
   kev
 }
 
+/// The filters of one descriptor's registration that are still in the
+/// kernel.
+///
+/// Every descriptor is registered one-shot, so the kernel removes a filter
+/// as it reports it. Removing it again would be a system call that finds
+/// nothing, and a registration is replaced after every event: this is what
+/// tells [`OsPoller::delete`] there is nothing left to remove.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Armed {
+  read: bool,
+  write: bool,
+}
+
 /// Wrapper around a kqueue file descriptor
 ///
 /// This type is intentionally `!Send` to ensure it's only used from a single thread.
 /// Interior mutability is provided via `RefCell` for tracking registered fds/timers.
 pub struct OsPoller {
   kq_fd: OwnedFd,
-  /// Track registered fds to match epoll's strict add/modify semantics
-  registered_fds: RefCell<HashSet<RawFd>>,
+  /// The registered descriptors, to match epoll's strict add semantics,
+  /// each with the filters the kernel still holds for it.
+  registered_fds: RefCell<HashMap<RawFd, Armed>>,
   /// Track registered timer keys separately (timers don't have fds)
   registered_timers: RefCell<HashSet<u64>>,
+  /// Registrations that have not reached the kernel. `kevent` takes changes
+  /// and gives events in one call, so they go with the next wait: however
+  /// many descriptors gained a waiter since the last one, that is one
+  /// system call instead of one each.
+  pending: RefCell<Vec<libc::kevent>>,
+  /// Registrations the kernel refused when a full `pending` was submitted
+  /// on its own. They are handed out by the next wait, as it would have
+  /// reported them.
+  refused: RefCell<Vec<libc::kevent>>,
   notify: notify::Notify,
   /// Marker to make this type `!Send`
   _not_send: PhantomData<*const ()>,
@@ -66,8 +89,10 @@ impl OsPoller {
 
     let kqueue = Self {
       kq_fd: kqueue_fd,
-      registered_fds: RefCell::new(HashSet::new()),
+      registered_fds: RefCell::new(HashMap::new()),
       registered_timers: RefCell::new(HashSet::new()),
+      pending: RefCell::new(Vec::new()),
+      refused: RefCell::new(Vec::new()),
       notify: notify::Notify::new()?,
       _not_send: PhantomData,
     };
@@ -276,32 +301,100 @@ impl OsPoller {
       }
     } else {
       // Check if fd is already registered (match epoll's EEXIST behavior)
-      if !self.registered_fds.borrow_mut().insert(fd) {
-        // Value already existed
-        return Err(io::Error::from_raw_os_error(libc::EEXIST));
+      {
+        let mut registered = self.registered_fds.borrow_mut();
+        if registered.contains_key(&fd) {
+          return Err(io::Error::from_raw_os_error(libc::EEXIST));
+        }
+        let armed =
+          Armed { read: interest.is_readable(), write: interest.is_writable() };
+        registered.insert(fd, armed);
       }
 
-      // Optimization: batch both read and write into a single syscall
-      match Self::change_interests_batched(self, fd, key as usize, interest) {
-        Ok(()) => {
-          // Postcondition: fd must still be in registered_fds
-          assert!(
-            self.registered_fds.borrow().contains(&fd),
-            "fd should be in registered_fds after successful add"
-          );
-          Ok(())
-        }
-        Err(e) => {
-          // Rollback: remove from tracking if syscall failed
-          let removed = self.registered_fds.borrow_mut().remove(&fd);
-          assert!(
-            removed,
-            "fd should have been in registered_fds for rollback"
-          );
-          Err(e)
-        }
+      // A negative descriptor is no descriptor, and an event cannot name
+      // it: it is refused here.
+      if fd < 0 {
+        self.registered_fds.borrow_mut().remove(&fd);
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+      }
+
+      // SAFETY: libc::kevent is a C struct that is safe to zero-initialize.
+      let mut changes: [libc::kevent; 2] = unsafe { std::mem::zeroed() };
+      let mut n = 0;
+      self.build_fd_kevents(
+        &mut changes,
+        &mut n,
+        fd,
+        key as usize,
+        interest,
+        true,
+      );
+      let full = {
+        let mut pending = self.pending.borrow_mut();
+        pending.extend_from_slice(&changes[..n]);
+        pending.len() >= Self::MAX_PENDING
+      };
+      if full {
+        self.submit_pending()?;
+      }
+      Ok(())
+    }
+  }
+
+  /// The most registrations left for a wait to submit. A wait has to have
+  /// room for every one of them to be refused.
+  const MAX_PENDING: usize = 128;
+
+  /// Whether `event` is about the descriptor `fd`.
+  fn is_for(event: &libc::kevent, fd: RawFd) -> bool {
+    matches!(event.filter, libc::EVFILT_READ | libc::EVFILT_WRITE)
+      && RawFd::try_from(event.ident) == Ok(fd)
+  }
+
+  /// Records that the kernel no longer holds the filter `event` names: it
+  /// reported it, which uses a one-shot filter up, or refused it.
+  fn disarm(registered: &mut HashMap<RawFd, Armed>, event: &libc::kevent) {
+    let Ok(fd) = RawFd::try_from(event.ident) else { return };
+    let Some(armed) = registered.get_mut(&fd) else { return };
+    match event.filter {
+      libc::EVFILT_READ => armed.read = false,
+      libc::EVFILT_WRITE => armed.write = false,
+      _ => {}
+    }
+  }
+
+  /// Submits the queued registrations on their own, when too many have
+  /// gathered to leave for a wait. A refusal is kept for the next wait.
+  fn submit_pending(&self) -> io::Result<()> {
+    let mut changes = std::mem::take(&mut *self.pending.borrow_mut());
+    // With a receipt asked for, the call reports on each change and takes
+    // no event out of the queue.
+    for change in &mut changes {
+      change.flags |= libc::EV_RECEIPT;
+    }
+    let mut receipts: Vec<libc::kevent> = Vec::with_capacity(changes.len());
+    let count = syscall!(kevent(
+      self.kq_fd.as_raw_fd(),
+      changes.as_ptr(),
+      changes.len() as libc::c_int,
+      receipts.spare_capacity_mut().as_mut_ptr().cast(),
+      changes.len() as libc::c_int,
+      ptr::null(),
+    ))?;
+    // SAFETY: the kernel wrote `count` receipts, at most the capacity.
+    unsafe { receipts.set_len(count as usize) };
+    let mut registered = self.registered_fds.borrow_mut();
+    let mut refused = self.refused.borrow_mut();
+    for mut receipt in receipts {
+      if receipt.flags & libc::EV_ERROR != 0 && receipt.data != 0 {
+        Self::disarm(&mut registered, &receipt);
+        receipt.flags &= !libc::EV_RECEIPT;
+        refused.push(receipt);
       }
     }
+    changes.clear();
+    *self.pending.borrow_mut() = changes;
+    Ok(())
   }
 }
 
@@ -314,37 +407,32 @@ impl ReadinessPoll for OsPoller {
 
   fn delete(&self, fd: RawFd) -> io::Result<()> {
     // Check if fd is registered, fail with ENOENT if not
-    if !self.registered_fds.borrow_mut().remove(&fd) {
+    let Some(armed) = self.registered_fds.borrow_mut().remove(&fd) else {
       return Err(io::Error::from_raw_os_error(libc::ENOENT));
-    }
+    };
 
-    // Postcondition: fd should no longer be in registered_fds
-    assert!(
-      !self.registered_fds.borrow().contains(&fd),
-      "fd should not be in registered_fds after remove"
-    );
-
-    // Delete both read and write interests
-    let read_result = self.delete_interest(fd, libc::EVFILT_READ);
-    let write_result = self.delete_interest(fd, libc::EVFILT_WRITE);
-
-    // If either deletion succeeded, we're good
-    // If both failed, check if either had a non-ENOENT error
-    match (read_result, write_result) {
-      (Ok(()), _) | (_, Ok(())) => Ok(()),
-      (Err(read_err), Err(write_err)) => {
-        // Both failed - check if either is a real error (not ENOENT)
-        if !utils::is_not_found_error(&read_err) {
-          Err(read_err)
-        } else if !utils::is_not_found_error(&write_err) {
-          Err(write_err)
-        } else {
-          // Both were ENOENT - this shouldn't happen since fd was in registered_fds
-          // but if it does, treat it as success (filters were already deleted)
-          Ok(())
-        }
+    // A registration still queued never reached the kernel: taking it out
+    // of the queue removes it.
+    {
+      let mut pending = self.pending.borrow_mut();
+      let queued = pending.len();
+      pending.retain(|change| !Self::is_for(change, fd));
+      if pending.len() != queued {
+        return Ok(());
       }
     }
+    self.refused.borrow_mut().retain(|event| !Self::is_for(event, fd));
+
+    // Only the filters the kernel still holds are removed: one it has
+    // reported is gone already. `delete_interest` lets a filter that was not
+    // found pass, for a descriptor that was closed while registered.
+    if armed.read {
+      self.delete_interest(fd, libc::EVFILT_READ)?;
+    }
+    if armed.write {
+      self.delete_interest(fd, libc::EVFILT_WRITE)?;
+    }
+    Ok(())
   }
 
   fn wait(
@@ -358,28 +446,69 @@ impl ReadinessPoll for OsPoller {
       .as_ref()
       .map_or(std::ptr::null(), |ts| ts as *const libc::timespec);
 
+    // What the kernel refused earlier is reported first, and then there is
+    // something to report without waiting.
+    let carried = {
+      let mut refused = self.refused.borrow_mut();
+      let carried = refused.len().min(events.len());
+      for (slot, event) in events.iter_mut().zip(refused.drain(..carried)) {
+        *slot = event;
+      }
+      carried
+    };
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let timeout_ptr = if carried > 0 { &raw const zero } else { timeout_ptr };
+    let room = &mut events[carried..];
+
+    // The queued registrations go in with the wait. One the kernel refuses
+    // comes back among the events, flagged `EV_ERROR`, which needs a slot
+    // each: `add` keeps the queue shorter than a wait's buffer, and a wait
+    // given less room than that submits them on their own first.
+    if self.pending.borrow().len() > room.len() {
+      self.submit_pending()?;
+    }
+    let mut changes = std::mem::take(&mut *self.pending.borrow_mut());
     let ret = syscall!(kevent(
       self.kq_fd.as_raw_fd(),
-      std::ptr::null(),
-      0,
-      events.as_mut_ptr(),
-      events.len() as i32,
+      changes.as_ptr(),
+      changes.len() as libc::c_int,
+      room.as_mut_ptr(),
+      room.len() as i32,
       timeout_ptr,
-    ))?;
+    ));
+    // Applied or not, the changes are spent: an interrupted call has
+    // applied them all, and any other failure is the poller's own.
+    changes.clear();
+    *self.pending.borrow_mut() = changes;
+    let ret = ret?;
 
     let n = ret as usize;
     assert!(
-      n <= events.len(),
+      n <= room.len(),
       "kevent returned more events ({}) than buffer size ({})",
       n,
-      events.len()
+      room.len()
     );
 
-    Ok(n)
+    // A reported filter was one-shot, and a refused one never took: either
+    // way the kernel does not hold it.
+    let mut registered = self.registered_fds.borrow_mut();
+    if !registered.is_empty() {
+      for event in &room[..n] {
+        Self::disarm(&mut registered, event);
+      }
+    }
+
+    Ok(carried + n)
   }
 
   fn event_key(event: &Self::NativeEvent) -> u64 {
     event.udata as u64
+  }
+
+  fn event_error(event: &Self::NativeEvent) -> Option<i32> {
+    (event.flags & libc::EV_ERROR != 0 && event.data != 0)
+      .then_some(event.data as i32)
   }
 
   fn event_interest(event: &Self::NativeEvent) -> Interest {
