@@ -10,7 +10,7 @@ use core::marker::PhantomData;
 use wasip3::wit_bindgen::FutureReader;
 use wasip3::wit_bindgen::rt::async_support::FutureVtable;
 
-use crate::sealed::Started;
+use crate::sealed::FutureStart;
 
 /// Stored in a result's tag while no result is there: before the call
 /// returns, after a cancel, or once the result was taken. The host only
@@ -222,19 +222,15 @@ impl<E: LiftError + 'static> ResultFuture<E> {
   ///
   /// No read is in flight. `self` stays allocated, unmoved and untouched
   /// until the read completes or is cancelled.
-  pub(crate) unsafe fn start(&mut self) -> Started {
+  pub(crate) unsafe fn start(&mut self) -> FutureStart {
     if self.finished || self.reply.is_filled() {
-      panic!("a stream's status was pushed again after it returned");
+      panic!("a stream's status was read again after it was delivered");
     }
     let reply = self.reply.arm();
     // SAFETY: the handle is this future's readable end with no read in
     // flight, and the caller keeps `reply` in place.
     let code = unsafe { (self.vtable.start_read)(self.handle, reply) };
-    Started::Future {
-      handle: self.handle,
-      code,
-      cancel: self.vtable.cancel_read,
-    }
+    FutureStart { handle: self.handle, code, cancel: self.vtable.cancel_read }
   }
 
   pub(crate) fn take(&mut self) -> Option<Result<(), E>> {
@@ -254,8 +250,8 @@ impl<E: LiftError + 'static> Drop for ResultFuture<E> {
 
 /// Gives an operation its `result` method and makes it a [`Call`].
 ///
-/// It expands where `ErrorCode`, `Call`, `sealed` and `Started` name the
-/// calling module's items.
+/// It expands where `ErrorCode`, `Call` and `sealed` name the calling
+/// module's items.
 ///
 /// `$start` evaluates to the import's return value. It runs with `$op`
 /// borrowing the operation and `$reply` pointing at its result storage.
@@ -273,13 +269,13 @@ macro_rules! call {
 
     impl Call for $name<'_> {}
 
-    impl sealed::Sealed for $name<'_> {
-      unsafe fn start(&mut self) -> Started {
+    impl sealed::Call for $name<'_> {
+      unsafe fn start(&mut self) -> u32 {
         let $reply = self.reply.arm();
         let $op = &*self;
         // SAFETY: the arguments are valid for the import, and the caller
         // keeps `self` and what it borrows in place until the call returns.
-        Started::Subtask(unsafe { $start } as u32)
+        (unsafe { $start }) as u32
       }
     }
   };

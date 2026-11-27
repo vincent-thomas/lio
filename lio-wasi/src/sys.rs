@@ -118,7 +118,7 @@ pub(crate) fn subtask_drop(subtask: u32) {
 /// One event from a waitable set: its kind, the waitable it is about, and
 /// that waitable's result code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Event {
+pub(crate) struct RawEvent {
   pub(crate) kind: u32,
   pub(crate) waitable: u32,
   pub(crate) code: u32,
@@ -128,9 +128,9 @@ pub(crate) struct Event {
 ///
 /// Dropping a set that still has waitables joined traps, so the owner must
 /// [`leave`](Self::leave) each one first.
-pub(crate) struct WaitableSet(NonZeroU32);
+pub(crate) struct RawSet(NonZeroU32);
 
-impl WaitableSet {
+impl RawSet {
   pub(crate) fn new() -> Self {
     // SAFETY: `waitable-set.new` takes no arguments and returns a new handle.
     let raw = unsafe { imports::set_new() };
@@ -153,19 +153,19 @@ impl WaitableSet {
   }
 
   /// Blocks until a joined waitable has an event.
-  pub(crate) fn wait(&self) -> Event {
+  pub(crate) fn wait(&self) -> RawEvent {
     let mut payload = [0u32; 2];
     // SAFETY: `payload` is valid for the two words the host writes.
     let kind = unsafe { imports::set_wait(self.0.get(), &mut payload) };
-    Event { kind, waitable: payload[0], code: payload[1] }
+    RawEvent { kind, waitable: payload[0], code: payload[1] }
   }
 
   /// Returns an event if one is ready, without blocking.
-  pub(crate) fn poll(&self) -> Option<Event> {
+  pub(crate) fn poll(&self) -> Option<RawEvent> {
     let mut payload = [0u32; 2];
     // SAFETY: `payload` is valid for the two words the host writes.
     let kind = unsafe { imports::set_poll(self.0.get(), &mut payload) };
-    (kind != EVENT_NONE).then_some(Event {
+    (kind != EVENT_NONE).then_some(RawEvent {
       kind,
       waitable: payload[0],
       code: payload[1],
@@ -173,7 +173,7 @@ impl WaitableSet {
   }
 }
 
-impl Drop for WaitableSet {
+impl Drop for RawSet {
   fn drop(&mut self) {
     // SAFETY: the handle is owned and dropped once.
     unsafe { imports::set_drop(self.0.get()) }

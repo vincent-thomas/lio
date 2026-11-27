@@ -8,77 +8,84 @@
 use std::time::{Duration, Instant};
 
 use lio_wasi::clock::WaitFor;
-use lio_wasi::{Completion, Outcome, Queue};
+use lio_wasi::{Cancel, Event, Started, StreamResult, Subtask, WaitableSet};
 
-fn next(queue: &mut Queue) -> Completion {
-  let Some(done) = queue.wait() else {
-    unreachable!("an operation is outstanding")
+/// Starts a timer that cannot have fired yet.
+///
+/// # Safety
+///
+/// As for [`WaitableSet::start`].
+unsafe fn start(set: &mut WaitableSet, timer: &mut WaitFor) -> Subtask {
+  // SAFETY: guaranteed by the caller.
+  let Some(subtask) = (unsafe { set.start(timer) }) else {
+    panic!("a timer fired as it was started");
   };
-  done
+  subtask
 }
 
 fn main() {
-  let mut queue = Queue::new();
+  let mut set = WaitableSet::new();
 
-  // Three timers pushed longest first complete shortest first.
+  // Three timers started longest first fire shortest first.
   let mut timers = [
     WaitFor::new(Duration::from_millis(300)),
     WaitFor::new(Duration::from_millis(200)),
     WaitFor::new(Duration::from_millis(100)),
   ];
-  let start = Instant::now();
-  for (id, timer) in timers.iter_mut().enumerate() {
-    // SAFETY: `timers` stays put until every completion is taken.
-    unsafe { queue.push_call(timer, id as u64) };
+  let start_time = Instant::now();
+  // SAFETY: `timers` stays put until every timer has fired.
+  let subtasks: Vec<Subtask> =
+    timers.iter_mut().map(|timer| unsafe { start(&mut set, timer) }).collect();
+  assert!(set.poll().is_none(), "no timer has fired yet");
+  assert_eq!(set.in_flight(), 3);
+  let mut order = Vec::new();
+  while let Some(event) = set.wait() {
+    let Event::Returned(subtask) = event else {
+      unreachable!("only timers are in flight: {event:?}")
+    };
+    order.push(subtasks.iter().position(|started| *started == subtask));
   }
-  assert!(queue.poll().is_none(), "no timer has fired yet");
-  assert_eq!(queue.outstanding(), 3);
-  let order: Vec<u64> = (0..3)
-    .map(|_| {
-      let done = next(&mut queue);
-      assert_eq!(done.outcome(), Outcome::Returned);
-      done.user_data()
-    })
-    .collect();
-  assert_eq!(order, [2, 1, 0]);
-  let elapsed = start.elapsed();
+  assert_eq!(order, [Some(2), Some(1), Some(0)]);
+  let elapsed = start_time.elapsed();
   assert!(elapsed >= Duration::from_millis(300), "fired early: {elapsed:?}");
   assert!(elapsed < Duration::from_millis(900), "fired late: {elapsed:?}");
   println!("three timers fired in order after {elapsed:?}");
 
-  // A cancelled timer completes at once as cancelled, and never fires.
+  // A cancelled timer is stopped at once, and never fires.
   let mut long = WaitFor::new(Duration::from_secs(3600));
-  let start = Instant::now();
-  // SAFETY: `long` stays put until its completion is taken.
-  unsafe { queue.push_call(&mut long, 7) };
-  assert!(queue.cancel(7));
-  assert!(!queue.cancel(7));
-  let done = next(&mut queue);
-  assert_eq!((done.user_data(), done.outcome()), (7, Outcome::Cancelled(0)));
-  assert!(queue.wait().is_none());
-  assert!(start.elapsed() < Duration::from_secs(1));
+  let start_time = Instant::now();
+  // SAFETY: `long` stays put until the timer is cancelled.
+  let subtask = unsafe { start(&mut set, &mut long) };
+  assert_eq!(set.cancel(subtask), Some(Cancel::Cancelled));
+  assert_eq!(set.cancel(subtask), None);
+  assert!(set.wait().is_none());
+  assert!(start_time.elapsed() < Duration::from_secs(1));
   println!("cancelled timer: ok");
 
   // A timer bounds a wait on a stream that never has data: the lio
   // backend's `wait(timeout)`.
   let (_writer, reader) = wasip3::wit_stream::new::<u8>();
-  let reader = queue.add_reader(reader);
+  let reader = set.add_reader(reader);
   let mut buf = [0u8; 8];
   let mut timeout = WaitFor::new(Duration::from_millis(50));
-  // SAFETY: `buf` and `timeout` outlive the completions taken below.
-  unsafe {
-    assert_eq!(queue.push_read(reader, buf.as_mut_ptr(), buf.len(), 1), Ok(()));
-    queue.push_call(&mut timeout, 2);
-  }
-  assert_eq!(next(&mut queue).user_data(), 2, "the timeout comes first");
-  assert!(queue.cancel(1));
-  assert_eq!(next(&mut queue).outcome(), Outcome::Cancelled(0));
+  // SAFETY: `buf` and `timeout` outlive the read and the timer, which have
+  // both ended by the cancel below.
+  let (read, timer) = unsafe {
+    (
+      set.read(reader, buf.as_mut_ptr(), buf.len()),
+      start(&mut set, &mut timeout),
+    )
+  };
+  assert_eq!(read, Ok(Started::Blocked));
+  assert_eq!(set.wait(), Some(Event::Returned(timer)), "the timeout is first");
+  assert_eq!(set.cancel_read(reader), Some(StreamResult::Cancelled(0)));
+  assert!(set.wait().is_none());
   println!("timeout bounds a wait: ok");
 
-  // Dropping the queue with a timer in flight cancels it.
+  // Dropping the set with a timer in flight cancels it.
   let mut pending = WaitFor::new(Duration::from_secs(3600));
-  // SAFETY: the queue is dropped before `pending`.
-  unsafe { queue.push_call(&mut pending, 3) };
-  drop(queue);
+  // SAFETY: the set is dropped before `pending`.
+  let _ = unsafe { start(&mut set, &mut pending) };
+  drop(set);
   println!("drop with a timer in flight: ok");
 }
