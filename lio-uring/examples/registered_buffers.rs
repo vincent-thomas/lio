@@ -2,7 +2,7 @@
 
 use lio_uring::{LioUring, operation::*};
 use std::fs;
-use std::io::{self, IoSlice};
+use std::io;
 use std::os::fd::AsRawFd;
 
 fn main() -> io::Result<()> {
@@ -20,7 +20,10 @@ fn main() -> io::Result<()> {
     *byte = (i % 256) as u8;
   }
 
-  let buffers = [IoSlice::new(&pattern)];
+  let buffers = [libc::iovec {
+    iov_base: pattern.as_ptr() as *mut _,
+    iov_len: pattern.len(),
+  }];
   unsafe { ring.register_buffers(&buffers)? };
 
   let write = WriteFixed::new(

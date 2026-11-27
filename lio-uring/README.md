@@ -15,6 +15,9 @@ A production-ready, safe, and ergonomic Rust interface to Linux's io_uring async
   - Fixed files and buffers
   - Batch submissions
   - Non-blocking completions
+- **`no_std`**: needs only `core` and libc. Errors are an `Errno`; the
+  default `std` feature converts it into `std::io::Error`, so `?` works in
+  functions returning `io::Result`.
 
 ## Requirements
 
@@ -121,14 +124,15 @@ Pre-register resources for zero-copy operations and improved performance.
 Register buffers once, then reference them by index for zero-copy I/O:
 
 ```rust
-use std::io::IoSlice;
-
 // Prepare your buffers
 let mut buffer1 = vec![0u8; 4096];
 let mut buffer2 = vec![0u8; 4096];
 
 // Register them with io_uring (pins them in kernel memory)
-let buffers = vec![IoSlice::new(&buffer1), IoSlice::new(&buffer2)];
+let buffers = [
+    libc::iovec { iov_base: buffer1.as_mut_ptr().cast(), iov_len: buffer1.len() },
+    libc::iovec { iov_base: buffer2.as_mut_ptr().cast(), iov_len: buffer2.len() },
+];
 unsafe { sq.register_buffers(&buffers) }?;
 
 // Use ReadFixed/WriteFixed with buf_index to reference registered buffers

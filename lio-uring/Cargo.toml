@@ -17,6 +17,11 @@ default-target = "x86_64-unknown-linux-gnu"
 # Explicitly limit to just one (or few) targets
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
+[features]
+default = ["std"]
+# Converts `Errno` into `std::io::Error`. The crate itself is no_std.
+std = []
+
 [dependencies]
 libc.workspace = true
 
