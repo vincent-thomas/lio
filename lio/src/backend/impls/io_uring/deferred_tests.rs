@@ -285,7 +285,6 @@ fn nonblocking_waits_make_progress_on_file_completions() {
       );
     }
   }
-  backend.flush();
   let mut seen = [false; DEPTH];
   let mut count = 0;
   let mut completed = Vec::new();
@@ -341,7 +340,6 @@ fn read_with_more_iovecs_than_the_native_array_is_rejected() {
       }),
     );
   }
-  backend.flush();
   let mut completed = Vec::new();
   backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
   assert_eq!(completed.len(), 1);
@@ -375,7 +373,6 @@ fn drop_waits_for_operations_in_the_kernel() {
       }),
     );
   }
-  backend.flush();
   let mut completed = Vec::new();
   backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
   assert!(completed.is_empty(), "the read waits for data");

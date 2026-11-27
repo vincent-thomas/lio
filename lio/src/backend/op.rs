@@ -1082,7 +1082,7 @@ pub enum Op {
   /// Open a path relative to a directory file descriptor.
   ///
   /// This is an immediate operation on readiness backends: it should execute
-  /// during `flush()` and surface its completion on the next `wait()`.
+  /// as it is pushed and surface its completion on the next `wait()`.
   OpenAt {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
@@ -1096,7 +1096,7 @@ pub enum Op {
   /// Remove a file or directory relative to a directory file descriptor.
   ///
   /// This is an immediate operation on readiness backends: it should execute
-  /// during `flush()` and surface its completion on the next `wait()`.
+  /// as it is pushed and surface its completion on the next `wait()`.
   UnlinkAt {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
@@ -1108,7 +1108,7 @@ pub enum Op {
   /// Rename a file or directory relative to directory file descriptors.
   ///
   /// This is an immediate operation on readiness backends: it should execute
-  /// during `flush()` and surface its completion on the next `wait()`.
+  /// as it is pushed and surface its completion on the next `wait()`.
   RenameAt {
     /// Directory file descriptor used as the base for the old path.
     old_dir_fd: Resource,
@@ -1122,7 +1122,7 @@ pub enum Op {
   /// Create a directory relative to a directory file descriptor.
   ///
   /// This is an immediate operation on readiness backends: it should execute
-  /// during `flush()` and surface its completion on the next `wait()`.
+  /// as it is pushed and surface its completion on the next `wait()`.
   MkdirAt {
     /// Directory file descriptor used as the base for relative paths.
     dir_fd: Resource,
@@ -1177,7 +1177,7 @@ pub enum Op {
   /// Create a new socket descriptor.
   ///
   /// This is an immediate operation on readiness backends: it should execute
-  /// during `flush()` and surface its completion on the next `wait()`.
+  /// as it is pushed and surface its completion on the next `wait()`.
   Socket {
     /// Cross-platform semantic socket domain.
     domain: SockDomain,
@@ -1189,7 +1189,7 @@ pub enum Op {
   /// Bind a socket to a local address.
   ///
   /// This is an immediate operation on readiness backends: it should execute
-  /// during `flush()` and surface its completion on the next `wait()`.
+  /// as it is pushed and surface its completion on the next `wait()`.
   Bind {
     /// Socket resource to bind.
     fd: Resource,

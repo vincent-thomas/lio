@@ -1,7 +1,7 @@
 //! What lio's bookkeeping costs, with no system calls.
 //!
 //! Every group except `timer` runs on [`BenchBackend`], which completes nops
-//! and reads in memory as the driver's flush starts them. `cancel` keeps
+//! and reads in memory as the driver starts them. `cancel` keeps
 //! started operations in flight until the driver cancels them, then
 //! completes those in memory too.
 //! `timer` drives [`Clock`](lio::time::Clock) directly. None of this enters
@@ -9,14 +9,14 @@
 //!
 //! Throughput is operations per second. `resubmit` counts yielded items.
 //!
-//! - `bookkeeping/no_driver` — push, flush, and wait `qd` nops on the backend
+//! - `bookkeeping/no_driver` — push and wait `qd` nops on the backend
 //!   and its table ([`Tracked`]) alone. The driver groups sit on top of this
 //!   cost.
 //! - `bookkeeping/round_trip` — submit `qd` nops and deliver every completion
-//!   through `when_done`, in one `try_run`. The gap above `no_driver` is
-//!   registration, routing, the callback, and releasing the slot.
-//! - `bookkeeping/cancel` — submit `qd` nops, flush them so they stay in
-//!   flight, drop the futures, then route the cancellation completions.
+//!   through `when_done`, which the backend's finishing each as it starts
+//!   makes happen at the submit. The gap above `no_driver` is registration,
+//!   the callback, and releasing the slot.
+//! - `bookkeeping/cancel` — submit `qd` nops, which stay in flight, drop the futures, then route the cancellation completions.
 //! - `bookkeeping/buffer_256` — the round trip for `qd` reads of a 256-byte
 //!   buffer. The backend does not write the buffer, so the gap above
 //!   `round_trip` is building the iovec and handing the buffer back.
@@ -153,7 +153,6 @@ fn no_driver(criterion: &mut Criterion) {
             // SAFETY: a no-op borrows nothing.
             unsafe { backend.push(id, BorrowedOp::nop()) };
           }
-          backend.flush();
           backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
           assert_eq!(completed.len(), depth);
           black_box(&completed);
@@ -184,7 +183,8 @@ fn round_trip(criterion: &mut Criterion) {
               completed.set(completed.get() + 1);
             });
           }
-          assert_eq!(lio.try_run().unwrap(), depth);
+          // Routes what the backend did not finish as it started.
+          lio.try_run().unwrap();
           assert_eq!(completed.get() - before, depth);
         });
       },
@@ -256,7 +256,8 @@ fn buffer(criterion: &mut Criterion) {
               },
             );
           }
-          assert_eq!(lio.try_run().unwrap(), depth);
+          // Routes what the backend did not finish as it started.
+          lio.try_run().unwrap();
           assert_eq!(completed.get() - before, depth);
         });
       },
@@ -315,10 +316,13 @@ fn awaited(criterion: &mut Criterion) {
         bencher.iter(|| {
           for _ in 0..depth {
             let mut fut = api::nop().with_lio(&lio).into_future();
-            assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
-            futures.push(fut);
+            // Ready here when the backend finished it as it started.
+            match Pin::new(&mut fut).poll(&mut cx) {
+              Poll::Ready(result) => result.unwrap(),
+              Poll::Pending => futures.push(fut),
+            }
           }
-          assert_eq!(lio.try_run().unwrap(), depth);
+          lio.try_run().unwrap();
           for mut fut in futures.drain(..) {
             let Poll::Ready(result) = Pin::new(&mut fut).poll(&mut cx) else {
               panic!("an operation the driver completed is not ready");
@@ -356,15 +360,12 @@ fn resubmit(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("steps", steps), |bencher| {
       bencher.iter(|| {
         let mut next = std::pin::pin!(stream.next());
-        assert!(next.as_mut().poll(&mut cx).is_pending());
         loop {
-          assert_eq!(lio.try_run().unwrap(), 1);
-          if ready.0.swap(false, Ordering::Relaxed)
-            && let Poll::Ready(item) = next.as_mut().poll(&mut cx)
-          {
+          if let Poll::Ready(item) = next.as_mut().poll(&mut cx) {
             assert_eq!(item, Some(()));
             break;
           }
+          lio.try_run().unwrap();
         }
       });
     });

@@ -134,14 +134,14 @@ fn panicking_callback_that_owns_an_in_flight_future_does_not_abort() {
   let lio = Lio::new(2).unwrap();
   let sleep = submitted_sleep(&lio);
 
-  api::nop().with_lio(&lio).when_done(move |_| {
-    let _ = &sleep;
-    panic!("callback failure");
-  });
-  let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-    lio.run_timeout(Duration::from_millis(50)).unwrap();
+  // A nop is done as it is submitted, so its callback runs there.
+  let submit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    api::nop().with_lio(&lio).when_done(move |_| {
+      let _ = &sleep;
+      panic!("callback failure");
+    });
   }));
-  assert!(run.is_err(), "the callback panic propagates");
+  assert!(submit.is_err(), "the callback panic propagates");
 
   // The next run drops the panicked registration, and with it the sleep.
   lio.try_run().unwrap();
@@ -176,8 +176,9 @@ fn waker_schedules_work_when_woken() {
     done: done.clone(),
   }));
   let mut cx = Context::from_waker(&waker);
+  // Something that waits: a nop is done as it is submitted.
   let mut future: Pin<Box<_>> =
-    Box::pin(api::nop().with_lio(&lio).into_future());
+    Box::pin(api::sleep(Duration::from_millis(1)).with_lio(&lio).into_future());
   assert!(future.as_mut().poll(&mut cx).is_pending());
 
   run_until(&lio, &done);
@@ -216,8 +217,9 @@ fn waker_may_poll_its_future_inline() {
   let lio = Lio::new(8).unwrap();
   let done = Rc::new(Cell::new(false));
   let polling = Arc::new(PollingWaker {
+    // Something that waits: a nop is done as it is submitted.
     future: RefCell::new(Some(Box::pin(
-      api::nop().with_lio(&lio).into_future(),
+      api::sleep(Duration::from_millis(1)).with_lio(&lio).into_future(),
     ))),
     done: done.clone(),
   });
@@ -239,11 +241,13 @@ fn panicking_callback_frees_its_slot() {
   // scheduled.
   let lio = Lio::new(1).unwrap();
 
-  api::nop().with_lio(&lio).when_done(|_| panic!("callback failure"));
-  let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-    lio.run_timeout(Duration::from_millis(50)).unwrap();
+  // A nop is done as it is submitted, so its callback runs there.
+  let submit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    api::nop().with_lio(&lio).when_done(|_| panic!("callback failure"));
   }));
-  assert!(run.is_err(), "the callback panic propagates to the caller");
+  assert!(submit.is_err(), "the callback panic propagates to the caller");
+  // The next run drops the panicked registration.
+  lio.try_run().unwrap();
 
   let done = Rc::new(Cell::new(false));
   let inner_done = done.clone();

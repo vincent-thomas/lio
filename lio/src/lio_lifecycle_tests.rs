@@ -153,7 +153,7 @@ impl Harness {
     crate::time::pause(&lio);
     Self {
       kinds: kinds.to_vec(),
-      backend: Kernel::new(backend, &lio),
+      backend: Kernel::new(backend),
       lio: Some(lio),
       ops: kinds.iter().map(|_| OpState::default()).collect(),
       drops: Arc::default(),

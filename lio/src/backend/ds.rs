@@ -4165,35 +4165,6 @@ mod tests {
     unsafe { backend.push(id, BorrowedOp::from_op(op)) };
   }
 
-  #[test]
-  fn cancel_reports_a_queued_read_without_performing_it() {
-    let mut backend = Tracked::new(DSBackend::new());
-    backend.init(4).unwrap();
-    let mut bytes = [1u8; 4];
-    let iov = [crate::backend::op::RawBufMut::from_mut(&mut bytes)];
-    let op = BorrowedOp::read(
-      crate::api::resource::Resource::invalid(),
-      &iov,
-      None,
-      Default::default(),
-    );
-    // SAFETY: `iov` and `bytes` outlive the completion taken below.
-    unsafe { backend.push(1, op) };
-    backend.cancel(1);
-    backend.flush();
-    let mut completed = Vec::new();
-    for _ in 0..8 {
-      backend.wait(Some(std::time::Duration::ZERO), &mut completed).unwrap();
-      if !completed.is_empty() {
-        break;
-      }
-    }
-    assert_eq!(completed.len(), 1);
-    assert!(completed[0].is_cancelled());
-    drop(completed);
-    assert_eq!(bytes, [1u8; 4]);
-  }
-
   use super::*;
   use crate::backend::Tracked;
   use crate::backend::op::BorrowedOp;
@@ -4346,8 +4317,6 @@ mod tests {
     let mut step_b = Bump::new();
     submit(&mut a, 1, Op::Nop, &mut step_a);
     submit(&mut b, 1, Op::Nop, &mut step_b);
-    a.flush();
-    b.flush();
 
     let mut done_a = Vec::new();
     let mut done_b = Vec::new();
@@ -4377,7 +4346,6 @@ mod tests {
       Op::GetCwd { out: NonNull::from(&mut out) },
       &mut step_bump,
     );
-    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
@@ -4413,7 +4381,6 @@ mod tests {
       Op::Recv { fd: Resource::stdin(), msg, flags: RecvFlags::empty() },
       &mut step_bump,
     );
-    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
@@ -4448,7 +4415,6 @@ mod tests {
       Op::Recv { fd: socket, msg, flags: RecvFlags::empty() },
       &mut step_bump,
     );
-    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
@@ -4505,7 +4471,6 @@ mod tests {
       Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
     );
-    backend.flush();
 
     let mut send_done = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut send_done).unwrap();
@@ -4523,7 +4488,6 @@ mod tests {
       Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
     );
-    backend.flush();
 
     let mut recv_done = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut recv_done).unwrap();
@@ -4572,7 +4536,6 @@ mod tests {
     let mut bump = Bump::new();
     let mut run = |id, op| {
       submit(&mut backend, id, op, &mut bump);
-      backend.flush();
       let mut done = Vec::new();
       backend.wait(Some(Duration::ZERO), &mut done).unwrap();
       assert_eq!(done.len(), 1);
@@ -4655,7 +4618,6 @@ mod tests {
       Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
     );
-    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
@@ -4674,7 +4636,6 @@ mod tests {
       Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
     );
-    backend.flush();
 
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
@@ -4750,7 +4711,6 @@ mod tests {
       Op::Connect { fd: client, addr: op::socket_addr_into_buf(connect_addr) },
       &mut connect_bump,
     );
-    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
@@ -4823,10 +4783,9 @@ mod tests {
       Op::Recv { fd: receiver, msg: recv_msg, flags: RecvFlags::empty() },
       &mut recv_bump,
     );
-    backend.flush();
 
-    let after_flush = backend.backend_mut().progress_snapshot();
-    assert_eq!(after_flush.pending, before.pending + 1);
+    let after_push = backend.backend_mut().progress_snapshot();
+    assert_eq!(after_push.pending, before.pending + 1);
     assert!(backend.backend_mut().has_pending_work());
     assert!(!backend.backend_mut().is_quiescent());
   }
@@ -4891,7 +4850,6 @@ mod tests {
       Op::Send { fd: sender, msg: send_msg, flags: SendFlags::empty() },
       &mut send_bump,
     );
-    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
@@ -5433,7 +5391,6 @@ mod tests {
       },
       &mut step_bump,
     );
-    backend.flush();
 
     let mut completed = Vec::new();
     backend.wait(None, &mut completed).unwrap();
@@ -5504,7 +5461,7 @@ mod tests {
     backend.init(8).unwrap();
     dst_test_socket(&backend.backend().node, 91);
 
-    // Flushed, so the simulator has it, and not stepped, so the network
+    // Pushed, so the simulator has it, and not stepped, so the network
     // has not looked at it.
     submit(
       &mut backend,
@@ -5512,7 +5469,6 @@ mod tests {
       Op::Fsync { fd: dst_resource(91) },
       &mut Bump::new(),
     );
-    backend.flush();
     backend.cancel(1);
 
     let mut completed = Vec::new();
@@ -5542,7 +5498,6 @@ mod tests {
 
     let fd = dst_resource(91);
     submit(&mut backend, 1, Op::Fsync { fd }, &mut Bump::new());
-    backend.flush();
     assert!(dst.step());
 
     let mut completed = Vec::new();

@@ -42,7 +42,6 @@ fn drop_cancels_a_blocked_pipe_read() {
       ),
     );
   }
-  backend.flush();
   // Give a worker time to block in ReadFile on the empty pipe.
   std::thread::sleep(Duration::from_millis(50));
 

@@ -104,12 +104,11 @@ fn cancelling_a_future_frees_its_slot_for_a_waiter() {
 
   drop(long);
   assert!(woken.0.load(Ordering::SeqCst), "cancelling frees the slot");
-  assert!(waiting.as_mut().poll(&mut cx).is_pending());
   for _ in 0..100 {
-    lio.run_timeout(Duration::from_millis(5)).unwrap();
     if waiting.as_mut().poll(&mut cx).is_ready() {
       return;
     }
+    lio.run_timeout(Duration::from_millis(5)).unwrap();
   }
   panic!("the waiting future never completed");
 }

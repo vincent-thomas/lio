@@ -477,11 +477,13 @@ where
       else {
         unreachable!("a future that was idle is not");
       };
-      let spawned = lio.spawn_awaited(model, cx.waker().clone());
+      let (spawned, finished) = lio.spawn_awaited(model, cx.waker());
       this.state = RunState::Running(Task { lio: lio.downgrade(), spawned });
-      // A model that finished inside the spawn has woken this future's
-      // waker, which is given its item when it is polled again.
-      return Poll::Pending;
+      if !finished {
+        // The waker is in the slot.
+        return Poll::Pending;
+      }
+      // The backend had the answer: the item is in the slot already.
     }
     match &this.state {
       RunState::Running(task) => {
@@ -542,13 +544,8 @@ impl<Req, Out> Leaf<Req, Out> {
     submit: impl FnOnce(&mut Cx<'_>, Req) -> Ticket<Out>,
   ) -> Step<Out> {
     let mut ticket = match std::mem::replace(self, Leaf::Done) {
-      Leaf::Idle(request) => {
-        // Nothing is reported before the driver runs, so there is no result
-        // to ask for yet, and the model that submits an operation is the
-        // one polled when it has one.
-        *self = Leaf::InFlight(submit(cx, request));
-        return Step::Pending;
-      }
+      // The backend may have finished it as it was submitted.
+      Leaf::Idle(request) => submit(cx, request),
       Leaf::InFlight(ticket) => ticket,
       Leaf::Done => panic!("operation polled after it was done"),
     };

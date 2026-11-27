@@ -135,8 +135,9 @@ struct TaskPayload<M, F> {
 /// it comes first in [`AwaitedPayload`].
 #[repr(C)]
 struct Mailbox<T> {
-  item: Option<T>,
+  /// First, so that the driver can set it without knowing `T`.
   waker: Option<Waker>,
+  item: Option<T>,
 }
 
 /// A model run for a future, and that future's mailbox.
@@ -374,16 +375,17 @@ impl Registration {
   }
 
   /// A slot that runs `model` for a future: the model's item waits in the
-  /// slot for that future, which `waker` wakes when it is there.
+  /// slot for that future. Nothing wakes it until
+  /// [`arm_mail`](Self::arm_mail) says what does.
   ///
   /// The slot is held until [`take_mail`](Self::take_mail) has returned the
   /// item or [`release_mail`](Self::release_mail) was called.
-  pub(crate) fn awaited<M>(arena: &mut Bump, model: M, waker: Waker) -> Self
+  pub(crate) fn awaited<M>(arena: &mut Bump, model: M) -> Self
   where
     M: Drive + 'static,
   {
     let payload: &mut AwaitedPayload<M> = arena.alloc(AwaitedPayload {
-      mailbox: Mailbox { item: None, waker: Some(waker) },
+      mailbox: Mailbox { item: None, waker: None },
       model: Some(model),
     });
     let mut registration = Self::vacant();
@@ -443,6 +445,25 @@ impl Registration {
       (*payload).mailbox.item = None;
       (*payload).mailbox.waker = None;
     }
+  }
+
+  /// Whether this slot's model, if it runs one, is done and dropped.
+  pub(crate) fn is_finished(&self) -> bool {
+    self.task.as_ref().is_none_or(|task| task.finished)
+  }
+
+  /// Names what wakes the future this slot's model runs for, when its item
+  /// is there.
+  pub(crate) fn arm_mail(&mut self, waker: Waker) {
+    let Some(task) = self.task.as_mut().filter(|task| task.held) else {
+      unreachable!("a slot that runs no model for a future was armed");
+    };
+    // SAFETY: a held task's payload is an `AwaitedPayload`, which is
+    // `repr(C)` and starts with its mailbox's waker, whatever its item is.
+    // Nothing else refers to the mailbox: see `take_mail`.
+    let before = unsafe { &mut *task.payload.cast::<Option<Waker>>() };
+    assert!(before.is_none(), "a future's slot was armed twice");
+    *before = Some(waker);
   }
 
   /// The item of the model this slot runs for a future, once it is there.
