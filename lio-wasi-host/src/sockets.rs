@@ -52,6 +52,9 @@ pub struct TcpSocket {
   resource: Resource,
   family: IpAddressFamily,
   state: TcpState,
+  /// Alive for as long as the connect that put the socket in `Connecting`
+  /// is. A guest that drops that connect leaves nothing to finish it.
+  connecting: std::sync::Weak<()>,
   backlog: i32,
   /// Each direction's stream can be asked for once.
   receiving: bool,
@@ -245,6 +248,7 @@ impl<D: 'static> StreamProducer<D> for Acceptor<D> {
       resource,
       family: me.family,
       state: TcpState::Connected,
+      connecting: std::sync::Weak::new(),
       backlog: 0,
       receiving: false,
       sending: false,
@@ -264,7 +268,15 @@ impl WasiCtx {
     &mut self,
     socket: &Handle<TcpSocket>,
   ) -> wasmtime::Result<&mut TcpSocket> {
-    Ok(self.table.get_mut(socket)?)
+    let socket = self.table.get_mut(socket)?;
+    // A connect that was dropped before it finished cannot say how it
+    // ended: the socket is left as one whose connect failed.
+    if socket.state == TcpState::Connecting
+      && socket.connecting.strong_count() == 0
+    {
+      socket.state = TcpState::Closed;
+    }
+    Ok(socket)
   }
 
   fn udp(
@@ -340,6 +352,7 @@ impl types::HostTcpSocket for WasiCtx {
       resource,
       family,
       state: TcpState::Unbound,
+      connecting: std::sync::Weak::new(),
       backlog: 128,
       receiving: false,
       sending: false,
@@ -579,11 +592,14 @@ impl<T: Send + 'static> types::HostTcpSocketWithStore<T> for LioWasi {
         if remote.ip().is_unspecified() || remote.port() == 0 {
           return Err(ErrorCode::InvalidArgument);
         }
+        let alive = std::sync::Arc::new(());
         socket.state = TcpState::Connecting;
-        Ok((socket.resource.clone(), remote))
+        socket.connecting = std::sync::Arc::downgrade(&alive);
+        Ok((socket.resource.clone(), remote, alive))
       })())
     })?;
-    let (resource, remote) = match started {
+    // Held until the socket's state says how the connect ended.
+    let (resource, remote, _alive) = match started {
       Ok(started) => started,
       Err(error) => return Ok(Err(error)),
     };
@@ -712,12 +728,16 @@ impl types::HostUdpSocket for WasiCtx {
 
   fn disconnect(&mut self, this: Handle<UdpSocket>) -> Sock<()> {
     let socket = self.udp(&this)?;
-    Ok(if socket.connected.take().is_none() {
+    Ok(if socket.connected.is_none() {
       Err(ErrorCode::InvalidState)
     } else {
       match rustix::net::connect_unspec(&socket.resource) {
         // Dissolving the association reports the family it no longer has.
-        Ok(()) | Err(rustix::io::Errno::AFNOSUPPORT) => Ok(()),
+        Ok(()) | Err(rustix::io::Errno::AFNOSUPPORT) => {
+          socket.connected = None;
+          Ok(())
+        }
+        // The system still has the peer, so the host goes on saying so.
         Err(error) => Err(errno(error)),
       }
     })
