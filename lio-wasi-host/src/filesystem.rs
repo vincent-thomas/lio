@@ -396,9 +396,16 @@ impl<T: Send + 'static> types::HostDescriptorWithStore<T> for LioWasi {
   {
     let descriptor = host.get().table.get(&fd)?.clone();
     // Reading a directory fails with `is-directory` in the stream's status.
+    let readable = descriptor.flags.contains(DescriptorFlags::READ);
     let from = ReadFrom::File(descriptor.resource, offset);
     let lending = host.get().lending.clone();
-    let (reader, status) = ByteReader::new(from, fs_error, nothing, lending);
+    let (mut reader, status) =
+      ByteReader::new(from, fs_error, nothing, lending);
+    // The system opened it for reading whether or not the guest asked to
+    // read it, so the guest's own flags are what say.
+    if !readable {
+      reader.end(Err(ErrorCode::NotPermitted));
+    }
     Ok((
       StreamReader::new(&mut host, reader)?,
       FutureReader::new(&mut host, status)?,
@@ -504,6 +511,10 @@ impl<T: Send + 'static> types::HostDescriptorWithStore<T> for LioWasi {
       status: Some(status),
     };
     match descriptor.dir() {
+      // As for a file: the guest's flags say whether it may be read.
+      Ok(_) if !descriptor.flags.contains(DescriptorFlags::READ) => {
+        reader.end(Err(ErrorCode::NotPermitted));
+      }
       Ok(dir) => {
         let flags = api::OpenFlags::READ | api::OpenFlags::DIRECTORY;
         reader.listing = Listing::Opening(op(api::openat(
@@ -629,6 +640,15 @@ impl<T: Send + 'static> types::HostDescriptorWithStore<T> for LioWasi {
       let writes = flags.contains(DescriptorFlags::WRITE) && !directory;
       let changes = writes
         || open_flags.intersects(OpenFlags::CREATE | OpenFlags::TRUNCATE);
+      // A directory is made with `create-directory-at`. The system's own
+      // `open` would make a file of that name, or refuse.
+      if directory
+        && open_flags.intersects(
+          OpenFlags::CREATE | OpenFlags::EXCLUSIVE | OpenFlags::TRUNCATE,
+        )
+      {
+        return Err(ErrorCode::Invalid);
+      }
       // The right to change a directory's entries comes from its parent:
       // a descriptor cannot have it if the one it was opened from did not.
       let mutates = flags.contains(DescriptorFlags::MUTATE_DIRECTORY);
