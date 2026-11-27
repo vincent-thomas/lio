@@ -706,7 +706,13 @@ impl<B: IoBackend> Tracked<B> {
     entry.id = id;
     entry.keep = Some(keep);
     self.backlog.push_back(OpKey::new(slot as u32, entry.generation));
-    self.ops[slot].clone_from(op.as_op());
+    // Moved, not cloned: the operation was built for this push.
+    let before = std::mem::replace(&mut self.ops[slot], op.into_op());
+    // A vacant slot holds no operation, and that owns nothing: skipping its
+    // destructor skips a call. Anything else is dropped as usual.
+    if matches!(before, Op::Nop) {
+      std::mem::forget(before);
+    }
   }
 
   /// Queues an operation whose buffers the caller keeps alive itself.

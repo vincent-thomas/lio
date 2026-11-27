@@ -1295,6 +1295,12 @@ impl<'a> BorrowedOp<'a> {
     &self.op
   }
 
+  /// The operation, for the table to keep until the backend starts it.
+  #[inline]
+  pub(crate) fn into_op(self) -> Op {
+    self.op
+  }
+
   /// Brands `op` as `'static`.
   ///
   /// # Safety

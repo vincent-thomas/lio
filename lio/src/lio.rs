@@ -5,7 +5,7 @@ use crate::{
     store::{Detached, OpStore},
   },
   model::{Cx, Drive},
-  registration::{Abandon, AfterPoll, RawTask, Registration},
+  registration::{Abandon, AfterPoll, Mail, RawTask, Registration},
   time::TimeManager,
 };
 
@@ -173,6 +173,16 @@ pub(crate) enum Spawned {
   Now(u64),
   /// Waiting for a slot.
   Queued(Rc<QueueToken>),
+}
+
+impl Spawned {
+  /// The slot it is in, once it has one.
+  fn id(&self) -> Option<u64> {
+    match self {
+      Spawned::Now(id) => Some(*id),
+      Spawned::Queued(token) => token.id(),
+    }
+  }
 }
 
 /// Moves the memory of one operation into a slot's step arena and records
@@ -557,19 +567,136 @@ impl Lio {
     M: Drive + 'static,
     F: FnMut(M::Item) -> bool + 'static,
   {
+    self.spawn_in(move |arena| Registration::running(arena, model, sink))
+  }
+
+  /// Runs `model` for a future: its item waits in the slot until
+  /// [`take_awaited`](Self::take_awaited) returns it, and `waker` is woken
+  /// when it is there.
+  ///
+  /// The slot is not given back before the item is taken or
+  /// [`drop_awaited`](Self::drop_awaited) is called.
+  pub(crate) fn spawn_awaited<M>(&self, model: M, waker: Waker) -> Spawned
+  where
+    M: Drive + 'static,
+  {
+    self.spawn_in(move |arena| Registration::awaited(arena, model, waker))
+  }
+
+  /// The item of a model started with
+  /// [`spawn_awaited`](Self::spawn_awaited), once, when it is there. Until
+  /// then, `waker` is what is woken when it is.
+  ///
+  /// # Safety
+  ///
+  /// `spawned` came from a `spawn_awaited` on this driver, of a model whose
+  /// item is `T`, and [`drop_awaited`](Self::drop_awaited) was not called
+  /// for it.
+  pub(crate) unsafe fn take_awaited<T>(
+    &self,
+    spawned: &Spawned,
+    waker: &Waker,
+  ) -> Option<T> {
+    let id = spawned.id()?;
+    let mut inner = self.inner.borrow_mut();
+    let inner_ref = &mut *inner;
+    let reg = inner_ref.store.get_mut(id)?;
+    // SAFETY: a slot id is never reused with the same generation, so `id`
+    // names the slot `spawn_awaited` filled, for a model whose item is `T`.
+    match unsafe { reg.take_mail::<T>(waker) } {
+      Mail::Item(item) => {
+        // Still running when its own waker polled the future: whoever
+        // polls the model gives the slot back.
+        let spent = reg.is_spent();
+        if spent {
+          Self::retire(inner_ref, id);
+        }
+        let settle = spent && Self::slot_is_wanted(inner_ref);
+        drop(inner);
+        if settle {
+          // The slot goes to a model that was waiting for one, which is
+          // polled now: no run is under way to do it.
+          self.bury_and_wake();
+          self.poll_woken();
+        }
+        Some(item)
+      }
+      Mail::Waiting(replaced) => {
+        drop(inner);
+        // A waker's drop is the caller's code.
+        drop(replaced);
+        None
+      }
+    }
+  }
+
+  /// The future of a model started with
+  /// [`spawn_awaited`](Self::spawn_awaited) is gone: the model is stopped,
+  /// an item nobody took is dropped, and the slot is given back.
+  ///
+  /// # Safety
+  ///
+  /// As for [`take_awaited`](Self::take_awaited). Called at most once.
+  pub(crate) unsafe fn drop_awaited<T>(&self, spawned: &Spawned) {
+    if let Spawned::Queued(token) = spawned {
+      // Still queued: it never starts.
+      token.abandon();
+    }
+    let Some(id) = spawned.id() else { return };
+    let (mail, spent) = {
+      let mut inner = self.inner.borrow_mut();
+      let inner_ref = &mut *inner;
+      let Some(reg) = inner_ref.store.get_mut(id) else { return };
+      // SAFETY: as in `take_awaited`.
+      let mail = unsafe { reg.release_mail::<T>() };
+      let spent = reg.is_spent();
+      if spent {
+        Self::retire(inner_ref, id);
+      }
+      (mail, spent && Self::slot_is_wanted(inner_ref))
+    };
+    if spent {
+      // As in `take_awaited`.
+      self.bury_and_wake();
+      self.poll_woken();
+    }
+    // The item and the waker are the caller's: dropped with the driver not
+    // borrowed.
+    drop(mail);
+    // A model that is still running is dropped, and its slot given back.
+    self.cancel_task(id);
+  }
+
+  /// Whether giving a slot back leaves anything to do: something waits for
+  /// a slot, or for the driver to be free of its borrow.
+  #[inline]
+  fn slot_is_wanted(inner: &LioInner) -> bool {
+    !(inner.overflow.is_empty()
+      && inner.capacity_waiters.is_empty()
+      && inner.dying.is_empty()
+      && inner.abandoned.is_empty()
+      && inner.woken.is_empty())
+  }
+
+  /// Fills a slot with what `make` builds in its arena, and polls its model
+  /// for the first time. Over capacity it waits in a queue.
+  fn spawn_in(
+    &self,
+    make: impl FnOnce(&mut Bump) -> Registration + 'static,
+  ) -> Spawned {
     let mut inner = self.inner.borrow_mut();
     // Queued submissions go first.
     if !inner.overflow.is_empty() || inner.store.is_full() {
       let token = Rc::new(QueueToken::default());
       let start = move |inner: &mut LioInner, _home: Option<u64>| {
-        let id = Self::insert_task(inner, model, sink);
+        let id = Self::insert_task(inner, make);
         Self::wake(inner, id);
         (id, FIRST_OP)
       };
       Self::enqueue(&mut inner, start, Some(Rc::clone(&token)), None);
       return Spawned::Queued(token);
     }
-    let id = Self::insert_task(&mut inner, model, sink);
+    let id = Self::insert_task(&mut inner, make);
     let begun = Self::begin(&mut inner, id);
     let Some(begun) = begun else {
       unreachable!("driver: a model that was just started cannot be polled");
@@ -600,15 +727,14 @@ impl Lio {
   }
 
   /// Moves a model into a free slot. The store must have one.
-  fn insert_task<M, F>(inner: &mut LioInner, model: M, sink: F) -> u64
-  where
-    M: Drive + 'static,
-    F: FnMut(M::Item) -> bool + 'static,
-  {
-    let inserted = inner.store.insert_submitting(
-      |arena| Registration::running(arena, model, sink),
-      |_id, _reg, _lease, insert| insert.keep_on_panic(),
-    );
+  fn insert_task(
+    inner: &mut LioInner,
+    make: impl FnOnce(&mut Bump) -> Registration,
+  ) -> u64 {
+    let inserted =
+      inner.store.insert_submitting(make, |_id, _reg, _lease, insert| {
+        insert.keep_on_panic()
+      });
     let Some(id) = inserted else {
       unreachable!("driver: a slot that was kept was not claimed");
     };
@@ -649,6 +775,7 @@ impl Lio {
 
   /// Marks the model in slot `id` busy and returns what polls it, or what
   /// drops it if it was asked to stop while it could not be dropped.
+  #[inline]
   fn begin(inner: &mut LioInner, id: u64) -> Option<Begun> {
     Self::begin_in(inner.store.get_mut(id)?)
   }
@@ -1154,11 +1281,15 @@ impl Lio {
   /// dropped first, then their slots are released together.
   fn bury_and_wake(&self) {
     loop {
-      // Queued submissions nobody waits for any more hold user values:
-      // dropped here, with the driver not borrowed.
-      let abandoned = std::mem::take(&mut self.inner.borrow_mut().abandoned);
-      drop(abandoned);
       let mut inner = self.inner.borrow_mut();
+      if !inner.abandoned.is_empty() {
+        // Queued submissions nobody waits for any more hold user values:
+        // dropped here, with the driver not borrowed.
+        let abandoned = std::mem::take(&mut inner.abandoned);
+        drop(inner);
+        drop(abandoned);
+        inner = self.inner.borrow_mut();
+      }
       if inner.dying.is_empty() {
         // Slots given back since the last time may be wanted.
         let waiters = Self::release_capacity(&mut inner);
@@ -1284,7 +1415,15 @@ impl Lio {
       timed!(PROFILE, stats, wait_time, io.wait(effective_timeout, completed));
     // Queue what the backend reported even if it then failed, so those
     // operations are not lost.
-    inner_ref.ready_io.extend(inner_ref.completed.drain(..));
+    // One at a time is the common case, and far cheaper moved by hand than
+    // through `extend`.
+    if inner_ref.completed.len() == 1 {
+      if let Some(only) = inner_ref.completed.pop() {
+        inner_ref.ready_io.push_back(only);
+      }
+    } else {
+      inner_ref.ready_io.extend(inner_ref.completed.drain(..));
+    }
     waited?;
 
     let before = inner_ref.ready_timers.len();
@@ -1435,10 +1574,19 @@ struct Batch<'a> {
 }
 
 impl Drop for Batch<'_> {
+  #[inline]
   fn drop(&mut self) {
-    let Some(id) = self.current.take() else {
-      return;
-    };
+    if let Some(id) = self.current.take() {
+      self.unwound(id);
+    }
+  }
+}
+
+impl Batch<'_> {
+  /// The handler of operation `id` panicked.
+  #[cold]
+  #[inline(never)]
+  fn unwound(&mut self, id: u64) {
     if let Ok(mut inner) = self.lio.inner.try_borrow_mut()
       && let Some(reg) = inner.store.get_mut(id)
     {
@@ -1461,10 +1609,19 @@ struct PollGuard<'a> {
 }
 
 impl Drop for PollGuard<'_> {
+  #[inline]
   fn drop(&mut self) {
-    if !self.armed {
-      return;
+    if self.armed {
+      self.unwound();
     }
+  }
+}
+
+impl PollGuard<'_> {
+  /// The model panicked while it was polled.
+  #[cold]
+  #[inline(never)]
+  fn unwound(&mut self) {
     if let Ok(mut inner) = self.lio.inner.try_borrow_mut() {
       let inner = &mut *inner;
       if let Some(reg) = inner.store.get_mut(self.id) {
@@ -1483,6 +1640,7 @@ struct AbortOp<'a> {
 }
 
 impl Drop for AbortOp<'_> {
+  #[inline]
   fn drop(&mut self) {
     if self.armed {
       self.reg.abort_op();
@@ -1880,6 +2038,93 @@ mod tests {
     assert!(later.borrow().is_none());
     assert!(fired.get(), "only the dropped sleep's firing is forgotten");
     assert!(!lio.is_full());
+  }
+
+  #[test]
+  fn an_awaited_result_keeps_its_slot_until_the_future_takes_it() {
+    use std::future::{Future, IntoFuture};
+    use std::task::{Context, Poll};
+
+    let (backend, lio) = lio(1);
+    let mut nop = Box::pin(crate::api::nop().with_lio(&lio).into_future());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(nop.as_mut().poll(&mut cx).is_pending());
+    backend.complete_all(0);
+    assert_eq!(lio.try_run().unwrap(), 1);
+    assert!(lio.is_full(), "the result waits in the slot");
+    assert!(matches!(nop.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+    assert!(!lio.is_full(), "taking the result gives the slot back");
+  }
+
+  #[test]
+  fn dropping_a_future_gives_back_the_slot_of_a_result_it_never_took() {
+    use std::future::{Future, IntoFuture};
+    use std::task::Context;
+
+    let (backend, lio) = lio(1);
+    let mut nop = Box::pin(crate::api::nop().with_lio(&lio).into_future());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(nop.as_mut().poll(&mut cx).is_pending());
+    backend.complete_all(0);
+    assert_eq!(lio.try_run().unwrap(), 1);
+    assert!(lio.is_full());
+    drop(nop);
+    assert!(!lio.is_full());
+  }
+
+  #[test]
+  fn a_future_outlives_a_driver_that_held_its_result() {
+    use std::future::{Future, IntoFuture};
+    use std::task::Context;
+
+    let (backend, lio) = lio(1);
+    let mut nop = Box::pin(crate::api::nop().with_lio(&lio).into_future());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(nop.as_mut().poll(&mut cx).is_pending());
+    backend.complete_all(0);
+    assert_eq!(lio.try_run().unwrap(), 1);
+    // The result goes with the driver.
+    drop(lio);
+    assert!(nop.as_mut().poll(&mut cx).is_pending());
+  }
+
+  #[test]
+  fn a_waker_may_poll_its_future_as_it_is_woken() {
+    use std::cell::RefCell;
+    use std::future::{Future, IntoFuture};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake};
+
+    type Nop = Pin<Box<dyn Future<Output = io::Result<()>>>>;
+    thread_local! {
+      static WAITING: RefCell<Option<Nop>> = const { RefCell::new(None) };
+      static GOT: Cell<bool> = const { Cell::new(false) };
+    }
+    /// Polls the future the moment it is woken.
+    struct Eager;
+    impl Wake for Eager {
+      fn wake(self: Arc<Self>) {
+        let Some(mut nop) = WAITING.with(|waiting| waiting.borrow_mut().take())
+        else {
+          return;
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(nop.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+        GOT.with(|got| got.set(true));
+      }
+    }
+
+    let (backend, lio) = lio(1);
+    let mut nop: Nop = Box::pin(crate::api::nop().with_lio(&lio).into_future());
+    let waker = Waker::from(Arc::new(Eager));
+    let mut cx = Context::from_waker(&waker);
+    assert!(nop.as_mut().poll(&mut cx).is_pending());
+    WAITING.with(|waiting| *waiting.borrow_mut() = Some(nop));
+    backend.complete_all(0);
+    assert_eq!(lio.try_run().unwrap(), 1);
+    assert!(GOT.with(Cell::get), "the waker polled the future");
+    assert!(!lio.is_full(), "the slot went back once its model was done");
   }
 
   #[test]
