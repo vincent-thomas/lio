@@ -857,6 +857,21 @@ impl Poller {
       // A receive that does not wait takes what is there, whichever mode
       // the socket is in: there is nothing to ask the descriptor.
       Op::Recv { .. } => {}
+      // One buffer, the common case: sent without asking the descriptor
+      // anything first.
+      Op::Send { fd, msg, flags }
+        if msg.buf_count.get() == 1 && msg.to.is_none() =>
+      {
+        // SAFETY: the message's one buffer stays live until this call
+        // returns.
+        let buf = unsafe { msg.bufs.as_ref() };
+        return Self::send_one(
+          fd.as_raw_fd(),
+          buf.ptr.as_ptr(),
+          buf.len,
+          crate::backend::native::send_flags(*flags),
+        );
+      }
       // A send that does not wait may stop short where a blocking socket
       // would go on, so a blocking one is left to wait for room.
       Op::Send { fd, .. } => {
@@ -875,6 +890,46 @@ impl Poller {
     } else {
       Some(result)
     }
+  }
+
+  /// Sends one buffer without waiting. `None` when there is no room at
+  /// all: the send then waits for some.
+  ///
+  /// Only a send that stops short has to know whether its socket blocks.
+  /// One that blocks would have gone on until everything was sent, so the
+  /// rest is sent that way. Any other is reported as it is.
+  fn send_one(
+    fd: RawFd,
+    bytes: *const u8,
+    len: usize,
+    flags: i32,
+  ) -> Option<isize> {
+    let sent =
+      syscall!(raw send(fd, bytes.cast(), len, flags | libc::MSG_DONTWAIT));
+    if sent == EAGAIN_NEG || sent == EWOULDBLOCK_NEG {
+      return None;
+    }
+    if sent < 0 || sent as usize >= len {
+      return Some(sent);
+    }
+    let mode = syscall!(raw fcntl(fd, libc::F_GETFL));
+    if mode < 0 || mode & libc::O_NONBLOCK as isize != 0 {
+      return Some(sent);
+    }
+    let mut done = sent as usize;
+    while done < len {
+      // SAFETY: `done` is within the buffer, which stays live for the
+      // call.
+      let rest = unsafe { bytes.add(done) };
+      let more = syscall!(raw send(fd, rest.cast(), len - done, flags));
+      if more <= 0 {
+        // What was sent is what is reported, as a blocking send that is
+        // cut short reports it.
+        break;
+      }
+      done += more as usize;
+    }
+    Some(done as isize)
   }
 
   fn exec_op_with_socket_flags(op: &Op, socket_flags: i32) -> isize {
