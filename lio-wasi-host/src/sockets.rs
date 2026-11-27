@@ -43,6 +43,8 @@ enum TcpState {
   Listening,
   Connecting,
   Connected,
+  /// A connect failed: nothing is left to do with the socket but drop it.
+  Closed,
 }
 
 /// A TCP socket.
@@ -423,7 +425,7 @@ impl types::HostTcpSocket for WasiCtx {
         TcpState::Listening => {
           rustix::net::listen(&socket.resource, backlog).map_err(errno)?;
         }
-        TcpState::Connecting | TcpState::Connected => {
+        TcpState::Connecting | TcpState::Connected | TcpState::Closed => {
           return Err(ErrorCode::InvalidState);
         }
       }
@@ -577,12 +579,11 @@ impl<T: Send + 'static> types::HostTcpSocketWithStore<T> for LioWasi {
         if remote.ip().is_unspecified() || remote.port() == 0 {
           return Err(ErrorCode::InvalidArgument);
         }
-        let before = socket.state;
         socket.state = TcpState::Connecting;
-        Ok((socket.resource.clone(), remote, before))
+        Ok((socket.resource.clone(), remote))
       })())
     })?;
-    let (resource, remote, before) = match started {
+    let (resource, remote) = match started {
       Ok(started) => started,
       Err(error) => return Ok(Err(error)),
     };
@@ -592,8 +593,9 @@ impl<T: Send + 'static> types::HostTcpSocketWithStore<T> for LioWasi {
       if let Ok(socket) = store.get().tcp(&this) {
         socket.state = match connected {
           Ok(()) => TcpState::Connected,
-          // What it was bound to, it still is.
-          Err(_) => before,
+          // WASI leaves a socket whose connect failed closed, whatever
+          // the system still holds for it.
+          Err(_) => TcpState::Closed,
         };
       }
     });

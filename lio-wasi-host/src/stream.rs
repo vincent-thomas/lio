@@ -412,7 +412,9 @@ impl<E: Ends> ByteWriter<E> {
     (writer, ended)
   }
 
-  fn end(&mut self, how: Result<(), E>) {
+  /// Ends the stream, with `how` as its status. Later writes find it
+  /// ended.
+  pub(crate) fn end(&mut self, how: Result<(), E>) {
     if let Some(status) = self.status.take() {
       status.send(how);
     }
