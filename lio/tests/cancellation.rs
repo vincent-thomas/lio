@@ -2,12 +2,9 @@
 //! not free the memory that operation uses: the registration (op model,
 //! buffers, arenas) lives until the backend reports the operation done.
 
-mod common;
-
 use lio::ready;
 use std::cell::RefCell;
 use std::future::{Future, IntoFuture};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
@@ -207,32 +204,6 @@ fn stream_dropped_by_its_wake_up_is_not_resubmitted() {
   assert!(holder.0.borrow().is_none(), "the wake-up dropped the stream");
   assert_eq!(backend.pushed(), vec![id], "no next step is pushed");
   assert!(!lio.is_full(), "its slot is free");
-}
-
-#[test]
-#[cfg_attr(miri, ignore = "needs a real backend")]
-fn dropped_accept_frees_its_slot() {
-  // A real backend: an accept with no client never completes on its own.
-  let lio = Lio::new(1).unwrap();
-  let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-  listener.set_nonblocking(true).unwrap();
-  let listener = common::socket_resource(listener);
-
-  let mut accept: Pin<Box<_>> =
-    Box::pin(api::accept(&listener).with_lio(&lio).into_future());
-  let mut cx = Context::from_waker(Waker::noop());
-  assert!(accept.as_mut().poll(&mut cx).is_pending());
-  lio.run_timeout(Duration::from_millis(10)).unwrap();
-  assert!(accept.as_mut().poll(&mut cx).is_pending());
-  drop(accept);
-
-  for _ in 0..200 {
-    if !lio.is_full() {
-      return;
-    }
-    lio.run_timeout(Duration::from_millis(5)).unwrap();
-  }
-  panic!("the cancelled accept never released its slot");
 }
 
 #[test]

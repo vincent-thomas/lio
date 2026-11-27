@@ -795,6 +795,16 @@ mod tests {
     unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
   }
 
+  /// A driver over a kernel with nothing to report: a wait takes the time
+  /// the driver allows it and returns. These tests are about sleeps, which
+  /// the driver times itself, so that is all a backend does in them. A
+  /// real one would block for good if the driver got that time wrong.
+  fn idle_lio() -> Lio {
+    let backend = ScriptedBackend::new();
+    backend.set_stuck(true);
+    Lio::new_with_backend(backend, 64).unwrap()
+  }
+
   /// Helper to run lio until completion (with timeout to avoid hanging)
   fn run_until_done(lio: &Lio) {
     use std::time::Duration;
@@ -809,7 +819,7 @@ mod tests {
 
   #[test]
   fn test_io_future_completes() {
-    let lio = Lio::new(64).unwrap();
+    let lio = idle_lio();
     let io = test_io(&lio);
     let mut future = io.into_future();
 
@@ -831,7 +841,7 @@ mod tests {
   #[test]
   #[should_panic(expected = "model future polled after completion")]
   fn test_io_future_panics_when_polled_after_completion() {
-    let lio = Lio::new(64).unwrap();
+    let lio = idle_lio();
     let io = test_io(&lio);
     let mut future = io.into_future();
 
@@ -854,7 +864,7 @@ mod tests {
 
   #[test]
   fn test_io_future_state_transitions() {
-    let lio = Lio::new(64).unwrap();
+    let lio = idle_lio();
     let io = test_io(&lio);
     let mut future = io.into_future();
 
@@ -873,7 +883,7 @@ mod tests {
 
   #[test]
   fn test_io_future_multiple_pending_polls() {
-    let lio = Lio::new(64).unwrap();
+    let lio = idle_lio();
     let io = test_io(&lio);
     let mut future = io.into_future();
 
@@ -896,7 +906,7 @@ mod tests {
 
   #[test]
   fn test_multiple_futures_can_coexist() {
-    let lio = Lio::new(64).unwrap();
+    let lio = idle_lio();
 
     // Create multiple futures from the same lio - this was not possible before
     let fut1 = test_io(&lio).into_future();
@@ -934,7 +944,7 @@ mod tests {
 
   #[test]
   fn test_lio_is_clone() {
-    let lio1 = Lio::new(64).unwrap();
+    let lio1 = idle_lio();
     let lio2 = lio1.clone();
 
     // Both refer to the same underlying instance
@@ -947,7 +957,7 @@ mod tests {
 
   #[test]
   fn test_lio_with_receiver() {
-    let lio = Lio::new(64).unwrap();
+    let lio = idle_lio();
 
     // Operations work with .with_lio()
     let mut receiver = test_io(&lio).send();
@@ -1270,7 +1280,7 @@ mod tests {
 
   #[test]
   fn test_stream_send_uses_bound_lio() {
-    let lio = Lio::new(64).unwrap();
+    let lio = idle_lio();
 
     let receiver =
       api::interval(Duration::from_millis(1)).with_lio(&lio).send();
