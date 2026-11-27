@@ -935,6 +935,22 @@ impl Poller {
         )
       }
 
+      // One buffer and no address to report, the common case, is a plain
+      // receive: no message header to build, and a cheaper call.
+      Op::Recv { fd, msg, flags }
+        if msg.buf_count.get() == 1 && msg.from.is_none() =>
+      {
+        // SAFETY: the message's one buffer stays live until this call
+        // returns.
+        let buf = unsafe { msg.bufs.as_ref() };
+        syscall!(raw recv(
+          fd.as_raw_fd(),
+          buf.ptr.as_ptr().cast(),
+          buf.len,
+          crate::backend::native::recv_flags(*flags) | socket_flags
+        ))
+      }
+
       Op::Recv { fd, msg, flags } => {
         let fd = fd.as_raw_fd();
         let Some((mut iovecs, mut hdr, mut addr)) = Self::lower_recv_msg(msg)
@@ -957,6 +973,21 @@ impl Poller {
           }
         }
         result
+      }
+
+      // As for a receive: one buffer and no address to send to.
+      Op::Send { fd, msg, flags }
+        if msg.buf_count.get() == 1 && msg.to.is_none() =>
+      {
+        // SAFETY: the message's one buffer stays live until this call
+        // returns.
+        let buf = unsafe { msg.bufs.as_ref() };
+        syscall!(raw send(
+          fd.as_raw_fd(),
+          buf.ptr.as_ptr().cast(),
+          buf.len,
+          crate::backend::native::send_flags(*flags) | socket_flags
+        ))
       }
 
       Op::Send { fd, msg, flags } => {
