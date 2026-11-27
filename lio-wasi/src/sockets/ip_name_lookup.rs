@@ -1,6 +1,8 @@
 //! Calls on `wasi:sockets/ip-name-lookup@0.3.2`.
 
-use std::alloc::Layout;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::alloc::Layout;
 
 pub use wasip3::sockets::ip_name_lookup::ErrorCode;
 pub use wasip3::sockets::types::IpAddress;
@@ -81,7 +83,7 @@ impl LiftOk for Vec<IpAddress> {
     };
     // SAFETY: the host allocated the list through this component's
     // allocator with this layout and handed it over. It is freed once.
-    unsafe { std::alloc::dealloc(ptr, layout) };
+    unsafe { alloc::alloc::dealloc(ptr, layout) };
     addresses
   }
 }
@@ -154,7 +156,7 @@ mod tests {
     // SAFETY: the layout has a non-zero size, and the list is handed to
     // `lift`, which frees it, as the host would hand one over.
     let addresses = unsafe {
-      let ptr = std::alloc::alloc_zeroed(layout);
+      let ptr = alloc::alloc::alloc_zeroed(layout);
       assert!(!ptr.is_null());
       ptr.add(2).copy_from([10u8, 0, 0, 7].as_ptr(), 4);
       ptr.add(ADDRESS_SIZE).write(1);

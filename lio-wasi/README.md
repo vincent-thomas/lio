@@ -48,6 +48,11 @@ println!("{} bytes", read.count());
   the component model lets only an async export do that. On `wasm32-wasip2`,
   `main` is a synchronous export and the first blocking wait traps.
 - A host with WASI 0.3: `wasmtime run -S p3`.
+- `alloc`. The crate is `no_std`, but WASI hands some results over as memory
+  the host allocates in the component (names, datagrams, error messages), so
+  an allocator has to be there. The `std` feature only adds the
+  `core::error::Error` impls of the WASI error codes, which `wasip3` gates
+  that way.
 
 ## Safety
 

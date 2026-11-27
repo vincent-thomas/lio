@@ -58,6 +58,12 @@
 //! `main` is one. On `wasm32-wasip2` `main` is a synchronous export, and the
 //! first blocking wait traps.
 //!
+//! ## `no_std`
+//!
+//! The crate is `no_std` and needs `alloc`: WASI hands some results over as
+//! memory the host allocates in the component. The `std` feature only adds
+//! the `core::error::Error` impls of the WASI error codes.
+//!
 //! ## Status
 //!
 //! Every function of `wasi:cli`, `wasi:clocks`, `wasi:filesystem`,
@@ -67,9 +73,13 @@
 //! passed on under its own name with nothing added. `wasi:http` is not
 //! bound. See the crate README for the full table.
 
+#![no_std]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use std::fmt;
+extern crate alloc;
+
+use alloc::vec::Vec;
+use core::fmt;
 
 /// The ends of a component-model stream, as [`stream`] and WASI hand them
 /// out. A [`WaitableSet`] takes them over.
@@ -275,7 +285,7 @@ impl fmt::Display for Error {
   }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// The readable end of a byte stream owned by a [`WaitableSet`].
 ///
@@ -376,7 +386,7 @@ impl WaitableSet {
     let handle = writer.handle();
     // The writer has no way to give up its handle. Forgetting it skips the
     // destructor that would drop the handle; it owns no heap memory.
-    std::mem::forget(writer);
+    core::mem::forget(writer);
     let ops = sys::byte_stream();
     self.adopt(handle, End::Writable, ops.cancel_write, ops.drop_writable);
     WriteStream(handle)
@@ -581,7 +591,7 @@ impl WaitableSet {
   /// uses the call's memory.
   pub fn cancel(&mut self, subtask: Subtask) -> Option<Cancel> {
     let live = self.calls.get_mut(subtask.0 as usize)?;
-    if !std::mem::take(live) {
+    if !core::mem::take(live) {
       return None;
     }
     // A waitable that is in a set cannot be cancelled synchronously: the
@@ -779,7 +789,7 @@ impl WaitableSet {
   /// Cancels the operation in flight on a stream end of this kind.
   fn cancel_stream(&mut self, handle: u32, end: End) -> Option<StreamResult> {
     let slot = self.slot_mut(handle, end).ok()?;
-    if !std::mem::take(&mut slot.blocked) {
+    if !core::mem::take(&mut slot.blocked) {
       return None;
     }
     // As for calls: leave the set before cancelling synchronously.
@@ -827,7 +837,7 @@ impl WaitableSet {
     match raw.code {
       sys::STATUS_STARTING | sys::STATUS_STARTED => None,
       sys::STATUS_RETURNED => {
-        if !std::mem::take(live) {
+        if !core::mem::take(live) {
           unreachable!("event for a call that is not in flight: {raw:?}")
         }
         RawSet::leave(raw.waitable);
@@ -862,7 +872,7 @@ impl WaitableSet {
     if raw.kind != slot.end.event() {
       unreachable!("event does not match its stream end: {raw:?}")
     }
-    if !std::mem::take(&mut slot.blocked) {
+    if !core::mem::take(&mut slot.blocked) {
       unreachable!("event for a stream with nothing in flight: {raw:?}")
     }
     let Some(result) = StreamResult::decode(raw.code) else {
