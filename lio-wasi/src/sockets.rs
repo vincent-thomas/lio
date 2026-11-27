@@ -2,10 +2,12 @@
 //!
 //! As in [`fs`](crate::fs), each operation value holds a call's arguments
 //! and result. TCP data moves over byte streams: pass the stream from
-//! `TcpSocket::receive` to [`Queue::add_reader`](crate::Queue::add_reader),
-//! and hand `TcpSocket::send` the readable end of a stream whose writable
-//! end went to [`Queue::add_writer`](crate::Queue::add_writer). A listener
-//! is a stream of sockets: see [`Queue::add_listener`](crate::Queue).
+//! `TcpSocket::receive` to
+//! [`WaitableSet::add_reader`](crate::WaitableSet::add_reader), and hand
+//! `TcpSocket::send` the readable end of a stream whose writable end went
+//! to [`WaitableSet::add_writer`](crate::WaitableSet::add_writer). A
+//! listener is a stream of sockets: see
+//! [`WaitableSet::add_listener`](crate::WaitableSet::add_listener).
 //!
 //! Calls that do not wait are not here: use `wasip3` directly for `create`,
 //! `bind`, `listen`, the UDP `connect` and `disconnect`, addresses and
@@ -23,10 +25,10 @@ pub use wasip3::sockets::types::{
 use wasip3::wit_bindgen::FutureReader;
 use wasip3::wit_future::FuturePayload;
 
-use crate::Call;
 use crate::reply::{LiftError, NO_RESULT, ResultFuture, Slot, Words, call};
-use crate::sealed::{self, Started};
+use crate::sealed::{self, FutureStart};
 use crate::sys::wasm_imports;
+use crate::{Call, ReadableFuture};
 
 wasm_imports!("wasi:sockets/types@0.3.2" {
   "[async-lower][method]tcp-socket.connect"
@@ -188,11 +190,13 @@ call!(Connect => (), |op, reply| {
 });
 
 /// The listening end of a TCP socket, owned by a
-/// [`Queue`](crate::Queue).
+/// [`WaitableSet`](crate::WaitableSet).
 ///
-/// Returned by [`Queue::add_listener`](crate::Queue::add_listener). It stays
-/// valid until [`Queue::close_listener`](crate::Queue::close_listener) or
-/// until the queue is dropped.
+/// Returned by
+/// [`WaitableSet::add_listener`](crate::WaitableSet::add_listener). It stays
+/// valid until
+/// [`WaitableSet::close_listener`](crate::WaitableSet::close_listener) or
+/// until the set is dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Listener(pub(crate) u32);
 
@@ -202,9 +206,9 @@ const NO_SOCKET: u32 = u32::MAX;
 
 /// Where an accepted connection lands.
 ///
-/// Pass it to [`Queue::push_accept`](crate::Queue::push_accept). After the
-/// accept's completion reports
-/// [`Outcome::Transferred(1)`](crate::Outcome::Transferred), take the
+/// Pass it to [`WaitableSet::accept`](crate::WaitableSet::accept). After
+/// the accept ends as
+/// [`StreamResult::Completed(1)`](crate::StreamResult::Completed), take the
 /// connection with [`socket`](Self::socket).
 pub struct Accepted {
   /// The host writes the new socket's handle through a pointer into this.
@@ -253,13 +257,15 @@ impl Drop for Accepted {
 /// How a TCP stream ended: `Ok` when the peer closed it cleanly, or the
 /// error that cut it short.
 ///
-/// `TcpSocket::send` and `TcpSocket::receive` return it as a future. Push
-/// it to tell an orderly close from a reset. It completes once the stream
-/// has ended.
+/// `TcpSocket::send` and `TcpSocket::receive` return it as a future. Read
+/// it with [`WaitableSet::read_future`](crate::WaitableSet::read_future) to
+/// tell an orderly close from a reset. It is delivered once the stream has
+/// ended.
 ///
 /// # Panics
 ///
-/// Pushing it again after it returned panics: a status is delivered once.
+/// Reading it again after it was delivered panics: a status is delivered
+/// once.
 pub struct StreamStatus {
   future: ResultFuture<ErrorCode>,
 }
@@ -279,10 +285,10 @@ impl StreamStatus {
   }
 }
 
-impl Call for StreamStatus {}
+impl ReadableFuture for StreamStatus {}
 
-impl sealed::Sealed for StreamStatus {
-  unsafe fn start(&mut self) -> Started {
+impl sealed::Future for StreamStatus {
+  unsafe fn start_read(&mut self) -> FutureStart {
     // SAFETY: the caller keeps `self` in place until the read completes.
     unsafe { self.future.start() }
   }
@@ -444,14 +450,14 @@ impl Drop for ReceiveFrom<'_> {
 
 impl Call for ReceiveFrom<'_> {}
 
-impl sealed::Sealed for ReceiveFrom<'_> {
-  unsafe fn start(&mut self) -> Started {
+impl sealed::Call for ReceiveFrom<'_> {
+  unsafe fn start(&mut self) -> u32 {
     drop(self.result());
     // SAFETY: the caller keeps `self` and the socket in place until the
     // call returns.
     let packed =
       unsafe { imports::udp_receive(self.socket, self.reply.get().cast()) };
-    Started::Subtask(packed as u32)
+    packed as u32
   }
 }
 

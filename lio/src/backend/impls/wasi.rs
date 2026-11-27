@@ -1,7 +1,8 @@
 //! WASI 0.3 backend, for WebAssembly components.
 //!
-//! Built on [`lio_wasi::Queue`], which is completion-based like io_uring:
-//! an operation is started with caller memory and reports once it is done.
+//! Built on [`lio_wasi::WaitableSet`]: a step of an operation is started
+//! with caller memory, and ends at once or in an event that names the stream
+//! or call it ran on. [`Steps`] maps those back to operations.
 //!
 //! # Resources
 //!
@@ -50,7 +51,10 @@ use lio_wasi::sockets::{
   Ipv6SocketAddress, Listener, TcpSocket, UdpSocket,
 };
 use lio_wasi::wasip3;
-use lio_wasi::{Completion, Outcome, Queue, ReadStream, WriteStream};
+use lio_wasi::{
+  Cancel, Event, ReadFuture, ReadStream, ReadableFuture, Started, StreamResult,
+  Subtask, WaitableSet, WriteStream,
+};
 
 use crate::api::resource::{RawResource, ResourceClose};
 use crate::backend::native;
@@ -65,7 +69,7 @@ use crate::backend::{InFlight, IoBackend, OpCompleted, Ticket};
 #[cfg(test)]
 mod tests;
 
-/// `user_data` of the timer that bounds a [`wait`](IoBackend::wait). No
+/// The id of the timer step that bounds a [`wait`](IoBackend::wait). No
 /// registration id is this value.
 const TIMER: u64 = u64::MAX;
 
@@ -227,7 +231,7 @@ enum ListingState {
 /// A directory being listed. It lives with the directory, so that each
 /// `ReadDir` continues where the last one stopped.
 struct Listing {
-  /// The backend whose queue holds the stream.
+  /// The backend whose set holds the stream.
   owner: u64,
   /// Open until the listing has ended.
   stream: Option<DirStream>,
@@ -239,7 +243,7 @@ struct Listing {
   carry: VecDeque<DirectoryEntry>,
 }
 
-/// Something closed whose streams still sit in a live backend's queue.
+/// Something closed whose streams still sit in a live backend's set.
 enum Orphan {
   Tcp(Tcp),
   Listing(Listing),
@@ -258,7 +262,7 @@ impl Orphan {
 /// once, so they are kept for the socket's life.
 struct Tcp {
   socket: TcpSocket,
-  /// The backend whose queue holds the streams below.
+  /// The backend whose set holds the streams below.
   owner: u64,
   connected: bool,
   /// Incoming connections, once listening.
@@ -326,7 +330,7 @@ thread_local! {
   /// Resources closed while the table was in use. A backend closes them the
   /// next time it runs.
   static DEFERRED: RefCell<Vec<RawResource>> = const { RefCell::new(Vec::new()) };
-  /// Closed resources whose streams still sit in a live backend's queue.
+  /// Closed resources whose streams still sit in a live backend's set.
   /// That backend closes the streams the next time it runs.
   static ORPHANS: RefCell<Vec<Orphan>> = const { RefCell::new(Vec::new()) };
   /// The backends alive on this thread.
@@ -351,7 +355,7 @@ fn close_resource(raw: RawResource) {
   }
 }
 
-/// Drops a removed entry. One whose streams are in a live backend's queue
+/// Drops a removed entry. One whose streams are in a live backend's set
 /// is handed to that backend instead, which has to close them first.
 fn dispose(entry: Option<Entry>) {
   let orphan = match entry {
@@ -565,25 +569,25 @@ enum Call {
 impl Call {
   /// # Safety
   ///
-  /// `self` stays allocated and unmoved until its completion is handled.
-  unsafe fn push(&mut self, queue: &mut Queue, id: u64) {
+  /// `self` stays allocated and unmoved until the step's end is handled.
+  unsafe fn start(&mut self, steps: &mut Steps, id: u64) {
     // SAFETY: guaranteed by the caller.
     unsafe {
       match self {
-        Call::Open { call, .. } => queue.push_call(call, id),
-        Call::Stat(call) => queue.push_call(call, id),
-        Call::StatAt(call) => queue.push_call(call, id),
-        Call::Mkdir(call) => queue.push_call(call, id),
-        Call::Unlink(call) => queue.push_call(call, id),
-        Call::Rmdir(call) => queue.push_call(call, id),
-        Call::Rename(call) => queue.push_call(call, id),
-        Call::Link(call) => queue.push_call(call, id),
-        Call::Symlink(call) => queue.push_call(call, id),
-        Call::Readlink(call) => queue.push_call(call, id),
-        Call::Sync(call) => queue.push_call(call, id),
-        Call::Connect { call, .. } => queue.push_call(call, id),
-        Call::SendTo { call, .. } => queue.push_call(call, id),
-        Call::ReceiveFrom(call) => queue.push_call(call, id),
+        Call::Open { call, .. } => steps.call(call, id),
+        Call::Stat(call) => steps.call(call, id),
+        Call::StatAt(call) => steps.call(call, id),
+        Call::Mkdir(call) => steps.call(call, id),
+        Call::Unlink(call) => steps.call(call, id),
+        Call::Rmdir(call) => steps.call(call, id),
+        Call::Rename(call) => steps.call(call, id),
+        Call::Link(call) => steps.call(call, id),
+        Call::Symlink(call) => steps.call(call, id),
+        Call::Readlink(call) => steps.call(call, id),
+        Call::Sync(call) => steps.call(call, id),
+        Call::Connect { call, .. } => steps.call(call, id),
+        Call::SendTo { call, .. } => steps.call(call, id),
+        Call::ReceiveFrom(call) => steps.call(call, id),
       }
     }
   }
@@ -792,13 +796,13 @@ enum Status {
 impl Status {
   /// # Safety
   ///
-  /// `self` stays allocated and unmoved until its completion is handled.
-  unsafe fn push(&mut self, queue: &mut Queue, id: u64) {
+  /// `self` stays allocated and unmoved until the step's end is handled.
+  unsafe fn read(&mut self, steps: &mut Steps, id: u64) {
     // SAFETY: guaranteed by the caller.
     unsafe {
       match self {
-        Status::File(status) => queue.push_call(status, id),
-        Status::Socket(status) => queue.push_call(status, id),
+        Status::File(status) => steps.status(status, id),
+        Status::Socket(status) => steps.status(status, id),
       }
     }
   }
@@ -968,11 +972,314 @@ enum ListStep {
   Status,
 }
 
+/// How one step of an operation ended.
+#[derive(Clone, Copy, Debug)]
+enum Outcome {
+  /// A stream step moved this many items and the stream is still open.
+  Transferred(usize),
+  /// The other end of the stream is gone. This many items moved first.
+  Closed(usize),
+  /// The step was stopped. This many items moved first.
+  Cancelled(usize),
+  /// A call returned, or a status arrived. The result is in its value.
+  Returned,
+}
+
+impl Outcome {
+  /// Items a stream step moved before it ended.
+  fn count(&self) -> usize {
+    match *self {
+      Outcome::Transferred(n) | Outcome::Closed(n) | Outcome::Cancelled(n) => n,
+      Outcome::Returned => 0,
+    }
+  }
+}
+
+impl From<StreamResult> for Outcome {
+  fn from(result: StreamResult) -> Self {
+    match result {
+      StreamResult::Completed(n) => Outcome::Transferred(n),
+      StreamResult::Dropped(n) => Outcome::Closed(n),
+      StreamResult::Cancelled(n) => Outcome::Cancelled(n),
+    }
+  }
+}
+
+impl From<Cancel> for Outcome {
+  fn from(found: Cancel) -> Self {
+    match found {
+      Cancel::Completed => Outcome::Returned,
+      Cancel::Cancelled => Outcome::Cancelled(0),
+    }
+  }
+}
+
+/// What a step in flight runs on. The host's event names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Waiting {
+  Call(Subtask),
+  Status(ReadFuture),
+  Read(ReadStream),
+  Write(WriteStream),
+  Accept(Listener),
+  List(DirStream),
+}
+
+/// The waitable set, and which operation each step in flight belongs to.
+///
+/// An operation runs one step at a time: a call, a stream read or write,
+/// or the read of a stream's status. The set reports a step's end by what
+/// it ran on. This keeps the operation's id next to that, and holds the
+/// steps that ended without an event until they are handled like the rest.
+struct Steps {
+  set: WaitableSet,
+  /// The operation whose step runs on each thing in flight.
+  owner: HashMap<Waiting, u64>,
+  /// What each operation's step in flight runs on.
+  waiting: HashMap<u64, Waiting>,
+  /// Steps that ended as they started, or by a cancel or a close.
+  ended: VecDeque<(u64, Outcome)>,
+}
+
+impl Steps {
+  fn new() -> Self {
+    Self {
+      set: WaitableSet::new(),
+      owner: HashMap::new(),
+      waiting: HashMap::new(),
+      ended: VecDeque::new(),
+    }
+  }
+
+  /// Records a step the host has not finished.
+  fn track(&mut self, id: u64, waiting: Waiting) {
+    self.owner.insert(waiting, id);
+    self.waiting.insert(id, waiting);
+  }
+
+  /// Records how a stream step started.
+  fn started(&mut self, id: u64, waiting: Waiting, started: Started) {
+    match started {
+      Started::Done(result) => self.ended.push_back((id, result.into())),
+      Started::Blocked => self.track(id, waiting),
+    }
+  }
+
+  /// Starts a call as a step of operation `id`.
+  ///
+  /// # Safety
+  ///
+  /// As for [`WaitableSet::start`], until the step's end is taken from
+  /// [`poll`](Self::poll) or [`wait`](Self::wait).
+  unsafe fn call<C: lio_wasi::Call>(&mut self, call: &mut C, id: u64) {
+    // SAFETY: guaranteed by the caller.
+    match unsafe { self.set.start(call) } {
+      Some(subtask) => self.track(id, Waiting::Call(subtask)),
+      None => self.ended.push_back((id, Outcome::Returned)),
+    }
+  }
+
+  /// Starts reading a stream's status as a step of operation `id`.
+  ///
+  /// # Safety
+  ///
+  /// As for [`WaitableSet::read_future`], until the step's end is taken.
+  unsafe fn status<F: ReadableFuture>(&mut self, status: &mut F, id: u64) {
+    // SAFETY: guaranteed by the caller.
+    match unsafe { self.set.read_future(status) } {
+      Some(future) => self.track(id, Waiting::Status(future)),
+      None => self.ended.push_back((id, Outcome::Returned)),
+    }
+  }
+
+  /// # Safety
+  ///
+  /// As for [`WaitableSet::read`], until the step's end is taken.
+  unsafe fn read(
+    &mut self,
+    stream: ReadStream,
+    buf: *mut u8,
+    len: usize,
+    id: u64,
+  ) -> Result<(), lio_wasi::Error> {
+    // SAFETY: guaranteed by the caller.
+    let started = unsafe { self.set.read(stream, buf, len) }?;
+    self.started(id, Waiting::Read(stream), started);
+    Ok(())
+  }
+
+  /// # Safety
+  ///
+  /// As for [`WaitableSet::write`], until the step's end is taken.
+  unsafe fn write(
+    &mut self,
+    stream: WriteStream,
+    buf: *const u8,
+    len: usize,
+    id: u64,
+  ) -> Result<(), lio_wasi::Error> {
+    // SAFETY: guaranteed by the caller.
+    let started = unsafe { self.set.write(stream, buf, len) }?;
+    self.started(id, Waiting::Write(stream), started);
+    Ok(())
+  }
+
+  /// # Safety
+  ///
+  /// As for [`WaitableSet::accept`], until the step's end is taken.
+  unsafe fn accept(
+    &mut self,
+    listener: Listener,
+    slot: &mut Accepted,
+    id: u64,
+  ) -> Result<(), lio_wasi::Error> {
+    // SAFETY: guaranteed by the caller.
+    let started = unsafe { self.set.accept(listener, slot) }?;
+    self.started(id, Waiting::Accept(listener), started);
+    Ok(())
+  }
+
+  /// # Safety
+  ///
+  /// As for [`WaitableSet::read_dir`], until the step's end is taken.
+  unsafe fn read_dir(
+    &mut self,
+    stream: DirStream,
+    buf: &mut DirEntryBuf,
+    id: u64,
+  ) -> Result<(), lio_wasi::Error> {
+    // SAFETY: guaranteed by the caller.
+    let started = unsafe { self.set.read_dir(stream, buf) }?;
+    self.started(id, Waiting::List(stream), started);
+    Ok(())
+  }
+
+  /// Stops the step operation `id` has in flight, if it has one. Its end
+  /// is then among those [`poll`](Self::poll) returns.
+  fn cancel(&mut self, id: u64) {
+    let Some(waiting) = self.waiting.remove(&id) else {
+      return;
+    };
+    self.owner.remove(&waiting);
+    let outcome = match waiting {
+      Waiting::Call(subtask) => self.set.cancel(subtask).map(Outcome::from),
+      Waiting::Status(future) => {
+        self.set.cancel_future(future).map(Outcome::from)
+      }
+      Waiting::Read(stream) => self.set.cancel_read(stream).map(Outcome::from),
+      Waiting::Write(stream) => {
+        self.set.cancel_write(stream).map(Outcome::from)
+      }
+      Waiting::Accept(listener) => {
+        self.set.cancel_accept(listener).map(Outcome::from)
+      }
+      Waiting::List(stream) => {
+        self.set.cancel_read_dir(stream).map(Outcome::from)
+      }
+    };
+    let Some(outcome) = outcome else {
+      unreachable!("a tracked step is in flight in the set")
+    };
+    self.ended.push_back((id, outcome));
+  }
+
+  /// Records the end of a step that closing its stream cancelled.
+  fn closed(&mut self, waiting: Waiting, cancelled: Option<StreamResult>) {
+    let Some(result) = cancelled else {
+      return;
+    };
+    let Some(id) = self.owner.remove(&waiting) else {
+      unreachable!("a step in flight in the set is tracked")
+    };
+    self.waiting.remove(&id);
+    self.ended.push_back((id, result.into()));
+  }
+
+  fn close_reader(
+    &mut self,
+    stream: ReadStream,
+  ) -> Result<(), lio_wasi::Error> {
+    let cancelled = self.set.close_reader(stream)?;
+    self.closed(Waiting::Read(stream), cancelled);
+    Ok(())
+  }
+
+  fn close_writer(
+    &mut self,
+    stream: WriteStream,
+  ) -> Result<(), lio_wasi::Error> {
+    let cancelled = self.set.close_writer(stream)?;
+    self.closed(Waiting::Write(stream), cancelled);
+    Ok(())
+  }
+
+  fn close_listener(
+    &mut self,
+    listener: Listener,
+  ) -> Result<(), lio_wasi::Error> {
+    let cancelled = self.set.close_listener(listener)?;
+    self.closed(Waiting::Accept(listener), cancelled);
+    Ok(())
+  }
+
+  fn close_dir_reader(
+    &mut self,
+    stream: DirStream,
+  ) -> Result<(), lio_wasi::Error> {
+    let cancelled = self.set.close_dir_reader(stream)?;
+    self.closed(Waiting::List(stream), cancelled);
+    Ok(())
+  }
+
+  /// Turns the set's event into the operation whose step it ends.
+  fn resolve(&mut self, event: Event) -> (u64, Outcome) {
+    let (waiting, outcome) = match event {
+      Event::Returned(subtask) => (Waiting::Call(subtask), Outcome::Returned),
+      Event::FutureRead(future) => (Waiting::Status(future), Outcome::Returned),
+      Event::Read(stream, result) => (Waiting::Read(stream), result.into()),
+      Event::Write(stream, result) => (Waiting::Write(stream), result.into()),
+      Event::Accept(listener, result) => {
+        (Waiting::Accept(listener), result.into())
+      }
+      Event::ReadDir(stream, result) => (Waiting::List(stream), result.into()),
+    };
+    let Some(id) = self.owner.remove(&waiting) else {
+      unreachable!("an event for a step that is not tracked: {event:?}")
+    };
+    self.waiting.remove(&id);
+    (id, outcome)
+  }
+
+  /// Steps whose end has not been taken yet.
+  fn outstanding(&self) -> usize {
+    self.set.in_flight() + self.ended.len()
+  }
+
+  /// The next step that ended, blocking until one does. `None` when no
+  /// step is outstanding.
+  fn wait(&mut self) -> Option<(u64, Outcome)> {
+    if let Some(ended) = self.ended.pop_front() {
+      return Some(ended);
+    }
+    let event = self.set.wait()?;
+    Some(self.resolve(event))
+  }
+
+  /// The next step that ended, if one has, without blocking.
+  fn poll(&mut self) -> Option<(u64, Outcome)> {
+    if let Some(ended) = self.ended.pop_front() {
+      return Some(ended);
+    }
+    let event = self.set.poll()?;
+    Some(self.resolve(event))
+  }
+}
+
 /// The WASI 0.3 backend.
 pub struct Wasi {
   /// Tells this backend's sockets from another's on the same thread.
   id: u64,
-  queue: Queue,
+  steps: Steps,
   /// Pushed but not yet flushed.
   queued: Vec<InFlight>,
   /// Boxed so that an operation's storage does not move while the host
@@ -997,7 +1304,7 @@ impl Wasi {
     LIVE.with(|live| live.borrow_mut().push(id));
     Self {
       id,
-      queue: Queue::new(),
+      steps: Steps::new(),
       queued: Vec::new(),
       ops: HashMap::new(),
       ready: Vec::new(),
@@ -1026,22 +1333,22 @@ impl Wasi {
     let mine: Vec<Orphan> = mine;
     for orphan in mine {
       // Nothing is in flight on these: an operation keeps its resource
-      // open. A stream this queue does not know was already closed.
+      // open. A stream this set does not know was already closed.
       match orphan {
         Orphan::Tcp(tcp) => {
           if let Some(listener) = tcp.listener {
-            let _ = self.queue.close_listener(listener);
+            let _ = self.steps.close_listener(listener);
           }
           if let Some(input) = tcp.input {
-            let _ = self.queue.close_reader(input);
+            let _ = self.steps.close_reader(input);
           }
           if let Some(output) = tcp.output {
-            let _ = self.queue.close_writer(output);
+            let _ = self.steps.close_writer(output);
           }
         }
         Orphan::Listing(listing) => {
           if let Some(stream) = listing.stream {
-            let _ = self.queue.close_dir_reader(stream);
+            let _ = self.steps.close_dir_reader(stream);
           }
         }
       }
@@ -1232,9 +1539,9 @@ impl Wasi {
         let Stage::Accept(slot) = &mut pending.stage else {
           unreachable!("the stage was just set")
         };
-        // SAFETY: `pending` is boxed and stays in `ops` until the
-        // completion.
-        let pushed = unsafe { self.queue.push_accept(listener, slot, id) };
+        // SAFETY: `pending` is boxed and stays in `ops` until the step's
+        // end is handled.
+        let pushed = unsafe { self.steps.accept(listener, slot, id) };
         if pushed.is_err() {
           unreachable!("a listener is open and its lane carries one accept")
         }
@@ -1368,7 +1675,7 @@ impl Wasi {
             let (entries, status) = file.descriptor.read_directory();
             Box::new(Listing {
               owner: self.id,
-              stream: Some(self.queue.add_dir_reader(entries)),
+              stream: Some(self.steps.set.add_dir_reader(entries)),
               status: fs::StreamStatus::new(status),
               state: ListingState::Reading,
               buf: DirEntryBuf::with_capacity(LISTING_BATCH),
@@ -1392,8 +1699,9 @@ impl Wasi {
     let Stage::Call(call) = &mut pending.stage else {
       unreachable!("the stage was just set")
     };
-    // SAFETY: `pending` is boxed and stays in `ops` until the completion.
-    unsafe { call.push(&mut self.queue, id) };
+    // SAFETY: `pending` is boxed and stays in `ops` until the step's end is
+    // handled.
+    unsafe { call.start(&mut self.steps, id) };
     Ok(())
   }
 
@@ -1445,7 +1753,7 @@ impl Wasi {
         .set_listen_backlog_size(u64::try_from(backlog).unwrap_or(1).max(1));
       match tcp.socket.listen() {
         Ok(connections) => {
-          tcp.listener = Some(self.queue.add_listener(connections));
+          tcp.listener = Some(self.steps.set.add_listener(connections));
           0
         }
         Err(error) => fail(socket_errno(&error)),
@@ -1476,8 +1784,8 @@ impl Wasi {
         tcp.output_shut = true;
         match tcp.output.take() {
           Some(output) => {
-            if self.queue.close_writer(output).is_err() {
-              unreachable!("a socket's output stream is open in this queue")
+            if self.steps.close_writer(output).is_err() {
+              unreachable!("a socket's output stream is open in this set")
             }
           }
           None => {
@@ -1493,8 +1801,8 @@ impl Wasi {
         tcp.input_shut = true;
         match tcp.input.take() {
           Some(input) => {
-            if self.queue.close_reader(input).is_err() {
-              unreachable!("a socket's input stream is open in this queue")
+            if self.steps.close_reader(input).is_err() {
+              unreachable!("a socket's input stream is open in this set")
             }
           }
           None => {
@@ -1569,10 +1877,10 @@ impl Wasi {
               } else {
                 descriptor.write_via_stream(reader, at)
               };
-              (Stream::Write(self.queue.add_writer(writer)), status)
+              (Stream::Write(self.steps.set.add_writer(writer)), status)
             } else {
               let (reader, status) = descriptor.read_via_stream(at);
-              (Stream::Read(self.queue.add_reader(reader)), status)
+              (Stream::Read(self.steps.set.add_reader(reader)), status)
             };
             let sync = flags
               .contains(WriteFlags::SYNC)
@@ -1630,7 +1938,7 @@ impl Wasi {
     }
     let (stream, status): (Stream, Box<dyn Any>) = if raw == 0 {
       let (reader, status) = wasip3::cli::stdin::read_via_stream();
-      (Stream::Read(self.queue.add_reader(reader)), Box::new(status))
+      (Stream::Read(self.steps.set.add_reader(reader)), Box::new(status))
     } else {
       let (writer, reader) = wasip3::wit_stream::new::<u8>();
       let status: Box<dyn Any> = if raw == 1 {
@@ -1638,7 +1946,7 @@ impl Wasi {
       } else {
         Box::new(wasip3::cli::stderr::write_via_stream(reader))
       };
-      (Stream::Write(self.queue.add_writer(writer)), status)
+      (Stream::Write(self.steps.set.add_writer(writer)), status)
     };
     *slot = Some(stream);
     self._standard_status.push(status);
@@ -1670,7 +1978,7 @@ impl Wasi {
           let (writer, reader) = wasip3::wit_stream::new::<u8>();
           tcp.output_status =
             Some(sockets::StreamStatus::new(tcp.socket.send(reader)));
-          self.queue.add_writer(writer)
+          self.steps.set.add_writer(writer)
         });
         Ok(Stream::Write(output))
       } else {
@@ -1680,7 +1988,7 @@ impl Wasi {
         let input = *tcp.input.get_or_insert_with(|| {
           let (reader, status) = tcp.socket.receive();
           tcp.input_status = Some(sockets::StreamStatus::new(status));
-          self.queue.add_reader(reader)
+          self.steps.set.add_reader(reader)
         });
         Ok(Stream::Read(input))
       }
@@ -1706,8 +2014,8 @@ impl Wasi {
       // SAFETY: as above; nothing else touches the buffer meanwhile.
       let pushed = unsafe {
         match transfer.stream {
-          Stream::Read(stream) => self.queue.push_read(stream, ptr, len, id),
-          Stream::Write(stream) => self.queue.push_write(stream, ptr, len, id),
+          Stream::Read(stream) => self.steps.read(stream, ptr, len, id),
+          Stream::Write(stream) => self.steps.write(stream, ptr, len, id),
         }
       };
       if pushed.is_err() {
@@ -1717,17 +2025,16 @@ impl Wasi {
     }
   }
 
-  /// Handles a completion from the queue.
-  fn on_completion(&mut self, done: Completion) {
-    let id = done.user_data();
+  /// Handles the end of one step of operation `id`.
+  fn on_step(&mut self, (id, outcome): (u64, Outcome)) {
     if id == TIMER {
       self.timer_pending = false;
       return;
     }
     let Some(mut pending) = self.ops.remove(&id) else {
-      unreachable!("a completion for an operation that is not in flight")
+      unreachable!("a step ended for an operation that is not in flight")
     };
-    match self.advance(id, &mut pending, done.outcome()) {
+    match self.advance(id, &mut pending, outcome) {
       Some(result) => self.finish(pending, result),
       None => {
         self.ops.insert(id, pending);
@@ -1735,7 +2042,7 @@ impl Wasi {
     }
   }
 
-  /// Moves an operation forward after one of its steps completed. Returns
+  /// Moves an operation forward after one of its steps ended. Returns
   /// its result once it is finished.
   fn advance(
     &mut self,
@@ -1905,13 +2212,13 @@ impl Wasi {
         return Some(fail(native::BUFFER_TOO_SMALL));
       }
       // SAFETY (both arms): the listing is boxed in the table and its
-      // directory stays open until this operation's completion is handled.
+      // directory stays open until the step's end is handled.
       match (listing.state, listing.stream) {
         (ListingState::Reading, Some(stream)) => {
           *stage = Stage::ReadDir(ListStep::Entries);
           // SAFETY: see above.
           let pushed =
-            unsafe { self.queue.push_read_dir(stream, &mut listing.buf, id) };
+            unsafe { self.steps.read_dir(stream, &mut listing.buf, id) };
           if pushed.is_err() {
             unreachable!("a listing's stream is open and read one at a time")
           }
@@ -1919,14 +2226,14 @@ impl Wasi {
         _ => {
           *stage = Stage::ReadDir(ListStep::Status);
           // SAFETY: see above.
-          unsafe { self.queue.push_call(&mut listing.status, id) };
+          unsafe { self.steps.status(&mut listing.status, id) };
         }
       }
       None
     })
   }
 
-  /// Handles a listing step that completed.
+  /// Handles a listing step that ended.
   fn listed(
     &mut self,
     id: u64,
@@ -1960,7 +2267,7 @@ impl Wasi {
           let stream = listing.stream.take();
           let result = listing.status.result();
           if let Some(stream) = stream
-            && self.queue.close_dir_reader(stream).is_err()
+            && self.steps.close_dir_reader(stream).is_err()
           {
             unreachable!("a listing's stream is open until it is closed here")
           }
@@ -2043,9 +2350,9 @@ impl Wasi {
     match &mut transfer.status {
       Some(status) => {
         transfer.phase = Phase::Status;
-        // SAFETY: `pending` is boxed and stays in `ops` until the
-        // completion.
-        unsafe { status.push(&mut self.queue, id) };
+        // SAFETY: `pending` is boxed and stays in `ops` until the step's
+        // end is handled.
+        unsafe { status.read(&mut self.steps, id) };
         None
       }
       None => {
@@ -2068,11 +2375,12 @@ impl Wasi {
     let Stage::Transfer(transfer) = &mut pending.stage else {
       unreachable!("only a transfer has a status")
     };
-    // SAFETY: `pending` is boxed and stays in `ops` until the completion.
+    // SAFETY: `pending` is boxed and stays in `ops` until the step's end is
+    // handled.
     unsafe {
       match (&mut transfer.sync, &mut transfer.sync_data) {
-        (Some(sync), _) => self.queue.push_call(sync, id),
-        (None, Some(sync)) => self.queue.push_call(sync, id),
+        (Some(sync), _) => self.steps.call(sync, id),
+        (None, Some(sync)) => self.steps.call(sync, id),
         (None, None) => return self.after_sync(id, pending),
       }
     }
@@ -2089,9 +2397,9 @@ impl Wasi {
     match &mut transfer.position {
       Some(stat) => {
         transfer.phase = Phase::Position;
-        // SAFETY: `pending` is boxed and stays in `ops` until the
-        // completion.
-        unsafe { self.queue.push_call(stat, id) };
+        // SAFETY: `pending` is boxed and stays in `ops` until the step's
+        // end is handled.
+        unsafe { self.steps.call(stat, id) };
         None
       }
       None => {
@@ -2108,8 +2416,8 @@ impl Wasi {
       return;
     }
     let closed = match transfer.stream {
-      Stream::Read(stream) => self.queue.close_reader(stream),
-      Stream::Write(stream) => self.queue.close_writer(stream),
+      Stream::Read(stream) => self.steps.close_reader(stream),
+      Stream::Write(stream) => self.steps.close_writer(stream),
     };
     if closed.is_err() {
       unreachable!("an owned stream is open until it is closed here")
@@ -2132,10 +2440,10 @@ impl Wasi {
     }
   }
 
-  /// Handles every completion that is ready without blocking.
+  /// Handles every step that has ended, without blocking.
   fn pump(&mut self) {
-    while let Some(done) = self.queue.poll() {
-      self.on_completion(done);
+    while let Some(done) = self.steps.poll() {
+      self.on_step(done);
     }
   }
 }
@@ -2158,23 +2466,23 @@ impl Wasi {
       }
     }
     // A cancel only finds a step that is still in flight. If the step had
-    // already completed, the pump moves its operation on to the next step,
+    // already ended, the pump moves its operation on to the next step,
     // which the host then holds. So cancel and pump until no operation is
     // left: each pass ends a step, and an operation has finitely many.
     while !self.ops.is_empty() {
       let ids: Vec<u64> = self.ops.keys().copied().collect();
       for id in ids {
-        self.queue.cancel(id);
+        self.steps.cancel(id);
       }
       self.pump();
-      if self.queue.outstanding() == 0 {
+      if self.steps.outstanding() == 0 {
         // Nothing can complete any more, so nothing is held by the host.
         break;
       }
     }
     for (_, pending) in self.ops.drain() {
-      // SAFETY: the loop above ended with nothing outstanding in the queue,
-      // so the host holds no step of any operation.
+      // SAFETY: the loop above ended with no step outstanding, so the host
+      // holds no step of any operation.
       drop(unsafe { pending.ticket.cancelled(CANCELLED) });
     }
     self.ready.clear();
@@ -2192,11 +2500,11 @@ impl Drop for Wasi {
   fn drop(&mut self) {
     // Stop the host before any operation's memory is freed. The driver
     // has cancelled and waited for everything before it drops a backend,
-    // and `queue` is declared before `ops` so it would be dropped, and
+    // and `steps` is declared before `ops` so its set would be dropped, and
     // cancel everything, first anyway; this does not rely on either.
     self.stop();
     LIVE.with(|live| live.borrow_mut().retain(|id| *id != self.id));
-    // This backend's queue closes its streams as it drops, so what was
+    // This backend's set closes its streams as it drops, so what was
     // waiting on it can go.
     ORPHANS.with(|orphans| {
       orphans.borrow_mut().retain(|orphan| orphan.owner() != self.id);
@@ -2344,10 +2652,10 @@ impl IoBackend for Wasi {
       self.close_deferred();
       return;
     }
-    // The cancelled completion is queued and handled by the next `wait`.
-    // If nothing was in flight, the operation's own completion is already
-    // queued.
-    self.queue.cancel(id);
+    // The cancelled step's end is handled by the next `wait`. If no step
+    // was in flight, the end of the operation's last one is already waiting
+    // there.
+    self.steps.cancel(id);
   }
 
   fn wait(
@@ -2363,26 +2671,26 @@ impl IoBackend for Wasi {
         Some(Duration::ZERO) => {}
         None => {
           while self.ready.is_empty() {
-            let Some(done) = self.queue.wait() else {
+            let Some(done) = self.steps.wait() else {
               break;
             };
-            self.on_completion(done);
+            self.on_step(done);
           }
         }
         Some(limit) => {
           self.timer = WaitFor::new(limit);
           self.timer_pending = true;
           // SAFETY: `self.timer` is not touched until `timer_pending` is
-          // cleared by its completion, which happens before this returns.
-          unsafe { self.queue.push_call(&mut self.timer, TIMER) };
+          // cleared by the timer's end, which happens before this returns.
+          unsafe { self.steps.call(&mut self.timer, TIMER) };
           while self.ready.is_empty() && self.timer_pending {
-            let Some(done) = self.queue.wait() else {
+            let Some(done) = self.steps.wait() else {
               break;
             };
-            self.on_completion(done);
+            self.on_step(done);
           }
           if self.timer_pending {
-            self.queue.cancel(TIMER);
+            self.steps.cancel(TIMER);
             self.pump();
           }
         }

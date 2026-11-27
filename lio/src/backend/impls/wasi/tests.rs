@@ -656,7 +656,7 @@ fn cancelling_everything_stops_everything_in_flight() {
     [(1, CANCELLED), (2, CANCELLED), (3, CANCELLED), (4, CANCELLED)]
   );
   assert!(backend.ops.is_empty() && backend.queued.is_empty());
-  assert_eq!(backend.queue.outstanding(), 0);
+  assert_eq!(backend.steps.outstanding(), 0);
   assert!(poll(&mut backend).is_empty(), "each is reported once");
 }
 
@@ -710,7 +710,7 @@ fn cancelling_follows_operations_through_their_later_steps() {
   let ids: Vec<u64> = done.iter().map(|(id, _)| *id).collect();
   assert_eq!(ids, [1, 2]);
   assert!(backend.ops.is_empty());
-  assert_eq!(backend.queue.outstanding(), 0, "the host still holds a step");
+  assert_eq!(backend.steps.outstanding(), 0, "the host still holds a step");
   assert!(poll(&mut backend).is_empty());
 }
 
@@ -720,7 +720,7 @@ fn cancelling_follows_operations_through_their_later_steps() {
 fn closing_a_listener_frees_its_port() {
   let mut backend = backend();
   let (listening, addr) = listener(&mut backend, loopback());
-  // The listening stream is in this backend's queue, so the close is
+  // The listening stream is in this backend's set, so the close is
   // finished by the backend the next time it runs.
   drop(listening);
   backend.flush().unwrap();
@@ -813,9 +813,9 @@ fn a_directory_closed_mid_listing_is_cleaned_up() {
   assert_eq!((result.entries, result.eof), (1, false));
   assert!(opaque.is_null(), "the listing lives with the directory");
 
-  // Its stream is still open in the queue; the backend closes it.
+  // Its stream is still open in the set; the backend closes it.
   drop(dir);
   backend.flush().unwrap();
   assert!(ORPHANS.with(|orphans| orphans.borrow().is_empty()));
-  assert_eq!(backend.queue.outstanding(), 0);
+  assert_eq!(backend.steps.outstanding(), 0);
 }

@@ -3,10 +3,10 @@
 //! Each operation value holds a call's arguments and its result in the
 //! canonical-ABI layout the host reads and writes. Nothing is allocated to
 //! make a call: paths are passed by pointer, and the result lands in the
-//! operation value. Push one with
-//! [`Queue::push_call`](crate::Queue::push_call); after its completion
-//! reports [`Outcome::Returned`](crate::Outcome::Returned), take the result
-//! with its `result` method.
+//! operation value. Make the call with
+//! [`WaitableSet::start`](crate::WaitableSet::start); once it has returned,
+//! at once or by [`Event::Returned`](crate::Event::Returned), take the
+//! result with its `result` method.
 //!
 //! Calls that do not wait are not here: use `wasip3` directly for
 //! `read_via_stream`, `write_via_stream`, `append_via_stream`,
@@ -28,12 +28,12 @@ pub use wasip3::filesystem::types::{
 use wasip3::wit_bindgen::FutureReader;
 use wasip3::wit_future::FuturePayload;
 
-use crate::Call;
 use crate::reply::{
   LiftError, LiftOk, NO_RESULT, ResultFuture, Slot, Words, call,
 };
-use crate::sealed::{self, Started};
+use crate::sealed::{self, FutureStart};
 use crate::sys::wasm_imports;
+use crate::{Call, ReadableFuture};
 
 wasm_imports!("wasi:filesystem/types@0.3.2" {
   "[async-lower][method]descriptor.sync"
@@ -395,9 +395,10 @@ const _: () = {
 ///   OpenFlags::empty(),
 ///   DescriptorFlags::READ,
 /// );
-/// // SAFETY: `open` stays put until its completion is taken below.
-/// unsafe { queue.push_call(&mut open, 7) };
-/// queue.wait();
+/// // SAFETY: `open` stays put until the call has returned, just below.
+/// if let Some(subtask) = unsafe { set.start(&mut open) } {
+///   assert_eq!(set.wait(), Some(Event::Returned(subtask)));
+/// }
 /// let file = open.result();
 /// ```
 pub struct OpenAt<'a> {
@@ -874,12 +875,14 @@ call!(StatAt => DescriptorStat, |op, reply| {
 
 // ───────────────────────────── directory listing ────────────────────────────
 
-/// The stream of a directory's entries, owned by a [`Queue`](crate::Queue).
+/// The stream of a directory's entries, owned by a
+/// [`WaitableSet`](crate::WaitableSet).
 ///
-/// Returned by [`Queue::add_dir_reader`](crate::Queue::add_dir_reader). It
+/// Returned by
+/// [`WaitableSet::add_dir_reader`](crate::WaitableSet::add_dir_reader). It
 /// stays valid until
-/// [`Queue::close_dir_reader`](crate::Queue::close_dir_reader) or until the
-/// queue is dropped.
+/// [`WaitableSet::close_dir_reader`](crate::WaitableSet::close_dir_reader)
+/// or until the set is dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DirStream(pub(crate) u32);
 
@@ -932,8 +935,8 @@ impl RawDirEntry {
 
 /// Where directory entries land.
 ///
-/// Pass it to [`Queue::push_read_dir`](crate::Queue::push_read_dir). The
-/// read's completion reports how many entries arrived, and
+/// Pass it to [`WaitableSet::read_dir`](crate::WaitableSet::read_dir). The
+/// read's result counts the entries that arrived, and
 /// [`drain`](Self::drain) hands them over. Entries for `.` and `..` are not
 /// among them.
 ///
@@ -988,13 +991,15 @@ impl Drop for DirEntryBuf {
 ///
 /// `read_via_stream`, `write_via_stream` and `append_via_stream` return it
 /// next to the stream as a future. A stream alone only reports
-/// [`Outcome::Closed`](crate::Outcome::Closed), for an error as for the end
-/// of the file. Push this to learn which it was. It completes once the
-/// stream has ended.
+/// [`StreamResult::Dropped`](crate::StreamResult::Dropped), for an error as
+/// for the end of the file. Read this with
+/// [`WaitableSet::read_future`](crate::WaitableSet::read_future) to learn
+/// which it was. It is delivered once the stream has ended.
 ///
 /// # Panics
 ///
-/// Pushing it again after it returned panics: a status is delivered once.
+/// Reading it again after it was delivered panics: a status is delivered
+/// once.
 pub struct StreamStatus {
   future: ResultFuture<ErrorCode>,
 }
@@ -1014,10 +1019,10 @@ impl StreamStatus {
   }
 }
 
-impl Call for StreamStatus {}
+impl ReadableFuture for StreamStatus {}
 
-impl sealed::Sealed for StreamStatus {
-  unsafe fn start(&mut self) -> Started {
+impl sealed::Future for StreamStatus {
+  unsafe fn start_read(&mut self) -> FutureStart {
     // SAFETY: the caller keeps `self` in place until the read completes.
     unsafe { self.future.start() }
   }

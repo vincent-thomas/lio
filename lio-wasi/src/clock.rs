@@ -3,16 +3,16 @@
 use core::time::Duration;
 
 use crate::Call;
-use crate::sealed::{self, Started};
+use crate::sealed;
 use crate::sys::wasm_imports;
 
 /// Completes after a duration has passed, like a one-shot timer.
 ///
-/// Push it with [`Queue::push_call`](crate::Queue::push_call). It has no
-/// result: its completion reporting
-/// [`Outcome::Returned`](crate::Outcome::Returned) is the timer firing.
-/// Cancel it with [`Queue::cancel`](crate::Queue::cancel) to bound a
-/// [`Queue::wait`](crate::Queue::wait) and then withdraw the bound.
+/// Start it with [`WaitableSet::start`](crate::WaitableSet::start). It has
+/// no result: [`Event::Returned`](crate::Event::Returned) for its subtask
+/// is the timer firing. Start one next to other operations to bound a
+/// [`WaitableSet::wait`](crate::WaitableSet::wait), and
+/// [`cancel`](crate::WaitableSet::cancel) it to withdraw the bound.
 #[derive(Clone, Copy, Debug)]
 pub struct WaitFor {
   nanos: u64,
@@ -27,13 +27,13 @@ impl WaitFor {
 
 impl Call for WaitFor {}
 
-impl sealed::Sealed for WaitFor {
-  unsafe fn start(&mut self) -> Started {
+impl sealed::Call for WaitFor {
+  unsafe fn start(&mut self) -> u32 {
     // The canonical ABI passes a `u64` as an `i64` with the same bits.
     let nanos = self.nanos.cast_signed();
     // SAFETY: the argument is passed by value and there is no result, so
     // the host keeps no pointer into this component.
-    Started::Subtask(unsafe { imports::wait_for(nanos) } as u32)
+    (unsafe { imports::wait_for(nanos) }) as u32
   }
 }
 
@@ -57,12 +57,10 @@ impl WaitUntil {
 
 impl Call for WaitUntil {}
 
-impl sealed::Sealed for WaitUntil {
-  unsafe fn start(&mut self) -> Started {
+impl sealed::Call for WaitUntil {
+  unsafe fn start(&mut self) -> u32 {
     // SAFETY: as for `WaitFor`.
-    Started::Subtask(
-      unsafe { imports::wait_until(self.mark.cast_signed()) } as u32
-    )
+    (unsafe { imports::wait_until(self.mark.cast_signed()) }) as u32
   }
 }
 
