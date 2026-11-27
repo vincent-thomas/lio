@@ -39,6 +39,11 @@ workloads=(
   "tcp 268435456"
   "burst 19200"
   "fan 300"
+  "copy"
+  "echo 20000"
+  "conns 2000"
+  "churn 5000"
+  "smallw 20000"
 )
 hosts=(
   "lio:target/release/lio-wasi-run"
