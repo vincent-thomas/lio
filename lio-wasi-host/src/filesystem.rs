@@ -481,6 +481,9 @@ impl<T: Send + 'static> types::HostDescriptorWithStore<T> for LioWasi {
     if descriptor.is_dir() {
       return Ok(Err(ErrorCode::BadDescriptor));
     }
+    if !descriptor.flags.contains(DescriptorFlags::WRITE) {
+      return Ok(Err(ErrorCode::NotPermitted));
+    }
     Ok(rustix::fs::ftruncate(&descriptor.resource, size).map_err(errno))
   }
 
@@ -491,6 +494,16 @@ impl<T: Send + 'static> types::HostDescriptorWithStore<T> for LioWasi {
     modification: NewTimestamp,
   ) -> Fs<()> {
     let descriptor = get(accessor, &fd)?;
+    // The system lets a file's owner set its times through any descriptor.
+    // Here it takes the right to change what the descriptor names.
+    let may = if descriptor.is_dir() {
+      DescriptorFlags::MUTATE_DIRECTORY
+    } else {
+      DescriptorFlags::WRITE
+    };
+    if !descriptor.flags.contains(may) {
+      return Ok(Err(ErrorCode::NotPermitted));
+    }
     Ok(timestamps(access, modification).and_then(|times| {
       rustix::fs::futimens(&descriptor.resource, &times).map_err(errno)
     }))
@@ -662,7 +675,10 @@ impl<T: Send + 'static> types::HostDescriptorWithStore<T> for LioWasi {
       if flags.contains(DescriptorFlags::READ) || !writes {
         how |= api::OpenFlags::READ;
       }
-      if writes {
+      // A file that is created or cut short is opened for writing whatever
+      // the guest asked: the system does neither through a descriptor that
+      // only reads. What the guest may do with it is in its own flags.
+      if changes {
         how |= api::OpenFlags::WRITE;
       }
       if directory {
@@ -842,9 +858,15 @@ fn write<T: Send + 'static>(
   data: StreamReader<u8>,
   to: impl FnOnce(Resource) -> WriteTo,
 ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
+  let writable = descriptor.flags.contains(DescriptorFlags::WRITE);
   let lending = host.get().lending.clone();
-  let (writer, status) =
+  let (mut writer, status) =
     ByteWriter::new(to(descriptor.resource), fs_error, nothing, lending);
+  // The system may have opened it for writing for its own reasons (to
+  // create it, or to cut it short), so the guest's own flags are what say.
+  if !writable {
+    writer.end(Err(ErrorCode::NotPermitted));
+  }
   data.pipe(&mut host, writer)?;
   FutureReader::new(&mut host, status)
 }
