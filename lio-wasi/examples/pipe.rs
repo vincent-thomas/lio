@@ -176,9 +176,9 @@ fn drop_with_operations_in_flight(out: &mut Out) -> Result<(), Error> {
 
 /// Copies standard input to standard output through host streams.
 fn copy_stdin_to_stdout() -> Result<(), Error> {
-  let (stdin, _stdin_result) = lio_wasi::cli::stdin();
+  let (stdin, _stdin_result) = lio_wasi::cli::stdin::read_via_stream();
   let (out, out_reader) = lio_wasi::stream();
-  let _stdout_result = lio_wasi::cli::stdout(out_reader);
+  let _stdout_result = lio_wasi::cli::stdout::write_via_stream(out_reader);
   let mut set = WaitableSet::new();
   let stdin = set.add_reader(stdin);
   let out = set.add_writer(out);

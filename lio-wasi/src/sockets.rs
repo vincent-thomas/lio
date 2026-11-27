@@ -9,12 +9,14 @@
 //! listener is a stream of sockets: see
 //! [`WaitableSet::add_listener`](crate::WaitableSet::add_listener).
 //!
-//! Calls that do not wait are not operations: `create`, `bind`, `listen`,
-//! the UDP `connect` and `disconnect`, addresses and socket options are
-//! methods of [`TcpSocket`] and [`UdpSocket`], and dropping a socket closes
-//! it. Dropping the stream given
+//! Functions that do not wait are WASI's own, passed on as they are:
+//! `create`, `bind`, `listen`, the UDP `connect` and `disconnect`, addresses
+//! and socket options are methods of [`TcpSocket`] and [`UdpSocket`], and
+//! dropping a socket closes it. Names are resolved in [`ip_name_lookup`]. Dropping the stream given
 //! to `send` shuts down the write side; closing the `receive` stream shuts
 //! down the read side.
+
+pub mod ip_name_lookup;
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;

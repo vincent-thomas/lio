@@ -19,7 +19,7 @@ target="wasm32-wasip3"
 
 # The lio-wasi examples do their I/O through lio-wasi alone: no std I/O, and
 # no direct use of the wasip3 bindings.
-banned='wasip3(::|;| as )|std::(io|fs|net)\b|\b(e?print(ln)?|dbg)!'
+banned='wasip3(::|;| as )|std::(io|fs|net|env)\b|\b(e?print(ln)?|dbg)!'
 if grep -rnE "${banned}" lio-wasi/examples; then
   echo "lio-wasi examples must not use std I/O or the wasip3 crate."
   exit 1
@@ -69,7 +69,7 @@ read_out="$(wasmtime run -S p3 --dir "${scratch}/read::/" \
 echo "${read_out}"
 grep -q '^file.txt: 12 bytes$' <<<"${read_out}"
 
-run sockets -S inherit-network </dev/null
+run sockets -S inherit-network -S allow-ip-name-lookup </dev/null
 
 mkdir "${scratch}/lio"
 echo "--- lio backend"

@@ -1,6 +1,14 @@
-//! Calls on `wasi:clocks/monotonic-clock@0.3.2`.
+//! `wasi:clocks@0.3.2`.
+//!
+//! The timers [`WaitFor`] and [`WaitUntil`] wait. Reading a clock does not,
+//! so those functions are WASI's own, passed on as they are: [`now`] and
+//! [`get_resolution`] for the monotonic clock that the timers run on, and
+//! [`system_clock`] for wall-clock time.
 
 use core::time::Duration;
+
+pub use wasip3::clocks::monotonic_clock::{Mark, get_resolution, now};
+pub use wasip3::clocks::system_clock;
 
 use crate::Call;
 use crate::sealed;
@@ -40,17 +48,16 @@ impl sealed::Call for WaitFor {
 /// Completes when the monotonic clock reaches a mark, like an absolute
 /// timer.
 ///
-/// A mark is a count of nanoseconds on the clock that
-/// `wasip3::clocks::monotonic_clock::now` reads. Like [`WaitFor`], it has no
+/// A mark is a count of nanoseconds on the clock that [`now`] reads. Like [`WaitFor`], it has no
 /// result.
 #[derive(Clone, Copy, Debug)]
 pub struct WaitUntil {
-  mark: u64,
+  mark: Mark,
 }
 
 impl WaitUntil {
   /// A timer for the moment the clock reads `mark`.
-  pub fn new(mark: u64) -> Self {
+  pub fn new(mark: Mark) -> Self {
     Self { mark }
   }
 }

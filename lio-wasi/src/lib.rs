@@ -28,7 +28,7 @@
 //! ```rust,ignore
 //! use lio_wasi::{Event, Started, WaitableSet};
 //!
-//! let (stdin, _result) = wasip3::cli::stdin::read_via_stream();
+//! let (stdin, _status) = lio_wasi::cli::stdin::read_via_stream();
 //! let mut set = WaitableSet::new();
 //! let stdin = set.add_reader(stdin);
 //!
@@ -60,9 +60,12 @@
 //!
 //! ## Status
 //!
-//! Bound: byte-stream reads and writes, the status of their streams, and the
-//! `wasi:clocks`, `wasi:filesystem` and `wasi:sockets` functions that wait.
-//! See the crate README for the full table.
+//! Every function of `wasi:cli`, `wasi:clocks`, `wasi:filesystem`,
+//! `wasi:sockets` and `wasi:random` is reachable from this crate. One that
+//! waits is an operation: a stream read or write, a [`Call`], or a
+//! [`ReadableFuture`]. One that does not wait is WASI's own function,
+//! passed on under its own name with nothing added. `wasi:http` is not
+//! bound. See the crate README for the full table.
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
@@ -76,8 +79,10 @@ use wasip3::wit_stream::StreamPayload;
 use fs::{DirEntryBuf, DirStream, DirectoryEntry};
 use sockets::{Accepted, Listener, TcpSocket};
 
-/// The `wasip3` bindings this crate is built on. Use them for the WASI
-/// functions that do not wait and that this crate does not pass on.
+/// `wasi:random@0.3.2`, passed on as it is: none of it waits.
+pub use wasip3::random;
+
+/// The `wasip3` bindings this crate is built on.
 pub use wasip3;
 
 pub mod cli;
@@ -92,8 +97,9 @@ use sys::{RawEvent, RawSet};
 /// Creates a byte stream inside this component and returns its two ends.
 ///
 /// WASI takes data as the readable end of a stream: hand that end to
-/// [`cli::stdout`], `Descriptor::write_via_stream` or `TcpSocket::send`,
-/// give the writable end to [`WaitableSet::add_writer`], and write.
+/// [`cli::stdout::write_via_stream`], `Descriptor::write_via_stream` or
+/// `TcpSocket::send`, give the writable end to
+/// [`WaitableSet::add_writer`], and write.
 pub fn stream() -> (StreamWriter<u8>, StreamReader<u8>) {
   wasip3::wit_stream::new::<u8>()
 }
@@ -105,7 +111,8 @@ pub fn stream() -> (StreamWriter<u8>, StreamReader<u8>) {
 pub trait Call: sealed::Call {}
 
 /// A `future` that [`WaitableSet::read_future`] can read: the status of a
-/// stream, [`fs::StreamStatus`] or [`sockets::StreamStatus`].
+/// stream, [`fs::StreamStatus`], [`sockets::StreamStatus`] or
+/// [`cli::StreamStatus`].
 ///
 /// It cannot be implemented outside this crate.
 pub trait ReadableFuture: sealed::Future {}
