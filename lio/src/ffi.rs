@@ -2532,6 +2532,7 @@ fn open_flags_from_posix(bits: libc::c_int) -> Option<api::OpenFlags> {
     (libc::O_TRUNC, OpenFlags::TRUNCATE),
     (libc::O_EXCL, OpenFlags::EXCLUSIVE),
     (libc::O_DIRECTORY, OpenFlags::DIRECTORY),
+    (libc::O_NOFOLLOW, OpenFlags::NOFOLLOW),
   ] {
     if rest & native != 0 {
       flags |= flag;

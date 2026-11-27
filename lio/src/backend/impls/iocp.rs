@@ -1463,6 +1463,10 @@ fn open_at(
   if !flags.reads() && !flags.writes() {
     return Err(io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32));
   }
+  // Not told apart here: refused, not ignored.
+  if flags.contains(OpenFlags::NOFOLLOW) {
+    return Err(io::Error::from_raw_os_error(ERROR_NOT_SUPPORTED as i32));
+  }
   let path = resolve(dir, path)?;
   let mut options = OpenOptions::new();
   // Directories can only be opened with backup semantics. std opens handles

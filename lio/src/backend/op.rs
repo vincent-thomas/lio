@@ -183,6 +183,11 @@ portable_flags! {
   const EXCLUSIVE = 1 << 5;
   /// Fail unless the path is a directory.
   const DIRECTORY = 1 << 6;
+  /// Fail if the last component of the path is a symbolic link, with the
+  /// platform's error for that (`ELOOP` on Linux and macOS). Links earlier
+  /// in the path are still followed (`O_NOFOLLOW`). A backend that cannot
+  /// tell completes the open with `ENOTSUP`.
+  const NOFOLLOW = 1 << 7;
 }
 
 impl OpenFlags {

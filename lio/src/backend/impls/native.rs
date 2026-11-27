@@ -176,6 +176,7 @@ pub(crate) fn open_flags(flags: OpenFlags) -> Result<i32, i32> {
     (OpenFlags::TRUNCATE, libc::O_TRUNC),
     (OpenFlags::EXCLUSIVE, libc::O_EXCL),
     (OpenFlags::DIRECTORY, libc::O_DIRECTORY),
+    (OpenFlags::NOFOLLOW, libc::O_NOFOLLOW),
   ] {
     if flags.contains(flag) {
       bits |= native;
