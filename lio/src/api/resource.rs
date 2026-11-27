@@ -274,6 +274,27 @@ impl Drop for InnerResource {
 #[derive(Clone)]
 pub struct Resource(Arc<InnerResource>);
 
+impl Resource {
+  /// A handle to the same resource that is not counted.
+  ///
+  /// # Safety
+  ///
+  /// The result is never dropped, and is not used once this handle, or
+  /// what it was moved to, is gone.
+  #[inline]
+  pub(crate) unsafe fn alias(&self) -> Resource {
+    // SAFETY: a bitwise copy of the handle. The caller never drops it, so
+    // the count it did not take is never given back.
+    unsafe { std::ptr::read(self) }
+  }
+
+  /// How many counted handles the resource has.
+  #[cfg(test)]
+  pub(crate) fn handles(&self) -> usize {
+    Arc::strong_count(&self.0)
+  }
+}
+
 /// Trait for types that can be converted into a [`Resource`].
 ///
 /// This trait is implemented by high-level types like `Socket`, `TcpSocket`, and

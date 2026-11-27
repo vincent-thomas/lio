@@ -350,8 +350,10 @@ impl Cx<'_> {
     self.submit(
       (listener, SocketAddrBuf::unspecified(), peer),
       |(listener, addr, _)| {
-        action_io!(Op::Accept {
-          fd: listener.clone(),
+        action_lent!(Op::Accept {
+          // SAFETY: the alias is kept from being dropped by `action_lent!`,
+          // and the model holds `listener` for as long as the action.
+          fd: unsafe { listener.alias() },
           addr: NonNull::from(addr),
         })
       },
@@ -477,7 +479,10 @@ impl<B: IoBufMutVec> Receiving<B> {
       Some(from) => MsgRecv::with_from(regions, NonNull::from(from)),
       None => MsgRecv::new(regions),
     };
-    action_io!(Op::Recv { fd: self.socket.clone(), msg, flags: self.flags })
+    // SAFETY: the alias is kept from being dropped by `action_lent!`, and
+    // the model holds `socket` for as long as the action.
+    let fd = unsafe { self.socket.alias() };
+    action_lent!(Op::Recv { fd, msg, flags: self.flags })
   }
 
   fn received(
@@ -559,7 +564,10 @@ impl Cx<'_> {
           unsafe { MsgBuf::from_raw_parts(NonNull::dangling(), 0) }
         });
         let msg = MsgSend::new(regions, *to);
-        action_io!(Op::Send { fd: socket.clone(), msg, flags: *flags })
+        // SAFETY: the alias is kept from being dropped by `action_lent!`,
+        // and the model holds `socket` for as long as the action.
+        let fd = unsafe { socket.alias() };
+        action_lent!(Op::Send { fd, msg, flags: *flags })
       },
       |(_, buf, ..), _, done| (done.count(), held(buf.take())),
     )
@@ -604,8 +612,10 @@ impl Cx<'_> {
           // valid in place until the result is read.
           unsafe { RawBufMut::from_raw_parts(ptr.as_ptr(), len) }
         });
-        action_io!(Op::Read {
-          fd: file.clone(),
+        action_lent!(Op::Read {
+          // SAFETY: the alias is kept from being dropped by `action_lent!`,
+          // and the model holds `file` for as long as the action.
+          fd: unsafe { file.alias() },
           iovecs: regions.as_ptr().cast(),
           iov_count: regions.count(),
           offset: *offset,
@@ -659,8 +669,10 @@ impl Cx<'_> {
             RawBuf::from_raw_parts(bytes.as_ptr().cast_mut(), bytes.len())
           }
         }));
-        action_io!(Op::Write {
-          fd: file.clone(),
+        action_lent!(Op::Write {
+          // SAFETY: the alias is kept from being dropped by `action_lent!`,
+          // and the model holds `file` for as long as the action.
+          fd: unsafe { file.alias() },
           iovecs: regions.as_ptr().cast(),
           iov_count: regions.count(),
           offset: *offset,
@@ -768,8 +780,10 @@ impl Cx<'_> {
     self.submit(
       (dir, buf),
       |(dir, buf)| {
-        action_io!(Op::ReadDir {
-          fd: dir.clone(),
+        action_lent!(Op::ReadDir {
+          // SAFETY: the alias is kept from being dropped by `action_lent!`,
+          // and the model holds `dir` for as long as the action.
+          fd: unsafe { dir.alias() },
           raw_buf: NonNull::from(buf.raw.as_mut_slice()).cast(),
           raw_cap: buf.raw.len(),
           entries: NonNull::from(buf.entries.as_mut_slice()).cast(),

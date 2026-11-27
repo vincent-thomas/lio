@@ -7,7 +7,7 @@ use crate::api::resource::Resource;
 use std::ffi::OsString;
 use std::io;
 use std::marker::PhantomData;
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
@@ -1230,10 +1230,31 @@ pub enum Op {
 /// `'a`. Passing it to [`Tracked::push`](crate::backend::Tracked::push) is
 /// `unsafe` because the backend may use those addresses after `push`
 /// returns; the caller promises they outlive the submission.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BorrowedOp<'a> {
-  op: Op,
+  op: ManuallyDrop<Op>,
+  /// Whether `op` owns what it names. One that does not names resources
+  /// by a copy of their handle that was never counted: see
+  /// [`aliasing`](Self::aliasing).
+  owned: bool,
   _lt: PhantomData<&'a ()>,
+}
+
+impl Clone for BorrowedOp<'_> {
+  /// A copy that owns what it names, whether or not this one does.
+  fn clone(&self) -> Self {
+    branded(Op::clone(&self.op))
+  }
+}
+
+impl Drop for BorrowedOp<'_> {
+  #[inline]
+  fn drop(&mut self) {
+    if self.owned {
+      // SAFETY: dropped once, here, and not used again.
+      unsafe { ManuallyDrop::drop(&mut self.op) };
+    }
+  }
 }
 
 fn descriptor_list<T>(bufs: &[T]) -> (NonNull<T>, usize) {
@@ -1287,7 +1308,7 @@ impl Default for SendSlots {
 }
 
 fn branded<'b>(op: Op) -> BorrowedOp<'b> {
-  BorrowedOp { op, _lt: PhantomData }
+  BorrowedOp { op: ManuallyDrop::new(op), owned: true, _lt: PhantomData }
 }
 
 impl<'a> BorrowedOp<'a> {
@@ -1300,10 +1321,36 @@ impl<'a> BorrowedOp<'a> {
     &self.op
   }
 
-  /// The operation, for the table to keep until the backend starts it.
+  /// The operation, for the table to keep until the backend starts it:
+  /// one that owns what it names.
   #[inline]
   pub(crate) fn into_op(self) -> Op {
-    self.op
+    let mut this = ManuallyDrop::new(self);
+    if this.owned {
+      // SAFETY: `this` is never dropped, so the operation is taken once.
+      unsafe { ManuallyDrop::take(&mut this.op) }
+    } else {
+      // The uncounted handles stay behind, undropped: the clone counts
+      // its own.
+      Op::clone(&this.op)
+    }
+  }
+
+  /// Brands `op`, which names resources by handles that were never
+  /// counted ([`Resource::alias`]), as `'static`.
+  ///
+  /// Building an operation for the backend to look at would otherwise
+  /// count each resource up and down again, for a handle the operation's
+  /// own memory already holds. The result is never dropped as an
+  /// operation, and [`into_op`](Self::into_op) clones it, which counts.
+  ///
+  /// # Safety
+  ///
+  /// As for [`from_op`](Self::from_op). Every resource in `op` is an alias
+  /// of one that outlives the result, and `op` owns nothing else: nothing
+  /// in it is dropped.
+  pub(crate) unsafe fn aliasing(op: Op) -> BorrowedOp<'static> {
+    BorrowedOp { op: ManuallyDrop::new(op), owned: false, _lt: PhantomData }
   }
 
   /// Brands `op` as `'static`.
@@ -1313,7 +1360,7 @@ impl<'a> BorrowedOp<'a> {
   /// Every address in `op` must remain valid for as long as the result is
   /// used. This does not check that.
   pub(crate) unsafe fn from_op(op: Op) -> BorrowedOp<'static> {
-    BorrowedOp { op, _lt: PhantomData }
+    branded(op)
   }
 
   /// A no-op. It borrows nothing.
