@@ -220,7 +220,7 @@ fn unsupported_setup_flags_retry_without_flags() {
   let ring = IoUring::create_ring_with(16, |params| {
     attempts.push((params.sq_entries, params.flags));
     if attempts.len() == 1 {
-      Err(io::Error::from_raw_os_error(libc::EINVAL))
+      Err(Errno::new(libc::EINVAL))
     } else {
       LioUring::with_params(params)
     }
@@ -238,7 +238,7 @@ fn other_setup_errors_are_not_retried() {
   let mut attempts = 0;
   let result = IoUring::create_ring_with(16, |_| {
     attempts += 1;
-    Err(io::Error::from_raw_os_error(libc::ENOMEM))
+    Err(Errno::new(libc::ENOMEM))
   });
   assert_eq!(attempts, 1);
   assert_eq!(result.err().unwrap().raw_os_error(), Some(libc::ENOMEM));

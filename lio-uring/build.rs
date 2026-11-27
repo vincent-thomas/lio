@@ -118,6 +118,8 @@ fn build_linux() {
     // The input header we would like to generate
     // bindings for.
     .header(headers_path.to_str().unwrap())
+    // The crate is no_std: name C types through `core::ffi`, not `std`.
+    .use_core()
     // Add clang args to find the includes and define necessary macros
     .clang_arg("-include")
     .clang_arg(atomics_path.to_str().unwrap())
