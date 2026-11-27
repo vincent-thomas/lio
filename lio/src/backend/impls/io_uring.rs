@@ -14,7 +14,7 @@ use lio_uring::{
   operation::{
     Accept, AsyncCancel, Bind, Connect, Fsync, LinkAt, Listen, MkDirAt, Nop,
     OpenAt, Readv, Recv, RecvMsg, RenameAt, Send, SendMsg, Shutdown, Socket,
-    Statx, SymlinkAt, UnlinkAt, Writev,
+    SymlinkAt, UnlinkAt, Writev,
   },
 };
 
@@ -370,10 +370,8 @@ impl LoweredState {
         // and remains valid until submission finishes.
         IoUring::create_socket_entry(op, unsafe { state.as_ref() })
       }
-      Self::Stat(state) => {
-        // SAFETY: `state` points into the bump arena backing this lowered op
-        // and remains valid until submission finishes.
-        IoUring::create_stat_entry(op, unsafe { state.as_ref() })
+      Self::Stat(_) => {
+        unreachable!("a stat is performed on this thread, not on the ring")
       }
       Self::Path(state) => {
         // SAFETY: `state` points into the bump arena backing this lowered op
@@ -421,11 +419,6 @@ impl LoweredState {
             *out.as_ptr() = addr;
           }
         }
-      }
-      Self::Stat(state) => {
-        // SAFETY: `state` points to the still-live lowered stat state for this
-        // completion.
-        unsafe { state.as_ref() }.finalize()
       }
       _ => {}
     }
@@ -1044,40 +1037,50 @@ impl IoUring {
     }
   }
 
-  fn create_stat_entry(op: &Op, native_stat: &NativeStatState) -> Entry {
-    match op {
-      Op::Stat { target, .. } => match target {
-        crate::backend::op::StatTarget::Path {
-          dir_fd,
-          follow_symlinks,
-          ..
-        } => {
-          let Some(path) = native_stat.path.as_ref() else {
-            unreachable!("path-based stat must have path cstring");
-          };
-          let path_ptr = path.as_ptr();
-          let flags =
-            if *follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
-          Statx::new(
-            dir_fd.as_raw_fd(),
-            path_ptr,
-            (&native_stat.statx as *const lio_uring::statx).cast_mut(),
-          )
-          .flags(flags)
-          .mask(STATX_BASIC_STATS)
-          .build()
-        }
-        crate::backend::op::StatTarget::Fd { fd } => Statx::new(
-          fd.as_raw_fd(),
-          c"".as_ptr(),
-          (&native_stat.statx as *const lio_uring::statx).cast_mut(),
-        )
-        .flags(libc::AT_EMPTY_PATH)
-        .mask(STATX_BASIC_STATS)
-        .build(),
-      },
-      _ => unreachable!("stat entry requires stat op"),
+  /// Performs a stat on this thread, into `state`, and returns the
+  /// operation's result.
+  ///
+  /// The kernel never completes a `statx` request as it is submitted: it
+  /// hands every one to a worker thread, which costs tens of microseconds
+  /// where the system call itself takes well under one. So a stat is made
+  /// here, like the other path operations that are. A lookup of something
+  /// the kernel has not cached waits on this thread.
+  fn stat_here(op: &Op, state: &mut NativeStatState) -> isize {
+    let Op::Stat { target, .. } = op else {
+      unreachable!("stat state belongs to a stat op")
+    };
+    let (dir, path, flags) = match target {
+      crate::backend::op::StatTarget::Path {
+        dir_fd, follow_symlinks, ..
+      } => {
+        let Some(path) = state.path.as_ref() else {
+          unreachable!("path-based stat must have path cstring");
+        };
+        let flags =
+          if *follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+        (dir_fd.as_raw_fd(), path.as_ptr(), flags)
+      }
+      crate::backend::op::StatTarget::Fd { fd } => {
+        (fd.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH)
+      }
+    };
+    // SAFETY: `path` is a NUL-terminated string that outlives the call, and
+    // `state.statx` is writable storage of the size the kernel fills.
+    let result = unsafe {
+      libc::syscall(
+        libc::SYS_statx,
+        dir,
+        path,
+        flags,
+        STATX_BASIC_STATS,
+        &raw mut state.statx,
+      )
+    };
+    if result < 0 {
+      return -(crate::backend::impls::syscall::last_os_error_code() as isize);
     }
+    state.finalize();
+    0
   }
 
   fn execute_immediate(op: &Op) -> Option<io::Result<isize>> {
@@ -1290,6 +1293,17 @@ impl IoBackend for IoUring {
         profile.nop_ops += 1;
       }
       Self::finish_here(done, key, 0);
+      return started;
+    }
+
+    if let LoweredState::Stat(mut state) = lowered {
+      if let Some(profile) = self.profile.as_mut() {
+        profile.immediate_ops += 1;
+      }
+      // SAFETY: `state` points into the step arena, which outlives this
+      // call, and nothing else refers to it.
+      let result = Self::stat_here(op, unsafe { state.as_mut() });
+      Self::finish_here(done, key, result);
       return started;
     }
 
