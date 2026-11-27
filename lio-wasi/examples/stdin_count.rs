@@ -9,8 +9,11 @@
 
 use lio_wasi::{Event, Started, StreamResult, WaitableSet};
 
+mod common;
+
 fn main() -> Result<(), lio_wasi::Error> {
-  let (stdin, _result) = wasip3::cli::stdin::read_via_stream();
+  let mut out = common::Out::stdout();
+  let (stdin, _result) = lio_wasi::cli::stdin();
   let mut set = WaitableSet::new();
   let stdin = set.add_reader(stdin);
 
@@ -33,6 +36,6 @@ fn main() -> Result<(), lio_wasi::Error> {
       break;
     }
   }
-  println!("{total} bytes in {reads} reads");
+  say!(out, "{total} bytes in {reads} reads");
   Ok(())
 }

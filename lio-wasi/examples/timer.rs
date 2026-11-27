@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use lio_wasi::clock::WaitFor;
 use lio_wasi::{Cancel, Event, Started, StreamResult, Subtask, WaitableSet};
 
+mod common;
+
 /// Starts a timer that cannot have fired yet.
 ///
 /// # Safety
@@ -24,6 +26,7 @@ unsafe fn start(set: &mut WaitableSet, timer: &mut WaitFor) -> Subtask {
 }
 
 fn main() {
+  let mut out = common::Out::stdout();
   let mut set = WaitableSet::new();
 
   // Three timers started longest first fire shortest first.
@@ -49,7 +52,7 @@ fn main() {
   let elapsed = start_time.elapsed();
   assert!(elapsed >= Duration::from_millis(300), "fired early: {elapsed:?}");
   assert!(elapsed < Duration::from_millis(900), "fired late: {elapsed:?}");
-  println!("three timers fired in order after {elapsed:?}");
+  say!(out, "three timers fired in order after {elapsed:?}");
 
   // A cancelled timer is stopped at once, and never fires.
   let mut long = WaitFor::new(Duration::from_secs(3600));
@@ -60,11 +63,11 @@ fn main() {
   assert_eq!(set.cancel(subtask), None);
   assert!(set.wait().is_none());
   assert!(start_time.elapsed() < Duration::from_secs(1));
-  println!("cancelled timer: ok");
+  say!(out, "cancelled timer: ok");
 
   // A timer bounds a wait on a stream that never has data: the lio
   // backend's `wait(timeout)`.
-  let (_writer, reader) = wasip3::wit_stream::new::<u8>();
+  let (_writer, reader) = lio_wasi::stream();
   let reader = set.add_reader(reader);
   let mut buf = [0u8; 8];
   let mut timeout = WaitFor::new(Duration::from_millis(50));
@@ -80,12 +83,12 @@ fn main() {
   assert_eq!(set.wait(), Some(Event::Returned(timer)), "the timeout is first");
   assert_eq!(set.cancel_read(reader), Some(StreamResult::Cancelled(0)));
   assert!(set.wait().is_none());
-  println!("timeout bounds a wait: ok");
+  say!(out, "timeout bounds a wait: ok");
 
   // Dropping the set with a timer in flight cancels it.
   let mut pending = WaitFor::new(Duration::from_secs(3600));
   // SAFETY: the set is dropped before `pending`.
   let _ = unsafe { start(&mut set, &mut pending) };
   drop(set);
-  println!("drop with a timer in flight: ok");
+  say!(out, "drop with a timer in flight: ok");
 }

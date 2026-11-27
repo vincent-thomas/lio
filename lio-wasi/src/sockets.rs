@@ -9,9 +9,10 @@
 //! listener is a stream of sockets: see
 //! [`WaitableSet::add_listener`](crate::WaitableSet::add_listener).
 //!
-//! Calls that do not wait are not here: use `wasip3` directly for `create`,
-//! `bind`, `listen`, the UDP `connect` and `disconnect`, addresses and
-//! socket options, and drop a socket to close it. Dropping the stream given
+//! Calls that do not wait are not operations: `create`, `bind`, `listen`,
+//! the UDP `connect` and `disconnect`, addresses and socket options are
+//! methods of [`TcpSocket`] and [`UdpSocket`], and dropping a socket closes
+//! it. Dropping the stream given
 //! to `send` shuts down the write side; closing the `receive` stream shuts
 //! down the read side.
 

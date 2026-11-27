@@ -4,8 +4,9 @@
 # 1. lio's own tests that build for wasm32-wasip3: the library tests, which
 #    include the WASI backend's (lio/src/backend/impls/wasi/tests.rs), and
 #    the integration tests that do not build fixtures from std descriptors.
-# 2. The lio-wasi examples, which assert what each operation did, and
-#    examples/wasi, which drives the backend through lio's own API.
+# 2. The lio-wasi examples, which assert what each operation did and use
+#    nothing but lio-wasi for I/O, and examples/wasi, which drives the
+#    backend through lio's own API.
 #
 # A failed assertion aborts: wasm32-wasip3 does not unwind. Tests that catch
 # a panic are ignored there (`not(panic = "unwind")`).
@@ -15,6 +16,15 @@
 set -euo pipefail
 
 target="wasm32-wasip3"
+
+# The lio-wasi examples do their I/O through lio-wasi alone: no std I/O, and
+# no direct use of the wasip3 bindings.
+banned='wasip3(::|;| as )|std::(io|fs|net)\b|\b(e?print(ln)?|dbg)!'
+if grep -rnE "${banned}" lio-wasi/examples; then
+  echo "lio-wasi examples must not use std I/O or the wasip3 crate."
+  exit 1
+fi
+
 cargo build -p lio-wasi --examples --target "${target}"
 cargo build -p lio-wasi-example --target "${target}"
 

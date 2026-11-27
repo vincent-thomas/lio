@@ -64,8 +64,11 @@ answers at once, and no event follows it.
 
 The WASI 0.3 functions that can wait, by interface; the few still missing
 are listed under [Not bound yet](#not-bound-yet). A function that does
-not wait has nothing to start and await: call it through `wasip3`, which
-this crate re-exports.
+not wait has nothing to start and await. The common ones are plain
+functions and methods here: `lio_wasi::stream`, `cli::stdin`, `cli::stdout`,
+`cli::stderr`, `fs::preopens`, and the methods of `fs::Descriptor`,
+`sockets::TcpSocket` and `sockets::UdpSocket`. The rest are in `wasip3`,
+which this crate re-exports.
 
 | WASI 0.3 | lio-wasi |
 | --- | --- |
@@ -108,6 +111,7 @@ side; closing its `receive` stream shuts down the read side.
 
 ### Not bound yet
 
+- Reading the status of a standard stream (`cli::StreamStatus`).
 - `ip-name-lookup.resolve-addresses`.
 - `descriptor.is-same-object`, `metadata-hash`, `metadata-hash-at`.
 
@@ -119,7 +123,8 @@ Unit tests cover result decoding and layouts and run on any host:
 cargo test -p lio-wasi
 ```
 
-The examples are the runtime tests. Each asserts what its operations did.
+The examples are the runtime tests. Each asserts what its operations did,
+and does all of its I/O, its own output included, through this crate.
 `mise run wasi` builds them for `wasm32-wasip3` and runs every one under
 wasmtime.
 

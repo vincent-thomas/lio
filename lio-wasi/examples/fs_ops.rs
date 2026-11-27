@@ -9,7 +9,7 @@
 
 use lio_wasi::fs::{
   Advice, Advise, CreateDirectoryAt, Descriptor, DescriptorFlags,
-  DescriptorType, DirEntryBuf, ErrorCode, GetFlags, GetType, LinkAt,
+  DescriptorType, DirEntryBuf, ErrorCode, GetFlags, GetType, Instant, LinkAt,
   NewTimestamp, OpenAt, OpenFlags, PathFlags, ReadlinkAt, RemoveDirectoryAt,
   RenameAt, SetSize, SetTimes, SetTimesAt, Stat, StatAt, StreamStatus,
   SymlinkAt, Sync, SyncData, UnlinkFileAt,
@@ -18,7 +18,8 @@ use lio_wasi::{
   Call, Event, ReadStream, ReadableFuture, Started, StreamResult, Subtask,
   WaitableSet, WriteStream,
 };
-use wasip3::clocks::system_clock::Instant;
+
+mod common;
 
 /// Makes `call` and waits for it to return.
 fn run<C: Call>(set: &mut WaitableSet, call: &mut C) {
@@ -107,7 +108,7 @@ fn write_at(
   offset: u64,
   data: &[u8],
 ) -> Result<(), ErrorCode> {
-  let (writer, reader) = wasip3::wit_stream::new::<u8>();
+  let (writer, reader) = lio_wasi::stream();
   let mut status = StreamStatus::new(file.write_via_stream(reader, offset));
   let writer = set.add_writer(writer);
   let mut sent = 0;
@@ -154,9 +155,8 @@ fn read_from(
 }
 
 fn main() {
-  let Some((root, _name)) =
-    wasip3::filesystem::preopens::get_directories().into_iter().next()
-  else {
+  let mut out = common::Out::stdout();
+  let Some((root, _name)) = lio_wasi::fs::preopens().into_iter().next() else {
     panic!("run with a preopened scratch directory");
   };
   let mut set = WaitableSet::new();
@@ -181,7 +181,7 @@ fn main() {
   let mut kind = GetType::new(&dir);
   run(set, &mut kind);
   assert!(matches!(ok!(kind), DescriptorType::Directory));
-  println!("create-directory-at, open-at, get-type: ok");
+  say!(out, "create-directory-at, open-at, get-type: ok");
 
   // Create a file, write it, read it back.
   let file = match open(
@@ -211,13 +211,13 @@ fn main() {
   assert!(matches!(status, Ok(())));
   let (tail, _) = read_from(set, &file, 7);
   assert_eq!(tail, b"WASI!");
-  println!("write-via-stream, read-via-stream, stream status: ok");
+  say!(out, "write-via-stream, read-via-stream, stream status: ok");
 
   // A stream that fails reports why through its status.
   let (bytes, status) = read_from(set, &dir, 0);
   assert!(bytes.is_empty());
   assert!(status.is_err(), "reading a directory as a file succeeded");
-  println!("failed stream status: {status:?}");
+  say!(out, "failed stream status: {status:?}");
 
   let mut flags = GetFlags::new(&file);
   run(set, &mut flags);
@@ -226,7 +226,7 @@ fn main() {
   let mut kind = GetType::new(&file);
   run(set, &mut kind);
   assert!(matches!(ok!(kind), DescriptorType::RegularFile));
-  println!("get-flags, get-type: ok");
+  say!(out, "get-flags, get-type: ok");
 
   let mut sync = Sync::new(&file);
   run(set, &mut sync);
@@ -237,7 +237,7 @@ fn main() {
   let mut advise = Advise::new(&file, 0, 12, Advice::Sequential);
   run(set, &mut advise);
   ok!(advise);
-  println!("sync, sync-data, advise: ok");
+  say!(out, "sync, sync-data, advise: ok");
 
   // Stat sees the size; set-size changes it both ways.
   let mut stat = Stat::new(&file);
@@ -255,7 +255,7 @@ fn main() {
   assert_eq!(read_from(set, &file, 0).0, b"hello\0\0\0");
   run(set, &mut stat);
   assert_eq!(ok!(stat).size, 8);
-  println!("stat, set-size: ok");
+  say!(out, "stat, set-size: ok");
 
   // Times, through the descriptor and through a path.
   let at =
@@ -297,7 +297,7 @@ fn main() {
   let mut missing = StatAt::new(&dir, PathFlags::empty(), "absent");
   run(set, &mut missing);
   assert!(matches!(missing.result(), Some(Err(ErrorCode::NoEntry))));
-  println!("set-times, set-times-at, stat-at: ok");
+  say!(out, "set-times, set-times-at, stat-at: ok");
 
   // Links.
   let mut hard =
@@ -321,7 +321,7 @@ fn main() {
   let mut followed = StatAt::new(&dir, PathFlags::SYMLINK_FOLLOW, "soft");
   run(set, &mut followed);
   assert!(matches!(ok!(followed).type_, DescriptorType::RegularFile));
-  println!("link-at, symlink-at, readlink-at: ok");
+  say!(out, "link-at, symlink-at, readlink-at: ok");
 
   // Rename, including across directories, then clean everything up.
   let mut rename = RenameAt::new(&dir, "hard", &root, "moved");
@@ -348,7 +348,7 @@ fn main() {
   let mut rmdir = RemoveDirectoryAt::new(&root, "work");
   run(set, &mut rmdir);
   ok!(rmdir);
-  println!("rename-at, unlink-file-at, remove-directory-at: ok");
+  say!(out, "rename-at, unlink-file-at, remove-directory-at: ok");
 
   // Many calls started together, told apart by their subtasks.
   let names = ["a", "b", "c", "d", "e"];
@@ -377,7 +377,7 @@ fn main() {
     run(set, call);
     ok!(call);
   }
-  println!("batched calls: ok");
+  say!(out, "batched calls: ok");
 
   // List a directory with a buffer smaller than its contents, so the
   // listing takes several reads.
@@ -473,5 +473,5 @@ fn main() {
   let mut rmdir = RemoveDirectoryAt::new(&root, "ls");
   run(set, &mut rmdir);
   ok!(rmdir);
-  println!("read-directory: ok ({reads} reads for 4 entries)");
+  say!(out, "read-directory: ok ({reads} reads for 4 entries)");
 }

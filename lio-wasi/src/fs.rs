@@ -8,10 +8,10 @@
 //! at once or by [`Event::Returned`](crate::Event::Returned), take the
 //! result with its `result` method.
 //!
-//! Calls that do not wait are not here: use `wasip3` directly for
-//! `read_via_stream`, `write_via_stream`, `append_via_stream`,
-//! `read_directory` and `filesystem::preopens`, and drop a [`Descriptor`] to
-//! close it. A directory is listed through the stream `read_directory`
+//! Calls that do not wait are not operations: [`preopens`] is a plain
+//! function, `read_via_stream`, `write_via_stream`, `append_via_stream` and
+//! `read_directory` are methods of [`Descriptor`], and dropping a
+//! [`Descriptor`] closes it. A directory is listed through the stream `read_directory`
 //! returns: see [`DirEntryBuf`].
 //!
 //! The layouts are written by hand to match what `wit-bindgen` generates for
@@ -20,7 +20,7 @@
 
 use core::marker::PhantomData;
 
-use wasip3::clocks::system_clock::Instant;
+pub use wasip3::clocks::system_clock::Instant;
 pub use wasip3::filesystem::types::{
   Advice, Descriptor, DescriptorFlags, DescriptorStat, DescriptorType,
   DirectoryEntry, ErrorCode, NewTimestamp, OpenFlags, PathFlags,
@@ -152,6 +152,12 @@ impl LiftOk for DescriptorType {
       other => unreachable!("unknown descriptor-type case {other}"),
     }
   }
+}
+
+/// The directories the host opened for this component, each with the path
+/// it stands for. This does not wait.
+pub fn preopens() -> Vec<(Descriptor, String)> {
+  wasip3::filesystem::preopens::get_directories()
 }
 
 /// A descriptor argument: its handle, as the ABI passes it.

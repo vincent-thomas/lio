@@ -13,6 +13,10 @@ use lio_wasi::{
   Error, Event, ReadStream, Started, StreamResult, WaitableSet, WriteStream,
 };
 
+mod common;
+
+use common::Out;
+
 /// Waits until nothing is in flight. Returns how the read on `reader` and
 /// the write on `writer` ended, for each that an event reported.
 fn settle(
@@ -43,8 +47,8 @@ fn ended(started: Started, event: Option<StreamResult>) -> StreamResult {
 }
 
 /// A read blocks until the write arrives; both then end.
-fn blocked_read_meets_write() -> Result<(), Error> {
-  let (writer, reader) = wasip3::wit_stream::new::<u8>();
+fn blocked_read_meets_write(out: &mut Out) -> Result<(), Error> {
+  let (writer, reader) = lio_wasi::stream();
   let mut set = WaitableSet::new();
   let reader = set.add_reader(reader);
   let writer = set.add_writer(writer);
@@ -63,14 +67,14 @@ fn blocked_read_meets_write() -> Result<(), Error> {
   assert_eq!(ended(write, write_event), StreamResult::Completed(5));
   assert_eq!(&buf[..5], b"hello");
   assert_eq!(set.in_flight(), 0);
-  println!("blocked read meets write: ok");
+  say!(out, "blocked read meets write: ok");
   Ok(())
 }
 
 /// Cancelling a blocked read answers `Cancelled(0)` with no event, and the
 /// stream is usable afterwards.
-fn cancel_blocked_read() -> Result<(), Error> {
-  let (writer, reader) = wasip3::wit_stream::new::<u8>();
+fn cancel_blocked_read(out: &mut Out) -> Result<(), Error> {
+  let (writer, reader) = lio_wasi::stream();
   let mut set = WaitableSet::new();
   let reader = set.add_reader(reader);
   let writer = set.add_writer(writer);
@@ -99,14 +103,14 @@ fn cancel_blocked_read() -> Result<(), Error> {
     ended(read, read_event).count() + ended(write, write_event).count();
   assert_eq!(total, 10);
   assert_eq!(&buf[..5], b"again");
-  println!("cancel blocked read: ok");
+  say!(out, "cancel blocked read: ok");
   Ok(())
 }
 
 /// Closing the writer ends the reader's stream, and later reads are answered
 /// without reaching the host.
-fn close_writer_ends_reader() -> Result<(), Error> {
-  let (writer, reader) = wasip3::wit_stream::new::<u8>();
+fn close_writer_ends_reader(out: &mut Out) -> Result<(), Error> {
+  let (writer, reader) = lio_wasi::stream();
   let mut set = WaitableSet::new();
   let reader = set.add_reader(reader);
   let writer = set.add_writer(writer);
@@ -124,14 +128,14 @@ fn close_writer_ends_reader() -> Result<(), Error> {
   // SAFETY: as above; this read ends as it starts.
   let read = unsafe { set.read(reader, buf.as_mut_ptr(), buf.len())? };
   assert_eq!(read, Started::Done(StreamResult::Dropped(0)));
-  println!("close writer ends reader: ok");
+  say!(out, "close writer ends reader: ok");
   Ok(())
 }
 
 /// Closing a stream end with an operation in flight cancels it and says how
 /// it ended.
-fn close_cancels_what_is_in_flight() -> Result<(), Error> {
-  let (_writer, reader) = wasip3::wit_stream::new::<u8>();
+fn close_cancels_what_is_in_flight(out: &mut Out) -> Result<(), Error> {
+  let (_writer, reader) = lio_wasi::stream();
   let mut set = WaitableSet::new();
   let reader = set.add_reader(reader);
 
@@ -142,15 +146,15 @@ fn close_cancels_what_is_in_flight() -> Result<(), Error> {
   assert_eq!(set.close_reader(reader)?, Some(StreamResult::Cancelled(0)));
   assert_eq!(set.in_flight(), 0);
   assert_eq!(set.close_reader(reader), Err(Error::UnknownStream));
-  println!("close cancels what is in flight: ok");
+  say!(out, "close cancels what is in flight: ok");
   Ok(())
 }
 
 /// Dropping the set with operations in flight cancels them and traps
 /// nothing.
-fn drop_with_operations_in_flight() -> Result<(), Error> {
-  let (writer, reader) = wasip3::wit_stream::new::<u8>();
-  let (idle_writer, idle_reader) = wasip3::wit_stream::new::<u8>();
+fn drop_with_operations_in_flight(out: &mut Out) -> Result<(), Error> {
+  let (writer, reader) = lio_wasi::stream();
+  let (idle_writer, idle_reader) = lio_wasi::stream();
   let mut set = WaitableSet::new();
   let reader = set.add_reader(reader);
   set.add_writer(writer);
@@ -166,15 +170,15 @@ fn drop_with_operations_in_flight() -> Result<(), Error> {
   }
   assert_eq!(set.in_flight(), 2);
   drop(set);
-  println!("drop with operations in flight: ok");
+  say!(out, "drop with operations in flight: ok");
   Ok(())
 }
 
 /// Copies standard input to standard output through host streams.
 fn copy_stdin_to_stdout() -> Result<(), Error> {
-  let (stdin, _stdin_result) = wasip3::cli::stdin::read_via_stream();
-  let (out, out_reader) = wasip3::wit_stream::new::<u8>();
-  let _stdout_result = wasip3::cli::stdout::write_via_stream(out_reader);
+  let (stdin, _stdin_result) = lio_wasi::cli::stdin();
+  let (out, out_reader) = lio_wasi::stream();
+  let _stdout_result = lio_wasi::cli::stdout(out_reader);
   let mut set = WaitableSet::new();
   let stdin = set.add_reader(stdin);
   let out = set.add_writer(out);
@@ -201,15 +205,17 @@ fn copy_stdin_to_stdout() -> Result<(), Error> {
     }
   }
   set.close_writer(out)?;
-  eprintln!("copied {copied} bytes");
+  let mut err = Out::stderr();
+  say!(err, "copied {copied} bytes");
   Ok(())
 }
 
 fn main() -> Result<(), Error> {
-  blocked_read_meets_write()?;
-  cancel_blocked_read()?;
-  close_writer_ends_reader()?;
-  close_cancels_what_is_in_flight()?;
-  drop_with_operations_in_flight()?;
+  let mut out = Out::stdout();
+  blocked_read_meets_write(&mut out)?;
+  cancel_blocked_read(&mut out)?;
+  close_writer_ends_reader(&mut out)?;
+  close_cancels_what_is_in_flight(&mut out)?;
+  drop_with_operations_in_flight(&mut out)?;
   copy_stdin_to_stdout()
 }

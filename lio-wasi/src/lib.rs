@@ -68,16 +68,19 @@
 
 use std::fmt;
 
-use wasip3::wit_bindgen::{StreamReader, StreamWriter};
+/// The ends of a component-model stream, as [`stream`] and WASI hand them
+/// out. A [`WaitableSet`] takes them over.
+pub use wasip3::wit_bindgen::{StreamReader, StreamWriter};
 use wasip3::wit_stream::StreamPayload;
 
 use fs::{DirEntryBuf, DirStream, DirectoryEntry};
 use sockets::{Accepted, Listener, TcpSocket};
 
 /// The `wasip3` bindings this crate is built on. Use them for the WASI
-/// functions that do not wait and so have no operation here.
+/// functions that do not wait and that this crate does not pass on.
 pub use wasip3;
 
+pub mod cli;
 pub mod clock;
 pub mod fs;
 mod reply;
@@ -85,6 +88,15 @@ pub mod sockets;
 mod sys;
 
 use sys::{RawEvent, RawSet};
+
+/// Creates a byte stream inside this component and returns its two ends.
+///
+/// WASI takes data as the readable end of a stream: hand that end to
+/// [`cli::stdout`], `Descriptor::write_via_stream` or `TcpSocket::send`,
+/// give the writable end to [`WaitableSet::add_writer`], and write.
+pub fn stream() -> (StreamWriter<u8>, StreamReader<u8>) {
+  wasip3::wit_stream::new::<u8>()
+}
 
 /// A WASI function call that [`WaitableSet::start`] can make.
 ///
