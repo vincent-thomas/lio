@@ -28,6 +28,7 @@ use crate::api::resource::Resource;
 use crate::api::{Io, IoStream};
 use crate::backend::op::Op;
 use crate::backend::testing::{Checked, ScriptedBackend};
+use crate::driver::Kernel;
 use crate::model::{Cx, Next, OpModel, OpStream, Ticket};
 
 /// A stream ends after this many items, or at its first error.
@@ -136,7 +137,7 @@ struct OpState {
 
 struct Harness {
   kinds: Vec<Kind>,
-  backend: ScriptedBackend,
+  backend: Kernel,
   lio: Option<Lio>,
   ops: Vec<OpState>,
   drops: Arc<Mutex<Vec<u32>>>,
@@ -152,7 +153,7 @@ impl Harness {
     crate::time::pause(&lio);
     Self {
       kinds: kinds.to_vec(),
-      backend,
+      backend: Kernel::new(backend, &lio),
       lio: Some(lio),
       ops: kinds.iter().map(|_| OpState::default()).collect(),
       drops: Arc::default(),

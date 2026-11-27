@@ -64,7 +64,7 @@ use crate::backend::op::{
   UnlinkKind, WriteFlags, is_supported_socket, is_valid_file_offset,
   socket_addr_from_buf, socket_addr_into_buf,
 };
-use crate::backend::{InFlight, IoBackend, OpCompleted, Ticket};
+use crate::backend::{Done, IoBackend, OpKey, Queued};
 
 #[cfg(test)]
 mod tests;
@@ -945,9 +945,9 @@ struct Lane {
 struct Pending {
   /// Owns the paths the calls point into and keeps the resources open.
   op: Op,
-  /// The right to report the operation, which keeps its buffers allocated
-  /// until then.
-  ticket: Ticket,
+  /// What the operation is reported by. Its buffers stay allocated until
+  /// then.
+  key: OpKey,
   /// The lane this operation holds until it is reported.
   lane: Option<LaneKey>,
   stage: Stage,
@@ -1280,13 +1280,14 @@ pub struct Wasi {
   /// Tells this backend's sockets from another's on the same thread.
   id: u64,
   steps: Steps,
-  /// Pushed but not yet flushed.
-  queued: Vec<InFlight>,
   /// Boxed so that an operation's storage does not move while the host
   /// writes into it.
   ops: HashMap<u64, Box<Pending>>,
-  /// Results waiting for the next `wait`.
-  ready: Vec<OpCompleted>,
+  /// Results on their way to the table: `report` hands them over before
+  /// the call that produced them returns. Each was pushed by `finish`, or
+  /// for an operation that never started, so nothing uses its operation's
+  /// addresses any more.
+  ready: Vec<(OpKey, isize)>,
   lanes: HashMap<LaneKey, Lane>,
   /// Standard input, output and error, by resource id, opened on first
   /// use.
@@ -1305,7 +1306,6 @@ impl Wasi {
     Self {
       id,
       steps: Steps::new(),
-      queued: Vec::new(),
       ops: HashMap::new(),
       ready: Vec::new(),
       lanes: HashMap::new(),
@@ -1381,7 +1381,7 @@ impl Wasi {
 
   /// Starts an operation. It finishes at once, joins `ops`, or waits there
   /// for its lane.
-  fn start(&mut self, id: u64, mut pending: Box<Pending>) {
+  fn admit(&mut self, id: u64, mut pending: Box<Pending>) {
     if let Some(key) = Self::lane_of(&pending.op) {
       let lane = self.lanes.entry(key).or_default();
       if lane.busy {
@@ -1400,21 +1400,32 @@ impl Wasi {
     }
   }
 
-  /// Reports an operation, frees what it held, and lets the next one onto
+  /// Hands the table every result that is ready.
+  fn report(&mut self, done: &mut Done<'_>) {
+    for (key, result) in self.ready.drain(..) {
+      // SAFETY: what is in `ready` is finished with (see the field): the
+      // host no longer uses the operation's memory, and the result is the
+      // host's. Only an operation that was stopped has `CANCELLED`, which
+      // is negative.
+      unsafe {
+        if result == CANCELLED {
+          done.cancelled(key, result)
+        } else {
+          done.complete(key, result)
+        }
+      }
+    }
+  }
+
+  /// Finishes an operation, frees what it held, and lets the next one onto
   /// its lane.
   fn finish(&mut self, pending: Box<Pending>, result: isize) {
-    let Pending { op, ticket, lane, stage } = *pending;
-    // SAFETY: the host has finished every step of the operation, or
-    // confirmed that it stopped the one in flight, so it no longer uses the
-    // operation's memory. The result is the host's. Only a step the host
-    // stopped reports `CANCELLED`.
-    self.ready.push(unsafe {
-      if result == CANCELLED {
-        ticket.cancelled(result)
-      } else {
-        ticket.complete(result)
-      }
-    });
+    let Pending { op, key, lane, stage } = *pending;
+    // The host has finished every step of the operation, or confirmed that
+    // it stopped the one in flight, so it no longer uses the operation's
+    // memory. The result is the host's. Only a step the host stopped
+    // reports `CANCELLED`.
+    self.ready.push((key, result));
     drop((op, stage));
     self.close_deferred();
     let Some(key) = lane else {
@@ -1431,7 +1442,7 @@ impl Wasi {
     let Some(waiting) = self.ops.remove(&next) else {
       unreachable!("a waiting operation is in `ops`")
     };
-    self.start(next, waiting);
+    self.admit(next, waiting);
   }
 
   /// Starts `pending`. `Err` carries the result of an operation that is
@@ -2449,20 +2460,14 @@ impl Wasi {
 }
 
 impl Wasi {
-  /// Stops everything the host holds and gives every operation up
-  /// unreported, for a backend that is going away.
+  /// Stops everything the host holds, for a backend that is going away.
+  /// Nothing is reported: nobody is left to report to.
   fn stop(&mut self) {
-    // Never started: the host never saw their addresses.
-    self.queued.clear();
     // Operations waiting for a lane never started. Dropping them first
     // keeps a finishing operation from starting one.
     for lane in self.lanes.values_mut() {
       for id in lane.waiting.drain(..) {
-        if let Some(pending) = self.ops.remove(&id) {
-          // SAFETY: the operation was waiting for its lane and never
-          // started, so the host never saw its addresses.
-          drop(unsafe { pending.ticket.cancelled(CANCELLED) });
-        }
+        self.ops.remove(&id);
       }
     }
     // A cancel only finds a step that is still in flight. If the step had
@@ -2480,11 +2485,7 @@ impl Wasi {
         break;
       }
     }
-    for (_, pending) in self.ops.drain() {
-      // SAFETY: the loop above ended with no step outstanding, so the host
-      // holds no step of any operation.
-      drop(unsafe { pending.ticket.cancelled(CANCELLED) });
-    }
+    self.ops.clear();
     self.ready.clear();
     self.close_deferred();
   }
@@ -2602,7 +2603,6 @@ fn open_flags(
 
 impl IoBackend for Wasi {
   fn init(&mut self, cap: usize) -> io::Result<()> {
-    self.queued.reserve(cap);
     self.ops.reserve(cap);
     self.ready.reserve(cap);
     Ok(())
@@ -2612,28 +2612,25 @@ impl IoBackend for Wasi {
     ResourceClose::with(close_resource)
   }
 
-  fn push(&mut self, op: InFlight, _step_bump: &mut Bump) {
-    self.queued.push(op);
-  }
-
-  fn flush(&mut self) -> io::Result<()> {
+  fn start(
+    &mut self,
+    queued: Queued<'_>,
+    _step_bump: &mut Bump,
+    done: &mut Done<'_>,
+  ) -> crate::backend::Started {
     self.close_deferred();
-    for queued in std::mem::take(&mut self.queued) {
-      let (op, ticket) = queued.start();
-      let id = ticket.id();
-      let pending =
-        Box::new(Pending { op, ticket, lane: None, stage: Stage::Queued });
-      self.start(id, pending);
-    }
-    Ok(())
+    let (started, key, op) = queued.begin();
+    // Kept until the host has finished every step.
+    let op = std::mem::replace(op, Op::Nop);
+    let pending =
+      Box::new(Pending { op, key, lane: None, stage: Stage::Queued });
+    self.admit(key.as_u64(), pending);
+    self.report(done);
+    started
   }
 
-  fn cancel(&mut self, id: u64) {
-    if let Some(at) = self.queued.iter().position(|queued| queued.id() == id) {
-      let queued = self.queued.swap_remove(at);
-      self.ready.push(queued.cancelled(CANCELLED));
-      return;
-    }
+  fn cancel(&mut self, key: OpKey, done: &mut Done<'_>) {
+    let id = key.as_u64();
     let waiting = match self.ops.get(&id).map(|pending| &pending.stage) {
       Some(Stage::Queued) => true,
       Some(_) => false,
@@ -2646,10 +2643,11 @@ impl IoBackend for Wasi {
       let Some(pending) = self.ops.remove(&id) else {
         unreachable!("the operation was just found in `ops`")
       };
-      // SAFETY: the operation was waiting for its lane and never started,
-      // so the host never saw its addresses.
-      self.ready.push(unsafe { pending.ticket.cancelled(CANCELLED) });
+      // The operation was waiting for its lane and never started, so the
+      // host never saw its addresses.
+      self.ready.push((pending.key, CANCELLED));
       self.close_deferred();
+      self.report(done);
       return;
     }
     // The cancelled step's end is handled by the next `wait`. If no step
@@ -2661,11 +2659,15 @@ impl IoBackend for Wasi {
   fn wait(
     &mut self,
     timeout: Option<Duration>,
-    completed: &mut Vec<OpCompleted>,
+    done: &mut Done<'_>,
   ) -> io::Result<()> {
-    completed.clear();
     self.close_deferred();
     self.pump();
+    // A report the driver has not collected is as good as a result here.
+    if done.waiting() > 0 {
+      self.report(done);
+      return Ok(());
+    }
     if self.ready.is_empty() {
       match timeout {
         Some(Duration::ZERO) => {}
@@ -2696,7 +2698,7 @@ impl IoBackend for Wasi {
         }
       }
     }
-    completed.append(&mut self.ready);
+    self.report(done);
     Ok(())
   }
 }

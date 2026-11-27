@@ -19,18 +19,18 @@ use lio_uring::{
 };
 
 use crate::backend::{
-  IoBackend, OpCompleted,
+  Done, IoBackend, OpKey, PerOp, Queued, Started,
   impls::{
     iovec::fill_iovecs,
     unix_stat::{file_type_from_dirent_dtype, file_type_from_mode},
   },
   op::{DirEntryRef, LinkKind, Op, ReadDirResult, is_valid_file_offset},
 };
-use crate::slab::{Slab, SlabKey};
 
 const STATX_BASIC_STATS: u32 = 0x0000_07ff;
 /// `user_data` of cancellation requests. Their completions are not
-/// operations, and no slab key decodes to it.
+/// operations, and no operation's key is this value: its slot would be
+/// `u32::MAX - 1`.
 const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 /// How long dropping the backend waits for cancelled operations to finish.
 /// Requests parked on readiness (accept, socket reads) are cancelled at
@@ -44,48 +44,12 @@ mod deferred_tests;
 #[cfg(test)]
 mod single_socket_tests;
 
-/// An operation `flush` has not looked at yet.
-///
-/// `lowered` is built from the operation's addresses, and nothing has used
-/// them: the operation is still whole, and is given up without `unsafe`.
-#[derive(Debug)]
-struct QueuedOp {
-  op: crate::backend::InFlight,
-  lowered: LoweredState,
-}
-
-impl QueuedOp {
-  /// Starts the operation: `flush` is about to perform or submit it.
-  fn start(self) -> PendingOp {
-    let (op, ticket) = self.op.start();
-    PendingOp {
-      registration_id: ticket.id(),
-      op,
-      ticket,
-      lowered: self.lowered,
-    }
-  }
-}
-
+/// One request the ring has: what the kernel's completion is matched to.
 #[derive(Debug)]
 struct PendingOp {
-  registration_id: u64,
-  op: Op,
-  /// Given up when the kernel reports the request, or when it turns out
-  /// never to reach the kernel.
-  ticket: crate::backend::Ticket,
+  /// Holds the operation's resources until the kernel reports the request.
+  _op: Op,
   lowered: LoweredState,
-}
-
-impl PendingOp {
-  /// Reports an operation that never reached the ring: it was performed on
-  /// this thread, or not at all. `result` is that syscall's, or an error.
-  fn finish_here(self, result: isize) -> OpCompleted {
-    // SAFETY: the kernel never saw this request, so nothing but this thread
-    // has its addresses, and this thread is done with them. The result is
-    // the immediate syscall's own, or an error, which claims nothing.
-    unsafe { self.ticket.complete(result) }
-  }
 }
 
 #[derive(Debug)]
@@ -476,53 +440,27 @@ impl LoweredState {
   }
 }
 
+#[derive(Default)]
 pub struct IoUring {
   ring: Option<LioUring>,
-  capacity: usize,
-  in_flight: usize,
   needs_submit: bool,
   single_socket: bool,
   deferred_completions: bool,
-  backlog: Vec<QueuedOp>,
-  pending: Slab<PendingOp>,
-  queued_completed: Vec<OpCompleted>,
+  /// The requests the ring has, by the key that is their `user_data`.
+  pending: PerOp<PendingOp>,
   profile: Option<IoUringProfile>,
-}
-
-impl Default for IoUring {
-  fn default() -> Self {
-    Self {
-      ring: None,
-      capacity: 0,
-      in_flight: 0,
-      needs_submit: false,
-      single_socket: false,
-      deferred_completions: false,
-      backlog: Vec::new(),
-      pending: Slab::new(0),
-      queued_completed: Vec::new(),
-      profile: None,
-    }
-  }
 }
 
 #[derive(Debug, Default)]
 struct IoUringProfile {
-  flush_calls: usize,
-  empty_flush_calls: usize,
-  backlog_entries: usize,
-  validated_ops: usize,
+  started_ops: usize,
+  refused_ops: usize,
   nop_ops: usize,
   immediate_ops: usize,
-  lowered_ops: usize,
-  backlog_stage_time: Duration,
-  validate_time: Duration,
-  immediate_time: Duration,
+  submitted_ops: usize,
   lower_time: Duration,
-  prepare_time: Duration,
+  immediate_time: Duration,
   push_time: Duration,
-  pending_insert_time: Duration,
-  final_submit_time: Duration,
 }
 
 impl Drop for IoUring {
@@ -532,22 +470,15 @@ impl Drop for IoUring {
       return;
     };
     eprintln!(
-      "io_uring-profile flush_calls={} empty_flush_calls={} backlog_entries={} validated_ops={} nop_ops={} immediate_ops={} lowered_ops={} backlog_stage_ms={:.3} validate_ms={:.3} immediate_ms={:.3} lower_ms={:.3} prepare_ms={:.3} push_ms={:.3} pending_insert_ms={:.3} final_submit_ms={:.3}",
-      profile.flush_calls,
-      profile.empty_flush_calls,
-      profile.backlog_entries,
-      profile.validated_ops,
+      "io_uring-profile started_ops={} refused_ops={} nop_ops={} immediate_ops={} submitted_ops={} lower_ms={:.3} immediate_ms={:.3} push_ms={:.3}",
+      profile.started_ops,
+      profile.refused_ops,
       profile.nop_ops,
       profile.immediate_ops,
-      profile.lowered_ops,
-      profile.backlog_stage_time.as_secs_f64() * 1000.0,
-      profile.validate_time.as_secs_f64() * 1000.0,
-      profile.immediate_time.as_secs_f64() * 1000.0,
+      profile.submitted_ops,
       profile.lower_time.as_secs_f64() * 1000.0,
-      profile.prepare_time.as_secs_f64() * 1000.0,
+      profile.immediate_time.as_secs_f64() * 1000.0,
       profile.push_time.as_secs_f64() * 1000.0,
-      profile.pending_insert_time.as_secs_f64() * 1000.0,
-      profile.final_submit_time.as_secs_f64() * 1000.0,
     );
   }
 }
@@ -617,10 +548,10 @@ impl IoUring {
   /// The driver has done this already, through `cancel` and `wait`, before
   /// it drops a backend. This is for a backend dropped on its own.
   fn drain_in_flight(&mut self) {
-    if self.ring.is_none() || self.in_flight == 0 {
+    if self.ring.is_none() || self.pending.is_empty() {
       return;
     }
-    let keys: Vec<SlabKey> = self.pending.keys_where(|_| true).collect();
+    let keys: Vec<OpKey> = self.pending.keys().collect();
     for key in keys {
       let ring = self.ring();
       if ring.sq_space_left() == 0 && ring.submit().is_err() {
@@ -634,8 +565,7 @@ impl IoUring {
     }
 
     let deadline = Instant::now() + DRAIN_GRACE;
-    let mut discarded = Vec::new();
-    while self.in_flight > 0 {
+    while !self.pending.is_empty() {
       let remaining = deadline.saturating_duration_since(Instant::now());
       if remaining.is_zero() || self.ring().submit().is_err() {
         break;
@@ -643,52 +573,59 @@ impl IoUring {
       match self.ring().wait_timeout(remaining.min(Duration::from_millis(100)))
       {
         Ok(Some(completion)) => {
-          self.reap(completion.user_data(), completion.result(), &mut discarded)
+          self.reap(completion.user_data(), completion.result(), None)
         }
         Ok(None) => continue,
         Err(_) => break,
       }
       while let Ok(Some(completion)) = self.ring().try_wait() {
-        self.reap(completion.user_data(), completion.result(), &mut discarded);
+        self.reap(completion.user_data(), completion.result(), None);
       }
-      discarded.clear();
     }
 
-    if self.in_flight > 0 {
+    if !self.pending.is_empty() {
       // Some request outlived the grace period. Keep the state it points
       // into alive rather than free it under the kernel.
-      mem::forget(mem::replace(&mut self.pending, Slab::new(0)));
+      mem::forget(mem::take(&mut self.pending));
     }
   }
 
+  /// Takes one completion of the ring. `done` is `None` when the backend is
+  /// being dropped: nobody is left to report to.
   #[inline]
-  fn reap(
-    &mut self,
-    user_data: u64,
-    result: i32,
-    completed: &mut Vec<OpCompleted>,
-  ) {
+  fn reap(&mut self, user_data: u64, result: i32, done: Option<&mut Done<'_>>) {
     if user_data == CANCEL_USER_DATA {
       // The cancelled operation reports through its own completion.
       return;
     }
-    self.in_flight = self.in_flight.saturating_sub(1);
-    if let Some(pending) =
-      self.pending.remove_value(SlabKey::from_u64(user_data))
-    {
-      pending.lowered.finalize(result);
-      let ticket = pending.ticket;
-      // SAFETY: this is the request's own completion, so the kernel is done
-      // with its memory, and the result is the kernel's. The kernel reports
-      // a request it stopped with `ECANCELED`, and nothing else that way.
-      completed.push(unsafe {
-        if result == -libc::ECANCELED {
-          ticket.cancelled(result as isize)
-        } else {
-          ticket.complete(result as isize)
-        }
-      });
+    let key = OpKey::from_u64(user_data);
+    let Some(pending) = self.pending.take(key) else {
+      return;
+    };
+    pending.lowered.finalize(result);
+    let Some(done) = done else {
+      return;
+    };
+    // SAFETY: this is the request's own completion, so the kernel is done
+    // with its memory, and the result is the kernel's. The kernel reports
+    // a request it stopped with `ECANCELED`, and nothing else that way.
+    unsafe {
+      if result == -libc::ECANCELED {
+        done.cancelled(key, result as isize)
+      } else {
+        done.complete(key, result as isize)
+      }
     }
+  }
+
+  /// Reports an operation that never reached the ring: it was performed on
+  /// this thread. `result` is that syscall's, or the error that kept the
+  /// request off the ring.
+  fn finish_here(done: &mut Done<'_>, key: OpKey, result: isize) {
+    // SAFETY: the kernel never saw this request, so nothing but this thread
+    // has its addresses, and this thread is done with them. The result is
+    // the immediate syscall's own, or an error, which claims nothing.
+    unsafe { done.complete(key, result) }
   }
 
   #[inline]
@@ -1143,24 +1080,6 @@ impl IoUring {
     }
   }
 
-  fn push_entry(
-    &mut self,
-    pending: &PendingOp,
-    id: u64,
-    sq_space_left: &mut usize,
-  ) -> io::Result<()> {
-    if *sq_space_left == 0 {
-      self.ring().submit()?;
-      *sq_space_left = self.ring().sq_space_left();
-    }
-    let io_uring_entry = pending.lowered.create_entry(&pending.op);
-    // SAFETY: `io_uring_entry` references buffers owned by `pending`, which
-    // stays in the slab until completion processing removes it.
-    unsafe { self.ring().push(io_uring_entry, id) }?;
-    *sq_space_left = sq_space_left.saturating_sub(1);
-    Ok(())
-  }
-
   fn execute_immediate(op: &Op) -> Option<io::Result<isize>> {
     match op {
       Op::ReadlinkAt { dir_fd, path, buf, buf_len } => {
@@ -1330,197 +1249,105 @@ impl IoBackend for IoUring {
     });
     self.single_socket =
       self.ring().supports_opcodes(&[Send::CODE, Recv::CODE]);
-    self.capacity = cap;
-    self.in_flight = 0;
     self.needs_submit = false;
-    self.backlog.clear();
-    self.backlog.reserve_exact(cap);
-    self.pending = Slab::new(cap);
-    self.queued_completed = Vec::with_capacity(cap);
+    self.pending = PerOp::new(cap);
     self.profile =
       std::env::var_os("LIO_PROFILE").map(|_| IoUringProfile::default());
     Ok(())
   }
 
-  fn push(&mut self, op: crate::backend::InFlight, step_bump: &mut Bump) {
-    assert!(
-      self.backlog.len() + self.in_flight < self.capacity,
-      "IoBackend capacity exceeded: attempted to queue more than {} operations",
-      self.capacity
-    );
-    let lowered =
-      match LoweredState::lower_in(op.as_op(), step_bump, self.single_socket) {
-        Ok(lowered) => lowered,
-        Err(err) => {
-          let result = -(err.raw_os_error().unwrap_or(libc::EIO) as isize);
-          self.queued_completed.push(op.failed(result));
-          return;
-        }
-      };
-    self.backlog.push(QueuedOp { op, lowered });
-  }
-
-  fn flush(&mut self) -> io::Result<()> {
-    let profiling_enabled = self.profile.is_some();
-    let mut backlog_stage_time = Duration::ZERO;
-    let mut validate_time = Duration::ZERO;
-    let mut immediate_time = Duration::ZERO;
-    let lower_time = Duration::ZERO;
-    let mut prepare_time = Duration::ZERO;
-    let mut push_time = Duration::ZERO;
-    let mut pending_insert_time = Duration::ZERO;
-    let final_submit_time = Duration::ZERO;
-    let mut validated_ops = 0usize;
-    let mut nop_ops = 0usize;
-    let mut immediate_ops = 0usize;
-    let mut lowered_ops = 0usize;
-    let backlog_stage_started =
-      if profiling_enabled { Some(Instant::now()) } else { None };
-    let processing_backlog = std::mem::take(&mut self.backlog);
-    if let Some(started) = backlog_stage_started {
-      backlog_stage_time += started.elapsed();
-    }
-
-    if processing_backlog.is_empty() {
-      if let Some(profile) = self.profile.as_mut() {
-        profile.flush_calls += 1;
-        profile.empty_flush_calls += 1;
-        profile.backlog_stage_time += backlog_stage_time;
-      }
-      return Ok(());
-    }
-
-    let mut submitted_any = false;
-    let backlog_entries = processing_backlog.len();
-    let mut sq_space_left = self.ring().sq_space_left();
-
-    for entry in processing_backlog {
-      let entry = entry.start();
-      let validate_started =
-        if profiling_enabled { Some(Instant::now()) } else { None };
-      if let Some(result) = Self::validate_op(&entry.op) {
-        if let Some(started) = validate_started {
-          validate_time += started.elapsed();
-        }
-        validated_ops += 1;
-        self.queued_completed.push(entry.finish_here(result));
-        continue;
-      }
-      if let Some(started) = validate_started {
-        validate_time += started.elapsed();
-      }
-
-      if matches!(&entry.op, Op::Nop) {
-        nop_ops += 1;
-        self.queued_completed.push(entry.finish_here(0));
-        continue;
-      }
-
-      let immediate_started =
-        if profiling_enabled { Some(Instant::now()) } else { None };
-      if let Some(result) = Self::execute_immediate(&entry.op) {
-        if let Some(started) = immediate_started {
-          immediate_time += started.elapsed();
-        }
-        immediate_ops += 1;
-        let result = match result {
-          Ok(value) => value,
-          Err(err) => -(err.raw_os_error().unwrap_or(libc::EIO) as isize),
-        };
-        self.queued_completed.push(entry.finish_here(result));
-        continue;
-      }
-      if let Some(started) = immediate_started {
-        immediate_time += started.elapsed();
-      }
-
-      let pending_insert_started =
-        if profiling_enabled { Some(Instant::now()) } else { None };
-      let Some((pending_key, pending)) = self.pending.insert_get_mut(entry)
-      else {
-        unreachable!("in-flight pending operations must fit backend capacity");
-      };
-      if let Some(started) = pending_insert_started {
-        pending_insert_time += started.elapsed();
-      }
-
-      let mut local_prepare_time = Duration::ZERO;
-      let pending_ptr = {
-        let prepare_started =
-          if profiling_enabled { Some(Instant::now()) } else { None };
-        pending.lowered.prepare();
-        if let Some(started) = prepare_started {
-          local_prepare_time += started.elapsed();
-        }
-        pending as *const PendingOp
-      };
-      prepare_time += local_prepare_time;
-
-      // SAFETY: `pending_ptr` points into a slab slot that remains stable
-      // until completion removes it from the slab.
-      let pending = unsafe { &*pending_ptr };
-      let push_started =
-        if profiling_enabled { Some(Instant::now()) } else { None };
-      if let Err(err) =
-        self.push_entry(pending, pending_key.as_u64(), &mut sq_space_left)
-      {
-        // The request never reached the ring. It is reported with the
-        // error, like one performed here, so that it neither stays stored
-        // with a ticket nobody gives up nor takes the rest of the batch
-        // down with it.
-        let Some(entry) = self.pending.remove_value(pending_key) else {
-          unreachable!("the operation was stored just above");
-        };
-        let errno = err.raw_os_error().unwrap_or(libc::EIO);
-        self.queued_completed.push(entry.finish_here(-(errno as isize)));
-        continue;
-      }
-      if let Some(started) = push_started {
-        push_time += started.elapsed();
-      }
-
-      self.in_flight += 1;
-      submitted_any = true;
-      lowered_ops += 1;
-    }
-
-    if submitted_any {
-      self.needs_submit = true;
-    }
+  fn start(
+    &mut self,
+    queued: Queued<'_>,
+    step_bump: &mut Bump,
+    done: &mut Done<'_>,
+  ) -> Started {
+    let profiling = self.profile.is_some();
     if let Some(profile) = self.profile.as_mut() {
-      profile.flush_calls += 1;
-      profile.backlog_entries += backlog_entries;
-      profile.validated_ops += validated_ops;
-      profile.nop_ops += nop_ops;
-      profile.immediate_ops += immediate_ops;
-      profile.lowered_ops += lowered_ops;
-      profile.backlog_stage_time += backlog_stage_time;
-      profile.validate_time += validate_time;
-      profile.immediate_time += immediate_time;
-      profile.lower_time += lower_time;
-      profile.prepare_time += prepare_time;
-      profile.push_time += push_time;
-      profile.pending_insert_time += pending_insert_time;
-      profile.final_submit_time += final_submit_time;
+      profile.started_ops += 1;
     }
-    Ok(())
+
+    let lower_started = profiling.then(Instant::now);
+    let lowered =
+      LoweredState::lower_in(queued.as_op(), step_bump, self.single_socket);
+    if let (Some(started), Some(profile)) = (lower_started, &mut self.profile) {
+      profile.lower_time += started.elapsed();
+    }
+    let refused = match &lowered {
+      Err(err) => Some(-(err.raw_os_error().unwrap_or(libc::EIO) as isize)),
+      Ok(_) => Self::validate_op(queued.as_op()),
+    };
+    let (Ok(lowered), None) = (lowered, refused) else {
+      if let Some(profile) = self.profile.as_mut() {
+        profile.refused_ops += 1;
+      }
+      return queued.refuse(refused.unwrap_or(-(libc::EIO as isize)));
+    };
+
+    let (started, key, op) = queued.begin();
+    if matches!(op, Op::Nop) {
+      if let Some(profile) = self.profile.as_mut() {
+        profile.nop_ops += 1;
+      }
+      Self::finish_here(done, key, 0);
+      return started;
+    }
+
+    let immediate_started = profiling.then(Instant::now);
+    let immediate = Self::execute_immediate(op);
+    if let (Some(started), Some(profile)) =
+      (immediate_started, &mut self.profile)
+    {
+      profile.immediate_time += started.elapsed();
+    }
+    if let Some(result) = immediate {
+      if let Some(profile) = self.profile.as_mut() {
+        profile.immediate_ops += 1;
+      }
+      let result = match result {
+        Ok(value) => value,
+        Err(err) => -(err.raw_os_error().unwrap_or(libc::EIO) as isize),
+      };
+      Self::finish_here(done, key, result);
+      return started;
+    }
+
+    let push_started = profiling.then(Instant::now);
+    lowered.prepare();
+    let ring = self.ring();
+    let pushed =
+      if ring.sq_space_left() == 0 { ring.submit().map(drop) } else { Ok(()) }
+        .and_then(|()| {
+          let entry = lowered.create_entry(op);
+          // SAFETY: the entry points into the operation's memory and into its
+          // step arena. Both stay in place until the key is reported, which
+          // happens when the kernel's completion for it is reaped.
+          unsafe { ring.push(entry, key.as_u64()) }
+        });
+    if let Err(err) = pushed {
+      // The request never reached the ring. It is reported with the error,
+      // like one performed here, so that it neither stays in flight with
+      // nobody to report it nor takes the rest of the batch down with it.
+      Self::finish_here(done, key, -(err.raw() as isize));
+      return started;
+    }
+    // Kept until the kernel reports the request.
+    let op = mem::replace(op, Op::Nop);
+    self.pending.insert(key, PendingOp { _op: op, lowered });
+    self.needs_submit = true;
+    if let Some(profile) = self.profile.as_mut() {
+      profile.submitted_ops += 1;
+      if let Some(started) = push_started {
+        profile.push_time += started.elapsed();
+      }
+    }
+    started
   }
 
-  fn cancel(&mut self, id: u64) {
-    if let Some(index) =
-      self.backlog.iter().position(|entry| entry.op.id() == id)
-    {
-      let entry = self.backlog.swap_remove(index);
-      self
-        .queued_completed
-        .push(entry.op.cancelled(-(libc::ECANCELED as isize)));
+  fn cancel(&mut self, key: OpKey, _done: &mut Done<'_>) {
+    if !self.pending.contains(key) {
       return;
     }
-    let Some(key) =
-      self.pending.keys_where(|entry| entry.registration_id == id).next()
-    else {
-      return;
-    };
     // The kernel may be using the op's buffers: it stays pending, and its
     // own completion (`-ECANCELED`, or its result if it won the race)
     // finishes it as usual.
@@ -1538,12 +1365,11 @@ impl IoBackend for IoUring {
   fn wait(
     &mut self,
     timeout: Option<Duration>,
-    completed: &mut Vec<OpCompleted>,
+    done: &mut Done<'_>,
   ) -> io::Result<()> {
-    completed.clear();
-
-    if !self.queued_completed.is_empty() {
-      completed.append(&mut self.queued_completed);
+    // What was performed at `start` is ready already: the ring is not
+    // looked at until the driver has taken that.
+    if done.waiting() > 0 {
       return Ok(());
     }
 
@@ -1574,9 +1400,13 @@ impl IoBackend for IoUring {
     };
 
     if let Some(completion) = first {
-      self.reap(completion.user_data(), completion.result(), completed);
+      self.reap(completion.user_data(), completion.result(), Some(&mut *done));
       while let Some(completion) = self.ring().try_wait()? {
-        self.reap(completion.user_data(), completion.result(), completed);
+        self.reap(
+          completion.user_data(),
+          completion.result(),
+          Some(&mut *done),
+        );
       }
     }
 

@@ -1,15 +1,17 @@
 //! What lio's bookkeeping costs, with no system calls.
 //!
-//! Every group except `timer` runs on [`BenchBackend`]. A flush completes
-//! queued nops and reads in memory. `cancel` keeps flushed operations in
-//! flight until the driver cancels them, then completes those in memory too.
+//! Every group except `timer` runs on [`BenchBackend`], which completes nops
+//! and reads in memory as the driver's flush starts them. `cancel` keeps
+//! started operations in flight until the driver cancels them, then
+//! completes those in memory too.
 //! `timer` drives [`Clock`](lio::time::Clock) directly. None of this enters
 //! the kernel. Kernel time is `cargo bench -p lio --bench backends`.
 //!
 //! Throughput is operations per second. `resubmit` counts yielded items.
 //!
 //! - `bookkeeping/no_driver` — push, flush, and wait `qd` nops on the backend
-//!   alone. The driver groups sit on top of this cost.
+//!   and its table ([`Tracked`]) alone. The driver groups sit on top of this
+//!   cost.
 //! - `bookkeeping/round_trip` — submit `qd` nops and deliver every completion
 //!   through `when_done`, in one `try_run`. The gap above `no_driver` is
 //!   registration, routing, the callback, and releasing the slot.
@@ -50,7 +52,7 @@ use criterion::{
 };
 use lio::api::resource::Resource;
 use lio::backend::op::{BorrowedOp, Op};
-use lio::backend::{IoBackend, OpCompleted, Ticket};
+use lio::backend::{Done, IoBackend, OpKey, PerOp, Queued, Started, Tracked};
 use lio::model::{Cx, Next, OpModel, OpStream};
 use lio::time::Clock;
 use lio::{Lio, api};
@@ -64,27 +66,20 @@ const BUFFER_LEN: usize = 256;
 /// A negative completion is an error to the op model. Not an errno.
 const CANCEL_RESULT: isize = -1;
 
-const SLOT_EMPTY: u8 = 0;
-const SLOT_QUEUED: u8 = 1;
-const SLOT_IN_FLIGHT: u8 = 2;
-
 /// In-memory backend for nops and fixed-size reads.
 ///
-/// `flush` completes everything queued, unless constructed with
-/// [`BenchBackend::holding`]: flushed ops then stay in flight until `cancel`.
-/// `wait` never blocks. Cancel of an in-flight op is indexed by slab slot, so
-/// a batch cancel is not a scan.
+/// `start` completes the operation, unless constructed with
+/// [`BenchBackend::holding`]: started ops then stay in flight until
+/// `cancel`. `wait` never blocks. An op in flight is found by its key, so a
+/// batch cancel is not a scan.
 #[derive(Default)]
 struct BenchBackend {
-  queued: Vec<(Ticket, isize)>,
-  ready: Vec<(Ticket, isize)>,
   hold: bool,
-  slots: Vec<u8>,
-  slot_ticket: Vec<Option<Ticket>>,
+  held: PerOp<()>,
 }
 
 impl BenchBackend {
-  /// Flushed ops stay in flight until `cancel` completes them.
+  /// Started ops stay in flight until `cancel` completes them.
   fn holding() -> Self {
     Self { hold: true, ..Self::default() }
   }
@@ -92,91 +87,47 @@ impl BenchBackend {
 
 impl IoBackend for BenchBackend {
   fn init(&mut self, cap: usize) -> io::Result<()> {
-    self.queued.reserve(cap);
-    self.ready.reserve(cap);
     if self.hold {
-      self.slots.resize(cap, SLOT_EMPTY);
-      self.slot_ticket.resize_with(cap, || None);
+      self.held = PerOp::new(cap);
     }
     Ok(())
   }
 
-  fn push(&mut self, op: lio::backend::InFlight, _step_bump: &mut Bump) {
+  fn start(
+    &mut self,
+    op: Queued<'_>,
+    _step_bump: &mut Bump,
+    done: &mut Done<'_>,
+  ) -> Started {
     let result = match op.as_op() {
       Op::Nop => 0,
       Op::Read { .. } => BUFFER_LEN as isize,
       _ => panic!("bench backend only supports nop and read"),
     };
-    let (_, ticket) = op.start();
-    let id = ticket.id();
+    let (started, key, _) = op.begin();
     if self.hold {
-      let slot = id as u32 as usize;
-      assert!(
-        slot < self.slots.len(),
-        "bench backend slot {slot} is past its capacity"
-      );
-      assert_eq!(
-        self.slots[slot], SLOT_EMPTY,
-        "bench backend slot {slot} is still in use"
-      );
-      self.slots[slot] = SLOT_QUEUED;
-      self.slot_ticket[slot] = Some(ticket);
+      self.held.insert(key, ());
     } else {
-      self.queued.push((ticket, result));
+      // SAFETY: this backend never copies an address. Every buffer the
+      // benches submit is initialized for the length a read reports.
+      unsafe { done.complete(key, result) };
     }
+    started
   }
 
-  fn flush(&mut self) -> io::Result<()> {
-    if self.hold {
-      for state in &mut self.slots {
-        if *state == SLOT_QUEUED {
-          *state = SLOT_IN_FLIGHT;
-        }
-      }
-    } else {
-      self.ready.append(&mut self.queued);
-    }
-    Ok(())
-  }
-
-  fn cancel(&mut self, id: u64) {
-    if self.hold {
-      let slot = id as u32 as usize;
-      if slot < self.slots.len()
-        && (self.slots[slot] == SLOT_QUEUED
-          || self.slots[slot] == SLOT_IN_FLIGHT)
-        && self.slot_ticket[slot].as_ref().is_some_and(|held| held.id() == id)
-        && let Some(ticket) = self.slot_ticket[slot].take()
-      {
-        self.slots[slot] = SLOT_EMPTY;
-        self.ready.push((ticket, CANCEL_RESULT));
-      }
-      return;
-    }
-    if let Some(index) =
-      self.queued.iter().position(|(queued, _)| queued.id() == id)
-    {
-      let (ticket, _) = self.queued.swap_remove(index);
-      self.ready.push((ticket, CANCEL_RESULT));
+  fn cancel(&mut self, key: OpKey, done: &mut Done<'_>) {
+    if self.held.take(key).is_some() {
+      // SAFETY: this backend never copies an address, and the result is
+      // negative.
+      unsafe { done.cancelled(key, CANCEL_RESULT) };
     }
   }
 
   fn wait(
     &mut self,
     _timeout: Option<Duration>,
-    completed: &mut Vec<OpCompleted>,
+    _done: &mut Done<'_>,
   ) -> io::Result<()> {
-    completed.clear();
-    // SAFETY: this backend never copies an address. Every buffer the
-    // benches submit is initialized for the length a read reports, and the
-    // only negative result is the one for a cancelled operation.
-    completed.extend(self.ready.drain(..).map(|(ticket, result)| unsafe {
-      if result < 0 {
-        ticket.cancelled(result)
-      } else {
-        ticket.complete(result)
-      }
-    }));
     Ok(())
   }
 
@@ -188,9 +139,8 @@ impl IoBackend for BenchBackend {
 fn no_driver(criterion: &mut Criterion) {
   let mut group = criterion.benchmark_group("bookkeeping/no_driver");
   for depth in QUEUE_DEPTHS {
-    let mut backend = BenchBackend::default();
+    let mut backend = Tracked::new(BenchBackend::default());
     backend.init(depth).unwrap();
-    let mut bump = Bump::new();
     let mut completed = Vec::with_capacity(depth);
 
     group.throughput(Throughput::Elements(depth as u64));
@@ -201,12 +151,9 @@ fn no_driver(criterion: &mut Criterion) {
         bencher.iter(|| {
           for id in 0..depth as u64 {
             // SAFETY: a no-op borrows nothing.
-            backend.push(
-              unsafe { lio::backend::InFlight::attest(id, BorrowedOp::nop()) },
-              &mut bump,
-            );
+            unsafe { backend.push(id, BorrowedOp::nop()) };
           }
-          backend.flush().unwrap();
+          backend.flush();
           backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
           assert_eq!(completed.len(), depth);
           black_box(&completed);

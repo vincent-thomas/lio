@@ -1,7 +1,7 @@
 use crate::{
   api::op::{Action, Completion},
   backend::{
-    IoBackend, OpCompleted,
+    IoBackend, OpCompleted, Tracked,
     store::{Detached, OpStore},
   },
   model::{Cx, Drive},
@@ -101,10 +101,11 @@ pub(crate) fn get_global() -> Option<Lio> {
 }
 
 struct LioInner {
-  // Dropped by hand in `Drop`: the backend must have reported what was in
-  // flight before `store` frees the memory that work points into, and both
-  // are leaked when it has not.
-  io: ManuallyDrop<Box<dyn IoBackend>>,
+  // The backend, and the table of what it was given, which holds the step
+  // arenas. Dropped by hand in `Drop`: the backend must have reported what
+  // was in flight before `store` frees the memory that work points into,
+  // and both are leaked when it has not.
+  io: ManuallyDrop<Tracked<Box<dyn IoBackend>>>,
   store: ManuallyDrop<OpStore>,
   /// The backend's close for resources its completions carry.
   resource_close: crate::api::resource::ResourceClose,
@@ -347,9 +348,7 @@ impl LioInner {
       for &id in &held {
         self.io.cancel(id);
       }
-      if self.io.flush().is_err() {
-        return;
-      }
+      self.io.flush();
       let now = Instant::now();
       let remaining = deadline
         .get_or_insert(now + SHUTDOWN_GRACE)
@@ -382,12 +381,16 @@ impl Drop for LioInner {
     self.ready_io.clear();
     // A lease still held belongs to an operation the backend has not
     // reported: it may still be running in the kernel or on a backend
-    // thread, writing into buffers and lowered state owned by the store.
-    // Leaking both keeps that memory valid, and keeps the backend from
-    // waiting again in its own `Drop`.
+    // thread, writing into buffers owned by the store and lowered state in
+    // the table's arenas. Leaking both keeps that memory valid, and keeps
+    // the backend from waiting again in its own `Drop`.
     if !self.store.any_lease_held() {
       // SAFETY: this field is not used again.
-      unsafe { ManuallyDrop::drop(&mut self.io) };
+      let io = unsafe { ManuallyDrop::take(&mut self.io) };
+      // The step arenas hold the operations' memory, which registrations
+      // point into: they go after the store, and stay if the store does.
+      let (backend, arenas) = io.into_parts();
+      drop(backend);
       // `leaked` counts registrations forgotten while a backend still held
       // their lease. Their arenas live in the store, so the store stays.
       if self.leaked == 0 {
@@ -396,6 +399,9 @@ impl Drop for LioInner {
         // SAFETY: every registration was dropped, and this field is not
         // used again.
         unsafe { ManuallyDrop::drop(&mut self.store) };
+        drop(arenas);
+      } else {
+        std::mem::forget(arenas);
       }
     }
 
@@ -506,7 +512,7 @@ impl Lio {
   /// [`io::ErrorKind::InvalidInput`] if `cap` is zero: such a driver could
   /// never run an operation. Otherwise, whatever initializing the backend
   /// reports.
-  pub fn new_with_backend<D>(mut backend: D, cap: usize) -> io::Result<Self>
+  pub fn new_with_backend<D>(backend: D, cap: usize) -> io::Result<Self>
   where
     D: IoBackend + 'static,
   {
@@ -516,11 +522,13 @@ impl Lio {
         "lio capacity must be at least 1",
       ));
     }
-    backend.init(cap)?;
+    let backend: Box<dyn IoBackend> = Box::new(backend);
+    let mut io = Tracked::new(backend);
+    io.init(cap)?;
 
     let inner = LioInner {
-      resource_close: backend.resource_close(),
-      io: ManuallyDrop::new(Box::new(backend)),
+      resource_close: io.backend().resource_close(),
+      io: ManuallyDrop::new(io),
       store: ManuallyDrop::new(OpStore::with_capacity(cap)),
       time: TimeManager::with_capacity(cap),
       completed: Vec::with_capacity(cap),
@@ -599,7 +607,7 @@ impl Lio {
   {
     let inserted = inner.store.insert_submitting(
       |arena| Registration::running(arena, model, sink),
-      |_id, _reg, _step_bump, _lease, insert| insert.keep_on_panic(),
+      |_id, _reg, _lease, insert| insert.keep_on_panic(),
     );
     let Some(id) = inserted else {
       unreachable!("driver: a slot that was kept was not claimed");
@@ -768,7 +776,7 @@ impl Lio {
     place: P,
   ) -> Result<u64, P> {
     let LioInner { io, store, time, .. } = inner;
-    let started = store.with_slot(id, move |reg, step_bump, lease| {
+    let started = store.with_slot(id, move |reg, lease| {
       // A backend that still holds the lease may still use the memory of
       // the operation before this one.
       if !reg.can_start_op() || lease.held_elsewhere() {
@@ -776,20 +784,18 @@ impl Lio {
       }
       // The operation before this one is finished and its result taken:
       // nothing points into the arena any more.
+      let step_bump = io.arena(id);
       step_bump.reset();
       let seq = place(reg, step_bump, id);
       let mut abort = AbortOp { reg, armed: true };
       let AbortOp { reg, armed } = &mut abort;
       reg.with_action(&mut |action| {
-        // After this, a panic must not free the operation's memory: `push`
-        // may have copied its addresses. A panic while building the action
+        // After this, a panic must not free the operation's memory: the
+        // table has a copy of its addresses. A panic while building the action
         // happens first, and frees it.
         *armed = false;
         match action {
-          Action::Io(op) => io.push(
-            crate::backend::InFlight::from_model(id, op, lease.clone()),
-            step_bump,
-          ),
+          Action::Io(op) => io.push_model(id, op, lease.clone()),
           Action::Sleep(duration) => time.schedule(id, duration),
         }
       });
@@ -807,21 +813,19 @@ impl Lio {
     let LioInner { io, store, time, .. } = inner;
     let inserted = store.insert_submitting(
       |_arena| Registration::vacant(),
-      |id, reg, step_bump, lease, insert| {
+      |id, reg, lease, insert| {
         // The slot's last operation is long gone: nothing points into the
         // arena any more.
+        let step_bump = io.arena(id);
         step_bump.reset();
         place(reg, step_bump, waiter);
         reg.with_action(&mut |action| {
-          // After this, a panic must not free the operation's memory:
-          // `push` may have copied its addresses. A panic while building
+          // After this, a panic must not free the operation's memory: the
+          // table has a copy of its addresses. A panic while building
           // the action happens first and still frees the slot.
           insert.keep_on_panic();
           match action {
-            Action::Io(op) => io.push(
-              crate::backend::InFlight::from_model(id, op, lease.clone()),
-              step_bump,
-            ),
+            Action::Io(op) => io.push_model(id, op, lease.clone()),
             Action::Sleep(duration) => time.schedule(id, duration),
           }
         });
@@ -1257,7 +1261,7 @@ impl Lio {
     let mut stats = LioProfile::default();
     let inner_ref = &mut *inner;
 
-    timed!(PROFILE, stats, flush_time, inner_ref.io.flush())?;
+    timed!(PROFILE, stats, flush_time, inner_ref.io.flush());
 
     // Work already queued is ready now; don't block on the backend first.
     let queued = !inner_ref.ready_io.is_empty()
@@ -1565,14 +1569,93 @@ mod model_tests;
 #[path = "lio_lifecycle_tests.rs"]
 mod lifecycle_tests;
 
+/// A [`ScriptedBackend`](crate::backend::testing::ScriptedBackend) as a test
+/// scripts it: the kernel under a driver.
+///
+/// The driver hands the backend an operation when it flushes, which a run
+/// does first. A test that submits and then scripts the kernel means "once
+/// the kernel has it", so every look at the backend flushes first.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct Kernel {
+  backend: crate::backend::testing::ScriptedBackend,
+  lio: std::rc::Weak<RefCell<LioInner>>,
+}
+
+#[cfg(test)]
+impl Kernel {
+  /// The kernel under `lio`, which was made with a clone of `backend`.
+  pub(crate) fn new(
+    backend: crate::backend::testing::ScriptedBackend,
+    lio: &Lio,
+  ) -> Self {
+    Self { backend, lio: Rc::downgrade(&lio.inner) }
+  }
+
+  /// A driver over a scripted backend, and its kernel.
+  pub(crate) fn with_lio(cap: usize) -> (Self, Lio) {
+    let backend = crate::backend::testing::ScriptedBackend::new();
+    let lio = match Lio::new_with_backend(backend.clone(), cap) {
+      Ok(lio) => lio,
+      Err(err) => panic!("a scripted backend initializes: {err}"),
+    };
+    (Self::new(backend, &lio), lio)
+  }
+
+  /// Hands the backend what the driver has queued. Does nothing from
+  /// inside the driver, which is about to do that itself, or once the
+  /// driver is gone.
+  pub(crate) fn flush(&self) {
+    if let Some(inner) = self.lio.upgrade()
+      && let Ok(mut inner) = inner.try_borrow_mut()
+    {
+      inner.io.flush();
+    }
+  }
+
+  pub(crate) fn pushed(&self) -> Vec<u64> {
+    self.flush();
+    self.backend.pushed()
+  }
+
+  pub(crate) fn in_flight(&self) -> Vec<u64> {
+    self.flush();
+    self.backend.in_flight()
+  }
+
+  pub(crate) fn op(&self, id: u64) -> Option<crate::backend::op::Op> {
+    self.flush();
+    self.backend.op(id)
+  }
+
+  pub(crate) fn cancelled(&self) -> Vec<u64> {
+    self.flush();
+    self.backend.cancelled()
+  }
+
+  pub(crate) fn complete(&self, id: u64, result: isize) {
+    self.flush();
+    self.backend.complete(id, result);
+  }
+
+  pub(crate) fn complete_all(&self, result: isize) {
+    self.flush();
+    self.backend.complete_all(result);
+  }
+
+  pub(crate) fn set_stuck(&self, stuck: bool) {
+    self.backend.set_stuck(stuck);
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::backend::testing::ScriptedBackend;
+  use crate::backend::{Done, OpKey, Queued, Started};
 
-  fn lio(cap: usize) -> (ScriptedBackend, Lio) {
-    let backend = ScriptedBackend::new();
-    (backend.clone(), Lio::new_with_backend(backend, cap).unwrap())
+  fn lio(cap: usize) -> (Kernel, Lio) {
+    Kernel::with_lio(cap)
   }
 
   #[test]
@@ -1660,10 +1743,13 @@ mod tests {
 
   #[test]
   #[cfg_attr(miri, ignore = "leaks the registration on purpose")]
-  fn a_ticket_never_given_up_keeps_the_store_after_the_driver_drops() {
-    // `Hoarding` ignores the cancel, and still holds its tickets.
+  fn an_operation_never_reported_keeps_the_store_after_the_driver_drops() {
+    // `Hoarding` ignores the cancel, and never reports what it began.
     let lio = Lio::new_with_backend(Hoarding::default(), 1).unwrap();
     crate::api::nop().with_lio(&lio).when_done(|_| {});
+    // The backend has to have it: one that is still queued is the table's
+    // to give up.
+    lio.inner.borrow_mut().io.flush();
     assert_eq!(lio.inner.borrow().leaked, 0);
     STORE_DROPPED.with(|dropped| dropped.set(false));
     drop(lio);
@@ -1722,6 +1808,7 @@ mod tests {
   fn dropping_the_driver_keeps_asking_until_its_grace_is_over() {
     let (backend, lio) = lio(1);
     let _held = crate::api::nop().with_lio(&lio).send();
+    backend.flush();
     backend.set_stuck(true);
     STORE_DROPPED.with(|dropped| dropped.set(false));
     let started = Instant::now();
@@ -1747,50 +1834,17 @@ mod tests {
     assert!(STORE_DROPPED.with(|dropped| dropped.get()));
   }
 
-  /// Reports a completion for every pushed op, twice.
-  #[derive(Default)]
-  struct Twice(Vec<crate::backend::Ticket>);
-
-  impl IoBackend for Twice {
-    fn init(&mut self, _: usize) -> io::Result<()> {
-      Ok(())
-    }
-    fn push(&mut self, op: crate::backend::InFlight, _: &mut Bump) {
-      self.0.push(op.start().1);
-    }
-    fn flush(&mut self) -> io::Result<()> {
-      Ok(())
-    }
-    fn wait(
-      &mut self,
-      _: Option<Duration>,
-      completed: &mut Vec<OpCompleted>,
-    ) -> io::Result<()> {
-      completed.clear();
-      for ticket in self.0.drain(..) {
-        let id = ticket.id();
-        // SAFETY: test backend. It never copied an address, and reports
-        // only nops, for which 0 is what happened.
-        completed.push(unsafe { ticket.complete(0) });
-        // A ticket reports once: the second report is made up.
-        completed.push(OpCompleted::forged(id, 0));
-      }
-      Ok(())
-    }
-
-    fn resource_close(&self) -> crate::api::resource::ResourceClose {
-      crate::api::resource::ResourceClose::native()
-    }
-
-    // Its operations finish on their own: there is nothing to stop.
-    fn cancel(&mut self, _id: u64) {}
-  }
-
   #[test]
   #[should_panic(expected = "which is not in flight")]
   fn a_second_completion_for_an_operation_panics() {
-    let lio = Lio::new_with_backend(Twice::default(), 1).unwrap();
+    let (backend, lio) = lio(1);
     crate::api::nop().with_lio(&lio).when_done(|_| {});
+    lio.try_run().unwrap();
+    let id = backend.pushed()[0];
+    backend.complete(id, 0);
+    lio.try_run().unwrap();
+    // The table reports an operation once: the second report is made up.
+    lio.inner.borrow_mut().io.forge(id, 0);
     lio.try_run().unwrap();
   }
 
@@ -1925,28 +1979,30 @@ mod tests {
     fn init(&mut self, cap: usize) -> io::Result<()> {
       self.inner.init(cap)
     }
-    fn push(&mut self, op: crate::backend::InFlight, bump: &mut Bump) {
+    fn start(
+      &mut self,
+      op: Queued<'_>,
+      bump: &mut Bump,
+      done: &mut Done<'_>,
+    ) -> Started {
       let at = bump.alloc(0u64) as *mut u64 as usize;
       self.first_allocs.borrow_mut().push(at);
-      self.inner.push(op, bump);
-    }
-    fn flush(&mut self) -> io::Result<()> {
-      self.inner.flush()
+      self.inner.start(op, bump, done)
     }
     fn wait(
       &mut self,
       timeout: Option<Duration>,
-      completed: &mut Vec<OpCompleted>,
+      done: &mut Done<'_>,
     ) -> io::Result<()> {
-      self.inner.wait(timeout, completed)
+      self.inner.wait(timeout, done)
     }
 
     fn resource_close(&self) -> crate::api::resource::ResourceClose {
       self.inner.resource_close()
     }
 
-    fn cancel(&mut self, id: u64) {
-      self.inner.cancel(id)
+    fn cancel(&mut self, key: OpKey, done: &mut Done<'_>) {
+      self.inner.cancel(key, done)
     }
   }
 
@@ -1954,9 +2010,10 @@ mod tests {
   fn every_operation_lowers_into_its_slot_s_reset_arena() {
     let backend = Lowering::default();
     let lio = Lio::new_with_backend(backend.clone(), 1).unwrap();
+    let kernel = Kernel::new(backend.inner.clone(), &lio);
     for _ in 0..2 {
       crate::api::nop().with_lio(&lio).when_done(|_| {});
-      backend.inner.complete_all(0);
+      kernel.complete_all(0);
       lio.try_run().unwrap();
     }
     let allocs = backend.first_allocs.borrow().clone();
@@ -2051,23 +2108,25 @@ mod tests {
     fn resource_close(&self) -> crate::api::resource::ResourceClose {
       self.inner.resource_close()
     }
-    fn push(&mut self, op: crate::backend::InFlight, bump: &mut Bump) {
-      self.inner.push(op, bump);
-    }
-    fn flush(&mut self) -> io::Result<()> {
-      self.inner.flush()
+    fn start(
+      &mut self,
+      op: Queued<'_>,
+      bump: &mut Bump,
+      done: &mut Done<'_>,
+    ) -> Started {
+      self.inner.start(op, bump, done)
     }
     fn wait(
       &mut self,
       timeout: Option<Duration>,
-      completed: &mut Vec<OpCompleted>,
+      done: &mut Done<'_>,
     ) -> io::Result<()> {
       self.timeouts.borrow_mut().push(timeout);
-      self.inner.wait(timeout, completed)
+      self.inner.wait(timeout, done)
     }
 
-    fn cancel(&mut self, id: u64) {
-      self.inner.cancel(id)
+    fn cancel(&mut self, key: OpKey, done: &mut Done<'_>) {
+      self.inner.cancel(key, done)
     }
   }
 
@@ -2126,7 +2185,20 @@ mod tests {
         let _note = &note;
       });
     }
-    lio.try_run().unwrap();
+    let routed = lio.try_run().unwrap();
+    {
+      let inner = lio.inner.borrow();
+      eprintln!(
+        "DBG cap={cap} routed={routed} noted={} leaked={} dying={} ready_io={} in_flight={} woken={} full={}",
+        full.borrow().len(),
+        inner.leaked,
+        inner.dying.len(),
+        inner.ready_io.len(),
+        inner.io.in_flight(),
+        inner.woken.len(),
+        inner.store.is_full()
+      );
+    }
     full.take()
   }
 
@@ -2288,40 +2360,39 @@ mod tests {
     }
   }
 
-  /// Finishes every operation on the next wait, and keeps its lease.
+  /// Begins every operation and never reports it: its lease stays held.
   ///
-  /// What a backend does that reports an operation while something still
-  /// uses its memory: the driver must not reuse that memory.
+  /// With the completion [`run_hoarding`] makes up for each, this is a
+  /// backend that reports an operation while something still uses its
+  /// memory. The table does not let a real backend do that: the driver
+  /// must not reuse that memory all the same.
   #[derive(Default)]
   struct Hoarding {
     pushed: Rc<RefCell<Vec<u64>>>,
-    pending: Vec<u64>,
-    tickets: Vec<crate::backend::Ticket>,
+    pending: Rc<RefCell<Vec<u64>>>,
   }
 
   impl IoBackend for Hoarding {
     fn init(&mut self, _: usize) -> io::Result<()> {
       Ok(())
     }
-    fn push(&mut self, op: crate::backend::InFlight, _: &mut Bump) {
-      let (_, ticket) = op.start();
-      let id = ticket.id();
-      // Never given up: its lease stays held.
-      self.tickets.push(ticket);
-      self.pending.push(id);
+    fn start(
+      &mut self,
+      op: Queued<'_>,
+      _: &mut Bump,
+      _: &mut Done<'_>,
+    ) -> Started {
+      let id = op.id();
+      self.pending.borrow_mut().push(id);
       self.pushed.borrow_mut().push(id);
-    }
-    fn flush(&mut self) -> io::Result<()> {
-      Ok(())
+      // Begun and never reported.
+      op.begin().0
     }
     fn wait(
       &mut self,
       _: Option<Duration>,
-      completed: &mut Vec<OpCompleted>,
+      _: &mut Done<'_>,
     ) -> io::Result<()> {
-      // Reported without its ticket, which a real backend cannot do.
-      completed
-        .extend(self.pending.drain(..).map(|id| OpCompleted::forged(id, 0)));
       Ok(())
     }
 
@@ -2330,24 +2401,34 @@ mod tests {
     }
 
     // Its operations finish on their own: there is nothing to stop.
-    fn cancel(&mut self, _id: u64) {}
+    fn cancel(&mut self, _: OpKey, _: &mut Done<'_>) {}
+  }
+
+  /// Runs the driver with a made-up completion for everything `Hoarding`
+  /// was given since the last time.
+  fn run_hoarding(lio: &Lio, pending: &Rc<RefCell<Vec<u64>>>) {
+    // Hand over what is queued first, so that it is pending.
+    lio.inner.borrow_mut().io.flush();
+    for id in pending.borrow_mut().drain(..) {
+      lio.inner.borrow_mut().io.forge(id, 0);
+    }
+    lio.try_run().unwrap();
   }
 
   #[test]
   #[cfg_attr(miri, ignore = "leaks the registrations on purpose")]
   fn a_slot_whose_lease_is_still_held_takes_no_further_operation() {
-    let pushed = Rc::new(RefCell::new(Vec::new()));
-    let backend = Hoarding { pushed: pushed.clone(), ..Hoarding::default() };
+    let backend = Hoarding::default();
+    let (pushed, pending) = (backend.pushed.clone(), backend.pending.clone());
     let lio = Lio::new_with_backend(backend, 2).unwrap();
     let done = Rc::new(Cell::new(0));
     let model = NopTwice { first: Some(Nop::new()), second: Nop::new() };
     lio.spawn(model, counting(&done));
 
-    lio.try_run().unwrap();
+    run_hoarding(&lio, &pending);
+    run_hoarding(&lio, &pending);
     let [first, second] = pushed.borrow()[..] else { panic!("two ops") };
     assert_ne!(first, second, "the backend may still use the first's memory");
-
-    lio.try_run().unwrap();
     assert_eq!(done.get(), 1);
     assert_eq!(lio.inner.borrow().leaked, 2);
   }
@@ -2376,12 +2457,13 @@ mod tests {
     let done = Rc::new(Cell::new(0));
     let model = Fickle { given_up: Some(Nop::new()), kept: Nop::new() };
     lio.spawn(model, counting(&done));
-    let [given_up, kept] = backend.pushed()[..] else { panic!("two ops") };
-    assert_eq!(backend.cancelled(), [given_up]);
+    // The one it gave up on was still queued: the table reports it, and the
+    // backend never sees it.
+    let [kept] = backend.pushed()[..] else { panic!("one op") };
+    assert!(backend.cancelled().is_empty());
 
     // It finishes in the model's own slot, which the model still needs.
-    backend.complete(given_up, 0);
-    lio.try_run().unwrap();
+    assert_eq!(lio.try_run().unwrap(), 1);
     assert_eq!(done.get(), 0);
 
     backend.complete(kept, 0);

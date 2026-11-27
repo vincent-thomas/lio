@@ -555,6 +555,7 @@ fn an_operation_in_flight_can_move_to_another_model() {
   // The model that started the read is done. The read is still in flight,
   // in that model's slot, and its ticket is here.
   let in_flight = out.borrow_mut().take().unwrap();
+  lio.try_run().unwrap();
   assert_eq!(backend.in_flight().len(), 1);
 
   // Whoever polls it next is the one told when it finishes.
@@ -611,25 +612,25 @@ fn an_operation_waiting_for_a_slot_can_move_to_another_model() {
   let picks_up =
     PicksUp { nop: Some(api::nop()), from: Rc::clone(&out), read: None };
   let (items, _task) = collect(&lio, picks_up);
+  lio.try_run().unwrap();
   let nop = backend.in_flight()[0];
 
-  // The first read fills the driver: the second waits for a slot.
+  // The first read fills the driver: the second waits for a slot. The
+  // model gives the first up before the driver hands it to the backend, so
+  // the backend never sees it: it is reported stopped on the next run.
   let read = || api::read(&Resource::stdin(), Vec::with_capacity(8));
   let _task =
     api::run(HandsOut { reads: Some([read(), read()]), out: Rc::clone(&out) })
       .with_lio(&lio)
       .when_done(|()| {});
-  assert_eq!(backend.pushed().len(), 2);
+  assert_eq!(backend.pushed().len(), 1);
 
   // The other model takes the waiting read over, and asks for its result
-  // before it has a slot.
+  // before it has a slot. That run also takes the read its first model
+  // gave up on out of its slot, which the waiting read gets afterwards.
   finish(&backend, &lio, nop, 0);
   assert!(out.borrow().is_none());
-  assert_eq!(backend.pushed().len(), 2, "still waiting");
-
-  // The read its first model gave up on finishes, which frees a slot.
-  finish(&backend, &lio, reads(&backend)[0], 0);
-  assert_eq!(backend.pushed().len(), 3);
+  assert_eq!(backend.pushed().len(), 2, "it has a slot now");
 
   // The model that has the ticket now is the one told.
   finish(&backend, &lio, reads(&backend)[0], 3);

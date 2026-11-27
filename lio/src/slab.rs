@@ -8,8 +8,6 @@
 //! A slot whose generation would wrap is retired for good and replaced by a
 //! fresh one, so stale keys never resolve and the capacity stays the same.
 
-use std::mem::MaybeUninit;
-
 /// A generational index into a slab.
 ///
 /// Combines a slot index with a generation counter to detect stale references.
@@ -119,6 +117,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     }
   }
 
+  #[cfg(test)]
   #[inline]
   pub(crate) fn allocate(&mut self) -> Option<(SlabKey, &mut T)> {
     self.allocate_with(|_| {})
@@ -204,6 +203,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
   /// The slot is only marked occupied once `init` returns, so a panicking
   /// `init` leaves the pool unchanged instead of holding an occupied slot
   /// whose state was never initialized.
+  #[cfg(test)]
   #[inline]
   pub(crate) fn allocate_with(
     &mut self,
@@ -357,6 +357,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
   }
 
   /// The slots allocated so far, with their indices.
+  #[cfg(test)]
   fn used(&self) -> impl Iterator<Item = (u32, &Slot<T>)> {
     // The slots go first in each `zip`, so no index past the last is made.
     let slots = self.slots[..self.next_slot as usize].iter().zip(0..);
@@ -393,11 +394,7 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
     self.free_head != u32::MAX || self.next_slot < self.capacity
   }
 
-  // Only the Unix backend implementations use the slab.
-  #[cfg_attr(
-    any(windows, target_os = "wasi", not(feature = "backend_impls")),
-    allow(dead_code)
-  )]
+  #[cfg(test)]
   #[inline]
   pub(crate) fn len(&self) -> usize {
     self.len as usize
@@ -436,184 +433,9 @@ impl<T, const TRACK_LEN: bool> SlotPool<T, TRACK_LEN> {
   }
 }
 
-/// Generic slab allocator with generational indices.
-///
-/// Allocates items of type `T` in contiguous memory with O(1) insert/remove.
-/// Uses bump allocation for new slots and a free list for reuse.
-#[cfg_attr(
-  any(windows, target_os = "wasi", not(feature = "backend_impls")),
-  allow(dead_code)
-)]
-pub struct Slab<T> {
-  pool: SlotPool<MaybeUninit<T>>,
-}
-
-#[cfg_attr(
-  any(windows, target_os = "wasi", not(feature = "backend_impls")),
-  allow(dead_code)
-)]
-impl<T> Slab<T> {
-  /// Creates a new slab with the given capacity.
-  ///
-  /// Memory is allocated lazily as slots are used.
-  pub fn new(capacity: usize) -> Self {
-    Self { pool: SlotPool::with_capacity(capacity, MaybeUninit::uninit) }
-  }
-
-  /// Insert a value, returning its key.
-  ///
-  /// Returns `None` if at capacity.
-  #[inline]
-  pub fn insert(&mut self, value: T) -> Option<SlabKey> {
-    let (key, slot) = self.pool.allocate()?;
-    slot.write(value);
-    Some(key)
-  }
-
-  /// Insert a value and return both its key and a mutable reference to it.
-  ///
-  /// Returns `None` if at capacity.
-  #[inline]
-  pub fn insert_get_mut(&mut self, value: T) -> Option<(SlabKey, &mut T)> {
-    let key = self.insert(value)?;
-    let Some(value) = self.get_mut(key) else {
-      unreachable!("just-inserted slab entry must be retrievable");
-    };
-    Some((key, value))
-  }
-
-  /// Remove a value by key.
-  ///
-  /// Returns `true` if removed, `false` if key was invalid or stale.
-  #[cfg(test)]
-  pub fn remove(&mut self, key: SlabKey) -> bool {
-    // Drop the value only once its slot is released.
-    self.remove_value(key).is_some()
-  }
-
-  /// Remove a value by key and return it.
-  ///
-  /// Returns `None` if the key was invalid or stale.
-  #[inline]
-  pub fn remove_value(&mut self, key: SlabKey) -> Option<T> {
-    self.pool.remove_with(key, |slot| {
-      // SAFETY: occupied slots always contain an initialized value.
-      unsafe { slot.assume_init_read() }
-    })
-  }
-
-  /// Get a mutable reference to a value by key.
-  #[inline]
-  pub fn get_mut(&mut self, key: SlabKey) -> Option<&mut T> {
-    let slot = self.pool.get_mut(key)?;
-    // SAFETY: occupied slots always contain an initialized value.
-    Some(unsafe { slot.assume_init_mut() })
-  }
-
-  #[inline]
-  pub fn len(&self) -> usize {
-    self.pool.len()
-  }
-
-  /// Keys of the values matching `pred`, by a linear scan of the slots in
-  /// use so far. Meant for rare lookups, such as cancellation.
-  pub fn keys_where<'a>(
-    &'a self,
-    mut pred: impl FnMut(&T) -> bool + 'a,
-  ) -> impl Iterator<Item = SlabKey> + 'a {
-    self.pool.used().filter_map(move |(index, slot)| {
-      // SAFETY: occupied slots always contain an initialized value.
-      (slot.occupied() && pred(unsafe { slot.state.assume_init_ref() }))
-        .then_some(SlabKey { slot: index, generation: slot.generation })
-    })
-  }
-}
-
-impl<T> Drop for Slab<T> {
-  fn drop(&mut self) {
-    self.pool.for_each_occupied(|state| {
-      // SAFETY: occupied slots always contain an initialized value.
-      unsafe { state.assume_init_drop() };
-    });
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn test_insert_and_get_mut() {
-    let mut slab: Slab<i32> = Slab::new(10);
-    let key = slab.insert(42).unwrap();
-    assert_eq!(slab.get_mut(key), Some(&mut 42));
-  }
-
-  #[test]
-  fn test_remove() {
-    let mut slab: Slab<i32> = Slab::new(10);
-    let key = slab.insert(42).unwrap();
-    assert!(slab.remove(key));
-    assert_eq!(slab.get_mut(key), None);
-    // Double remove fails
-    assert!(!slab.remove(key));
-  }
-
-  #[test]
-  fn test_generation_increments() {
-    let mut slab: Slab<i32> = Slab::new(10);
-
-    let key1 = slab.insert(1).unwrap();
-    slab.remove(key1);
-
-    // Reuses slot 0 with incremented generation
-    let key2 = slab.insert(2).unwrap();
-
-    // Old key is stale
-    assert_eq!(slab.get_mut(key1), None);
-    assert_eq!(slab.get_mut(key2), Some(&mut 2));
-  }
-
-  #[test]
-  fn test_capacity_limit() {
-    let mut slab: Slab<i32> = Slab::new(2);
-    let _k1 = slab.insert(1).unwrap();
-    let _k2 = slab.insert(2).unwrap();
-    assert!(slab.insert(3).is_none());
-  }
-
-  #[test]
-  fn test_free_list_reuse() {
-    let mut slab: Slab<i32> = Slab::new(10);
-
-    let k1 = slab.insert(1).unwrap();
-    let k2 = slab.insert(2).unwrap();
-    let k3 = slab.insert(3).unwrap();
-
-    // Remove middle
-    slab.remove(k2);
-
-    // Next insert reuses a slot
-    let k4 = slab.insert(4).unwrap();
-
-    // Others unchanged
-    assert_eq!(slab.get_mut(k1), Some(&mut 1));
-    assert_eq!(slab.get_mut(k3), Some(&mut 3));
-    assert_eq!(slab.get_mut(k4), Some(&mut 4));
-  }
-
-  #[test]
-  fn keys_where_finds_only_matching_live_values() {
-    let mut slab: Slab<i32> = Slab::new(4);
-    let removed = slab.insert(1).unwrap();
-    let k2 = slab.insert(2).unwrap();
-    let k3 = slab.insert(3).unwrap();
-    slab.remove(removed);
-    // The predicates ignore their argument: a removed slot holds no value.
-    assert_eq!(slab.keys_where(|_| true).collect::<Vec<_>>(), [k2, k3]);
-    assert_eq!(slab.keys_where(|_| false).count(), 0);
-    assert_eq!(slab.keys_where(|&v| v == 3).collect::<Vec<_>>(), [k3]);
-  }
 
   #[test]
   fn test_key_packing() {
@@ -621,30 +443,6 @@ mod tests {
     let packed = key.as_u64();
     let unpacked = SlabKey::from_u64(packed);
     assert_eq!(key, unpacked);
-  }
-
-  #[test]
-  fn test_drop_called() {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    let drop_count = Rc::new(RefCell::new(0));
-    struct DropCounter(Rc<RefCell<i32>>);
-    impl Drop for DropCounter {
-      fn drop(&mut self) {
-        *self.0.borrow_mut() += 1;
-      }
-    }
-
-    {
-      let mut slab: Slab<DropCounter> = Slab::new(10);
-      let k1 = slab.insert(DropCounter(drop_count.clone())).unwrap();
-      let _k2 = slab.insert(DropCounter(drop_count.clone())).unwrap();
-      slab.remove(k1); // Should drop
-      assert_eq!(*drop_count.borrow(), 1);
-    }
-    // Slab dropped, remaining item dropped
-    assert_eq!(*drop_count.borrow(), 2);
   }
 
   #[test]
@@ -802,24 +600,6 @@ mod tests {
     let (mut pool, spent) = on_last_generation(2);
     pool.remove_with(spent, |_| ()).unwrap();
     pool.release(spent.slot());
-  }
-
-  #[test]
-  fn a_slab_finds_and_drops_values_in_replacement_slots() {
-    use std::rc::Rc;
-
-    let value = Rc::new(());
-    let mut slab: Slab<Rc<()>> = Slab::new(2);
-    slab.pool.set_generation(0, u32::MAX);
-    let spent = slab.insert(value.clone()).unwrap();
-    assert!(slab.remove(spent));
-    let first = slab.insert(value.clone()).unwrap();
-    let second = slab.insert(value.clone()).unwrap();
-    assert_eq!((first.slot(), second.slot()), (2, 1));
-    assert_eq!(slab.keys_where(|_| true).collect::<Vec<_>>(), [second, first]);
-    assert_eq!(slab.len(), 2);
-    drop(slab);
-    assert_eq!(Rc::strong_count(&value), 1, "both values were dropped");
   }
 
   /// Random step sequences against a reference model of the pool.

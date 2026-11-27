@@ -258,7 +258,7 @@ const MAX_BLOCK: Duration = Duration::from_secs(2);
 /// like a real backend would.
 #[derive(Default)]
 struct InOrderBackend {
-  queued: Vec<lio::backend::Ticket>,
+  queued: Vec<lio::backend::OpKey>,
 }
 
 impl lio::backend::IoBackend for InOrderBackend {
@@ -266,32 +266,30 @@ impl lio::backend::IoBackend for InOrderBackend {
     Ok(())
   }
 
-  fn push(
+  fn start(
     &mut self,
-    op: lio::backend::InFlight,
+    op: lio::backend::Queued<'_>,
     _step_bump: &mut bumpalo::Bump,
-  ) {
-    self.queued.push(op.start().1);
-  }
-
-  fn flush(&mut self) -> std::io::Result<()> {
-    Ok(())
+    _done: &mut lio::backend::Done<'_>,
+  ) -> lio::backend::Started {
+    let (started, key, _) = op.begin();
+    self.queued.push(key);
+    started
   }
 
   fn wait(
     &mut self,
     timeout: Option<Duration>,
-    completed: &mut Vec<lio::backend::OpCompleted>,
+    done: &mut lio::backend::Done<'_>,
   ) -> std::io::Result<()> {
-    completed.clear();
-    if self.queued.is_empty() {
+    if self.queued.is_empty() && done.waiting() == 0 {
       std::thread::sleep(timeout.unwrap_or(Duration::MAX).min(MAX_BLOCK));
     }
-    // SAFETY: it never copied an address, and reports only nops, for which
-    // 0 is what happened.
-    completed.extend(
-      self.queued.drain(..).map(|ticket| unsafe { ticket.complete(0) }),
-    );
+    for key in self.queued.drain(..) {
+      // SAFETY: it never copied an address, and reports only nops, for
+      // which 0 is what happened.
+      unsafe { done.complete(key, 0) };
+    }
     Ok(())
   }
 
@@ -300,7 +298,12 @@ impl lio::backend::IoBackend for InOrderBackend {
   }
 
   // Its operations finish on their own: there is nothing to stop.
-  fn cancel(&mut self, _id: u64) {}
+  fn cancel(
+    &mut self,
+    _key: lio::backend::OpKey,
+    _done: &mut lio::backend::Done<'_>,
+  ) {
+  }
 }
 
 #[test]

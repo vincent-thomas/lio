@@ -1222,8 +1222,8 @@ pub enum Op {
 /// An [`Op`] whose buffers are borrowed for `'a`.
 ///
 /// Constructing one does not require `unsafe`. The addresses stay valid for
-/// `'a`. Passing it to [`IoBackend::push`](crate::backend::IoBackend::push)
-/// is `unsafe` because the backend may use those addresses after `push`
+/// `'a`. Passing it to [`Tracked::push`](crate::backend::Tracked::push) is
+/// `unsafe` because the backend may use those addresses after `push`
 /// returns; the caller promises they outlive the submission.
 #[derive(Clone, Debug)]
 pub struct BorrowedOp<'a> {
@@ -1290,7 +1290,7 @@ impl<'a> BorrowedOp<'a> {
   ///
   /// Cloning this [`Op`] copies addresses and drops the `'a` brand. Keeping
   /// the copy, and dereferencing it after `'a` ends, is the
-  /// [`IoBackend::push`](crate::backend::IoBackend::push) contract.
+  /// [`Tracked::push`](crate::backend::Tracked::push) contract.
   pub fn as_op(&self) -> &Op {
     &self.op
   }
