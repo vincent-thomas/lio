@@ -104,7 +104,6 @@ mod immediate_sockets {
     let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 11, model.action());
-    backend.flush();
     assert_eq!(backend.backend().parked.len(), 0);
     let mut completed = Vec::new();
     // It finished at the flush: a wait with a limit fails where one without
@@ -122,7 +121,6 @@ mod immediate_sockets {
     let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 12, model.action());
-    backend.flush();
     assert_eq!(backend.backend().parked.len(), 1);
     let mut completed = Vec::new();
     backend.wait(Some(Duration::ZERO), &mut completed).unwrap();
@@ -140,7 +138,6 @@ mod immediate_sockets {
     let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 13, model.action());
-    backend.flush();
     assert_eq!(backend.backend().parked.len(), 1);
     assert_eq!(backend.in_flight(), 1, "nothing was reported");
     peer.write_all(b"hello").unwrap();
@@ -156,7 +153,6 @@ mod immediate_sockets {
     let mut model = Send::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 14, model.action());
-    backend.flush();
     assert_eq!(backend.backend().parked.len(), 0);
     let mut completed = Vec::new();
     backend.wait(Some(Duration::from_secs(2)), &mut completed).unwrap();
@@ -173,12 +169,10 @@ mod immediate_sockets {
     let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 15, model.action());
-    backend.flush();
     assert_eq!(backend.backend().parked.len(), 1);
     peer.write_all(b"hello").unwrap();
     // SAFETY: a no-op borrows nothing.
     unsafe { backend.push(16, crate::backend::op::BorrowedOp::nop()) };
-    backend.flush();
     let mut completed = Vec::new();
     backend.wait(Some(Duration::from_secs(2)), &mut completed).unwrap();
     let mut ids: Vec<_> =
@@ -194,7 +188,6 @@ mod immediate_sockets {
     let mut model = Receive::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 15, model.action());
-    backend.flush();
     assert_eq!(backend.backend().parked.len(), 1);
     backend.cancel(15);
     assert_eq!(backend.backend().parked.len(), 0);
@@ -213,7 +206,6 @@ mod immediate_sockets {
     let mut backend = backend();
     queue(&mut backend, 15, model.action());
     backend.cancel(15);
-    backend.flush();
     assert_eq!(
       backend.backend().parked.len(),
       0,
@@ -245,7 +237,6 @@ mod immediate_sockets {
     let mut model = Send::new(&socket);
     let mut backend = backend();
     queue(&mut backend, 17, model.action());
-    backend.flush();
     assert_eq!(backend.backend().parked.len(), 1);
     assert_eq!(backend.in_flight(), 1, "nothing was reported");
     let mut drain = [0u8; 8192];
@@ -294,7 +285,6 @@ mod immediate_sockets {
         }),
       );
     }
-    backend.flush();
     let mut completed = Vec::new();
     backend.wait(Some(Duration::from_secs(1)), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);

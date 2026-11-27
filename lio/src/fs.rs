@@ -993,7 +993,7 @@ mod open_options_tests {
 
     let backend = ScriptedBackend::new();
     let lio = crate::Lio::new_with_backend(backend.clone(), 1).unwrap();
-    let backend = crate::driver::Kernel::new(backend, &lio);
+    let backend = crate::driver::Kernel::new(backend);
     let result = Rc::new(RefCell::new(None));
     let out = Rc::clone(&result);
     OpenOptions::new()

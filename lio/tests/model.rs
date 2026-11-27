@@ -617,21 +617,23 @@ fn an_operation_waiting_for_a_slot_can_move_to_another_model() {
   let nop = backend.in_flight()[0];
 
   // The first read fills the driver: the second waits for a slot. The
-  // model gives the first up before the driver hands it to the backend, so
-  // the backend never sees it: it is reported stopped on the next run.
+  // model gives the first up, and the backend is asked to stop it.
   let read = || api::read(&Resource::stdin(), Vec::with_capacity(8));
   let _task =
     api::run(HandsOut { reads: Some([read(), read()]), out: Rc::clone(&out) })
       .with_lio(&lio)
       .when_done(|()| {});
-  assert_eq!(backend.pushed().len(), 1);
+  assert_eq!(backend.pushed().len(), 2);
+  let given_up = reads(&backend)[0];
+  assert_eq!(backend.cancelled(), [given_up]);
 
   // The other model takes the waiting read over, and asks for its result
-  // before it has a slot. That run also takes the read its first model
-  // gave up on out of its slot, which the waiting read gets afterwards.
+  // before it has a slot. The read its first model gave up on then leaves
+  // its slot, which the waiting read gets.
   finish(&backend, &lio, nop, 0);
   assert!(out.borrow().is_none());
-  assert_eq!(backend.pushed().len(), 2, "it has a slot now");
+  finish(&backend, &lio, given_up, -1);
+  assert_eq!(backend.pushed().len(), 3, "it has a slot now");
 
   // The model that has the ticket now is the one told.
   finish(&backend, &lio, reads(&backend)[0], 3);

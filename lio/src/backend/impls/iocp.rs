@@ -3,12 +3,12 @@
 //! # Execution model
 //!
 //! - Socket I/O (`Read`/`Write` on sockets, `Recv`, `Send`, `Accept`, and
-//!   `Connect` to IP addresses) is submitted as overlapped I/O during
-//!   `flush()` and completes through the port. Each in-flight operation owns
+//!   `Connect` to IP addresses) is submitted as overlapped I/O as it
+//!   is pushed and completes through the port. Each in-flight operation owns
 //!   a boxed [`Overlapped`] whose first field is the `OVERLAPPED` handed to
 //!   the kernel, so the completion entry leads straight back to its state.
 //! - Everything else (files, path operations, socket setup) runs
-//!   synchronously during `flush()`; its completion is surfaced on the next
+//!   synchronously as it is pushed; its completion is surfaced on the next
 //!   `wait()`, matching the readiness backends.
 //!
 //! # Errors

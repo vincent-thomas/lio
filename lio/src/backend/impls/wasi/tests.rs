@@ -16,11 +16,11 @@ use std::time::{Duration, Instant};
 use super::*;
 use crate::api::op::Completion as Done;
 use crate::api::resource::Resource;
+use crate::backend::Tracked;
 use crate::backend::op::{
   BorrowedMsgBuf, BorrowedMsgBufMut, BorrowedOp, FileMode, RawBuf, RawBufMut,
   ReadFlags, RecvFlags, SendFlags, SockProto,
 };
-use crate::backend::{CANCELLED_BEFORE_START, Tracked};
 
 const READ: OpenFlags = OpenFlags::READ;
 
@@ -64,7 +64,6 @@ fn shut_down(backend: &mut Tracked<Wasi>, ids: &[u64]) -> Vec<(u64, isize)> {
         backend.cancel(id);
       }
     }
-    backend.flush();
     done.extend(wait(backend, Some(Duration::from_millis(10))));
     if done.len() >= ids.len() {
       break;
@@ -76,7 +75,6 @@ fn shut_down(backend: &mut Tracked<Wasi>, ids: &[u64]) -> Vec<(u64, isize)> {
 
 /// Flushes and waits until `id` completes. Returns its result.
 fn finish(backend: &mut Tracked<Wasi>, id: u64) -> isize {
-  backend.flush();
   loop {
     let done = wait(backend, None);
     assert!(!done.is_empty(), "nothing in flight, but {id} never completed");
@@ -166,7 +164,6 @@ fn pair(
     2,
     BorrowedOp::connect(client.clone(), socket_addr_into_buf(addr)),
   );
-  backend.flush();
   let mut done = Vec::new();
   while done.len() < 2 {
     done.extend(wait(backend, None));
@@ -187,26 +184,23 @@ fn send(backend: &mut Tracked<Wasi>, to: &Resource, data: &[u8]) -> isize {
 #[test]
 fn an_idle_backend_has_no_completions_and_does_not_block() {
   let mut backend = backend();
-  backend.flush();
   assert!(poll(&mut backend).is_empty());
   // Nothing is in flight, so there is nothing to block on.
   assert!(wait(&mut backend, None).is_empty());
 }
 
 #[test]
-fn pushed_work_is_not_observable_until_flush() {
+fn a_nop_is_done_as_it_is_pushed() {
   let mut backend = backend();
   push(&mut backend, 7, BorrowedOp::nop());
-  assert!(poll(&mut backend).is_empty());
-  backend.flush();
   assert_eq!(poll(&mut backend), [(7, 0)]);
+  assert!(poll(&mut backend).is_empty());
 }
 
 #[test]
 fn a_completion_is_delivered_once() {
   let mut backend = backend();
   push(&mut backend, 1, BorrowedOp::nop());
-  backend.flush();
   assert_eq!(poll(&mut backend), [(1, 0)]);
   assert!(poll(&mut backend).is_empty());
 }
@@ -235,7 +229,6 @@ fn a_batch_completes_each_registration_under_its_own_id() {
       mode(),
     ),
   );
-  backend.flush();
   let mut done = Vec::new();
   while done.len() < 3 {
     done.extend(wait(&mut backend, None));
@@ -251,7 +244,6 @@ fn a_bounded_wait_with_nothing_ready_returns_after_its_timeout() {
   let (listening, _) = listener(&mut backend, loopback());
   let mut peer = SocketAddrBuf::unspecified();
   push(&mut backend, 5, BorrowedOp::accept(listening.clone(), &mut peer));
-  backend.flush();
 
   let start = Instant::now();
   assert!(wait(&mut backend, Some(Duration::from_millis(40))).is_empty());
@@ -448,7 +440,6 @@ fn cursor_reads_in_one_batch_each_get_their_own_part() {
     2,
     BorrowedOp::read(file.clone(), &second_bufs, None, ReadFlags::empty()),
   );
-  backend.flush();
   let mut done = Vec::new();
   while done.len() < 2 {
     done.extend(wait(&mut backend, None));
@@ -528,13 +519,12 @@ fn a_synced_append_still_moves_the_cursor() {
 // ─────────────────────────────── cancellation ───────────────────────────────
 
 #[test]
-fn cancelling_before_flush_completes_as_cancelled() {
+fn cancelling_what_is_done_already_changes_nothing() {
   let mut backend = backend();
   push(&mut backend, 3, BorrowedOp::nop());
   backend.cancel(3);
-  backend.flush();
-  // The backend never saw it: the table reports it.
-  assert_eq!(poll(&mut backend), [(3, CANCELLED_BEFORE_START)]);
+  // It was done as it was pushed.
+  assert_eq!(poll(&mut backend), [(3, 0)]);
   assert!(poll(&mut backend).is_empty());
 }
 
@@ -542,7 +532,6 @@ fn cancelling_before_flush_completes_as_cancelled() {
 fn cancelling_an_unknown_id_does_nothing() {
   let mut backend = backend();
   backend.cancel(99);
-  backend.flush();
   assert!(poll(&mut backend).is_empty());
 }
 
@@ -552,7 +541,6 @@ fn a_cancelled_accept_completes_once_and_the_listener_still_accepts() {
   let (listening, addr) = listener(&mut backend, loopback());
   let mut peer = SocketAddrBuf::unspecified();
   push(&mut backend, 4, BorrowedOp::accept(listening.clone(), &mut peer));
-  backend.flush();
   assert!(poll(&mut backend).is_empty());
   backend.cancel(4);
   assert_eq!(wait(&mut backend, None), [(4, CANCELLED)]);
@@ -565,7 +553,6 @@ fn a_cancelled_accept_completes_once_and_the_listener_still_accepts() {
     6,
     BorrowedOp::connect(client, socket_addr_into_buf(addr)),
   );
-  backend.flush();
   let mut done = Vec::new();
   while done.len() < 2 {
     done.extend(wait(&mut backend, None));
@@ -588,7 +575,6 @@ fn a_cancelled_receive_leaves_the_socket_usable() {
       9,
       BorrowedOp::recv(server.clone(), &bufs, RecvFlags::empty()),
     );
-    backend.flush();
     assert!(poll(&mut backend).is_empty());
     backend.cancel(9);
     assert_eq!(wait(&mut backend, None), [(9, CANCELLED)]);
@@ -618,7 +604,6 @@ fn cancelling_a_receive_waiting_its_turn_leaves_the_one_ahead() {
     2,
     BorrowedOp::recv(server.clone(), &second_bufs, RecvFlags::empty()),
   );
-  backend.flush();
   backend.cancel(2);
   assert_eq!(poll(&mut backend), [(2, CANCELLED)]);
 
@@ -628,7 +613,6 @@ fn cancelling_a_receive_waiting_its_turn_leaves_the_one_ahead() {
     3,
     BorrowedOp::send(client, &bufs, None, SendFlags::empty()),
   );
-  backend.flush();
   let mut done = Vec::new();
   while done.len() < 2 {
     done.extend(wait(&mut backend, None));
@@ -658,7 +642,6 @@ fn cancelling_everything_stops_everything_in_flight() {
     3,
     BorrowedOp::recv(server, &second_bufs, RecvFlags::empty()),
   );
-  backend.flush();
   push(&mut backend, 4, BorrowedOp::nop());
 
   let done = shut_down(&mut backend, &[1, 2, 3, 4]);
@@ -668,8 +651,8 @@ fn cancelling_everything_stops_everything_in_flight() {
       (1, CANCELLED),
       (2, CANCELLED),
       (3, CANCELLED),
-      // Never flushed: the table reports it.
-      (4, CANCELLED_BEFORE_START)
+      // Done as it was pushed.
+      (4, 0)
     ]
   );
   assert!(backend.backend().ops.is_empty() && backend.in_flight() == 0);
@@ -687,7 +670,6 @@ fn dropping_the_backend_stops_what_is_in_flight() {
   let bufs = [BorrowedMsgBufMut::from_slice(&mut buf)];
   push(&mut backend, 1, BorrowedOp::accept(listening, &mut peer));
   push(&mut backend, 2, BorrowedOp::recv(server, &bufs, RecvFlags::empty()));
-  backend.flush();
   assert!(poll(&mut backend).is_empty());
   // The host is told to stop before the operations' memory goes away.
   drop(backend);
@@ -720,7 +702,6 @@ fn cancelling_follows_operations_through_their_later_steps() {
     2,
     BorrowedOp::read(file.clone(), &bufs, Some(0), ReadFlags::empty()),
   );
-  backend.flush();
 
   // Each is reported once, stopped or finished, whichever came first.
   let done = shut_down(&mut backend, &[1, 2]);
@@ -744,7 +725,6 @@ fn closing_a_listener_frees_its_port() {
   // The listening stream is in this backend's set, so the close is
   // finished by the backend the next time it runs.
   drop(listening);
-  backend.flush();
   let client = tcp_socket(&mut backend, SockDomain::IPV4);
   let refused =
     run(&mut backend, BorrowedOp::connect(client, socket_addr_into_buf(addr)));
@@ -793,7 +773,6 @@ fn a_peer_that_closes_ends_the_stream_and_breaks_the_pipe() {
   let mut backend = backend();
   let (_listener, client, server) = pair(&mut backend, loopback());
   drop(client);
-  backend.flush();
   let mut buf = [0u8; 8];
   let bufs = [BorrowedMsgBufMut::from_slice(&mut buf)];
   let received = run(

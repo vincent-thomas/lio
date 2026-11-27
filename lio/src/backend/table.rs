@@ -6,7 +6,6 @@
 //! from then on knows it by an [`OpKey`]. Reporting it is a call on [`Done`],
 //! which is the table as a backend sees it.
 
-use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
@@ -14,15 +13,6 @@ use bumpalo::Bump;
 
 use crate::api::resource::ResourceClose;
 use crate::backend::op::{BorrowedOp, Op};
-
-/// The result of an operation that was cancelled before the backend was
-/// given it.
-///
-/// The backend never saw the operation, so no platform produced this number
-/// and it means nothing on its own: read [`OpCompleted::is_cancelled`].
-pub const CANCELLED_BEFORE_START: isize = -125;
-// A stopped operation reports an error.
-const _: () = assert!(CANCELLED_BEFORE_START < 0);
 
 /// One finished operation: what [`Tracked::wait`] reports.
 ///
@@ -63,8 +53,8 @@ impl OpCompleted {
 /// One share of the lifetime of an operation's memory.
 ///
 /// The driver holds one. The table holds another while the operation is
-/// queued or with the backend, and the [`OpCompleted`] made for it holds
-/// that share afterwards. The driver frees the model only when it holds the
+/// with the backend, and the [`OpCompleted`] made for it holds that share
+/// afterwards. The driver frees the model only when it holds the
 /// last one.
 ///
 /// Shares never leave the driver's thread: a backend that hands work to
@@ -131,13 +121,12 @@ impl OpKey {
 ///
 /// [`IoBackend::start`] gets it and must turn it into a [`Started`]:
 /// [`begin`](Self::begin) it, or [`refuse`](Self::refuse) it. It cannot be
-/// kept for later: it borrows the operation from the table, which holds
-/// operations that are not started.
+/// kept for later: it borrows the operation for that call.
 #[derive(Debug)]
 pub struct Queued<'a> {
   key: OpKey,
   id: u64,
-  /// In the table, where it stays unless the backend takes it.
+  /// Dropped when `start` returns, unless the backend takes it.
   op: &'a mut Op,
 }
 
@@ -209,8 +198,6 @@ impl<'a> Queued<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
   Vacant,
-  /// Pushed, and still in the table's backlog.
-  Queued,
   /// Given to the backend, which has not reported it.
   Started,
 }
@@ -414,8 +401,8 @@ impl<T> PerOp<T> {
 ///
 /// Contract:
 /// - `init()` is called before anything else
-/// - `start()` is called once per operation, in the order they were pushed,
-///   when the driver flushes. It may perform the operation at once
+/// - `start()` is called once per operation, as it is pushed. It may perform
+///   the operation at once
 /// - `wait()` hands whatever was started to the kernel, and reports what
 ///   has finished
 ///
@@ -558,25 +545,19 @@ impl<B: IoBackend + ?Sized> IoBackend for Box<B> {
 /// has not been reported, and should be small: the table is indexed by it.
 /// The ids `Lio` uses are made that way, and small numbers are too.
 ///
-/// - [`push`](Self::push) queues an operation. The backend does not see it.
-/// - [`flush`](Self::flush) gives the backend what is queued, in order.
-/// - [`cancel`](Self::cancel) reports a queued operation itself, and asks
-///   the backend about a started one.
+/// - [`push`](Self::push) gives the backend an operation, which may finish
+///   it there and then.
+/// - [`cancel`](Self::cancel) asks the backend to finish one early.
 /// - [`wait`](Self::wait) collects what was reported.
 pub struct Tracked<B> {
   // Before the table: a backend that stops its work when dropped may still
   // touch what it allocated in the arenas.
   backend: B,
   entries: Vec<Entry>,
-  /// One per slot: the operation there, while it is queued. Apart from the
-  /// entries, so that a backend can read one while it reports another.
-  ops: Vec<Op>,
   /// One per slot: the step arena of the operation there.
   arenas: Vec<Bump>,
-  /// Queued operations, in push order.
-  backlog: VecDeque<OpKey>,
   cap: usize,
-  /// Operations queued or started, and not reported.
+  /// Operations started, and not reported.
   live: usize,
   /// Reported, and not collected by `wait` yet.
   ready: Vec<OpCompleted>,
@@ -588,9 +569,7 @@ impl<B: IoBackend> Tracked<B> {
     Self {
       backend,
       entries: Vec::new(),
-      ops: Vec::new(),
       arenas: Vec::new(),
-      backlog: VecDeque::new(),
       cap: 0,
       live: 0,
       ready: Vec::new(),
@@ -612,11 +591,8 @@ impl<B: IoBackend> Tracked<B> {
     self.backend.init(cap)?;
     self.entries.clear();
     self.entries.resize_with(cap, Entry::vacant);
-    self.ops.clear();
-    self.ops.resize_with(cap, || Op::Nop);
     self.arenas.clear();
     self.arenas.resize_with(cap, Bump::new);
-    self.backlog = VecDeque::with_capacity(cap);
     self.cap = cap;
     self.live = 0;
     self.ready = Vec::with_capacity(cap);
@@ -644,7 +620,7 @@ impl<B: IoBackend> Tracked<B> {
     &mut self.backend
   }
 
-  /// How many operations are queued or started, and not reported.
+  /// How many operations are started, and not reported.
   #[inline]
   pub fn in_flight(&self) -> usize {
     self.live
@@ -666,7 +642,6 @@ impl<B: IoBackend> Tracked<B> {
   #[inline(never)]
   fn grow(&mut self, slot: usize) {
     self.entries.resize_with(slot + 1, Entry::vacant);
-    self.ops.resize_with(slot + 1, || Op::Nop);
     self.arenas.resize_with(slot + 1, Bump::new);
   }
 
@@ -680,16 +655,26 @@ impl<B: IoBackend> Tracked<B> {
     &mut self.arenas[slot]
   }
 
-  /// Queues an operation borrowed from a model the driver has pinned.
+  /// Gives the backend an operation borrowed from a model the driver has
+  /// pinned. The backend may report it before this returns: see
+  /// [`take_started`](Self::take_started).
   ///
   /// The driver calls this while it borrows the operation's memory to build
   /// the action, and does not move or drop that memory while `keep` is held
   /// elsewhere. That is what lets the borrow end here.
   #[inline]
   pub(crate) fn push_model(&mut self, id: u64, op: BorrowedOp<'_>, keep: Keep) {
+    let slot = self.claim(id);
+    self.start(slot, op, keep);
+  }
+
+  /// Checks that operation `id` may start, and returns its slot.
+  #[inline]
+  fn claim(&mut self, id: u64) -> usize {
+    // One the backend finished still counts until its report is collected.
     assert!(
-      self.live < self.cap,
-      "IoBackend capacity exceeded: attempted to queue more than {} operations",
+      self.live + self.ready.len() < self.cap,
+      "IoBackend capacity exceeded: attempted to start more than {} operations",
       self.cap
     );
     let slot = self.slot_of(id);
@@ -700,22 +685,51 @@ impl<B: IoBackend> Tracked<B> {
        in its slot",
       entry.id
     );
-    self.live += 1;
-    entry.generation = entry.generation.wrapping_add(1);
-    entry.state = State::Queued;
     entry.id = id;
+    slot
+  }
+
+  /// Hands the backend the operation of a slot that was just claimed.
+  #[inline]
+  fn start(&mut self, slot: usize, op: BorrowedOp<'_>, keep: Keep) {
+    let Self { backend, entries, arenas, ready, live, .. } = self;
+    let entry = &mut entries[slot];
+    *live += 1;
+    entry.generation = entry.generation.wrapping_add(1);
+    // From here on it is the backend's, unless the backend refuses it. One
+    // the backend panics on stays that way: its memory is kept.
+    entry.state = State::Started;
     entry.keep = Some(keep);
-    self.backlog.push_back(OpKey::new(slot as u32, entry.generation));
-    // Moved, not cloned: the operation was built for this push.
-    let before = std::mem::replace(&mut self.ops[slot], op.into_op());
-    // A vacant slot holds no operation, and that owns nothing: skipping its
-    // destructor skips a call. Anything else is dropped as usual.
-    if matches!(before, Op::Nop) {
-      std::mem::forget(before);
+    let key = OpKey::new(slot as u32, entry.generation);
+    let id = entry.id;
+    // Moved, not cloned: the operation was built for this push. What the
+    // backend does not take goes when this returns, with the resources it
+    // holds.
+    let mut op = op.into_op();
+    let queued = Queued { key, id, op: &mut op };
+    let mut done = Done { entries: &mut entries[..], ready, live };
+    let started = backend.start(queued, &mut arenas[slot], &mut done);
+    if let Outcome::Refused(result) = started.0 {
+      // The backend never had the key, so it cannot have reported it.
+      done.report(key, result, false);
     }
   }
 
-  /// Queues an operation whose buffers the caller keeps alive itself.
+  /// The report of operation `id`, if the backend finished it as it was
+  /// pushed: the driver hands that result on at once, without a wait.
+  ///
+  /// Only the last report is looked at, so this is for the caller of the
+  /// push that just returned.
+  #[inline]
+  pub(crate) fn take_started(&mut self, id: u64) -> Option<OpCompleted> {
+    if self.ready.last()?.registration_id != id {
+      return None;
+    }
+    self.ready.pop()
+  }
+
+  /// Gives the backend an operation whose buffers the caller keeps alive
+  /// itself. The backend may report it before this returns.
   ///
   /// Contract tests use this. [`Lio`](crate::Lio) does not: it submits the
   /// model it owns.
@@ -735,78 +749,30 @@ impl<B: IoBackend> Tracked<B> {
   pub unsafe fn push(&mut self, id: u64, op: BorrowedOp<'_>) {
     // Checked first: the arena of a slot that is in use holds what the
     // backend lowered for the operation there.
-    self.push_model(id, op, Keep::new());
-    // The backend does not see this operation before the flush.
-    self.arena(id).reset();
-  }
-
-  /// Gives the backend every queued operation, in the order they were
-  /// pushed.
-  pub fn flush(&mut self) {
-    let Self { backend, entries, ops, arenas, backlog, ready, live, .. } = self;
-    // Taken one at a time: a backend that panics leaves the rest queued
-    // for the next flush.
-    while let Some(key) = backlog.pop_front() {
-      let slot = key.slot();
-      let entry = &mut entries[slot];
-      if entry.generation != key.generation() || entry.state != State::Queued {
-        continue; // Cancelled while it was queued.
-      }
-      // From here on it is the backend's, unless the backend refuses it.
-      entry.state = State::Started;
-      let queued = Queued { key, id: entry.id, op: &mut ops[slot] };
-      let mut done = Done {
-        entries: &mut entries[..],
-        ready: &mut *ready,
-        live: &mut *live,
-      };
-      let started = backend.start(queued, &mut arenas[slot], &mut done);
-      if let Outcome::Refused(result) = started.0 {
-        // The backend never had the key, so it cannot have reported it.
-        done.report(key, result, false);
-      }
-      // What the backend did not take goes, with the resources it holds.
-      ops[slot] = Op::Nop;
-    }
+    let slot = self.claim(id);
+    self.arenas[slot].reset();
+    self.start(slot, op, Keep::new());
   }
 
   /// Asks for operation `id` to finish early.
   ///
-  /// One that is still queued is reported as cancelled, with
-  /// [`CANCELLED_BEFORE_START`], and never reaches the backend. One the
-  /// backend has is its to stop: see [`IoBackend::cancel`]. Anything else
+  /// It is the backend's to stop: see [`IoBackend::cancel`]. Anything else
   /// (unknown, or reported already) is left alone.
   pub fn cancel(&mut self, id: u64) {
     let slot = id as u32 as usize;
     let Some(entry) = self.entries.get_mut(slot) else {
       return;
     };
-    if entry.id != id {
+    if entry.id != id || entry.state != State::Started {
       return;
     }
     let key = OpKey::new(slot as u32, entry.generation);
-    match entry.state {
-      State::Vacant => {}
-      State::Queued => {
-        // No address ever left the table.
-        entry.state = State::Started;
-        self.ops[slot] = Op::Nop;
-        let mut done = Done {
-          entries: &mut self.entries,
-          ready: &mut self.ready,
-          live: &mut self.live,
-        };
-        done.report(key, CANCELLED_BEFORE_START, true);
-      }
-      State::Started => {
-        let mut done = Done {
-          entries: &mut self.entries,
-          ready: &mut self.ready,
-          live: &mut self.live,
-        };
-        self.backend.cancel(key, &mut done);
-      }
-    }
+    let mut done = Done {
+      entries: &mut self.entries,
+      ready: &mut self.ready,
+      live: &mut self.live,
+    };
+    self.backend.cancel(key, &mut done);
   }
 
   /// Waits for the backend, then moves everything reported so far into
@@ -848,7 +814,6 @@ impl<B> std::fmt::Debug for Tracked<B> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("Tracked")
       .field("capacity", &self.entries.len())
-      .field("queued", &self.backlog.len())
       .field("ready", &self.ready.len())
       .finish_non_exhaustive()
   }
@@ -932,30 +897,21 @@ mod tests {
       push(&mut io, id);
     }
     assert_eq!(io.in_flight(), 3);
-    assert!(io.backend().begun.is_empty(), "nothing before the flush");
-    io.flush();
     let ids: Vec<u64> = io.backend().begun.iter().map(|(id, _)| *id).collect();
     assert_eq!(ids, [2, 0, 3]);
-    io.flush();
     assert_eq!(io.backend().begun.len(), 3, "each is started once");
   }
 
   #[test]
-  fn a_cancel_goes_to_whoever_has_the_operation() {
+  fn a_cancel_goes_to_the_backend_for_an_operation_it_has() {
     let mut io = tracked(4);
     push(&mut io, 1);
-    io.flush();
     push(&mut io, 2);
-    io.cancel(1); // The backend has it.
-    io.cancel(2); // Still queued.
+    io.cancel(1);
+    io.cancel(2);
     io.cancel(3); // Unknown.
-    assert_eq!(
-      collect(&mut io),
-      [(1, -1, true), (2, CANCELLED_BEFORE_START, true)]
-    );
+    assert_eq!(collect(&mut io), [(1, -1, true), (2, -1, true)]);
     assert_eq!(io.in_flight(), 0);
-    io.flush();
-    assert_eq!(io.backend().begun.len(), 1, "the cancelled one never started");
     io.cancel(1);
     assert!(collect(&mut io).is_empty(), "a reported operation is left alone");
   }
@@ -965,7 +921,6 @@ mod tests {
   fn pushing_an_id_in_flight_leaves_its_arena_alone() {
     let mut io = tracked(2);
     push(&mut io, 1);
-    io.flush();
     let at = |io: &mut Tracked<Fussy>| io.arena(1).alloc(7u64) as *mut u64;
     let first = at(&mut io);
     let again = std::panic::AssertUnwindSafe(|| push(&mut io, 1));
@@ -984,7 +939,6 @@ mod tests {
   fn a_stale_key_does_not_report_the_slot_s_next_operation() {
     let mut io = tracked(2);
     push(&mut io, 1);
-    io.flush();
     let (_, stale) = io.backend().begun[0];
     io.cancel(1);
     assert_eq!(collect(&mut io), [(1, -1, true)]);
@@ -992,7 +946,6 @@ mod tests {
     // The slot's next operation is with the backend when the old key is
     // reported again.
     push(&mut io, 1);
-    io.flush();
     let mut completed = Vec::new();
     let mut done = Done {
       entries: &mut io.entries,
@@ -1014,13 +967,11 @@ mod tests {
   fn the_table_prints_what_it_holds() {
     let mut io = tracked(4);
     push(&mut io, 1);
-    io.flush();
     push(&mut io, 2);
     push(&mut io, 3);
     io.cancel(1);
     let printed = format!("{io:?}");
     assert!(printed.contains("capacity: 4"), "{printed}");
-    assert!(printed.contains("queued: 2"), "{printed}");
     assert!(printed.contains("ready: 1"), "{printed}");
   }
 
@@ -1028,7 +979,6 @@ mod tests {
   fn a_cancel_names_the_operation_by_its_whole_id() {
     let mut io = tracked(4);
     push(&mut io, 1);
-    io.flush();
     // Same slot, another generation of the driver's id.
     io.cancel(1 | 1 << 32);
     assert!(collect(&mut io).is_empty());
@@ -1037,16 +987,13 @@ mod tests {
 
   #[test]
   #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
-  fn a_backend_that_panics_leaves_the_rest_queued() {
+  fn an_operation_the_backend_panicked_on_keeps_its_memory() {
     let mut io = tracked(4);
     io.backend_mut().panic_on = Some(2);
-    for id in [1, 2, 3] {
-      push(&mut io, id);
-    }
-    let flush = std::panic::AssertUnwindSafe(|| io.flush());
-    assert!(std::panic::catch_unwind(flush).is_err());
-    assert_eq!(io.backend().begun.len(), 1);
-    io.flush();
+    push(&mut io, 1);
+    let panics = std::panic::AssertUnwindSafe(|| push(&mut io, 2));
+    assert!(std::panic::catch_unwind(panics).is_err());
+    push(&mut io, 3);
     let ids: Vec<u64> = io.backend().begun.iter().map(|(id, _)| *id).collect();
     assert_eq!(ids, [1, 3], "the one it panicked on is not offered again");
     assert_eq!(io.in_flight(), 3, "and stays unreported: its memory is kept");
@@ -1056,7 +1003,6 @@ mod tests {
   fn the_table_makes_room_for_a_slot_past_its_capacity() {
     let mut io = tracked(1);
     push(&mut io, 5);
-    io.flush();
     let (_, key) = io.backend().begun[0];
     assert_eq!(key.slot(), 5);
     io.cancel(5);

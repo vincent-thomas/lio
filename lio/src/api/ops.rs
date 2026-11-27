@@ -1023,7 +1023,7 @@ mod tests {
   {
     let backend = ScriptedBackend::new();
     let lio = Lio::new_with_backend(Checked::new(backend.clone()), 1).unwrap();
-    let backend = crate::driver::Kernel::new(backend, &lio);
+    let backend = crate::driver::Kernel::new(backend);
     let items = Rc::new(RefCell::new(Vec::new()));
     let mut submitted = Vec::new();
     for polled in [false, true] {
@@ -1399,7 +1399,7 @@ mod tests {
   fn sleep_and_interval_wait_on_the_driver_s_clock() {
     let backend = ScriptedBackend::new();
     let lio = Lio::new_with_backend(Checked::new(backend.clone()), 2).unwrap();
-    let backend = crate::driver::Kernel::new(backend, &lio);
+    let backend = crate::driver::Kernel::new(backend);
     crate::time::pause(&lio);
     let ticks = Rc::new(RefCell::new(Vec::new()));
 

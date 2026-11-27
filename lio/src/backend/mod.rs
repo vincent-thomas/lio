@@ -16,7 +16,8 @@
 //! - **Zero runtime allocation**: All capacity is pre-allocated via [`init`](IoBackend::init)
 //! - **Dyn-compatible**: Backends can be used as `Box<dyn IoBackend>`
 //! - **Thread-local ownership**: Each thread owns its backend instance (`&mut self`)
-//! - **Batched submission**: Push multiple ops, flush once
+//! - **Batched submission**: a backend starts each op as it is pushed, and
+//!   hands the kernel what has to wait in its next `wait`
 //! - **One table**: [`Tracked`] owns every operation from push to report. A
 //!   backend holds keys, never the right to report
 //!
@@ -35,7 +36,6 @@
 //! // which the driver keeps in place until the operation is reported.
 //! // SAFETY: this nop has no buffer for the backend to retain.
 //! unsafe { io.push(1, BorrowedOp::nop()) };
-//! io.flush();
 //!
 //! let mut completions = Vec::new();
 //! io.wait(Some(Duration::ZERO), &mut completions).unwrap();
@@ -173,6 +173,5 @@ mod table;
 
 pub(crate) use table::Keep;
 pub use table::{
-  CANCELLED_BEFORE_START, Done, IoBackend, OpCompleted, OpKey, PerOp, Queued,
-  Started, Tracked,
+  Done, IoBackend, OpCompleted, OpKey, PerOp, Queued, Started, Tracked,
 };

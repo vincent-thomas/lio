@@ -89,8 +89,8 @@ impl ScriptedBackend {
     Self::default()
   }
 
-  /// A backend that completes every operation with `result` when it is
-  /// flushed, in push order.
+  /// A backend that completes every operation with `result`, reported by
+  /// the wait after it was pushed, in push order.
   pub fn auto(result: isize) -> Self {
     let backend = Self::new();
     backend.0.borrow_mut().auto = Some(result);
@@ -499,7 +499,6 @@ mod tests {
     // SAFETY: a nop carries no addresses.
     let op = unsafe { BorrowedOp::from_op(Op::Nop) };
     io.push_model(1, op, keep.clone());
-    io.flush();
     assert!(keep.held_elsewhere(), "the backend has the operation");
 
     drop(io);
@@ -512,8 +511,7 @@ mod tests {
     let (backend, mut io) = init(4);
     push_op(&mut io, 1, Op::Nop);
     push_op(&mut io, 2, Op::Nop);
-    assert!(backend.pushed().is_empty(), "queued, not started");
-    io.flush();
+    assert_eq!(backend.pushed(), vec![1, 2], "started as they were pushed");
     assert!(wait(&mut io).is_empty());
 
     backend.complete(2, 0);
@@ -528,14 +526,12 @@ mod tests {
   }
 
   #[test]
-  fn auto_completes_on_flush_in_push_order() {
+  fn auto_completes_as_pushed_in_push_order() {
     let mut io = Tracked::new(Checked::new(ScriptedBackend::auto(7)));
     io.init(4).unwrap();
     for id in [3, 1, 2] {
       push_op(&mut io, id, Op::Nop);
     }
-    assert!(wait(&mut io).is_empty(), "nothing before the flush");
-    io.flush();
     let mut completed = Vec::new();
     io.wait(Some(Duration::ZERO), &mut completed).unwrap();
     assert_eq!(
@@ -573,7 +569,6 @@ mod tests {
 
     push_op(&mut io, 1, read);
     push_op(&mut io, 2, write);
-    io.flush();
     backend.complete_all(8);
     assert_eq!(into, [POISON; 8]);
     assert_eq!(&from, b"payload!", "sent bytes are only read");
@@ -617,7 +612,6 @@ mod tests {
       io.init(1).unwrap();
       let (mut into, mut iovec) = (0u8, crate::backend::op::RawBufMut::empty());
       push_op(&mut io, 1, read_into(&mut into, &mut iovec));
-      io.flush();
       io.cancel(1);
       let mut completed = Vec::new();
       io.wait(None, &mut completed).unwrap();
@@ -635,7 +629,6 @@ mod tests {
     io.init(1).unwrap();
     let (mut into, mut iovec) = (0u8, crate::backend::op::RawBufMut::empty());
     push_op(&mut io, 1, read_into(&mut into, &mut iovec));
-    io.flush();
     backend.complete(1, 1);
     assert_eq!(into, 0);
     assert_eq!(wait(&mut io), vec![1]);
@@ -646,7 +639,6 @@ mod tests {
     let (backend, mut io) = init(2);
     push_op(&mut io, 1, Op::Nop);
     push_op(&mut io, 2, Op::Nop);
-    io.flush();
     io.cancel(1);
     io.cancel(99);
     assert_eq!(
@@ -676,7 +668,6 @@ mod tests {
     let (backend, mut io) = init(2);
     push_op(&mut io, 1, Op::Nop);
     push_op(&mut io, 2, Op::Nop);
-    io.flush();
     io.cancel(2);
     backend.set_stuck(true);
     backend.complete(1, 0);
@@ -687,41 +678,6 @@ mod tests {
     assert_eq!(backend.in_flight(), vec![2]);
     backend.complete(2, 0);
     assert_eq!(wait(&mut io), vec![2]);
-  }
-
-  #[test]
-  fn a_report_the_driver_has_not_collected_keeps_a_wait_from_blocking() {
-    // The cancel of a queued operation is reported by the table. With that
-    // report waiting, the scripted kernel is not idle: it does not act on
-    // the other cancel yet.
-    let (backend, mut io) = init(2);
-    push_op(&mut io, 1, Op::Nop);
-    io.flush();
-    io.cancel(1);
-    push_op(&mut io, 2, Op::Nop);
-    io.cancel(2);
-    let mut completed = Vec::new();
-    io.wait(None, &mut completed).unwrap();
-    let ids: Vec<u64> = completed.iter().map(|c| c.registration_id()).collect();
-    assert_eq!(ids, [2], "what the kernel was asked to stop waits its turn");
-    assert_eq!(backend.in_flight(), vec![1]);
-    io.wait(None, &mut completed).unwrap();
-    assert_eq!(completed.len(), 1);
-    assert!(completed[0].is_cancelled());
-  }
-
-  #[test]
-  fn a_cancel_before_the_flush_never_reaches_the_backend() {
-    let (backend, mut io) = init(2);
-    push_op(&mut io, 1, Op::Nop);
-    io.cancel(1);
-    io.flush();
-    let mut completed = Vec::new();
-    io.wait(Some(Duration::ZERO), &mut completed).unwrap();
-    assert_eq!(completed.len(), 1);
-    assert!(completed[0].is_cancelled());
-    assert_eq!(completed[0].result(), crate::backend::CANCELLED_BEFORE_START);
-    assert!(backend.pushed().is_empty() && backend.cancelled().is_empty());
   }
 
   #[test]
@@ -737,7 +693,6 @@ mod tests {
     let mut io = Tracked::new(Uninit(Checked::new(ScriptedBackend::new())));
     io.init(1).unwrap();
     push_op(&mut io, 1, Op::Nop);
-    io.flush();
   }
 
   /// Forwards everything but `init`.
@@ -833,16 +788,14 @@ mod tests {
     let mut io = Tracked::new(Checked::new(Eager(None)));
     io.init(1).unwrap();
     push_op(&mut io, 1, Op::Nop);
-    io.flush();
     assert_eq!(wait(&mut io), vec![1]);
     assert!(wait(&mut io).is_empty(), "reported once");
 
     // The slot's next operation is not the one the stale key names.
     push_op(&mut io, 1, Op::Nop);
-    assert!(wait(&mut io).is_empty(), "the stale key reports nothing");
     assert_eq!(io.in_flight(), 1);
-    io.flush();
     assert_eq!(wait(&mut io), vec![1]);
+    assert!(wait(&mut io).is_empty(), "reported once");
   }
 
   #[test]
@@ -876,7 +829,6 @@ mod tests {
     let mut io = Tracked::new(Checked::new(Refusing));
     io.init(1).unwrap();
     push_op(&mut io, 1, Op::Nop);
-    io.flush();
     let mut completed = Vec::new();
     io.wait(Some(Duration::ZERO), &mut completed).unwrap();
     assert_eq!(completed.len(), 1);
@@ -890,6 +842,5 @@ mod tests {
   fn dropping_with_operations_in_flight_breaks_the_contract() {
     let (_, mut io) = init(1);
     push_op(&mut io, 1, Op::Nop);
-    io.flush();
   }
 }

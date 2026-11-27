@@ -35,9 +35,8 @@
 /// - pushing more than the initialized backend capacity panics
 /// - `wait(Duration::ZERO)` never blocks
 /// - `wait(None)` blocks until at least one completion is available
-/// - `flush()` with an empty backlog is harmless
-/// - `flush()` is allowed to produce completions without creating pending work
-/// - immediate completions queued during `flush()` are surfaced on the next `wait()`
+/// - a push is allowed to produce a completion without creating pending work
+/// - completions produced as an operation is pushed are surfaced on the next `wait()`
 /// - batched immediate completions are surfaced together with exact results
 /// - a completed `wait()` buffer is cleared on the next `wait()`
 /// - completions are not duplicated across `wait()` calls
@@ -243,7 +242,6 @@ macro_rules! test_io_backend {
     fn init_and_empty_wait() {
       let mut backend = new_backend();
       backend.init(64).unwrap();
-      backend.flush();
 
       let completed = wait_completions(&mut backend, Some(Duration::ZERO));
       assert!(
@@ -284,7 +282,6 @@ macro_rules! test_io_backend {
         3,
         BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
       );
-      backend.flush();
 
       let writer = thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(20));
@@ -308,48 +305,19 @@ macro_rules! test_io_backend {
     }
 
     #[test]
-    fn empty_flush_is_harmless() {
+    fn a_wait_with_nothing_pushed_reports_nothing() {
       let mut backend = new_backend();
       backend.init(64).unwrap();
-
-      backend.flush();
-      backend.flush();
 
       let completed = wait_completions(&mut backend, Some(Duration::ZERO));
       assert!(
         completed.is_empty(),
-        "flush() with an empty backlog must not create completions"
+        "a wait with nothing pushed must not create completions"
       );
     }
 
     #[test]
-    fn pushed_work_is_not_observable_until_flush() {
-      let mut backend = new_backend();
-      backend.init(64).unwrap();
-
-      let path = unix_socket_path("not-flushed");
-      let storage = unix_sockaddr_un(&path);
-
-      push_op(&mut backend,
-        90,
-        BorrowedOp::connect(invalid_fd_resource(), storage),
-      );
-
-      let completed = wait_completions(&mut backend, Some(Duration::ZERO));
-      assert!(
-        completed.is_empty(),
-        "queued work must not become observable before flush()"
-      );
-
-      backend.flush();
-
-      let completed = wait_completions(&mut backend, Some(Duration::ZERO));
-      assert_eq!(completed.len(), 1);
-      assert_exact_result(&completed[0], 90, expect::BADF_SOCKET);
-    }
-
-    #[test]
-    fn flush_can_produce_immediate_completions_without_pending_work() {
+    fn a_push_can_produce_an_immediate_completion_without_pending_work() {
       let mut backend = new_backend();
       backend.init(64).unwrap();
 
@@ -361,20 +329,19 @@ macro_rules! test_io_backend {
         BorrowedOp::read(invalid_fd, std::slice::from_ref(&raw_buf), Some(u64::MAX), ReadFlags::empty()),
       );
 
-      backend.flush();
 
       let completed = wait_completions(&mut backend, Some(Duration::ZERO));
       assert_eq!(
         completed.len(),
         1,
-        "flush-produced completion must be surfaced on the next wait()"
+        "push-produced completion must be surfaced on the next wait()"
       );
       assert_exact_result(&completed[0], 91, expect::INVAL);
 
       let completed = wait_completions(&mut backend, Some(Duration::ZERO));
       assert!(
         completed.is_empty(),
-        "flush-produced completion must not be replayed on later wait() calls"
+        "push-produced completion must not be replayed on later wait() calls"
       );
     }
 
@@ -826,12 +793,11 @@ macro_rules! test_io_backend {
 
         // Neither submitting nor polling may wait for the pipe.
         let start = Instant::now();
-        backend.flush();
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert!(completed.is_empty(), "read on an empty pipe must stay pending");
         assert!(
           start.elapsed() < Duration::from_millis(500),
-          "flush/wait blocked on an empty pipe for {:?}",
+          "wait blocked on an empty pipe for {:?}",
           start.elapsed()
         );
 
@@ -872,7 +838,6 @@ macro_rules! test_io_backend {
             97,
             BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
           );
-          backend.flush();
           assert!(
             wait_completions(&mut backend, Some(Duration::ZERO)).is_empty(),
             "recv without data must stay pending"
@@ -895,7 +860,7 @@ macro_rules! test_io_backend {
       }
 
       #[test]
-      fn cancel_before_flush_completes_the_op() {
+      fn cancel_right_after_push_completes_the_op() {
         let mut backend = new_backend();
         backend.init(64).unwrap();
 
@@ -907,7 +872,6 @@ macro_rules! test_io_backend {
           BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
         );
         backend.cancel(98);
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_eq!(completed.registration_id(), 98);
@@ -935,8 +899,7 @@ macro_rules! test_io_backend {
           1,
           BorrowedOp::recv(read_res.clone(), &first_bufs, RecvFlags::empty()),
         );
-        backend.flush();
-        // Pushed and never flushed.
+        // In flight behind it.
         push_op(
           &mut backend,
           2,
@@ -954,7 +917,6 @@ macro_rules! test_io_backend {
               backend.cancel(id);
             }
           }
-          backend.flush();
           let done =
             wait_completions(&mut backend, Some(Duration::from_millis(10)));
           reported.extend(done.iter().map(|done| done.registration_id()));
@@ -973,7 +935,6 @@ macro_rules! test_io_backend {
 
         backend.cancel(12_345);
         push_op(&mut backend, 99, BorrowedOp::nop());
-        backend.flush();
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 99, 0);
         let extra = drain_for(&mut backend, Duration::from_millis(50));
@@ -990,7 +951,6 @@ macro_rules! test_io_backend {
         backend.init(64).unwrap();
 
         push_op(&mut backend, 40, BorrowedOp::nop());
-        backend.flush();
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert_eq!(completed.len(), 1, "nop must complete immediately");
@@ -1029,7 +989,6 @@ macro_rules! test_io_backend {
             id,
             BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
           );
-          backend.flush();
 
           let completed = wait_for_positive_completion(&mut backend);
           assert_eq!(completed.registration_id(), id);
@@ -1062,7 +1021,6 @@ macro_rules! test_io_backend {
           54,
           BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
         );
-        backend.flush();
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert!(
@@ -1092,7 +1050,6 @@ macro_rules! test_io_backend {
             id,
             BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
           );
-          backend.flush();
 
           let completed = wait_for_positive_completion(&mut backend);
           assert_eq!(completed.registration_id(), id);
@@ -1125,7 +1082,6 @@ macro_rules! test_io_backend {
           541,
           BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
         );
-        backend.flush();
 
         assert!(
           wait_completions(&mut backend, Some(Duration::ZERO)).is_empty(),
@@ -1177,7 +1133,6 @@ macro_rules! test_io_backend {
             id,
             BorrowedOp::read(read_res.clone(), &bufs, None, ReadFlags::empty()),
           );
-          backend.flush();
 
           let completed = wait_for_positive_completion(&mut backend);
           assert_eq!(completed.registration_id(), id);
@@ -1210,7 +1165,6 @@ macro_rules! test_io_backend {
           55,
           BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
         );
-        backend.flush();
         drop(write_res);
 
         let completed = wait_for_single_completion(&mut backend);
@@ -1229,7 +1183,6 @@ macro_rules! test_io_backend {
           47,
           BorrowedOp::read(invalid_fd_resource(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 47, expect::BADF);
@@ -1251,7 +1204,6 @@ macro_rules! test_io_backend {
             id,
             BorrowedOp::read(read_res.clone(), std::slice::from_ref(&raw_buf), Some(offset), ReadFlags::empty()),
           );
-          backend.flush();
 
           let completed = wait_completions(&mut backend, Some(Duration::ZERO));
           assert_eq!(completed.len(), 1);
@@ -1282,7 +1234,6 @@ macro_rules! test_io_backend {
             id,
           BorrowedOp::write(write_res.clone(), std::slice::from_ref(&raw_buf), None, WriteFlags::empty()),
           );
-          backend.flush();
 
           let completed = wait_for_positive_completion(&mut backend);
           assert_eq!(completed.registration_id(), id);
@@ -1327,7 +1278,6 @@ macro_rules! test_io_backend {
             id,
           BorrowedOp::write(write_res.clone(), &bufs, None, WriteFlags::empty()),
           );
-          backend.flush();
 
           let completed = wait_for_positive_completion(&mut backend);
           assert_eq!(completed.registration_id(), id);
@@ -1359,7 +1309,6 @@ macro_rules! test_io_backend {
           48,
           BorrowedOp::write(invalid_fd_resource(), std::slice::from_ref(&raw_buf), None, WriteFlags::empty()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 48, expect::BADF);
@@ -1383,7 +1332,6 @@ macro_rules! test_io_backend {
             id,
             BorrowedOp::write(write_res.clone(), std::slice::from_ref(&raw_buf), Some(offset), WriteFlags::empty()),
           );
-          backend.flush();
 
           let completed = wait_for_single_completion(&mut backend);
           assert_exact_result(&completed, id, expect::INVAL);
@@ -1410,7 +1358,6 @@ macro_rules! test_io_backend {
           73,
           BorrowedOp::write(file, std::slice::from_ref(&raw_buf), Some(0), WriteFlags::APPEND),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         // A backend that cannot honour a flag reports `ENOTSUP` instead.
@@ -1446,7 +1393,6 @@ macro_rules! test_io_backend {
             id,
             BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
           );
-          backend.flush();
 
           let completed = wait_for_positive_completion(&mut backend);
           assert_eq!(completed.registration_id(), id);
@@ -1476,7 +1422,6 @@ macro_rules! test_io_backend {
           47,
           BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::PEEK),
         );
-        backend.flush();
 
         let completed = wait_for_positive_completion(&mut backend);
         assert_eq!(completed.registration_id(), 47);
@@ -1504,7 +1449,6 @@ macro_rules! test_io_backend {
           56,
           BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
         );
-        backend.flush();
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert!(
@@ -1533,7 +1477,6 @@ macro_rules! test_io_backend {
             id,
             BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
           );
-          backend.flush();
 
           let completed = wait_for_positive_completion(&mut backend);
           assert_eq!(completed.registration_id(), id);
@@ -1561,7 +1504,6 @@ macro_rules! test_io_backend {
           561,
           BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
         );
-        backend.flush();
 
         assert!(
           wait_completions(&mut backend, Some(Duration::ZERO)).is_empty(),
@@ -1610,7 +1552,6 @@ macro_rules! test_io_backend {
             id,
             BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
           );
-          backend.flush();
 
           let completed = wait_for_positive_completion(&mut backend);
           assert_eq!(completed.registration_id(), id);
@@ -1638,7 +1579,6 @@ macro_rules! test_io_backend {
           57,
           BorrowedOp::recv(read_res.clone(), &bufs, RecvFlags::empty()),
         );
-        backend.flush();
         drop(write_res);
 
         let completed = wait_for_single_completion(&mut backend);
@@ -1657,7 +1597,6 @@ macro_rules! test_io_backend {
           49,
           BorrowedOp::recv(invalid_fd_resource(), &bufs, RecvFlags::empty()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 49, expect::BADF_SOCKET);
@@ -1683,7 +1622,6 @@ macro_rules! test_io_backend {
             id,
             BorrowedOp::send(write_res.clone(), &bufs, None, SendFlags::empty()),
           );
-          backend.flush();
 
           let completed = wait_for_positive_completion(&mut backend);
           assert_eq!(completed.registration_id(), id);
@@ -1723,7 +1661,6 @@ macro_rules! test_io_backend {
             id,
             BorrowedOp::send(write_res.clone(), &bufs, None, SendFlags::empty()),
           );
-          backend.flush();
 
           let completed = wait_for_positive_completion(&mut backend);
           assert_eq!(completed.registration_id(), id);
@@ -1753,7 +1690,6 @@ macro_rules! test_io_backend {
           50,
           BorrowedOp::send(invalid_fd_resource(), &bufs, None, SendFlags::empty()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 50, expect::BADF_SOCKET);
@@ -1777,7 +1713,6 @@ macro_rules! test_io_backend {
           52,
           BorrowedOp::accept(listener_res, &mut storage),
         );
-        backend.flush();
 
         let client = listener.spawn_client();
 
@@ -1807,7 +1742,6 @@ macro_rules! test_io_backend {
           58,
           BorrowedOp::accept(listener_res, &mut storage),
         );
-        backend.flush();
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert!(
@@ -1840,7 +1774,6 @@ macro_rules! test_io_backend {
           51,
           BorrowedOp::accept(invalid_fd_resource(), &mut storage),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 51, expect::BADF_SOCKET);
@@ -1865,7 +1798,6 @@ macro_rules! test_io_backend {
           46,
           BorrowedOp::connect(client_res.clone(), storage),
         );
-        backend.flush();
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert_eq!(completed.len(), 1);
@@ -1886,7 +1818,6 @@ macro_rules! test_io_backend {
           53,
           BorrowedOp::connect(client_res, storage),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 53, 0);
@@ -1906,7 +1837,6 @@ macro_rules! test_io_backend {
           59,
           BorrowedOp::connect(invalid_fd_resource(), storage),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 59, expect::BADF_SOCKET);
@@ -1927,7 +1857,6 @@ macro_rules! test_io_backend {
           63,
           BorrowedOp::connect(client_res, storage),
         );
-        backend.flush();
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert_eq!(completed.len(), 1);
@@ -1947,7 +1876,6 @@ macro_rules! test_io_backend {
           69,
           BorrowedOp::socket(__lio_test_lio::backend::op::SockDomain::IPV4, __lio_test_lio::backend::op::SockType::STREAM, __lio_test_lio::backend::op::SockProto::DEFAULT),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_eq!(completed.registration_id(), 69);
@@ -1968,7 +1896,6 @@ macro_rules! test_io_backend {
           79,
           BorrowedOp::socket(__lio_test_lio::backend::op::SockDomain::UNIX, __lio_test_lio::backend::op::SockType::STREAM, __lio_test_lio::backend::op::SockProto::TCP),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 79, expect::INVAL_SOCKET);
@@ -1990,7 +1917,6 @@ macro_rules! test_io_backend {
           80,
           BorrowedOp::open_at(Resource::cwd(), path.as_os_str().to_os_string(), OpenFlags::READ, FileMode::empty()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_eq!(completed.registration_id(), 80);
@@ -2014,7 +1940,6 @@ macro_rules! test_io_backend {
           81,
           BorrowedOp::open_at(Resource::cwd(), path.as_os_str().to_os_string(), OpenFlags::READ, FileMode::empty()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 81, expect::NOENT);
@@ -2041,7 +1966,6 @@ macro_rules! test_io_backend {
               follow_symlinks: true,
             }, &mut out),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 82, 0);
@@ -2066,7 +1990,6 @@ macro_rules! test_io_backend {
               follow_symlinks: true,
             }, &mut out),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 83, expect::NOENT);
@@ -2091,7 +2014,6 @@ macro_rules! test_io_backend {
               follow_symlinks: false,
             }, &mut out),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 84, 0);
@@ -2127,7 +2049,6 @@ macro_rules! test_io_backend {
           85,
           BorrowedOp::read_dir(dir_fd, &mut raw[..], &mut out[..], &mut result, &mut opaque, &mut opaque_drop),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 85, 0);
@@ -2177,7 +2098,6 @@ macro_rules! test_io_backend {
           70,
           BorrowedOp::unlink_at(Resource::cwd(), path.as_os_str().to_os_string(), UnlinkKind::File),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 70, 0);
@@ -2195,7 +2115,6 @@ macro_rules! test_io_backend {
           71,
           BorrowedOp::unlink_at(Resource::cwd(), path.as_os_str().to_os_string(), UnlinkKind::File),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 71, expect::NOENT);
@@ -2219,7 +2138,6 @@ macro_rules! test_io_backend {
           72,
           BorrowedOp::rename_at(Resource::cwd(), source.as_os_str().to_os_string(), Resource::cwd(), dest.as_os_str().to_os_string()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 72, 0);
@@ -2241,7 +2159,6 @@ macro_rules! test_io_backend {
           73,
           BorrowedOp::rename_at(Resource::cwd(), source.as_os_str().to_os_string(), Resource::cwd(), dest.as_os_str().to_os_string()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 73, expect::NOENT);
@@ -2263,7 +2180,6 @@ macro_rules! test_io_backend {
           74,
           BorrowedOp::mkdir_at(Resource::cwd(), path.as_os_str().to_os_string(), FileMode::from_octal(0o755).unwrap()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 74, 0);
@@ -2283,7 +2199,6 @@ macro_rules! test_io_backend {
           75,
           BorrowedOp::mkdir_at(Resource::cwd(), path.as_os_str().to_os_string(), FileMode::from_octal(0o755).unwrap()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 75, expect::EXIST);
@@ -2308,7 +2223,6 @@ macro_rules! test_io_backend {
           76,
           BorrowedOp::link_at(LinkKind::Hard, Resource::cwd(), source.as_os_str().to_os_string(), Resource::cwd(), dest.as_os_str().to_os_string()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 76, 0);
@@ -2331,7 +2245,6 @@ macro_rules! test_io_backend {
           77,
           BorrowedOp::link_at(LinkKind::Soft, Resource::cwd(), source.as_os_str().to_os_string(), Resource::cwd(), dest.as_os_str().to_os_string()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 77, 0);
@@ -2356,7 +2269,6 @@ macro_rules! test_io_backend {
           78,
           BorrowedOp::link_at(LinkKind::Hard, Resource::cwd(), source.as_os_str().to_os_string(), Resource::cwd(), dest.as_os_str().to_os_string()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 78, expect::NOENT);
@@ -2381,7 +2293,6 @@ macro_rules! test_io_backend {
           79,
           BorrowedOp::readlink_at(Resource::cwd(), link.as_os_str().to_os_string(), &mut buf),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 79, target.as_os_str().as_encoded_bytes().len() as isize);
@@ -2406,7 +2317,6 @@ macro_rules! test_io_backend {
           80,
           BorrowedOp::readlink_at(Resource::cwd(), link.as_os_str().to_os_string(), &mut buf),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 80, expect::NOENT);
@@ -2425,7 +2335,6 @@ macro_rules! test_io_backend {
         let mut out = OsString::new();
 
         push_op(&mut backend, 81, BorrowedOp::getcwd(&mut out));
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 81, 0);
@@ -2441,7 +2350,6 @@ macro_rules! test_io_backend {
         let mut out = OsString::from("stale");
 
         push_op(&mut backend, 82, BorrowedOp::getcwd(&mut out));
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 82, 0);
@@ -2461,7 +2369,6 @@ macro_rules! test_io_backend {
           83,
           BorrowedOp::spawn(success_spawn_spec()),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_eq!(completed.registration_id(), 83);
@@ -2482,7 +2389,6 @@ macro_rules! test_io_backend {
               env: None,
             }),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 84, expect::SPAWN_MISSING);
@@ -2511,7 +2417,6 @@ macro_rules! test_io_backend {
           61,
           BorrowedOp::read(invalid_fd_resource(), std::slice::from_ref(&raw_buf), None, ReadFlags::empty()),
         );
-        backend.flush();
 
         let mut completed =
           wait_completions(&mut backend, Some(Duration::ZERO));
@@ -2534,7 +2439,6 @@ macro_rules! test_io_backend {
           62,
           BorrowedOp::connect(invalid_fd_resource(), storage),
         );
-        backend.flush();
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert_eq!(completed.len(), 1);
@@ -2548,19 +2452,17 @@ macro_rules! test_io_backend {
       }
 
       #[test]
-      fn second_flush_does_not_replay_already_submitted_work() {
+      fn a_second_wait_does_not_replay_submitted_work() {
         let mut backend = new_backend();
         backend.init(64).unwrap();
 
-        let path = unix_socket_path("flush-idempotent");
+        let path = unix_socket_path("wait-idempotent");
         let storage = unix_sockaddr_un(&path);
 
         push_op(&mut backend,
           63,
           BorrowedOp::connect(invalid_fd_resource(), storage),
         );
-        backend.flush();
-        backend.flush();
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert_eq!(completed.len(), 1);
@@ -2569,7 +2471,7 @@ macro_rules! test_io_backend {
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert!(
           completed.is_empty(),
-          "a second flush() must not replay already-submitted work"
+          "a second wait() must not replay already-submitted work"
         );
       }
 
@@ -2585,7 +2487,6 @@ macro_rules! test_io_backend {
           64,
           BorrowedOp::connect(invalid_fd_resource(), storage),
         );
-        backend.flush();
 
         let completed = wait_completions(&mut backend, Some(Duration::ZERO));
         assert_eq!(completed.len(), 1);
@@ -2625,7 +2526,6 @@ macro_rules! test_io_backend {
           702,
           BorrowedOp::read(read_b.clone(), std::slice::from_ref(&raw_b), None, ReadFlags::empty()),
         );
-        backend.flush();
 
         assert!(
           wait_completions(&mut backend, Some(Duration::ZERO)).is_empty(),
@@ -2731,7 +2631,6 @@ macro_rules! test_io_backend {
             802,
             BorrowedOp::recv(read_res.clone(), &second_bufs, RecvFlags::empty()),
           );
-          backend.flush();
           assert_quiet(
             &mut backend,
             "two recvs without data must both stay pending",
@@ -2781,7 +2680,6 @@ macro_rules! test_io_backend {
             812,
             BorrowedOp::recv(read_res.clone(), &kept_bufs, RecvFlags::empty()),
           );
-          backend.flush();
           assert_quiet(
             &mut backend,
             "two recvs without data must both stay pending",
@@ -2822,7 +2720,6 @@ macro_rules! test_io_backend {
             821,
             BorrowedOp::recv(ours.clone(), &incoming_bufs, RecvFlags::empty()),
           );
-          backend.flush();
           assert_quiet(&mut backend, "a recv without data must stay pending");
 
           let outgoing_bufs = [BorrowedMsgBuf::from_slice(b"ping")];
@@ -2831,7 +2728,6 @@ macro_rules! test_io_backend {
             822,
             BorrowedOp::send(ours.clone(), &outgoing_bufs, None, SendFlags::empty()),
           );
-          backend.flush();
           let done = collect(&mut backend, 1);
           assert_eq!(done.get(&822), Some(&4), "the send completes: {done:?}");
           assert_quiet(&mut backend, "the recv still has no data");
@@ -2884,7 +2780,6 @@ macro_rules! test_io_backend {
             WriteFlags::empty(),
           ),
         );
-        backend.flush();
 
         let done = collect(&mut backend, 2);
         assert_eq!(done.get(&831), Some(&4), "{done:?}");
@@ -2925,7 +2820,6 @@ macro_rules! test_io_backend {
             WriteFlags::empty(),
           ),
         );
-        backend.flush();
 
         let completed = wait_for_single_completion(&mut backend);
         assert_exact_result(&completed, 841, 4);

@@ -234,9 +234,16 @@ where
 
   /// Registers a callback to be invoked when the operation completes.
   ///
-  /// The callback runs during [`Lio::run`](crate::Lio::run) (or a sibling),
-  /// without the driver locked: it may schedule follow-up operations on the
-  /// same `Lio`, drop other in-flight operations, or drive the loop itself.
+  /// The operation is handed to the backend here. If the backend finishes
+  /// it there and then, the callback runs before this returns. Otherwise it
+  /// runs during [`Lio::run`](crate::Lio::run) (or a sibling). Either way
+  /// the driver is not locked: the callback may schedule follow-up
+  /// operations on the same `Lio`, drop other in-flight operations, or
+  /// drive the loop itself.
+  ///
+  /// Since it may run before this returns, the callback must not need
+  /// anything the caller still holds across this call, such as a `RefCell`
+  /// borrow.
   ///
   /// Returns a handle to [`cancel`](Task::cancel) the model by. Dropping
   /// the handle leaves it running.

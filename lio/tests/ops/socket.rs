@@ -170,7 +170,7 @@ fn test_socket_unix_stream() {
   .with_lio(&mut lio)
   .send();
 
-  assert_eq!(lio.try_run().unwrap(), 1);
+  lio.try_run().unwrap();
 
   let socket = sock_recv.try_recv().unwrap().unwrap();
   let _ = raw_id(&socket);
@@ -191,7 +191,7 @@ fn test_socket_unix_dgram() {
   .with_lio(&mut lio)
   .send();
 
-  assert_eq!(lio.try_run().unwrap(), 1);
+  lio.try_run().unwrap();
 
   let sock = sock_recv.try_recv().unwrap().unwrap();
   let _ = raw_id(&sock);

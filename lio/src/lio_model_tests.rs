@@ -104,7 +104,7 @@ impl Harness {
       Lio::new_with_backend(Checked::new(backend.clone()), cap).unwrap();
     crate::time::pause(&lio);
     Self {
-      backend: Kernel::new(backend, &lio),
+      backend: Kernel::new(backend),
       lio,
       futures: Vec::new(),
       delivered: Rc::default(),
