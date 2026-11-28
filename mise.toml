@@ -85,13 +85,13 @@ env = { RUSTFLAGS = "-Dwarnings" }
 run = "cargo clippy --workspace --all-targets{% if os() != 'linux' %} --exclude lio-uring{% endif %}{% if os() == 'windows' %} --exclude busybox --features lio/high{% else %} --all-features{% endif %}"
 
 [tasks.test]
-description = "Library and integration tests with high, plus doctests. Includes this OS's backends."
+description = "Library and integration tests with high, plus doctests, for lio and lio-tls. Includes this OS's backends."
 # After lint when both are in the same run. mise run test does not run lint.
 wait_for = ["lint"]
 env = { RUSTFLAGS = "-Dwarnings" }
 run = [
-  "cargo test -p lio --features high --tests",
-  "cargo test --doc -p lio -p lio-test{% if os() == 'windows' %} --features lio/high{% else %} --all-features{% endif %}",
+  "cargo test -p lio -p lio-tls --features lio/high --tests",
+  "cargo test --doc -p lio -p lio-test -p lio-tls{% if os() == 'windows' %} --features lio/high{% else %} --all-features{% endif %}",
 ]
 
 [tasks.no-debug-assert]
