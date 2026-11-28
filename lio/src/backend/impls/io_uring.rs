@@ -1205,35 +1205,7 @@ impl IoUring {
         // SAFETY: `state` points into the step arena, which outlives this
         // call.
         let iovecs = unsafe { &state.as_ref().iovecs };
-        let wanted: usize =
-          iovecs.iter().take(*iov_count).map(|region| region.iov_len).sum();
-        let fd = fd.as_raw_fd();
-        let read = Self::rw_nowait(
-          libc::SYS_preadv2,
-          fd,
-          iovecs.as_ptr(),
-          *iov_count,
-          *offset,
-          0,
-        )?;
-        if read == wanted || read == 0 {
-          return Some(read as isize);
-        }
-        // Short of what was asked: either the file ends here, or the rest
-        // is not cached. One more byte tells which. A read that stops
-        // before the end of a file is left to the ring, which does not.
-        let mut byte = 0u8;
-        let probe =
-          libc::iovec { iov_base: (&raw mut byte).cast(), iov_len: 1 };
-        let rest = Self::rw_nowait(
-          libc::SYS_preadv2,
-          fd,
-          &probe,
-          1,
-          *offset + read as u64,
-          0,
-        );
-        (rest == Some(0)).then_some(read as isize)
+        Self::read_here(fd.as_raw_fd(), &iovecs[..*iov_count], *offset)
       }
       (
         Op::Write { fd, iov_count, offset, flags, .. },
@@ -1241,15 +1213,7 @@ impl IoUring {
       ) => {
         // SAFETY: as above.
         let iovecs = unsafe { &state.as_ref().iovecs };
-        Self::rw_nowait(
-          libc::SYS_pwritev2,
-          fd.as_raw_fd(),
-          iovecs.as_ptr(),
-          *iov_count,
-          Self::io_offset(*offset),
-          crate::backend::native::write_flags(*flags),
-        )
-        .map(|written| written as isize)
+        Self::write_here(fd.as_raw_fd(), &iovecs[..*iov_count], *offset, *flags)
       }
       (Op::Recv { fd, flags, .. }, LoweredState::SingleMsg { ptr, len }) => {
         let flags =
@@ -1304,6 +1268,59 @@ impl IoUring {
       }
     }
     Self::try_here(op, lowered)
+  }
+
+  /// A positional read of what the page cache holds. `None` when the rest
+  /// would have had to wait.
+  fn read_here(
+    fd: std::os::fd::RawFd,
+    iovecs: &[libc::iovec],
+    offset: u64,
+  ) -> Option<isize> {
+    let wanted: usize = iovecs.iter().map(|region| region.iov_len).sum();
+    let read = Self::rw_nowait(
+      libc::SYS_preadv2,
+      fd,
+      iovecs.as_ptr(),
+      iovecs.len(),
+      offset,
+      0,
+    )?;
+    if read == wanted || read == 0 {
+      return Some(read as isize);
+    }
+    // Short of what was asked: either the file ends here, or the rest is
+    // not cached. One more byte tells which. A read that stops before the
+    // end of a file is left to the ring, which does not.
+    let mut byte = 0u8;
+    let probe = libc::iovec { iov_base: (&raw mut byte).cast(), iov_len: 1 };
+    let rest = Self::rw_nowait(
+      libc::SYS_preadv2,
+      fd,
+      &probe,
+      1,
+      offset + read as u64,
+      0,
+    );
+    (rest == Some(0)).then_some(read as isize)
+  }
+
+  /// A write the kernel can take without waiting.
+  fn write_here(
+    fd: std::os::fd::RawFd,
+    iovecs: &[libc::iovec],
+    offset: Option<u64>,
+    flags: crate::backend::op::WriteFlags,
+  ) -> Option<isize> {
+    Self::rw_nowait(
+      libc::SYS_pwritev2,
+      fd,
+      iovecs.as_ptr(),
+      iovecs.len(),
+      Self::io_offset(offset),
+      crate::backend::native::write_flags(flags),
+    )
+    .map(|written| written as isize)
   }
 
   /// `preadv2` or `pwritev2` with `RWF_NOWAIT`. `None` when the call failed,
@@ -1504,7 +1521,33 @@ impl IoBackend for IoUring {
       Op::Nop => Some(0),
       // What `try_here` and `stat_here` perform. An operation that is not
       // valid is left for `start` to refuse.
-      // Lowered on the stack: the common case needs no arena.
+      // One region, the common case, is lowered to one `iovec` on the
+      // stack.
+      Op::Read { fd, iovecs, iov_count: 1, offset: Some(offset), .. }
+        if Self::validate_op(op).is_none() =>
+      {
+        use crate::backend::op::ByteSpan;
+        // SAFETY: the op's one region stays live until this call returns.
+        let region = unsafe { iovecs.as_ref() };
+        let one = libc::iovec {
+          iov_base: region.bytes_ptr().cast(),
+          iov_len: region.bytes_len(),
+        };
+        Self::read_here(fd.as_raw_fd(), &[one], *offset)
+      }
+      Op::Write { fd, iovecs, iov_count: 1, offset, flags }
+        if Self::validate_op(op).is_none() =>
+      {
+        use crate::backend::op::ByteSpan;
+        // SAFETY: as above.
+        let region = unsafe { iovecs.as_ref() };
+        let one = libc::iovec {
+          iov_base: region.bytes_ptr().cast(),
+          iov_len: region.bytes_len(),
+        };
+        Self::write_here(fd.as_raw_fd(), &[one], *offset, *flags)
+      }
+      // More are lowered on the stack too: no arena.
       Op::Read { iovecs, iov_count, offset: Some(_), .. }
         if Self::validate_op(op).is_none() =>
       {
